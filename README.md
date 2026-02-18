@@ -15,7 +15,6 @@ A standalone, high-performance LLM inference engine supporting **Llama 3.1** and
 ## Project Structure
 
 ```
-standalone_llama/
 ├── ops/               # Low-level operators
 │   ├── attention.py   # Multi-head attention + KV cache store kernel
 │   ├── context.py     # Global inference context (paged KV cache coordination)
@@ -34,11 +33,15 @@ standalone_llama/
 ## Quick Start
 
 ```bash
+# Clone the repo
+git clone git@github.com:sfc-gh-goliaro/kb-nano.git
+cd kb-nano
+
 # Single model test
-python -m standalone_llama.test --model meta-llama/Llama-3.1-8B-Instruct
+python test.py --model meta-llama/Llama-3.1-8B-Instruct
 
 # Multiple models with tensor parallelism
-python -m standalone_llama.test \
+python test.py \
     --model meta-llama/Llama-3.1-70B-Instruct mistralai/Mixtral-8x7B-Instruct-v0.1 \
     --tp 4 --max-tokens 50
 ```

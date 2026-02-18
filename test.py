@@ -1,22 +1,21 @@
 #!/usr/bin/env python3
 """
-Unified correctness and benchmark test: standalone Llama vs vLLM.
+Unified correctness and benchmark test: standalone engine vs vLLM.
 
 Runs both engines in separate subprocesses, compares outputs token-by-token,
 and measures inference speed (sequential and batched).
 
 Usage:
     # Single model
-    python -m standalone_llama.test --model meta-llama/Llama-3.1-8B-Instruct
+    python test.py --model meta-llama/Llama-3.1-8B-Instruct
 
     # Multiple models in sequence
-    python -m standalone_llama.test \\
+    python test.py \\
         --model meta-llama/Llama-3.1-70B-Instruct mistralai/Mixtral-8x7B-Instruct-v0.1 \\
         --tp 4
 
     # Custom settings
-    python -m standalone_llama.test --model meta-llama/Llama-3.1-8B-Instruct \\
-        --max-tokens 200 --seed 123
+    python test.py --model meta-llama/Llama-3.1-8B-Instruct --max-tokens 200 --seed 123
 """
 
 import argparse
@@ -103,7 +102,9 @@ sys.path.insert(0, cfg["project_root"])
 
 def main():
     cfg = json.loads(sys.argv[1])
-    from standalone_llama.engine import LlamaEngine, SamplingParams
+    pkg = cfg["package_name"]
+    mod = __import__(f"{pkg}.engine", fromlist=["LlamaEngine", "SamplingParams"])
+    LlamaEngine, SamplingParams = mod.LlamaEngine, mod.SamplingParams
 
     engine = LlamaEngine(
         model_name=cfg["model"], seed=cfg["seed"],
@@ -268,7 +269,7 @@ def report_benchmark(vllm_data: dict, standalone_data: dict) -> None:
 # ---------------------------------------------------------------------------
 # Main
 # ---------------------------------------------------------------------------
-def run_model_test(model_name: str, args, project_root: str) -> int:
+def run_model_test(model_name: str, args, project_root: str, package_name: str) -> int:
     """Run correctness + benchmark for a single model. Returns number of mismatches."""
     short_name = model_name.split("/")[-1]
     print(f"\n{'#' * 70}")
@@ -283,6 +284,7 @@ def run_model_test(model_name: str, args, project_root: str) -> int:
         "prompts": PROMPTS,
         "max_tokens": args.max_tokens,
         "project_root": project_root,
+        "package_name": package_name,
     }
 
     vllm_data = run_worker(
@@ -340,11 +342,13 @@ def main():
     print(f"  Prompts    : {len(PROMPTS)}")
     print("=" * 70)
 
-    project_root = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
+    this_dir = os.path.dirname(os.path.abspath(__file__))
+    project_root = os.path.dirname(this_dir)
+    package_name = os.path.basename(this_dir)
 
     results = {}
     for model_name in models:
-        mismatches = run_model_test(model_name, args, project_root)
+        mismatches = run_model_test(model_name, args, project_root, package_name)
         results[model_name] = mismatches
 
     # Final summary across all models
