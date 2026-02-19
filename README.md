@@ -52,7 +52,9 @@ A standalone, high-performance LLM inference engine supporting **Llama 3.1** and
 │   └── __main__.py             # CLI entry point
 ├── engine.py                   # Batched inference engine with paged KV cache and TP
 ├── weight_loader.py            # HuggingFace safetensors weight loading with TP sharding
-└── test.py                     # Correctness + benchmark tests vs vLLM
+└── tests/                      # Test suite
+    ├── test_vllm_alignment.py  # Correctness + benchmark tests vs vLLM
+    └── test_bench.py           # Bench module tests (discovery, evaluator, replacement, integration)
 ```
 
 ## Quick Start
@@ -62,13 +64,19 @@ A standalone, high-performance LLM inference engine supporting **Llama 3.1** and
 git clone git@github.com:sfc-gh-goliaro/kb-nano.git
 cd kb-nano
 
-# Single model test
-python test.py --model meta-llama/Llama-3.1-8B-Instruct
+# Single model test (vs vLLM)
+python tests/test_vllm_alignment.py --model meta-llama/Llama-3.1-8B-Instruct
 
 # Multiple models with tensor parallelism
-python test.py \
+python tests/test_vllm_alignment.py \
     --model meta-llama/Llama-3.1-70B-Instruct mistralai/Mixtral-8x7B-Instruct-v0.1 \
     --tp 4 --max-tokens 50
+
+# Bench module tests (unit tests + GPU integration)
+python tests/test_bench.py
+
+# Bench module unit tests only (no GPU required)
+python tests/test_bench.py --unit-only
 ```
 
 ## Benchmarking

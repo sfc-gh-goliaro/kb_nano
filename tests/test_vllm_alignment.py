@@ -7,15 +7,15 @@ and measures inference speed (sequential and batched).
 
 Usage:
     # Single model
-    python test.py --model meta-llama/Llama-3.1-8B-Instruct
+    python tests/test_vllm_alignment.py --model meta-llama/Llama-3.1-8B-Instruct
 
     # Multiple models in sequence
-    python test.py \\
+    python tests/test_vllm_alignment.py \\
         --model meta-llama/Llama-3.1-70B-Instruct mistralai/Mixtral-8x7B-Instruct-v0.1 \\
         --tp 4
 
     # Custom settings
-    python test.py --model meta-llama/Llama-3.1-8B-Instruct --max-tokens 200 --seed 123
+    python tests/test_vllm_alignment.py --model meta-llama/Llama-3.1-8B-Instruct --max-tokens 200 --seed 123
 """
 
 import argparse
@@ -342,8 +342,9 @@ def main():
     print("=" * 70)
 
     this_dir = os.path.dirname(os.path.abspath(__file__))
-    project_root = os.path.dirname(this_dir)
-    package_name = os.path.basename(this_dir)
+    package_dir = os.path.dirname(this_dir)
+    project_root = os.path.dirname(package_dir)
+    package_name = os.path.basename(package_dir)
 
     results = {}
     for model_name in models:

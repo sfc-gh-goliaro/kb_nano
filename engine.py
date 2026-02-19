@@ -431,6 +431,7 @@ class LlamaEngine:
             del self.model_runner
             for p in self.workers:
                 p.join(timeout=10)
+            torch.cuda.empty_cache()
 
     def _sample_greedy(self, logits):
         return logits.argmax(dim=-1).tolist()

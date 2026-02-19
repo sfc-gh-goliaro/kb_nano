@@ -155,6 +155,7 @@ def run_benchmark(
                 num_warmup=num_warmup, num_runs=num_runs,
             )
         finally:
+            engine._cleanup()
             del engine
 
         print(f"  Patching {target.target_cls.__name__} with {user_impl.__name__}...")
@@ -169,6 +170,7 @@ def run_benchmark(
                     num_warmup=num_warmup, num_runs=num_runs,
                 )
             finally:
+                engine._cleanup()
                 del engine
         finally:
             restore(undo_info)
