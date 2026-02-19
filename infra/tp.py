@@ -5,9 +5,10 @@ from __future__ import annotations
 import torch
 import torch.distributed as dist
 import torch.nn as nn
-import torch.nn.functional as F
 
 from .context import get_context
+from ..L1.linear import Linear
+from ..L1.embedding import Embedding
 
 
 # ---------------------------------------------------------------------------
@@ -36,6 +37,7 @@ class ColumnParallelLinear(nn.Module):
         self.bias = nn.Parameter(torch.empty(self.output_size_per_partition)) if bias else None
         if self.bias is not None:
             self.bias.weight_loader = self._weight_loader
+        self.linear_op = Linear()
 
     def _weight_loader(self, param, loaded_weight):
         tp, rank = _tp_size(), _tp_rank()
@@ -44,7 +46,7 @@ class ColumnParallelLinear(nn.Module):
         param.data.copy_(loaded_weight)
 
     def forward(self, x):
-        return F.linear(x, self.weight, self.bias)
+        return self.linear_op(x, self.weight, self.bias)
 
 
 class MergedColumnParallelLinear(nn.Module):
@@ -59,6 +61,7 @@ class MergedColumnParallelLinear(nn.Module):
         self.weight = nn.Parameter(torch.empty(total // tp, input_size))
         self.weight.weight_loader = self._weight_loader
         self.bias = None
+        self.linear_op = Linear()
 
     def _weight_loader(self, param, loaded_weight, shard_id: int):
         tp, rank = _tp_size(), _tp_rank()
@@ -69,7 +72,7 @@ class MergedColumnParallelLinear(nn.Module):
         dst.copy_(src)
 
     def forward(self, x):
-        return F.linear(x, self.weight, self.bias)
+        return self.linear_op(x, self.weight, self.bias)
 
 
 class QKVParallelLinear(nn.Module):
@@ -90,6 +93,7 @@ class QKVParallelLinear(nn.Module):
         if bias:
             self.bias = nn.Parameter(torch.empty(output_size))
             self.bias.weight_loader = self._weight_loader
+        self.linear_op = Linear()
 
     def _weight_loader(self, param, loaded_weight, shard_id: str):
         tp, rank = _tp_size(), _tp_rank()
@@ -107,7 +111,7 @@ class QKVParallelLinear(nn.Module):
         dst.copy_(src)
 
     def forward(self, x):
-        return F.linear(x, self.weight, self.bias)
+        return self.linear_op(x, self.weight, self.bias)
 
 
 class RowParallelLinear(nn.Module):
@@ -125,6 +129,7 @@ class RowParallelLinear(nn.Module):
         self.bias = nn.Parameter(torch.empty(output_size)) if bias else None
         if self.bias is not None:
             self.bias.weight_loader = lambda p, w: p.data.copy_(w)
+        self.linear_op = Linear()
 
     def _weight_loader(self, param, loaded_weight):
         tp, rank = _tp_size(), _tp_rank()
@@ -133,7 +138,7 @@ class RowParallelLinear(nn.Module):
         param.data.copy_(loaded_weight)
 
     def forward(self, x):
-        y = F.linear(x, self.weight, self.bias if self.tp_rank == 0 else None)
+        y = self.linear_op(x, self.weight, self.bias if self.tp_rank == 0 else None)
         if self.tp_size > 1:
             dist.all_reduce(y)
         return y
@@ -154,6 +159,7 @@ class VocabParallelEmbedding(nn.Module):
         self.tp_size = tp
         self.weight = nn.Parameter(torch.empty(self.per_partition, embedding_dim))
         self.weight.weight_loader = self._weight_loader
+        self.embedding_op = Embedding()
 
     def _weight_loader(self, param, loaded_weight):
         tp, rank = _tp_size(), _tp_rank()
@@ -164,7 +170,7 @@ class VocabParallelEmbedding(nn.Module):
         if self.tp_size > 1:
             mask = (x >= self.vocab_start) & (x < self.vocab_end)
             x = mask * (x - self.vocab_start)
-        y = F.embedding(x, self.weight)
+        y = self.embedding_op(x, self.weight)
         if self.tp_size > 1:
             y = mask.unsqueeze(1) * y
             dist.all_reduce(y)
@@ -172,12 +178,16 @@ class VocabParallelEmbedding(nn.Module):
 
 
 class ParallelLMHead(VocabParallelEmbedding):
+    def __init__(self, num_embeddings: int, embedding_dim: int):
+        super().__init__(num_embeddings, embedding_dim)
+        self.linear_op = Linear()
+
     def forward(self, x):
         ctx = get_context()
         if ctx.is_prefill:
             last_indices = ctx.cu_seqlens_q[1:] - 1
             x = x[last_indices].contiguous()
-        logits = F.linear(x, self.weight)
+        logits = self.linear_op(x, self.weight)
         if self.tp_size > 1:
             all_logits = [torch.empty_like(logits) for _ in range(self.tp_size)] if _tp_rank() == 0 else None
             dist.gather(logits, all_logits, 0)

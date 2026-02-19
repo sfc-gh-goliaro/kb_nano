@@ -28,7 +28,7 @@ import torch.distributed as dist
 import torch.multiprocessing as mp
 from transformers import AutoTokenizer
 
-from .ops import get_context, reset_context, set_context
+from .infra.context import get_context, reset_context, set_context
 from .weight_loader import load_model
 
 BLOCK_SIZE = 256
@@ -51,6 +51,7 @@ class GenerationOutput:
     prompt: str
     generated_text: str
     token_ids: list[int] = field(default_factory=list)
+    logits_history: list[torch.Tensor] | None = None
 
 
 class SeqStatus(Enum):
@@ -450,7 +451,7 @@ class LlamaEngine:
         return torch.multinomial(probs, 1).squeeze(-1).tolist()
 
     @torch.inference_mode()
-    def generate(self, prompts, sampling_params):
+    def generate(self, prompts, sampling_params, collect_logits: bool = False):
         if sampling_params.seed is not None:
             self._set_seeds(sampling_params.seed)
 
@@ -458,10 +459,14 @@ class LlamaEngine:
         waiting = deque()
         running = deque()
 
+        seq_logits: dict[int, list[torch.Tensor]] = {}
+
         for prompt in prompts:
             ids = self.tokenizer.encode(prompt)
             seq = Sequence(ids, max_tokens=sampling_params.max_tokens)
             waiting.append(seq)
+            if collect_logits:
+                seq_logits[id(seq)] = []
 
         all_seqs = list(waiting)
 
@@ -481,6 +486,9 @@ class LlamaEngine:
             if prefill_seqs:
                 logits = self.model_runner.call("run", prefill_seqs, True)
                 if logits is not None:
+                    if collect_logits:
+                        for i, seq in enumerate(prefill_seqs):
+                            seq_logits[id(seq)].append(logits[i:i+1].cpu())
                     token_ids = self._sample(logits, sampling_params)
                     for seq, tid in zip(prefill_seqs, token_ids):
                         seq.append_token(tid)
@@ -507,6 +515,9 @@ class LlamaEngine:
 
             logits = self.model_runner.call("run", decode_seqs, False)
             if logits is not None:
+                if collect_logits:
+                    for i, seq in enumerate(decode_seqs):
+                        seq_logits[id(seq)].append(logits[i:i+1].cpu())
                 token_ids = self._sample(logits, sampling_params)
                 for seq, tid in zip(decode_seqs, token_ids):
                     seq.append_token(tid)
@@ -523,6 +534,9 @@ class LlamaEngine:
                     all_seqs[i].generated_ids, skip_special_tokens=True,
                 ),
                 token_ids=all_seqs[i].generated_ids,
+                logits_history=(
+                    seq_logits.get(id(all_seqs[i])) if collect_logits else None
+                ),
             )
             for i in range(len(prompts))
         ]

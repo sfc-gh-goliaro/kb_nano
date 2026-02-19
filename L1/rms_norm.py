@@ -1,10 +1,9 @@
-"""RMSNorm and SiLU-and-Mul activation."""
+"""RMSNorm: fused RMS normalization kernel."""
 
 from __future__ import annotations
 
 import torch
 import torch.nn as nn
-import torch.nn.functional as F
 
 
 class RMSNorm(nn.Module):
@@ -35,10 +34,3 @@ class RMSNorm(nn.Module):
             return self._rms_forward(x, self.weight, self.eps)
         else:
             return self._add_rms_forward(x, residual, self.weight, self.eps)
-
-
-class SiluAndMul(nn.Module):
-    @torch.compile
-    def forward(self, x):
-        x, y = x.chunk(2, -1)
-        return F.silu(x) * y

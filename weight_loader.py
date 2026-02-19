@@ -17,7 +17,8 @@ from huggingface_hub import snapshot_download
 from safetensors import safe_open
 from transformers import AutoConfig
 
-from .models import LlamaConfig, LlamaForCausalLM, MixtralConfig, MixtralForCausalLM
+from .L4.llama import LlamaConfig, LlamaForCausalLM
+from .L4.mixtral import MixtralConfig, MixtralForCausalLM
 
 
 def default_weight_loader(param: torch.nn.Parameter, loaded_weight: torch.Tensor):

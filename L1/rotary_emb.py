@@ -1,0 +1,84 @@
+"""Rotary position embeddings (RoPE), with optional Llama 3.1-style frequency scaling."""
+
+from __future__ import annotations
+
+import math
+
+import torch
+import torch.nn as nn
+
+
+def _apply_rotary_emb(x, cos, sin):
+    x1, x2 = torch.chunk(x.float(), 2, dim=-1)
+    y1 = x1 * cos - x2 * sin
+    y2 = x2 * cos + x1 * sin
+    return torch.cat((y1, y2), dim=-1).to(x.dtype)
+
+
+def _compute_scaled_inv_freq(
+    inv_freq: torch.Tensor,
+    scaling_factor: float,
+    low_freq_factor: float,
+    high_freq_factor: float,
+    original_max_position_embeddings: int,
+) -> torch.Tensor:
+    low_wl = original_max_position_embeddings / low_freq_factor
+    high_wl = original_max_position_embeddings / high_freq_factor
+    wl = 2 * math.pi / inv_freq
+    if low_freq_factor != high_freq_factor:
+        smooth = (original_max_position_embeddings / wl - low_freq_factor) / (
+            high_freq_factor - low_freq_factor
+        )
+    else:
+        smooth = torch.zeros_like(inv_freq)
+    return torch.where(
+        wl < high_wl,
+        inv_freq,
+        torch.where(
+            wl > low_wl,
+            inv_freq / scaling_factor,
+            (1 - smooth) * inv_freq / scaling_factor + smooth * inv_freq,
+        ),
+    )
+
+
+class RotaryEmbedding(nn.Module):
+    """RoPE with optional Llama 3.1-style frequency scaling.
+
+    When rope_scaling_factor == 1.0 (default), behaves as standard RoPE.
+    When rope_scaling_factor != 1.0, applies the Llama 3.1 piecewise
+    frequency scaling controlled by low/high freq factors.
+    """
+
+    def __init__(
+        self,
+        head_dim: int,
+        max_position_embeddings: int,
+        rope_theta: float,
+        rope_scaling_factor: float = 1.0,
+        rope_low_freq_factor: float = 1.0,
+        rope_high_freq_factor: float = 1.0,
+        rope_original_max_position_embeddings: int | None = None,
+    ):
+        super().__init__()
+        inv_freq = 1.0 / (rope_theta ** (torch.arange(0, head_dim, 2, dtype=torch.float) / head_dim))
+
+        if rope_scaling_factor != 1.0 and rope_original_max_position_embeddings is not None:
+            inv_freq = _compute_scaled_inv_freq(
+                inv_freq,
+                rope_scaling_factor,
+                rope_low_freq_factor,
+                rope_high_freq_factor,
+                rope_original_max_position_embeddings,
+            )
+
+        t = torch.arange(max_position_embeddings, dtype=torch.float)
+        freqs = torch.einsum("i,j -> ij", t, inv_freq)
+        cache = torch.cat((freqs.cos(), freqs.sin()), dim=-1).unsqueeze_(1)
+        self.register_buffer("cos_sin_cache", cache, persistent=False)
+
+    @torch.compile
+    def forward(self, positions, query, key):
+        cos_sin = self.cos_sin_cache[positions]
+        cos, sin = cos_sin.chunk(2, dim=-1)
+        return _apply_rotary_emb(query, cos, sin), _apply_rotary_emb(key, cos, sin)
