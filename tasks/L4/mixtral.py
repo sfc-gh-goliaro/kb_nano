@@ -15,7 +15,7 @@ import torch
 import torch.nn as nn
 from transformers import AutoConfig
 
-from ..infra.tp import ParallelLMHead, VocabParallelEmbedding
+from ...infra.tp import ParallelLMHead, VocabParallelEmbedding
 from ..L1.rms_norm import RMSNorm
 from ..L1.rotary_emb import RotaryEmbedding
 from ..L3.mixtral_decoder import MixtralDecoderLayer

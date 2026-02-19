@@ -7,8 +7,8 @@ import torch.distributed as dist
 import torch.nn as nn
 
 from .context import get_context
-from ..L1.linear import Linear
-from ..L1.embedding import Embedding
+from ..tasks.L1.linear import Linear
+from ..tasks.L1.embedding import Embedding
 
 
 # ---------------------------------------------------------------------------

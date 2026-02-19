@@ -6,7 +6,7 @@ import torch
 import torch.distributed as dist
 import torch.nn as nn
 
-from ..infra.tp import _tp_rank, _tp_size
+from ...infra.tp import _tp_rank, _tp_size
 from ..L1.softmax import Softmax
 from ..L1.topk import Topk
 from ..L2.fused_experts import FusedExperts

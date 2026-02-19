@@ -233,14 +233,13 @@ def report_benchmark(vllm_data: dict, standalone_data: dict) -> None:
     vt = vllm_data["timings"]
     st = standalone_data["timings"]
 
-    print(f"\n  {'Prompt':<8} {'vLLM (s)':<12} {'Ours (s)':<12} {'Ratio':<10} {'Tokens'}")
-    print(f"  {'-' * 54}")
+    print(f"\n  {'Prompt':<8} {'vLLM (s)':<12} {'Ours (s)':<12} {'Speedup':<10} {'Tokens'}")
+    print(f"  {'-' * 56}")
     for i, (v, s) in enumerate(zip(vt, st)):
-        ratio = s["elapsed"] / v["elapsed"]
-        faster = "faster" if ratio < 1.0 else "slower"
+        speedup = v["elapsed"] / s["elapsed"] if s["elapsed"] > 0 else float("inf")
         print(
             f"  #{i:<7} {v['elapsed']:<12.3f} {s['elapsed']:<12.3f} "
-            f"{ratio:<6.2f}x    {v['ntoks']}"
+            f"{speedup:<6.2f}x    {v['ntoks']}"
         )
 
     # Sequential totals
@@ -248,22 +247,22 @@ def report_benchmark(vllm_data: dict, standalone_data: dict) -> None:
     s_total = sum(r["elapsed"] for r in st)
     v_toks = sum(r["ntoks"] for r in vt)
     s_toks = sum(r["ntoks"] for r in st)
-    seq_ratio = s_total / v_total
+    seq_speedup = v_total / s_total if s_total > 0 else float("inf")
 
     print(f"\n  Sequential:  vLLM={v_total:.3f}s ({v_toks / v_total:.1f} tok/s)"
           f"  |  Ours={s_total:.3f}s ({s_toks / s_total:.1f} tok/s)"
-          f"  |  {seq_ratio:.2f}x")
+          f"  |  {seq_speedup:.2f}x speedup")
 
     # Batched totals
     vb = vllm_data["batch_elapsed"]
     sb = standalone_data["batch_elapsed"]
     vbn = vllm_data["batch_ntoks"]
     sbn = standalone_data["batch_ntoks"]
-    bat_ratio = sb / vb
+    bat_speedup = vb / sb if sb > 0 else float("inf")
 
     print(f"  Batched:     vLLM={vb:.3f}s ({vbn / vb:.1f} tok/s)"
           f"  |  Ours={sb:.3f}s ({sbn / sb:.1f} tok/s)"
-          f"  |  {bat_ratio:.2f}x")
+          f"  |  {bat_speedup:.2f}x speedup")
 
 
 # ---------------------------------------------------------------------------

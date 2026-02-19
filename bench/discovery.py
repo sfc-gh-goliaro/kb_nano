@@ -1,7 +1,7 @@
 """Convention-based target discovery via static import analysis.
 
-Scans L4/ files as model entry points and recursively walks their imports
-(using ast.parse) to determine which L1-L3 operators each model uses.
+Scans tasks/L4/ files as model entry points and recursively walks their
+imports (using ast.parse) to determine which L1-L3 operators each model uses.
 No _META annotations needed -- the import graph is the single source of truth.
 """
 
@@ -39,7 +39,7 @@ def _resolve_internal_imports(filepath: Path, visited: set[Path] | None = None) 
     """Recursively collect all internal .py files imported by *filepath*.
 
     Only follows imports that resolve to files under _KB_ROOT and belong to
-    L1/, L2/, L3/, L4/, or infra/ directories.
+    tasks/L1/, tasks/L2/, tasks/L3/, tasks/L4/, or infra/ directories.
     """
     if visited is None:
         visited = set()
@@ -93,9 +93,9 @@ def _find_module_class(mod) -> type | None:
 def _build_model_map() -> dict[str, set[str]]:
     """Build a mapping from relative module path -> set of model keys.
 
-    Walks L4/ entry points and traces their imports to build the reverse map.
+    Walks tasks/L4/ entry points and traces their imports to build the reverse map.
     """
-    l4_dir = _KB_ROOT / "L4"
+    l4_dir = _KB_ROOT / "tasks" / "L4"
     if not l4_dir.is_dir():
         return {}
 
@@ -135,14 +135,14 @@ def discover_targets() -> list[BenchTarget]:
     targets = []
 
     for level_num in (1, 2, 3, 4):
-        level_dir = _KB_ROOT / f"L{level_num}"
+        level_dir = _KB_ROOT / "tasks" / f"L{level_num}"
         if not level_dir.is_dir():
             continue
         for fname in sorted(os.listdir(level_dir)):
             if fname.startswith("_") or not fname.endswith(".py"):
                 continue
             name = fname[:-3]
-            module_path = f"L{level_num}.{name}"
+            module_path = f"tasks.L{level_num}.{name}"
             models = sorted(model_map.get(module_path, []))
             if not models:
                 continue

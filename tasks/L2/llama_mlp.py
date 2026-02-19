@@ -4,7 +4,7 @@ from __future__ import annotations
 
 import torch.nn as nn
 
-from ..infra.tp import MergedColumnParallelLinear, RowParallelLinear
+from ...infra.tp import MergedColumnParallelLinear, RowParallelLinear
 from ..L1.silu_and_mul import SiluAndMul
 
 
