@@ -27,6 +27,7 @@ def _fused_moe_kernel(
     BLOCK_SIZE_K: tl.constexpr,
     GROUP_SIZE_M: tl.constexpr,
     compute_type: tl.constexpr,
+    NAIVE_BLOCK_ASSIGNMENT: tl.constexpr = False,
 ):
     pid = tl.program_id(axis=0)
     num_pid_m = tl.cdiv(EM, BLOCK_SIZE_M)
@@ -43,8 +44,12 @@ def _fused_moe_kernel(
         return
 
     offs_m = tl.arange(0, BLOCK_SIZE_M).to(tl.int64)
-    offs_token_id = pid_m * BLOCK_SIZE_M + offs_m
-    offs_token = tl.load(sorted_token_ids_ptr + offs_token_id)
+
+    if NAIVE_BLOCK_ASSIGNMENT:
+        offs_token = tl.where(offs_m == 0, pid_m, num_valid_tokens)
+    else:
+        offs_token_id = pid_m * BLOCK_SIZE_M + offs_m
+        offs_token = tl.load(sorted_token_ids_ptr + offs_token_id)
     token_mask = offs_token < num_valid_tokens
 
     off_expert = tl.load(expert_ids_ptr + pid_m).to(tl.int64)
@@ -75,26 +80,92 @@ def _fused_moe_kernel(
     tl.store(c_ptrs, accumulator, mask=c_mask)
 
 
-def _get_default_config(M: int) -> dict:
+_TUNED_CONFIGS_N14336 = {
+    1: {"BLOCK_SIZE_M": 16, "BLOCK_SIZE_N": 128, "BLOCK_SIZE_K": 128, "GROUP_SIZE_M": 16, "num_warps": 4, "num_stages": 5},
+    2: {"BLOCK_SIZE_M": 32, "BLOCK_SIZE_N": 64, "BLOCK_SIZE_K": 128, "GROUP_SIZE_M": 1, "num_warps": 4, "num_stages": 5},
+    4: {"BLOCK_SIZE_M": 16, "BLOCK_SIZE_N": 64, "BLOCK_SIZE_K": 64, "GROUP_SIZE_M": 1, "num_warps": 4, "num_stages": 5},
+    8: {"BLOCK_SIZE_M": 16, "BLOCK_SIZE_N": 128, "BLOCK_SIZE_K": 128, "GROUP_SIZE_M": 1, "num_warps": 4, "num_stages": 5},
+    16: {"BLOCK_SIZE_M": 16, "BLOCK_SIZE_N": 64, "BLOCK_SIZE_K": 256, "GROUP_SIZE_M": 16, "num_warps": 4, "num_stages": 3},
+    24: {"BLOCK_SIZE_M": 16, "BLOCK_SIZE_N": 128, "BLOCK_SIZE_K": 256, "GROUP_SIZE_M": 16, "num_warps": 4, "num_stages": 2},
+    32: {"BLOCK_SIZE_M": 16, "BLOCK_SIZE_N": 128, "BLOCK_SIZE_K": 128, "GROUP_SIZE_M": 16, "num_warps": 8, "num_stages": 3},
+    48: {"BLOCK_SIZE_M": 32, "BLOCK_SIZE_N": 128, "BLOCK_SIZE_K": 128, "GROUP_SIZE_M": 16, "num_warps": 4, "num_stages": 3},
+    64: {"BLOCK_SIZE_M": 32, "BLOCK_SIZE_N": 128, "BLOCK_SIZE_K": 128, "GROUP_SIZE_M": 64, "num_warps": 4, "num_stages": 3},
+    96: {"BLOCK_SIZE_M": 32, "BLOCK_SIZE_N": 128, "BLOCK_SIZE_K": 128, "GROUP_SIZE_M": 64, "num_warps": 4, "num_stages": 3},
+    128: {"BLOCK_SIZE_M": 64, "BLOCK_SIZE_N": 128, "BLOCK_SIZE_K": 128, "GROUP_SIZE_M": 1, "num_warps": 8, "num_stages": 4},
+    256: {"BLOCK_SIZE_M": 128, "BLOCK_SIZE_N": 256, "BLOCK_SIZE_K": 64, "GROUP_SIZE_M": 1, "num_warps": 8, "num_stages": 4},
+    512: {"BLOCK_SIZE_M": 128, "BLOCK_SIZE_N": 256, "BLOCK_SIZE_K": 64, "GROUP_SIZE_M": 16, "num_warps": 8, "num_stages": 4},
+    1024: {"BLOCK_SIZE_M": 128, "BLOCK_SIZE_N": 256, "BLOCK_SIZE_K": 64, "GROUP_SIZE_M": 16, "num_warps": 8, "num_stages": 4},
+    2048: {"BLOCK_SIZE_M": 128, "BLOCK_SIZE_N": 256, "BLOCK_SIZE_K": 64, "GROUP_SIZE_M": 32, "num_warps": 8, "num_stages": 4},
+    4096: {"BLOCK_SIZE_M": 128, "BLOCK_SIZE_N": 256, "BLOCK_SIZE_K": 64, "GROUP_SIZE_M": 16, "num_warps": 8, "num_stages": 4},
+}
+
+_TUNED_CONFIGS_N4096 = {
+    1: {"BLOCK_SIZE_M": 16, "BLOCK_SIZE_N": 64, "BLOCK_SIZE_K": 128, "GROUP_SIZE_M": 16, "num_warps": 4, "num_stages": 5},
+    2: {"BLOCK_SIZE_M": 32, "BLOCK_SIZE_N": 256, "BLOCK_SIZE_K": 64, "GROUP_SIZE_M": 32, "num_warps": 4, "num_stages": 5},
+    4: {"BLOCK_SIZE_M": 16, "BLOCK_SIZE_N": 128, "BLOCK_SIZE_K": 256, "GROUP_SIZE_M": 16, "num_warps": 8, "num_stages": 3},
+    8: {"BLOCK_SIZE_M": 32, "BLOCK_SIZE_N": 128, "BLOCK_SIZE_K": 128, "GROUP_SIZE_M": 64, "num_warps": 4, "num_stages": 5},
+    16: {"BLOCK_SIZE_M": 16, "BLOCK_SIZE_N": 256, "BLOCK_SIZE_K": 128, "GROUP_SIZE_M": 16, "num_warps": 8, "num_stages": 2},
+    24: {"BLOCK_SIZE_M": 16, "BLOCK_SIZE_N": 128, "BLOCK_SIZE_K": 128, "GROUP_SIZE_M": 64, "num_warps": 4, "num_stages": 2},
+    32: {"BLOCK_SIZE_M": 16, "BLOCK_SIZE_N": 128, "BLOCK_SIZE_K": 128, "GROUP_SIZE_M": 1, "num_warps": 4, "num_stages": 2},
+    48: {"BLOCK_SIZE_M": 32, "BLOCK_SIZE_N": 256, "BLOCK_SIZE_K": 128, "GROUP_SIZE_M": 64, "num_warps": 4, "num_stages": 2},
+    64: {"BLOCK_SIZE_M": 32, "BLOCK_SIZE_N": 128, "BLOCK_SIZE_K": 128, "GROUP_SIZE_M": 1, "num_warps": 4, "num_stages": 4},
+    96: {"BLOCK_SIZE_M": 64, "BLOCK_SIZE_N": 128, "BLOCK_SIZE_K": 128, "GROUP_SIZE_M": 1, "num_warps": 8, "num_stages": 4},
+    128: {"BLOCK_SIZE_M": 64, "BLOCK_SIZE_N": 128, "BLOCK_SIZE_K": 128, "GROUP_SIZE_M": 1, "num_warps": 8, "num_stages": 4},
+    256: {"BLOCK_SIZE_M": 128, "BLOCK_SIZE_N": 256, "BLOCK_SIZE_K": 64, "GROUP_SIZE_M": 1, "num_warps": 8, "num_stages": 4},
+    512: {"BLOCK_SIZE_M": 128, "BLOCK_SIZE_N": 256, "BLOCK_SIZE_K": 64, "GROUP_SIZE_M": 64, "num_warps": 8, "num_stages": 4},
+    1024: {"BLOCK_SIZE_M": 128, "BLOCK_SIZE_N": 256, "BLOCK_SIZE_K": 64, "GROUP_SIZE_M": 32, "num_warps": 8, "num_stages": 4},
+    2048: {"BLOCK_SIZE_M": 128, "BLOCK_SIZE_N": 256, "BLOCK_SIZE_K": 64, "GROUP_SIZE_M": 64, "num_warps": 8, "num_stages": 3},
+    4096: {"BLOCK_SIZE_M": 128, "BLOCK_SIZE_N": 256, "BLOCK_SIZE_K": 64, "GROUP_SIZE_M": 32, "num_warps": 8, "num_stages": 4},
+}
+
+_TUNED_GRID_KEYS_N14336 = sorted(_TUNED_CONFIGS_N14336.keys())
+_TUNED_GRID_KEYS_N4096 = sorted(_TUNED_CONFIGS_N4096.keys())
+
+
+def _get_default_config(M: int, N: int = 0) -> dict:
+    """Select best kernel config based on batch size M and output dim N.
+
+    Uses autotuned configs from vLLM (H200) when N matches known dimensions.
+    Falls back to a reasonable generic config otherwise.
+    """
+    if N > 0:
+        if N >= 14336 or (N >= 7168 and N < 8192):
+            configs = _TUNED_CONFIGS_N14336
+            grid_keys = _TUNED_GRID_KEYS_N14336
+        elif N <= 4096:
+            configs = _TUNED_CONFIGS_N4096
+            grid_keys = _TUNED_GRID_KEYS_N4096
+        else:
+            configs = _TUNED_CONFIGS_N14336
+            grid_keys = _TUNED_GRID_KEYS_N14336
+        best_key = min(grid_keys, key=lambda x: abs(x - M))
+        return dict(configs[best_key])
+
     if M <= 4:
         return {
             "BLOCK_SIZE_M": 16,
-            "BLOCK_SIZE_N": 64,
-            "BLOCK_SIZE_K": 64,
-            "GROUP_SIZE_M": 1,
+            "BLOCK_SIZE_N": 128,
+            "BLOCK_SIZE_K": 128,
+            "GROUP_SIZE_M": 16,
+            "num_warps": 4,
+            "num_stages": 5,
         }
     if M <= 64:
         return {
-            "BLOCK_SIZE_M": 64,
+            "BLOCK_SIZE_M": 32,
             "BLOCK_SIZE_N": 128,
-            "BLOCK_SIZE_K": 64,
-            "GROUP_SIZE_M": 8,
+            "BLOCK_SIZE_K": 128,
+            "GROUP_SIZE_M": 64,
+            "num_warps": 4,
+            "num_stages": 3,
         }
     return {
         "BLOCK_SIZE_M": 128,
-        "BLOCK_SIZE_N": 128,
+        "BLOCK_SIZE_N": 256,
         "BLOCK_SIZE_K": 64,
-        "GROUP_SIZE_M": 8,
+        "GROUP_SIZE_M": 16,
+        "num_warps": 8,
+        "num_stages": 4,
     }
 
 
@@ -105,16 +176,20 @@ class MoeGroupedGemm(nn.Module):
         B: torch.Tensor,
         C: torch.Tensor,
         topk_weights: torch.Tensor | None,
-        sorted_token_ids: torch.Tensor,
+        sorted_token_ids: torch.Tensor | None,
         expert_ids: torch.Tensor,
         num_tokens_post_padded: torch.Tensor,
         mul_routed_weight: bool,
         top_k: int,
         config: dict,
     ):
-        EM = sorted_token_ids.size(0)
-        if A.size(0) < config["BLOCK_SIZE_M"]:
-            EM = min(EM, A.size(0) * top_k * config["BLOCK_SIZE_M"])
+        naive = sorted_token_ids is None
+        if naive:
+            EM = expert_ids.numel() * config["BLOCK_SIZE_M"]
+        else:
+            EM = sorted_token_ids.size(0)
+            if A.size(0) < config["BLOCK_SIZE_M"]:
+                EM = min(EM, A.size(0) * top_k * config["BLOCK_SIZE_M"])
 
         grid = (
             triton.cdiv(EM, config["BLOCK_SIZE_M"]) * triton.cdiv(B.size(1), config["BLOCK_SIZE_N"]),
@@ -127,10 +202,18 @@ class MoeGroupedGemm(nn.Module):
         else:
             compute_type = tl.float32
 
+        launch_kwargs = {}
+        if "num_warps" in config:
+            launch_kwargs["num_warps"] = config["num_warps"]
+        if "num_stages" in config:
+            launch_kwargs["num_stages"] = config["num_stages"]
+
+        sorted_ids_ptr = sorted_token_ids if sorted_token_ids is not None else A
+
         _fused_moe_kernel[grid](
             A, B, C,
             topk_weights,
-            sorted_token_ids,
+            sorted_ids_ptr,
             expert_ids,
             num_tokens_post_padded,
             B.size(1), B.size(2), EM,
@@ -141,5 +224,10 @@ class MoeGroupedGemm(nn.Module):
             MUL_ROUTED_WEIGHT=mul_routed_weight,
             top_k=top_k,
             compute_type=compute_type,
-            **config,
+            BLOCK_SIZE_M=config["BLOCK_SIZE_M"],
+            BLOCK_SIZE_N=config["BLOCK_SIZE_N"],
+            BLOCK_SIZE_K=config["BLOCK_SIZE_K"],
+            GROUP_SIZE_M=config["GROUP_SIZE_M"],
+            NAIVE_BLOCK_ASSIGNMENT=naive,
+            **launch_kwargs,
         )

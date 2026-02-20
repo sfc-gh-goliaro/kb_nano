@@ -6,7 +6,7 @@ import torch
 import torch.distributed as dist
 import torch.nn as nn
 
-from ...infra.tp import _tp_rank, _tp_size
+from ...infra.tp import _tp_rank, _tp_size, get_custom_ar
 from ..L1.softmax import Softmax
 from ..L1.topk import Topk
 from ..L2.fused_experts import FusedExperts
@@ -74,6 +74,11 @@ class MixtralMoE(nn.Module):
         )
 
         if self.tp_size > 1:
+            ar = get_custom_ar()
+            if ar is not None:
+                reduced = ar.custom_all_reduce(out)
+                if reduced is not None:
+                    return reduced.view(orig_shape)
             dist.all_reduce(out)
 
         return out.view(orig_shape)

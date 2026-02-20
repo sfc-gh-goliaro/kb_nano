@@ -7,7 +7,10 @@ import torch.nn as nn
 
 from ..L1.moe_align import MoeAlign
 from ..L1.moe_grouped_gemm import MoeGroupedGemm, _get_default_config
+from ..L1.moe_sum import MoeSum
 from ..L1.silu_and_mul import SiluAndMul
+
+SPARSITY_FACTOR = 4
 
 
 class FusedExperts(nn.Module):
@@ -30,6 +33,31 @@ class FusedExperts(nn.Module):
         self.moe_align = MoeAlign()
         self.moe_grouped_gemm = MoeGroupedGemm()
         self.act_fn = SiluAndMul()
+        self.moe_sum = MoeSum()
+        self._cache1 = None
+        self._cache3 = None
+        self._naive_num_tokens_post_padded = None
+
+    def _get_cache(self, name, size, device, dtype):
+        cache = getattr(self, name)
+        if cache is None or cache.size(0) < size[0] or cache.size(1) < size[1]:
+            cache = torch.empty(size, device=device, dtype=dtype)
+            setattr(self, name, cache)
+        return cache[:size[0], :size[1]]
+
+    def _naive_align(self, topk_ids, block_size_m, num_experts):
+        """Fast path: skip full alignment when tokens * top_k is very small."""
+        numel = topk_ids.numel()
+        max_num_tokens_padded = numel * block_size_m
+        expert_ids = topk_ids.view(-1).to(torch.int32)
+        if (self._naive_num_tokens_post_padded is None
+                or self._naive_num_tokens_post_padded.device != topk_ids.device):
+            self._naive_num_tokens_post_padded = torch.empty(
+                1, dtype=torch.int32, device=topk_ids.device,
+            )
+        self._naive_num_tokens_post_padded.fill_(max_num_tokens_padded)
+        sorted_token_ids = None
+        return sorted_token_ids, expert_ids, self._naive_num_tokens_post_padded
 
     def forward(
         self,
@@ -45,14 +73,21 @@ class FusedExperts(nn.Module):
         N = N2 // 2
         top_k = topk_ids.size(1)
 
-        config = _get_default_config(M)
+        config = _get_default_config(M, N2)
 
-        sorted_token_ids, expert_ids, num_tokens_post_padded = self.moe_align(
-            topk_ids, config["BLOCK_SIZE_M"], num_experts,
-        )
+        use_naive = (M * top_k * SPARSITY_FACTOR <= num_experts)
 
-        intermediate1 = torch.empty(
-            M * top_k, N2, device=hidden_states.device, dtype=hidden_states.dtype,
+        if use_naive:
+            sorted_token_ids, expert_ids, num_tokens_post_padded = \
+                self._naive_align(topk_ids, config["BLOCK_SIZE_M"], num_experts)
+        else:
+            sorted_token_ids, expert_ids, num_tokens_post_padded = self.moe_align(
+                topk_ids, config["BLOCK_SIZE_M"], num_experts,
+            )
+
+        intermediate1 = self._get_cache(
+            "_cache1", (M * top_k, N2),
+            hidden_states.device, hidden_states.dtype,
         )
 
         self.moe_grouped_gemm(
@@ -64,8 +99,9 @@ class FusedExperts(nn.Module):
 
         intermediate2 = self.act_fn(intermediate1)
 
-        intermediate3 = torch.empty(
-            M * top_k, K, device=hidden_states.device, dtype=hidden_states.dtype,
+        intermediate3 = self._get_cache(
+            "_cache3", (M * top_k, K),
+            hidden_states.device, hidden_states.dtype,
         )
 
         self.moe_grouped_gemm(
@@ -75,4 +111,4 @@ class FusedExperts(nn.Module):
             mul_routed_weight=True, top_k=1, config=config,
         )
 
-        return intermediate3.view(M, top_k, K).sum(dim=1)
+        return self.moe_sum(intermediate3, top_k)

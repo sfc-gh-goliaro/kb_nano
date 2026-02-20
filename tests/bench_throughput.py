@@ -211,6 +211,14 @@ def main():
         "--seed", type=int, default=0,
         help="Random seed for workload generation (default: 0)",
     )
+    parser.add_argument(
+        "--save-vllm", type=str, default=None,
+        help="Save vLLM results to a JSON file for reuse in later runs",
+    )
+    parser.add_argument(
+        "--load-vllm", type=str, default=None,
+        help="Load previously saved vLLM results instead of re-running vLLM",
+    )
     args = parser.parse_args()
 
     this_dir = os.path.dirname(os.path.abspath(__file__))
@@ -253,10 +261,20 @@ def main():
         "package_name": package_name,
     }
 
-    vllm_data = run_worker(
-        VLLM_WORKER, dict(config),
-        f"vLLM  [{short_name}] (TP={args.tp}, full speed)",
-    )
+    if args.load_vllm:
+        print(f"\n  Loading cached vLLM results from: {args.load_vllm}")
+        with open(args.load_vllm) as f:
+            vllm_data = json.load(f)
+    else:
+        vllm_data = run_worker(
+            VLLM_WORKER, dict(config),
+            f"vLLM  [{short_name}] (TP={args.tp}, full speed)",
+        )
+        if vllm_data and args.save_vllm:
+            with open(args.save_vllm, "w") as f:
+                json.dump(vllm_data, f, indent=2)
+            print(f"  vLLM results saved to: {args.save_vllm}")
+
     standalone_data = run_worker(
         STANDALONE_WORKER, dict(config),
         f"Ours  [{short_name}] (TP={args.tp}, full speed)",

@@ -1,4 +1,9 @@
-"""MoE token-to-expert alignment with block padding (Triton kernel)."""
+"""MoE token-to-expert alignment with block padding.
+
+Parallel GPU implementation using PyTorch ops instead of a serial Triton kernel.
+For CUDA graph compatibility, we always allocate max-sized output buffers and
+avoid GPU-to-CPU synchronization (.item() calls).
+"""
 
 from __future__ import annotations
 
@@ -57,6 +62,41 @@ def _moe_align_kernel(
 
 
 class MoeAlign(nn.Module):
+    """MoE token-to-expert alignment.
+
+    Uses the Triton kernel which is CUDA-graph-compatible (all operations stay
+    on GPU, no host sync). Pre-allocates output buffers for reuse.
+    """
+
+    def __init__(self):
+        super().__init__()
+        self._sorted_token_ids = None
+        self._expert_ids = None
+        self._num_tokens_post_padded = None
+        self._tokens_per_expert = None
+
+    def _ensure_buffers(self, max_padded, max_blocks, num_experts, device):
+        if (self._sorted_token_ids is None
+                or self._sorted_token_ids.size(0) < max_padded):
+            self._sorted_token_ids = torch.empty(
+                max_padded, dtype=torch.int32, device=device,
+            )
+        if (self._expert_ids is None
+                or self._expert_ids.size(0) < max_blocks):
+            self._expert_ids = torch.empty(
+                max_blocks, dtype=torch.int32, device=device,
+            )
+        if (self._num_tokens_post_padded is None
+                or self._num_tokens_post_padded.device != device):
+            self._num_tokens_post_padded = torch.zeros(
+                1, dtype=torch.int32, device=device,
+            )
+        if (self._tokens_per_expert is None
+                or self._tokens_per_expert.size(0) < 3 * num_experts):
+            self._tokens_per_expert = torch.zeros(
+                3 * num_experts, dtype=torch.int32, device=device,
+            )
+
     def forward(
         self,
         topk_ids: torch.Tensor,
@@ -67,25 +107,21 @@ class MoeAlign(nn.Module):
         max_padded = numel + num_experts * (block_size - 1)
         max_blocks = triton.cdiv(max_padded, block_size)
 
-        sorted_token_ids = torch.full(
-            (max_padded,), numel, dtype=torch.int32, device=topk_ids.device,
-        )
-        expert_ids = torch.full(
-            (max_blocks,), 0, dtype=torch.int32, device=topk_ids.device,
-        )
-        num_tokens_post_padded = torch.zeros(1, dtype=torch.int32, device=topk_ids.device)
-        tokens_per_expert = torch.zeros(
-            3 * num_experts, dtype=torch.int32, device=topk_ids.device,
-        )
+        self._ensure_buffers(max_padded, max_blocks, num_experts, topk_ids.device)
+
+        sorted_token_ids = self._sorted_token_ids[:max_padded]
+        expert_ids = self._expert_ids[:max_blocks]
+        self._num_tokens_post_padded.zero_()
+        self._tokens_per_expert[:3 * num_experts].zero_()
 
         _moe_align_kernel[(1,)](
             topk_ids.view(-1).contiguous(),
             sorted_token_ids,
             expert_ids,
-            num_tokens_post_padded,
-            tokens_per_expert,
+            self._num_tokens_post_padded,
+            self._tokens_per_expert,
             numel, num_experts, block_size,
             BLOCK=1,
         )
 
-        return sorted_token_ids, expert_ids, num_tokens_post_padded
+        return sorted_token_ids, expert_ids, self._num_tokens_post_padded
