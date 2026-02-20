@@ -191,8 +191,11 @@ class ModelRunner:
         )
         self.warmup_model()
         self.allocate_kv_cache()
-        if not self.enforce_eager:
+        self.is_moe = hasattr(self.config, "num_local_experts")
+        if not self.enforce_eager and not self.is_moe:
             self.capture_cudagraph()
+        if self.is_moe:
+            self._init_moe_decode_buffers()
         if world_size > 1:
             self._init_greedy_buffers()
         torch.set_default_device("cpu")
@@ -372,7 +375,7 @@ class ModelRunner:
 
     @torch.inference_mode()
     def run_model(self, input_ids, positions, is_prefill):
-        if is_prefill or self.enforce_eager or input_ids.size(0) > self.graph_bs_list[-1]:
+        if is_prefill or self.enforce_eager or self.is_moe or input_ids.size(0) > self.graph_bs_list[-1]:
             return self.model.compute_logits(self.model(input_ids, positions))
         bs = input_ids.size(0)
         ctx = get_context()
@@ -406,6 +409,40 @@ class ModelRunner:
         Does NOT call .tolist() -- caller is responsible for syncing.
         """
         n, ids_np, pos_np, sm_np, cl_np, bt_np = decode_data
+
+        if self.is_moe:
+            self._moe_input_ids[:n].copy_(torch.from_numpy(ids_np), non_blocking=True)
+            self._moe_positions[:n].copy_(torch.from_numpy(pos_np), non_blocking=True)
+            self._moe_slot_mapping[:n].copy_(torch.from_numpy(sm_np), non_blocking=True)
+            self._moe_context_lens[:n].copy_(torch.from_numpy(cl_np), non_blocking=True)
+            bt_cols = bt_np.shape[1]
+            self._moe_block_tables[:n, :bt_cols].copy_(
+                torch.from_numpy(bt_np), non_blocking=True)
+            set_context(
+                False,
+                slot_mapping=self._moe_slot_mapping[:n],
+                context_lens=self._moe_context_lens[:n],
+                block_tables=self._moe_block_tables[:n],
+            )
+            hidden = self.model(self._moe_input_ids[:n], self._moe_positions[:n])
+            lm_head = self.model.lm_head
+            logits = lm_head.linear_op(hidden, lm_head.weight).float()
+            max_vals, max_idxs = logits.max(dim=-1)
+            reset_context()
+            if self.world_size > 1:
+                info = self._greedy_info
+                info[:n, 0] = max_vals
+                info[:n, 1] = max_idxs.float()
+                vocab_offset = lm_head.per_partition * self.rank
+                info[:n, 1] += vocab_offset
+                dist.all_gather(self._greedy_gathered, info)
+                all_info = self._greedy_all_info
+                torch.stack(self._greedy_gathered, out=all_info)
+                best_rank = all_info[:, :n, 0].argmax(dim=0)
+                return all_info[best_rank, self._greedy_arange[:n], 1].to(torch.int64)
+            else:
+                return max_idxs
+        
         gv = self.graph_vars
         graph_bs = self._graph_bs_for_n[n]
         prev_n = getattr(self, '_prev_decode_n', -1)
@@ -424,6 +461,17 @@ class ModelRunner:
 
         self.graphs[graph_bs].replay()
         return self._greedy_from_hidden(n)
+
+    def _init_moe_decode_buffers(self):
+        """Pre-allocate GPU buffers for MoE eager decode path."""
+        max_bs = MAX_NUM_SEQS
+        max_num_blocks = (MAX_MODEL_LEN + BLOCK_SIZE - 1) // BLOCK_SIZE
+        dev = f"cuda:{self.rank}"
+        self._moe_input_ids = torch.zeros(max_bs, dtype=torch.int64, device=dev)
+        self._moe_positions = torch.zeros(max_bs, dtype=torch.int64, device=dev)
+        self._moe_slot_mapping = torch.full((max_bs,), -1, dtype=torch.int32, device=dev)
+        self._moe_context_lens = torch.zeros(max_bs, dtype=torch.int32, device=dev)
+        self._moe_block_tables = torch.zeros(max_bs, max_num_blocks, dtype=torch.int32, device=dev)
 
     def _init_greedy_buffers(self):
         """Pre-allocate buffers for gather_greedy to avoid per-step allocation."""

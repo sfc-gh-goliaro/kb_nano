@@ -4,10 +4,10 @@ from __future__ import annotations
 
 import torch
 import torch.nn as nn
-import torch.nn.functional as F
 
 from ..L1.moe_align import MoeAlign
 from ..L1.moe_grouped_gemm import MoeGroupedGemm, _get_default_config
+from ..L1.silu_and_mul import SiluAndMul
 
 
 class FusedExperts(nn.Module):
@@ -29,6 +29,7 @@ class FusedExperts(nn.Module):
         super().__init__()
         self.moe_align = MoeAlign()
         self.moe_grouped_gemm = MoeGroupedGemm()
+        self.act_fn = SiluAndMul()
 
     def forward(
         self,
@@ -61,9 +62,7 @@ class FusedExperts(nn.Module):
             mul_routed_weight=False, top_k=top_k, config=config,
         )
 
-        gate = intermediate1[:, :N]
-        up = intermediate1[:, N:]
-        intermediate2 = F.silu(gate) * up
+        intermediate2 = self.act_fn(intermediate1)
 
         intermediate3 = torch.empty(
             M * top_k, K, device=hidden_states.device, dtype=hidden_states.dtype,
