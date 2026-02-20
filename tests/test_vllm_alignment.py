@@ -1,20 +1,17 @@
 #!/usr/bin/env python3
 """
-Unified correctness and benchmark test: standalone engine vs vLLM.
+Correctness test: standalone engine vs vLLM.
 
-Runs both engines in separate subprocesses, compares outputs token-by-token,
-and measures inference speed (sequential and batched).
+Runs both engines in separate subprocesses with enforce_eager=True for
+deterministic outputs, then compares generated tokens.
 
 Usage:
-    # Single model
     python tests/test_vllm_alignment.py --model meta-llama/Llama-3.1-8B-Instruct
 
-    # Multiple models in sequence
-    python tests/test_vllm_alignment.py \\
-        --model meta-llama/Llama-3.1-70B-Instruct mistralai/Mixtral-8x7B-Instruct-v0.1 \\
+    python tests/test_vllm_alignment.py \
+        --model meta-llama/Llama-3.1-70B-Instruct mistralai/Mixtral-8x7B-Instruct-v0.1 \
         --tp 4
 
-    # Custom settings
     python tests/test_vllm_alignment.py --model meta-llama/Llama-3.1-8B-Instruct --max-tokens 200 --seed 123
 """
 
@@ -42,7 +39,7 @@ PROMPTS = [
 # vLLM worker (runs in subprocess)
 # ---------------------------------------------------------------------------
 VLLM_WORKER = r'''
-import json, os, sys, time
+import json, os, sys
 os.environ["VLLM_ENABLE_V1_MULTIPROCESSING"] = "0"
 
 def main():
@@ -61,32 +58,18 @@ def main():
         temperature=0.0, max_tokens=cfg["max_tokens"], seed=cfg["seed"],
     )
 
-    # Warmup
     llm.generate(["warmup"], sp)
 
-    # Per-prompt (sequential)
-    results, timings = [], []
+    results = []
     for prompt in cfg["prompts"]:
-        t = time.perf_counter()
         out = llm.generate([prompt], sp)[0]
-        elapsed = time.perf_counter() - t
         results.append({
             "text": out.outputs[0].text,
             "token_ids": list(out.outputs[0].token_ids),
         })
-        timings.append({"elapsed": elapsed, "ntoks": len(out.outputs[0].token_ids)})
-
-    # Batched
-    t = time.perf_counter()
-    outs = llm.generate(cfg["prompts"], sp)
-    batch_elapsed = time.perf_counter() - t
-    batch_ntoks = sum(len(o.outputs[0].token_ids) for o in outs)
 
     with open(cfg["output_file"], "w") as f:
-        json.dump({
-            "results": results, "timings": timings,
-            "batch_elapsed": batch_elapsed, "batch_ntoks": batch_ntoks,
-        }, f)
+        json.dump({"results": results}, f)
 
 if __name__ == "__main__":
     main()
@@ -96,7 +79,7 @@ if __name__ == "__main__":
 # Standalone worker (runs in subprocess)
 # ---------------------------------------------------------------------------
 STANDALONE_WORKER = r'''
-import json, os, sys, time
+import json, os, sys
 cfg = json.loads(sys.argv[1])
 sys.path.insert(0, cfg["project_root"])
 
@@ -108,38 +91,25 @@ def main():
 
     engine = LlamaEngine(
         model_name=cfg["model"], seed=cfg["seed"],
+        enforce_eager=True,
         tensor_parallel_size=cfg["tp"],
     )
     sp = SamplingParams(
         temperature=0.0, max_tokens=cfg["max_tokens"], seed=cfg["seed"],
     )
 
-    # Warmup
     engine.generate(["warmup"], sp)
 
-    # Per-prompt (sequential)
-    results, timings = [], []
+    results = []
     for prompt in cfg["prompts"]:
-        t = time.perf_counter()
         out = engine.generate([prompt], sp)[0]
-        elapsed = time.perf_counter() - t
         results.append({
             "text": out.generated_text,
             "token_ids": out.token_ids,
         })
-        timings.append({"elapsed": elapsed, "ntoks": len(out.token_ids)})
-
-    # Batched
-    t = time.perf_counter()
-    outs = engine.generate(cfg["prompts"], sp)
-    batch_elapsed = time.perf_counter() - t
-    batch_ntoks = sum(len(o.token_ids) for o in outs)
 
     with open(cfg["output_file"], "w") as f:
-        json.dump({
-            "results": results, "timings": timings,
-            "batch_elapsed": batch_elapsed, "batch_ntoks": batch_ntoks,
-        }, f)
+        json.dump({"results": results}, f)
 
     del engine
 
@@ -224,52 +194,11 @@ def report_correctness(
     return mismatches
 
 
-def report_benchmark(vllm_data: dict, standalone_data: dict) -> None:
-    """Print benchmark comparison."""
-    print(f"\n{'=' * 70}")
-    print("  BENCHMARK")
-    print(f"{'=' * 70}")
-
-    vt = vllm_data["timings"]
-    st = standalone_data["timings"]
-
-    print(f"\n  {'Prompt':<8} {'vLLM (s)':<12} {'Ours (s)':<12} {'Speedup':<10} {'Tokens'}")
-    print(f"  {'-' * 56}")
-    for i, (v, s) in enumerate(zip(vt, st)):
-        speedup = v["elapsed"] / s["elapsed"] if s["elapsed"] > 0 else float("inf")
-        print(
-            f"  #{i:<7} {v['elapsed']:<12.3f} {s['elapsed']:<12.3f} "
-            f"{speedup:<6.2f}x    {v['ntoks']}"
-        )
-
-    # Sequential totals
-    v_total = sum(r["elapsed"] for r in vt)
-    s_total = sum(r["elapsed"] for r in st)
-    v_toks = sum(r["ntoks"] for r in vt)
-    s_toks = sum(r["ntoks"] for r in st)
-    seq_speedup = v_total / s_total if s_total > 0 else float("inf")
-
-    print(f"\n  Sequential:  vLLM={v_total:.3f}s ({v_toks / v_total:.1f} tok/s)"
-          f"  |  Ours={s_total:.3f}s ({s_toks / s_total:.1f} tok/s)"
-          f"  |  {seq_speedup:.2f}x speedup")
-
-    # Batched totals
-    vb = vllm_data["batch_elapsed"]
-    sb = standalone_data["batch_elapsed"]
-    vbn = vllm_data["batch_ntoks"]
-    sbn = standalone_data["batch_ntoks"]
-    bat_speedup = vb / sb if sb > 0 else float("inf")
-
-    print(f"  Batched:     vLLM={vb:.3f}s ({vbn / vb:.1f} tok/s)"
-          f"  |  Ours={sb:.3f}s ({sbn / sb:.1f} tok/s)"
-          f"  |  {bat_speedup:.2f}x speedup")
-
-
 # ---------------------------------------------------------------------------
 # Main
 # ---------------------------------------------------------------------------
 def run_model_test(model_name: str, args, project_root: str, package_name: str) -> int:
-    """Run correctness + benchmark for a single model. Returns number of mismatches."""
+    """Run correctness test for a single model. Returns number of mismatches."""
     short_name = model_name.split("/")[-1]
     print(f"\n{'#' * 70}")
     print(f"  MODEL: {model_name}")
@@ -287,10 +216,12 @@ def run_model_test(model_name: str, args, project_root: str, package_name: str) 
     }
 
     vllm_data = run_worker(
-        VLLM_WORKER, dict(config), f"vLLM  [{short_name}] (TP={args.tp}, flash_attn, eager)",
+        VLLM_WORKER, dict(config),
+        f"vLLM  [{short_name}] (TP={args.tp}, eager)",
     )
     standalone_data = run_worker(
-        STANDALONE_WORKER, dict(config), f"Ours  [{short_name}] (TP={args.tp})",
+        STANDALONE_WORKER, dict(config),
+        f"Ours  [{short_name}] (TP={args.tp}, eager)",
     )
 
     if vllm_data is None or standalone_data is None:
@@ -298,7 +229,6 @@ def run_model_test(model_name: str, args, project_root: str, package_name: str) 
         return len(PROMPTS)
 
     mismatches = report_correctness(vllm_data, standalone_data, PROMPTS)
-    report_benchmark(vllm_data, standalone_data)
 
     if mismatches == 0:
         print(f"\n  PASS [{short_name}]: All outputs are token-identical.")
@@ -310,7 +240,7 @@ def run_model_test(model_name: str, args, project_root: str, package_name: str) 
 
 def main():
     parser = argparse.ArgumentParser(
-        description="Test and benchmark standalone Llama vs vLLM",
+        description="Correctness test: standalone engine vs vLLM",
     )
     parser.add_argument(
         "--model", nargs="+", default=["meta-llama/Llama-3.1-8B-Instruct"],
@@ -332,7 +262,7 @@ def main():
 
     models = args.model
     print("=" * 70)
-    print("  Standalone vs vLLM — Correctness & Benchmark")
+    print("  Standalone vs vLLM — Correctness Test")
     print("=" * 70)
     print(f"  Models     : {', '.join(models)}")
     print(f"  TP         : {args.tp}")
@@ -351,7 +281,6 @@ def main():
         mismatches = run_model_test(model_name, args, project_root, package_name)
         results[model_name] = mismatches
 
-    # Final summary across all models
     print(f"\n{'=' * 70}")
     print("  FINAL SUMMARY")
     print(f"{'=' * 70}")

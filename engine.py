@@ -16,6 +16,7 @@ import atexit
 import os
 import pickle
 import random
+import time
 import uuid
 from collections import deque
 from dataclasses import dataclass, field
@@ -29,10 +30,16 @@ import torch.multiprocessing as mp
 from transformers import AutoTokenizer
 
 from .infra.context import get_context, reset_context, set_context
+from .infra.tp import set_custom_ar
 from .weight_loader import load_model
 
 BLOCK_SIZE = 256
+MAX_NUM_BATCHED_TOKENS = 16384
+MAX_NUM_SEQS = 512
+MAX_MODEL_LEN = 4096
 NCCL_PORT = 29501
+
+_PROFILE = os.environ.get("KB_NANO_PROFILE", "0") == "1"
 
 
 # ---------------------------------------------------------------------------
@@ -44,6 +51,7 @@ class SamplingParams:
     top_p: float = 1.0
     max_tokens: int = 512
     seed: int | None = None
+    ignore_eos: bool = False
 
 
 @dataclass
@@ -66,18 +74,22 @@ class SeqStatus(Enum):
 class Sequence:
     _next_id = 0
 
-    def __init__(self, prompt_ids: list[int], max_tokens: int = 512):
+    def __init__(self, prompt_ids: list[int], max_tokens: int = 512,
+                 ignore_eos: bool = False):
         self.seq_id = Sequence._next_id
         Sequence._next_id += 1
         self.prompt_ids = list(prompt_ids)
         self.token_ids = list(prompt_ids)
         self.generated_ids: list[int] = []
         self.max_tokens = max_tokens
+        self.ignore_eos = ignore_eos
         self.block_table: list[int] = []
         self.status = SeqStatus.WAITING
 
     def __len__(self):
-        return len(self.token_ids)
+        if self.token_ids is not None:
+            return len(self.token_ids)
+        return self._num_tokens
 
     @property
     def num_blocks(self):
@@ -90,7 +102,9 @@ class Sequence:
 
     @property
     def last_token(self):
-        return self.token_ids[-1]
+        if self.token_ids is not None:
+            return self.token_ids[-1]
+        return self._last_token
 
     def append_token(self, token_id):
         self.token_ids.append(token_id)
@@ -98,18 +112,18 @@ class Sequence:
 
     def __getstate__(self):
         """Minimal pickling for shared memory transfer to non-rank-0 workers."""
-        return (len(self.token_ids), len(self.prompt_ids), self.block_table,
+        return (len(self), len(self.prompt_ids), self.block_table,
                 self.token_ids if not self.generated_ids else self.last_token)
 
     def __setstate__(self, state):
-        num_tokens, num_prompt, self.block_table = state[:-1]
+        self._num_tokens, num_prompt, self.block_table = state[:-1]
         if isinstance(state[-1], list):
             self.token_ids = state[-1]
         else:
-            self.token_ids = [0] * (num_tokens - 1) + [state[-1]]
-        self.prompt_ids = self.token_ids[:num_prompt]
-        self.generated_ids = self.token_ids[num_prompt:]
-        self.num_tokens_saved = num_tokens
+            self.token_ids = None
+            self._last_token = state[-1]
+        self.prompt_ids = []
+        self.generated_ids = []
 
 
 # ---------------------------------------------------------------------------
@@ -151,11 +165,23 @@ class ModelRunner:
         self.event = event
         self.block_size = BLOCK_SIZE
 
+        torch.cuda.set_device(rank)
         dist.init_process_group(
             "nccl", f"tcp://localhost:{NCCL_PORT}",
             world_size=world_size, rank=rank,
+            device_id=torch.device(f"cuda:{rank}"),
         )
-        torch.cuda.set_device(rank)
+
+        self.custom_ar = None
+        if world_size > 1:
+            self.cpu_group = dist.new_group(backend="gloo")
+            if not os.environ.get("KB_NANO_DISABLE_CUSTOM_AR", "0") == "1":
+                from .infra.custom_allreduce import CustomAllreduce
+                self.custom_ar = CustomAllreduce(
+                    self.cpu_group, rank, max_size=8 * 1024 * 1024
+                )
+                set_custom_ar(self.custom_ar)
+
         default_dtype = torch.get_default_dtype()
         torch.set_default_dtype(dtype)
         torch.set_default_device("cuda")
@@ -167,6 +193,8 @@ class ModelRunner:
         self.allocate_kv_cache()
         if not self.enforce_eager:
             self.capture_cudagraph()
+        if world_size > 1:
+            self._init_greedy_buffers()
         torch.set_default_device("cpu")
         torch.set_default_dtype(default_dtype)
 
@@ -174,6 +202,8 @@ class ModelRunner:
         if world_size > 1:
             if rank == 0:
                 self.shm = SharedMemory(name=shm_name, create=True, size=2**20)
+                self.shm.buf[self._SHM_FLAG_OFFSET] = 0
+                self.shm.buf[self._SHM_SEQ_OFFSET:self._SHM_SEQ_OFFSET+4] = (0).to_bytes(4, "little")
                 dist.barrier()
             else:
                 dist.barrier()
@@ -181,6 +211,10 @@ class ModelRunner:
                 self.loop()  # Non-rank-0 blocks here forever
 
     def exit(self):
+        if self.custom_ar is not None:
+            self.custom_ar.close()
+            self.custom_ar = None
+            set_custom_ar(None)
         if self.world_size > 1:
             self.shm.close()
             dist.barrier()
@@ -191,32 +225,59 @@ class ModelRunner:
         torch.cuda.synchronize()
         dist.destroy_process_group()
 
+    # SHM layout for spin-wait signaling:
+    # byte[-1] (_SHM_FLAG_OFFSET): 0=generic, 1=decode_greedy, 2=exit marker
+    # bytes[-5:-1] (_SHM_SEQ_OFFSET): 4-byte little-endian sequence counter
+    _SHM_FLAG_OFFSET = 2**20 - 1
+    _SHM_SEQ_OFFSET = 2**20 - 5
+
     def loop(self):
-        """Worker loop for non-rank-0 processes."""
+        """Worker loop: spin-wait on SHM sequence counter for decode, event for generic."""
+        buf = self.shm.buf
+        flag_off = self._SHM_FLAG_OFFSET
+        seq_off = self._SHM_SEQ_OFFSET
+        last_seq = int.from_bytes(buf[seq_off:seq_off+4], "little")
         while True:
-            self.event.wait()
-            n = int.from_bytes(self.shm.buf[0:4], "little")
-            method_name, *args = pickle.loads(self.shm.buf[4:n+4])
-            self.event.clear()
-            getattr(self, method_name)(*args)
-            if method_name == "exit":
-                break
+            cur_seq = int.from_bytes(buf[seq_off:seq_off+4], "little")
+            if cur_seq != last_seq:
+                last_seq = cur_seq
+                if buf[flag_off] != 0:
+                    self._loop_decode_greedy()
+                    continue
+                n = int.from_bytes(buf[0:4], "little")
+                method_name, *args = pickle.loads(buf[4:n+4])
+                getattr(self, method_name)(*args)
+                if method_name == "exit":
+                    break
+                continue
+            # Yield briefly to avoid pure busy-wait burning power
+            pass
+
+    def _signal_workers(self):
+        """Increment SHM sequence counter to wake spin-waiting workers."""
+        buf = self.shm.buf
+        seq_off = self._SHM_SEQ_OFFSET
+        cur = int.from_bytes(buf[seq_off:seq_off+4], "little")
+        nxt = (cur + 1) & 0xFFFFFFFF
+        buf[seq_off:seq_off+4] = nxt.to_bytes(4, "little")
 
     def call(self, method_name, *args):
         """Called by rank 0 to execute method on ALL ranks."""
         if self.world_size > 1 and self.rank == 0:
             data = pickle.dumps([method_name, *args])
             n = len(data)
-            self.shm.buf[0:4] = n.to_bytes(4, "little")
-            self.shm.buf[4:n+4] = data
-            for ev in self.event:
-                ev.set()
+            buf = self.shm.buf
+            buf[0:4] = n.to_bytes(4, "little")
+            buf[4:n+4] = data
+            buf[self._SHM_FLAG_OFFSET] = 0  # generic path
+            self._signal_workers()
         return getattr(self, method_name)(*args)
 
     def warmup_model(self):
         torch.cuda.empty_cache()
         torch.cuda.reset_peak_memory_stats()
-        seqs = [Sequence([0] * 256)]
+        num_seqs = min(MAX_NUM_BATCHED_TOKENS // MAX_MODEL_LEN, MAX_NUM_SEQS)
+        seqs = [Sequence([0] * MAX_MODEL_LEN) for _ in range(num_seqs)]
         self.run(seqs, True)
         torch.cuda.empty_cache()
 
@@ -280,28 +341,33 @@ class ModelRunner:
         )
 
     def prepare_decode(self, seqs):
-        input_ids, positions, slot_mapping, context_lens = [], [], [], []
-        for seq in seqs:
-            input_ids.append(seq.last_token)
-            positions.append(len(seq) - 1)
-            context_lens.append(len(seq))
-            slot_mapping.append(
-                seq.block_table[-1] * BLOCK_SIZE + seq.last_block_num_tokens - 1
-            )
-        max_bt = max(len(seq.block_table) for seq in seqs)
-        block_tables = [
-            seq.block_table + [-1] * (max_bt - len(seq.block_table))
-            for seq in seqs
-        ]
+        n = len(seqs)
+        ids = np.empty(n, dtype=np.int64)
+        pos = np.empty(n, dtype=np.int64)
+        sm = np.empty(n, dtype=np.int32)
+        cl = np.empty(n, dtype=np.int32)
+        max_bt = 0
+        for i, seq in enumerate(seqs):
+            ids[i] = seq.last_token
+            pos[i] = len(seq) - 1
+            cl[i] = len(seq)
+            sm[i] = seq.block_table[-1] * BLOCK_SIZE + seq.last_block_num_tokens - 1
+            blen = len(seq.block_table)
+            if blen > max_bt:
+                max_bt = blen
+        bt = np.full((n, max_bt), -1, dtype=np.int32)
+        for i, seq in enumerate(seqs):
+            b = seq.block_table
+            bt[i, :len(b)] = b
         set_context(
             False,
-            slot_mapping=torch.tensor(slot_mapping, dtype=torch.int32, pin_memory=True).cuda(non_blocking=True),
-            context_lens=torch.tensor(context_lens, dtype=torch.int32, pin_memory=True).cuda(non_blocking=True),
-            block_tables=torch.tensor(block_tables, dtype=torch.int32, pin_memory=True).cuda(non_blocking=True),
+            slot_mapping=torch.from_numpy(sm).pin_memory().cuda(non_blocking=True),
+            context_lens=torch.from_numpy(cl).pin_memory().cuda(non_blocking=True),
+            block_tables=torch.from_numpy(bt).pin_memory().cuda(non_blocking=True),
         )
         return (
-            torch.tensor(input_ids, dtype=torch.int64, pin_memory=True).cuda(non_blocking=True),
-            torch.tensor(positions, dtype=torch.int64, pin_memory=True).cuda(non_blocking=True),
+            torch.from_numpy(ids).pin_memory().cuda(non_blocking=True),
+            torch.from_numpy(pos).pin_memory().cuda(non_blocking=True),
         )
 
     @torch.inference_mode()
@@ -310,63 +376,253 @@ class ModelRunner:
             return self.model.compute_logits(self.model(input_ids, positions))
         bs = input_ids.size(0)
         ctx = get_context()
-        graph_bs = next(x for x in self.graph_bs_list if x >= bs)
+        graph_bs = self._graph_bs_for_n[bs]
         gv = self.graph_vars
         gv["input_ids"][:bs] = input_ids
         gv["positions"][:bs] = positions
-        gv["slot_mapping"].fill_(-1)
         gv["slot_mapping"][:bs] = ctx.slot_mapping
-        gv["context_lens"].zero_()
+        if bs < graph_bs:
+            gv["slot_mapping"][bs:graph_bs].fill_(-1)
+            gv["context_lens"][bs:graph_bs].zero_()
         gv["context_lens"][:bs] = ctx.context_lens
         bt = ctx.block_tables
         gv["block_tables"][:bs, :bt.size(1)] = bt
         self.graphs[graph_bs].replay()
         return self.model.compute_logits(gv["outputs"][:bs])
 
+    @torch.inference_mode()
+    def run_decode_greedy(self, seqs):
+        """Fused decode path for greedy sampling with TP.
+        Returns GPU tensor (rank 0) or list (TP=1).
+        """
+        decode_data = self._prepare_decode_arrays(seqs)
+        return self.run_decode_greedy_fast(decode_data)
+
+    @torch.inference_mode()
+    def run_decode_greedy_fast(self, decode_data):
+        """Fast decode: receives precomputed arrays instead of Sequence objects.
+        
+        Returns GPU tensor (rank 0) or None (other ranks).
+        Does NOT call .tolist() -- caller is responsible for syncing.
+        """
+        n, ids_np, pos_np, sm_np, cl_np, bt_np = decode_data
+        gv = self.graph_vars
+        graph_bs = self._graph_bs_for_n[n]
+        prev_n = getattr(self, '_prev_decode_n', -1)
+
+        gv["input_ids"][:n].copy_(torch.from_numpy(ids_np), non_blocking=True)
+        gv["positions"][:n].copy_(torch.from_numpy(pos_np), non_blocking=True)
+        gv["slot_mapping"][:n].copy_(torch.from_numpy(sm_np), non_blocking=True)
+        if n < graph_bs and n != prev_n:
+            gv["slot_mapping"][n:graph_bs].fill_(-1)
+            gv["context_lens"][n:graph_bs].zero_()
+        gv["context_lens"][:n].copy_(torch.from_numpy(cl_np), non_blocking=True)
+        gv["block_tables"][:n, :bt_np.shape[1]].copy_(
+            torch.from_numpy(bt_np), non_blocking=True
+        )
+        self._prev_decode_n = n
+
+        self.graphs[graph_bs].replay()
+        return self._greedy_from_hidden(n)
+
+    def _init_greedy_buffers(self):
+        """Pre-allocate buffers for gather_greedy to avoid per-step allocation."""
+        max_bs = MAX_NUM_SEQS
+        dev = f"cuda:{self.rank}"
+        self._greedy_info = torch.zeros(max_bs, 2, dtype=torch.float32, device=dev)
+        self._greedy_gathered = [
+            torch.zeros(max_bs, 2, dtype=torch.float32, device=dev)
+            for _ in range(self.world_size)
+        ]
+        self._greedy_all_info = torch.zeros(self.world_size, max_bs, 2, dtype=torch.float32, device=dev)
+        self._greedy_arange = torch.arange(max_bs, device=dev)
+
+        max_num_blocks = (MAX_MODEL_LEN + BLOCK_SIZE - 1) // BLOCK_SIZE
+        self._np_ids = np.empty(max_bs, dtype=np.int64)
+        self._np_pos = np.empty(max_bs, dtype=np.int64)
+        self._np_sm = np.empty(max_bs, dtype=np.int32)
+        self._np_cl = np.empty(max_bs, dtype=np.int32)
+        self._np_bt = np.full((max_bs, max_num_blocks), -1, dtype=np.int32)
+
+    def _greedy_from_hidden(self, n):
+        """Use CUDA-graph-captured LM head + local argmax, then allgather.
+        
+        Returns GPU tensor of token IDs (rank 0) or None (other ranks).
+        Caller must call .tolist() to sync.
+        """
+        gv = self.graph_vars
+        local_max_vals = gv["lm_max_vals"][:n]
+        local_max_idxs = gv["lm_max_idxs"][:n] + self.model.lm_head.vocab_start
+
+        info = self._greedy_info[:n]
+        info[:, 0] = local_max_vals
+        info[:, 1] = local_max_idxs.float()
+
+        gathered = [g[:n] for g in self._greedy_gathered]
+        dist.all_gather(gathered, info)
+
+        if self.rank == 0:
+            for i, g in enumerate(gathered):
+                self._greedy_all_info[i, :n] = g
+            all_vals = self._greedy_all_info[:, :n, 0]
+            all_idxs = self._greedy_all_info[:, :n, 1].long()
+            best_rank = all_vals.argmax(dim=0)
+            token_ids = all_idxs[best_rank, self._greedy_arange[:n]]
+            return token_ids
+        return None
+
+    def _prepare_decode_arrays(self, seqs):
+        """Precompute numpy arrays for decode - uses pre-allocated buffers."""
+        n = len(seqs)
+        ids_np = self._np_ids
+        pos_np = self._np_pos
+        sm_np = self._np_sm
+        cl_np = self._np_cl
+        max_bt = 0
+        for i, seq in enumerate(seqs):
+            ids_np[i] = seq.last_token
+            pos_np[i] = len(seq) - 1
+            cl_np[i] = len(seq)
+            sm_np[i] = seq.block_table[-1] * BLOCK_SIZE + seq.last_block_num_tokens - 1
+            blen = len(seq.block_table)
+            if blen > max_bt:
+                max_bt = blen
+        bt_np = self._np_bt
+        for i, seq in enumerate(seqs):
+            b = seq.block_table
+            blen = len(b)
+            bt_np[i, :blen] = b
+            if blen < max_bt:
+                bt_np[i, blen:max_bt] = -1
+        return (n, ids_np[:n], pos_np[:n], sm_np[:n], cl_np[:n], bt_np[:n, :max_bt])
+
+    def _write_decode_shm(self, n, ids_np, pos_np, sm_np, cl_np, bt_np):
+        """Write decode arrays directly into SHM with binary layout.
+        
+        Layout: [n(2)][max_bt(2)][ids(n*8)][pos(n*8)][sm(n*4)][cl(n*4)][bt(n*max_bt*4)]
+        """
+        max_bt = bt_np.shape[1]
+        buf = self.shm.buf
+        buf[0:2] = n.to_bytes(2, "little")
+        buf[2:4] = max_bt.to_bytes(2, "little")
+        off = 4
+        for arr in (ids_np, pos_np, sm_np, cl_np, bt_np):
+            nb = arr.nbytes
+            buf[off:off+nb] = arr.tobytes()
+            off += nb
+
+    def _loop_decode_greedy(self):
+        """Worker fast path: read decode arrays from SHM without pickle."""
+        buf = self.shm.buf
+        n = int.from_bytes(buf[0:2], "little")
+        max_bt = int.from_bytes(buf[2:4], "little")
+        off = 4
+        ids_np = np.frombuffer(buf, dtype=np.int64, count=n, offset=off).copy(); off += n * 8
+        pos_np = np.frombuffer(buf, dtype=np.int64, count=n, offset=off).copy(); off += n * 8
+        sm_np = np.frombuffer(buf, dtype=np.int32, count=n, offset=off).copy(); off += n * 4
+        cl_np = np.frombuffer(buf, dtype=np.int32, count=n, offset=off).copy(); off += n * 4
+        bt_np = np.frombuffer(buf, dtype=np.int32, count=n*max_bt, offset=off).copy().reshape(n, max_bt)
+        self.run_decode_greedy_fast((n, ids_np, pos_np, sm_np, cl_np, bt_np))
+
+    def call_decode_greedy(self, seqs):
+        """Optimized call for greedy decode: uses SHM spin-wait signaling.
+        
+        Returns GPU tensor of token IDs (doesn't sync).
+        Caller must call .tolist() to get Python list.
+        """
+        if self.world_size > 1 and self.rank == 0:
+            if _PROFILE:
+                _t0 = time.perf_counter()
+            decode_data = self._prepare_decode_arrays(seqs)
+            self._write_decode_shm(*decode_data)
+            if _PROFILE:
+                _t1 = time.perf_counter()
+            self.shm.buf[self._SHM_FLAG_OFFSET] = 1  # mark as decode_greedy
+            self._signal_workers()
+            if _PROFILE:
+                _t2 = time.perf_counter()
+            result = self.run_decode_greedy_fast(decode_data)
+            if _PROFILE:
+                torch.cuda.synchronize()
+                _t3 = time.perf_counter()
+                pd = getattr(self, '_call_profile', None)
+                if pd is None:
+                    pd = {"prepare": 0.0, "signal": 0.0, "gpu_exec": 0.0, "n_calls": 0}
+                    self._call_profile = pd
+                pd["prepare"] += _t1 - _t0
+                pd["signal"] += _t2 - _t1
+                pd["gpu_exec"] += _t3 - _t2
+                pd["n_calls"] += 1
+            return result
+        return self.run_decode_greedy(seqs)
+
     def run(self, seqs, is_prefill):
         input_ids, positions = (
             self.prepare_prefill(seqs) if is_prefill
             else self.prepare_decode(seqs)
         )
-        logits = self.run_model(input_ids, positions, is_prefill)
+        result = self.run_model(input_ids, positions, is_prefill)
         reset_context()
-        return logits
+        return result
 
     @torch.inference_mode()
     def capture_cudagraph(self):
-        max_bs = 64
-        max_num_blocks = 256
+        from contextlib import nullcontext
+        max_bs = MAX_NUM_SEQS
+        max_num_blocks = (MAX_MODEL_LEN + BLOCK_SIZE - 1) // BLOCK_SIZE
         input_ids = torch.zeros(max_bs, dtype=torch.int64)
         positions = torch.zeros(max_bs, dtype=torch.int64)
-        slot_mapping = torch.zeros(max_bs, dtype=torch.int32)
+        slot_mapping = torch.full((max_bs,), -1, dtype=torch.int32)
         context_lens = torch.zeros(max_bs, dtype=torch.int32)
         block_tables = torch.zeros(max_bs, max_num_blocks, dtype=torch.int32)
-        outputs = torch.zeros(max_bs, self.config.hidden_size)
 
         self.graph_bs_list = [1, 2, 4, 8] + list(range(16, max_bs + 1, 16))
         self.graphs = {}
         self.graph_pool = None
 
-        for bs in reversed(self.graph_bs_list):
-            graph = torch.cuda.CUDAGraph()
-            set_context(
-                False, slot_mapping=slot_mapping[:bs],
-                context_lens=context_lens[:bs], block_tables=block_tables[:bs],
-            )
-            outputs[:bs] = self.model(input_ids[:bs], positions[:bs])
-            with torch.cuda.graph(graph, self.graph_pool):
+        outputs = torch.zeros(max_bs, self.config.hidden_size)
+
+        lm_head = self.model.lm_head
+        vocab_per_rank = lm_head.per_partition
+        lm_logits = torch.zeros(max_bs, vocab_per_rank)
+        lm_max_vals = torch.zeros(max_bs)
+        lm_max_idxs = torch.zeros(max_bs, dtype=torch.int64)
+
+        ar_ctx = self.custom_ar.capture() if self.custom_ar is not None else nullcontext()
+        with ar_ctx:
+            for bs in reversed(self.graph_bs_list):
+                graph = torch.cuda.CUDAGraph()
+                set_context(
+                    False, slot_mapping=slot_mapping[:bs],
+                    context_lens=context_lens[:bs], block_tables=block_tables[:bs],
+                )
                 outputs[:bs] = self.model(input_ids[:bs], positions[:bs])
-            if self.graph_pool is None:
-                self.graph_pool = graph.pool()
-            self.graphs[bs] = graph
-            torch.cuda.synchronize()
-            reset_context()
+                lm_logits[:bs] = lm_head.linear_op(outputs[:bs], lm_head.weight).float()
+                lm_max_vals[:bs], lm_max_idxs[:bs] = lm_logits[:bs].max(dim=-1)
+
+                with torch.cuda.graph(graph, self.graph_pool):
+                    outputs[:bs] = self.model(input_ids[:bs], positions[:bs])
+                    lm_logits[:bs] = lm_head.linear_op(outputs[:bs], lm_head.weight).float()
+                    lm_max_vals[:bs], lm_max_idxs[:bs] = lm_logits[:bs].max(dim=-1)
+
+                if self.graph_pool is None:
+                    self.graph_pool = graph.pool()
+                self.graphs[bs] = graph
+                torch.cuda.synchronize()
+                reset_context()
 
         self.graph_vars = dict(
             input_ids=input_ids, positions=positions,
             slot_mapping=slot_mapping, context_lens=context_lens,
             block_tables=block_tables, outputs=outputs,
+            lm_logits=lm_logits, lm_max_vals=lm_max_vals,
+            lm_max_idxs=lm_max_idxs,
         )
+
+        # Pre-compute lookup table: _graph_bs_for_n[n] = smallest graph_bs >= n
+        self._graph_bs_for_n = [0] * (max_bs + 1)
+        for n in range(max_bs + 1):
+            self._graph_bs_for_n[n] = next(x for x in self.graph_bs_list if x >= n)
 
 
 # ---------------------------------------------------------------------------
@@ -453,8 +709,15 @@ class LlamaEngine:
 
     @torch.inference_mode()
     def generate(self, prompts, sampling_params, collect_logits: bool = False):
-        if sampling_params.seed is not None:
-            self._set_seeds(sampling_params.seed)
+        """Generate completions for a batch of prompts."""
+        if isinstance(sampling_params, list):
+            sp_list = sampling_params
+        else:
+            sp_list = [sampling_params] * len(prompts)
+
+        seed = sp_list[0].seed
+        if seed is not None:
+            self._set_seeds(seed)
 
         eos = self.tokenizer.eos_token_id
         waiting = deque()
@@ -462,20 +725,45 @@ class LlamaEngine:
 
         seq_logits: dict[int, list[torch.Tensor]] = {}
 
-        for prompt in prompts:
-            ids = self.tokenizer.encode(prompt)
-            seq = Sequence(ids, max_tokens=sampling_params.max_tokens)
+        for prompt, sp in zip(prompts, sp_list):
+            ids = prompt if isinstance(prompt, list) else self.tokenizer.encode(prompt)
+            seq = Sequence(ids, max_tokens=sp.max_tokens, ignore_eos=sp.ignore_eos)
             waiting.append(seq)
             if collect_logits:
                 seq_logits[id(seq)] = []
 
         all_seqs = list(waiting)
 
+        use_greedy = (sp_list[0].temperature == 0.0
+                      and not collect_logits
+                      and len(self.workers) > 0)
+        block_size = BLOCK_SIZE
+
+        profile = _PROFILE
+        if profile:
+            _pf_time = 0.0
+            _pf_steps = 0
+            _pf_tokens = 0
+            _dc_time = 0.0
+            _dc_steps = 0
+            _dc_tokens = 0
+            _dc_sched_time = 0.0
+            _dc_call_time = 0.0
+            _dc_tolist_time = 0.0
+            _dc_post_time = 0.0
+            _dc_bs_counts = []
+
         while waiting or running:
             # --- Prefill ---
             prefill_seqs = []
+            num_batched_tokens = 0
             while waiting:
                 seq = waiting[0]
+                seq_len = len(seq)
+                if num_batched_tokens + seq_len > MAX_NUM_BATCHED_TOKENS:
+                    break
+                if len(prefill_seqs) >= MAX_NUM_SEQS:
+                    break
                 if not self.block_manager.can_allocate(seq):
                     break
                 waiting.popleft()
@@ -483,30 +771,46 @@ class LlamaEngine:
                 seq.status = SeqStatus.RUNNING
                 running.append(seq)
                 prefill_seqs.append(seq)
+                num_batched_tokens += seq_len
 
             if prefill_seqs:
+                if profile:
+                    _t0 = time.perf_counter()
                 logits = self.model_runner.call("run", prefill_seqs, True)
                 if logits is not None:
                     if collect_logits:
                         for i, seq in enumerate(prefill_seqs):
                             seq_logits[id(seq)].append(logits[i:i+1].cpu())
-                    token_ids = self._sample(logits, sampling_params)
+                    token_ids = self._sample(logits, sp_list[0])
                     for seq, tid in zip(prefill_seqs, token_ids):
                         seq.append_token(tid)
-                        if tid == eos or len(seq.generated_ids) >= seq.max_tokens:
+                        done = len(seq.generated_ids) >= seq.max_tokens
+                        if not seq.ignore_eos:
+                            done = done or tid == eos
+                        if done:
                             seq.status = SeqStatus.FINISHED
                             running.remove(seq)
                             self.block_manager.deallocate(seq)
+                if profile:
+                    _pf_time += time.perf_counter() - _t0
+                    _pf_steps += 1
+                    _pf_tokens += num_batched_tokens
                 continue
 
             # --- Decode ---
+            if profile:
+                _t_sched = time.perf_counter()
+
+            bm = self.block_manager
+            free = bm.free_block_ids
             decode_seqs = []
             temp = deque()
-            while running:
+            while running and len(decode_seqs) < MAX_NUM_SEQS:
                 seq = running.popleft()
-                if not self.block_manager.can_append(seq):
+                if len(seq) % block_size == 1 and not free:
                     break
-                self.block_manager.may_append(seq)
+                if len(seq) % block_size == 1:
+                    seq.block_table.append(free.popleft())
                 decode_seqs.append(seq)
                 temp.append(seq)
             running.extendleft(reversed(temp))
@@ -514,23 +818,93 @@ class LlamaEngine:
             if not decode_seqs:
                 break
 
-            logits = self.model_runner.call("run", decode_seqs, False)
-            if logits is not None:
-                if collect_logits:
-                    for i, seq in enumerate(decode_seqs):
-                        seq_logits[id(seq)].append(logits[i:i+1].cpu())
-                token_ids = self._sample(logits, sampling_params)
-                for seq, tid in zip(decode_seqs, token_ids):
-                    seq.append_token(tid)
-                    if tid == eos or len(seq.generated_ids) >= seq.max_tokens:
-                        seq.status = SeqStatus.FINISHED
-                        running.remove(seq)
-                        self.block_manager.deallocate(seq)
+            if profile:
+                _dc_sched_time += time.perf_counter() - _t_sched
+                _dc_bs_counts.append(len(decode_seqs))
+                _t_call = time.perf_counter()
+
+            if use_greedy:
+                gpu_result = self.model_runner.call_decode_greedy(decode_seqs)
+                if profile:
+                    _dc_call_time += time.perf_counter() - _t_call
+                    _t_tolist = time.perf_counter()
+                if gpu_result is not None:
+                    token_ids = gpu_result.tolist()
+                    if profile:
+                        _dc_tolist_time += time.perf_counter() - _t_tolist
+                        _t_post = time.perf_counter()
+                    for seq, tid in zip(decode_seqs, token_ids):
+                        seq.append_token(tid)
+                        done = len(seq.generated_ids) >= seq.max_tokens
+                        if not seq.ignore_eos:
+                            done = done or tid == eos
+                        if done:
+                            seq.status = SeqStatus.FINISHED
+                            running.remove(seq)
+                            bm.deallocate(seq)
+                    if profile:
+                        _dc_post_time += time.perf_counter() - _t_post
+                elif profile:
+                    _dc_tolist_time += time.perf_counter() - _t_tolist
+                    _dc_post_time += 0.0
+            else:
+                result = self.model_runner.call("run", decode_seqs, False)
+                if profile:
+                    _dc_call_time += time.perf_counter() - _t_call
+                    _t_tolist = time.perf_counter()
+                    _dc_tolist_time += 0.0
+                    _t_post = time.perf_counter()
+                if result is not None:
+                    if collect_logits:
+                        for i, seq in enumerate(decode_seqs):
+                            seq_logits[id(seq)].append(result[i:i+1].cpu())
+                    token_ids = self._sample(result, sp_list[0])
+                    for seq, tid in zip(decode_seqs, token_ids):
+                        seq.append_token(tid)
+                        done = len(seq.generated_ids) >= seq.max_tokens
+                        if not seq.ignore_eos:
+                            done = done or tid == eos
+                        if done:
+                            seq.status = SeqStatus.FINISHED
+                            running.remove(seq)
+                            bm.deallocate(seq)
+                if profile:
+                    _dc_post_time += time.perf_counter() - _t_post
+
+            if profile:
+                _dc_steps += 1
+                _dc_tokens += len(decode_seqs)
+
+        if profile:
+            self._profile_data = {
+                "prefill_time": _pf_time,
+                "prefill_steps": _pf_steps,
+                "prefill_tokens": _pf_tokens,
+                "decode_time": _dc_time,
+                "decode_steps": _dc_steps,
+                "decode_tokens": _dc_tokens,
+                "decode_sched_time": _dc_sched_time,
+                "decode_call_time": _dc_call_time,
+                "decode_tolist_time": _dc_tolist_time,
+                "decode_post_time": _dc_post_time,
+                "decode_bs_counts": _dc_bs_counts,
+            }
+            self._profile_data["decode_time"] = (
+                _dc_sched_time + _dc_call_time + _dc_tolist_time + _dc_post_time
+            )
+            cp = getattr(self.model_runner, '_call_profile', None)
+            if cp and cp["n_calls"] > 0:
+                self._profile_data["call_detail"] = {
+                    "prepare_ms": cp["prepare"] / cp["n_calls"] * 1000,
+                    "signal_ms": cp["signal"] / cp["n_calls"] * 1000,
+                    "gpu_exec_ms": cp["gpu_exec"] / cp["n_calls"] * 1000,
+                    "n_calls": cp["n_calls"],
+                }
 
         # Return in original order
         return [
             GenerationOutput(
-                prompt=prompts[i],
+                prompt=(prompts[i] if isinstance(prompts[i], str) else ""),
                 generated_text=self.tokenizer.decode(
                     all_seqs[i].generated_ids, skip_special_tokens=True,
                 ),

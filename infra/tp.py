@@ -2,6 +2,8 @@
 
 from __future__ import annotations
 
+from typing import Optional
+
 import torch
 import torch.distributed as dist
 import torch.nn as nn
@@ -19,6 +21,21 @@ def _tp_size():
 
 def _tp_rank():
     return dist.get_rank() if dist.is_initialized() else 0
+
+
+# ---------------------------------------------------------------------------
+# Global custom allreduce communicator (set by engine, used by TP layers)
+# ---------------------------------------------------------------------------
+_CUSTOM_AR: Optional["CustomAllreduce"] = None  # noqa: F821
+
+
+def set_custom_ar(ar):
+    global _CUSTOM_AR
+    _CUSTOM_AR = ar
+
+
+def get_custom_ar():
+    return _CUSTOM_AR
 
 
 # ---------------------------------------------------------------------------
@@ -140,6 +157,11 @@ class RowParallelLinear(nn.Module):
     def forward(self, x):
         y = self.linear_op(x, self.weight, self.bias if self.tp_rank == 0 else None)
         if self.tp_size > 1:
+            ar = _CUSTOM_AR
+            if ar is not None:
+                out = ar.custom_all_reduce(y)
+                if out is not None:
+                    return out
             dist.all_reduce(y)
         return y
 
@@ -173,6 +195,11 @@ class VocabParallelEmbedding(nn.Module):
         y = self.embedding_op(x, self.weight)
         if self.tp_size > 1:
             y = mask.unsqueeze(1) * y
+            ar = _CUSTOM_AR
+            if ar is not None:
+                out = ar.custom_all_reduce(y)
+                if out is not None:
+                    return out
             dist.all_reduce(y)
         return y
 
@@ -182,14 +209,49 @@ class ParallelLMHead(VocabParallelEmbedding):
         super().__init__(num_embeddings, embedding_dim)
         self.linear_op = Linear()
 
-    def forward(self, x):
+    def project(self, x):
+        """Linear projection only (no gather). Used inside CUDA graph."""
         ctx = get_context()
         if ctx.is_prefill:
             last_indices = ctx.cu_seqlens_q[1:] - 1
             x = x[last_indices].contiguous()
-        logits = self.linear_op(x, self.weight)
+        return self.linear_op(x, self.weight)
+
+    def gather_logits(self, logits):
+        """Gather partial logits from all ranks. Used outside CUDA graph."""
         if self.tp_size > 1:
             all_logits = [torch.empty_like(logits) for _ in range(self.tp_size)] if _tp_rank() == 0 else None
             dist.gather(logits, all_logits, 0)
             logits = torch.cat(all_logits, -1) if _tp_rank() == 0 else logits
         return logits
+
+    def gather_greedy(self, logits):
+        """Fast path for greedy: local argmax + small allgather.
+
+        Instead of gathering full vocab logits (~31MB/rank), gather only
+        the (max_val, max_idx) per sequence (~2KB/rank).
+        Returns token IDs directly on rank 0, None on other ranks.
+        """
+        if self.tp_size <= 1:
+            return None
+
+        rank = _tp_rank()
+        local_max_vals, local_max_idxs = logits.max(dim=-1)
+        local_max_idxs = local_max_idxs + self.vocab_start
+
+        info = torch.stack([local_max_vals, local_max_idxs.float()], dim=-1)
+        gathered = [torch.empty_like(info) for _ in range(self.tp_size)]
+        dist.all_gather(gathered, info)
+        if rank == 0:
+            all_info = torch.stack(gathered, dim=0)
+            all_vals = all_info[:, :, 0]
+            all_idxs = all_info[:, :, 1].long()
+            best_rank = all_vals.argmax(dim=0)
+            bs = logits.size(0)
+            token_ids = all_idxs[best_rank, torch.arange(bs, device=logits.device)]
+            return token_ids
+        return None
+
+    def forward(self, x):
+        logits = self.project(x)
+        return self.gather_logits(logits)

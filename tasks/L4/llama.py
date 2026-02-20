@@ -103,8 +103,25 @@ class LlamaForCausalLM(nn.Module):
     def forward(self, input_ids, positions):
         return self.model(input_ids, positions)
 
+    def forward_with_lm_proj(self, input_ids, positions):
+        """Forward pass including LM head linear (no gather)."""
+        hidden_states = self.model(input_ids, positions)
+        return self.lm_head.project(hidden_states)
+
     def compute_logits(self, hidden_states):
         logits = self.lm_head(hidden_states)
         if logits is not None:
             logits = logits.float()
         return logits
+
+    def compute_logits_decode(self, partial_logits):
+        """Gather and finalize logits from pre-computed local partition."""
+        logits = self.lm_head.gather_logits(partial_logits)
+        if logits is not None:
+            logits = logits.float()
+        return logits
+
+    def greedy_sample_decode(self, partial_logits):
+        """Fast greedy sampling path: local argmax + small allgather."""
+        result = self.lm_head.gather_greedy(partial_logits.float())
+        return result

@@ -6,7 +6,7 @@ A standalone, high-performance LLM inference engine supporting **Llama 3.1** and
 
 - **Llama 3.1** (8B, 70B) with frequency-scaled RoPE
 - **Mixtral-8x7B** with fused Triton MoE grouped-GEMM kernels
-- **Tensor parallelism** (TP) via NCCL for multi-GPU inference
+- **Tensor parallelism** (TP) with custom IPC-based all-reduce for multi-GPU inference
 - **Paged KV cache** with Triton store kernels
 - **CUDA graph capture** for decode steps
 - **Flash Attention** for both prefill and paged decode
@@ -43,7 +43,9 @@ A standalone, high-performance LLM inference engine supporting **Llama 3.1** and
 │       └── mixtral.py          # MixtralForCausalLM (config, model, LM head)
 ├── infra/                      # Non-benchmarkable infrastructure
 │   ├── context.py              # Global inference context (paged KV cache coordination)
-│   └── tp.py                   # TP-aware linear layers, embeddings, LM head
+│   ├── tp.py                   # TP-aware linear layers, embeddings, LM head
+│   ├── custom_allreduce.py     # IPC-based custom all-reduce (replaces NCCL for intra-node TP)
+│   └── custom_allreduce_kernels.cu  # CUDA kernels for P2P cross-device reduction
 ├── bench/                      # Benchmarking suite
 │   ├── discovery.py            # Auto-discovers targets via import graph analysis
 │   ├── replacement.py          # Class monkey-patching for swapping implementations
@@ -53,8 +55,10 @@ A standalone, high-performance LLM inference engine supporting **Llama 3.1** and
 ├── engine.py                   # Batched inference engine with paged KV cache and TP
 ├── weight_loader.py            # HuggingFace safetensors weight loading with TP sharding
 └── tests/                      # Test suite
-    ├── test_vllm_alignment.py  # Correctness + benchmark tests vs vLLM
-    └── test_bench.py           # Bench module tests (discovery, evaluator, replacement, integration)
+    ├── test_vllm_alignment.py  # Token-level correctness test vs vLLM (eager mode)
+    ├── test_bench.py           # Bench module tests (discovery, evaluator, replacement, integration)
+    ├── bench_throughput.py     # Throughput benchmark vs vLLM (full speed, nano-vllm style)
+    └── profile_gap.py          # Detailed prefill/decode timing breakdown vs vLLM
 ```
 
 ## Quick Start
@@ -77,6 +81,14 @@ python tests/test_bench.py
 
 # Bench module unit tests only (no GPU required)
 python tests/test_bench.py --unit-only
+
+# Throughput benchmark vs vLLM (both engines at full speed)
+python tests/bench_throughput.py --model meta-llama/Llama-3.1-8B-Instruct
+
+# With tensor parallelism and custom workload
+python tests/bench_throughput.py \
+    --model meta-llama/Llama-3.1-70B-Instruct --tp 4 \
+    --num-seqs 256 --max-input-len 1024 --max-output-len 1024
 ```
 
 ## Benchmarking
@@ -114,13 +126,33 @@ The model-to-operator mapping is derived automatically from the import graph —
 
 ## Performance
 
-Benchmarked with TP=4, 100 max tokens, greedy decoding:
+Run `tests/bench_throughput.py` to reproduce. Workload: 256 sequences, random 100-1024 input/output tokens, `ignore_eos=True`, both engines with full optimizations (`enforce_eager=False`).
 
-| Model | Mode | vLLM | Ours | Speedup |
-|-------|------|------|------|---------|
-| Llama 3.1 70B | Sequential | 42.4 tok/s | 57.8 tok/s | 1.36x |
-| Llama 3.1 70B | Batched | 170.2 tok/s | 251.4 tok/s | 1.48x |
-| Mixtral 8x7B | Sequential | 42.7 tok/s | 129.4 tok/s | 3.03x |
-| Mixtral 8x7B | Batched | 139.1 tok/s | 367.4 tok/s | 2.64x |
+**Hardware: 4× NVIDIA H200 (NVLink)**
 
-Llama 3.1 8B and Mixtral 8x7B produce near-identical outputs to vLLM (minor divergences in 1/4 prompts due to bfloat16 numerical differences).
+| Model | TP | Seqs | vLLM (tok/s) | Ours (tok/s) | Ratio |
+|-------|---:|-----:|-------------:|-------------:|------:|
+| Llama-3.1-8B  | 1 |   32 |  2,938 |  2,671 | 0.91× |
+| Llama-3.1-8B  | 1 |   64 |  5,324 |  4,840 | 0.91× |
+| Llama-3.1-8B  | 1 |  128 |  7,465 |  6,784 | 0.91× |
+| Llama-3.1-8B  | 1 |  256 |  9,787 |  9,048 | 0.92× |
+| Llama-3.1-8B  | 4 |   32 |  5,274 |  4,896 | 0.93× |
+| Llama-3.1-8B  | 4 |   64 |  9,886 |  9,097 | 0.92× |
+| Llama-3.1-8B  | 4 |  128 | 14,682 | 14,101 | 0.96× |
+| Llama-3.1-8B  | 4 |  256 | 21,067 | 20,608 | 0.98× |
+| Llama-3.1-70B | 4 |  256 |  4,470 |  4,408 | 0.99× |
+
+Use `tests/profile_gap.py` for a detailed prefill/decode timing breakdown:
+
+```bash
+python -m kb-nano.tests.profile_gap \
+    --model meta-llama/Llama-3.1-8B-Instruct --tp 4 \
+    --batch-sizes 32 64 128 256
+```
+
+### Key optimizations
+
+- **Custom IPC all-reduce**: Replaces NCCL for intra-node TP with direct GPU P2P memory access, matching vLLM's approach
+- **SHM spin-wait signaling**: Workers spin on a shared-memory sequence counter instead of `multiprocessing.Event`, reducing per-step signaling latency from ~0.48ms to ~0.004ms
+- **LM head in CUDA graph**: The LM head projection and local argmax are captured inside the CUDA graph alongside the transformer body, eliminating extra kernel launch overhead
+- **Greedy fast path**: For greedy decoding with TP, uses local argmax + small all-gather instead of gathering full logits across ranks
