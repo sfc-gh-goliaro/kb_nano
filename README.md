@@ -55,6 +55,10 @@ A standalone, high-performance LLM inference engine supporting **Llama 3.1** and
 │   ├── runner.py               # Benchmark orchestration (baseline vs user)
 │   ├── evaluator.py            # KL divergence + speedup metrics
 │   └── __main__.py             # CLI entry point
+├── example/                    # LLM-powered kernel generation agent
+│   ├── agent.py               # CLI agent: generates kernels via Claude, benchmarks them
+│   ├── llm_api.py             # Corvo LLM endpoint helper (async + sync)
+│   └── _generated_kernels/    # Output directory for LLM-generated kernels (gitignored)
 ├── engine.py                   # Batched inference engine with paged KV cache and TP
 ├── weight_loader.py            # HuggingFace safetensors weight loading with TP sharding
 └── tests/                      # Test suite
@@ -126,6 +130,34 @@ python -m kb_nano.bench \
 
 The model-to-operator mapping is derived automatically from the import graph — no manual annotations needed.
 
+## LLM Kernel Agent
+
+The agent uses Claude Opus 4.6 to automatically generate replacement kernels for any operator level, then benchmarks them against the baseline using the bench suite.
+
+```bash
+# Generate all L1 kernels for Llama, benchmark them
+python -m kb_nano.example \
+    --model meta-llama/Llama-3.1-8B-Instruct \
+    --level 1
+
+# Force CUDA-only kernels (no Triton/PyTorch builtins)
+python -m kb_nano.example \
+    --model meta-llama/Llama-3.1-8B-Instruct \
+    --level 1 --cuda-only
+
+# Mixtral with tensor parallelism
+python -m kb_nano.example \
+    --model mistralai/Mixtral-8x7B-Instruct-v0.1 \
+    --level 2 --tp 4
+
+# Custom retry limit and LLM model
+python -m kb_nano.example \
+    --model meta-llama/Llama-3.1-8B-Instruct \
+    --level 1 --max-retries 3 --llm-model claude-opus-4-6
+```
+
+The agent discovers operators, generates replacements, validates they compile, patches them all into the model simultaneously, and reports KL divergence, token match rate, and speedup. Failed kernels are retried up to `--max-retries` times with error feedback to the LLM.
+
 ## Dependencies
 
 - Python 3.10+
@@ -133,6 +165,7 @@ The model-to-operator mapping is derived automatically from the import graph —
 - Triton
 - Flash Attention (`flash-attn`)
 - Hugging Face (`transformers`, `huggingface_hub`, `safetensors`)
+- aiohttp (for the LLM kernel agent)
 - vLLM (only needed for running comparison tests)
 
 ## Performance
