@@ -3,12 +3,12 @@
 from __future__ import annotations
 
 import torch
-import torch.distributed as dist
 import torch.nn as nn
 
 from sgl_kernel.moe import topk_softmax as _sgl_topk_softmax
 
-from ...infra.tp import _tp_rank, _tp_size, get_custom_ar
+from ...infra.tp import _tp_rank, _tp_size
+from ..L1.allreduce import AllReduce
 from ..L2.fused_experts import FusedExperts
 
 
@@ -43,6 +43,7 @@ class MixtralMoE(nn.Module):
         self.w2.weight_loader = self._w2_weight_loader
 
         self.fused_experts = FusedExperts()
+        self.allreduce = AllReduce()
         self._topk_weights = None
         self._topk_ids = None
 
@@ -81,11 +82,6 @@ class MixtralMoE(nn.Module):
         )
 
         if self.tp_size > 1:
-            ar = get_custom_ar()
-            if ar is not None:
-                reduced = ar.custom_all_reduce(out)
-                if reduced is not None:
-                    return reduced.view(orig_shape)
-            dist.all_reduce(out)
+            out = self.allreduce(out)
 
         return out.view(orig_shape)

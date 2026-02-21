@@ -12,7 +12,7 @@ import torch
 import torch.nn as nn
 from transformers import AutoConfig
 
-from ...infra.tp import ParallelLMHead, VocabParallelEmbedding
+from ..L2.parallel_embedding import ParallelLMHead, VocabParallelEmbedding
 from ..L1.rms_norm import RMSNorm
 from ..L1.rotary_emb import RotaryEmbedding
 from ..L3.llama_decoder import LlamaDecoderLayer

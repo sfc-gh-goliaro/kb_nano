@@ -6,12 +6,11 @@ import torch
 import torch.nn as nn
 
 from ...infra.context import get_context
-from ...infra.tp import QKVParallelLinear, RowParallelLinear, _tp_size
+from ...infra.tp import _tp_size
+from .parallel_linear import QKVParallelLinear, RowParallelLinear
 from ..L1.store_kvcache import StoreKVCache
 from ..L1.flash_attn_prefill import FlashAttnPrefill
 from ..L1.flash_attn_decode import FlashAttnDecode
-
-from flash_attn import flash_attn_varlen_func
 
 
 class Attention(nn.Module):
@@ -57,7 +56,7 @@ class Attention(nn.Module):
 
         if ctx.is_prefill:
             if ctx.block_tables is not None:
-                o = flash_attn_varlen_func(
+                o = self.flash_attn_prefill(
                     q, k_cache, v_cache,
                     cu_seqlens_q=ctx.cu_seqlens_q,
                     cu_seqlens_k=ctx.cu_seqlens_k,

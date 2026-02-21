@@ -30,7 +30,7 @@ import torch.multiprocessing as mp
 from transformers import AutoTokenizer
 
 from .infra.context import get_context, reset_context, set_context, set_mixed_context
-from .infra.tp import set_custom_ar
+from .tasks.L1.allreduce import set_custom_ar
 from .weight_loader import load_model
 
 BLOCK_SIZE = 256
@@ -200,7 +200,7 @@ class ModelRunner:
         if world_size > 1:
             self.cpu_group = dist.new_group(backend="gloo")
             if not os.environ.get("KB_NANO_DISABLE_CUSTOM_AR", "0") == "1":
-                from .infra.custom_allreduce import CustomAllreduce
+                from .tasks.L1.allreduce import CustomAllreduce
                 self.custom_ar = CustomAllreduce(
                     self.cpu_group, rank, max_size=8 * 1024 * 1024
                 )

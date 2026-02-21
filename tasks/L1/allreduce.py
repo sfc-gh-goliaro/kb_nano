@@ -1,9 +1,7 @@
-"""
-Custom all-reduce for intra-node tensor parallelism via CUDA IPC.
+"""AllReduce L1 operator with custom IPC all-reduce and NCCL fallback.
 
-Ported from vLLM's custom_all_reduce.py, simplified to remove
-vLLM-specific dependencies. Uses JIT-compiled CUDA kernels from
-custom_allreduce_kernels.cu.
+Includes the CustomAllreduce class (ported from vLLM, simplified) which
+uses JIT-compiled CUDA kernels for intra-node P2P cross-device reduction.
 """
 
 from __future__ import annotations
@@ -14,12 +12,47 @@ from typing import Optional
 
 import torch
 import torch.distributed as dist
+import torch.nn as nn
 from torch.distributed import ProcessGroup
 
 
+# ---------------------------------------------------------------------------
+# Global custom allreduce communicator (set by engine, used by TP layers)
+# ---------------------------------------------------------------------------
+_CUSTOM_AR: Optional["CustomAllreduce"] = None
+
+
+def set_custom_ar(ar):
+    global _CUSTOM_AR
+    _CUSTOM_AR = ar
+
+
+def get_custom_ar():
+    return _CUSTOM_AR
+
+
+# ---------------------------------------------------------------------------
+# AllReduce L1 operator
+# ---------------------------------------------------------------------------
+class AllReduce(nn.Module):
+    def forward(self, tensor):
+        ar = _CUSTOM_AR
+        if ar is not None:
+            out = ar.custom_all_reduce(tensor)
+            if out is not None:
+                return out
+        dist.all_reduce(tensor)
+        return tensor
+
+
+# ---------------------------------------------------------------------------
+# Custom all-reduce via CUDA IPC
+# ---------------------------------------------------------------------------
 def _load_ops():
     from torch.utils.cpp_extension import load
-    src = os.path.join(os.path.dirname(__file__), "custom_allreduce_kernels.cu")
+    src = os.path.join(
+        os.path.dirname(__file__), "..", "..", "infra", "custom_allreduce_kernels.cu",
+    )
     return load(
         name="custom_allreduce_kernels",
         sources=[src],
