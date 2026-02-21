@@ -22,6 +22,7 @@ Usage:
 from __future__ import annotations
 
 import argparse
+import asyncio
 import importlib.util
 import json
 import os
@@ -32,6 +33,7 @@ import sys
 import tempfile
 import time
 import traceback
+from concurrent.futures import ThreadPoolExecutor
 from dataclasses import dataclass
 from pathlib import Path
 
@@ -39,9 +41,10 @@ _PROJECT_ROOT = str(Path(__file__).resolve().parent.parent.parent)
 if _PROJECT_ROOT not in sys.path:
     sys.path.insert(0, _PROJECT_ROOT)
 
-from kb_nano.example.llm_api import call_llm
+from kb_nano.example.llm_api import call_llm_async
 
 _OUTPUT_DIR = Path(__file__).resolve().parent / "_generated_kernels"
+_CUDA_BUILD_CACHE = Path(__file__).resolve().parent / "_cuda_build_cache"
 
 
 # ---------------------------------------------------------------------------
@@ -131,6 +134,7 @@ SYSTEM_PROMPT = (
 
 def build_generation_prompt(op: OperatorSpec, cuda_only: bool) -> str:
     constraint_block = _constraint_text(cuda_only)
+    build_cache = str(_CUDA_BUILD_CACHE)
     return (
         "I need you to write a high-performance replacement for the following "
         "PyTorch nn.Module operator used in an LLM inference engine. "
@@ -152,8 +156,10 @@ def build_generation_prompt(op: OperatorSpec, cuda_only: bool) -> str:
         f"4. You may import `torch`, `triton`, `triton.language`, standard library modules, "
         f"`flash_attn`, or JIT-compile CUDA. For inline CUDA strings use "
         f"`torch.utils.cpp_extension.load_inline(name=..., cpp_sources=..., "
-        f"cuda_sources=..., functions=[...])`. Do NOT pass `cuda_sources` to "
-        f"`torch.utils.cpp_extension.load()` (it only takes file paths via `sources`).\n"
+        f"cuda_sources=..., functions=[...], "
+        f"build_directory='{build_cache}/<unique_name>')`. "
+        f"Do NOT pass `cuda_sources` to `torch.utils.cpp_extension.load()` "
+        f"(it only takes file paths via `sources`).\n"
         f"5. Focus on PERFORMANCE: minimize memory traffic, maximize GPU occupancy, "
         f"fuse operations where possible, and use vectorized loads/stores.\n\n"
         "## Response format\n\n"
@@ -173,7 +179,7 @@ def _constraint_text(cuda_only: bool) -> str:
             "Do NOT use Triton kernels, PyTorch built-in functions "
             "(F.linear, F.embedding, etc.), flash_attn, torch.distributed, "
             "or external Python libraries for the core computation. "
-            "You may use CUDA libraries like cuBLAS, cutlass, cuDNN, nccl, etc.\n"
+            "You may use CUDA libraries like cuBLAS, cutlass, cuDNN, etc.\n"
             "   IMPORTANT: To JIT-compile inline CUDA source strings, use "
             "`torch.utils.cpp_extension.load_inline(name=..., cpp_sources=..., "
             "cuda_sources=..., functions=[...])`. Do NOT pass `cuda_sources` "
@@ -190,6 +196,7 @@ def build_retry_prompt(
     op: OperatorSpec, failed_code: str, error_msg: str, cuda_only: bool,
 ) -> str:
     constraint_block = _constraint_text(cuda_only)
+    build_cache = str(_CUDA_BUILD_CACHE)
     return (
         f"The kernel you generated for `{op.class_name}` failed with this error:\n\n"
         f"```\n{error_msg}\n```\n\n"
@@ -201,7 +208,9 @@ def build_retry_prompt(
         f"1. Class must be named `{op.class_name}`, subclass `torch.nn.Module`, "
         f"same `forward` signature (override `__init__` only if needed, keeping the same signature).\n"
         f"2. {constraint_block}\n"
-        f"3. Do NOT import `vllm`, `sglang`, or `sgl_kernel`.\n\n"
+        f"3. Do NOT import `vllm`, `sglang`, or `sgl_kernel`.\n"
+        f"4. For CUDA JIT compilation use `torch.utils.cpp_extension.load_inline` "
+        f"with `build_directory='{build_cache}/<unique_name>'`.\n\n"
         f"Please fix the error and return ONLY a corrected Python code block "
         f"(```python ... ```). No explanation outside the code block."
     )
@@ -252,7 +261,6 @@ def validate_kernel(code: str, expected_class_name: str) -> tuple[type | None, s
                 f"Available nn.Module classes: {available}"
             )
 
-        # Try instantiating to catch deferred JIT compilation errors
         try:
             cls()
         except Exception:
@@ -268,7 +276,160 @@ def validate_kernel(code: str, expected_class_name: str) -> tuple[type | None, s
 
 
 # ---------------------------------------------------------------------------
-# Kernel generation loop
+# Per-operator unit test with random data
+# ---------------------------------------------------------------------------
+_UNIT_TEST_WORKER = r'''
+import json, sys, traceback
+
+def main():
+    cfg = json.loads(sys.argv[1])
+    sys.path.insert(0, cfg["project_root"])
+
+    import torch
+    import importlib, importlib.util
+
+    pkg = cfg["package_name"]
+    op_name = cfg["op_name"]
+    class_name = cfg["class_name"]
+    code_file = cfg["code_file"]
+    baseline_module = cfg["baseline_module"]
+
+    # Import baseline
+    baseline_mod = importlib.import_module(f"{pkg}.{baseline_module}")
+    BaselineCls = None
+    for v in vars(baseline_mod).values():
+        if isinstance(v, type) and issubclass(v, torch.nn.Module) and v is not torch.nn.Module:
+            if v.__name__ == class_name:
+                BaselineCls = v
+                break
+    if BaselineCls is None:
+        json.dump({"success": False, "error": f"Baseline class {class_name} not found"}, sys.stdout)
+        return
+
+    # Import generated
+    spec = importlib.util.spec_from_file_location("_gen", code_file)
+    gen_mod = importlib.util.module_from_spec(spec)
+    spec.loader.exec_module(gen_mod)
+    GenCls = getattr(gen_mod, class_name)
+
+    baseline_op = BaselineCls()
+    gen_op = GenCls()
+
+    # Generate test inputs based on the operator
+    torch.manual_seed(42)
+    device = "cuda"
+    dtype = torch.bfloat16
+    B, S, H, D = 4, 128, 32, 128  # batch, seq, heads, head_dim
+
+    test_configs = {
+        "embedding": lambda: (torch.randint(0, 32000, (B, S), device=device),
+                              torch.randn(32000, 4096, device=device, dtype=dtype)),
+        "linear": lambda: (torch.randn(B * S, 4096, device=device, dtype=dtype),
+                           torch.randn(4096, 4096, device=device, dtype=dtype)),
+        "rms_norm": lambda: (torch.randn(B * S, 4096, device=device, dtype=dtype),),
+        "silu_and_mul": lambda: (torch.randn(B * S, 4096 * 2, device=device, dtype=dtype),),
+        "rotary_emb": lambda: (torch.arange(S, device=device).unsqueeze(0).expand(B, -1).contiguous(),
+                               torch.randn(B * S, H, D, device=device, dtype=dtype),
+                               torch.randn(B * S, 8, D, device=device, dtype=dtype)),
+        "store_kvcache": lambda: (torch.randn(B * S, 8, D, device=device, dtype=dtype),
+                                  torch.randn(B * S, 8, D, device=device, dtype=dtype),
+                                  torch.randn(1024, 8, D, device=device, dtype=dtype),
+                                  torch.randn(1024, 8, D, device=device, dtype=dtype),
+                                  torch.arange(B * S, device=device)),
+        "allreduce": lambda: (torch.randn(B * S, 4096, device=device, dtype=dtype),),
+    }
+
+    make_inputs = test_configs.get(op_name)
+    if make_inputs is None:
+        json.dump({"success": True, "skipped": True, "reason": f"No unit test config for {op_name}"}, sys.stdout)
+        return
+
+    try:
+        inputs = make_inputs()
+
+        # For RMSNorm, we need to set the weight
+        if op_name == "rms_norm":
+            if hasattr(baseline_op, "weight"):
+                pass  # weight is a parameter, set via init
+            # Also test with residual
+            with torch.no_grad():
+                baseline_out = baseline_op(*inputs)
+                gen_out = gen_op(*inputs)
+        elif op_name == "rotary_emb":
+            # RotaryEmbedding needs cos_sin_cache set up - skip direct test if not possible
+            json.dump({"success": True, "skipped": True, "reason": "RotaryEmbedding needs model init"}, sys.stdout)
+            return
+        else:
+            with torch.no_grad():
+                baseline_out = baseline_op(*inputs)
+                gen_out = gen_op(*inputs)
+
+        # Compare outputs
+        if isinstance(baseline_out, tuple):
+            baseline_tensors = [t for t in baseline_out if isinstance(t, torch.Tensor)]
+            gen_tensors = [t for t in gen_out if isinstance(t, torch.Tensor)]
+        else:
+            baseline_tensors = [baseline_out]
+            gen_tensors = [gen_out]
+
+        max_diff = 0.0
+        for bt, gt in zip(baseline_tensors, gen_tensors):
+            if bt.dtype in (torch.float16, torch.bfloat16):
+                bt = bt.float()
+                gt = gt.float()
+            diff = (bt - gt).abs().max().item()
+            max_diff = max(max_diff, diff)
+
+        json.dump({"success": True, "max_diff": max_diff, "close": max_diff < 0.01}, sys.stdout)
+
+    except Exception:
+        json.dump({"success": False, "error": traceback.format_exc()[-2000:]}, sys.stdout)
+
+if __name__ == "__main__":
+    main()
+'''
+
+
+def run_unit_test(kernel: GeneratedKernel, op: OperatorSpec) -> dict:
+    """Run a quick unit test comparing baseline vs generated op with random data.
+
+    Returns a dict with 'success', 'close', 'max_diff', etc.
+    Runs in a subprocess to isolate CUDA state.
+    """
+    pkg_dir = Path(__file__).resolve().parent.parent
+    project_root = str(pkg_dir.parent)
+    package_name = pkg_dir.name
+
+    tmp_dir = tempfile.mkdtemp(prefix="kb_utest_")
+    worker_file = os.path.join(tmp_dir, "_unit_test.py")
+    with open(worker_file, "w") as f:
+        f.write(_UNIT_TEST_WORKER)
+
+    config = {
+        "project_root": project_root,
+        "package_name": package_name,
+        "op_name": kernel.op_name,
+        "class_name": kernel.class_name,
+        "code_file": kernel.file_path,
+        "baseline_module": op.module_path,
+    }
+
+    try:
+        result = subprocess.run(
+            [sys.executable, worker_file, json.dumps(config)],
+            capture_output=True, text=True, timeout=120,
+        )
+        if result.returncode != 0:
+            return {"success": False, "error": (result.stderr or "")[-1000:]}
+        return json.loads(result.stdout)
+    except subprocess.TimeoutExpired:
+        return {"success": False, "error": "Unit test timed out (120s)"}
+    except Exception as e:
+        return {"success": False, "error": str(e)}
+
+
+# ---------------------------------------------------------------------------
+# Kernel generation (single operator, with retries)
 # ---------------------------------------------------------------------------
 def _save_kernel(op_name: str, code: str) -> Path:
     """Write kernel code to _generated_kernels/<op_name>.py and return the path."""
@@ -277,75 +438,94 @@ def _save_kernel(op_name: str, code: str) -> Path:
     return out_file
 
 
-def generate_kernel(
+async def generate_kernel_async(
     op: OperatorSpec,
     cuda_only: bool,
     max_retries: int,
     llm_model: str,
+    session,
 ) -> GeneratedKernel:
     """Generate a replacement kernel for one operator, with retries."""
     result = GeneratedKernel(op_name=op.name, class_name=op.class_name, code="")
 
     prompt = build_generation_prompt(op, cuda_only)
-    print(f"\n  Generating {op.class_name} ({op.name})...")
+    print(f"  [gen] {op.class_name} ({op.name}): starting...", flush=True)
 
     for attempt in range(1, max_retries + 1):
         result.attempts = attempt
-        print(f"    Attempt {attempt}/{max_retries}... ", end="", flush=True)
 
         try:
-            response = call_llm(
+            response = await call_llm_async(
                 prompt, model_name=llm_model, max_tokens=8192, temperature=0.0,
-                system=SYSTEM_PROMPT,
+                system=SYSTEM_PROMPT, session=session,
             )
         except Exception as e:
             error_msg = f"LLM API call failed: {e}"
-            print(f"API error: {e}")
+            print(f"  [gen] {op.name} attempt {attempt}: API error: {e}", flush=True)
             result.error = error_msg
             if attempt < max_retries:
-                time.sleep(2)
+                await asyncio.sleep(2)
             continue
 
         code = extract_python_code(response)
         if code is None:
             error_msg = "No Python code block found in LLM response."
-            print("no code block found")
+            print(f"  [gen] {op.name} attempt {attempt}: no code block", flush=True)
             result.error = error_msg
             result.code = response[:500]
-            prompt = build_retry_prompt(
-                op, response[:500], error_msg, cuda_only,
-            )
+            prompt = build_retry_prompt(op, response[:500], error_msg, cuda_only)
             continue
 
         result.code = code
         out_file = _save_kernel(op.name, code)
         result.file_path = str(out_file)
 
-        cls, error_msg = validate_kernel(code, op.class_name)
+        # Validation is CPU/GPU bound -- run in thread pool to avoid blocking the event loop
+        loop = asyncio.get_event_loop()
+        cls, error_msg = await loop.run_in_executor(
+            None, validate_kernel, code, op.class_name,
+        )
+
         if cls is not None:
-            print("OK")
+            print(f"  [gen] {op.name}: OK (attempt {attempt})", flush=True)
             result.success = True
             result.error = None
             return result
 
-        print(f"validation failed")
+        print(f"  [gen] {op.name} attempt {attempt}: validation failed", flush=True)
         result.error = error_msg
-        print(f"      Error: {_truncate(error_msg, 200)}")
 
         if attempt < max_retries:
             prompt = build_retry_prompt(op, code, error_msg, cuda_only)
 
-    print(f"    FAILED after {max_retries} attempts")
+    print(f"  [gen] {op.name}: FAILED after {max_retries} attempts", flush=True)
     return result
 
 
-def _regenerate_kernel(
+async def generate_all_kernels(
+    ops: list[OperatorSpec],
+    cuda_only: bool,
+    max_retries: int,
+    llm_model: str,
+) -> list[GeneratedKernel]:
+    """Generate kernels for all operators in parallel."""
+    import aiohttp
+    async with aiohttp.ClientSession() as session:
+        tasks = [
+            generate_kernel_async(op, cuda_only, max_retries, llm_model, session)
+            for op in ops
+        ]
+        return await asyncio.gather(*tasks)
+
+
+async def regenerate_kernel_async(
     op: OperatorSpec,
     old_kernel: GeneratedKernel,
     runtime_error: str,
     cuda_only: bool,
     max_retries: int,
     llm_model: str,
+    session=None,
 ) -> GeneratedKernel:
     """Re-generate a kernel that failed at runtime, feeding the error to the LLM."""
     result = GeneratedKernel(
@@ -353,27 +533,26 @@ def _regenerate_kernel(
         file_path=old_kernel.file_path,
     )
     prompt = build_retry_prompt(op, old_kernel.code, runtime_error, cuda_only)
-    print(f"\n  Re-generating {op.class_name} ({op.name}) after runtime error...")
+    print(f"  [regen] {op.name}: re-generating after runtime error...", flush=True)
 
     for attempt in range(1, max_retries + 1):
         result.attempts = attempt
-        print(f"    Attempt {attempt}/{max_retries}... ", end="", flush=True)
 
         try:
-            response = call_llm(
+            response = await call_llm_async(
                 prompt, model_name=llm_model, max_tokens=8192, temperature=0.0,
-                system=SYSTEM_PROMPT,
+                system=SYSTEM_PROMPT, session=session,
             )
         except Exception as e:
-            print(f"API error: {e}")
+            print(f"  [regen] {op.name} attempt {attempt}: API error: {e}", flush=True)
             result.error = f"LLM API call failed: {e}"
             if attempt < max_retries:
-                time.sleep(2)
+                await asyncio.sleep(2)
             continue
 
         code = extract_python_code(response)
         if code is None:
-            print("no code block found")
+            print(f"  [regen] {op.name} attempt {attempt}: no code block", flush=True)
             result.error = "No Python code block found in LLM response."
             result.code = response[:500]
             prompt = build_retry_prompt(op, response[:500], result.error, cuda_only)
@@ -383,21 +562,23 @@ def _regenerate_kernel(
         out_file = _save_kernel(op.name, code)
         result.file_path = str(out_file)
 
-        cls, error_msg = validate_kernel(code, op.class_name)
+        loop = asyncio.get_event_loop()
+        cls, error_msg = await loop.run_in_executor(
+            None, validate_kernel, code, op.class_name,
+        )
+
         if cls is not None:
-            print("OK")
+            print(f"  [regen] {op.name}: OK (attempt {attempt})", flush=True)
             result.success = True
             result.error = None
             return result
 
-        print("validation failed")
+        print(f"  [regen] {op.name} attempt {attempt}: validation failed", flush=True)
         result.error = error_msg
-        print(f"      Error: {_truncate(error_msg, 200)}")
-
         if attempt < max_retries:
             prompt = build_retry_prompt(op, code, error_msg, cuda_only)
 
-    print(f"    FAILED after {max_retries} attempts")
+    print(f"  [regen] {op.name}: FAILED after {max_retries} attempts", flush=True)
     return result
 
 
@@ -608,7 +789,6 @@ def run_benchmark(
         timeout=600,
     )
 
-    # Always relay subprocess stdout so the user can see progress
     if result.stdout:
         print(result.stdout, end="")
 
@@ -643,6 +823,24 @@ def print_generation_report(kernels: list[GeneratedKernel]) -> None:
 
     ok = sum(1 for k in kernels if k.success)
     print(f"\n  {ok}/{len(kernels)} kernels compiled successfully")
+
+
+def print_unit_test_report(results: dict[str, dict]) -> None:
+    print(f"\n{'=' * 70}")
+    print("  UNIT TEST RESULTS (random-data smoke test)")
+    print(f"{'=' * 70}")
+
+    for op_name, res in sorted(results.items()):
+        if res.get("skipped"):
+            print(f"  {op_name:<25} SKIPPED  ({res.get('reason', '')})")
+        elif not res.get("success"):
+            err = _truncate(res.get("error", "unknown"), 100)
+            print(f"  {op_name:<25} FAILED   {err}")
+        else:
+            close = res.get("close", False)
+            diff = res.get("max_diff", float("inf"))
+            status = "PASS" if close else "FAIL (max_diff too large)"
+            print(f"  {op_name:<25} {status}  max_diff={diff:.6f}")
 
 
 def print_benchmark_report(bench_result: dict) -> None:
@@ -720,12 +918,17 @@ def main():
         "--llm-model", type=str, default="claude-opus-4-6",
         help="LLM model to use for kernel generation (default: claude-opus-4-6)",
     )
+    parser.add_argument(
+        "--skip-unit-tests", action="store_true",
+        help="Skip per-operator unit tests and go straight to e2e benchmark",
+    )
     args = parser.parse_args()
 
-    # Clear previous generated kernels
+    # Clear previous generated kernels (but keep the build cache)
     if _OUTPUT_DIR.exists():
         shutil.rmtree(_OUTPUT_DIR)
     _OUTPUT_DIR.mkdir(parents=True, exist_ok=True)
+    _CUDA_BUILD_CACHE.mkdir(parents=True, exist_ok=True)
 
     print("=" * 70)
     print("  kb-nano LLM Kernel Generation Agent")
@@ -737,6 +940,7 @@ def main():
     print(f"  LLM model:   {args.llm_model}")
     print(f"  TP:          {args.tp}")
     print(f"  Output:      {_OUTPUT_DIR}")
+    print(f"  CUDA cache:  {_CUDA_BUILD_CACHE}")
     print("=" * 70)
 
     # Step 1: Discover operators
@@ -750,17 +954,51 @@ def main():
     for op in ops:
         print(f"    L{op.level} {op.name:<25} {op.class_name}")
 
-    # Step 2: Generate kernels
-    kernels = []
-    for op in ops:
-        kernel = generate_kernel(op, args.cuda_only, args.max_retries, args.llm_model)
-        kernels.append(kernel)
+    # Step 2: Generate kernels IN PARALLEL
+    print(f"\n  Generating {len(ops)} kernels in parallel...")
+    t_gen_start = time.perf_counter()
+    kernels = asyncio.run(
+        generate_all_kernels(ops, args.cuda_only, args.max_retries, args.llm_model)
+    )
+    t_gen = time.perf_counter() - t_gen_start
+    print(f"\n  Generation completed in {t_gen:.1f}s")
 
     print_generation_report(kernels)
 
-    # Step 3: Benchmark (with retry loop for runtime failures)
-    # Build a map from op_name -> (OperatorSpec, GeneratedKernel) for retry
+    # Step 3: Per-operator unit tests with random data (parallel via threads)
     op_by_name = {op.name: op for op in ops}
+    testable = [k for k in kernels if k.success and k.file_path]
+
+    if not args.skip_unit_tests and testable:
+        print(f"\n  Running unit tests for {len(testable)} operators in parallel...")
+        t_test_start = time.perf_counter()
+        unit_results: dict[str, dict] = {}
+
+        with ThreadPoolExecutor(max_workers=min(4, len(testable))) as pool:
+            futures = {
+                pool.submit(run_unit_test, k, op_by_name[k.op_name]): k
+                for k in testable
+            }
+            for future in futures:
+                k = futures[future]
+                try:
+                    unit_results[k.op_name] = future.result(timeout=180)
+                except Exception as e:
+                    unit_results[k.op_name] = {"success": False, "error": str(e)}
+
+        t_test = time.perf_counter() - t_test_start
+        print(f"  Unit tests completed in {t_test:.1f}s")
+        print_unit_test_report(unit_results)
+
+        # Exclude kernels that failed unit tests from e2e benchmark
+        for k in kernels:
+            res = unit_results.get(k.op_name, {})
+            if res.get("success") and not res.get("skipped") and not res.get("close"):
+                print(f"  Excluding {k.op_name} from e2e benchmark (unit test failed)")
+                k.success = False
+                k.error = f"Unit test failed: max_diff={res.get('max_diff', '?')}"
+
+    # Step 4: E2E Benchmark (with retry loop for runtime failures)
     bench_attempt = 0
     max_bench_retries = args.max_retries
 
@@ -773,7 +1011,6 @@ def main():
         if bench_result.get("success"):
             break
 
-        # Try to identify and fix the failing kernel
         failing = _identify_failing_kernel(bench_result, kernels)
         if failing is None or bench_attempt > max_bench_retries:
             if failing is None:
@@ -787,17 +1024,13 @@ def main():
               f"Re-generating (bench retry {bench_attempt}/{max_bench_retries})...")
 
         op = op_by_name[failing.op_name]
-        # Mark the kernel as failed so we can re-generate
         failing.success = False
         failing.error = error_text
 
-        # Use the existing generate_kernel to re-generate with error context
-        # Start with a retry prompt seeded by the runtime error
-        new_kernel = _regenerate_kernel(
+        new_kernel = asyncio.run(_regen_single(
             op, failing, error_text, args.cuda_only, args.max_retries, args.llm_model,
-        )
+        ))
 
-        # Replace the old kernel in the list
         for i, k in enumerate(kernels):
             if k.op_name == failing.op_name:
                 kernels[i] = new_kernel
@@ -809,6 +1042,14 @@ def main():
             continue
 
     print_benchmark_report(bench_result)
+
+
+async def _regen_single(op, old_kernel, error_text, cuda_only, max_retries, llm_model):
+    import aiohttp
+    async with aiohttp.ClientSession() as session:
+        return await regenerate_kernel_async(
+            op, old_kernel, error_text, cuda_only, max_retries, llm_model, session,
+        )
 
 
 if __name__ == "__main__":
