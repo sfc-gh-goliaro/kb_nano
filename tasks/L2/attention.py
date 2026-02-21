@@ -11,6 +11,8 @@ from ..L1.store_kvcache import StoreKVCache
 from ..L1.flash_attn_prefill import FlashAttnPrefill
 from ..L1.flash_attn_decode import FlashAttnDecode
 
+from flash_attn import flash_attn_varlen_func
+
 
 class Attention(nn.Module):
     """Multi-head attention with GQA, flash_attn, and paged KV cache."""
@@ -54,13 +56,23 @@ class Attention(nn.Module):
             self.store_kvcache(k, v, k_cache, v_cache, ctx.slot_mapping)
 
         if ctx.is_prefill:
-            o = self.flash_attn_prefill(
-                q, k, v,
-                cu_seqlens_q=ctx.cu_seqlens_q, cu_seqlens_k=ctx.cu_seqlens_k,
-                max_seqlen_q=ctx.max_seqlen_q, max_seqlen_k=ctx.max_seqlen_k,
-                softmax_scale=self.scaling, causal=True,
-                block_table=ctx.block_tables,
-            )
+            if ctx.block_tables is not None:
+                o = flash_attn_varlen_func(
+                    q, k_cache, v_cache,
+                    cu_seqlens_q=ctx.cu_seqlens_q,
+                    cu_seqlens_k=ctx.cu_seqlens_k,
+                    max_seqlen_q=ctx.max_seqlen_q,
+                    max_seqlen_k=ctx.max_seqlen_k,
+                    softmax_scale=self.scaling, causal=True,
+                    block_table=ctx.block_tables,
+                )
+            else:
+                o = self.flash_attn_prefill(
+                    q, k, v,
+                    cu_seqlens_q=ctx.cu_seqlens_q, cu_seqlens_k=ctx.cu_seqlens_k,
+                    max_seqlen_q=ctx.max_seqlen_q, max_seqlen_k=ctx.max_seqlen_k,
+                    softmax_scale=self.scaling, causal=True,
+                )
         else:
             o = self.flash_attn_decode(
                 q.unsqueeze(1), k_cache, v_cache,

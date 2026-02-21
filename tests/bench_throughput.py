@@ -1,8 +1,8 @@
 #!/usr/bin/env python3
 """
-Throughput benchmark: standalone engine vs vLLM.
+Throughput benchmark: standalone engine vs vLLM vs sglang.
 
-Both engines run at full speed (CUDA graphs, torch.compile enabled) on the
+All engines run at full speed (CUDA graphs, torch.compile enabled) on the
 same random-token-ID workload, matching the methodology from nano-vllm/bench.py.
 
 Usage:
@@ -136,6 +136,63 @@ if __name__ == "__main__":
     main()
 '''
 
+# ---------------------------------------------------------------------------
+# sglang worker (runs in subprocess, full speed)
+# ---------------------------------------------------------------------------
+SGLANG_WORKER = r'''
+import json, os, sys, time
+
+def main():
+    with open(sys.argv[1]) as f:
+        cfg = json.load(f)
+
+    from sglang.srt.entrypoints.engine import Engine
+
+    engine = Engine(
+        model_path=cfg["model"],
+        tp_size=cfg["tp"],
+        random_seed=cfg["seed"],
+    )
+
+    prompt_token_ids = cfg["prompt_token_ids"]
+    output_lens = cfg["output_lens"]
+
+    sp_list = [
+        {"temperature": 0.0, "ignore_eos": True, "max_new_tokens": ol}
+        for ol in output_lens
+    ]
+
+    # Warmup
+    engine.generate(input_ids=[0] * 16, sampling_params={"temperature": 0.0, "max_new_tokens": 16})
+
+    # Timed run
+    import torch
+    torch.cuda.synchronize()
+    start = time.perf_counter()
+    outputs = engine.generate(
+        input_ids=prompt_token_ids,
+        sampling_params=sp_list,
+    )
+    torch.cuda.synchronize()
+    elapsed = time.perf_counter() - start
+
+    total_output_tokens = sum(
+        o["meta_info"]["completion_tokens"]
+        for o in outputs
+    )
+
+    with open(cfg["output_file"], "w") as f:
+        json.dump({
+            "elapsed": elapsed,
+            "total_output_tokens": total_output_tokens,
+        }, f)
+
+    engine.shutdown()
+
+if __name__ == "__main__":
+    main()
+'''
+
 
 # ---------------------------------------------------------------------------
 # Subprocess runner
@@ -219,6 +276,22 @@ def main():
         "--load-vllm", type=str, default=None,
         help="Load previously saved vLLM results instead of re-running vLLM",
     )
+    parser.add_argument(
+        "--save-sglang", type=str, default=None,
+        help="Save sglang results to a JSON file for reuse in later runs",
+    )
+    parser.add_argument(
+        "--load-sglang", type=str, default=None,
+        help="Load previously saved sglang results instead of re-running sglang",
+    )
+    parser.add_argument(
+        "--skip-sglang", action="store_true",
+        help="Skip sglang benchmark",
+    )
+    parser.add_argument(
+        "--skip-vllm", action="store_true",
+        help="Skip vLLM benchmark",
+    )
     args = parser.parse_args()
 
     this_dir = os.path.dirname(os.path.abspath(__file__))
@@ -241,7 +314,7 @@ def main():
     short_name = args.model.split("/")[-1]
 
     print("=" * 70)
-    print("  Throughput Benchmark: Ours vs vLLM")
+    print("  Throughput Benchmark: Ours vs vLLM vs sglang")
     print("=" * 70)
     print(f"  Model          : {args.model}")
     print(f"  TP             : {args.tp}")
@@ -261,7 +334,10 @@ def main():
         "package_name": package_name,
     }
 
-    if args.load_vllm:
+    # --- Run vLLM ---
+    if args.skip_vllm:
+        vllm_data = None
+    elif args.load_vllm:
         print(f"\n  Loading cached vLLM results from: {args.load_vllm}")
         with open(args.load_vllm) as f:
             vllm_data = json.load(f)
@@ -275,6 +351,24 @@ def main():
                 json.dump(vllm_data, f, indent=2)
             print(f"  vLLM results saved to: {args.save_vllm}")
 
+    # --- Run sglang ---
+    if args.skip_sglang:
+        sglang_data = None
+    elif args.load_sglang:
+        print(f"\n  Loading cached sglang results from: {args.load_sglang}")
+        with open(args.load_sglang) as f:
+            sglang_data = json.load(f)
+    else:
+        sglang_data = run_worker(
+            SGLANG_WORKER, dict(config),
+            f"sglang [{short_name}] (TP={args.tp}, full speed)",
+        )
+        if sglang_data and args.save_sglang:
+            with open(args.save_sglang, "w") as f:
+                json.dump(sglang_data, f, indent=2)
+            print(f"  sglang results saved to: {args.save_sglang}")
+
+    # --- Run Ours ---
     standalone_data = run_worker(
         STANDALONE_WORKER, dict(config),
         f"Ours  [{short_name}] (TP={args.tp}, full speed)",
@@ -284,8 +378,8 @@ def main():
     print("  RESULTS")
     print(f"{'=' * 70}")
 
-    if vllm_data is None and standalone_data is None:
-        print("  ERROR: Both engines failed.")
+    if vllm_data is None and standalone_data is None and sglang_data is None:
+        print("  ERROR: All engines failed.")
         sys.exit(1)
 
     if vllm_data:
@@ -296,7 +390,19 @@ def main():
         print(f"    Throughput    : {v_tps:,.1f} output tok/s")
     else:
         v_tps = None
-        print("  vLLM: FAILED")
+        if not args.skip_vllm:
+            print("  vLLM: FAILED")
+
+    if sglang_data:
+        sg_tps = sglang_data["total_output_tokens"] / sglang_data["elapsed"]
+        print(f"  sglang:")
+        print(f"    Output tokens : {sglang_data['total_output_tokens']:,}")
+        print(f"    Time          : {sglang_data['elapsed']:.2f}s")
+        print(f"    Throughput    : {sg_tps:,.1f} output tok/s")
+    else:
+        sg_tps = None
+        if not args.skip_sglang:
+            print("  sglang: FAILED")
 
     if standalone_data:
         s_tps = standalone_data["total_output_tokens"] / standalone_data["elapsed"]
@@ -308,10 +414,19 @@ def main():
         s_tps = None
         print("  Ours: FAILED")
 
+    print()
     if v_tps and s_tps:
         ratio = s_tps / v_tps
         winner = "Ours" if ratio > 1.0 else "vLLM"
-        print(f"\n  Speedup (Ours / vLLM) : {ratio:.2f}x  ({winner} is faster)")
+        print(f"  Ours / vLLM   : {ratio:.2f}x  ({winner} is faster)")
+    if sg_tps and s_tps:
+        ratio = s_tps / sg_tps
+        winner = "Ours" if ratio > 1.0 else "sglang"
+        print(f"  Ours / sglang : {ratio:.2f}x  ({winner} is faster)")
+    if v_tps and sg_tps:
+        ratio = sg_tps / v_tps
+        winner = "sglang" if ratio > 1.0 else "vLLM"
+        print(f"  sglang / vLLM : {ratio:.2f}x  ({winner} is faster)")
 
     print(f"{'=' * 70}")
 

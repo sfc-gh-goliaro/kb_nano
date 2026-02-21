@@ -29,7 +29,7 @@ import torch.distributed as dist
 import torch.multiprocessing as mp
 from transformers import AutoTokenizer
 
-from .infra.context import get_context, reset_context, set_context
+from .infra.context import get_context, reset_context, set_context, set_mixed_context
 from .infra.tp import set_custom_ar
 from .weight_loader import load_model
 
@@ -37,7 +37,7 @@ BLOCK_SIZE = 256
 MAX_NUM_BATCHED_TOKENS = 16384
 MAX_NUM_SEQS = 512
 MAX_MODEL_LEN = 4096
-NCCL_PORT = 29501
+NCCL_PORT = int(os.environ.get("KB_NANO_NCCL_PORT", "29501"))
 
 _PROFILE = os.environ.get("KB_NANO_PROFILE", "0") == "1"
 
@@ -64,6 +64,7 @@ class GenerationOutput:
 
 class SeqStatus(Enum):
     WAITING = auto()
+    PREFILLING = auto()
     RUNNING = auto()
     FINISHED = auto()
 
@@ -85,6 +86,7 @@ class Sequence:
         self.ignore_eos = ignore_eos
         self.block_table: list[int] = []
         self.status = SeqStatus.WAITING
+        self.num_computed_tokens: int = 0
 
     def __len__(self):
         if self.token_ids is not None:
@@ -106,6 +108,20 @@ class Sequence:
             return self.token_ids[-1]
         return self._last_token
 
+    @property
+    def num_prompt_tokens(self):
+        return len(self.prompt_ids)
+
+    @property
+    def num_remaining_prefill(self):
+        return max(0, self.num_prompt_tokens - self.num_computed_tokens)
+
+    def blocks_needed_for(self, num_tokens):
+        """Number of NEW blocks needed to store num_tokens more KV slots."""
+        total_after = self.num_computed_tokens + num_tokens
+        blocks_after = (total_after + BLOCK_SIZE - 1) // BLOCK_SIZE
+        return max(0, blocks_after - len(self.block_table))
+
     def append_token(self, token_id):
         self.token_ids.append(token_id)
         self.generated_ids.append(token_id)
@@ -113,10 +129,11 @@ class Sequence:
     def __getstate__(self):
         """Minimal pickling for shared memory transfer to non-rank-0 workers."""
         return (len(self), len(self.prompt_ids), self.block_table,
+                self.num_computed_tokens,
                 self.token_ids if not self.generated_ids else self.last_token)
 
     def __setstate__(self, state):
-        self._num_tokens, num_prompt, self.block_table = state[:-1]
+        self._num_tokens, num_prompt, self.block_table, self.num_computed_tokens = state[:-1]
         if isinstance(state[-1], list):
             self.token_ids = state[-1]
         else:
@@ -138,6 +155,13 @@ class BlockManager:
 
     def allocate(self, seq):
         for _ in range(seq.num_blocks):
+            seq.block_table.append(self.free_block_ids.popleft())
+
+    def can_allocate_n(self, n_blocks):
+        return len(self.free_block_ids) >= n_blocks
+
+    def allocate_n(self, seq, n_blocks):
+        for _ in range(n_blocks):
             seq.block_table.append(self.free_block_ids.popleft())
 
     def can_append(self, seq):
@@ -194,8 +218,7 @@ class ModelRunner:
         self.is_moe = hasattr(self.config, "num_local_experts")
         if not self.enforce_eager:
             self.capture_cudagraph()
-        if world_size > 1:
-            self._init_greedy_buffers()
+        self._init_greedy_buffers()
         torch.set_default_device("cpu")
         torch.set_default_dtype(default_dtype)
 
@@ -313,6 +336,7 @@ class ModelRunner:
         cu_seqlens_q, cu_seqlens_k = [0], [0]
         max_sq, max_sk = 0, 0
         slot_mapping = []
+        max_bt = 0
         for seq in seqs:
             sl = len(seq)
             input_ids.extend(seq.token_ids)
@@ -328,6 +352,19 @@ class ModelRunner:
                 end = start + (BLOCK_SIZE if i != seq.num_blocks - 1
                                else seq.last_block_num_tokens)
                 slot_mapping.extend(range(start, end))
+            blen = len(seq.block_table)
+            if blen > max_bt:
+                max_bt = blen
+
+        block_tables = None
+        if max_bt > 0:
+            n = len(seqs)
+            bt = np.full((n, max_bt), -1, dtype=np.int32)
+            for i, seq in enumerate(seqs):
+                if seq.block_table:
+                    b = seq.block_table
+                    bt[i, :len(b)] = b
+            block_tables = torch.from_numpy(bt).pin_memory().cuda(non_blocking=True)
 
         set_context(
             True,
@@ -335,6 +372,7 @@ class ModelRunner:
             torch.tensor(cu_seqlens_k, dtype=torch.int32, pin_memory=True).cuda(non_blocking=True),
             max_sq, max_sk,
             torch.tensor(slot_mapping, dtype=torch.int32, pin_memory=True).cuda(non_blocking=True),
+            block_tables=block_tables,
         )
         return (
             torch.tensor(input_ids, dtype=torch.int64, pin_memory=True).cuda(non_blocking=True),
@@ -369,6 +407,81 @@ class ModelRunner:
         return (
             torch.from_numpy(ids).pin_memory().cuda(non_blocking=True),
             torch.from_numpy(pos).pin_memory().cuda(non_blocking=True),
+        )
+
+    def prepare_mixed_batch(self, prefill_seqs, prefill_chunk_sizes, decode_seqs):
+        """Prepare a unified mixed batch with full prefills and decode tokens.
+
+        All attention reads from the paged KV cache via block_table.
+        cu_seqlens_q/k cover all sequences (prefill + decode).
+        """
+        input_ids, positions = [], []
+        slot_mapping = []
+        cu_seqlens_q, cu_seqlens_k = [0], [0]
+        max_sq, max_sk = 0, 0
+
+        block_size = self.block_size
+        all_seqs = list(prefill_seqs) + list(decode_seqs)
+        max_bt = 0
+
+        # Prefill sequences: q_len = prompt_len, k_len = prompt_len
+        for seq, chunk_size in zip(prefill_seqs, prefill_chunk_sizes):
+            sl = chunk_size
+            input_ids.extend(seq.token_ids[:sl])
+            positions.extend(range(sl))
+            cu_seqlens_q.append(cu_seqlens_q[-1] + sl)
+            cu_seqlens_k.append(cu_seqlens_k[-1] + sl)
+            max_sq = max(sl, max_sq)
+            max_sk = max(sl, max_sk)
+            for i in range(seq.num_blocks):
+                start = seq.block_table[i] * block_size
+                end = start + (block_size if i != seq.num_blocks - 1
+                               else seq.last_block_num_tokens)
+                slot_mapping.extend(range(start, end))
+            blen = len(seq.block_table)
+            if blen > max_bt:
+                max_bt = blen
+
+        num_prefill_tokens = len(input_ids)
+
+        # Decode sequences: q_len = 1, k_len = full context length
+        for seq in decode_seqs:
+            input_ids.append(seq.last_token)
+            positions.append(len(seq) - 1)
+            cu_seqlens_q.append(cu_seqlens_q[-1] + 1)
+            cu_seqlens_k.append(cu_seqlens_k[-1] + len(seq))
+            max_sk = max(len(seq), max_sk)
+            max_sq = max(1, max_sq)
+            slot_mapping.append(
+                seq.block_table[-1] * block_size + seq.last_block_num_tokens - 1
+            )
+            blen = len(seq.block_table)
+            if blen > max_bt:
+                max_bt = blen
+
+        num_decode_tokens = len(decode_seqs)
+
+        # Unified block table for all sequences
+        n_all = len(all_seqs)
+        bt = np.full((n_all, max_bt), -1, dtype=np.int32)
+        for i, seq in enumerate(all_seqs):
+            b = seq.block_table
+            bt[i, :len(b)] = b
+
+        set_mixed_context(
+            cu_seqlens_q=torch.tensor(cu_seqlens_q, dtype=torch.int32, pin_memory=True).cuda(non_blocking=True),
+            cu_seqlens_k=torch.tensor(cu_seqlens_k, dtype=torch.int32, pin_memory=True).cuda(non_blocking=True),
+            max_seqlen_q=max_sq,
+            max_seqlen_k=max_sk,
+            slot_mapping=torch.tensor(slot_mapping, dtype=torch.int32, pin_memory=True).cuda(non_blocking=True),
+            num_prefill_tokens=num_prefill_tokens,
+            num_decode_tokens=num_decode_tokens,
+            decode_context_lens=None,
+            decode_block_tables=torch.from_numpy(bt).pin_memory().cuda(non_blocking=True),
+        )
+        return (
+            torch.tensor(input_ids, dtype=torch.int64, pin_memory=True).cuda(non_blocking=True),
+            torch.tensor(positions, dtype=torch.int64, pin_memory=True).cuda(non_blocking=True),
         )
 
     @torch.inference_mode()
@@ -493,6 +606,9 @@ class ModelRunner:
         local_max_vals = gv["lm_max_vals"][:n]
         local_max_idxs = gv["lm_max_idxs"][:n] + self.model.lm_head.vocab_start
 
+        if self.world_size == 1:
+            return local_max_idxs
+
         info = self._greedy_info[:n]
         info[:, 0] = local_max_vals
         info[:, 1] = local_max_idxs.float()
@@ -500,13 +616,14 @@ class ModelRunner:
         gathered = [g[:n] for g in self._greedy_gathered]
         dist.all_gather(gathered, info)
 
+        for i, g in enumerate(gathered):
+            self._greedy_all_info[i, :n] = g
+        all_vals = self._greedy_all_info[:, :n, 0]
+        all_idxs = self._greedy_all_info[:, :n, 1].long()
+        best_rank = all_vals.argmax(dim=0)
+        token_ids = all_idxs[best_rank, self._greedy_arange[:n]]
+
         if self.rank == 0:
-            for i, g in enumerate(gathered):
-                self._greedy_all_info[i, :n] = g
-            all_vals = self._greedy_all_info[:, :n, 0]
-            all_idxs = self._greedy_all_info[:, :n, 1].long()
-            best_rank = all_vals.argmax(dim=0)
-            token_ids = all_idxs[best_rank, self._greedy_arange[:n]]
             return token_ids
         return None
 
@@ -601,6 +718,14 @@ class ModelRunner:
             else self.prepare_decode(seqs)
         )
         result = self.run_model(input_ids, positions, is_prefill)
+        reset_context()
+        return result
+
+    def run_mixed(self, prefill_seqs, prefill_chunk_sizes, decode_seqs):
+        input_ids, positions = self.prepare_mixed_batch(
+            prefill_seqs, prefill_chunk_sizes, decode_seqs,
+        )
+        result = self.run_model(input_ids, positions, True)
         reset_context()
         return result
 
@@ -774,8 +899,7 @@ class LlamaEngine:
         all_seqs = list(waiting)
 
         use_greedy = (sp_list[0].temperature == 0.0
-                      and not collect_logits
-                      and len(self.workers) > 0)
+                      and not collect_logits)
         block_size = BLOCK_SIZE
 
         profile = _PROFILE
@@ -793,7 +917,7 @@ class LlamaEngine:
             _dc_bs_counts = []
 
         while waiting or running:
-            # --- Prefill ---
+            # --- Prefill one batch (if any waiting) ---
             prefill_seqs = []
             num_batched_tokens = 0
             while waiting:
@@ -822,6 +946,7 @@ class LlamaEngine:
                             seq_logits[id(seq)].append(logits[i:i+1].cpu())
                     token_ids = self._sample(logits, sp_list[0])
                     for seq, tid in zip(prefill_seqs, token_ids):
+                        seq.num_computed_tokens = len(seq)
                         seq.append_token(tid)
                         done = len(seq.generated_ids) >= seq.max_tokens
                         if not seq.ignore_eos:
@@ -834,9 +959,11 @@ class LlamaEngine:
                     _pf_time += time.perf_counter() - _t0
                     _pf_steps += 1
                     _pf_tokens += num_batched_tokens
+
+            # --- Decode all running sequences (CUDA graph path) ---
+            if not running:
                 continue
 
-            # --- Decode ---
             if profile:
                 _t_sched = time.perf_counter()
 
@@ -855,7 +982,9 @@ class LlamaEngine:
             running.extendleft(reversed(temp))
 
             if not decode_seqs:
-                break
+                if not waiting:
+                    break
+                continue
 
             if profile:
                 _dc_sched_time += time.perf_counter() - _t_sched
@@ -872,6 +1001,7 @@ class LlamaEngine:
                     if profile:
                         _dc_tolist_time += time.perf_counter() - _t_tolist
                         _t_post = time.perf_counter()
+                    finished_set = set()
                     for seq, tid in zip(decode_seqs, token_ids):
                         seq.append_token(tid)
                         done = len(seq.generated_ids) >= seq.max_tokens
@@ -879,8 +1009,10 @@ class LlamaEngine:
                             done = done or tid == eos
                         if done:
                             seq.status = SeqStatus.FINISHED
-                            running.remove(seq)
+                            finished_set.add(id(seq))
                             bm.deallocate(seq)
+                    if finished_set:
+                        running = deque(s for s in running if id(s) not in finished_set)
                     if profile:
                         _dc_post_time += time.perf_counter() - _t_post
                 elif profile:
@@ -898,6 +1030,7 @@ class LlamaEngine:
                         for i, seq in enumerate(decode_seqs):
                             seq_logits[id(seq)].append(result[i:i+1].cpu())
                     token_ids = self._sample(result, sp_list[0])
+                    finished_set = set()
                     for seq, tid in zip(decode_seqs, token_ids):
                         seq.append_token(tid)
                         done = len(seq.generated_ids) >= seq.max_tokens
@@ -905,8 +1038,10 @@ class LlamaEngine:
                             done = done or tid == eos
                         if done:
                             seq.status = SeqStatus.FINISHED
-                            running.remove(seq)
+                            finished_set.add(id(seq))
                             bm.deallocate(seq)
+                    if finished_set:
+                        running = deque(s for s in running if id(s) not in finished_set)
                 if profile:
                     _dc_post_time += time.perf_counter() - _t_post
 

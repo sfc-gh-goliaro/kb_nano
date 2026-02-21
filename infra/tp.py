@@ -212,7 +212,7 @@ class ParallelLMHead(VocabParallelEmbedding):
     def project(self, x):
         """Linear projection only (no gather). Used inside CUDA graph."""
         ctx = get_context()
-        if ctx.is_prefill:
+        if ctx.is_prefill or ctx.is_mixed:
             last_indices = ctx.cu_seqlens_q[1:] - 1
             x = x[last_indices].contiguous()
         return self.linear_op(x, self.weight)

@@ -1,4 +1,7 @@
-"""Rotary position embeddings (RoPE), with optional Llama 3.1-style frequency scaling."""
+"""Rotary position embeddings (RoPE), with optional Llama 3.1-style frequency scaling.
+
+Uses sgl_kernel.apply_rope_with_cos_sin_cache_inplace for high-performance in-place RoPE.
+"""
 
 from __future__ import annotations
 
@@ -7,12 +10,7 @@ import math
 import torch
 import torch.nn as nn
 
-
-def _apply_rotary_emb(x, cos, sin):
-    x1, x2 = torch.chunk(x.float(), 2, dim=-1)
-    y1 = x1 * cos - x2 * sin
-    y2 = x2 * cos + x1 * sin
-    return torch.cat((y1, y2), dim=-1).to(x.dtype)
+from sgl_kernel import apply_rope_with_cos_sin_cache_inplace as _sgl_rope
 
 
 def _compute_scaled_inv_freq(
@@ -61,6 +59,7 @@ class RotaryEmbedding(nn.Module):
         rope_original_max_position_embeddings: int | None = None,
     ):
         super().__init__()
+        self.head_dim = head_dim
         inv_freq = 1.0 / (rope_theta ** (torch.arange(0, head_dim, 2, dtype=torch.float) / head_dim))
 
         if rope_scaling_factor != 1.0 and rope_original_max_position_embeddings is not None:
@@ -74,11 +73,13 @@ class RotaryEmbedding(nn.Module):
 
         t = torch.arange(max_position_embeddings, dtype=torch.float)
         freqs = torch.einsum("i,j -> ij", t, inv_freq)
-        cache = torch.cat((freqs.cos(), freqs.sin()), dim=-1).unsqueeze_(1)
+        cache = torch.cat((freqs.cos(), freqs.sin()), dim=-1).float()
         self.register_buffer("cos_sin_cache", cache, persistent=False)
 
-    @torch.compile
     def forward(self, positions, query, key):
-        cos_sin = self.cos_sin_cache[positions]
-        cos, sin = cos_sin.chunk(2, dim=-1)
-        return _apply_rotary_emb(query, cos, sin), _apply_rotary_emb(key, cos, sin)
+        cache = self.cos_sin_cache
+        if cache.dtype != torch.float32:
+            cache = cache.float()
+            self.cos_sin_cache = cache
+        _sgl_rope(positions, query, key, self.head_dim, cache)
+        return query, key

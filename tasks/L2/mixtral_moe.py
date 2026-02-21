@@ -6,9 +6,9 @@ import torch
 import torch.distributed as dist
 import torch.nn as nn
 
+from sgl_kernel.moe import topk_softmax as _sgl_topk_softmax
+
 from ...infra.tp import _tp_rank, _tp_size, get_custom_ar
-from ..L1.softmax import Softmax
-from ..L1.topk import Topk
 from ..L2.fused_experts import FusedExperts
 
 
@@ -42,9 +42,9 @@ class MixtralMoE(nn.Module):
         ))
         self.w2.weight_loader = self._w2_weight_loader
 
-        self.softmax_op = Softmax()
-        self.topk_op = Topk()
         self.fused_experts = FusedExperts()
+        self._topk_weights = None
+        self._topk_ids = None
 
     def _w13_weight_loader(self, param, loaded_weight, expert_id: int, is_w1: bool):
         tp, rank = _tp_size(), _tp_rank()
@@ -58,14 +58,21 @@ class MixtralMoE(nn.Module):
         N = self.intermediate_per_tp
         param.data[expert_id].copy_(loaded_weight.narrow(1, rank * N, N))
 
+    def _ensure_routing_buffers(self, M, device):
+        if self._topk_weights is None or self._topk_weights.size(0) < M:
+            self._topk_weights = torch.empty(M, self.top_k, device=device, dtype=torch.float32)
+            self._topk_ids = torch.empty(M, self.top_k, device=device, dtype=torch.int32)
+
     def forward(self, hidden_states: torch.Tensor) -> torch.Tensor:
         orig_shape = hidden_states.shape
         hidden_states = hidden_states.view(-1, self.hidden_size)
+        M = hidden_states.size(0)
 
         router_logits = self.gate(hidden_states)
-        routing_weights = self.softmax_op(router_logits, dim=-1, dtype=torch.float32)
-        topk_weights, topk_ids = self.topk_op(routing_weights, self.top_k, dim=-1)
-        topk_weights = topk_weights / topk_weights.sum(dim=-1, keepdim=True)
+        self._ensure_routing_buffers(M, hidden_states.device)
+        topk_weights = self._topk_weights[:M]
+        topk_ids = self._topk_ids[:M]
+        _sgl_topk_softmax(topk_weights, topk_ids, router_logits, renormalize=True)
         topk_weights = topk_weights.to(hidden_states.dtype)
 
         out = self.fused_experts(

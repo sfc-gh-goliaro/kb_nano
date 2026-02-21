@@ -18,6 +18,14 @@ class Context:
     context_lens: torch.Tensor | None = None
     block_tables: torch.Tensor | None = None
 
+    # Chunked prefill: mixed batch with both prefill and decode tokens
+    is_mixed: bool = False
+    num_prefill_tokens: int = 0
+    num_decode_tokens: int = 0
+    # Decode-specific fields for mixed batches (indexed over decode tokens only)
+    decode_context_lens: torch.Tensor | None = None
+    decode_block_tables: torch.Tensor | None = None
+
 
 _CONTEXT = Context()
 
@@ -33,6 +41,23 @@ def set_context(is_prefill, cu_seqlens_q=None, cu_seqlens_k=None,
     _CONTEXT = Context(is_prefill, cu_seqlens_q, cu_seqlens_k,
                        max_seqlen_q, max_seqlen_k, slot_mapping,
                        context_lens, block_tables)
+
+
+def set_mixed_context(cu_seqlens_q, cu_seqlens_k, max_seqlen_q, max_seqlen_k,
+                      slot_mapping, num_prefill_tokens, num_decode_tokens,
+                      decode_context_lens, decode_block_tables):
+    global _CONTEXT
+    _CONTEXT = Context(
+        is_prefill=True, is_mixed=True,
+        cu_seqlens_q=cu_seqlens_q, cu_seqlens_k=cu_seqlens_k,
+        max_seqlen_q=max_seqlen_q, max_seqlen_k=max_seqlen_k,
+        slot_mapping=slot_mapping,
+        num_prefill_tokens=num_prefill_tokens,
+        num_decode_tokens=num_decode_tokens,
+        decode_context_lens=decode_context_lens,
+        decode_block_tables=decode_block_tables,
+        block_tables=decode_block_tables,
+    )
 
 
 def reset_context():
