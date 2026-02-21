@@ -11,6 +11,7 @@ A standalone, high-performance LLM inference engine supporting **Llama 3.1** and
 - **CUDA graph capture** for decode steps
 - **Flash Attention** for both prefill and paged decode
 - Greedy and top-p sampling
+- **Layered operator architecture** (L1 single-kernel ops through L4 full models) with clean separation of concerns
 - **Benchmarking suite** for evaluating custom CUDA/Triton/PyTorch kernels at 4 abstraction levels
 
 ## Project Structure
@@ -24,17 +25,21 @@ A standalone, high-performance LLM inference engine supporting **Llama 3.1** and
 │   │   ├── store_kvcache.py    # Triton KV cache store kernel
 │   │   ├── flash_attn_prefill.py
 │   │   ├── flash_attn_decode.py
+│   │   ├── allreduce.py        # AllReduce op + custom IPC all-reduce (NCCL fallback)
 │   │   ├── linear.py           # F.linear wrapper
 │   │   ├── embedding.py        # F.embedding wrapper
-│   │   ├── softmax.py          # F.softmax wrapper
-│   │   ├── topk.py             # torch.topk wrapper
-│   │   ├── moe_align.py        # Triton MoE token-expert alignment
-│   │   └── moe_grouped_gemm.py # Triton fused MoE grouped GEMM
+│   │   ├── moe_align.py        # MoE token-expert alignment
+│   │   ├── moe_sum.py          # Fused MoE sum kernel
+│   │   ├── moe_grouped_gemm.py # Triton fused MoE grouped GEMM
+│   │   └── csrc/               # CUDA/C++ kernel sources (JIT-compiled)
+│   │       └── custom_allreduce_kernels.cu  # P2P cross-device reduction
 │   ├── L2/                     # Multi-op blocks
 │   │   ├── attention.py        # GQA attention (QKV proj + RoPE + KV cache + flash attn)
 │   │   ├── llama_mlp.py        # Llama SwiGLU MLP
 │   │   ├── mixtral_moe.py      # Mixtral MoE routing + experts
-│   │   └── fused_experts.py    # Fused expert execution (2x grouped GEMM + SiLU)
+│   │   ├── fused_experts.py    # Fused expert execution (2x grouped GEMM + SiLU)
+│   │   ├── parallel_linear.py  # TP-aware linear layers (Column, Merged, QKV, Row)
+│   │   └── parallel_embedding.py # TP-aware embedding and LM head
 │   ├── L3/                     # Decoder layers
 │   │   ├── llama_decoder.py    # Llama decoder (attention + MLP + norms)
 │   │   └── mixtral_decoder.py  # Mixtral decoder (attention + MoE + norms)
@@ -43,9 +48,7 @@ A standalone, high-performance LLM inference engine supporting **Llama 3.1** and
 │       └── mixtral.py          # MixtralForCausalLM (config, model, LM head)
 ├── infra/                      # Non-benchmarkable infrastructure
 │   ├── context.py              # Global inference context (paged KV cache coordination)
-│   ├── tp.py                   # TP-aware linear layers, embeddings, LM head
-│   ├── custom_allreduce.py     # IPC-based custom all-reduce (replaces NCCL for intra-node TP)
-│   └── custom_allreduce_kernels.cu  # CUDA kernels for P2P cross-device reduction
+│   └── tp.py                   # TP helper utilities (_tp_size, _tp_rank)
 ├── bench/                      # Benchmarking suite
 │   ├── discovery.py            # Auto-discovers targets via import graph analysis
 │   ├── replacement.py          # Class monkey-patching for swapping implementations
@@ -57,8 +60,16 @@ A standalone, high-performance LLM inference engine supporting **Llama 3.1** and
 └── tests/                      # Test suite
     ├── test_vllm_alignment.py  # Token-level correctness test vs vLLM (eager mode)
     ├── test_bench.py           # Bench module tests (discovery, evaluator, replacement, integration)
-    ├── bench_throughput.py     # Throughput benchmark vs vLLM (full speed, nano-vllm style)
-    └── profile_gap.py          # Detailed prefill/decode timing breakdown vs vLLM
+    ├── bench_throughput.py     # Throughput benchmark vs vLLM (full speed)
+    └── debug/                  # Profiling and debugging scripts
+        ├── profile_decode.py
+        ├── profile_decode_detail.py
+        ├── profile_gap.py
+        ├── profile_llama_tp1.py
+        ├── profile_llama_tp1_detail.py
+        ├── profile_mixtral_detail.py
+        ├── tune_moe_gemm.py
+        └── bench_moe.py
 ```
 
 ## Quick Start
@@ -126,33 +137,34 @@ The model-to-operator mapping is derived automatically from the import graph —
 
 ## Performance
 
-Run `tests/bench_throughput.py` to reproduce. Workload: 256 sequences, random 100-1024 input/output tokens, `ignore_eos=True`, both engines with full optimizations (`enforce_eager=False`).
+Run `tests/bench_throughput.py` to reproduce. Workload uses random token IDs with `ignore_eos=True`, both engines with full optimizations (`enforce_eager=False`).
 
-**Hardware: 4× NVIDIA H200 (NVLink)**
+**Hardware: 4x NVIDIA H200 (NVLink)**
 
-| Model | TP | Seqs | vLLM (tok/s) | Ours (tok/s) | Ratio |
-|-------|---:|-----:|-------------:|-------------:|------:|
-| Llama-3.1-8B  | 1 |   32 |  2,938 |  2,671 | 0.91× |
-| Llama-3.1-8B  | 1 |   64 |  5,324 |  4,840 | 0.91× |
-| Llama-3.1-8B  | 1 |  128 |  7,465 |  6,784 | 0.91× |
-| Llama-3.1-8B  | 1 |  256 |  9,787 |  9,048 | 0.92× |
-| Llama-3.1-8B  | 4 |   32 |  5,274 |  4,896 | 0.93× |
-| Llama-3.1-8B  | 4 |   64 |  9,886 |  9,097 | 0.92× |
-| Llama-3.1-8B  | 4 |  128 | 14,682 | 14,101 | 0.96× |
-| Llama-3.1-8B  | 4 |  256 | 21,067 | 20,608 | 0.98× |
-| Llama-3.1-70B | 4 |  256 |  4,470 |  4,408 | 0.99× |
+### Llama 3.1
 
-Use `tests/profile_gap.py` for a detailed prefill/decode timing breakdown:
+| Model | TP | Seqs | Input/Output | vLLM (tok/s) | Ours (tok/s) | Ratio |
+|-------|---:|-----:|:------------:|-------------:|-------------:|------:|
+| Llama-3.1-8B  | 1 |  256 | 1024/1024 |  9,623 |  9,150 | 0.95x |
+| Llama-3.1-8B  | 4 |  128 |  512/256  | 16,468 | 16,605 | 1.01x |
+| Llama-3.1-8B  | 4 |  256 | 1024/1024 | 21,052 | 20,492 | 0.97x |
 
-```bash
-python -m kb-nano.tests.profile_gap \
-    --model meta-llama/Llama-3.1-8B-Instruct --tp 4 \
-    --batch-sizes 32 64 128 256
-```
+### Mixtral-8x7B
+
+| Model | TP | Seqs | Input/Output | vLLM (tok/s) | Ours (tok/s) | Ratio |
+|-------|---:|-----:|:------------:|-------------:|-------------:|------:|
+| Mixtral-8x7B | 4 |   64 |  512/256  |  3,397 |  4,401 | 1.30x |
+| Mixtral-8x7B | 4 |  128 |  512/256  |  4,720 |  7,230 | 1.53x |
+| Mixtral-8x7B | 4 |  256 | 1024/1024 |  9,769 |  9,852 | 1.01x |
 
 ### Key optimizations
 
-- **Custom IPC all-reduce**: Replaces NCCL for intra-node TP with direct GPU P2P memory access, matching vLLM's approach
+- **Fused RMSNorm**: Uses `sgl_kernel`'s fused residual-add + RMSNorm CUDA kernel, eliminating multiple kernel launches per norm call
+- **Fused SiLU-and-Mul**: Single-kernel SiLU activation with gate multiplication
+- **Inplace RoPE**: Applies rotary position embeddings in-place with cos/sin cache
+- **Fused MoE routing**: `topk_softmax` fuses softmax + top-k into a single kernel for expert routing
+- **Triton grouped GEMM**: Custom Triton kernels for MoE expert execution with auto-tuned configs
+- **Custom IPC all-reduce**: Replaces NCCL for intra-node TP with direct GPU P2P memory access
 - **SHM spin-wait signaling**: Workers spin on a shared-memory sequence counter instead of `multiprocessing.Event`, reducing per-step signaling latency from ~0.48ms to ~0.004ms
-- **LM head in CUDA graph**: The LM head projection and local argmax are captured inside the CUDA graph alongside the transformer body, eliminating extra kernel launch overhead
+- **LM head in CUDA graph**: The LM head projection and local argmax are captured inside the CUDA graph alongside the transformer body
 - **Greedy fast path**: For greedy decoding with TP, uses local argmax + small all-gather instead of gathering full logits across ranks

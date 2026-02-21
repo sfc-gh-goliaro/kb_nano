@@ -51,7 +51,7 @@ class AllReduce(nn.Module):
 def _load_ops():
     from torch.utils.cpp_extension import load
     src = os.path.join(
-        os.path.dirname(__file__), "..", "..", "infra", "custom_allreduce_kernels.cu",
+        os.path.dirname(__file__), "csrc", "custom_allreduce_kernels.cu",
     )
     return load(
         name="custom_allreduce_kernels",
