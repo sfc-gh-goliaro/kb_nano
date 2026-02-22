@@ -36,8 +36,12 @@ from .weight_loader import load_model
 BLOCK_SIZE = 256
 MAX_NUM_BATCHED_TOKENS = 16384
 MAX_NUM_SEQS = 512
-MAX_MODEL_LEN = 4096
+MAX_MODEL_LEN = 8192
 NCCL_PORT = int(os.environ.get("KB_NANO_NCCL_PORT", "29501"))
+
+# Placeholder token IDs for Qwen VL models
+QWEN_IMAGE_PAD_ID = 151655  # <|image_pad|>
+QWEN_VIDEO_PAD_ID = 151656  # <|video_pad|>
 
 _PROFILE = os.environ.get("KB_NANO_PROFILE", "0") == "1"
 
@@ -87,6 +91,13 @@ class Sequence:
         self.block_table: list[int] = []
         self.status = SeqStatus.WAITING
         self.num_computed_tokens: int = 0
+        # Multimodal fields
+        self.pixel_values = None  # preprocessed image pixels
+        self.image_grid_thw = None  # list of [t, h, w] per image
+        self.video_pixel_values = None
+        self.video_grid_thw = None
+        self.mrope_position_delta: int = 0
+        self.mrope_positions = None  # (3, seq_len) tensor computed at prefill
 
     def __len__(self):
         if self.token_ids is not None:
@@ -213,9 +224,10 @@ class ModelRunner:
         self.model, self.config = load_model(
             model_name, torch.device(f"cuda:{rank}"), dtype,
         )
+        self.is_moe = hasattr(self.config, "num_local_experts")
+        self.is_qwen_vl = hasattr(self.config, "mrope_section")
         self.warmup_model()
         self.allocate_kv_cache()
-        self.is_moe = hasattr(self.config, "num_local_experts")
         if not self.enforce_eager:
             self.capture_cudagraph()
         self._init_greedy_buffers()
@@ -337,10 +349,20 @@ class ModelRunner:
         max_sq, max_sk = 0, 0
         slot_mapping = []
         max_bt = 0
+        use_mrope = self.is_qwen_vl and any(s.mrope_positions is not None for s in seqs)
+        mrope_pos_list = [] if use_mrope else None
+
         for seq in seqs:
             sl = len(seq)
             input_ids.extend(seq.token_ids)
-            positions.extend(range(sl))
+            if use_mrope and seq.mrope_positions is not None:
+                mrope_pos_list.append(seq.mrope_positions)
+            else:
+                positions.extend(range(sl))
+                if use_mrope:
+                    mrope_pos_list.append(
+                        torch.arange(sl, dtype=torch.int64).unsqueeze(0).expand(3, -1)
+                    )
             cu_seqlens_q.append(cu_seqlens_q[-1] + sl)
             cu_seqlens_k.append(cu_seqlens_k[-1] + sl)
             max_sq = max(sl, max_sq)
@@ -374,10 +396,15 @@ class ModelRunner:
             torch.tensor(slot_mapping, dtype=torch.int32, pin_memory=True).cuda(non_blocking=True),
             block_tables=block_tables,
         )
-        return (
-            torch.tensor(input_ids, dtype=torch.int64, pin_memory=True).cuda(non_blocking=True),
-            torch.tensor(positions, dtype=torch.int64, pin_memory=True).cuda(non_blocking=True),
-        )
+
+        input_ids_t = torch.tensor(input_ids, dtype=torch.int64, pin_memory=True).cuda(non_blocking=True)
+
+        if use_mrope:
+            positions_t = torch.cat(mrope_pos_list, dim=1).to(torch.int64).pin_memory().cuda(non_blocking=True)
+        else:
+            positions_t = torch.tensor(positions, dtype=torch.int64, pin_memory=True).cuda(non_blocking=True)
+
+        return input_ids_t, positions_t
 
     def prepare_decode(self, seqs):
         n = len(seqs)
@@ -385,10 +412,19 @@ class ModelRunner:
         pos = np.empty(n, dtype=np.int64)
         sm = np.empty(n, dtype=np.int32)
         cl = np.empty(n, dtype=np.int32)
+        use_mrope = self.is_qwen_vl
+        if use_mrope:
+            mrope_pos = np.empty((3, n), dtype=np.int64)
         max_bt = 0
         for i, seq in enumerate(seqs):
             ids[i] = seq.last_token
-            pos[i] = len(seq) - 1
+            base_pos = len(seq) - 1
+            if use_mrope:
+                # For decode, all 3 dims get the same position = context_len + delta
+                decode_pos = base_pos + seq.mrope_position_delta
+                mrope_pos[:, i] = decode_pos
+            else:
+                pos[i] = base_pos
             cl[i] = len(seq)
             sm[i] = seq.block_table[-1] * BLOCK_SIZE + seq.last_block_num_tokens - 1
             blen = len(seq.block_table)
@@ -404,9 +440,13 @@ class ModelRunner:
             context_lens=torch.from_numpy(cl).pin_memory().cuda(non_blocking=True),
             block_tables=torch.from_numpy(bt).pin_memory().cuda(non_blocking=True),
         )
+        if use_mrope:
+            positions_t = torch.from_numpy(mrope_pos).pin_memory().cuda(non_blocking=True)
+        else:
+            positions_t = torch.from_numpy(pos).pin_memory().cuda(non_blocking=True)
         return (
             torch.from_numpy(ids).pin_memory().cuda(non_blocking=True),
-            torch.from_numpy(pos).pin_memory().cuda(non_blocking=True),
+            positions_t,
         )
 
     def prepare_mixed_batch(self, prefill_seqs, prefill_chunk_sizes, decode_seqs):
@@ -485,8 +525,14 @@ class ModelRunner:
         )
 
     @torch.inference_mode()
-    def run_model(self, input_ids, positions, is_prefill):
+    def run_model(self, input_ids, positions, is_prefill, inputs_embeds=None,
+                  deepstack_embeds=None):
         if is_prefill or self.enforce_eager or input_ids.size(0) > self.graph_bs_list[-1]:
+            if inputs_embeds is not None:
+                return self.model.compute_logits(
+                    self.model(input_ids, positions, inputs_embeds=inputs_embeds,
+                               deepstack_embeds=deepstack_embeds)
+                )
             return self.model.compute_logits(self.model(input_ids, positions))
         bs = input_ids.size(0)
         ctx = get_context()
@@ -545,11 +591,19 @@ class ModelRunner:
 
     def _run_decode_greedy_eager(self, n, ids_np, pos_np, sm_np, cl_np, bt_np):
         """Eager decode path for greedy sampling with TP (no CUDA graphs)."""
-        input_ids = torch.from_numpy(ids_np).cuda(non_blocking=True)
-        positions = torch.from_numpy(pos_np).cuda(non_blocking=True)
-        slot_mapping = torch.from_numpy(sm_np).cuda(non_blocking=True)
-        context_lens = torch.from_numpy(cl_np).cuda(non_blocking=True)
-        block_tables = torch.from_numpy(bt_np).cuda(non_blocking=True)
+        self._eager_input_ids[:n].copy_(torch.from_numpy(ids_np), non_blocking=True)
+        self._eager_positions[:n].copy_(torch.from_numpy(pos_np), non_blocking=True)
+        bt_cols = bt_np.shape[1]
+        self._eager_slot_mapping[:n].copy_(torch.from_numpy(sm_np), non_blocking=True)
+        self._eager_context_lens[:n].copy_(torch.from_numpy(cl_np), non_blocking=True)
+        self._eager_block_tables[:n, :bt_cols].copy_(
+            torch.from_numpy(bt_np), non_blocking=True)
+
+        input_ids = self._eager_input_ids[:n]
+        positions = self._eager_positions[:n]
+        slot_mapping = self._eager_slot_mapping[:n]
+        context_lens = self._eager_context_lens[:n]
+        block_tables = self._eager_block_tables[:n, :bt_cols]
 
         set_context(
             False,
@@ -596,6 +650,12 @@ class ModelRunner:
         self._np_cl = np.empty(max_bs, dtype=np.int32)
         self._np_bt = np.full((max_bs, max_num_blocks), -1, dtype=np.int32)
 
+        self._eager_input_ids = torch.zeros(max_bs, dtype=torch.int64, device=dev)
+        self._eager_positions = torch.zeros(max_bs, dtype=torch.int64, device=dev)
+        self._eager_slot_mapping = torch.zeros(max_bs, dtype=torch.int32, device=dev)
+        self._eager_context_lens = torch.zeros(max_bs, dtype=torch.int32, device=dev)
+        self._eager_block_tables = torch.zeros(max_bs, max_num_blocks, dtype=torch.int32, device=dev)
+
     def _greedy_from_hidden(self, n):
         """Use CUDA-graph-captured LM head + local argmax, then allgather.
         
@@ -637,7 +697,10 @@ class ModelRunner:
         max_bt = 0
         for i, seq in enumerate(seqs):
             ids_np[i] = seq.last_token
-            pos_np[i] = len(seq) - 1
+            if self.is_qwen_vl:
+                pos_np[i] = len(seq) - 1 + seq.mrope_position_delta
+            else:
+                pos_np[i] = len(seq) - 1
             cl_np[i] = len(seq)
             sm_np[i] = seq.block_table[-1] * BLOCK_SIZE + seq.last_block_num_tokens - 1
             blen = len(seq.block_table)
@@ -802,6 +865,7 @@ class LlamaEngine:
         enforce_eager: bool = False,
         tensor_parallel_size: int = 1,
     ):
+        self.model_name = model_name
         self.seed = seed
         self._set_seeds(seed)
 
@@ -833,6 +897,12 @@ class LlamaEngine:
         self.tokenizer = AutoTokenizer.from_pretrained(model_name)
         if self.tokenizer.pad_token_id is None:
             self.tokenizer.pad_token_id = self.tokenizer.eos_token_id
+
+        self.is_qwen_vl = self.model_runner.is_qwen_vl
+        self.processor = None
+        if self.is_qwen_vl:
+            from transformers import AutoProcessor
+            self.processor = AutoProcessor.from_pretrained(model_name)
 
         atexit.register(self._cleanup)
 
@@ -871,8 +941,131 @@ class LlamaEngine:
         probs = torch.softmax(logits, -1)
         return torch.multinomial(probs, 1).squeeze(-1).tolist()
 
+    def _preprocess_multimodal(self, prompt, images=None, videos=None):
+        """Preprocess a multimodal prompt with images/videos.
+
+        Returns (token_ids, pixel_values, image_grid_thw, video_pixel_values,
+                 video_grid_thw) where pixel values are already processed.
+        """
+        messages = [{"role": "user", "content": []}]
+        if images:
+            for img in images:
+                messages[0]["content"].append({"type": "image", "image": img})
+        if videos:
+            for vid in videos:
+                messages[0]["content"].append({"type": "video", "video": vid})
+        messages[0]["content"].append({"type": "text", "text": prompt})
+
+        text = self.processor.apply_chat_template(
+            messages, tokenize=False, add_generation_prompt=True,
+        )
+        inputs = self.processor(
+            text=[text], images=images, videos=videos,
+            return_tensors="pt", padding=True,
+        )
+        token_ids = inputs["input_ids"][0].tolist()
+        pixel_values = inputs.get("pixel_values", None)
+        image_grid_thw = inputs.get("image_grid_thw", None)
+        video_pixel_values = inputs.get("pixel_values_videos", None)
+        video_grid_thw = inputs.get("video_grid_thw", None)
+
+        return (token_ids, pixel_values, image_grid_thw,
+                video_pixel_values, video_grid_thw)
+
     @torch.inference_mode()
-    def generate(self, prompts, sampling_params, collect_logits: bool = False):
+    def _run_vision_encoder(self, seqs):
+        """Run vision encoder for sequences with multimodal data and merge embeddings.
+
+        Returns (inputs_embeds, deepstack_embeds) where deepstack_embeds is a list
+        of tensors for Qwen3-VL DeepStack, or None for Qwen2-VL.
+        """
+        model = self.model_runner.model
+        all_inputs_embeds = []
+        has_deepstack = hasattr(model.visual, 'deepstack_merger_list')
+        all_deepstack = [] if has_deepstack else None
+
+        for seq in seqs:
+            token_ids = torch.tensor(seq.token_ids, dtype=torch.int64, device="cuda")
+            text_embeds = model.get_input_embeddings()(token_ids)
+            seq_deepstack = [] if has_deepstack else None
+
+            if seq.pixel_values is not None:
+                pixel_values = seq.pixel_values.cuda()
+                grid_thw = seq.image_grid_thw
+                vis_out = model.visual(pixel_values, grid_thw=grid_thw)
+
+                if has_deepstack:
+                    image_embeds, ds_features = vis_out
+                else:
+                    image_embeds = vis_out
+                    ds_features = []
+
+                merge_size = model.config.vision.spatial_merge_size
+                sizes = []
+                for thw in grid_thw:
+                    t, h, w = thw
+                    sizes.append(t * (h // merge_size) * (w // merge_size))
+
+                mask = token_ids == QWEN_IMAGE_PAD_ID
+                if mask.any():
+                    text_embeds[mask] = image_embeds.to(text_embeds.dtype)
+
+                if has_deepstack and ds_features:
+                    for ds_feat in ds_features:
+                        ds_expanded = torch.zeros_like(text_embeds)
+                        if mask.any():
+                            ds_expanded[mask] = ds_feat.to(text_embeds.dtype)
+                        seq_deepstack.append(ds_expanded)
+
+            if seq.video_pixel_values is not None:
+                video_pv = seq.video_pixel_values.cuda()
+                grid_thw = seq.video_grid_thw
+                vis_out = model.visual(video_pv, grid_thw=grid_thw)
+
+                if has_deepstack:
+                    video_embeds, ds_features = vis_out
+                else:
+                    video_embeds = vis_out
+                    ds_features = []
+
+                mask = token_ids == QWEN_VIDEO_PAD_ID
+                if mask.any():
+                    text_embeds[mask] = video_embeds.to(text_embeds.dtype)
+
+                if has_deepstack and ds_features:
+                    for i, ds_feat in enumerate(ds_features):
+                        ds_expanded = torch.zeros_like(text_embeds)
+                        if mask.any():
+                            ds_expanded[mask] = ds_feat.to(text_embeds.dtype)
+                        if i < len(seq_deepstack):
+                            seq_deepstack[i] = seq_deepstack[i] + ds_expanded
+                        else:
+                            seq_deepstack.append(ds_expanded)
+
+            all_inputs_embeds.append(text_embeds)
+            if has_deepstack:
+                all_deepstack.append(seq_deepstack)
+
+        inputs_embeds = torch.cat(all_inputs_embeds, dim=0)
+
+        if has_deepstack and all_deepstack:
+            num_levels = max(len(ds) for ds in all_deepstack)
+            deepstack_embeds = []
+            for level in range(num_levels):
+                level_parts = []
+                for ds in all_deepstack:
+                    if level < len(ds):
+                        level_parts.append(ds[level])
+                    else:
+                        level_parts.append(torch.zeros_like(all_inputs_embeds[0]))
+                deepstack_embeds.append(torch.cat(level_parts, dim=0))
+            return inputs_embeds, deepstack_embeds
+
+        return inputs_embeds, None
+
+    @torch.inference_mode()
+    def generate(self, prompts, sampling_params, collect_logits: bool = False,
+                 images=None, videos=None):
         """Generate completions for a batch of prompts."""
         if isinstance(sampling_params, list):
             sp_list = sampling_params
@@ -889,9 +1082,71 @@ class LlamaEngine:
 
         seq_logits: dict[int, list[torch.Tensor]] = {}
 
-        for prompt, sp in zip(prompts, sp_list):
-            ids = prompt if isinstance(prompt, list) else self.tokenizer.encode(prompt)
-            seq = Sequence(ids, max_tokens=sp.max_tokens, ignore_eos=sp.ignore_eos)
+        # Handle multimodal inputs
+        if images is None:
+            images = [None] * len(prompts)
+        if videos is None:
+            videos = [None] * len(prompts)
+
+        for i, (prompt, sp) in enumerate(zip(prompts, sp_list)):
+            img = images[i] if i < len(images) else None
+            vid = videos[i] if i < len(videos) else None
+
+            if self.is_qwen_vl and (img is not None or vid is not None):
+                (ids, pixel_values, image_grid_thw,
+                 video_pv, video_grid_thw) = self._preprocess_multimodal(
+                    prompt, images=img, videos=vid,
+                )
+                seq = Sequence(ids, max_tokens=sp.max_tokens, ignore_eos=sp.ignore_eos)
+                seq.pixel_values = pixel_values
+                seq.image_grid_thw = image_grid_thw.tolist() if image_grid_thw is not None else None
+                seq.video_pixel_values = video_pv
+                seq.video_grid_thw = video_grid_thw.tolist() if video_grid_thw is not None else None
+
+                # Compute M-RoPE positions
+                model = self.model_runner.model
+                merge_size = model.config.vision.spatial_merge_size
+                image_offsets = []
+                video_offsets = []
+                img_idx = 0
+                vid_idx = 0
+                i_tok = 0
+                while i_tok < len(ids):
+                    tid = ids[i_tok]
+                    if tid == QWEN_IMAGE_PAD_ID and seq.image_grid_thw and img_idx < len(seq.image_grid_thw):
+                        image_offsets.append(i_tok)
+                        t, h, w = seq.image_grid_thw[img_idx]
+                        num_tokens = t * (h // merge_size) * (w // merge_size)
+                        i_tok += num_tokens
+                        img_idx += 1
+                    elif tid == QWEN_VIDEO_PAD_ID and seq.video_grid_thw and vid_idx < len(seq.video_grid_thw):
+                        video_offsets.append(i_tok)
+                        t, h, w = seq.video_grid_thw[vid_idx]
+                        num_tokens = t * (h // merge_size) * (w // merge_size)
+                        i_tok += num_tokens
+                        vid_idx += 1
+                    else:
+                        i_tok += 1
+
+                mrope_positions, delta = model.get_mrope_input_positions(
+                    ids,
+                    image_grid_thw=seq.image_grid_thw,
+                    video_grid_thw=seq.video_grid_thw,
+                    image_offsets=image_offsets if image_offsets else None,
+                    video_offsets=video_offsets if video_offsets else None,
+                )
+                seq.mrope_positions = mrope_positions
+                seq.mrope_position_delta = delta
+            elif self.is_qwen_vl:
+                ids = prompt if isinstance(prompt, list) else self.tokenizer.encode(prompt)
+                seq = Sequence(ids, max_tokens=sp.max_tokens, ignore_eos=sp.ignore_eos)
+                # Text-only with M-RoPE: all 3 dims same
+                seq.mrope_positions = torch.arange(len(ids), dtype=torch.int64).unsqueeze(0).expand(3, -1)
+                seq.mrope_position_delta = 0
+            else:
+                ids = prompt if isinstance(prompt, list) else self.tokenizer.encode(prompt)
+                seq = Sequence(ids, max_tokens=sp.max_tokens, ignore_eos=sp.ignore_eos)
+
             waiting.append(seq)
             if collect_logits:
                 seq_logits[id(seq)] = []
@@ -939,7 +1194,20 @@ class LlamaEngine:
             if prefill_seqs:
                 if profile:
                     _t0 = time.perf_counter()
-                logits = self.model_runner.call("run", prefill_seqs, True)
+                # Check if any sequences have multimodal data
+                has_mm = any(s.pixel_values is not None or s.video_pixel_values is not None
+                             for s in prefill_seqs)
+                if has_mm:
+                    inputs_embeds, deepstack_embeds = self._run_vision_encoder(prefill_seqs)
+                    input_ids_t, positions_t = self.model_runner.prepare_prefill(prefill_seqs)
+                    logits = self.model_runner.run_model(
+                        input_ids_t, positions_t, True,
+                        inputs_embeds=inputs_embeds,
+                        deepstack_embeds=deepstack_embeds,
+                    )
+                    reset_context()
+                else:
+                    logits = self.model_runner.call("run", prefill_seqs, True)
                 if logits is not None:
                     if collect_logits:
                         for i, seq in enumerate(prefill_seqs):
