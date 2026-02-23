@@ -17,35 +17,39 @@ A standalone, high-performance LLM inference engine supporting **Llama 3.1** and
 ## Project Structure
 
 ```
-├── tasks/                      # Benchmarkable operators & models, organized by level
-│   ├── L1/                     # Single-kernel ops
-│   │   ├── rms_norm.py         # Fused RMSNorm
-│   │   ├── silu_and_mul.py     # SiLU activation with gate
-│   │   ├── rotary_emb.py       # RoPE (standard + Llama 3.1 frequency scaling)
-│   │   ├── store_kvcache.py    # Triton KV cache store kernel
-│   │   ├── flash_attn_prefill.py
-│   │   ├── flash_attn_decode.py
-│   │   ├── allreduce.py        # AllReduce op + custom IPC all-reduce (NCCL fallback)
-│   │   ├── linear.py           # F.linear wrapper
-│   │   ├── embedding.py        # F.embedding wrapper
-│   │   ├── moe_align.py        # MoE token-expert alignment
-│   │   ├── moe_sum.py          # Fused MoE sum kernel
-│   │   ├── moe_grouped_gemm.py # Triton fused MoE grouped GEMM
-│   │   └── csrc/               # CUDA/C++ kernel sources (JIT-compiled)
-│   │       └── custom_allreduce_kernels.cu  # P2P cross-device reduction
-│   ├── L2/                     # Multi-op blocks
-│   │   ├── attention.py        # GQA attention (QKV proj + RoPE + KV cache + flash attn)
-│   │   ├── llama_mlp.py        # Llama SwiGLU MLP
-│   │   ├── mixtral_moe.py      # Mixtral MoE routing + experts
-│   │   ├── fused_experts.py    # Fused expert execution (2x grouped GEMM + SiLU)
-│   │   ├── parallel_linear.py  # TP-aware linear layers (Column, Merged, QKV, Row)
-│   │   └── parallel_embedding.py # TP-aware embedding and LM head
-│   ├── L3/                     # Decoder layers
-│   │   ├── llama_decoder.py    # Llama decoder (attention + MLP + norms)
-│   │   └── mixtral_decoder.py  # Mixtral decoder (attention + MoE + norms)
-│   └── L4/                     # Full models
-│       ├── llama.py            # LlamaForCausalLM (config, model, LM head)
-│       └── mixtral.py          # MixtralForCausalLM (config, model, LM head)
+├── tasks/                      # Benchmarkable operators & models
+│   ├── baseline/               # Reference implementations (the code to beat)
+│   │   ├── L1/                 # Single-kernel ops
+│   │   │   ├── rms_norm.py     # Fused RMSNorm
+│   │   │   ├── silu_and_mul.py # SiLU activation with gate
+│   │   │   ├── rotary_emb.py   # RoPE (standard + Llama 3.1 frequency scaling)
+│   │   │   ├── store_kvcache.py# Triton KV cache store kernel
+│   │   │   ├── flash_attn_prefill.py
+│   │   │   ├── flash_attn_decode.py
+│   │   │   ├── allreduce.py    # AllReduce op + custom IPC all-reduce (NCCL fallback)
+│   │   │   ├── linear.py       # F.linear wrapper
+│   │   │   ├── embedding.py    # F.embedding wrapper
+│   │   │   ├── moe_align.py    # MoE token-expert alignment
+│   │   │   ├── moe_sum.py      # Fused MoE sum kernel
+│   │   │   ├── moe_grouped_gemm.py # Triton fused MoE grouped GEMM
+│   │   │   └── csrc/           # CUDA/C++ kernel sources (JIT-compiled)
+│   │   │       └── custom_allreduce_kernels.cu
+│   │   ├── L2/                 # Multi-op blocks
+│   │   │   ├── attention.py    # GQA attention
+│   │   │   ├── llama_mlp.py    # Llama SwiGLU MLP
+│   │   │   ├── mixtral_moe.py  # Mixtral MoE routing + experts
+│   │   │   ├── fused_experts.py# Fused expert execution
+│   │   │   ├── parallel_linear.py  # TP-aware linear layers
+│   │   │   └── parallel_embedding.py
+│   │   ├── L3/                 # Decoder layers
+│   │   │   ├── llama_decoder.py
+│   │   │   └── mixtral_decoder.py
+│   │   └── L4/                 # Full models
+│   │       ├── llama.py        # LlamaForCausalLM
+│   │       └── mixtral.py      # MixtralForCausalLM
+│   └── candidate/              # Generated replacement kernels (gitignored)
+│       ├── README.md           # Instructions
+│       └── L1/, L2/, ...       # Organized by level, named after the operator
 ├── infra/                      # Non-benchmarkable infrastructure
 │   ├── context.py              # Global inference context (paged KV cache coordination)
 │   └── tp.py                   # TP helper utilities (_tp_size, _tp_rank)
@@ -57,8 +61,7 @@ A standalone, high-performance LLM inference engine supporting **Llama 3.1** and
 │   └── __main__.py             # CLI entry point
 ├── example/                    # LLM-powered kernel generation agent
 │   ├── agent.py               # CLI agent: generates kernels via Claude, benchmarks them
-│   ├── llm_api.py             # Corvo LLM endpoint helper (async + sync)
-│   └── _generated_kernels/    # Output directory for LLM-generated kernels (gitignored)
+│   └── llm_api.py             # Corvo LLM endpoint helper (async + sync)
 ├── engine.py                   # Batched inference engine with paged KV cache and TP
 ├── weight_loader.py            # HuggingFace safetensors weight loading with TP sharding
 └── tests/                      # Test suite
@@ -122,7 +125,10 @@ python -m kb_nano.bench --map
 # List targets at a specific level
 python -m kb_nano.bench --list --level 1
 
-# Benchmark a custom kernel
+# Benchmark a candidate kernel from tasks/candidate/ (auto-discovered)
+python -m kb_nano.bench --target rms_norm
+
+# Or specify a custom kernel explicitly
 python -m kb_nano.bench \
     --target rms_norm \
     --user-impl path/to/my_kernel.py:MyRMSNorm

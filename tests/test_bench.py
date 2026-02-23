@@ -195,7 +195,7 @@ def test_replacement():
     original_cls = target.target_cls
 
     # Also import a module that references RMSNorm via `from .. import`
-    decoder_mod = importlib.import_module(f"{PACKAGE_NAME}.tasks.L3.llama_decoder")
+    decoder_mod = importlib.import_module(f"{PACKAGE_NAME}.tasks.baseline.L3.llama_decoder")
 
     class FakeRMSNorm(nn.Module):
         pass
@@ -247,7 +247,7 @@ sys.path.insert(0, cfg["project_root"])
 def main():
     pkg = cfg["package_name"]
     bench = __import__(f"{pkg}.bench", fromlist=["benchmark"])
-    rms_mod = __import__(f"{pkg}.tasks.L1.rms_norm", fromlist=["RMSNorm"])
+    rms_mod = __import__(f"{pkg}.tasks.baseline.L1.rms_norm", fromlist=["RMSNorm"])
 
     results = bench.benchmark(
         target_name="rms_norm",

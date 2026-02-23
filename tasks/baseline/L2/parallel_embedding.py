@@ -6,8 +6,8 @@ import torch
 import torch.distributed as dist
 import torch.nn as nn
 
-from ...infra.context import get_context
-from ...infra.tp import _tp_size, _tp_rank
+from ....infra.context import get_context
+from ....infra.tp import _tp_size, _tp_rank
 from ..L1.linear import Linear
 from ..L1.embedding import Embedding
 from ..L1.allreduce import AllReduce

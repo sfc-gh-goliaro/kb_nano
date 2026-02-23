@@ -43,7 +43,9 @@ if _PROJECT_ROOT not in sys.path:
 
 from kb_nano.example.llm_api import call_llm_async
 
-_OUTPUT_DIR = Path(__file__).resolve().parent / "_generated_kernels"
+_KB_ROOT = Path(__file__).resolve().parent.parent
+_CANDIDATE_DIR = _KB_ROOT / "tasks" / "candidate"
+_PREV_ATTEMPTS_DIR = _CANDIDATE_DIR / "prev-attempts"
 _CUDA_BUILD_CACHE = Path(__file__).resolve().parent / "_cuda_build_cache"
 
 
@@ -431,9 +433,11 @@ def run_unit_test(kernel: GeneratedKernel, op: OperatorSpec) -> dict:
 # ---------------------------------------------------------------------------
 # Kernel generation (single operator, with retries)
 # ---------------------------------------------------------------------------
-def _save_kernel(op_name: str, code: str) -> Path:
-    """Write kernel code to _generated_kernels/<op_name>.py and return the path."""
-    out_file = _OUTPUT_DIR / f"{op_name}.py"
+def _save_kernel(op_name: str, level: int, code: str) -> Path:
+    """Write kernel code to tasks/candidate/L{level}/{op_name}.py and return the path."""
+    level_dir = _CANDIDATE_DIR / f"L{level}"
+    level_dir.mkdir(parents=True, exist_ok=True)
+    out_file = level_dir / f"{op_name}.py"
     out_file.write_text(code)
     return out_file
 
@@ -477,7 +481,7 @@ async def generate_kernel_async(
             continue
 
         result.code = code
-        out_file = _save_kernel(op.name, code)
+        out_file = _save_kernel(op.name, op.level, code)
         result.file_path = str(out_file)
 
         # Validation is CPU/GPU bound -- run in thread pool to avoid blocking the event loop
@@ -559,7 +563,7 @@ async def regenerate_kernel_async(
             continue
 
         result.code = code
-        out_file = _save_kernel(op.name, code)
+        out_file = _save_kernel(op.name, op.level, code)
         result.file_path = str(out_file)
 
         loop = asyncio.get_event_loop()
@@ -727,7 +731,7 @@ def _identify_failing_kernel(
     for k in kernels:
         if not k.file_path:
             continue
-        if k.file_path in tb or f"_generated_kernels/{k.op_name}.py" in tb:
+        if k.file_path in tb or f"candidate/{k.op_name}.py" in tb:
             return k
     return None
 
@@ -880,6 +884,35 @@ def print_benchmark_report(bench_result: dict) -> None:
 
 
 # ---------------------------------------------------------------------------
+# Candidate directory management
+# ---------------------------------------------------------------------------
+def _candidate_has_kernels() -> bool:
+    """Check if the candidate directory has any content besides README.md."""
+    if not _CANDIDATE_DIR.exists():
+        return False
+    for item in _CANDIDATE_DIR.iterdir():
+        if item.name in ("README.md", "prev-attempts"):
+            continue
+        return True
+    return False
+
+
+def _archive_existing_candidates() -> None:
+    """Move current candidate kernels to prev-attempts/<timestamp>/."""
+    if not _candidate_has_kernels():
+        return
+    _PREV_ATTEMPTS_DIR.mkdir(parents=True, exist_ok=True)
+    timestamp = time.strftime("%Y%m%d_%H%M%S")
+    archive_dir = _PREV_ATTEMPTS_DIR / timestamp
+    archive_dir.mkdir()
+    for item in _CANDIDATE_DIR.iterdir():
+        if item.name in ("README.md", "prev-attempts"):
+            continue
+        shutil.move(str(item), str(archive_dir / item.name))
+    print(f"  Archived previous candidates to {archive_dir}")
+
+
+# ---------------------------------------------------------------------------
 # Main
 # ---------------------------------------------------------------------------
 def main():
@@ -924,10 +957,8 @@ def main():
     )
     args = parser.parse_args()
 
-    # Clear previous generated kernels (but keep the build cache)
-    if _OUTPUT_DIR.exists():
-        shutil.rmtree(_OUTPUT_DIR)
-    _OUTPUT_DIR.mkdir(parents=True, exist_ok=True)
+    _archive_existing_candidates()
+    _CANDIDATE_DIR.mkdir(parents=True, exist_ok=True)
     _CUDA_BUILD_CACHE.mkdir(parents=True, exist_ok=True)
 
     print("=" * 70)
@@ -939,7 +970,7 @@ def main():
     print(f"  Max retries: {args.max_retries}")
     print(f"  LLM model:   {args.llm_model}")
     print(f"  TP:          {args.tp}")
-    print(f"  Output:      {_OUTPUT_DIR}")
+    print(f"  Output:      {_CANDIDATE_DIR}")
     print(f"  CUDA cache:  {_CUDA_BUILD_CACHE}")
     print("=" * 70)
 
