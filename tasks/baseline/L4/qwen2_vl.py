@@ -18,7 +18,7 @@ from ..L1.rms_norm import RMSNorm
 from ..L2.parallel_embedding import ParallelLMHead, VocabParallelEmbedding
 from ..L2.vision_patch_embed import VisionPatchEmbed
 from ..L2.vision_patch_merger import VisionPatchMerger
-from ..L3.qwen2_decoder import Qwen2DecoderLayer
+from ..L3.llama_decoder import LlamaDecoderLayer
 from ..L3.vision_block import VisionBlock
 
 
@@ -173,7 +173,7 @@ class Qwen2Model(nn.Module):
         super().__init__()
         self.embed_tokens = VocabParallelEmbedding(config.vocab_size, config.hidden_size)
         self.layers = nn.ModuleList([
-            Qwen2DecoderLayer(config) for _ in range(config.num_hidden_layers)
+            LlamaDecoderLayer(config, bias=True) for _ in range(config.num_hidden_layers)
         ])
         self.norm = RMSNorm(config.hidden_size, eps=config.rms_norm_eps)
         self.rotary_emb = MRotaryEmbedding(

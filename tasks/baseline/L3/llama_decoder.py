@@ -1,4 +1,9 @@
-"""Llama decoder layer: attention + MLP with RMSNorm residual connections."""
+"""Decoder layer: attention + MLP with RMSNorm residual connections.
+
+Unified across Llama, Qwen2, and Qwen3 architectures:
+  - bias:    Qwen2 uses bias=True on QKV projection.
+  - qk_norm: Qwen3 applies per-head RMSNorm to Q and K before RoPE.
+"""
 
 from __future__ import annotations
 
@@ -10,11 +15,14 @@ from ..L2.llama_mlp import LlamaMLP
 
 
 class LlamaDecoderLayer(nn.Module):
-    def __init__(self, config):
+    def __init__(self, config, bias: bool = False,
+                 qk_norm: bool = False):
         super().__init__()
         self.self_attn = Attention(
             config.hidden_size, config.num_attention_heads,
             config.num_key_value_heads, config.head_dim,
+            bias=bias, qk_norm=qk_norm,
+            rms_norm_eps=config.rms_norm_eps,
         )
         self.mlp = LlamaMLP(config)
         self.input_layernorm = RMSNorm(config.hidden_size, eps=config.rms_norm_eps)
