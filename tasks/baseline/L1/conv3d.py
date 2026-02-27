@@ -14,10 +14,14 @@ class Conv3d(nn.Module):
         super().__init__()
         self.conv = nn.Conv3d(in_channels, out_channels, kernel_size,
                               stride=stride or kernel_size, bias=bias)
-
     @property
     def weight(self):
         return self.conv.weight
 
+    @property
+    def bias(self):
+        return self.conv.bias
+
     def forward(self, x):
         return self.conv(x)
+

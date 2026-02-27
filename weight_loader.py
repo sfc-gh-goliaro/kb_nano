@@ -62,8 +62,18 @@ _VISION_QKV_RE = re.compile(r"(.+\.attn)\.qkv\.(weight|bias)")
 # Qwen3-VL vision MLP uses linear_fc1/linear_fc2 -> fc1/fc2
 _QWEN3_VISION_MLP_RE = re.compile(r"(.+\.mlp)\.linear_fc([12])\.(weight|bias)")
 
-# Qwen3-VL merger uses linear_fc1/linear_fc2 -> mlp.0/mlp.2
+# Qwen3-VL merger uses linear_fc1/linear_fc2 -> fc1/fc2
 _QWEN3_MERGER_FC_RE = re.compile(r"(.+)\.(linear_fc1|linear_fc2)\.(weight|bias)")
+
+# Qwen2-VL merger remapping: ln_q -> norm, mlp.0 -> fc1, mlp.2 -> fc2
+_QWEN2_MERGER_RE = re.compile(r"(visual\.merger)\.(ln_q|mlp\.0|mlp\.2)\.(weight|bias)")
+
+# L1 wrapper nesting: patch_embed.proj.X -> patch_embed.proj.conv.X
+_VISION_PATCH_EMBED_RE = re.compile(r"(visual\.patch_embed\.proj)\.(weight|bias)")
+# L1 wrapper nesting: *.norm1.X / *.norm2.X -> *.norm1.norm.X / *.norm2.norm.X (VisionBlock)
+_VISION_BLOCK_NORM_RE = re.compile(r"(visual\.blocks\.\d+\.norm[12])\.(weight|bias)")
+# L1 wrapper nesting: *.merger*.norm.X -> *.merger*.norm.norm.X (VisionPatchMerger)
+_VISION_MERGER_NORM_RE = re.compile(r"(visual\.(?:merger|deepstack_merger_list\.\d+)\.norm)\.(weight|bias)")
 
 
 def _remap_qwen2_vl_name(name: str) -> str:
@@ -132,6 +142,14 @@ def load_weights(model, model_path: str, model_type: str = "llama") -> None:
                 else:
                     mapped_name = weight_name
 
+                # Handle Qwen2-VL merger: ln_q -> norm, mlp.0 -> fc1, mlp.2 -> fc2
+                if is_qwen2_vl:
+                    m_merger = _QWEN2_MERGER_RE.match(mapped_name)
+                    if m_merger:
+                        prefix, attr, wb = m_merger.groups()
+                        remap = {"ln_q": "norm", "mlp.0": "fc1", "mlp.2": "fc2"}
+                        mapped_name = f"{prefix}.{remap[attr]}.{wb}"
+
                 # Handle Qwen3-VL vision MLP: linear_fc1 -> fc1, linear_fc2 -> fc2
                 if is_qwen3_vl:
                     m_mlp = _QWEN3_VISION_MLP_RE.match(mapped_name)
@@ -139,12 +157,27 @@ def load_weights(model, model_path: str, model_type: str = "llama") -> None:
                         prefix, fc_num, wb = m_mlp.groups()
                         mapped_name = f"{prefix}.fc{fc_num}.{wb}"
 
-                    # Handle Qwen3-VL merger: linear_fc1 -> mlp.0, linear_fc2 -> mlp.2
+                    # Handle Qwen3-VL merger: linear_fc1 -> fc1, linear_fc2 -> fc2
                     m_merger = _QWEN3_MERGER_FC_RE.match(mapped_name)
                     if m_merger and "merger" in mapped_name:
                         prefix, fc_name, wb = m_merger.groups()
-                        idx = "0" if fc_name == "linear_fc1" else "2"
-                        mapped_name = f"{prefix}.mlp.{idx}.{wb}"
+                        fc = "fc1" if fc_name == "linear_fc1" else "fc2"
+                        mapped_name = f"{prefix}.{fc}.{wb}"
+
+                # Remap vision param names for L1 wrapper nesting
+                if is_qwen_vl:
+                    m = _VISION_PATCH_EMBED_RE.match(mapped_name)
+                    if m:
+                        prefix, wb = m.groups()
+                        mapped_name = f"{prefix}.conv.{wb}"
+                    m = _VISION_BLOCK_NORM_RE.match(mapped_name)
+                    if m:
+                        prefix, wb = m.groups()
+                        mapped_name = f"{prefix}.norm.{wb}"
+                    m = _VISION_MERGER_NORM_RE.match(mapped_name)
+                    if m:
+                        prefix, wb = m.groups()
+                        mapped_name = f"{prefix}.norm.{wb}"
 
                 # Handle vision encoder merged QKV weights
                 if is_qwen_vl:

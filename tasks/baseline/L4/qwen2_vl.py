@@ -11,16 +11,15 @@ from functools import partial
 import numpy as np
 import torch
 import torch.nn as nn
-import torch.nn.functional as F
 from transformers import AutoConfig
 
 from ..L1.mrope import MRotaryEmbedding
 from ..L1.rms_norm import RMSNorm
 from ..L2.parallel_embedding import ParallelLMHead, VocabParallelEmbedding
-from ..L2.parallel_linear import ColumnParallelLinear, RowParallelLinear
-from ..L2.vision_attention import VisionAttention
-from ..L2.vision_mlp import VisionMLP, QuickGELU
+from ..L2.vision_patch_embed import VisionPatchEmbed
+from ..L2.vision_patch_merger import VisionPatchMerger
 from ..L3.qwen2_decoder import Qwen2DecoderLayer
+from ..L3.vision_block import VisionBlock
 
 
 @dataclass
@@ -89,63 +88,6 @@ class Qwen2VLConfig:
 
 # ---- Vision Encoder Components ----
 
-class Qwen2VisionPatchEmbed(nn.Module):
-    def __init__(self, patch_size: int, temporal_patch_size: int,
-                 in_channels: int, embed_dim: int):
-        super().__init__()
-        self.patch_size = patch_size
-        self.temporal_patch_size = temporal_patch_size
-        self.embed_dim = embed_dim
-        self.input_size = in_channels * temporal_patch_size * patch_size * patch_size
-        kernel = (temporal_patch_size, patch_size, patch_size)
-        self.proj = nn.Conv3d(in_channels, embed_dim, kernel, stride=kernel, bias=False)
-
-    def forward(self, x: torch.Tensor) -> torch.Tensor:
-        L, _ = x.shape
-        x = x.view(L, self.input_size)
-        return F.linear(
-            x,
-            self.proj.weight.view(self.embed_dim, self.input_size),
-            self.proj.bias,
-        )
-
-
-class Qwen2VisionBlock(nn.Module):
-    def __init__(self, dim: int, num_heads: int, mlp_ratio: float = 4.0):
-        super().__init__()
-        self.norm1 = nn.LayerNorm(dim, eps=1e-6)
-        self.norm2 = nn.LayerNorm(dim, eps=1e-6)
-        self.attn = VisionAttention(dim, num_heads)
-        mlp_hidden = int(dim * mlp_ratio)
-        self.mlp = VisionMLP(dim, mlp_hidden)
-
-    def forward(self, x, cu_seqlens, rotary_pos_emb_cos,
-                rotary_pos_emb_sin, max_seqlen=None):
-        x = x + self.attn(self.norm1(x), cu_seqlens,
-                          rotary_pos_emb_cos, rotary_pos_emb_sin, max_seqlen)
-        x = x + self.mlp(self.norm2(x))
-        return x
-
-
-class Qwen2VisionPatchMerger(nn.Module):
-    def __init__(self, d_model: int, context_dim: int, spatial_merge_size: int = 2):
-        super().__init__()
-        self.hidden_size = context_dim * (spatial_merge_size ** 2)
-        self.ln_q = nn.LayerNorm(context_dim, eps=1e-6)
-        self.mlp = nn.ModuleList([
-            ColumnParallelLinear(self.hidden_size, self.hidden_size, bias=True),
-            nn.GELU(),
-            RowParallelLinear(self.hidden_size, d_model, bias=True),
-        ])
-
-    def forward(self, x: torch.Tensor) -> torch.Tensor:
-        x = self.ln_q(x)
-        x = x.view(-1, self.hidden_size)
-        fc1, act, fc2 = self.mlp
-        x = fc2(act(fc1(x)))
-        return x
-
-
 class Qwen2VisionTransformer(nn.Module):
     def __init__(self, vision_config: Qwen2VLVisionConfig):
         super().__init__()
@@ -153,7 +95,7 @@ class Qwen2VisionTransformer(nn.Module):
         self.num_heads = vision_config.num_heads
         self.embed_dim = vision_config.embed_dim
 
-        self.patch_embed = Qwen2VisionPatchEmbed(
+        self.patch_embed = VisionPatchEmbed(
             vision_config.patch_size, vision_config.temporal_patch_size,
             vision_config.in_channels, vision_config.embed_dim,
         )
@@ -167,11 +109,11 @@ class Qwen2VisionTransformer(nn.Module):
         self.register_buffer("cos_sin_cache", cache, persistent=False)
 
         self.blocks = nn.ModuleList([
-            Qwen2VisionBlock(vision_config.embed_dim, vision_config.num_heads,
-                             vision_config.mlp_ratio)
+            VisionBlock(vision_config.embed_dim, vision_config.num_heads,
+                        int(vision_config.embed_dim * vision_config.mlp_ratio))
             for _ in range(vision_config.depth)
         ])
-        self.merger = Qwen2VisionPatchMerger(
+        self.merger = VisionPatchMerger(
             vision_config.hidden_size, vision_config.embed_dim,
             vision_config.spatial_merge_size,
         )
