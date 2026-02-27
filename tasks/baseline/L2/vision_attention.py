@@ -11,7 +11,7 @@ import torch.nn as nn
 from flash_attn import flash_attn_varlen_func
 from flash_attn.ops.triton.rotary import apply_rotary
 
-from ...infra.tp import _tp_size, _tp_rank
+from ....infra.tp import _tp_size, _tp_rank
 from .parallel_linear import QKVParallelLinear, RowParallelLinear
 
 
