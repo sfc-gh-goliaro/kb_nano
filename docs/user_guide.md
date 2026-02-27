@@ -129,76 +129,76 @@ For multi-GPU setups, rank-0 serializes method calls to worker ranks via shared 
 
 ## The Operator Hierarchy (L1–L4)
 
-All model operators live under `tasks/` and are organized into four abstraction levels. This hierarchy determines what you can benchmark and replace:
+All model operators live under `tasks/baseline/` and are organized into four abstraction levels. This hierarchy determines what you can benchmark and replace:
 
 ### L1 — Single-kernel ops
 
 Individual GPU kernels. The smallest replaceable unit.
 
-| Operator            | File                     | Description                              |
-|---------------------|--------------------------|------------------------------------------|
-| `rms_norm`          | `L1/rms_norm.py`         | Fused RMSNorm (with optional residual add) |
-| `silu_and_mul`      | `L1/silu_and_mul.py`     | SiLU activation fused with gate multiply |
-| `rotary_emb`        | `L1/rotary_emb.py`       | RoPE with Llama 3.1 frequency scaling   |
-| `linear`            | `L1/linear.py`           | `F.linear` wrapper                       |
-| `embedding`         | `L1/embedding.py`        | `F.embedding` wrapper                    |
-| `store_kvcache`     | `L1/store_kvcache.py`    | Triton KV cache store kernel             |
-| `flash_attn_prefill`| `L1/flash_attn_prefill.py`| Flash Attention for prefill              |
-| `flash_attn_decode` | `L1/flash_attn_decode.py`| Flash Attention for paged decode         |
-| `allreduce`         | `L1/allreduce.py`        | AllReduce + custom IPC implementation    |
-| `moe_align`         | `L1/moe_align.py`        | MoE token-expert alignment               |
-| `moe_sum`           | `L1/moe_sum.py`          | Fused MoE sum kernel                     |
-| `moe_grouped_gemm`  | `L1/moe_grouped_gemm.py` | Triton fused MoE grouped GEMM            |
+| Operator            | File                              | Description                              |
+|---------------------|-----------------------------------|------------------------------------------|
+| `rms_norm`          | `baseline/L1/rms_norm.py`         | Fused RMSNorm (with optional residual add) |
+| `silu_and_mul`      | `baseline/L1/silu_and_mul.py`     | SiLU activation fused with gate multiply |
+| `rotary_emb`        | `baseline/L1/rotary_emb.py`       | RoPE with Llama 3.1 frequency scaling   |
+| `linear`            | `baseline/L1/linear.py`           | `F.linear` wrapper                       |
+| `embedding`         | `baseline/L1/embedding.py`        | `F.embedding` wrapper                    |
+| `store_kvcache`     | `baseline/L1/store_kvcache.py`    | Triton KV cache store kernel             |
+| `flash_attn_prefill`| `baseline/L1/flash_attn_prefill.py`| Flash Attention for prefill              |
+| `flash_attn_decode` | `baseline/L1/flash_attn_decode.py`| Flash Attention for paged decode         |
+| `allreduce`         | `baseline/L1/allreduce.py`        | AllReduce + custom IPC implementation    |
+| `moe_align`         | `baseline/L1/moe_align.py`        | MoE token-expert alignment               |
+| `moe_sum`           | `baseline/L1/moe_sum.py`          | Fused MoE sum kernel                     |
+| `moe_grouped_gemm`  | `baseline/L1/moe_grouped_gemm.py` | Triton fused MoE grouped GEMM            |
 
 ### L2 — Multi-op blocks
 
 Composed of multiple L1 operators.
 
-| Operator            | File                      | Description                               |
-|---------------------|---------------------------|-------------------------------------------|
-| `attention`         | `L2/attention.py`         | GQA with QKV projection + RoPE + KV cache + Flash Attention |
-| `llama_mlp`         | `L2/llama_mlp.py`         | SwiGLU MLP (gate_up_proj + SiLU + down_proj) |
-| `mixtral_moe`       | `L2/mixtral_moe.py`       | MoE routing + expert execution            |
-| `fused_experts`     | `L2/fused_experts.py`     | Fused expert execution (grouped GEMM + SiLU) |
-| `parallel_linear`   | `L2/parallel_linear.py`   | TP-aware linear layers                    |
-| `parallel_embedding`| `L2/parallel_embedding.py`| TP-aware embedding and LM head            |
+| Operator            | File                               | Description                               |
+|---------------------|------------------------------------|-------------------------------------------|
+| `attention`         | `baseline/L2/attention.py`         | GQA with QKV projection + RoPE + KV cache + Flash Attention |
+| `llama_mlp`         | `baseline/L2/llama_mlp.py`         | SwiGLU MLP (gate_up_proj + SiLU + down_proj) |
+| `mixtral_moe`       | `baseline/L2/mixtral_moe.py`       | MoE routing + expert execution            |
+| `fused_experts`     | `baseline/L2/fused_experts.py`     | Fused expert execution (grouped GEMM + SiLU) |
+| `parallel_linear`   | `baseline/L2/parallel_linear.py`   | TP-aware linear layers                    |
+| `parallel_embedding`| `baseline/L2/parallel_embedding.py`| TP-aware embedding and LM head            |
 
 ### L3 — Decoder layers
 
 A single transformer decoder block.
 
-| Operator            | File                       | Description                                |
-|---------------------|----------------------------|--------------------------------------------|
-| `llama_decoder`     | `L3/llama_decoder.py`      | Attention + MLP + RMSNorm residual         |
-| `mixtral_decoder`   | `L3/mixtral_decoder.py`    | Attention + MoE + RMSNorm residual         |
+| Operator            | File                                | Description                                |
+|---------------------|-------------------------------------|--------------------------------------------|
+| `llama_decoder`     | `baseline/L3/llama_decoder.py`      | Attention + MLP + RMSNorm residual         |
+| `mixtral_decoder`   | `baseline/L3/mixtral_decoder.py`    | Attention + MoE + RMSNorm residual         |
 
 ### L4 — Full models
 
 Complete model implementations.
 
-| Operator   | File              | Description             |
-|------------|-------------------|-------------------------|
-| `llama`    | `L4/llama.py`     | LlamaForCausalLM        |
-| `mixtral`  | `L4/mixtral.py`   | MixtralForCausalLM      |
+| Operator   | File                       | Description             |
+|------------|----------------------------|-------------------------|
+| `llama`    | `baseline/L4/llama.py`     | LlamaForCausalLM        |
+| `mixtral`  | `baseline/L4/mixtral.py`   | MixtralForCausalLM      |
 
 ### How the hierarchy works
 
 Higher-level operators compose lower-level ones via standard Python imports. For example:
 
 ```
-L4/llama.py (LlamaForCausalLM)
-  └── L3/llama_decoder.py (LlamaDecoderLayer)
-        ├── L2/attention.py (Attention)
-        │     ├── L1/store_kvcache.py
-        │     ├── L1/flash_attn_prefill.py
-        │     ├── L1/flash_attn_decode.py
-        │     └── L2/parallel_linear.py
-        │           ├── L1/linear.py
-        │           └── L1/allreduce.py
-        ├── L2/llama_mlp.py (LlamaMLP)
-        │     ├── L1/silu_and_mul.py
-        │     └── L2/parallel_linear.py
-        └── L1/rms_norm.py
+baseline/L4/llama.py (LlamaForCausalLM)
+  └── baseline/L3/llama_decoder.py (LlamaDecoderLayer)
+        ├── baseline/L2/attention.py (Attention)
+        │     ├── baseline/L1/store_kvcache.py
+        │     ├── baseline/L1/flash_attn_prefill.py
+        │     ├── baseline/L1/flash_attn_decode.py
+        │     └── baseline/L2/parallel_linear.py
+        │           ├── baseline/L1/linear.py
+        │           └── baseline/L1/allreduce.py
+        ├── baseline/L2/llama_mlp.py (LlamaMLP)
+        │     ├── baseline/L1/silu_and_mul.py
+        │     └── baseline/L2/parallel_linear.py
+        └── baseline/L1/rms_norm.py
 ```
 
 When you replace an L1 operator, the change propagates upward through every level that uses it. The bench suite leverages this — it can trace which models use which operators automatically by analyzing the import graph.
@@ -229,6 +229,14 @@ The `--map` command shows two views:
 ### Running a benchmark
 
 ```bash
+# Auto-discover candidate from tasks/candidate/
+python -m kb_nano.bench \
+    --target rms_norm \
+    --model meta-llama/Llama-3.1-8B-Instruct \
+    --max-tokens 50 \
+    --tp 1
+
+# Or specify a custom implementation explicitly
 python -m kb_nano.bench \
     --target rms_norm \
     --user-impl path/to/my_kernel.py:MyRMSNorm \
@@ -307,7 +315,7 @@ python -m kb_nano.bench --list --level 1
 Pick a target, then read its source file to understand the `forward` signature. For example, `rms_norm`:
 
 ```python
-# Baseline: tasks/L1/rms_norm.py
+# Baseline: tasks/baseline/L1/rms_norm.py
 class RMSNorm(nn.Module):
     def __init__(self, hidden_size: int, eps: float = 1e-6):
         super().__init__()
@@ -355,6 +363,14 @@ class RMSNorm(nn.Module):
 
 ### Step 3: Benchmark it
 
+Place your file at `tasks/candidate/L1/rms_norm.py`, then:
+
+```bash
+python -m kb_nano.bench --target rms_norm
+```
+
+Or specify the path explicitly:
+
 ```bash
 python -m kb_nano.bench \
     --target rms_norm \
@@ -376,7 +392,7 @@ Avoid importing `vllm`, `sglang`, or `sgl_kernel` in your replacement (the basel
 
 The bench suite uses monkey-patching to swap classes. When you target `rms_norm`, it:
 
-1. Finds `RMSNorm` in `tasks/L1/rms_norm.py`
+1. Finds `RMSNorm` in `tasks/baseline/L1/rms_norm.py`
 2. Scans all loaded `kb_nano.*` modules for references to that class
 3. Replaces every reference with your class
 4. Rebuilds the full model — your class is now used wherever the original was
@@ -441,7 +457,7 @@ python -m kb_nano.example \
     --level 1 --max-retries 3 --llm-model claude-opus-4-6
 ```
 
-Generated kernels are saved to `example/_generated_kernels/`. CUDA JIT compilation artifacts are cached in `example/_cuda_build_cache/`.
+Generated kernels are saved to `tasks/candidate/L{level}/{op_name}.py`. Previous candidates are archived to `tasks/candidate/prev-attempts/<timestamp>/`. CUDA JIT compilation artifacts are cached in `example/_cuda_build_cache/`.
 
 ---
 
@@ -578,7 +594,7 @@ The engine downloads model weights from HuggingFace Hub automatically. Ensure:
 
 ### Bench target not found
 
-If `--target xyz` fails with "Unknown bench target", run `python -m kb_nano.bench --list` to see all available targets. Target names match the Python file names under `tasks/` (without `.py`).
+If `--target xyz` fails with "Unknown bench target", run `python -m kb_nano.bench --list` to see all available targets. Target names match the Python file names under `tasks/baseline/` (without `.py`).
 
 ### User implementation class name mismatch
 

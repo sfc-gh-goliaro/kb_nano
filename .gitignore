@@ -209,6 +209,6 @@ __marimo__/
 saved_results/
 
 # Agent-generated kernels and build cache
-example/_generated_kernels/
 example/_cuda_build_cache/
-tests/baselines/
+# tasks/candidate/L*/
+tasks/candidate/prev-attempts/

@@ -27,8 +27,8 @@ def main():
     torch.set_default_device("cuda")
     torch.set_default_dtype(torch.bfloat16)
 
-    from kb_nano.tasks.L2.mixtral_moe import MixtralMoE
-    from kb_nano.tasks.L4.mixtral import MixtralConfig
+    from kb_nano.tasks.baseline.L2.mixtral_moe import MixtralMoE
+    from kb_nano.tasks.baseline.L4.mixtral import MixtralConfig
 
     tp = cfg.get("tp", 1)
 

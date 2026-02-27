@@ -18,10 +18,10 @@ from huggingface_hub import snapshot_download
 from safetensors import safe_open
 from transformers import AutoConfig
 
-from .tasks.L4.llama import LlamaConfig, LlamaForCausalLM
-from .tasks.L4.mixtral import MixtralConfig, MixtralForCausalLM
-from .tasks.L4.qwen2_vl import Qwen2VLConfig, Qwen2VLForConditionalGeneration
-from .tasks.L4.qwen3_vl import Qwen3VLConfig, Qwen3VLForConditionalGeneration
+from .tasks.baseline.L4.llama import LlamaConfig, LlamaForCausalLM
+from .tasks.baseline.L4.mixtral import MixtralConfig, MixtralForCausalLM
+from .tasks.baseline.L4.qwen2_vl import Qwen2VLConfig, Qwen2VLForConditionalGeneration
+from .tasks.baseline.L4.qwen3_vl import Qwen3VLConfig, Qwen3VLForConditionalGeneration
 
 
 def default_weight_loader(param: torch.nn.Parameter, loaded_weight: torch.Tensor):

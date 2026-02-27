@@ -7,7 +7,7 @@ import torch.nn as nn
 
 from sgl_kernel.moe import topk_softmax as _sgl_topk_softmax
 
-from ...infra.tp import _tp_rank, _tp_size
+from ....infra.tp import _tp_rank, _tp_size
 from ..L1.allreduce import AllReduce
 from ..L2.fused_experts import FusedExperts
 
