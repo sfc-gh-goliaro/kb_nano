@@ -207,6 +207,7 @@ marimo/_lsp/
 __marimo__/
 
 saved_results/
+tests/baselines/
 
 # Agent-generated kernels and build cache
 example/_cuda_build_cache/

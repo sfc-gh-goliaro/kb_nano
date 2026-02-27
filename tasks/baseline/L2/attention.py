@@ -1,4 +1,9 @@
-"""Multi-head attention with GQA, flash_attn, and paged KV cache."""
+"""Multi-head attention with GQA, flash_attn, and paged KV cache.
+
+Unified across Llama, Qwen2, and Qwen3 architectures:
+  - bias:    Qwen2 uses bias=True on QKV projection; others use False.
+  - qk_norm: Qwen3 applies per-head RMSNorm to Q and K before RoPE.
+"""
 
 from __future__ import annotations
 
@@ -8,6 +13,7 @@ import torch.nn as nn
 from ....infra.context import get_context
 from ....infra.tp import _tp_size
 from .parallel_linear import QKVParallelLinear, RowParallelLinear
+from ..L1.rms_norm import RMSNorm
 from ..L1.store_kvcache import StoreKVCache
 from ..L1.flash_attn_prefill import FlashAttnPrefill
 from ..L1.flash_attn_decode import FlashAttnDecode
@@ -17,7 +23,10 @@ class Attention(nn.Module):
     """Multi-head attention with GQA, flash_attn, and paged KV cache."""
 
     def __init__(self, hidden_size: int, num_attention_heads: int,
-                 num_key_value_heads: int, head_dim: int):
+                 num_key_value_heads: int, head_dim: int,
+                 bias: bool = False,          # Qwen2: True
+                 qk_norm: bool = False,       # Qwen3: True
+                 rms_norm_eps: float = 1e-6):
         super().__init__()
         tp = _tp_size()
         self.num_heads = num_attention_heads // tp
@@ -28,10 +37,16 @@ class Attention(nn.Module):
         self.qkv_proj = QKVParallelLinear(
             hidden_size, head_dim,
             num_attention_heads, num_key_value_heads,
+            bias=bias,
         )
         self.o_proj = RowParallelLinear(
             num_attention_heads * head_dim, hidden_size,
         )
+
+        # Qwen3: per-head QK-norm applied before RoPE
+        self.q_norm = RMSNorm(head_dim, eps=rms_norm_eps) if qk_norm else None
+        self.k_norm = RMSNorm(head_dim, eps=rms_norm_eps) if qk_norm else None
+
         self.k_cache = self.v_cache = torch.tensor([])
 
         self.store_kvcache = StoreKVCache()
@@ -48,6 +63,12 @@ class Attention(nn.Module):
         q = q.view(N, self.num_heads, self.head_dim)
         k = k.view(N, self.num_kv_heads, self.head_dim)
         v = v.view(N, self.num_kv_heads, self.head_dim)
+
+        # Qwen3: per-head QK-norm applied before RoPE
+        if self.q_norm is not None:
+            q = self.q_norm(q.reshape(-1, self.head_dim)).view(N, self.num_heads, self.head_dim)
+            k = self.k_norm(k.reshape(-1, self.head_dim)).view(N, self.num_kv_heads, self.head_dim)
+
         q, k = rotary_emb(positions, q, k)
 
         k_cache, v_cache = self.k_cache, self.v_cache

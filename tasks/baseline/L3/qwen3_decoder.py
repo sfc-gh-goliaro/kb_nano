@@ -5,17 +5,17 @@ from __future__ import annotations
 import torch.nn as nn
 
 from ..L1.rms_norm import RMSNorm
-from ..L2.qwen3_attention import Qwen3Attention
+from ..L2.attention import Attention
 from ..L2.llama_mlp import LlamaMLP
 
 
 class Qwen3DecoderLayer(nn.Module):
     def __init__(self, config):
         super().__init__()
-        self.self_attn = Qwen3Attention(
+        self.self_attn = Attention(
             config.hidden_size, config.num_attention_heads,
             config.num_key_value_heads, config.head_dim,
-            rms_norm_eps=config.rms_norm_eps,
+            qk_norm=True, rms_norm_eps=config.rms_norm_eps,
         )
         self.mlp = LlamaMLP(config)
         self.input_layernorm = RMSNorm(config.hidden_size, eps=config.rms_norm_eps)
