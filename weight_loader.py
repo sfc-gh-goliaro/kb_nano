@@ -68,6 +68,9 @@ _QWEN3_MERGER_FC_RE = re.compile(r"(.+)\.(linear_fc1|linear_fc2)\.(weight|bias)"
 # Qwen2-VL merger remapping: ln_q -> norm, mlp.0 -> fc1, mlp.2 -> fc2
 _QWEN2_MERGER_RE = re.compile(r"(visual\.merger)\.(ln_q|mlp\.0|mlp\.2)\.(weight|bias)")
 
+# Qwen3-VL learned pos embed: visual.pos_embed.weight -> visual.pos_embed_interp.pos_embed
+_VISION_POS_EMBED_RE = re.compile(r"visual\.pos_embed\.weight$")
+
 # L1 wrapper nesting: patch_embed.proj.X -> patch_embed.proj.conv.X
 _VISION_PATCH_EMBED_RE = re.compile(r"(visual\.patch_embed\.proj)\.(weight|bias)")
 # L1 wrapper nesting: *.norm1.X / *.norm2.X -> *.norm1.norm.X / *.norm2.norm.X (VisionBlock)
@@ -163,6 +166,11 @@ def load_weights(model, model_path: str, model_type: str = "llama") -> None:
                         prefix, fc_name, wb = m_merger.groups()
                         fc = "fc1" if fc_name == "linear_fc1" else "fc2"
                         mapped_name = f"{prefix}.{fc}.{wb}"
+
+                # Remap learned pos embed nesting (Qwen3-VL)
+                if is_qwen3_vl:
+                    if _VISION_POS_EMBED_RE.match(mapped_name):
+                        mapped_name = "visual.pos_embed_interp.pos_embed"
 
                 # Remap vision param names for L1 wrapper nesting
                 if is_qwen_vl:

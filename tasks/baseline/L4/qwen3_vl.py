@@ -10,7 +10,6 @@ Key differences from Qwen2-VL:
 from __future__ import annotations
 
 from dataclasses import dataclass, field
-from functools import partial
 
 import numpy as np
 import torch
@@ -20,9 +19,12 @@ from transformers import AutoConfig
 
 from ..L1.mrope import MRotaryEmbedding
 from ..L1.rms_norm import RMSNorm
+from ..L1.vision_rotary_emb import VisionRotaryEmbedding
+from ..L1.mrope_input_positions import MRopeInputPositions
 from ..L2.parallel_embedding import ParallelLMHead, VocabParallelEmbedding
 from ..L2.vision_patch_embed import VisionPatchEmbed
 from ..L2.vision_patch_merger import VisionPatchMerger
+from ..L2.vision_pos_embed_interpolate import VisionPosEmbedInterpolate
 from ..L3.llama_decoder import LlamaDecoderLayer
 from ..L3.vision_block import VisionBlock
 
@@ -111,10 +113,7 @@ _ACTIVATION_MAP = {
 class Qwen3VisionTransformer(nn.Module):
     def __init__(self, vision_config: Qwen3VLVisionConfig):
         super().__init__()
-        self.hidden_size = vision_config.hidden_size
-        self.num_heads = vision_config.num_heads
         self.spatial_merge_size = vision_config.spatial_merge_size
-        self.num_position_embeddings = vision_config.num_position_embeddings
         self.deepstack_visual_indexes = vision_config.deepstack_visual_indexes
         self.out_hidden_size = vision_config.out_hidden_size * (
             1 + len(self.deepstack_visual_indexes)
@@ -125,20 +124,14 @@ class Qwen3VisionTransformer(nn.Module):
             vision_config.in_channels, vision_config.hidden_size, bias=True,
         )
 
-        self.pos_embed = nn.Embedding(
-            vision_config.num_position_embeddings, vision_config.hidden_size,
+        self.pos_embed_interp = VisionPosEmbedInterpolate(
+            vision_config.num_position_embeddings,
+            vision_config.hidden_size,
+            vision_config.spatial_merge_size,
         )
-        self.num_grid_per_side = int(vision_config.num_position_embeddings ** 0.5)
 
         head_dim = vision_config.hidden_size // vision_config.num_heads
-        self.rotary_dim = head_dim // 2
-        inv_freq = 1.0 / (10000.0 ** (
-            torch.arange(0, self.rotary_dim, 2, dtype=torch.float) / self.rotary_dim
-        ))
-        t = torch.arange(8192, dtype=torch.float)
-        freqs = torch.einsum("i,j->ij", t, inv_freq)
-        cache = torch.cat((freqs.cos(), freqs.sin()), dim=-1)
-        self.register_buffer("cos_sin_cache", cache, persistent=False)
+        self.rotary_emb = VisionRotaryEmbedding(head_dim // 2)
 
         act_fn = _ACTIVATION_MAP.get(vision_config.hidden_act, F.silu)
 
@@ -162,75 +155,6 @@ class Qwen3VisionTransformer(nn.Module):
             for _ in range(len(self.deepstack_visual_indexes))
         ])
 
-    def rot_pos_emb(self, grid_thw_list):
-        sms = self.spatial_merge_size
-        pos_ids = []
-        max_grid_size = 0
-        for t, h, w in grid_thw_list:
-            hpos = np.broadcast_to(np.arange(h).reshape(h, 1), (h, w))
-            wpos = np.broadcast_to(np.arange(w).reshape(1, w), (h, w))
-            hpos = hpos.reshape(h // sms, sms, w // sms, sms).transpose(0, 2, 1, 3).flatten()
-            wpos = wpos.reshape(h // sms, sms, w // sms, sms).transpose(0, 2, 1, 3).flatten()
-            hw = np.stack([hpos, wpos], axis=-1)
-            pos_ids.append(np.tile(hw, (t, 1)) if t > 1 else hw)
-            max_grid_size = max(max_grid_size, h, w)
-        pos_ids = torch.from_numpy(np.concatenate(pos_ids, axis=0)).to(
-            self.patch_embed.proj.weight.device
-        )
-
-        cache = self.cos_sin_cache[:max_grid_size].to(
-            dtype=self.patch_embed.proj.weight.dtype
-        )
-        cos, sin = cache.chunk(2, dim=-1)
-        cos_combined = cos[pos_ids].flatten(1)
-        sin_combined = sin[pos_ids].flatten(1)
-        return cos_combined, sin_combined
-
-    def fast_pos_embed_interpolate(self, grid_thw_list):
-        """Bilinear interpolation of learned position embeddings."""
-        num_grid = self.num_grid_per_side
-        m_size = self.spatial_merge_size
-        hidden_dim = self.pos_embed.embedding_dim
-        device = self.patch_embed.proj.weight.device
-        dtype = self.patch_embed.proj.weight.dtype
-
-        outputs = []
-        for t, h, w in grid_thw_list:
-            h_idxs = torch.linspace(0, num_grid - 1, h, dtype=torch.float32, device=device)
-            w_idxs = torch.linspace(0, num_grid - 1, w, dtype=torch.float32, device=device)
-
-            h_floor = h_idxs.long()
-            w_floor = w_idxs.long()
-            h_ceil = torch.clamp(h_floor + 1, max=num_grid - 1)
-            w_ceil = torch.clamp(w_floor + 1, max=num_grid - 1)
-
-            dh = h_idxs - h_floor
-            dw = w_idxs - w_floor
-
-            dh_grid, dw_grid = torch.meshgrid(dh, dw, indexing="ij")
-            h_floor_grid, w_floor_grid = torch.meshgrid(h_floor, w_floor, indexing="ij")
-            h_ceil_grid, w_ceil_grid = torch.meshgrid(h_ceil, w_ceil, indexing="ij")
-
-            w11 = dh_grid * dw_grid
-            w10 = dh_grid - w11
-            w01 = dw_grid - w11
-            w00 = 1 - dh_grid - w01
-
-            h_grid = torch.stack([h_floor_grid, h_floor_grid, h_ceil_grid, h_ceil_grid])
-            w_grid = torch.stack([w_floor_grid, w_ceil_grid, w_floor_grid, w_ceil_grid])
-            indices = (h_grid * num_grid + w_grid).reshape(4, -1)
-            weights = torch.stack([w00, w01, w10, w11], dim=0).reshape(4, -1, 1).to(dtype=dtype)
-
-            embeds = self.pos_embed(indices) * weights
-            combined = embeds.sum(dim=0)
-            combined = combined.reshape(
-                h // m_size, m_size, w // m_size, m_size, hidden_dim
-            ).permute(0, 2, 1, 3, 4).reshape(1, -1, hidden_dim)
-            repeated = combined.expand(t, -1, -1).reshape(-1, hidden_dim)
-            outputs.append(repeated)
-
-        return torch.cat(outputs, dim=0)
-
     def forward(self, x: torch.Tensor, grid_thw: torch.Tensor | list):
         device = self.patch_embed.proj.weight.device
         dtype = self.patch_embed.proj.weight.dtype
@@ -244,10 +168,12 @@ class Qwen3VisionTransformer(nn.Module):
             grid_thw_list = grid_thw.tolist()
             grid_thw_np = grid_thw.numpy()
 
-        pos_embeds = self.fast_pos_embed_interpolate(grid_thw_list)
+        pos_embeds = self.pos_embed_interp(grid_thw_list, dtype, device)
         hidden_states = hidden_states + pos_embeds
 
-        rotary_cos, rotary_sin = self.rot_pos_emb(grid_thw_list)
+        rotary_cos, rotary_sin = self.rotary_emb(
+            grid_thw_list, self.spatial_merge_size, dtype, device,
+        )
 
         cu_seqlens = np.repeat(
             grid_thw_np[:, 1] * grid_thw_np[:, 2], grid_thw_np[:, 0]
@@ -321,6 +247,7 @@ class Qwen3VLForConditionalGeneration(nn.Module):
         self.visual = Qwen3VisionTransformer(config.vision)
         self.model = Qwen3Model(config)
         self.lm_head = ParallelLMHead(config.vocab_size, config.hidden_size)
+        self._mrope_positions = MRopeInputPositions()
 
     def get_input_embeddings(self):
         return self.model.embed_tokens
@@ -332,50 +259,11 @@ class Qwen3VLForConditionalGeneration(nn.Module):
         image_offsets: list[int] | None = None,
         video_offsets: list[int] | None = None,
     ) -> tuple[torch.Tensor, int]:
-        """Compute M-RoPE 3D positions for text+vision tokens."""
-        spatial_merge_size = self.config.vision.spatial_merge_size
-        llm_pos_ids_list = []
-        st = 0
-
-        media_items = []
-        if image_grid_thw and image_offsets:
-            for i, (t, h, w) in enumerate(image_grid_thw):
-                merged_h = h // spatial_merge_size
-                merged_w = w // spatial_merge_size
-                media_items.append((image_offsets[i], t, merged_h, merged_w))
-        if video_grid_thw and video_offsets:
-            for i, (t, h, w) in enumerate(video_grid_thw):
-                merged_h = h // spatial_merge_size
-                merged_w = w // spatial_merge_size
-                media_items.append((video_offsets[i], t, merged_h, merged_w))
-        media_items.sort(key=lambda x: x[0])
-
-        for offset, grid_t, grid_h, grid_w in media_items:
-            text_len = offset - st
-            st_idx = int(llm_pos_ids_list[-1].max() + 1) if llm_pos_ids_list else 0
-            llm_pos_ids_list.append(
-                np.broadcast_to(np.arange(text_len), (3, text_len)) + st_idx
-            )
-            grid_indices = np.indices((grid_t, grid_h, grid_w))
-            llm_pos_ids_list.append(grid_indices.reshape(3, -1) + text_len + st_idx)
-            st = offset + grid_t * grid_h * grid_w
-
-        if st < len(input_tokens):
-            st_idx = int(llm_pos_ids_list[-1].max() + 1) if llm_pos_ids_list else 0
-            text_len = len(input_tokens) - st
-            llm_pos_ids_list.append(
-                np.broadcast_to(np.arange(text_len), (3, text_len)) + st_idx
-            )
-
-        if not llm_pos_ids_list:
-            positions = np.broadcast_to(
-                np.arange(len(input_tokens)), (3, len(input_tokens))
-            )
-            return torch.from_numpy(positions), 0
-
-        llm_positions = np.concatenate(llm_pos_ids_list, axis=1).reshape(3, -1)
-        mrope_position_delta = int(llm_positions.max() + 1 - len(input_tokens))
-        return torch.from_numpy(llm_positions), mrope_position_delta
+        return self._mrope_positions(
+            input_tokens, self.config.vision.spatial_merge_size,
+            image_grid_thw, video_grid_thw,
+            image_offsets, video_offsets,
+        )
 
     def forward(self, input_ids, positions, inputs_embeds=None,
                 deepstack_embeds=None):
