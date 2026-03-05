@@ -91,7 +91,7 @@ def _detect_model_key(model_name: str) -> str:
 
 def discover_operators(model_name: str, level: int) -> list[OperatorSpec]:
     """Find all operators at the given level used by the given model."""
-    from kb_nano.bench.discovery import discover_targets
+    from kb_nano.infra.kernel_swapper import discover_targets
 
     model_key = _detect_model_key(model_name)
     targets = discover_targets()

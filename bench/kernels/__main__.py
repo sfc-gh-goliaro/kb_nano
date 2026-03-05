@@ -1,18 +1,18 @@
 """
-CLI entry point for the kb-nano benchmark suite.
+CLI entry point for the kb-nano kernel benchmark suite.
 
 Usage:
-    python -m kb_nano.bench --list
-    python -m kb_nano.bench --list --level 1
+    python -m kb_nano.bench.kernels --list
+    python -m kb_nano.bench.kernels --list --level 1
 
-    python -m kb_nano.bench \\
+    python -m kb_nano.bench.kernels \\
         --target rms_norm \\
         --user-impl path/to/my_kernel.py:MyRMSNorm \\
         --model meta-llama/Llama-3.1-8B-Instruct \\
         --max-tokens 50
 
     # Auto-discover from tasks/candidate/:
-    python -m kb_nano.bench --target rms_norm
+    python -m kb_nano.bench.kernels --target rms_norm
 """
 
 from __future__ import annotations
@@ -22,12 +22,10 @@ import importlib.util
 import sys
 from pathlib import Path
 
-import torch.nn as nn
-
-from . import benchmark, list_targets, print_model_operator_map
-from .discovery import get as get_target
-
-_CANDIDATE_DIR = Path(__file__).resolve().parent.parent / "tasks" / "candidate"
+from kb_nano.infra.kernel_swapper import (
+    list_targets, print_model_operator_map, load_candidate, _CANDIDATE_DIR,
+)
+from .runner import run_benchmark as benchmark
 
 
 def _import_from_path(spec_str: str):
@@ -51,27 +49,6 @@ def _import_from_path(spec_str: str):
     if not hasattr(mod, name):
         raise AttributeError(f"{path_or_module} has no attribute {name!r}")
     return getattr(mod, name)
-
-
-def _load_candidate(target_name: str):
-    """Load the candidate kernel from tasks/candidate/L{level}/{target_name}.py."""
-    target = get_target(target_name)
-    candidate_file = _CANDIDATE_DIR / f"L{target.level}" / f"{target_name}.py"
-    if not candidate_file.is_file():
-        return None
-    class_name = target.target_cls.__name__
-    spec = importlib.util.spec_from_file_location("_candidate_impl", str(candidate_file))
-    if spec is None or spec.loader is None:
-        return None
-    mod = importlib.util.module_from_spec(spec)
-    spec.loader.exec_module(mod)
-    cls = getattr(mod, class_name, None)
-    if cls is None:
-        for v in vars(mod).values():
-            if isinstance(v, type) and issubclass(v, nn.Module) and v is not nn.Module:
-                cls = v
-                break
-    return cls
 
 
 def main():
@@ -149,7 +126,7 @@ def main():
     if args.user_impl is not None:
         user_impl = _import_from_path(args.user_impl)
     else:
-        user_impl = _load_candidate(args.target)
+        user_impl = load_candidate(args.target)
         if user_impl is None:
             parser.error(
                 f"No candidate kernel found for {args.target!r} in "

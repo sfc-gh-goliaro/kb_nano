@@ -90,6 +90,10 @@ class ChatMessage(BaseModel):
 
 # -- Requests ----------------------------------------------------------------
 
+class StreamOptions(BaseModel):
+    include_usage: bool = False
+
+
 class ChatCompletionRequest(BaseModel):
     model: str = "default"
     messages: List[ChatMessage]
@@ -98,11 +102,13 @@ class ChatCompletionRequest(BaseModel):
     max_tokens: Optional[int] = None
     max_completion_tokens: Optional[int] = None
     stream: bool = False
+    stream_options: Optional[StreamOptions] = None
     stop: Optional[Union[str, List[str]]] = None
     seed: Optional[int] = None
     n: int = 1
     frequency_penalty: float = 0.0
     presence_penalty: float = 0.0
+    ignore_eos: bool = False
     user: Optional[str] = None
 
 
@@ -117,6 +123,7 @@ class CompletionRequest(BaseModel):
     seed: Optional[int] = None
     n: int = 1
     echo: bool = False
+    ignore_eos: bool = False
     user: Optional[str] = None
 
 
@@ -284,6 +291,7 @@ def _build_sampling_params(
     top_p: Optional[float],
     max_tokens: Optional[int],
     seed: Optional[int],
+    ignore_eos: bool = False,
 ):
     """Build a kb_nano SamplingParams from request fields."""
     from kb_nano.engine import SamplingParams
@@ -293,6 +301,7 @@ def _build_sampling_params(
         top_p=top_p if top_p is not None else 1.0,
         max_tokens=max_tokens if max_tokens is not None else 512,
         seed=seed,
+        ignore_eos=ignore_eos,
     )
 
 
@@ -337,15 +346,21 @@ async def chat_completions(request: ChatCompletionRequest, raw: Request):
     token_ids, num_prompt_tokens = _messages_to_prompt(request.messages)
     sp = _build_sampling_params(
         request.temperature, request.top_p, max_tokens, request.seed,
+        request.ignore_eos,
     )
 
     request_id = _make_id("chatcmpl")
     created = int(time.time())
 
+    include_usage = (
+        request.stream_options is not None
+        and request.stream_options.include_usage
+    )
+
     if request.stream:
         return StreamingResponse(
             _stream_chat(request_id, created, request.model, token_ids,
-                         num_prompt_tokens, sp),
+                         num_prompt_tokens, sp, include_usage),
             media_type="text/event-stream",
         )
 
@@ -383,13 +398,15 @@ async def _stream_chat(
     token_ids: list[int],
     num_prompt_tokens: int,
     sp,
+    include_usage: bool = False,
 ) -> AsyncIterator[str]:
     """SSE generator for streaming chat completions."""
-    # First chunk: role
+    resolved_model = model or _model_name
+
     first = ChatCompletionStreamResponse(
         id=request_id,
         created=created,
-        model=model or _model_name,
+        model=resolved_model,
         choices=[ChatCompletionStreamChoice(
             index=0,
             delta=DeltaMessage(role="assistant", content=""),
@@ -412,7 +429,7 @@ async def _stream_chat(
         chunk = ChatCompletionStreamResponse(
             id=request_id,
             created=created,
-            model=model or _model_name,
+            model=resolved_model,
             choices=[ChatCompletionStreamChoice(
                 index=0,
                 delta=DeltaMessage(content=delta_text),
@@ -422,17 +439,25 @@ async def _stream_chat(
         yield f"data: {chunk.model_dump_json()}\n\n"
 
     finish = "stop" if len(generated_ids) < sp.max_tokens else "length"
-    final = ChatCompletionStreamResponse(
-        id=request_id,
-        created=created,
-        model=model or _model_name,
-        choices=[ChatCompletionStreamChoice(
-            index=0,
-            delta=DeltaMessage(),
-            finish_reason=finish,
-        )],
-    )
-    yield f"data: {final.model_dump_json()}\n\n"
+    final_data: Dict[str, Any] = {
+        "id": request_id,
+        "object": "chat.completion.chunk",
+        "created": created,
+        "model": resolved_model,
+        "choices": [{
+            "index": 0,
+            "delta": {},
+            "finish_reason": finish,
+        }],
+    }
+    if include_usage:
+        num_completion_tokens = len(generated_ids)
+        final_data["usage"] = {
+            "prompt_tokens": num_prompt_tokens,
+            "completion_tokens": num_completion_tokens,
+            "total_tokens": num_prompt_tokens + num_completion_tokens,
+        }
+    yield f"data: {json.dumps(final_data)}\n\n"
     yield "data: [DONE]\n\n"
 
 
@@ -451,6 +476,7 @@ async def completions(request: CompletionRequest, raw: Request):
 
     sp = _build_sampling_params(
         request.temperature, request.top_p, request.max_tokens, request.seed,
+        request.ignore_eos,
     )
 
     request_id = _make_id("cmpl")
@@ -556,6 +582,8 @@ def parse_args() -> argparse.Namespace:
     p.add_argument("--enforce-eager", action="store_true",
                     help="Disable CUDA graph capture")
     p.add_argument("--seed", type=int, default=42)
+    p.add_argument("--no-candidate-kernels", action="store_true", default=False,
+                    help="Disable candidate kernel auto-detection; use only baseline kernels")
     return p.parse_args()
 
 
@@ -580,6 +608,17 @@ def main():
     project_root = str(Path(__file__).resolve().parent.parent.parent)
     if project_root not in sys.path:
         sys.path.insert(0, project_root)
+
+    if not args.no_candidate_kernels:
+        from kb_nano.infra.kernel_swapper import (
+            apply_candidates,
+            discover_candidates,
+            print_candidate_summary,
+        )
+        candidates = discover_candidates()
+        if candidates:
+            print_candidate_summary(candidates)
+            apply_candidates(candidates)
 
     from kb_nano.engine import LlamaEngine
 

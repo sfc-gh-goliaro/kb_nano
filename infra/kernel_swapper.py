@@ -1,28 +1,52 @@
-"""Convention-based target discovery via static import analysis.
+"""
+Kernel target discovery, class monkey-patching, and candidate hot-swapping.
 
-Scans tasks/baseline/L4/ files as model entry points and recursively walks
-their imports (using ast.parse) to determine which L1-L3 operators each model
-uses.  No _META annotations needed -- the import graph is the single source of
-truth.
+This module consolidates three concerns that were previously split across
+bench/kernels/discovery.py, bench/kernels/replacement.py, and
+infra/kernel_swapper.py:
+
+1. **Target discovery** -- scans tasks/baseline/L{1-4}/ via static import
+   analysis to build BenchTarget objects mapping operators to models.
+
+2. **Class replacement** -- monkey-patches nn.Module classes across all loaded
+   modules so that subsequent LlamaEngine construction picks up replacements.
+
+3. **Candidate orchestration** -- scans tasks/candidate/L{level}/ for
+   user-provided kernels, matches them against known targets, and applies
+   them in bulk.
+
+Used by:
+  - bench/kernels/{runner,evaluator,__main__}.py  (kernel-level benchmarking)
+  - bench/e2e/{throughput,latency,serve}.py       (auto-detect all candidates)
+  - infra/server.py                               (auto-detect all candidates)
+  - example/{agent,create_stubs}.py               (target introspection)
 """
 
 from __future__ import annotations
 
 import ast
 import importlib
+import importlib.util
 import os
+import sys
+from contextlib import contextmanager
 from dataclasses import dataclass, field
 from pathlib import Path
 
 import torch.nn as nn
 
 _KB_ROOT = Path(__file__).resolve().parent.parent
+_CANDIDATE_DIR = _KB_ROOT / "tasks" / "candidate"
 
 _L4_MODEL_KEYS: dict[str, str] = {
     "llama": "llama31",
     "mixtral": "mixtral",
 }
 
+
+# ---------------------------------------------------------------------------
+# Target discovery
+# ---------------------------------------------------------------------------
 
 @dataclass
 class BenchTarget:
@@ -216,3 +240,123 @@ def print_model_operator_map() -> None:
     for t in sorted(targets, key=lambda t: (t.level, t.name)):
         print(f"  L{t.level}  {t.name:<25} {','.join(t.models)}")
     print()
+
+
+# ---------------------------------------------------------------------------
+# Class replacement (monkey-patching)
+# ---------------------------------------------------------------------------
+
+def _find_all_references(original_cls: type) -> list[tuple[object, str]]:
+    """Find all (module, attr_name) pairs where attr is original_cls."""
+    pkg_root = __package__.rsplit(".", 1)[0]
+    refs = []
+    for mod_name, mod in list(sys.modules.items()):
+        if mod is None or not mod_name.startswith(pkg_root):
+            continue
+        for attr_name in list(vars(mod)):
+            try:
+                if getattr(mod, attr_name) is original_cls:
+                    refs.append((mod, attr_name))
+            except Exception:
+                continue
+    return refs
+
+
+def patch_class(target: BenchTarget, user_cls: type) -> list[tuple]:
+    """Monkey-patch the target class with user_cls everywhere it's referenced.
+
+    Returns undo info: a list of (module, attr_name, original_cls) tuples.
+    """
+    original_cls = target.target_cls
+    refs = _find_all_references(original_cls)
+    undo_info = []
+    for mod, attr_name in refs:
+        undo_info.append((mod, attr_name, original_cls))
+        setattr(mod, attr_name, user_cls)
+    return undo_info
+
+
+def restore(undo_info: list[tuple]) -> None:
+    """Restore all original classes from undo info."""
+    for mod, attr_name, original_cls in undo_info:
+        setattr(mod, attr_name, original_cls)
+
+
+@contextmanager
+def replacement_context(target: BenchTarget, user_cls: type):
+    """Context manager that patches the class and restores on exit."""
+    undo = patch_class(target, user_cls)
+    try:
+        yield
+    finally:
+        restore(undo)
+
+
+# ---------------------------------------------------------------------------
+# Candidate kernel orchestration
+# ---------------------------------------------------------------------------
+
+def load_candidate(target_name: str) -> type | None:
+    """Load a single candidate kernel for *target_name* from tasks/candidate/.
+
+    Returns the nn.Module subclass if found, or None.
+    """
+    target = get(target_name)
+    candidate_file = _CANDIDATE_DIR / f"L{target.level}" / f"{target_name}.py"
+    if not candidate_file.is_file():
+        return None
+    class_name = target.target_cls.__name__
+    spec = importlib.util.spec_from_file_location("_candidate_impl", str(candidate_file))
+    if spec is None or spec.loader is None:
+        return None
+    mod = importlib.util.module_from_spec(spec)
+    spec.loader.exec_module(mod)
+    cls = getattr(mod, class_name, None)
+    if cls is None:
+        for v in vars(mod).values():
+            if isinstance(v, type) and issubclass(v, nn.Module) and v is not nn.Module:
+                cls = v
+                break
+    return cls
+
+
+def discover_candidates() -> list[tuple[BenchTarget, type]]:
+    """Scan tasks/candidate/ and return all valid (target, candidate_class) pairs."""
+    targets = discover_targets()
+    results: list[tuple[BenchTarget, type]] = []
+
+    for target in targets:
+        level_dir = _CANDIDATE_DIR / f"L{target.level}"
+        candidate_file = level_dir / f"{target.name}.py"
+        if not candidate_file.is_file():
+            continue
+        cls = load_candidate(target.name)
+        if cls is not None:
+            results.append((target, cls))
+
+    return results
+
+
+def apply_candidates(candidates: list[tuple[BenchTarget, type]]) -> list[tuple]:
+    """Monkey-patch all candidate kernels into their baseline targets.
+
+    Returns combined undo info that can be passed to ``restore()`` to revert
+    all patches.
+    """
+    all_undo: list[tuple] = []
+    for target, user_cls in candidates:
+        undo = patch_class(target, user_cls)
+        all_undo.extend(undo)
+    return all_undo
+
+
+def print_candidate_summary(candidates: list[tuple[BenchTarget, type]]) -> None:
+    """Print a human-readable summary of which candidate kernels will be used."""
+    if not candidates:
+        return
+    print(f"\n{'=' * 70}")
+    print("  CANDIDATE KERNELS")
+    print(f"{'=' * 70}")
+    for target, cls in candidates:
+        print(f"    L{target.level}  {target.name:<25} -> {cls.__name__}")
+    print(f"{'=' * 70}\n")

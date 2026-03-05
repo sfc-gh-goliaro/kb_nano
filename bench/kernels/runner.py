@@ -14,10 +14,9 @@ from typing import Any
 import torch
 from transformers import AutoConfig
 
-from ..engine import GenerationOutput, LlamaEngine, SamplingParams
-from .discovery import BenchTarget, get
+from kb_nano.engine import GenerationOutput, LlamaEngine, SamplingParams
+from kb_nano.infra.kernel_swapper import BenchTarget, get, patch_class, restore
 from .evaluator import BenchResult, evaluate
-from .replacement import patch_class, restore
 
 _MODEL_TYPE_TO_KEY = {
     "llama": "llama31",

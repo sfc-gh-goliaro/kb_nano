@@ -207,19 +207,19 @@ When you replace an L1 operator, the change propagates upward through every leve
 
 ## Benchmarking Custom Kernels
 
-The benchmark suite (`kb_nano.bench`) lets you swap any operator with your own implementation and measure correctness + performance against the baseline.
+The kernel benchmark suite (`kb_nano.bench.kernels`) lets you swap any operator with your own implementation and measure correctness + performance against the baseline.
 
 ### Listing available targets
 
 ```bash
 # List all benchmarkable targets
-python -m kb_nano.bench --list
+python -m kb_nano.bench.kernels --list
 
 # Filter by level
-python -m kb_nano.bench --list --level 1
+python -m kb_nano.bench.kernels --list --level 1
 
 # See the full model-to-operator mapping
-python -m kb_nano.bench --map
+python -m kb_nano.bench.kernels --map
 ```
 
 The `--map` command shows two views:
@@ -230,14 +230,14 @@ The `--map` command shows two views:
 
 ```bash
 # Auto-discover candidate from tasks/candidate/
-python -m kb_nano.bench \
+python -m kb_nano.bench.kernels \
     --target rms_norm \
     --model meta-llama/Llama-3.1-8B-Instruct \
     --max-tokens 50 \
     --tp 1
 
 # Or specify a custom implementation explicitly
-python -m kb_nano.bench \
+python -m kb_nano.bench.kernels \
     --target rms_norm \
     --user-impl path/to/my_kernel.py:MyRMSNorm \
     --model meta-llama/Llama-3.1-8B-Instruct \
@@ -267,7 +267,8 @@ This will:
 ### Programmatic API
 
 ```python
-from kb_nano.bench import benchmark, list_targets
+from kb_nano.bench.kernels.runner import run_benchmark as benchmark
+from kb_nano.infra.kernel_swapper import list_targets
 
 # List targets
 for t in list_targets(level=1):
@@ -309,7 +310,7 @@ To create a replacement kernel for benchmarking, you need to write an `nn.Module
 ### Step 1: Identify the target
 
 ```bash
-python -m kb_nano.bench --list --level 1
+python -m kb_nano.bench.kernels --list --level 1
 ```
 
 Pick a target, then read its source file to understand the `forward` signature. For example, `rms_norm`:
@@ -366,13 +367,13 @@ class RMSNorm(nn.Module):
 Place your file at `tasks/candidate/L1/rms_norm.py`, then:
 
 ```bash
-python -m kb_nano.bench --target rms_norm
+python -m kb_nano.bench.kernels --target rms_norm
 ```
 
 Or specify the path explicitly:
 
 ```bash
-python -m kb_nano.bench \
+python -m kb_nano.bench.kernels \
     --target rms_norm \
     --user-impl my_rms_norm.py:RMSNorm
 ```
@@ -545,7 +546,7 @@ engine = LlamaEngine(
 Or from the CLI:
 
 ```bash
-python -m kb_nano.bench --target rms_norm --user-impl my_kernel.py:RMSNorm --tp 4
+python -m kb_nano.bench.kernels --target rms_norm --user-impl my_kernel.py:RMSNorm --tp 4
 ```
 
 Worker processes are spawned automatically and cleaned up on exit.
@@ -575,14 +576,14 @@ The engine allocates KV cache to fill ~90% of available GPU memory after model l
 
 If you're running multiple instances, set different ports:
 ```bash
-KB_NANO_NCCL_PORT=29502 python -m kb_nano.bench ...
+KB_NANO_NCCL_PORT=29502 python -m kb_nano.bench.kernels ...
 ```
 
 ### Custom all-reduce hangs
 
 If multi-GPU inference hangs during all-reduce, disable the custom implementation:
 ```bash
-KB_NANO_DISABLE_CUSTOM_AR=1 python -m kb_nano.bench --tp 4 ...
+KB_NANO_DISABLE_CUSTOM_AR=1 python -m kb_nano.bench.kernels --tp 4 ...
 ```
 
 ### "No .safetensors files found"
@@ -594,7 +595,7 @@ The engine downloads model weights from HuggingFace Hub automatically. Ensure:
 
 ### Bench target not found
 
-If `--target xyz` fails with "Unknown bench target", run `python -m kb_nano.bench --list` to see all available targets. Target names match the Python file names under `tasks/baseline/` (without `.py`).
+If `--target xyz` fails with "Unknown bench target", run `python -m kb_nano.bench.kernels --list` to see all available targets. Target names match the Python file names under `tasks/baseline/` (without `.py`).
 
 ### User implementation class name mismatch
 

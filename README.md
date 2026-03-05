@@ -120,16 +120,16 @@ The benchmark suite lets you evaluate custom kernel implementations at 4 abstrac
 
 ```bash
 # List all targets and which models use them
-python -m kb_nano.bench --map
+python -m kb_nano.bench.kernels --map
 
 # List targets at a specific level
-python -m kb_nano.bench --list --level 1
+python -m kb_nano.bench.kernels --list --level 1
 
 # Benchmark a candidate kernel from tasks/candidate/ (auto-discovered)
-python -m kb_nano.bench --target rms_norm
+python -m kb_nano.bench.kernels --target rms_norm
 
 # Or specify a custom kernel explicitly
-python -m kb_nano.bench \
+python -m kb_nano.bench.kernels \
     --target rms_norm \
     --user-impl path/to/my_kernel.py:MyRMSNorm
 ```
