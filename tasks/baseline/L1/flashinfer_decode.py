@@ -11,15 +11,18 @@ class TRTLLMDecode(nn.Module):
     Interface mirrors flash_attn_with_kvcache: takes block_tables and
     cache_seqlens as GPU tensors, fully CUDA-graph-compatible.
     """
-    def __init__(self, num_qo_heads: int, num_kv_heads: int, head_dim: int):
+    def __init__(self, num_qo_heads: int, num_kv_heads: int, head_dim: int,
+                 workspace: torch.Tensor | None = None):
         super().__init__()
         self.num_qo_heads = num_qo_heads
         self.num_kv_heads = num_kv_heads
         self.head_dim = head_dim
         self.sm_scale = head_dim ** -0.5
-        self._workspace = torch.zeros(
-            512 * 1024 * 1024, dtype=torch.uint8, device="cuda"
-        )
+        if workspace is None:
+            workspace = torch.zeros(
+                512 * 1024 * 1024, dtype=torch.uint8, device="cuda"
+            )
+        self._workspace = workspace
 
     def forward(self, q, k_cache, v_cache, cache_seqlens, block_table,
                 max_seq_len, **kwargs):
@@ -32,5 +35,5 @@ class TRTLLMDecode(nn.Module):
             max_seq_len=max_seq_len,
             bmm1_scale=self.sm_scale,
             bmm2_scale=1.0,
-            kv_layout="NHD",
+            kv_layout="HND",
         )

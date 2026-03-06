@@ -252,6 +252,8 @@ class ModelRunner:
         self.model, self.config = load_model(
             model_name, torch.device(f"cuda:{rank}"), dtype,
         )
+        self._share_trtllm_workspace()
+        self._share_activation_buffers()
         self.warmup_model()
         self.allocate_kv_cache()
         self.is_moe = hasattr(self.config, "num_local_experts")
@@ -336,6 +338,38 @@ class ModelRunner:
             self._signal_workers()
         return getattr(self, method_name)(*args)
 
+    def _share_trtllm_workspace(self):
+        """Replace per-layer TRTLLM workspace buffers with a single shared one."""
+        if not USE_TRTLLM:
+            return
+        self._attn_layers = []
+        for module in self.model.modules():
+            if hasattr(module, "k_cache") and hasattr(module, "v_cache"):
+                self._attn_layers.append(module)
+        trtllm_workspace = torch.zeros(
+            512 * 1024 * 1024, dtype=torch.uint8, device=f"cuda:{self.rank}"
+        )
+        for layer in self._attn_layers:
+            layer.set_trtllm_workspace(trtllm_workspace)
+        torch.cuda.empty_cache()
+
+    def _share_activation_buffers(self):
+        """Share a single SiluAndMul activation buffer across all layers.
+
+        Layers execute sequentially so the buffer is safe to reuse.
+        Must be called before warmup so only one buffer grows to max size
+        instead of one per layer (saves ~14 GiB for 32-layer models).
+        """
+        from .tasks.baseline.L1.silu_and_mul import SiluAndMul
+        silu_modules = [
+            m for m in self.model.modules() if isinstance(m, SiluAndMul)
+        ]
+        if len(silu_modules) <= 1:
+            return
+        shared = silu_modules[0]._act_buf
+        for m in silu_modules[1:]:
+            m.set_shared_buffer(shared)
+
     def warmup_model(self):
         torch.cuda.empty_cache()
         torch.cuda.reset_peak_memory_stats()
@@ -346,6 +380,12 @@ class ModelRunner:
         torch.cuda.empty_cache()
 
     def allocate_kv_cache(self):
+        if not hasattr(self, '_attn_layers') or not self._attn_layers:
+            self._attn_layers = []
+            for module in self.model.modules():
+                if hasattr(module, "k_cache") and hasattr(module, "v_cache"):
+                    self._attn_layers.append(module)
+
         free, total = torch.cuda.mem_get_info()
         used = total - free
         peak = torch.cuda.memory_stats()["allocated_bytes.all.peak"]
@@ -361,17 +401,19 @@ class ModelRunner:
         if self.rank == 0:
             print(f"  KV cache: {num_blocks} blocks x {BLOCK_SIZE} = {num_blocks * BLOCK_SIZE} token slots")
 
-        self.kv_cache = torch.empty(
-            2, num_layers, num_blocks, BLOCK_SIZE, num_kv_heads, head_dim,
-        )
-        self._attn_layers = []
+        if USE_TRTLLM:
+            self.kv_cache = torch.empty(
+                2, num_layers, num_blocks, num_kv_heads, BLOCK_SIZE, head_dim,
+            )
+        else:
+            self.kv_cache = torch.empty(
+                2, num_layers, num_blocks, BLOCK_SIZE, num_kv_heads, head_dim,
+            )
         layer_id = 0
-        for module in self.model.modules():
-            if hasattr(module, "k_cache") and hasattr(module, "v_cache"):
-                module.k_cache = self.kv_cache[0, layer_id]
-                module.v_cache = self.kv_cache[1, layer_id]
-                self._attn_layers.append(module)
-                layer_id += 1
+        for module in self._attn_layers:
+            module.k_cache = self.kv_cache[0, layer_id]
+            module.v_cache = self.kv_cache[1, layer_id]
+            layer_id += 1
 
         if self.rank == 0 and USE_TRTLLM:
             print(f"  Attention backend: TRTLLM-gen via FlashInfer (block_size={BLOCK_SIZE})")
@@ -978,6 +1020,9 @@ class LlamaEngine:
             _dc_post_time = 0.0
             _dc_bs_counts = []
 
+        num_blocks = self.block_manager._num_blocks
+        watermark_blocks = max(int(num_blocks * 0.01), 1)
+
         while waiting or running:
             # --- Prefill one batch (if any waiting) ---
             prefill_seqs = []
@@ -990,6 +1035,9 @@ class LlamaEngine:
                 if len(prefill_seqs) >= MAX_NUM_SEQS:
                     break
                 if not self.block_manager.can_allocate(seq):
+                    break
+                free_after = len(self.block_manager.free_block_ids) - seq.num_blocks
+                if free_after < watermark_blocks:
                     break
                 waiting.popleft()
                 self.block_manager.allocate(seq)

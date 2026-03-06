@@ -10,15 +10,18 @@ class TRTLLMPrefill(nn.Module):
 
     Takes block_tables, seq_lens, and cumulative sequence lengths directly.
     """
-    def __init__(self, num_qo_heads: int, num_kv_heads: int, head_dim: int):
+    def __init__(self, num_qo_heads: int, num_kv_heads: int, head_dim: int,
+                 workspace: torch.Tensor | None = None):
         super().__init__()
         self.num_qo_heads = num_qo_heads
         self.num_kv_heads = num_kv_heads
         self.head_dim = head_dim
         self.sm_scale = head_dim ** -0.5
-        self._workspace = torch.zeros(
-            512 * 1024 * 1024, dtype=torch.uint8, device="cuda"
-        )
+        if workspace is None:
+            workspace = torch.zeros(
+                512 * 1024 * 1024, dtype=torch.uint8, device="cuda"
+            )
+        self._workspace = workspace
 
     def forward(self, q, k_cache, v_cache, block_tables, seq_lens,
                 max_q_len, max_kv_len, batch_size,
@@ -36,5 +39,5 @@ class TRTLLMPrefill(nn.Module):
             batch_size=batch_size,
             cum_seq_lens_q=cum_seq_lens_q,
             cum_seq_lens_kv=cum_seq_lens_kv,
-            kv_layout="NHD",
+            kv_layout="HND",
         )

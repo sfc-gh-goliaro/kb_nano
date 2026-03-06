@@ -12,12 +12,17 @@ import torch.nn as nn
 from ....infra.context import get_context
 from ....infra.tp import _tp_size
 from .parallel_linear import QKVParallelLinear, RowParallelLinear
-from ..L1.store_kvcache import StoreKVCache
+from ..L1.store_kvcache import StoreKVCache, StoreKVCacheHND
 
 
 def _use_trtllm() -> bool:
     from ....engine import USE_TRTLLM
     return USE_TRTLLM
+
+
+def _block_size() -> int:
+    from ....engine import BLOCK_SIZE
+    return BLOCK_SIZE
 
 
 class Attention(nn.Module):
@@ -41,10 +46,9 @@ class Attention(nn.Module):
         )
         self.k_cache = self.v_cache = torch.tensor([])
 
-        self.store_kvcache = StoreKVCache()
-
         self._use_trtllm = _use_trtllm()
         if self._use_trtllm:
+            self.store_kvcache = StoreKVCacheHND(page_size=_block_size())
             from ..L1.flashinfer_prefill import TRTLLMPrefill
             from ..L1.flashinfer_decode import TRTLLMDecode
             self.trtllm_prefill = TRTLLMPrefill(
@@ -54,10 +58,17 @@ class Attention(nn.Module):
                 self.num_heads, self.num_kv_heads, head_dim,
             )
         else:
+            self.store_kvcache = StoreKVCache()
             from ..L1.flash_attn_prefill import FlashAttnPrefill
             from ..L1.flash_attn_decode import FlashAttnDecode
             self.flash_attn_prefill = FlashAttnPrefill()
             self.flash_attn_decode = FlashAttnDecode()
+
+    def set_trtllm_workspace(self, workspace: torch.Tensor):
+        """Share a single workspace buffer across all layers (TRTLLM path only)."""
+        if self._use_trtllm:
+            self.trtllm_decode._workspace = workspace
+            self.trtllm_prefill._workspace = workspace
 
     def forward(self, positions, hidden_states, rotary_emb):
         ctx = get_context()
