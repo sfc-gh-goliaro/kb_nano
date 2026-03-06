@@ -1,36 +1,36 @@
-"""FlashInfer paged attention decode kernel."""
+"""TRTLLM-gen paged attention decode kernel (via FlashInfer, Blackwell only)."""
 
 import torch
 import torch.nn as nn
-from flashinfer import BatchDecodeWithPagedKVCacheWrapper
+from flashinfer.decode import trtllm_batch_decode_with_kv_cache
 
 
-class FlashInferDecode(nn.Module):
-    def __init__(self, num_qo_heads: int, num_kv_heads: int, head_dim: int,
-                 page_size: int):
+class TRTLLMDecode(nn.Module):
+    """Wraps trtllm_batch_decode_with_kv_cache for paged KV cache decode.
+
+    Interface mirrors flash_attn_with_kvcache: takes block_tables and
+    cache_seqlens as GPU tensors, fully CUDA-graph-compatible.
+    """
+    def __init__(self, num_qo_heads: int, num_kv_heads: int, head_dim: int):
         super().__init__()
         self.num_qo_heads = num_qo_heads
         self.num_kv_heads = num_kv_heads
         self.head_dim = head_dim
-        self.page_size = page_size
-        self._workspace = torch.zeros(512 * 1024 * 1024, dtype=torch.uint8,
-                                      device="cuda")
-        self._wrapper = BatchDecodeWithPagedKVCacheWrapper(
-            self._workspace, kv_layout="NHD", use_tensor_cores=True,
+        self.sm_scale = head_dim ** -0.5
+        self._workspace = torch.zeros(
+            512 * 1024 * 1024, dtype=torch.uint8, device="cuda"
         )
-        self._planned = False
 
-    def plan(self, indptr: torch.Tensor, indices: torch.Tensor,
-             last_page_len: torch.Tensor, q_dtype: torch.dtype):
-        self._wrapper.plan(
-            indptr=indptr, indices=indices, last_page_len=last_page_len,
-            num_qo_heads=self.num_qo_heads, num_kv_heads=self.num_kv_heads,
-            head_dim=self.head_dim, page_size=self.page_size,
-            pos_encoding_mode="NONE",
-            sm_scale=self.head_dim ** -0.5,
-            q_data_type=q_dtype,
+    def forward(self, q, k_cache, v_cache, cache_seqlens, block_table,
+                max_seq_len, **kwargs):
+        return trtllm_batch_decode_with_kv_cache(
+            query=q,
+            kv_cache=(k_cache, v_cache),
+            workspace_buffer=self._workspace,
+            block_tables=block_table,
+            seq_lens=cache_seqlens,
+            max_seq_len=max_seq_len,
+            bmm1_scale=self.sm_scale,
+            bmm2_scale=1.0,
+            kv_layout="NHD",
         )
-        self._planned = True
-
-    def forward(self, q, k_cache, v_cache, **kwargs):
-        return self._wrapper.run(q, (k_cache, v_cache))

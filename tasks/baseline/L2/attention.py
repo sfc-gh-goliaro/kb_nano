@@ -1,7 +1,7 @@
 """Multi-head attention with GQA, paged KV cache, and selectable backend.
 
-Uses FlashInfer on Blackwell/Hopper (sm>=90) for paged decode/prefill,
-falls back to flash_attn on older GPUs.
+Blackwell (sm_100+): TRTLLM-gen kernels via FlashInfer package.
+Hopper and below:    flash_attn (unchanged).
 """
 
 from __future__ import annotations
@@ -15,9 +15,9 @@ from .parallel_linear import QKVParallelLinear, RowParallelLinear
 from ..L1.store_kvcache import StoreKVCache
 
 
-def _use_flashinfer() -> bool:
-    from ....engine import USE_FLASHINFER
-    return USE_FLASHINFER
+def _use_trtllm() -> bool:
+    from ....engine import USE_TRTLLM
+    return USE_TRTLLM
 
 
 class Attention(nn.Module):
@@ -43,16 +43,15 @@ class Attention(nn.Module):
 
         self.store_kvcache = StoreKVCache()
 
-        self._flashinfer = _use_flashinfer()
-        if self._flashinfer:
-            from ..L1.flashinfer_prefill import FlashInferPrefill
-            from ..L1.flashinfer_decode import FlashInferDecode
-            from ....engine import BLOCK_SIZE
-            self.fi_prefill = FlashInferPrefill(
-                self.num_heads, self.num_kv_heads, head_dim, BLOCK_SIZE,
+        self._use_trtllm = _use_trtllm()
+        if self._use_trtllm:
+            from ..L1.flashinfer_prefill import TRTLLMPrefill
+            from ..L1.flashinfer_decode import TRTLLMDecode
+            self.trtllm_prefill = TRTLLMPrefill(
+                self.num_heads, self.num_kv_heads, head_dim,
             )
-            self.fi_decode = FlashInferDecode(
-                self.num_heads, self.num_kv_heads, head_dim, BLOCK_SIZE,
+            self.trtllm_decode = TRTLLMDecode(
+                self.num_heads, self.num_kv_heads, head_dim,
             )
         else:
             from ..L1.flash_attn_prefill import FlashAttnPrefill
@@ -76,8 +75,8 @@ class Attention(nn.Module):
         if k_cache.numel() and v_cache.numel():
             self.store_kvcache(k, v, k_cache, v_cache, ctx.slot_mapping)
 
-        if self._flashinfer:
-            o = self._forward_flashinfer(q, k, v, k_cache, v_cache, ctx)
+        if self._use_trtllm:
+            o = self._forward_trtllm(q, k, v, k_cache, v_cache, ctx)
         else:
             o = self._forward_flash_attn(q, k, v, k_cache, v_cache, ctx)
         return self.o_proj(o.reshape(N, self.num_heads * self.head_dim))
@@ -106,11 +105,23 @@ class Attention(nn.Module):
             softmax_scale=self.scaling, causal=True,
         )
 
-    def _forward_flashinfer(self, q, k, v, k_cache, v_cache, ctx):
+    def _forward_trtllm(self, q, k, v, k_cache, v_cache, ctx):
         if ctx.is_prefill:
-            if ctx.fi_planned:
-                return self.fi_prefill(q, k_cache, v_cache)
-            # Warmup (no block tables yet) — use flash_attn_varlen_func
+            if ctx.block_tables is not None:
+                # Compute seq_lens from cu_seqlens_k (int32 difference)
+                seq_lens = ctx.cu_seqlens_k[1:] - ctx.cu_seqlens_k[:-1]
+                batch_size = seq_lens.shape[0]
+                return self.trtllm_prefill(
+                    q, k_cache, v_cache,
+                    block_tables=ctx.block_tables,
+                    seq_lens=seq_lens,
+                    max_q_len=ctx.max_seqlen_q,
+                    max_kv_len=ctx.max_seqlen_k,
+                    batch_size=batch_size,
+                    cum_seq_lens_q=ctx.cu_seqlens_q,
+                    cum_seq_lens_kv=ctx.cu_seqlens_k,
+                )
+            # Warmup (no block tables) — fall back to flash_attn_varlen_func
             from flash_attn import flash_attn_varlen_func
             return flash_attn_varlen_func(
                 q, k, v,
@@ -118,5 +129,9 @@ class Attention(nn.Module):
                 max_seqlen_q=ctx.max_seqlen_q, max_seqlen_k=ctx.max_seqlen_k,
                 softmax_scale=self.scaling, causal=True,
             )
-        # Decode: wrapper.run expects q shape [batch_size, num_heads, head_dim]
-        return self.fi_decode(q, k_cache, v_cache)
+        return self.trtllm_decode(
+            q, k_cache, v_cache,
+            cache_seqlens=ctx.context_lens,
+            block_table=ctx.block_tables,
+            max_seq_len=ctx.max_context_len,
+        )

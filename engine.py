@@ -42,24 +42,25 @@ _PROFILE = os.environ.get("KB_NANO_PROFILE", "0") == "1"
 
 
 def _detect_attn_backend() -> tuple[bool, int]:
-    """Return (use_flashinfer, block_size) based on GPU compute capability.
+    """Return (use_trtllm, block_size) based on GPU compute capability.
 
-    Blackwell (sm_100+) and Hopper (sm_90+) use FlashInfer with block_size=16.
-    Older GPUs fall back to flash_attn with block_size=256.
+    Blackwell (sm_100+) uses TRTLLM-gen attention kernels via FlashInfer
+    with block_size=16.  Everything else uses flash_attn with block_size=256.
     """
     if not torch.cuda.is_available():
         return False, 256
     cc = torch.cuda.get_device_capability()
-    if cc[0] >= 9:
+    if cc[0] >= 10:
         try:
-            import flashinfer  # noqa: F401
+            from flashinfer.decode import trtllm_batch_decode_with_kv_cache  # noqa: F401
             return True, 16
         except ImportError:
             pass
     return False, 256
 
 
-USE_FLASHINFER, BLOCK_SIZE = _detect_attn_backend()
+USE_TRTLLM, BLOCK_SIZE = _detect_attn_backend()
+USE_FLASHINFER = USE_TRTLLM  # back-compat alias
 
 
 # ---------------------------------------------------------------------------
@@ -223,7 +224,6 @@ class ModelRunner:
         self.enforce_eager = enforce_eager
         self.event = event
         self.block_size = BLOCK_SIZE
-        self.use_flashinfer = USE_FLASHINFER
         self.gpu_memory_utilization = gpu_memory_utilization
         self.max_model_len = max_model_len
 
@@ -255,7 +255,7 @@ class ModelRunner:
         self.warmup_model()
         self.allocate_kv_cache()
         self.is_moe = hasattr(self.config, "num_local_experts")
-        if not self.enforce_eager and not self.use_flashinfer:
+        if not self.enforce_eager:
             self.capture_cudagraph()
         self._init_greedy_buffers()
         torch.set_default_device("cpu")
@@ -373,58 +373,10 @@ class ModelRunner:
                 self._attn_layers.append(module)
                 layer_id += 1
 
-        if self.rank == 0 and self.use_flashinfer:
-            print(f"  Attention backend: FlashInfer (block_size={BLOCK_SIZE})")
+        if self.rank == 0 and USE_TRTLLM:
+            print(f"  Attention backend: TRTLLM-gen via FlashInfer (block_size={BLOCK_SIZE})")
         elif self.rank == 0:
             print(f"  Attention backend: flash_attn (block_size={BLOCK_SIZE})")
-
-    def _plan_flashinfer_decode(self, seqs):
-        """Compute FlashInfer paged-attention metadata for decode and call plan()."""
-        n = len(seqs)
-        block_size = self.block_size
-        indptr = torch.zeros(n + 1, dtype=torch.int32, device="cpu")
-        indices_list = []
-        last_page_len = torch.empty(n, dtype=torch.int32, device="cpu")
-
-        for i, seq in enumerate(seqs):
-            num_blocks = len(seq.block_table)
-            indptr[i + 1] = indptr[i] + num_blocks
-            indices_list.extend(seq.block_table)
-            total_tokens = len(seq)
-            lpl = total_tokens % block_size
-            last_page_len[i] = lpl if lpl != 0 else block_size
-
-        indices = torch.tensor(indices_list, dtype=torch.int32, device="cpu")
-
-        for layer in self._attn_layers:
-            layer.fi_decode.plan(indptr, indices, last_page_len,
-                                q_dtype=self.dtype)
-
-        return indptr, indices, last_page_len
-
-    def _plan_flashinfer_prefill(self, seqs):
-        """Compute FlashInfer paged-attention metadata for prefill and call plan()."""
-        n = len(seqs)
-        block_size = self.block_size
-        qo_indptr = torch.zeros(n + 1, dtype=torch.int32, device="cpu")
-        kv_indptr = torch.zeros(n + 1, dtype=torch.int32, device="cpu")
-        indices_list = []
-        last_page_len = torch.empty(n, dtype=torch.int32, device="cpu")
-
-        for i, seq in enumerate(seqs):
-            sl = len(seq)
-            qo_indptr[i + 1] = qo_indptr[i] + sl
-            num_blocks = len(seq.block_table)
-            kv_indptr[i + 1] = kv_indptr[i] + num_blocks
-            indices_list.extend(seq.block_table)
-            lpl = sl % block_size
-            last_page_len[i] = lpl if lpl != 0 else block_size
-
-        indices = torch.tensor(indices_list, dtype=torch.int32, device="cpu")
-
-        for layer in self._attn_layers:
-            layer.fi_prefill.plan(qo_indptr, kv_indptr, indices, last_page_len,
-                                  q_dtype=self.dtype)
 
     def prepare_prefill(self, seqs):
         input_ids, positions = [], []
@@ -453,13 +405,8 @@ class ModelRunner:
             if blen > max_bt:
                 max_bt = blen
 
-        fi_planned = False
-        if self.use_flashinfer and has_block_tables:
-            self._plan_flashinfer_prefill(seqs)
-            fi_planned = True
-
         block_tables = None
-        if max_bt > 0 and not self.use_flashinfer:
+        if max_bt > 0:
             n = len(seqs)
             bt = np.full((n, max_bt), -1, dtype=np.int32)
             for i, seq in enumerate(seqs):
@@ -476,9 +423,6 @@ class ModelRunner:
             torch.tensor(slot_mapping, dtype=torch.int32, pin_memory=True).cuda(non_blocking=True),
             block_tables=block_tables,
         )
-        from .infra.context import get_context
-        ctx = get_context()
-        ctx.fi_planned = fi_planned
         return (
             torch.tensor(input_ids, dtype=torch.int64, pin_memory=True).cuda(non_blocking=True),
             torch.tensor(positions, dtype=torch.int64, pin_memory=True).cuda(non_blocking=True),
@@ -500,23 +444,18 @@ class ModelRunner:
             if blen > max_bt:
                 max_bt = blen
 
-        if self.use_flashinfer:
-            self._plan_flashinfer_decode(seqs)
-            set_context(
-                False,
-                slot_mapping=torch.from_numpy(sm).pin_memory().cuda(non_blocking=True),
-            )
-        else:
-            bt = np.full((n, max_bt), -1, dtype=np.int32)
-            for i, seq in enumerate(seqs):
-                b = seq.block_table
-                bt[i, :len(b)] = b
-            set_context(
-                False,
-                slot_mapping=torch.from_numpy(sm).pin_memory().cuda(non_blocking=True),
-                context_lens=torch.from_numpy(cl).pin_memory().cuda(non_blocking=True),
-                block_tables=torch.from_numpy(bt).pin_memory().cuda(non_blocking=True),
-            )
+        bt = np.full((n, max_bt), -1, dtype=np.int32)
+        for i, seq in enumerate(seqs):
+            b = seq.block_table
+            bt[i, :len(b)] = b
+        max_cl = int(cl[:n].max())
+        set_context(
+            False,
+            slot_mapping=torch.from_numpy(sm).pin_memory().cuda(non_blocking=True),
+            context_lens=torch.from_numpy(cl).pin_memory().cuda(non_blocking=True),
+            block_tables=torch.from_numpy(bt).pin_memory().cuda(non_blocking=True),
+            max_context_len=max_cl,
+        )
         return (
             torch.from_numpy(ids).pin_memory().cuda(non_blocking=True),
             torch.from_numpy(pos).pin_memory().cuda(non_blocking=True),
@@ -622,46 +561,8 @@ class ModelRunner:
         """Fused decode path for greedy sampling with TP.
         Returns GPU tensor (rank 0) or list (TP=1).
         """
-        if self.use_flashinfer:
-            return self._run_decode_greedy_flashinfer(seqs)
         decode_data = self._prepare_decode_arrays(seqs)
         return self.run_decode_greedy_fast(decode_data)
-
-    @torch.inference_mode()
-    def _run_decode_greedy_flashinfer(self, seqs):
-        """FlashInfer eager decode path: plan() then run()."""
-        n = len(seqs)
-        ids_np = self._np_ids
-        pos_np = self._np_pos
-        sm_np = self._np_sm
-        for i, seq in enumerate(seqs):
-            ids_np[i] = seq.last_token
-            pos_np[i] = len(seq) - 1
-            sm_np[i] = seq.block_table[-1] * BLOCK_SIZE + seq.last_block_num_tokens - 1
-
-        self._plan_flashinfer_decode(seqs)
-
-        input_ids = torch.from_numpy(ids_np[:n]).cuda(non_blocking=True)
-        positions = torch.from_numpy(pos_np[:n]).cuda(non_blocking=True)
-        slot_mapping = torch.from_numpy(sm_np[:n]).cuda(non_blocking=True)
-        set_context(False, slot_mapping=slot_mapping)
-        hidden = self.model(input_ids, positions)
-        lm_head = self.model.lm_head
-        logits = lm_head.linear_op(hidden, lm_head.weight).float()
-        max_vals, max_idxs = logits.max(dim=-1)
-        reset_context()
-        if self.world_size > 1:
-            info = self._greedy_info
-            info[:n, 0] = max_vals
-            info[:n, 1] = max_idxs.float()
-            vocab_offset = lm_head.per_partition * self.rank
-            info[:n, 1] += vocab_offset
-            dist.all_gather(self._greedy_gathered, info)
-            all_info = self._greedy_all_info
-            torch.stack(self._greedy_gathered, out=all_info)
-            best_rank = all_info[:, :n, 0].argmax(dim=0)
-            return all_info[best_rank, self._greedy_arange[:n], 1].to(torch.int64)
-        return max_idxs
 
     @torch.inference_mode()
     def run_decode_greedy_fast(self, decode_data):
@@ -707,6 +608,7 @@ class ModelRunner:
             slot_mapping=slot_mapping,
             context_lens=context_lens,
             block_tables=block_tables,
+            max_context_len=int(cl_np.max()),
         )
         hidden = self.model(input_ids, positions)
         lm_head = self.model.lm_head
@@ -907,33 +809,14 @@ class ModelRunner:
         with ar_ctx:
             for bs in reversed(self.graph_bs_list):
                 graph = torch.cuda.CUDAGraph()
-                if self.use_flashinfer:
-                    # plan() with dummy data before warmup/capture
-                    # Each seq has 1 page with 1 token
-                    dummy_indptr = torch.arange(bs + 1, dtype=torch.int32,
-                                                device="cpu")
-                    dummy_indices = torch.zeros(bs, dtype=torch.int32,
-                                                device="cpu")
-                    dummy_lpl = torch.ones(bs, dtype=torch.int32,
-                                           device="cpu")
-                    for layer in self._attn_layers:
-                        layer.fi_decode.plan(dummy_indptr, dummy_indices,
-                                             dummy_lpl, q_dtype=self.dtype)
-                    set_context(False, slot_mapping=slot_mapping[:bs])
-                else:
-                    set_context(
-                        False, slot_mapping=slot_mapping[:bs],
-                        context_lens=context_lens[:bs], block_tables=block_tables[:bs],
-                    )
+                set_context(
+                    False, slot_mapping=slot_mapping[:bs],
+                    context_lens=context_lens[:bs], block_tables=block_tables[:bs],
+                    max_context_len=self.max_model_len,
+                )
                 outputs[:bs] = self.model(input_ids[:bs], positions[:bs])
                 lm_logits[:bs] = lm_head.linear_op(outputs[:bs], lm_head.weight).float()
                 lm_max_vals[:bs], lm_max_idxs[:bs] = lm_logits[:bs].max(dim=-1)
-
-                if self.use_flashinfer:
-                    for layer in self._attn_layers:
-                        layer.fi_decode.plan(dummy_indptr, dummy_indices,
-                                             dummy_lpl, q_dtype=self.dtype)
-                    set_context(False, slot_mapping=slot_mapping[:bs])
 
                 with torch.cuda.graph(graph, self.graph_pool):
                     outputs[:bs] = self.model(input_ids[:bs], positions[:bs])

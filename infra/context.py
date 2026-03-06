@@ -17,6 +17,7 @@ class Context:
     slot_mapping: torch.Tensor | None = None
     context_lens: torch.Tensor | None = None
     block_tables: torch.Tensor | None = None
+    max_context_len: int = 0
 
     # Chunked prefill: mixed batch with both prefill and decode tokens
     is_mixed: bool = False
@@ -25,13 +26,6 @@ class Context:
     # Decode-specific fields for mixed batches (indexed over decode tokens only)
     decode_context_lens: torch.Tensor | None = None
     decode_block_tables: torch.Tensor | None = None
-
-    # FlashInfer paged-attention metadata (set when use_flashinfer=True)
-    fi_paged_kv_indptr: torch.Tensor | None = None
-    fi_paged_kv_indices: torch.Tensor | None = None
-    fi_paged_kv_last_page_len: torch.Tensor | None = None
-    fi_qo_indptr: torch.Tensor | None = None
-    fi_planned: bool = False
 
 
 _CONTEXT = Context()
@@ -43,11 +37,12 @@ def get_context() -> Context:
 
 def set_context(is_prefill, cu_seqlens_q=None, cu_seqlens_k=None,
                 max_seqlen_q=0, max_seqlen_k=0, slot_mapping=None,
-                context_lens=None, block_tables=None):
+                context_lens=None, block_tables=None,
+                max_context_len=0):
     global _CONTEXT
     _CONTEXT = Context(is_prefill, cu_seqlens_q, cu_seqlens_k,
                        max_seqlen_q, max_seqlen_k, slot_mapping,
-                       context_lens, block_tables)
+                       context_lens, block_tables, max_context_len)
 
 
 def set_mixed_context(cu_seqlens_q, cu_seqlens_k, max_seqlen_q, max_seqlen_k,
