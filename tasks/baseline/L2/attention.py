@@ -86,11 +86,18 @@ class Attention(nn.Module):
         if k_cache.numel() and v_cache.numel():
             self.store_kvcache(k, v, k_cache, v_cache, ctx.slot_mapping)
 
-        if self._use_trtllm:
+        if ctx.is_mixed:
+            if self._use_trtllm:
+                o = self._forward_trtllm_mixed(q, k_cache, v_cache, ctx)
+            else:
+                o = self._forward_flash_attn_mixed(q, k_cache, v_cache, ctx)
+        elif self._use_trtllm:
             o = self._forward_trtllm(q, k, v, k_cache, v_cache, ctx)
         else:
             o = self._forward_flash_attn(q, k, v, k_cache, v_cache, ctx)
         return self.o_proj(o.reshape(N, self.num_heads * self.head_dim))
+
+    # --- Pure prefill / decode paths ---
 
     def _forward_flash_attn(self, q, k, v, k_cache, v_cache, ctx):
         if ctx.is_prefill:
@@ -119,7 +126,6 @@ class Attention(nn.Module):
     def _forward_trtllm(self, q, k, v, k_cache, v_cache, ctx):
         if ctx.is_prefill:
             if ctx.block_tables is not None:
-                # Compute seq_lens from cu_seqlens_k (int32 difference)
                 seq_lens = ctx.cu_seqlens_k[1:] - ctx.cu_seqlens_k[:-1]
                 batch_size = seq_lens.shape[0]
                 return self.trtllm_prefill(
@@ -132,7 +138,6 @@ class Attention(nn.Module):
                     cum_seq_lens_q=ctx.cu_seqlens_q,
                     cum_seq_lens_kv=ctx.cu_seqlens_k,
                 )
-            # Warmup (no block tables) — fall back to flash_attn_varlen_func
             from flash_attn import flash_attn_varlen_func
             return flash_attn_varlen_func(
                 q, k, v,
@@ -146,3 +151,59 @@ class Attention(nn.Module):
             block_table=ctx.block_tables,
             max_seq_len=ctx.max_context_len,
         )
+
+    # --- Mixed batch paths (chunked prefill) ---
+
+    def _forward_flash_attn_mixed(self, q, k_cache, v_cache, ctx):
+        np = ctx.num_prefill_tokens
+        nd = ctx.num_decode_tokens
+        out = torch.empty_like(q)
+
+        if np > 0:
+            out[:np] = self.flash_attn_prefill(
+                q[:np], k_cache, v_cache,
+                cu_seqlens_q=ctx.prefill_cu_seqlens_q,
+                cu_seqlens_k=ctx.prefill_cu_seqlens_k,
+                max_seqlen_q=ctx.prefill_max_seqlen_q,
+                max_seqlen_k=ctx.prefill_max_seqlen_k,
+                softmax_scale=self.scaling, causal=True,
+                block_table=ctx.prefill_block_tables,
+            )
+
+        if nd > 0:
+            out[np:] = self.flash_attn_decode(
+                q[np:].unsqueeze(1), k_cache, v_cache,
+                cache_seqlens=ctx.decode_context_lens,
+                block_table=ctx.decode_block_tables,
+                softmax_scale=self.scaling, causal=True,
+            )
+        return out
+
+    def _forward_trtllm_mixed(self, q, k_cache, v_cache, ctx):
+        np_ = ctx.num_prefill_tokens
+        nd = ctx.num_decode_tokens
+        out = torch.empty_like(q)
+
+        if np_ > 0:
+            pq = q[:np_].contiguous()
+            seq_lens = (ctx.prefill_cu_seqlens_k[1:]
+                        - ctx.prefill_cu_seqlens_k[:-1])
+            out[:np_] = self.trtllm_prefill(
+                pq, k_cache, v_cache,
+                block_tables=ctx.prefill_block_tables,
+                seq_lens=seq_lens,
+                max_q_len=ctx.prefill_max_seqlen_q,
+                max_kv_len=ctx.prefill_max_seqlen_k,
+                batch_size=ctx.num_prefill_seqs,
+                cum_seq_lens_q=ctx.prefill_cu_seqlens_q,
+                cum_seq_lens_kv=ctx.prefill_cu_seqlens_k,
+            )
+
+        if nd > 0:
+            out[np_:] = self.trtllm_decode(
+                q[np_:], k_cache, v_cache,
+                cache_seqlens=ctx.decode_context_lens,
+                block_table=ctx.decode_block_tables,
+                max_seq_len=ctx.decode_max_context_len,
+            )
+        return out

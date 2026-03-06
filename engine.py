@@ -504,74 +504,95 @@ class ModelRunner:
         )
 
     def prepare_mixed_batch(self, prefill_seqs, prefill_chunk_sizes, decode_seqs):
-        """Prepare a unified mixed batch with full prefills and decode tokens.
+        """Prepare a unified mixed batch: [prefill_tokens... | decode_tokens...].
 
-        All attention reads from the paged KV cache via block_table.
-        cu_seqlens_q/k cover all sequences (prefill + decode).
+        The attention layer receives split metadata so it can dispatch
+        prefill tokens to the prefill kernel and decode tokens to the
+        decode kernel independently.
         """
         input_ids, positions = [], []
         slot_mapping = []
-        cu_seqlens_q, cu_seqlens_k = [0], [0]
-        max_sq, max_sk = 0, 0
-
         block_size = self.block_size
-        all_seqs = list(prefill_seqs) + list(decode_seqs)
-        max_bt = 0
 
-        # Prefill sequences: q_len = prompt_len, k_len = prompt_len
+        # --- Prefill portion ---
+        pf_cu_q, pf_cu_k = [0], [0]
+        pf_max_sq, pf_max_sk = 0, 0
+        pf_max_bt = 0
+
         for seq, chunk_size in zip(prefill_seqs, prefill_chunk_sizes):
-            sl = chunk_size
-            input_ids.extend(seq.token_ids[:sl])
-            positions.extend(range(sl))
-            cu_seqlens_q.append(cu_seqlens_q[-1] + sl)
-            cu_seqlens_k.append(cu_seqlens_k[-1] + sl)
-            max_sq = max(sl, max_sq)
-            max_sk = max(sl, max_sk)
-            for i in range(seq.num_blocks):
-                start = seq.block_table[i] * block_size
-                end = start + (block_size if i != seq.num_blocks - 1
-                               else seq.last_block_num_tokens)
-                slot_mapping.extend(range(start, end))
+            start_pos = seq.num_computed_tokens
+            chunk_ids = seq.token_ids[start_pos:start_pos + chunk_size]
+            input_ids.extend(chunk_ids)
+            positions.extend(range(start_pos, start_pos + chunk_size))
+
+            kv_len = start_pos + chunk_size
+            pf_cu_q.append(pf_cu_q[-1] + chunk_size)
+            pf_cu_k.append(pf_cu_k[-1] + kv_len)
+            pf_max_sq = max(chunk_size, pf_max_sq)
+            pf_max_sk = max(kv_len, pf_max_sk)
+
+            for p in range(start_pos, start_pos + chunk_size):
+                slot_mapping.append(
+                    seq.block_table[p // block_size] * block_size + (p % block_size)
+                )
             blen = len(seq.block_table)
-            if blen > max_bt:
-                max_bt = blen
+            if blen > pf_max_bt:
+                pf_max_bt = blen
 
         num_prefill_tokens = len(input_ids)
+        num_prefill_seqs = len(prefill_seqs)
 
-        # Decode sequences: q_len = 1, k_len = full context length
-        for seq in decode_seqs:
+        # Build prefill block table
+        prefill_block_tables = None
+        if pf_max_bt > 0 and num_prefill_seqs > 0:
+            pbt = np.full((num_prefill_seqs, pf_max_bt), -1, dtype=np.int32)
+            for i, seq in enumerate(prefill_seqs):
+                b = seq.block_table
+                pbt[i, :len(b)] = b
+            prefill_block_tables = torch.from_numpy(pbt).pin_memory().cuda(non_blocking=True)
+
+        # --- Decode portion ---
+        nd = len(decode_seqs)
+        dc_cl = np.empty(nd, dtype=np.int32)
+        dc_max_bt = 0
+        for i, seq in enumerate(decode_seqs):
             input_ids.append(seq.last_token)
             positions.append(len(seq) - 1)
-            cu_seqlens_q.append(cu_seqlens_q[-1] + 1)
-            cu_seqlens_k.append(cu_seqlens_k[-1] + len(seq))
-            max_sk = max(len(seq), max_sk)
-            max_sq = max(1, max_sq)
+            dc_cl[i] = len(seq)
             slot_mapping.append(
                 seq.block_table[-1] * block_size + seq.last_block_num_tokens - 1
             )
             blen = len(seq.block_table)
-            if blen > max_bt:
-                max_bt = blen
+            if blen > dc_max_bt:
+                dc_max_bt = blen
 
-        num_decode_tokens = len(decode_seqs)
-
-        # Unified block table for all sequences
-        n_all = len(all_seqs)
-        bt = np.full((n_all, max_bt), -1, dtype=np.int32)
-        for i, seq in enumerate(all_seqs):
+        dc_bt = np.full((nd, dc_max_bt), -1, dtype=np.int32) if nd > 0 else np.empty((0, 0), dtype=np.int32)
+        for i, seq in enumerate(decode_seqs):
             b = seq.block_table
-            bt[i, :len(b)] = b
+            dc_bt[i, :len(b)] = b
+        dc_max_cl = int(dc_cl[:nd].max()) if nd > 0 else 0
+
+        # logit_indices: last token of each prefill chunk + all decode tokens
+        logit_idx = []
+        for i in range(num_prefill_seqs):
+            logit_idx.append(pf_cu_q[i + 1] - 1)
+        for j in range(nd):
+            logit_idx.append(num_prefill_tokens + j)
 
         set_mixed_context(
-            cu_seqlens_q=torch.tensor(cu_seqlens_q, dtype=torch.int32, pin_memory=True).cuda(non_blocking=True),
-            cu_seqlens_k=torch.tensor(cu_seqlens_k, dtype=torch.int32, pin_memory=True).cuda(non_blocking=True),
-            max_seqlen_q=max_sq,
-            max_seqlen_k=max_sk,
             slot_mapping=torch.tensor(slot_mapping, dtype=torch.int32, pin_memory=True).cuda(non_blocking=True),
             num_prefill_tokens=num_prefill_tokens,
-            num_decode_tokens=num_decode_tokens,
-            decode_context_lens=None,
-            decode_block_tables=torch.from_numpy(bt).pin_memory().cuda(non_blocking=True),
+            num_decode_tokens=nd,
+            num_prefill_seqs=num_prefill_seqs,
+            prefill_cu_seqlens_q=torch.tensor(pf_cu_q, dtype=torch.int32, pin_memory=True).cuda(non_blocking=True),
+            prefill_cu_seqlens_k=torch.tensor(pf_cu_k, dtype=torch.int32, pin_memory=True).cuda(non_blocking=True),
+            prefill_max_seqlen_q=pf_max_sq,
+            prefill_max_seqlen_k=pf_max_sk,
+            prefill_block_tables=prefill_block_tables,
+            decode_context_lens=torch.from_numpy(dc_cl).pin_memory().cuda(non_blocking=True) if nd > 0 else None,
+            decode_block_tables=torch.from_numpy(dc_bt).pin_memory().cuda(non_blocking=True) if nd > 0 else None,
+            decode_max_context_len=dc_max_cl,
+            logit_indices=torch.tensor(logit_idx, dtype=torch.int64, pin_memory=True).cuda(non_blocking=True),
         )
         return (
             torch.tensor(input_ids, dtype=torch.int64, pin_memory=True).cuda(non_blocking=True),
@@ -730,12 +751,21 @@ class ModelRunner:
         sm_np = self._np_sm
         cl_np = self._np_cl
         max_bt = 0
+        bs = BLOCK_SIZE
         for i, seq in enumerate(seqs):
-            ids_np[i] = seq.last_token
-            pos_np[i] = len(seq) - 1
-            cl_np[i] = len(seq)
-            sm_np[i] = seq.block_table[-1] * BLOCK_SIZE + seq.last_block_num_tokens - 1
-            blen = len(seq.block_table)
+            tids = seq.token_ids
+            if tids is not None:
+                slen = len(tids)
+                ids_np[i] = tids[-1]
+            else:
+                slen = seq._num_tokens
+                ids_np[i] = seq._last_token
+            pos_np[i] = slen - 1
+            cl_np[i] = slen
+            bt = seq.block_table
+            blen = len(bt)
+            r = slen % bs
+            sm_np[i] = bt[-1] * bs + (r - 1 if r else bs - 1)
             if blen > max_bt:
                 max_bt = blen
         bt_np = self._np_bt
@@ -977,7 +1007,13 @@ class LlamaEngine:
 
     @torch.inference_mode()
     def generate(self, prompts, sampling_params, collect_logits: bool = False):
-        """Generate completions for a batch of prompts."""
+        """Generate completions for a batch of prompts.
+
+        Uses unified chunked-prefill scheduling: every GPU step processes
+        both decode tokens (for running seqs) and prefill chunks (for
+        new/continuing seqs) in a single forward pass, matching vLLM's
+        approach.
+        """
         if isinstance(sampling_params, list):
             sp_list = sampling_params
         else:
@@ -988,8 +1024,9 @@ class LlamaEngine:
             self._set_seeds(seed)
 
         eos = self.tokenizer.eos_token_id
-        waiting = deque()
-        running = deque()
+        waiting: deque[Sequence] = deque()
+        running: deque[Sequence] = deque()
+        prefilling: deque[Sequence] = deque()
 
         seq_logits: dict[int, list[torch.Tensor]] = {}
 
@@ -1005,122 +1042,142 @@ class LlamaEngine:
         use_greedy = (sp_list[0].temperature == 0.0
                       and not collect_logits)
         block_size = BLOCK_SIZE
-
-        profile = _PROFILE
-        if profile:
-            _pf_time = 0.0
-            _pf_steps = 0
-            _pf_tokens = 0
-            _dc_time = 0.0
-            _dc_steps = 0
-            _dc_tokens = 0
-            _dc_sched_time = 0.0
-            _dc_call_time = 0.0
-            _dc_tolist_time = 0.0
-            _dc_post_time = 0.0
-            _dc_bs_counts = []
-
-        num_blocks = self.block_manager._num_blocks
+        bm = self.block_manager
+        num_blocks = bm._num_blocks
         watermark_blocks = max(int(num_blocks * 0.01), 1)
 
-        while waiting or running:
-            # --- Prefill one batch (if any waiting) ---
-            prefill_seqs = []
-            num_batched_tokens = 0
-            while waiting:
-                seq = waiting[0]
-                seq_len = len(seq)
-                if num_batched_tokens + seq_len > MAX_NUM_BATCHED_TOKENS:
-                    break
-                if len(prefill_seqs) >= MAX_NUM_SEQS:
-                    break
-                if not self.block_manager.can_allocate(seq):
-                    break
-                free_after = len(self.block_manager.free_block_ids) - seq.num_blocks
-                if free_after < watermark_blocks:
-                    break
-                waiting.popleft()
-                self.block_manager.allocate(seq)
-                seq.status = SeqStatus.RUNNING
-                running.append(seq)
-                prefill_seqs.append(seq)
-                num_batched_tokens += seq_len
+        while waiting or running or prefilling:
+            # =============================================================
+            # FAST PATH: pure decode (most common steady-state)
+            # No waiting/prefilling seqs, so skip the full scheduler.
+            # =============================================================
+            if running and not waiting and not prefilling:
+                # Check how many seqs need a new block
+                need_blocks = 0
+                for seq in running:
+                    if len(seq) % block_size == 1:
+                        need_blocks += 1
+                if need_blocks <= len(bm.free_block_ids):
+                    decode_seqs = list(running)
+                    for seq in decode_seqs:
+                        if len(seq) % block_size == 1:
+                            seq.block_table.append(bm.free_block_ids.popleft())
 
-            if prefill_seqs:
-                if profile:
-                    _t0 = time.perf_counter()
-                logits = self.model_runner.call("run", prefill_seqs, True)
-                if logits is not None:
-                    if collect_logits:
-                        for i, seq in enumerate(prefill_seqs):
-                            seq_logits[id(seq)].append(logits[i:i+1].cpu())
-                    token_ids = self._sample(logits, sp_list[0])
-                    for seq, tid in zip(prefill_seqs, token_ids):
-                        seq.num_computed_tokens = len(seq)
-                        seq.append_token(tid)
-                        done = len(seq.generated_ids) >= seq.max_tokens
-                        if not seq.ignore_eos:
-                            done = done or tid == eos
-                        if done:
-                            seq.status = SeqStatus.FINISHED
-                            running.remove(seq)
-                            self.block_manager.deallocate(seq)
-                if profile:
-                    _pf_time += time.perf_counter() - _t0
-                    _pf_steps += 1
-                    _pf_tokens += num_batched_tokens
+                    if use_greedy:
+                        gpu_result = self.model_runner.call_decode_greedy(decode_seqs)
+                        if gpu_result is not None:
+                            token_ids = gpu_result.tolist()
+                            finished_set = set()
+                            for seq, tid in zip(decode_seqs, token_ids):
+                                seq.append_token(tid)
+                                done = len(seq.generated_ids) >= seq.max_tokens
+                                if not seq.ignore_eos:
+                                    done = done or tid == eos
+                                if done:
+                                    seq.status = SeqStatus.FINISHED
+                                    finished_set.add(id(seq))
+                                    bm.deallocate(seq)
+                            if finished_set:
+                                running = deque(s for s in running if id(s) not in finished_set)
+                    else:
+                        result = self.model_runner.call("run", decode_seqs, False)
+                        if result is not None:
+                            if collect_logits:
+                                for i, seq in enumerate(decode_seqs):
+                                    seq_logits[id(seq)].append(result[i:i+1].cpu())
+                            token_ids = self._sample(result, sp_list[0])
+                            finished_set = set()
+                            for seq, tid in zip(decode_seqs, token_ids):
+                                seq.append_token(tid)
+                                done = len(seq.generated_ids) >= seq.max_tokens
+                                if not seq.ignore_eos:
+                                    done = done or tid == eos
+                                if done:
+                                    seq.status = SeqStatus.FINISHED
+                                    finished_set.add(id(seq))
+                                    bm.deallocate(seq)
+                            if finished_set:
+                                running = deque(s for s in running if id(s) not in finished_set)
+                    continue
 
-            # --- Decode all running sequences (CUDA graph path) ---
-            if not running:
-                continue
+            # =============================================================
+            # SCHEDULE: one unified step
+            # =============================================================
+            token_budget = MAX_NUM_BATCHED_TOKENS
 
-            if profile:
-                _t_sched = time.perf_counter()
-
-            bm = self.block_manager
-            decode_seqs = []
-            while running and len(decode_seqs) < MAX_NUM_SEQS:
+            # --- 1. Allocate blocks for decode seqs that need a new block ---
+            decode_seqs: list[Sequence] = []
+            new_running: deque[Sequence] = deque()
+            while running:
                 seq = running.popleft()
-                if len(seq) % block_size == 1:
-                    while not bm.free_block_ids:
-                        if running:
-                            victim = running.pop()
-                        elif decode_seqs:
-                            victim = decode_seqs.pop()
-                        else:
-                            # Last sequence and no blocks: preempt itself
-                            bm.deallocate(seq)
-                            seq.preempt()
-                            waiting.appendleft(seq)
-                            seq = None
-                            break
-                        bm.deallocate(victim)
-                        victim.preempt()
-                        waiting.appendleft(victim)
-                    if seq is None:
-                        break
+                if len(decode_seqs) >= MAX_NUM_SEQS:
+                    new_running.append(seq)
+                    continue
+                needs_block = (len(seq) % block_size == 1)
+                if needs_block:
+                    if not bm.free_block_ids:
+                        bm.deallocate(seq)
+                        seq.preempt()
+                        waiting.appendleft(seq)
+                        continue
                     seq.block_table.append(bm.free_block_ids.popleft())
                 decode_seqs.append(seq)
-            running.extendleft(reversed(decode_seqs))
+            running = new_running
+            token_budget -= len(decode_seqs)
 
-            if not decode_seqs:
+            # --- 2. Continue prefilling seqs already mid-prefill ---
+            prefill_seqs: list[Sequence] = []
+            prefill_chunk_sizes: list[int] = []
+            still_prefilling: deque[Sequence] = deque()
+            while prefilling and token_budget > 0:
+                seq = prefilling.popleft()
+                remaining = seq.num_remaining_prefill
+                chunk = min(remaining, token_budget)
+                blocks_needed = seq.blocks_needed_for(chunk)
+                if blocks_needed > 0:
+                    if len(bm.free_block_ids) < blocks_needed:
+                        still_prefilling.append(seq)
+                        continue
+                    bm.allocate_n(seq, blocks_needed)
+                prefill_seqs.append(seq)
+                prefill_chunk_sizes.append(chunk)
+                token_budget -= chunk
+            while prefilling:
+                still_prefilling.append(prefilling.popleft())
+            prefilling = still_prefilling
+
+            # --- 3. Admit new seqs from waiting queue ---
+            while waiting and token_budget > 0:
+                seq = waiting[0]
+                prompt_len = seq.num_prompt_tokens
+                chunk = min(prompt_len, token_budget)
+                blocks_needed = (chunk + block_size - 1) // block_size
+                free = len(bm.free_block_ids)
+                if free < blocks_needed or free - blocks_needed < watermark_blocks:
+                    break
+                if len(prefill_seqs) + len(decode_seqs) >= MAX_NUM_SEQS:
+                    break
+                waiting.popleft()
+                bm.allocate_n(seq, blocks_needed)
+                seq.status = SeqStatus.PREFILLING
+                prefill_seqs.append(seq)
+                prefill_chunk_sizes.append(chunk)
+                token_budget -= chunk
+
+            if not decode_seqs and not prefill_seqs:
                 continue
 
-            if profile:
-                _dc_sched_time += time.perf_counter() - _t_sched
-                _dc_bs_counts.append(len(decode_seqs))
-                _t_call = time.perf_counter()
+            # =============================================================
+            # EXECUTE: single forward pass
+            # =============================================================
+            n_pf = len(prefill_seqs)
+            n_dc = len(decode_seqs)
 
-            if use_greedy:
+            if n_pf == 0 and use_greedy:
+                # Pure decode with CUDA graphs (fast path)
                 gpu_result = self.model_runner.call_decode_greedy(decode_seqs)
-                if profile:
-                    _dc_call_time += time.perf_counter() - _t_call
-                    _t_tolist = time.perf_counter()
                 if gpu_result is not None:
                     token_ids = gpu_result.tolist()
-                    if profile:
-                        _dc_tolist_time += time.perf_counter() - _t_tolist
-                        _t_post = time.perf_counter()
                     finished_set = set()
                     for seq, tid in zip(decode_seqs, token_ids):
                         seq.append_token(tid)
@@ -1131,20 +1188,16 @@ class LlamaEngine:
                             seq.status = SeqStatus.FINISHED
                             finished_set.add(id(seq))
                             bm.deallocate(seq)
+                        else:
+                            running.append(seq)
+                    # Don't re-add finished seqs to running
                     if finished_set:
                         running = deque(s for s in running if id(s) not in finished_set)
-                    if profile:
-                        _dc_post_time += time.perf_counter() - _t_post
-                elif profile:
-                    _dc_tolist_time += time.perf_counter() - _t_tolist
-                    _dc_post_time += 0.0
-            else:
+                else:
+                    running.extend(decode_seqs)
+            elif n_pf == 0:
+                # Pure decode, non-greedy
                 result = self.model_runner.call("run", decode_seqs, False)
-                if profile:
-                    _dc_call_time += time.perf_counter() - _t_call
-                    _t_tolist = time.perf_counter()
-                    _dc_tolist_time += 0.0
-                    _t_post = time.perf_counter()
                 if result is not None:
                     if collect_logits:
                         for i, seq in enumerate(decode_seqs):
@@ -1160,40 +1213,63 @@ class LlamaEngine:
                             seq.status = SeqStatus.FINISHED
                             finished_set.add(id(seq))
                             bm.deallocate(seq)
+                        else:
+                            running.append(seq)
                     if finished_set:
                         running = deque(s for s in running if id(s) not in finished_set)
-                if profile:
-                    _dc_post_time += time.perf_counter() - _t_post
+                else:
+                    running.extend(decode_seqs)
+            elif n_dc == 0:
+                # Pure prefill (no running decode seqs)
+                logits = self.model_runner.call(
+                    "run_mixed", prefill_seqs, prefill_chunk_sizes, [],
+                )
+                if logits is not None:
+                    self._process_prefill_logits(
+                        logits, prefill_seqs, prefill_chunk_sizes,
+                        sp_list[0], eos, collect_logits, seq_logits,
+                        running, prefilling, bm, block_size,
+                    )
+            else:
+                # Mixed batch: prefill + decode together
+                logits = self.model_runner.call(
+                    "run_mixed", prefill_seqs, prefill_chunk_sizes, decode_seqs,
+                )
+                if logits is not None:
+                    # logits has shape [n_pf_seqs + n_dc, vocab]
+                    # First n_pf_seqs rows are one-per-prefill-seq (last token),
+                    # next n_dc rows are decode seqs
+                    pf_logits = logits[:n_pf]
+                    dc_logits = logits[n_pf:]
 
-            if profile:
-                _dc_steps += 1
-                _dc_tokens += len(decode_seqs)
+                    # Process prefill results
+                    self._process_prefill_logits(
+                        pf_logits, prefill_seqs, prefill_chunk_sizes,
+                        sp_list[0], eos, collect_logits, seq_logits,
+                        running, prefilling, bm, block_size,
+                    )
 
-        if profile:
-            self._profile_data = {
-                "prefill_time": _pf_time,
-                "prefill_steps": _pf_steps,
-                "prefill_tokens": _pf_tokens,
-                "decode_time": _dc_time,
-                "decode_steps": _dc_steps,
-                "decode_tokens": _dc_tokens,
-                "decode_sched_time": _dc_sched_time,
-                "decode_call_time": _dc_call_time,
-                "decode_tolist_time": _dc_tolist_time,
-                "decode_post_time": _dc_post_time,
-                "decode_bs_counts": _dc_bs_counts,
-            }
-            self._profile_data["decode_time"] = (
-                _dc_sched_time + _dc_call_time + _dc_tolist_time + _dc_post_time
-            )
-            cp = getattr(self.model_runner, '_call_profile', None)
-            if cp and cp["n_calls"] > 0:
-                self._profile_data["call_detail"] = {
-                    "prepare_ms": cp["prepare"] / cp["n_calls"] * 1000,
-                    "signal_ms": cp["signal"] / cp["n_calls"] * 1000,
-                    "gpu_exec_ms": cp["gpu_exec"] / cp["n_calls"] * 1000,
-                    "n_calls": cp["n_calls"],
-                }
+                    # Process decode results
+                    if collect_logits:
+                        for i, seq in enumerate(decode_seqs):
+                            seq_logits[id(seq)].append(dc_logits[i:i+1].cpu())
+                    dc_token_ids = self._sample(dc_logits, sp_list[0])
+                    finished_set = set()
+                    for seq, tid in zip(decode_seqs, dc_token_ids):
+                        seq.append_token(tid)
+                        done = len(seq.generated_ids) >= seq.max_tokens
+                        if not seq.ignore_eos:
+                            done = done or tid == eos
+                        if done:
+                            seq.status = SeqStatus.FINISHED
+                            finished_set.add(id(seq))
+                            bm.deallocate(seq)
+                        else:
+                            running.append(seq)
+                    if finished_set:
+                        running = deque(s for s in running if id(s) not in finished_set)
+                else:
+                    running.extend(decode_seqs)
 
         # Return in original order
         return [
@@ -1209,3 +1285,47 @@ class LlamaEngine:
             )
             for i in range(len(prompts))
         ]
+
+    def _process_prefill_logits(
+        self, logits, prefill_seqs, prefill_chunk_sizes,
+        sp, eos, collect_logits, seq_logits,
+        running, prefilling, bm, block_size,
+    ):
+        """Handle output from prefill sequences after a forward pass.
+
+        For sequences whose prefill is complete, sample the first decode
+        token. For sequences still mid-prefill, update num_computed_tokens
+        and move them to the prefilling queue.
+        """
+        # Separate seqs into "done prefilling" vs "still prefilling"
+        sample_seqs = []
+        sample_logits = []
+        for i, (seq, chunk) in enumerate(zip(prefill_seqs, prefill_chunk_sizes)):
+            seq.num_computed_tokens += chunk
+            if seq.num_remaining_prefill == 0:
+                # Prefill complete — sample first decode token
+                sample_seqs.append(seq)
+                sample_logits.append(logits[i:i+1])
+            else:
+                # More prefill chunks needed
+                prefilling.append(seq)
+
+        if not sample_seqs:
+            return
+
+        sample_logits_t = torch.cat(sample_logits, dim=0)
+        if collect_logits:
+            for i, seq in enumerate(sample_seqs):
+                seq_logits[id(seq)].append(sample_logits_t[i:i+1].cpu())
+        token_ids = self._sample(sample_logits_t, sp)
+        for seq, tid in zip(sample_seqs, token_ids):
+            seq.append_token(tid)
+            seq.status = SeqStatus.RUNNING
+            done = len(seq.generated_ids) >= seq.max_tokens
+            if not seq.ignore_eos:
+                done = done or tid == eos
+            if done:
+                seq.status = SeqStatus.FINISHED
+                bm.deallocate(seq)
+            else:
+                running.append(seq)
