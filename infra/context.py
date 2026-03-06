@@ -2,7 +2,7 @@
 
 from __future__ import annotations
 
-from dataclasses import dataclass
+from dataclasses import dataclass, field
 
 import torch
 
@@ -25,6 +25,13 @@ class Context:
     # Decode-specific fields for mixed batches (indexed over decode tokens only)
     decode_context_lens: torch.Tensor | None = None
     decode_block_tables: torch.Tensor | None = None
+
+    # FlashInfer paged-attention metadata (set when use_flashinfer=True)
+    fi_paged_kv_indptr: torch.Tensor | None = None
+    fi_paged_kv_indices: torch.Tensor | None = None
+    fi_paged_kv_last_page_len: torch.Tensor | None = None
+    fi_qo_indptr: torch.Tensor | None = None
+    fi_planned: bool = False
 
 
 _CONTEXT = Context()

@@ -1,4 +1,8 @@
-"""Multi-head attention with GQA, flash_attn, and paged KV cache."""
+"""Multi-head attention with GQA, paged KV cache, and selectable backend.
+
+Uses FlashInfer on Blackwell/Hopper (sm>=90) for paged decode/prefill,
+falls back to flash_attn on older GPUs.
+"""
 
 from __future__ import annotations
 
@@ -9,12 +13,15 @@ from ....infra.context import get_context
 from ....infra.tp import _tp_size
 from .parallel_linear import QKVParallelLinear, RowParallelLinear
 from ..L1.store_kvcache import StoreKVCache
-from ..L1.flash_attn_prefill import FlashAttnPrefill
-from ..L1.flash_attn_decode import FlashAttnDecode
+
+
+def _use_flashinfer() -> bool:
+    from ....engine import USE_FLASHINFER
+    return USE_FLASHINFER
 
 
 class Attention(nn.Module):
-    """Multi-head attention with GQA, flash_attn, and paged KV cache."""
+    """Multi-head attention with GQA and paged KV cache."""
 
     def __init__(self, hidden_size: int, num_attention_heads: int,
                  num_key_value_heads: int, head_dim: int):
@@ -35,8 +42,23 @@ class Attention(nn.Module):
         self.k_cache = self.v_cache = torch.tensor([])
 
         self.store_kvcache = StoreKVCache()
-        self.flash_attn_prefill = FlashAttnPrefill()
-        self.flash_attn_decode = FlashAttnDecode()
+
+        self._flashinfer = _use_flashinfer()
+        if self._flashinfer:
+            from ..L1.flashinfer_prefill import FlashInferPrefill
+            from ..L1.flashinfer_decode import FlashInferDecode
+            from ....engine import BLOCK_SIZE
+            self.fi_prefill = FlashInferPrefill(
+                self.num_heads, self.num_kv_heads, head_dim, BLOCK_SIZE,
+            )
+            self.fi_decode = FlashInferDecode(
+                self.num_heads, self.num_kv_heads, head_dim, BLOCK_SIZE,
+            )
+        else:
+            from ..L1.flash_attn_prefill import FlashAttnPrefill
+            from ..L1.flash_attn_decode import FlashAttnDecode
+            self.flash_attn_prefill = FlashAttnPrefill()
+            self.flash_attn_decode = FlashAttnDecode()
 
     def forward(self, positions, hidden_states, rotary_emb):
         ctx = get_context()
@@ -54,9 +76,16 @@ class Attention(nn.Module):
         if k_cache.numel() and v_cache.numel():
             self.store_kvcache(k, v, k_cache, v_cache, ctx.slot_mapping)
 
+        if self._flashinfer:
+            o = self._forward_flashinfer(q, k, v, k_cache, v_cache, ctx)
+        else:
+            o = self._forward_flash_attn(q, k, v, k_cache, v_cache, ctx)
+        return self.o_proj(o.reshape(N, self.num_heads * self.head_dim))
+
+    def _forward_flash_attn(self, q, k, v, k_cache, v_cache, ctx):
         if ctx.is_prefill:
             if ctx.block_tables is not None:
-                o = self.flash_attn_prefill(
+                return self.flash_attn_prefill(
                     q, k_cache, v_cache,
                     cu_seqlens_q=ctx.cu_seqlens_q,
                     cu_seqlens_k=ctx.cu_seqlens_k,
@@ -65,17 +94,29 @@ class Attention(nn.Module):
                     softmax_scale=self.scaling, causal=True,
                     block_table=ctx.block_tables,
                 )
-            else:
-                o = self.flash_attn_prefill(
-                    q, k, v,
-                    cu_seqlens_q=ctx.cu_seqlens_q, cu_seqlens_k=ctx.cu_seqlens_k,
-                    max_seqlen_q=ctx.max_seqlen_q, max_seqlen_k=ctx.max_seqlen_k,
-                    softmax_scale=self.scaling, causal=True,
-                )
-        else:
-            o = self.flash_attn_decode(
-                q.unsqueeze(1), k_cache, v_cache,
-                cache_seqlens=ctx.context_lens, block_table=ctx.block_tables,
+            return self.flash_attn_prefill(
+                q, k, v,
+                cu_seqlens_q=ctx.cu_seqlens_q, cu_seqlens_k=ctx.cu_seqlens_k,
+                max_seqlen_q=ctx.max_seqlen_q, max_seqlen_k=ctx.max_seqlen_k,
                 softmax_scale=self.scaling, causal=True,
             )
-        return self.o_proj(o.reshape(N, self.num_heads * self.head_dim))
+        return self.flash_attn_decode(
+            q.unsqueeze(1), k_cache, v_cache,
+            cache_seqlens=ctx.context_lens, block_table=ctx.block_tables,
+            softmax_scale=self.scaling, causal=True,
+        )
+
+    def _forward_flashinfer(self, q, k, v, k_cache, v_cache, ctx):
+        if ctx.is_prefill:
+            if ctx.fi_planned:
+                return self.fi_prefill(q, k_cache, v_cache)
+            # Warmup (no block tables yet) — use flash_attn_varlen_func
+            from flash_attn import flash_attn_varlen_func
+            return flash_attn_varlen_func(
+                q, k, v,
+                cu_seqlens_q=ctx.cu_seqlens_q, cu_seqlens_k=ctx.cu_seqlens_k,
+                max_seqlen_q=ctx.max_seqlen_q, max_seqlen_k=ctx.max_seqlen_k,
+                softmax_scale=self.scaling, causal=True,
+            )
+        # Decode: wrapper.run expects q shape [batch_size, num_heads, head_dim]
+        return self.fi_decode(q, k_cache, v_cache)

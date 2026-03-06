@@ -94,12 +94,17 @@ def main():
     mod = __import__(f"{pkg}.engine", fromlist=["LlamaEngine", "SamplingParams"])
     LlamaEngine, SamplingParams = mod.LlamaEngine, mod.SamplingParams
 
-    engine = LlamaEngine(
+    engine_kwargs = dict(
         model_name=cfg["model"],
         seed=cfg["seed"],
         enforce_eager=cfg.get("enforce_eager", False),
         tensor_parallel_size=cfg["tp"],
     )
+    if "gpu_memory_utilization" in cfg:
+        engine_kwargs["gpu_memory_utilization"] = cfg["gpu_memory_utilization"]
+    if "max_model_len" in cfg:
+        engine_kwargs["max_model_len"] = cfg["max_model_len"]
+    engine = LlamaEngine(**engine_kwargs)
 
     prompts = cfg["prompts"]
     temperature = cfg.get("temperature", 1.0)

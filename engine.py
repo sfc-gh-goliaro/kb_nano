@@ -33,13 +33,33 @@ from .infra.context import get_context, reset_context, set_context, set_mixed_co
 from .tasks.baseline.L1.allreduce import set_custom_ar
 from .weight_loader import load_model
 
-BLOCK_SIZE = 256
 MAX_NUM_BATCHED_TOKENS = 16384
-MAX_NUM_SEQS = 512
-MAX_MODEL_LEN = 4096
+MAX_NUM_SEQS = 1024
+MAX_MODEL_LEN = 131072
 NCCL_PORT = int(os.environ.get("KB_NANO_NCCL_PORT", "29501"))
 
 _PROFILE = os.environ.get("KB_NANO_PROFILE", "0") == "1"
+
+
+def _detect_attn_backend() -> tuple[bool, int]:
+    """Return (use_flashinfer, block_size) based on GPU compute capability.
+
+    Blackwell (sm_100+) and Hopper (sm_90+) use FlashInfer with block_size=16.
+    Older GPUs fall back to flash_attn with block_size=256.
+    """
+    if not torch.cuda.is_available():
+        return False, 256
+    cc = torch.cuda.get_device_capability()
+    if cc[0] >= 9:
+        try:
+            import flashinfer  # noqa: F401
+            return True, 16
+        except ImportError:
+            pass
+    return False, 256
+
+
+USE_FLASHINFER, BLOCK_SIZE = _detect_attn_backend()
 
 
 # ---------------------------------------------------------------------------
@@ -122,6 +142,14 @@ class Sequence:
         blocks_after = (total_after + BLOCK_SIZE - 1) // BLOCK_SIZE
         return max(0, blocks_after - len(self.block_table))
 
+    def preempt(self):
+        """Reset to re-prefillable state (vLLM-style recompute preemption)."""
+        self.token_ids = list(self.prompt_ids)
+        self.generated_ids.clear()
+        self.block_table.clear()
+        self.num_computed_tokens = 0
+        self.status = SeqStatus.WAITING
+
     def append_token(self, token_id):
         self.token_ids.append(token_id)
         self.generated_ids.append(token_id)
@@ -148,7 +176,12 @@ class Sequence:
 # ---------------------------------------------------------------------------
 class BlockManager:
     def __init__(self, num_blocks: int):
+        self._num_blocks = num_blocks
         self.free_block_ids: deque[int] = deque(range(num_blocks))
+
+    def reset(self):
+        """Return all blocks to the free pool."""
+        self.free_block_ids = deque(range(self._num_blocks))
 
     def can_allocate(self, seq):
         return len(self.free_block_ids) >= seq.num_blocks
@@ -182,12 +215,17 @@ class BlockManager:
 class ModelRunner:
     def __init__(self, model_name: str, rank: int, world_size: int,
                  dtype: torch.dtype, enforce_eager: bool,
-                 event, shm_name: str):
+                 event, shm_name: str,
+                 gpu_memory_utilization: float = 0.9,
+                 max_model_len: int = MAX_MODEL_LEN):
         self.rank = rank
         self.world_size = world_size
         self.enforce_eager = enforce_eager
         self.event = event
         self.block_size = BLOCK_SIZE
+        self.use_flashinfer = USE_FLASHINFER
+        self.gpu_memory_utilization = gpu_memory_utilization
+        self.max_model_len = max_model_len
 
         torch.cuda.set_device(rank)
         dist.init_process_group(
@@ -206,6 +244,7 @@ class ModelRunner:
                 )
                 set_custom_ar(self.custom_ar)
 
+        self.dtype = dtype
         default_dtype = torch.get_default_dtype()
         torch.set_default_dtype(dtype)
         torch.set_default_device("cuda")
@@ -216,7 +255,7 @@ class ModelRunner:
         self.warmup_model()
         self.allocate_kv_cache()
         self.is_moe = hasattr(self.config, "num_local_experts")
-        if not self.enforce_eager:
+        if not self.enforce_eager and not self.use_flashinfer:
             self.capture_cudagraph()
         self._init_greedy_buffers()
         torch.set_default_device("cpu")
@@ -300,8 +339,9 @@ class ModelRunner:
     def warmup_model(self):
         torch.cuda.empty_cache()
         torch.cuda.reset_peak_memory_stats()
-        num_seqs = min(MAX_NUM_BATCHED_TOKENS // MAX_MODEL_LEN, MAX_NUM_SEQS)
-        seqs = [Sequence([0] * MAX_MODEL_LEN) for _ in range(num_seqs)]
+        warmup_len = min(self.max_model_len, MAX_NUM_BATCHED_TOKENS)
+        num_seqs = min(MAX_NUM_BATCHED_TOKENS // warmup_len, MAX_NUM_SEQS)
+        seqs = [Sequence([0] * warmup_len) for _ in range(num_seqs)]
         self.run(seqs, True)
         torch.cuda.empty_cache()
 
@@ -315,7 +355,7 @@ class ModelRunner:
         num_layers = self.config.num_hidden_layers
         elem_size = torch.finfo(torch.get_default_dtype()).bits // 8
         block_bytes = 2 * num_layers * BLOCK_SIZE * num_kv_heads * head_dim * elem_size
-        num_blocks = int(total * 0.9 - used - peak + current) // block_bytes
+        num_blocks = int(total * self.gpu_memory_utilization - used - peak + current) // block_bytes
         assert num_blocks > 0, f"Not enough GPU memory for KV cache on rank {self.rank}"
         self.num_blocks = num_blocks
         if self.rank == 0:
@@ -324,12 +364,67 @@ class ModelRunner:
         self.kv_cache = torch.empty(
             2, num_layers, num_blocks, BLOCK_SIZE, num_kv_heads, head_dim,
         )
+        self._attn_layers = []
         layer_id = 0
         for module in self.model.modules():
             if hasattr(module, "k_cache") and hasattr(module, "v_cache"):
                 module.k_cache = self.kv_cache[0, layer_id]
                 module.v_cache = self.kv_cache[1, layer_id]
+                self._attn_layers.append(module)
                 layer_id += 1
+
+        if self.rank == 0 and self.use_flashinfer:
+            print(f"  Attention backend: FlashInfer (block_size={BLOCK_SIZE})")
+        elif self.rank == 0:
+            print(f"  Attention backend: flash_attn (block_size={BLOCK_SIZE})")
+
+    def _plan_flashinfer_decode(self, seqs):
+        """Compute FlashInfer paged-attention metadata for decode and call plan()."""
+        n = len(seqs)
+        block_size = self.block_size
+        indptr = torch.zeros(n + 1, dtype=torch.int32, device="cpu")
+        indices_list = []
+        last_page_len = torch.empty(n, dtype=torch.int32, device="cpu")
+
+        for i, seq in enumerate(seqs):
+            num_blocks = len(seq.block_table)
+            indptr[i + 1] = indptr[i] + num_blocks
+            indices_list.extend(seq.block_table)
+            total_tokens = len(seq)
+            lpl = total_tokens % block_size
+            last_page_len[i] = lpl if lpl != 0 else block_size
+
+        indices = torch.tensor(indices_list, dtype=torch.int32, device="cpu")
+
+        for layer in self._attn_layers:
+            layer.fi_decode.plan(indptr, indices, last_page_len,
+                                q_dtype=self.dtype)
+
+        return indptr, indices, last_page_len
+
+    def _plan_flashinfer_prefill(self, seqs):
+        """Compute FlashInfer paged-attention metadata for prefill and call plan()."""
+        n = len(seqs)
+        block_size = self.block_size
+        qo_indptr = torch.zeros(n + 1, dtype=torch.int32, device="cpu")
+        kv_indptr = torch.zeros(n + 1, dtype=torch.int32, device="cpu")
+        indices_list = []
+        last_page_len = torch.empty(n, dtype=torch.int32, device="cpu")
+
+        for i, seq in enumerate(seqs):
+            sl = len(seq)
+            qo_indptr[i + 1] = qo_indptr[i] + sl
+            num_blocks = len(seq.block_table)
+            kv_indptr[i + 1] = kv_indptr[i] + num_blocks
+            indices_list.extend(seq.block_table)
+            lpl = sl % block_size
+            last_page_len[i] = lpl if lpl != 0 else block_size
+
+        indices = torch.tensor(indices_list, dtype=torch.int32, device="cpu")
+
+        for layer in self._attn_layers:
+            layer.fi_prefill.plan(qo_indptr, kv_indptr, indices, last_page_len,
+                                  q_dtype=self.dtype)
 
     def prepare_prefill(self, seqs):
         input_ids, positions = [], []
@@ -337,6 +432,7 @@ class ModelRunner:
         max_sq, max_sk = 0, 0
         slot_mapping = []
         max_bt = 0
+        has_block_tables = False
         for seq in seqs:
             sl = len(seq)
             input_ids.extend(seq.token_ids)
@@ -347,6 +443,7 @@ class ModelRunner:
             max_sk = max(sl, max_sk)
             if not seq.block_table:  # warmup
                 continue
+            has_block_tables = True
             for i in range(seq.num_blocks):
                 start = seq.block_table[i] * BLOCK_SIZE
                 end = start + (BLOCK_SIZE if i != seq.num_blocks - 1
@@ -356,8 +453,13 @@ class ModelRunner:
             if blen > max_bt:
                 max_bt = blen
 
+        fi_planned = False
+        if self.use_flashinfer and has_block_tables:
+            self._plan_flashinfer_prefill(seqs)
+            fi_planned = True
+
         block_tables = None
-        if max_bt > 0:
+        if max_bt > 0 and not self.use_flashinfer:
             n = len(seqs)
             bt = np.full((n, max_bt), -1, dtype=np.int32)
             for i, seq in enumerate(seqs):
@@ -374,6 +476,9 @@ class ModelRunner:
             torch.tensor(slot_mapping, dtype=torch.int32, pin_memory=True).cuda(non_blocking=True),
             block_tables=block_tables,
         )
+        from .infra.context import get_context
+        ctx = get_context()
+        ctx.fi_planned = fi_planned
         return (
             torch.tensor(input_ids, dtype=torch.int64, pin_memory=True).cuda(non_blocking=True),
             torch.tensor(positions, dtype=torch.int64, pin_memory=True).cuda(non_blocking=True),
@@ -394,16 +499,24 @@ class ModelRunner:
             blen = len(seq.block_table)
             if blen > max_bt:
                 max_bt = blen
-        bt = np.full((n, max_bt), -1, dtype=np.int32)
-        for i, seq in enumerate(seqs):
-            b = seq.block_table
-            bt[i, :len(b)] = b
-        set_context(
-            False,
-            slot_mapping=torch.from_numpy(sm).pin_memory().cuda(non_blocking=True),
-            context_lens=torch.from_numpy(cl).pin_memory().cuda(non_blocking=True),
-            block_tables=torch.from_numpy(bt).pin_memory().cuda(non_blocking=True),
-        )
+
+        if self.use_flashinfer:
+            self._plan_flashinfer_decode(seqs)
+            set_context(
+                False,
+                slot_mapping=torch.from_numpy(sm).pin_memory().cuda(non_blocking=True),
+            )
+        else:
+            bt = np.full((n, max_bt), -1, dtype=np.int32)
+            for i, seq in enumerate(seqs):
+                b = seq.block_table
+                bt[i, :len(b)] = b
+            set_context(
+                False,
+                slot_mapping=torch.from_numpy(sm).pin_memory().cuda(non_blocking=True),
+                context_lens=torch.from_numpy(cl).pin_memory().cuda(non_blocking=True),
+                block_tables=torch.from_numpy(bt).pin_memory().cuda(non_blocking=True),
+            )
         return (
             torch.from_numpy(ids).pin_memory().cuda(non_blocking=True),
             torch.from_numpy(pos).pin_memory().cuda(non_blocking=True),
@@ -509,8 +622,46 @@ class ModelRunner:
         """Fused decode path for greedy sampling with TP.
         Returns GPU tensor (rank 0) or list (TP=1).
         """
+        if self.use_flashinfer:
+            return self._run_decode_greedy_flashinfer(seqs)
         decode_data = self._prepare_decode_arrays(seqs)
         return self.run_decode_greedy_fast(decode_data)
+
+    @torch.inference_mode()
+    def _run_decode_greedy_flashinfer(self, seqs):
+        """FlashInfer eager decode path: plan() then run()."""
+        n = len(seqs)
+        ids_np = self._np_ids
+        pos_np = self._np_pos
+        sm_np = self._np_sm
+        for i, seq in enumerate(seqs):
+            ids_np[i] = seq.last_token
+            pos_np[i] = len(seq) - 1
+            sm_np[i] = seq.block_table[-1] * BLOCK_SIZE + seq.last_block_num_tokens - 1
+
+        self._plan_flashinfer_decode(seqs)
+
+        input_ids = torch.from_numpy(ids_np[:n]).cuda(non_blocking=True)
+        positions = torch.from_numpy(pos_np[:n]).cuda(non_blocking=True)
+        slot_mapping = torch.from_numpy(sm_np[:n]).cuda(non_blocking=True)
+        set_context(False, slot_mapping=slot_mapping)
+        hidden = self.model(input_ids, positions)
+        lm_head = self.model.lm_head
+        logits = lm_head.linear_op(hidden, lm_head.weight).float()
+        max_vals, max_idxs = logits.max(dim=-1)
+        reset_context()
+        if self.world_size > 1:
+            info = self._greedy_info
+            info[:n, 0] = max_vals
+            info[:n, 1] = max_idxs.float()
+            vocab_offset = lm_head.per_partition * self.rank
+            info[:n, 1] += vocab_offset
+            dist.all_gather(self._greedy_gathered, info)
+            all_info = self._greedy_all_info
+            torch.stack(self._greedy_gathered, out=all_info)
+            best_rank = all_info[:, :n, 0].argmax(dim=0)
+            return all_info[best_rank, self._greedy_arange[:n], 1].to(torch.int64)
+        return max_idxs
 
     @torch.inference_mode()
     def run_decode_greedy_fast(self, decode_data):
@@ -589,7 +740,7 @@ class ModelRunner:
         self._greedy_all_info = torch.zeros(self.world_size, max_bs, 2, dtype=torch.float32, device=dev)
         self._greedy_arange = torch.arange(max_bs, device=dev)
 
-        max_num_blocks = (MAX_MODEL_LEN + BLOCK_SIZE - 1) // BLOCK_SIZE
+        max_num_blocks = (self.max_model_len + BLOCK_SIZE - 1) // BLOCK_SIZE
         self._np_ids = np.empty(max_bs, dtype=np.int64)
         self._np_pos = np.empty(max_bs, dtype=np.int64)
         self._np_sm = np.empty(max_bs, dtype=np.int32)
@@ -733,7 +884,7 @@ class ModelRunner:
     def capture_cudagraph(self):
         from contextlib import nullcontext
         max_bs = MAX_NUM_SEQS
-        max_num_blocks = (MAX_MODEL_LEN + BLOCK_SIZE - 1) // BLOCK_SIZE
+        max_num_blocks = (self.max_model_len + BLOCK_SIZE - 1) // BLOCK_SIZE
         input_ids = torch.zeros(max_bs, dtype=torch.int64)
         positions = torch.zeros(max_bs, dtype=torch.int64)
         slot_mapping = torch.full((max_bs,), -1, dtype=torch.int32)
@@ -756,13 +907,33 @@ class ModelRunner:
         with ar_ctx:
             for bs in reversed(self.graph_bs_list):
                 graph = torch.cuda.CUDAGraph()
-                set_context(
-                    False, slot_mapping=slot_mapping[:bs],
-                    context_lens=context_lens[:bs], block_tables=block_tables[:bs],
-                )
+                if self.use_flashinfer:
+                    # plan() with dummy data before warmup/capture
+                    # Each seq has 1 page with 1 token
+                    dummy_indptr = torch.arange(bs + 1, dtype=torch.int32,
+                                                device="cpu")
+                    dummy_indices = torch.zeros(bs, dtype=torch.int32,
+                                                device="cpu")
+                    dummy_lpl = torch.ones(bs, dtype=torch.int32,
+                                           device="cpu")
+                    for layer in self._attn_layers:
+                        layer.fi_decode.plan(dummy_indptr, dummy_indices,
+                                             dummy_lpl, q_dtype=self.dtype)
+                    set_context(False, slot_mapping=slot_mapping[:bs])
+                else:
+                    set_context(
+                        False, slot_mapping=slot_mapping[:bs],
+                        context_lens=context_lens[:bs], block_tables=block_tables[:bs],
+                    )
                 outputs[:bs] = self.model(input_ids[:bs], positions[:bs])
                 lm_logits[:bs] = lm_head.linear_op(outputs[:bs], lm_head.weight).float()
                 lm_max_vals[:bs], lm_max_idxs[:bs] = lm_logits[:bs].max(dim=-1)
+
+                if self.use_flashinfer:
+                    for layer in self._attn_layers:
+                        layer.fi_decode.plan(dummy_indptr, dummy_indices,
+                                             dummy_lpl, q_dtype=self.dtype)
+                    set_context(False, slot_mapping=slot_mapping[:bs])
 
                 with torch.cuda.graph(graph, self.graph_pool):
                     outputs[:bs] = self.model(input_ids[:bs], positions[:bs])
@@ -801,6 +972,8 @@ class LlamaEngine:
         seed: int = 42,
         enforce_eager: bool = False,
         tensor_parallel_size: int = 1,
+        gpu_memory_utilization: float = 0.9,
+        max_model_len: int = MAX_MODEL_LEN,
     ):
         self.seed = seed
         self._set_seeds(seed)
@@ -818,6 +991,10 @@ class LlamaEngine:
                 target=ModelRunner,
                 args=(model_name, i, tensor_parallel_size, dtype,
                       enforce_eager, event, shm_name),
+                kwargs=dict(
+                    gpu_memory_utilization=gpu_memory_utilization,
+                    max_model_len=max_model_len,
+                ),
             )
             p.start()
             self.workers.append(p)
@@ -827,6 +1004,8 @@ class LlamaEngine:
         self.model_runner = ModelRunner(
             model_name, 0, tensor_parallel_size, dtype,
             enforce_eager, self.events, shm_name,
+            gpu_memory_utilization=gpu_memory_utilization,
+            max_model_len=max_model_len,
         )
         self.block_manager = BlockManager(self.model_runner.num_blocks)
 
@@ -968,22 +1147,32 @@ class LlamaEngine:
                 _t_sched = time.perf_counter()
 
             bm = self.block_manager
-            free = bm.free_block_ids
             decode_seqs = []
-            temp = deque()
             while running and len(decode_seqs) < MAX_NUM_SEQS:
                 seq = running.popleft()
-                if len(seq) % block_size == 1 and not free:
-                    break
                 if len(seq) % block_size == 1:
-                    seq.block_table.append(free.popleft())
+                    while not bm.free_block_ids:
+                        if running:
+                            victim = running.pop()
+                        elif decode_seqs:
+                            victim = decode_seqs.pop()
+                        else:
+                            # Last sequence and no blocks: preempt itself
+                            bm.deallocate(seq)
+                            seq.preempt()
+                            waiting.appendleft(seq)
+                            seq = None
+                            break
+                        bm.deallocate(victim)
+                        victim.preempt()
+                        waiting.appendleft(victim)
+                    if seq is None:
+                        break
+                    seq.block_table.append(bm.free_block_ids.popleft())
                 decode_seqs.append(seq)
-                temp.append(seq)
-            running.extendleft(reversed(temp))
+            running.extendleft(reversed(decode_seqs))
 
             if not decode_seqs:
-                if not waiting:
-                    break
                 continue
 
             if profile:

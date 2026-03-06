@@ -125,6 +125,8 @@ def run_kb_nano_subprocess(
     enforce_eager: bool,
     save_outputs: bool,
     no_candidate_kernels: bool = False,
+    gpu_memory_utilization: float = 0.9,
+    max_model_len: int | None = None,
 ) -> dict | None:
     """Run kb-nano offline throughput benchmark in a subprocess."""
     kb_root = str(Path(__file__).resolve().parent.parent.parent.parent)
@@ -150,7 +152,10 @@ def run_kb_nano_subprocess(
         "no_candidate_kernels": no_candidate_kernels,
         "project_root": kb_root,
         "package_name": package_name,
+        "gpu_memory_utilization": gpu_memory_utilization,
     }
+    if max_model_len is not None:
+        config["max_model_len"] = max_model_len
 
     short_name = model.split("/")[-1]
     return run_worker(

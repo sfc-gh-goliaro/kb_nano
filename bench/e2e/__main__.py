@@ -4,6 +4,7 @@ Usage:
     python -m kb_nano.bench.e2e throughput [args...]
     python -m kb_nano.bench.e2e latency [args...]
     python -m kb_nano.bench.e2e serve [args...]
+    python -m kb_nano.bench.e2e eval [args...]
 """
 
 from __future__ import annotations
@@ -19,6 +20,7 @@ def main():
     )
     subparsers = parser.add_subparsers(dest="command", help="Benchmark type")
 
+    from kb_nano.bench.e2e import eval as eval_mod
     from kb_nano.bench.e2e import latency, serve, throughput
 
     tp = subparsers.add_parser("throughput", help="Offline throughput benchmark")
@@ -29,6 +31,9 @@ def main():
 
     sp = subparsers.add_parser("serve", help="Online serving benchmark")
     serve.add_cli_args(sp)
+
+    ep = subparsers.add_parser("eval", help="Candidate kernels vs baseline evaluation")
+    eval_mod.add_cli_args(ep)
 
     args = parser.parse_args()
     if args.command is None:
@@ -41,6 +46,8 @@ def main():
         latency.main(args)
     elif args.command == "serve":
         serve.main(args)
+    elif args.command == "eval":
+        eval_mod.main(args)
 
 
 if __name__ == "__main__":

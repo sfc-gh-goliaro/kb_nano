@@ -464,22 +464,47 @@ Generated kernels are saved to `tasks/candidate/L{level}/{op_name}.py`. Previous
 
 ## Testing and Validation
 
-### Correctness test (vs. vLLM)
+### Throughput and alignment vs vLLM
 
-Compares kb-nano's outputs token-by-token against vLLM in eager mode:
+Compares kb-nano baseline throughput and output correctness against vLLM in
+a single pass. With `temperature=0.0` (default), outputs are compared
+token-by-token:
 
 ```bash
-# Single model
-python tests/test_vllm_alignment.py --model meta-llama/Llama-3.1-8B-Instruct
+# Default: 256 seqs, random 100-1024 input/output, deterministic
+python tests/bench_vllm.py --model meta-llama/Llama-3.1-8B-Instruct
 
-# Multiple models with TP
-python tests/test_vllm_alignment.py \
-    --model meta-llama/Llama-3.1-70B-Instruct \
-              mistralai/Mixtral-8x7B-Instruct-v0.1 \
-    --tp 4 --max-tokens 50
+# Large model with TP
+python tests/bench_vllm.py \
+    --model meta-llama/Llama-3.1-70B-Instruct --tp 4
+
+# Skip vLLM (only run kb-nano)
+python tests/bench_vllm.py --skip-vllm
+
+# Cache vLLM results for reuse
+python tests/bench_vllm.py --save-vllm vllm_results.json
+python tests/bench_vllm.py --load-vllm vllm_results.json
 ```
 
-Both engines run in separate subprocesses with `enforce_eager=True` for deterministic comparison. The test reports per-prompt token matches and highlights divergence points.
+### Candidate kernel evaluation
+
+Evaluates candidate kernels from `tasks/candidate/` against the baseline.
+By default, auto-detects all applicable models and sweeps:
+
+```bash
+# Sweep all applicable models (auto-detected)
+python -m kb_nano.bench.e2e eval
+
+# Single model, single workload
+python -m kb_nano.bench.e2e eval \
+    --model meta-llama/Llama-3.1-8B-Instruct \
+    --input-len 512 --output-len 128 --num-prompts 100
+
+# Sweep multiple workload sizes
+python -m kb_nano.bench.e2e eval \
+    --model meta-llama/Llama-3.1-8B-Instruct \
+    --input-len 128 512 2048 --output-len 128 512
+```
 
 ### Bench module tests
 
@@ -496,30 +521,6 @@ python tests/test_bench.py --unit-only
 The integration test runs two benchmarks in subprocesses:
 - **Identity test**: patches RMSNorm with itself, expects KL ~ 0
 - **Broken test**: patches with an all-zeros implementation, expects KL >> 0
-
-### Throughput benchmark
-
-Measures token throughput against vLLM and sglang at full speed (CUDA graphs enabled):
-
-```bash
-# Default workload
-python tests/bench_throughput.py --model meta-llama/Llama-3.1-8B-Instruct
-
-# Custom workload with TP
-python tests/bench_throughput.py \
-    --model meta-llama/Llama-3.1-70B-Instruct --tp 4 \
-    --num-seqs 256 --max-input-len 1024 --max-output-len 1024
-
-# Skip vLLM (only run kb-nano)
-python tests/bench_throughput.py \
-    --model meta-llama/Llama-3.1-8B-Instruct --skip-vllm --skip-sglang
-
-# Cache vLLM results for reuse
-python tests/bench_throughput.py \
-    --model meta-llama/Llama-3.1-8B-Instruct --save-vllm vllm_results.json
-python tests/bench_throughput.py \
-    --model meta-llama/Llama-3.1-8B-Instruct --load-vllm vllm_results.json
-```
 
 ---
 
