@@ -1183,6 +1183,10 @@ class LlamaEngine:
                     decode_data = mr._prepare_decode_arrays(decode_seqs)
                     if _PROFILE:
                         _fp_t1 = time.perf_counter()
+                    if mr.world_size > 1:
+                        mr._write_decode_shm(*decode_data)
+                        mr.shm.buf[mr._SHM_FLAG_OFFSET] = 1
+                        mr._signal_workers()
                     gpu_result = mr.run_decode_greedy_fast(decode_data)
                     if _PROFILE:
                         _fp_t2 = time.perf_counter()
@@ -1249,6 +1253,10 @@ class LlamaEngine:
                                 use_incr = True
                             if _PROFILE:
                                 _fp_t1 = time.perf_counter()
+                            if mr.world_size > 1:
+                                mr._write_decode_shm(*decode_data)
+                                mr.shm.buf[mr._SHM_FLAG_OFFSET] = 1
+                                mr._signal_workers()
                             gpu_result = mr.run_decode_greedy_fast(decode_data)
                             if _PROFILE:
                                 _fp_t2 = time.perf_counter()
