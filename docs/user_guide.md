@@ -207,19 +207,19 @@ When you replace an L1 operator, the change propagates upward through every leve
 
 ## Benchmarking Custom Kernels
 
-The benchmark suite (`kb_nano.bench`) lets you swap any operator with your own implementation and measure correctness + performance against the baseline.
+The kernel benchmark suite (`kb_nano.bench.kernels`) lets you swap any operator with your own implementation and measure correctness + performance against the baseline.
 
 ### Listing available targets
 
 ```bash
 # List all benchmarkable targets
-python -m kb_nano.bench --list
+python -m kb_nano.bench.kernels --list
 
 # Filter by level
-python -m kb_nano.bench --list --level 1
+python -m kb_nano.bench.kernels --list --level 1
 
 # See the full model-to-operator mapping
-python -m kb_nano.bench --map
+python -m kb_nano.bench.kernels --map
 ```
 
 The `--map` command shows two views:
@@ -230,14 +230,14 @@ The `--map` command shows two views:
 
 ```bash
 # Auto-discover candidate from tasks/candidate/
-python -m kb_nano.bench \
+python -m kb_nano.bench.kernels \
     --target rms_norm \
     --model meta-llama/Llama-3.1-8B-Instruct \
     --max-tokens 50 \
     --tp 1
 
 # Or specify a custom implementation explicitly
-python -m kb_nano.bench \
+python -m kb_nano.bench.kernels \
     --target rms_norm \
     --user-impl path/to/my_kernel.py:MyRMSNorm \
     --model meta-llama/Llama-3.1-8B-Instruct \
@@ -267,7 +267,8 @@ This will:
 ### Programmatic API
 
 ```python
-from kb_nano.bench import benchmark, list_targets
+from kb_nano.bench.kernels.runner import run_benchmark as benchmark
+from kb_nano.infra.kernel_swapper import list_targets
 
 # List targets
 for t in list_targets(level=1):
@@ -309,7 +310,7 @@ To create a replacement kernel for benchmarking, you need to write an `nn.Module
 ### Step 1: Identify the target
 
 ```bash
-python -m kb_nano.bench --list --level 1
+python -m kb_nano.bench.kernels --list --level 1
 ```
 
 Pick a target, then read its source file to understand the `forward` signature. For example, `rms_norm`:
@@ -366,13 +367,13 @@ class RMSNorm(nn.Module):
 Place your file at `tasks/candidate/L1/rms_norm.py`, then:
 
 ```bash
-python -m kb_nano.bench --target rms_norm
+python -m kb_nano.bench.kernels --target rms_norm
 ```
 
 Or specify the path explicitly:
 
 ```bash
-python -m kb_nano.bench \
+python -m kb_nano.bench.kernels \
     --target rms_norm \
     --user-impl my_rms_norm.py:RMSNorm
 ```
@@ -463,22 +464,47 @@ Generated kernels are saved to `tasks/candidate/L{level}/{op_name}.py`. Previous
 
 ## Testing and Validation
 
-### Correctness test (vs. vLLM)
+### Throughput and alignment vs vLLM
 
-Compares kb-nano's outputs token-by-token against vLLM in eager mode:
+Compares kb-nano baseline throughput and output correctness against vLLM in
+a single pass. With `temperature=0.0` (default), outputs are compared
+token-by-token:
 
 ```bash
-# Single model
-python tests/test_vllm_alignment.py --model meta-llama/Llama-3.1-8B-Instruct
+# Default: 256 seqs, random 100-1024 input/output, deterministic
+python tests/bench_vllm.py --model meta-llama/Llama-3.1-8B-Instruct
 
-# Multiple models with TP
-python tests/test_vllm_alignment.py \
-    --model meta-llama/Llama-3.1-70B-Instruct \
-              mistralai/Mixtral-8x7B-Instruct-v0.1 \
-    --tp 4 --max-tokens 50
+# Large model with TP
+python tests/bench_vllm.py \
+    --model meta-llama/Llama-3.1-70B-Instruct --tp 4
+
+# Skip vLLM (only run kb-nano)
+python tests/bench_vllm.py --skip-vllm
+
+# Cache vLLM results for reuse
+python tests/bench_vllm.py --save-vllm vllm_results.json
+python tests/bench_vllm.py --load-vllm vllm_results.json
 ```
 
-Both engines run in separate subprocesses with `enforce_eager=True` for deterministic comparison. The test reports per-prompt token matches and highlights divergence points.
+### Candidate kernel evaluation
+
+Evaluates candidate kernels from `tasks/candidate/` against the baseline.
+By default, auto-detects all applicable models and sweeps:
+
+```bash
+# Sweep all applicable models (auto-detected)
+python -m kb_nano.bench.e2e eval
+
+# Single model, single workload
+python -m kb_nano.bench.e2e eval \
+    --model meta-llama/Llama-3.1-8B-Instruct \
+    --input-len 512 --output-len 128 --num-prompts 100
+
+# Sweep multiple workload sizes
+python -m kb_nano.bench.e2e eval \
+    --model meta-llama/Llama-3.1-8B-Instruct \
+    --input-len 128 512 2048 --output-len 128 512
+```
 
 ### Bench module tests
 
@@ -495,30 +521,6 @@ python tests/test_bench.py --unit-only
 The integration test runs two benchmarks in subprocesses:
 - **Identity test**: patches RMSNorm with itself, expects KL ~ 0
 - **Broken test**: patches with an all-zeros implementation, expects KL >> 0
-
-### Throughput benchmark
-
-Measures token throughput against vLLM and sglang at full speed (CUDA graphs enabled):
-
-```bash
-# Default workload
-python tests/bench_throughput.py --model meta-llama/Llama-3.1-8B-Instruct
-
-# Custom workload with TP
-python tests/bench_throughput.py \
-    --model meta-llama/Llama-3.1-70B-Instruct --tp 4 \
-    --num-seqs 256 --max-input-len 1024 --max-output-len 1024
-
-# Skip vLLM (only run kb-nano)
-python tests/bench_throughput.py \
-    --model meta-llama/Llama-3.1-8B-Instruct --skip-vllm --skip-sglang
-
-# Cache vLLM results for reuse
-python tests/bench_throughput.py \
-    --model meta-llama/Llama-3.1-8B-Instruct --save-vllm vllm_results.json
-python tests/bench_throughput.py \
-    --model meta-llama/Llama-3.1-8B-Instruct --load-vllm vllm_results.json
-```
 
 ---
 
@@ -545,7 +547,7 @@ engine = LlamaEngine(
 Or from the CLI:
 
 ```bash
-python -m kb_nano.bench --target rms_norm --user-impl my_kernel.py:RMSNorm --tp 4
+python -m kb_nano.bench.kernels --target rms_norm --user-impl my_kernel.py:RMSNorm --tp 4
 ```
 
 Worker processes are spawned automatically and cleaned up on exit.
@@ -575,14 +577,14 @@ The engine allocates KV cache to fill ~90% of available GPU memory after model l
 
 If you're running multiple instances, set different ports:
 ```bash
-KB_NANO_NCCL_PORT=29502 python -m kb_nano.bench ...
+KB_NANO_NCCL_PORT=29502 python -m kb_nano.bench.kernels ...
 ```
 
 ### Custom all-reduce hangs
 
 If multi-GPU inference hangs during all-reduce, disable the custom implementation:
 ```bash
-KB_NANO_DISABLE_CUSTOM_AR=1 python -m kb_nano.bench --tp 4 ...
+KB_NANO_DISABLE_CUSTOM_AR=1 python -m kb_nano.bench.kernels --tp 4 ...
 ```
 
 ### "No .safetensors files found"
@@ -594,7 +596,7 @@ The engine downloads model weights from HuggingFace Hub automatically. Ensure:
 
 ### Bench target not found
 
-If `--target xyz` fails with "Unknown bench target", run `python -m kb_nano.bench --list` to see all available targets. Target names match the Python file names under `tasks/baseline/` (without `.py`).
+If `--target xyz` fails with "Unknown bench target", run `python -m kb_nano.bench.kernels --list` to see all available targets. Target names match the Python file names under `tasks/baseline/` (without `.py`).
 
 ### User implementation class name mismatch
 

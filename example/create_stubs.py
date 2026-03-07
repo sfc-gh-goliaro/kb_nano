@@ -253,7 +253,7 @@ def main():
     )
     args = parser.parse_args()
 
-    from kb_nano.bench.discovery import discover_targets, _L4_MODEL_KEYS
+    from kb_nano.infra.kernel_swapper import discover_targets, _L4_MODEL_KEYS
 
     arch_key = None
     if args.architecture:
@@ -297,7 +297,7 @@ def main():
 
     print(f"\nDone. Stubs written to {_CANDIDATE_DIR}")
     print("Edit the forward() methods to add your custom implementations,")
-    print("then benchmark with: python -m kb_nano.bench --target <name>")
+    print("then benchmark with: python -m kb_nano.bench.kernels --target <name>")
 
 
 if __name__ == "__main__":

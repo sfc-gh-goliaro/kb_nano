@@ -14,16 +14,24 @@ from ..L1.allreduce import AllReduce
 
 
 class VocabParallelEmbedding(nn.Module):
-    def __init__(self, num_embeddings: int, embedding_dim: int):
+    def __init__(self, num_embeddings: int, embedding_dim: int,
+                 params_dtype: torch.dtype | None = None,
+                 org_num_embeddings: int | None = None,
+                 padding_size: int = 64):
         super().__init__()
         tp, rank = _tp_size(), _tp_rank()
         assert num_embeddings % tp == 0
         self.num_embeddings = num_embeddings
+        self.org_vocab_size = org_num_embeddings or num_embeddings
+        self.padding_size = padding_size
+        self.embedding_dim = embedding_dim
         self.per_partition = num_embeddings // tp
         self.vocab_start = self.per_partition * rank
         self.vocab_end = self.vocab_start + self.per_partition
         self.tp_size = tp
-        self.weight = nn.Parameter(torch.empty(self.per_partition, embedding_dim))
+        if params_dtype is None:
+            params_dtype = torch.get_default_dtype()
+        self.weight = nn.Parameter(torch.empty(self.per_partition, embedding_dim, dtype=params_dtype))
         self.weight.weight_loader = self._weight_loader
         self.embedding_op = Embedding()
         self.allreduce = AllReduce()
@@ -45,14 +53,23 @@ class VocabParallelEmbedding(nn.Module):
 
 
 class ParallelLMHead(VocabParallelEmbedding):
-    def __init__(self, num_embeddings: int, embedding_dim: int):
-        super().__init__(num_embeddings, embedding_dim)
+    def __init__(self, num_embeddings: int, embedding_dim: int,
+                 bias: bool = False,
+                 params_dtype: torch.dtype | None = None,
+                 org_num_embeddings: int | None = None,
+                 padding_size: int = 64):
+        super().__init__(num_embeddings, embedding_dim,
+                         params_dtype=params_dtype,
+                         org_num_embeddings=org_num_embeddings,
+                         padding_size=padding_size)
         self.linear_op = Linear()
 
     def project(self, x):
         """Linear projection only (no gather). Used inside CUDA graph."""
         ctx = get_context()
-        if ctx.is_prefill or ctx.is_mixed:
+        if ctx.is_mixed:
+            x = x[ctx.logit_indices].contiguous()
+        elif ctx.is_prefill:
             last_indices = ctx.cu_seqlens_q[1:] - 1
             x = x[last_indices].contiguous()
         return self.linear_op(x, self.weight)
