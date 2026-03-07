@@ -48,7 +48,8 @@ SCENARIOS = [
 # Multi-scenario vLLM subprocess worker
 # ---------------------------------------------------------------------------
 VLLM_WORKER = r'''
-import json, sys, time
+import json, os, sys, time
+os.environ.setdefault("VLLM_WORKER_MULTIPROC_METHOD", "spawn")
 
 def main():
     from vllm import LLM, SamplingParams
@@ -111,6 +112,8 @@ def main():
             ],
         }
         all_results.append(result)
+
+    del llm
 
     with open(cfg["output_file"], "w") as f:
         json.dump(all_results, f)

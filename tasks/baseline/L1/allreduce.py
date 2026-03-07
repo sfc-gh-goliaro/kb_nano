@@ -168,7 +168,7 @@ class CustomAllreduce:
         if not is_weak_contiguous(inp):
             return False
         if self.world_size == 2 or self.fully_connected:
-            return inp_size < self.max_size
+            return inp_size <= self.max_size
         return False
 
     def all_reduce(
@@ -188,15 +188,18 @@ class CustomAllreduce:
 
     def custom_all_reduce(self, input: torch.Tensor) -> Optional[torch.Tensor]:
         """Main API: returns reduced tensor or None if custom AR can't handle it."""
-        if self.disabled or not self.should_custom_ar(input):
+        if self.disabled:
             return None
         if self._IS_CAPTURING:
+            if not is_weak_contiguous(input):
+                return None
             if torch.cuda.is_current_stream_capturing():
                 return self.all_reduce(input, registered=True)
             else:
                 return torch.empty_like(input)
-        else:
-            return self.all_reduce(input, registered=False)
+        if not self.should_custom_ar(input):
+            return None
+        return self.all_reduce(input, registered=False)
 
     def close(self):
         if not self.disabled and hasattr(self, '_ptr') and self._ptr:

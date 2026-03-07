@@ -225,7 +225,7 @@ class ModelRunner:
         self.event = event
         self.block_size = BLOCK_SIZE
         self.gpu_memory_utilization = gpu_memory_utilization
-        self.max_model_len = max_model_len
+        self.max_model_len = ((max_model_len + BLOCK_SIZE - 1) // BLOCK_SIZE + 2) * BLOCK_SIZE
 
         torch.cuda.set_device(rank)
         dist.init_process_group(

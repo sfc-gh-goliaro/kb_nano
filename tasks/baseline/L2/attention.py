@@ -121,7 +121,7 @@ class Attention(nn.Module):
             q.unsqueeze(1), k_cache, v_cache,
             cache_seqlens=ctx.context_lens, block_table=ctx.block_tables,
             softmax_scale=self.scaling, causal=True,
-        )
+        ).squeeze(1)
 
     def _forward_trtllm(self, q, k, v, k_cache, v_cache, ctx):
         if ctx.is_prefill:
@@ -176,7 +176,7 @@ class Attention(nn.Module):
                 cache_seqlens=ctx.decode_context_lens,
                 block_table=ctx.decode_block_tables,
                 softmax_scale=self.scaling, causal=True,
-            )
+            ).squeeze(1)
         return out
 
     def _forward_trtllm_mixed(self, q, k_cache, v_cache, ctx):
