@@ -27,7 +27,24 @@ import sys
 from pathlib import Path
 from random import randint
 
+import subprocess
+
 import numpy as np
+
+
+def _detect_gpu_name() -> str:
+    """Return short GPU name (e.g. 'H200', 'B200') via nvidia-smi."""
+    try:
+        out = subprocess.check_output(
+            ["nvidia-smi", "--query-gpu=name", "--format=csv,noheader"],
+            text=True,
+        ).strip().splitlines()[0]
+        for tag in ("B200", "B100", "H200", "H100", "A100", "A10G", "L40S", "L40", "L4"):
+            if tag in out:
+                return tag
+        return out.split()[-1]
+    except Exception:
+        return "unknown"
 
 _THIS_DIR = Path(__file__).resolve().parent
 _PACKAGE_DIR = _THIS_DIR.parent
@@ -271,13 +288,16 @@ def main():
     parser.add_argument(
         "--output-dir", type=str, default=None,
         help="Directory to save per-scenario outputs and results JSON "
-             "(default: /tmp/bench_vllm/<model>_tp<tp>)",
+             "(default: tests/results/<gpu>/<model>_tp<tp>)",
     )
     args = parser.parse_args()
 
+    gpu = _detect_gpu_name()
+
     if args.output_dir is None:
         short = args.model.split("/")[-1]
-        args.output_dir = f"/tmp/bench_vllm/{short}_tp{args.tp}"
+        repo_root = Path(__file__).resolve().parent.parent
+        args.output_dir = str(repo_root / "tests" / "results" / gpu / f"{short}_tp{args.tp}")
 
     # Pre-generate all scenario data
     scenario_data = []
@@ -446,6 +466,7 @@ def main():
         os.makedirs(args.output_dir, exist_ok=True)
         results_path = os.path.join(args.output_dir, "results.json")
         combined = {
+            "gpu": gpu,
             "model": args.model,
             "tp": args.tp,
             "seed": args.seed,
