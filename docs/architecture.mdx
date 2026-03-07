@@ -1,0 +1,104 @@
+---
+title: Architecture
+description: The L1–L4 operator hierarchy, interface mirroring, and how to extend kb-nano.
+---
+
+## The L1-L4 Hierarchy
+
+All model operators live under `tasks/baseline/` at four abstraction levels:
+
+- **L1** — Single-kernel ops (e.g. `rms_norm`, `silu_and_mul`, `rotary_emb`, `linear`)
+- **L2** — Multi-op blocks (e.g. `LlamaAttention`, `LlamaMLP`, `MixtralMoE`, `QKVParallelLinear`)
+- **L3** — Decoder layers (e.g. `LlamaDecoderLayer`, `MixtralDecoderLayer`)
+- **L4** — Full models (e.g. `LlamaForCausalLM`, `MixtralForCausalLM`)
+
+Higher levels compose lower ones via standard Python imports:
+
+```
+L4/llama.py (LlamaForCausalLM)
+  L3/llama_decoder.py (LlamaDecoderLayer)
+    L2/attention.py (LlamaAttention)
+      L1/store_kvcache.py, L1/flash_attn_*.py
+      L2/parallel_linear.py (QKVParallelLinear, RowParallelLinear)
+        L1/linear.py, L1/allreduce.py
+    L2/llama_mlp.py (LlamaMLP)
+      L1/silu_and_mul.py
+      L2/parallel_linear.py
+    L1/rms_norm.py
+```
+
+When you replace an L1 operator, the change propagates upward through every level that uses it. The bench suite traces these dependencies automatically via import graph analysis.
+
+---
+
+## Interface Mirroring
+
+Every module's `__init__` and `forward` signatures are designed to mirror the corresponding vLLM module. This makes it easy to port optimizations between the two codebases and ensures candidate kernels can be validated against a well-known reference.
+
+| kb-nano module | vLLM equivalent | `forward` signature |
+|---|---|---|
+| `LlamaAttention` | `LlamaAttention` | `(positions, hidden_states) -> Tensor` |
+| `LlamaDecoderLayer` | `LlamaDecoderLayer` | `(positions, hidden_states, residual) -> (Tensor, Tensor)` |
+| `QKVParallelLinear` | `QKVParallelLinear` | `(x) -> (output, bias)` |
+| `RowParallelLinear` | `RowParallelLinear` | `(x) -> (output, bias)` |
+| `MergedColumnParallelLinear` | `MergedColumnParallelLinear` | `(x) -> (output, bias)` |
+| `VocabParallelEmbedding` | `VocabParallelEmbedding` | `(input_ids) -> Tensor` |
+| `ParallelLMHead` | `ParallelLMHead` | `(hidden_states) -> Tensor` |
+| `SiluAndMul` | `SiluAndMul` | `(x) -> Tensor` |
+| `RMSNorm` | `RMSNorm` | `(x, residual=None) -> Tensor or (Tensor, Tensor)` |
+
+All parallel linear layers return `(output, bias)` tuples to match vLLM. `LlamaAttention` stores `rotary_emb` as an `__init__` parameter (not a `forward` argument), matching vLLM's design where each `LlamaAttention` owns its rotary embedding.
+
+---
+
+## Adding a New Model
+
+Follow the L1 → L4 pattern:
+
+1. **L1**: Identify which single-kernel ops are needed. Reuse existing L1 ops where possible (e.g. `RMSNorm`, `SiluAndMul`). Write new L1 modules only for ops that don't exist yet.
+2. **L2**: Compose L1 ops into multi-op blocks (attention, MLP). Mirror the corresponding vLLM module's `__init__` and `forward` signatures.
+3. **L3**: Write a decoder layer that combines L2 attention + L2 MLP + L1 normalization.
+4. **L4**: Write the full model class (`NewModelForCausalLM`) with embedding, decoder stack, and LM head.
+
+Each module should be a drop-in match for its vLLM counterpart. The bench suite auto-discovers new operators from the import graph.
+
+---
+
+## Writing a Candidate Kernel
+
+To write a replacement kernel for benchmarking:
+
+1. Read the baseline source to understand the `forward` signature.
+2. Write an `nn.Module` with the **exact same class name** and **exact same `forward` signature**.
+3. Place it at `tasks/candidate/L{level}/{op_name}.py` and run the benchmark.
+
+Example — replacing `RMSNorm`:
+
+```python
+# tasks/candidate/L1/rms_norm.py
+import torch
+import torch.nn as nn
+
+class RMSNorm(nn.Module):
+    def __init__(self, hidden_size: int, eps: float = 1e-6):
+        super().__init__()
+        self.eps = eps
+        self.weight = nn.Parameter(torch.ones(hidden_size))
+
+    def forward(self, x, residual=None):
+        if residual is not None:
+            x = x + residual
+            residual = x
+        variance = x.float().pow(2).mean(dim=-1, keepdim=True)
+        x = x * torch.rsqrt(variance + self.eps)
+        result = (self.weight * x).to(x.dtype)
+        if residual is not None:
+            return result, residual
+        return result
+```
+
+```bash
+python -m kb_nano.bench.kernels --target rms_norm
+```
+
+You can use pure PyTorch, Triton (`triton.jit`), inline CUDA (`torch.utils.cpp_extension.load_inline`), or external libraries. Avoid importing `vllm` or `sgl_kernel` in your replacement — the point is to provide an alternative implementation.

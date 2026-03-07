@@ -1,0 +1,125 @@
+---
+title: Getting Started
+description: Installation, benchmarking CLIs, and the LLM kernel agent.
+---
+
+## Quick Start
+
+```bash
+git clone git@github.com:sfc-gh-goliaro/kb-nano.git
+cd kb-nano
+
+# Throughput + latency + alignment benchmark vs vLLM
+python tests/bench_vllm.py --model meta-llama/Llama-3.1-8B-Instruct
+
+# E2E throughput benchmark (mirrors vLLM's benchmark_throughput.py)
+python -m kb_nano.bench.e2e throughput \
+    --model meta-llama/Llama-3.1-8B-Instruct \
+    --dataset-name random --random-input-len 512 --random-output-len 128
+
+# Kernel-level benchmark (swap an operator, measure correctness + speedup)
+python -m kb_nano.bench.kernels --target rms_norm
+```
+
+No `pip install` step is required. Run scripts from the repository root; `kb_nano` is used as a local package. See the [README](https://github.com/sfc-gh-goliaro/kb-nano) for dependency installation.
+
+---
+
+## Benchmarking
+
+kb-nano provides three complementary benchmarking tools.
+
+### E2E Benchmark CLI
+
+`python -m kb_nano.bench.e2e` mirrors vLLM's benchmarking CLI. The same flags work in both tools, making it easy to compare results:
+
+```bash
+# Throughput (mirrors vllm bench throughput)
+python -m kb_nano.bench.e2e throughput \
+    --model meta-llama/Llama-3.1-8B-Instruct \
+    --dataset-name random --random-input-len 512 --random-output-len 128 \
+    --num-prompts 200 --tp 4
+
+# Latency
+python -m kb_nano.bench.e2e latency \
+    --model meta-llama/Llama-3.1-8B-Instruct \
+    --input-len 128 --output-len 128
+
+# Evaluate candidate kernels from tasks/candidate/ against baseline
+python -m kb_nano.bench.e2e eval \
+    --model meta-llama/Llama-3.1-8B-Instruct \
+    --input-len 512 --output-len 128 --num-prompts 100
+```
+
+### Kernel Benchmark CLI
+
+`python -m kb_nano.bench.kernels` benchmarks a single operator replacement. It monkey-patches the target class, rebuilds the model, runs inference, and compares KL divergence, token match rate, and wall-clock speedup against the baseline.
+
+```bash
+# List all benchmarkable targets
+python -m kb_nano.bench.kernels --list
+
+# Show model-to-operator mapping
+python -m kb_nano.bench.kernels --map
+
+# Auto-discover candidate from tasks/candidate/
+python -m kb_nano.bench.kernels --target rms_norm
+
+# Specify a custom implementation explicitly
+python -m kb_nano.bench.kernels \
+    --target rms_norm \
+    --user-impl path/to/my_kernel.py:RMSNorm \
+    --model meta-llama/Llama-3.1-8B-Instruct \
+    --tp 1
+```
+
+A benchmark is **PASS** if `kl_mean < 0.1`. Speedup > 1.0 means your kernel is faster than the baseline.
+
+### vLLM Alignment Test
+
+`tests/bench_vllm.py` runs kb-nano and vLLM side-by-side across three workload scenarios (prefill-heavy, balanced, decode-heavy) plus latency benchmarks, comparing throughput and per-token alignment:
+
+```bash
+python tests/bench_vllm.py --model meta-llama/Llama-3.1-8B-Instruct
+python tests/bench_vllm.py --model meta-llama/Llama-3.1-70B-Instruct --tp 4
+
+# Latency only (skip throughput)
+python tests/bench_vllm.py --model meta-llama/Llama-3.1-8B-Instruct --skip-throughput
+
+# Parse and plot results
+python tests/utils/parse_vllm_bench_results.py
+```
+
+Results are saved to `tests/results/<GPU>/<model>_tp<N>/results.json`. The parser auto-discovers these files and generates tables and plots in `tests/plots/<GPU>/`.
+
+For a quick correctness check (no throughput measurement), use the `--skip-throughput` flag:
+
+```bash
+python tests/bench_vllm.py \
+    --model meta-llama/Llama-3.1-8B-Instruct \
+    --skip-throughput --skip-latency
+```
+
+---
+
+## LLM Kernel Agent
+
+The agent uses Claude to generate replacement kernels, validate them, and benchmark them end-to-end:
+
+```bash
+# Generate all L1 kernels for Llama
+python -m kb_nano.example \
+    --model meta-llama/Llama-3.1-8B-Instruct --level 1
+
+# CUDA-only kernels (no Triton/PyTorch builtins)
+python -m kb_nano.example \
+    --model meta-llama/Llama-3.1-8B-Instruct --level 1 --cuda-only
+
+# Mixtral L2 operators with TP
+python -m kb_nano.example \
+    --model mistralai/Mixtral-8x7B-Instruct-v0.1 --level 2 --tp 4
+```
+
+The agent discovers operators at the specified level, generates replacements in parallel, validates compilation and numerical correctness, patches all successful kernels into the model, and reports KL divergence, token match rate, and speedup. Failed kernels are retried with error feedback.
+
+Generated kernels are saved to `tasks/candidate/L{level}/{op_name}.py`.
