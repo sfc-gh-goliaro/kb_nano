@@ -128,7 +128,7 @@ def main():
     import torch
     torch.cuda.synchronize()
     start = time.perf_counter()
-    outputs = engine.generate(prompts, sp_list)
+    outputs = engine.generate(prompts, sp_list, use_tqdm=True)
     torch.cuda.synchronize()
     elapsed = time.perf_counter() - start
 

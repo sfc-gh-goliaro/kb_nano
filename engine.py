@@ -1152,7 +1152,8 @@ class LlamaEngine:
         return torch.multinomial(probs, 1).squeeze(-1).tolist()
 
     @torch.inference_mode()
-    def generate(self, prompts, sampling_params, collect_logits: bool = False):
+    def generate(self, prompts, sampling_params, collect_logits: bool = False,
+                 use_tqdm: bool = False):
         """Generate completions for a batch of prompts.
 
         Uses unified chunked-prefill scheduling: every GPU step processes
@@ -1184,6 +1185,18 @@ class LlamaEngine:
                 seq_logits[id(seq)] = []
 
         all_seqs = list(waiting)
+        num_prompts = len(prompts)
+
+        pbar = None
+        if use_tqdm:
+            from tqdm import tqdm as _tqdm
+            pbar = _tqdm(total=num_prompts, desc="Processed prompts",
+                         dynamic_ncols=True,
+                         postfix="est. speed input: 0.00 toks/s, "
+                                 "output: 0.00 toks/s")
+        num_finished = 0
+        total_in_toks = 0
+        total_out_toks = 0
 
         use_greedy = (sp_list[0].temperature == 0.0
                       and not collect_logits)
@@ -1192,7 +1205,40 @@ class LlamaEngine:
         num_blocks = bm._num_blocks
         watermark_blocks = max(int(num_blocks * 0.01), 1)
 
+        _pbar_pending = 0
+        _pbar_pending_in = 0
+        _pbar_pending_out = 0
+
+        def _finish_seq(seq: Sequence) -> None:
+            nonlocal _pbar_pending, _pbar_pending_in, _pbar_pending_out
+            seq.status = SeqStatus.FINISHED
+            bm.deallocate(seq)
+            if pbar is not None:
+                _pbar_pending += 1
+                _pbar_pending_in += seq.num_prompt_tokens
+                _pbar_pending_out += len(seq.generated_ids)
+
+        def _flush_pbar() -> None:
+            nonlocal _pbar_pending, _pbar_pending_in, _pbar_pending_out
+            nonlocal total_in_toks, total_out_toks
+            if _pbar_pending == 0:
+                return
+            total_in_toks += _pbar_pending_in
+            total_out_toks += _pbar_pending_out
+            elapsed = pbar.format_dict["elapsed"]
+            if elapsed > 0:
+                pbar.postfix = (
+                    f"est. speed input: {total_in_toks / elapsed:.2f}"
+                    f" toks/s, output: "
+                    f"{total_out_toks / elapsed:.2f} toks/s")
+            pbar.update(_pbar_pending)
+            _pbar_pending = 0
+            _pbar_pending_in = 0
+            _pbar_pending_out = 0
+
         while waiting or running or prefilling:
+            if pbar is not None:
+                _flush_pbar()
             # =============================================================
             # FAST PATH: pure decode (most common steady-state)
             # No waiting/prefilling seqs, so skip the full scheduler.
@@ -1233,8 +1279,7 @@ class LlamaEngine:
                             if not seq.ignore_eos:
                                 done = done or tid == eos
                             if done:
-                                seq.status = SeqStatus.FINISHED
-                                bm.deallocate(seq)
+                                _finish_seq(seq)
                                 any_finished = True
                         if any_finished:
                             running = deque(s for s in running
@@ -1303,8 +1348,7 @@ class LlamaEngine:
                                     if not seq.ignore_eos:
                                         done = done or tid == eos
                                     if done:
-                                        seq.status = SeqStatus.FINISHED
-                                        bm.deallocate(seq)
+                                        _finish_seq(seq)
                                         any_finished = True
                                 if any_finished:
                                     running = deque(
@@ -1342,9 +1386,8 @@ class LlamaEngine:
                             if not seq.ignore_eos:
                                 done = done or tid == eos
                             if done:
-                                seq.status = SeqStatus.FINISHED
+                                _finish_seq(seq)
                                 finished_set.add(id(seq))
-                                bm.deallocate(seq)
                         if finished_set:
                             running = deque(s for s in running if id(s) not in finished_set)
                     continue
@@ -1449,12 +1492,10 @@ class LlamaEngine:
                         if not seq.ignore_eos:
                             done = done or tid == eos
                         if done:
-                            seq.status = SeqStatus.FINISHED
+                            _finish_seq(seq)
                             finished_set.add(id(seq))
-                            bm.deallocate(seq)
                         else:
                             running.append(seq)
-                    # Don't re-add finished seqs to running
                     if finished_set:
                         running = deque(s for s in running if id(s) not in finished_set)
                 else:
@@ -1474,9 +1515,8 @@ class LlamaEngine:
                         if not seq.ignore_eos:
                             done = done or tid == eos
                         if done:
-                            seq.status = SeqStatus.FINISHED
+                            _finish_seq(seq)
                             finished_set.add(id(seq))
-                            bm.deallocate(seq)
                         else:
                             running.append(seq)
                     if finished_set:
@@ -1493,6 +1533,7 @@ class LlamaEngine:
                         logits, prefill_seqs, prefill_chunk_sizes,
                         sp_list[0], eos, collect_logits, seq_logits,
                         running, prefilling, bm, block_size,
+                        finish_seq=_finish_seq,
                     )
             else:
                 # Mixed batch: prefill + decode together
@@ -1507,6 +1548,7 @@ class LlamaEngine:
                         pf_logits, prefill_seqs, prefill_chunk_sizes,
                         sp_list[0], eos, collect_logits, seq_logits,
                         running, prefilling, bm, block_size,
+                        finish_seq=_finish_seq,
                     )
 
                     if collect_logits:
@@ -1520,15 +1562,18 @@ class LlamaEngine:
                         if not seq.ignore_eos:
                             done = done or tid == eos
                         if done:
-                            seq.status = SeqStatus.FINISHED
+                            _finish_seq(seq)
                             finished_set.add(id(seq))
-                            bm.deallocate(seq)
                         else:
                             running.append(seq)
                     if finished_set:
                         running = deque(s for s in running if id(s) not in finished_set)
                 else:
                     running.extend(decode_seqs)
+
+        if pbar is not None:
+            _flush_pbar()
+            pbar.close()
 
         # Return in original order
         return [
@@ -1549,6 +1594,7 @@ class LlamaEngine:
         self, logits, prefill_seqs, prefill_chunk_sizes,
         sp, eos, collect_logits, seq_logits,
         running, prefilling, bm, block_size,
+        finish_seq=None,
     ):
         """Handle output from prefill sequences after a forward pass.
 
@@ -1584,7 +1630,10 @@ class LlamaEngine:
             if not seq.ignore_eos:
                 done = done or tid == eos
             if done:
-                seq.status = SeqStatus.FINISHED
-                bm.deallocate(seq)
+                if finish_seq is not None:
+                    finish_seq(seq)
+                else:
+                    seq.status = SeqStatus.FINISHED
+                    bm.deallocate(seq)
             else:
                 running.append(seq)
