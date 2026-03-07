@@ -33,10 +33,29 @@ from .infra.context import get_context, reset_context, set_context, set_mixed_co
 from .tasks.baseline.L1.allreduce import set_custom_ar
 from .weight_loader import load_model
 
-MAX_NUM_BATCHED_TOKENS = 16384
-MAX_NUM_SEQS = 1024
 MAX_MODEL_LEN = 131072
 NCCL_PORT = int(os.environ.get("KB_NANO_NCCL_PORT", "29501"))
+
+
+def _detect_scheduling_defaults() -> tuple[int, int]:
+    """Choose max_num_batched_tokens and max_num_seqs based on GPU memory.
+
+    Mirrors vLLM's heuristic: high-memory GPUs (>=70 GiB, non-A100) get
+    larger defaults; everything else gets conservative values.
+    """
+    if not torch.cuda.is_available():
+        return 8192, 256
+    _GiB = 1 << 30
+    _, total = torch.cuda.mem_get_info()
+    name = torch.cuda.get_device_name(0).lower()
+    if total >= 70 * _GiB and "a100" not in name:
+        return 16384, 1024
+    return 8192, 256
+
+
+_DEFAULT_MAX_NUM_BATCHED_TOKENS, _DEFAULT_MAX_NUM_SEQS = (
+    _detect_scheduling_defaults()
+)
 
 _PROFILE = os.environ.get("KB_NANO_PROFILE", "0") == "1"
 
@@ -218,7 +237,9 @@ class ModelRunner:
                  dtype: torch.dtype, enforce_eager: bool,
                  event, shm_name: str,
                  gpu_memory_utilization: float = 0.9,
-                 max_model_len: int = MAX_MODEL_LEN):
+                 max_model_len: int = MAX_MODEL_LEN,
+                 max_num_seqs: int | None = None,
+                 max_num_batched_tokens: int | None = None):
         self.rank = rank
         self.world_size = world_size
         self.enforce_eager = enforce_eager
@@ -226,6 +247,8 @@ class ModelRunner:
         self.block_size = BLOCK_SIZE
         self.gpu_memory_utilization = gpu_memory_utilization
         self.max_model_len = ((max_model_len + BLOCK_SIZE - 1) // BLOCK_SIZE + 2) * BLOCK_SIZE
+        self.max_num_seqs = max_num_seqs if max_num_seqs is not None else _DEFAULT_MAX_NUM_SEQS
+        self.max_num_batched_tokens = max_num_batched_tokens if max_num_batched_tokens is not None else _DEFAULT_MAX_NUM_BATCHED_TOKENS
 
         torch.cuda.set_device(rank)
         dist.init_process_group(
@@ -373,8 +396,8 @@ class ModelRunner:
     def warmup_model(self):
         torch.cuda.empty_cache()
         torch.cuda.reset_peak_memory_stats()
-        warmup_len = min(self.max_model_len, MAX_NUM_BATCHED_TOKENS)
-        num_seqs = min(MAX_NUM_BATCHED_TOKENS // warmup_len, MAX_NUM_SEQS)
+        warmup_len = min(self.max_model_len, self.max_num_batched_tokens)
+        num_seqs = min(self.max_num_batched_tokens // warmup_len, self.max_num_seqs)
         seqs = [Sequence([0] * warmup_len) for _ in range(num_seqs)]
         self.run(seqs, True)
         torch.cuda.empty_cache()
@@ -723,7 +746,7 @@ class ModelRunner:
 
     def _init_greedy_buffers(self):
         """Pre-allocate buffers for gather_greedy to avoid per-step allocation."""
-        max_bs = MAX_NUM_SEQS
+        max_bs = self.max_num_seqs
         dev = f"cuda:{self.rank}"
         self._greedy_info = torch.zeros(max_bs, 2, dtype=torch.float32, device=dev)
         self._greedy_gathered = [
@@ -971,7 +994,7 @@ class ModelRunner:
     @torch.inference_mode()
     def capture_cudagraph(self):
         from contextlib import nullcontext
-        max_bs = MAX_NUM_SEQS
+        max_bs = self.max_num_seqs
         max_num_blocks = (self.max_model_len + BLOCK_SIZE - 1) // BLOCK_SIZE
         input_ids = torch.zeros(max_bs, dtype=torch.int64)
         positions = torch.zeros(max_bs, dtype=torch.int64)
@@ -1043,12 +1066,23 @@ class LlamaEngine:
         tensor_parallel_size: int = 1,
         gpu_memory_utilization: float = 0.9,
         max_model_len: int = MAX_MODEL_LEN,
+        max_num_seqs: int | None = None,
+        max_num_batched_tokens: int | None = None,
     ):
         self.seed = seed
+        self.max_num_seqs = max_num_seqs if max_num_seqs is not None else _DEFAULT_MAX_NUM_SEQS
+        self.max_num_batched_tokens = max_num_batched_tokens if max_num_batched_tokens is not None else _DEFAULT_MAX_NUM_BATCHED_TOKENS
         self._set_seeds(seed)
 
         # Unique shared memory name to avoid collisions
         shm_name = f"sllama_{uuid.uuid4().hex[:8]}"
+
+        mr_kwargs = dict(
+            gpu_memory_utilization=gpu_memory_utilization,
+            max_model_len=max_model_len,
+            max_num_seqs=self.max_num_seqs,
+            max_num_batched_tokens=self.max_num_batched_tokens,
+        )
 
         # Launch non-rank-0 workers
         self.workers = []
@@ -1060,10 +1094,7 @@ class LlamaEngine:
                 target=ModelRunner,
                 args=(model_name, i, tensor_parallel_size, dtype,
                       enforce_eager, event, shm_name),
-                kwargs=dict(
-                    gpu_memory_utilization=gpu_memory_utilization,
-                    max_model_len=max_model_len,
-                ),
+                kwargs=mr_kwargs,
             )
             p.start()
             self.workers.append(p)
@@ -1073,10 +1104,11 @@ class LlamaEngine:
         self.model_runner = ModelRunner(
             model_name, 0, tensor_parallel_size, dtype,
             enforce_eager, self.events, shm_name,
-            gpu_memory_utilization=gpu_memory_utilization,
-            max_model_len=max_model_len,
+            **mr_kwargs,
         )
         self.block_manager = BlockManager(self.model_runner.num_blocks)
+        print(f"  Scheduling: max_num_seqs={self.max_num_seqs}, "
+              f"max_num_batched_tokens={self.max_num_batched_tokens}")
 
         self.tokenizer = AutoTokenizer.from_pretrained(model_name)
         if self.tokenizer.pad_token_id is None:
@@ -1320,14 +1352,14 @@ class LlamaEngine:
             # =============================================================
             # SCHEDULE: one unified step
             # =============================================================
-            token_budget = MAX_NUM_BATCHED_TOKENS
+            token_budget = self.max_num_batched_tokens
 
             # --- 1. Allocate blocks for decode seqs that need a new block ---
             decode_seqs: list[Sequence] = []
             new_running: deque[Sequence] = deque()
             while running:
                 seq = running.popleft()
-                if len(decode_seqs) >= MAX_NUM_SEQS:
+                if len(decode_seqs) >= self.max_num_seqs:
                     new_running.append(seq)
                     continue
                 needs_block = (len(seq) % block_size == 1)
@@ -1386,7 +1418,7 @@ class LlamaEngine:
                             + block_size - 1) // block_size
                 if total_peak + seq_peak > num_blocks:
                     break
-                if len(prefill_seqs) + len(decode_seqs) >= MAX_NUM_SEQS:
+                if len(prefill_seqs) + len(decode_seqs) >= self.max_num_seqs:
                     break
                 waiting.popleft()
                 bm.allocate_n(seq, blocks_needed)
