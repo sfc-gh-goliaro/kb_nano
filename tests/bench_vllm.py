@@ -61,6 +61,11 @@ SCENARIOS = [
     {"name": "decode-heavy",  "input_len": 512,  "output_len": 1024},
 ]
 
+LATENCY_SCENARIOS = [
+    {"name": "single-request",  "input_len": 128, "output_len": 128, "batch_size": 1},
+    {"name": "fixed-batch-32",  "input_len": 128, "output_len": 128, "batch_size": 32},
+]
+
 # ---------------------------------------------------------------------------
 # Multi-scenario vLLM subprocess worker
 # ---------------------------------------------------------------------------
@@ -130,10 +135,33 @@ def main():
         }
         all_results.append(result)
 
+    latency_results = []
+    for ls in cfg.get("latency_scenarios", []):
+        prompts = [dict(prompt_token_ids=p) for p in ls["prompt_token_ids"]]
+        sp = SamplingParams(temperature=0.0,
+                            ignore_eos=True, max_tokens=ls["output_len"])
+        num_warmup = ls.get("num_warmup", 3)
+        num_iters = ls.get("num_iters", 5)
+        for _ in range(num_warmup):
+            llm.generate(prompts, sp, use_tqdm=False)
+        latencies = []
+        for _ in range(num_iters):
+            t0 = time.perf_counter()
+            llm.generate(prompts, sp, use_tqdm=False)
+            latencies.append(time.perf_counter() - t0)
+        latency_results.append({
+            "name": ls["name"],
+            "batch_size": ls["batch_size"],
+            "input_len": ls["input_len"],
+            "output_len": ls["output_len"],
+            "num_iters": num_iters,
+            "latencies": latencies,
+        })
+
     del llm
 
     with open(cfg["output_file"], "w") as f:
-        json.dump(all_results, f)
+        json.dump({"throughput": all_results, "latency": latency_results}, f)
 
 if __name__ == "__main__":
     main()
@@ -213,8 +241,37 @@ def main():
         }
         all_results.append(result)
 
+    latency_results = []
+    for ls in cfg.get("latency_scenarios", []):
+        prompts = ls["prompt_token_ids"]
+        sp = SamplingParams(temperature=0.0,
+                            ignore_eos=True, max_tokens=ls["output_len"])
+        num_warmup = ls.get("num_warmup", 3)
+        num_iters = ls.get("num_iters", 5)
+        for _ in range(num_warmup):
+            engine.block_manager.reset()
+            torch.cuda.synchronize()
+            engine.generate(prompts, sp)
+            torch.cuda.synchronize()
+        latencies = []
+        for _ in range(num_iters):
+            engine.block_manager.reset()
+            torch.cuda.synchronize()
+            t0 = time.perf_counter()
+            engine.generate(prompts, sp)
+            torch.cuda.synchronize()
+            latencies.append(time.perf_counter() - t0)
+        latency_results.append({
+            "name": ls["name"],
+            "batch_size": ls["batch_size"],
+            "input_len": ls["input_len"],
+            "output_len": ls["output_len"],
+            "num_iters": num_iters,
+            "latencies": latencies,
+        })
+
     with open(cfg["output_file"], "w") as f:
-        json.dump(all_results, f)
+        json.dump({"throughput": all_results, "latency": latency_results}, f)
 
     del engine
 
@@ -285,6 +342,12 @@ def main():
         "--no-enforce-eager", dest="enforce_eager", action="store_false",
     )
     parser.add_argument("--skip-vllm", action="store_true")
+    parser.add_argument("--skip-throughput", action="store_true",
+                        help="Skip the throughput phase (run latency only)")
+    parser.add_argument("--skip-latency", action="store_true",
+                        help="Skip the latency benchmark phase")
+    parser.add_argument("--latency-iters", type=int, default=5,
+                        help="Timed iterations per latency scenario (default: 5)")
     parser.add_argument(
         "--output-dir", type=str, default=None,
         help="Directory to save per-scenario outputs and results JSON "
@@ -302,27 +365,53 @@ def main():
     # Pre-generate all scenario data
     scenario_data = []
     global_max_seq_len = 0
-    for i, scenario in enumerate(SCENARIOS):
-        rng_seed = args.seed + i
-        random.seed(rng_seed)
-        np.random.seed(rng_seed)
-        input_len = scenario["input_len"]
-        output_len = scenario["output_len"]
-        prompt_token_ids = [
-            [randint(0, 10000) for _ in range(input_len)]
-            for _ in range(args.num_seqs)
-        ]
-        output_lens = [output_len] * args.num_seqs
-        max_seq_len = input_len + output_len
-        if max_seq_len > global_max_seq_len:
-            global_max_seq_len = max_seq_len
-        scenario_data.append({
-            "name": scenario["name"],
-            "input_len": input_len,
-            "output_len": output_len,
-            "prompt_token_ids": prompt_token_ids,
-            "output_lens": output_lens,
-        })
+    if not args.skip_throughput:
+        for i, scenario in enumerate(SCENARIOS):
+            rng_seed = args.seed + i
+            random.seed(rng_seed)
+            np.random.seed(rng_seed)
+            input_len = scenario["input_len"]
+            output_len = scenario["output_len"]
+            prompt_token_ids = [
+                [randint(0, 10000) for _ in range(input_len)]
+                for _ in range(args.num_seqs)
+            ]
+            output_lens = [output_len] * args.num_seqs
+            max_seq_len = input_len + output_len
+            if max_seq_len > global_max_seq_len:
+                global_max_seq_len = max_seq_len
+            scenario_data.append({
+                "name": scenario["name"],
+                "input_len": input_len,
+                "output_len": output_len,
+                "prompt_token_ids": prompt_token_ids,
+                "output_lens": output_lens,
+            })
+
+    # Pre-generate latency scenario data
+    latency_data = []
+    if not args.skip_latency:
+        for j, ls in enumerate(LATENCY_SCENARIOS):
+            rng_seed = args.seed + 100 + j
+            random.seed(rng_seed)
+            np.random.seed(rng_seed)
+            bs = ls["batch_size"]
+            prompt_token_ids = [
+                [randint(0, 10000) for _ in range(ls["input_len"])]
+                for _ in range(bs)
+            ]
+            seq_len = ls["input_len"] + ls["output_len"]
+            if seq_len > global_max_seq_len:
+                global_max_seq_len = seq_len
+            latency_data.append({
+                "name": ls["name"],
+                "input_len": ls["input_len"],
+                "output_len": ls["output_len"],
+                "batch_size": bs,
+                "prompt_token_ids": prompt_token_ids,
+                "num_warmup": 3,
+                "num_iters": args.latency_iters,
+            })
 
     print("=" * 70)
     print("  kb-nano Baseline vs vLLM -- Multi-Scenario Benchmark")
@@ -335,11 +424,17 @@ def main():
     print(f"  Seed           : {args.seed}")
     print(f"  Max seq len    : {global_max_seq_len}")
     print(f"  Output dir     : {args.output_dir}")
-    print(f"  Scenarios      : {', '.join(s['name'] for s in SCENARIOS)}")
+    if not args.skip_throughput:
+        print(f"  Scenarios      : {', '.join(s['name'] for s in SCENARIOS)}")
+    else:
+        print(f"  Scenarios      : (throughput skipped)")
+    if latency_data:
+        print(f"  Latency        : {', '.join(s['name'] for s in LATENCY_SCENARIOS)}"
+              f" ({args.latency_iters} iters)")
     print("=" * 70)
 
     # -- Run vLLM (one subprocess, all scenarios) --
-    vllm_results = None
+    vllm_raw = None
     if not args.skip_vllm:
         short_name = args.model.split("/")[-1]
         vllm_config = {
@@ -350,8 +445,9 @@ def main():
             "enforce_eager": args.enforce_eager,
             "max_model_len": global_max_seq_len,
             "scenarios": scenario_data,
+            "latency_scenarios": latency_data,
         }
-        vllm_results = run_worker(
+        vllm_raw = run_worker(
             VLLM_WORKER, vllm_config,
             f"vLLM [{short_name}] all scenarios (TP={args.tp})",
         )
@@ -369,100 +465,169 @@ def main():
         "project_root": kb_root,
         "package_name": package_name,
         "scenarios": scenario_data,
+        "latency_scenarios": latency_data,
     }
     short_name = args.model.split("/")[-1]
-    kb_results = run_worker(
+    kb_raw = run_worker(
         KB_NANO_WORKER, kb_config,
         f"kb-nano [{short_name}] all scenarios (TP={args.tp})",
     )
-    if kb_results is None:
+    if kb_raw is None:
         print("  ERROR: kb-nano subprocess failed.")
         sys.exit(1)
 
-    # -- Compute metrics per scenario --
+    kb_latency = kb_raw.get("latency", [])
+    vllm_latency = vllm_raw.get("latency", []) if vllm_raw else []
+
+    # -- Compute throughput metrics per scenario --
     all_results = []
-    for i, scenario in enumerate(SCENARIOS):
-        kb_data = kb_results[i]
-        kb_tps = kb_data["total_output_tokens"] / kb_data["elapsed"]
+    if not args.skip_throughput:
+        kb_results = kb_raw["throughput"]
+        vllm_results = vllm_raw["throughput"] if vllm_raw else None
 
-        result = {
-            "scenario": scenario["name"],
-            "input_len": scenario["input_len"],
-            "output_len": scenario["output_len"],
-            "num_seqs": args.num_seqs,
-            "kb_nano_elapsed": kb_data["elapsed"],
-            "kb_nano_output_tokens": kb_data["total_output_tokens"],
-            "kb_nano_tok_per_s": kb_tps,
-        }
+        for i, scenario in enumerate(SCENARIOS):
+            kb_data = kb_results[i]
+            kb_tps = kb_data["total_output_tokens"] / kb_data["elapsed"]
 
-        if vllm_results is not None:
-            v_data = vllm_results[i]
-            v_tps = v_data["total_output_tokens"] / v_data["elapsed"]
-            speedup = kb_tps / v_tps
-            result["vllm_elapsed"] = v_data["elapsed"]
-            result["vllm_output_tokens"] = v_data["total_output_tokens"]
-            result["vllm_tok_per_s"] = v_tps
-            result["speedup"] = speedup
-
-            if args.temperature == 0.0:
-                alignment = compute_alignment(
-                    kb_data["outputs"], v_data["outputs"]
-                )
-                result["alignment"] = alignment
-
-        # Save per-scenario outputs
-        if args.output_dir:
-            scenario_dir = os.path.join(args.output_dir, scenario["name"])
-            os.makedirs(scenario_dir, exist_ok=True)
-
-            kb_out_path = os.path.join(scenario_dir, "kb_nano_outputs.json")
-            with open(kb_out_path, "w") as f:
-                json.dump(kb_data, f, indent=2)
+            result = {
+                "scenario": scenario["name"],
+                "input_len": scenario["input_len"],
+                "output_len": scenario["output_len"],
+                "num_seqs": args.num_seqs,
+                "kb_nano_elapsed": kb_data["elapsed"],
+                "kb_nano_output_tokens": kb_data["total_output_tokens"],
+                "kb_nano_tok_per_s": kb_tps,
+            }
 
             if vllm_results is not None:
-                vllm_out_path = os.path.join(scenario_dir, "vllm_outputs.json")
-                with open(vllm_out_path, "w") as f:
-                    json.dump(vllm_results[i], f, indent=2)
+                v_data = vllm_results[i]
+                v_tps = v_data["total_output_tokens"] / v_data["elapsed"]
+                speedup = kb_tps / v_tps
+                result["vllm_elapsed"] = v_data["elapsed"]
+                result["vllm_output_tokens"] = v_data["total_output_tokens"]
+                result["vllm_tok_per_s"] = v_tps
+                result["speedup"] = speedup
 
-        all_results.append(result)
+                if args.temperature == 0.0:
+                    alignment = compute_alignment(
+                        kb_data["outputs"], v_data["outputs"]
+                    )
+                    result["alignment"] = alignment
 
-    # -- Summary table --
-    print(f"\n\n{'=' * 90}")
-    print("  SUMMARY")
-    print(f"{'=' * 90}")
-    header = (
-        f"  {'SCENARIO':<16} {'IN':>5} {'OUT':>5} "
-        f"{'KB-NANO tok/s':>15} {'vLLM tok/s':>12} {'SPEEDUP':>8} "
-        f"{'AVG MATCH TOKS':>15}"
-    )
-    print(header)
-    print(f"  {'-' * 84}")
+            if args.output_dir:
+                scenario_dir = os.path.join(args.output_dir, scenario["name"])
+                os.makedirs(scenario_dir, exist_ok=True)
 
-    for r in all_results:
-        kb_tps_str = f"{r['kb_nano_tok_per_s']:,.0f}"
-        v_tps_str = (
-            f"{r['vllm_tok_per_s']:,.0f}" if "vllm_tok_per_s" in r else "N/A"
+                kb_out_path = os.path.join(scenario_dir, "kb_nano_outputs.json")
+                with open(kb_out_path, "w") as f:
+                    json.dump(kb_data, f, indent=2)
+
+                if vllm_results is not None:
+                    vllm_out_path = os.path.join(scenario_dir, "vllm_outputs.json")
+                    with open(vllm_out_path, "w") as f:
+                        json.dump(vllm_results[i], f, indent=2)
+
+            all_results.append(result)
+
+        print(f"\n\n{'=' * 90}")
+        print("  THROUGHPUT SUMMARY")
+        print(f"{'=' * 90}")
+        header = (
+            f"  {'SCENARIO':<16} {'IN':>5} {'OUT':>5} "
+            f"{'KB-NANO tok/s':>15} {'vLLM tok/s':>12} {'SPEEDUP':>8} "
+            f"{'AVG MATCH TOKS':>15}"
         )
-        speedup_str = f"{r['speedup']:.2f}x" if "speedup" in r else "N/A"
+        print(header)
+        print(f"  {'-' * 84}")
 
-        align = r.get("alignment", {})
-        avg_match = align.get("avg_matching_tokens_per_request", 0)
-        avg_out = align.get("avg_output_len", 0)
-        if avg_out > 0:
-            match_str = f"{avg_match:.1f}/{avg_out:.0f}"
-        else:
-            match_str = "N/A"
+        for r in all_results:
+            kb_tps_str = f"{r['kb_nano_tok_per_s']:,.0f}"
+            v_tps_str = (
+                f"{r['vllm_tok_per_s']:,.0f}" if "vllm_tok_per_s" in r else "N/A"
+            )
+            speedup_str = f"{r['speedup']:.2f}x" if "speedup" in r else "N/A"
 
+            align = r.get("alignment", {})
+            avg_match = align.get("avg_matching_tokens_per_request", 0)
+            avg_out = align.get("avg_output_len", 0)
+            if avg_out > 0:
+                match_str = f"{avg_match:.1f}/{avg_out:.0f}"
+            else:
+                match_str = "N/A"
+
+            print(
+                f"  {r['scenario']:<16} {r['input_len']:>5} {r['output_len']:>5} "
+                f"{kb_tps_str:>15} {v_tps_str:>12} {speedup_str:>8} "
+                f"{match_str:>15}"
+            )
+
+        print(f"{'=' * 90}")
+
+    # -- Latency summary table --
+    latency_combined = []
+    if kb_latency:
+        print(f"\n{'=' * 110}")
+        print("  LATENCY SUMMARY")
+        print(f"{'=' * 110}")
         print(
-            f"  {r['scenario']:<16} {r['input_len']:>5} {r['output_len']:>5} "
-            f"{kb_tps_str:>15} {v_tps_str:>12} {speedup_str:>8} "
-            f"{match_str:>15}"
+            f"  {'SCENARIO':<18} {'BS':>4} {'IN':>5} {'OUT':>5} {'ITERS':>6}"
+            f"  {'KB-NANO med':>12} {'vLLM med':>12}"
+            f"  {'KB-NANO ms/tok':>15} {'vLLM ms/tok':>12} {'SPEEDUP':>8}"
         )
+        print(f"  {'-' * 104}")
 
-    print(f"{'=' * 90}")
+        for i, kb_lat in enumerate(kb_latency):
+            kb_lats = np.array(kb_lat["latencies"])
+            kb_med = float(np.median(kb_lats))
+            kb_p99 = float(np.percentile(kb_lats, 99))
+            bs = kb_lat["batch_size"]
+            out_len = kb_lat["output_len"]
+            total_out_tokens = bs * out_len
+            kb_ms_per_tok = (kb_med / total_out_tokens) * 1000
+
+            lat_result = {
+                "scenario": kb_lat["name"],
+                "batch_size": bs,
+                "input_len": kb_lat["input_len"],
+                "output_len": out_len,
+                "num_iters": kb_lat["num_iters"],
+                "kb_nano_median_s": kb_med,
+                "kb_nano_p99_s": kb_p99,
+                "kb_nano_ms_per_tok": kb_ms_per_tok,
+                "kb_nano_latencies": kb_lat["latencies"],
+            }
+
+            v_med_str = "N/A"
+            speedup_str = "N/A"
+            v_ms_str = "N/A"
+            if i < len(vllm_latency):
+                v_lat = vllm_latency[i]
+                v_lats = np.array(v_lat["latencies"])
+                v_med = float(np.median(v_lats))
+                v_p99 = float(np.percentile(v_lats, 99))
+                v_ms_per_tok = (v_med / total_out_tokens) * 1000
+                speedup = v_med / kb_med
+                v_med_str = f"{v_med:.4f}s"
+                speedup_str = f"{speedup:.2f}x"
+                v_ms_str = f"{v_ms_per_tok:.2f}"
+                lat_result["vllm_median_s"] = v_med
+                lat_result["vllm_p99_s"] = v_p99
+                lat_result["vllm_ms_per_tok"] = v_ms_per_tok
+                lat_result["speedup"] = speedup
+                lat_result["vllm_latencies"] = v_lat["latencies"]
+
+            print(
+                f"  {kb_lat['name']:<18} {bs:>4} {kb_lat['input_len']:>5}"
+                f" {out_len:>5} {kb_lat['num_iters']:>6}"
+                f"  {kb_med:.4f}s{'':<3} {v_med_str:>12}"
+                f"  {kb_ms_per_tok:>13.2f}   {v_ms_str:>10} {speedup_str:>8}"
+            )
+            latency_combined.append(lat_result)
+
+        print(f"{'=' * 110}")
 
     # -- Save combined results --
-    if args.output_dir:
+    if args.output_dir and (all_results or latency_combined):
         os.makedirs(args.output_dir, exist_ok=True)
         results_path = os.path.join(args.output_dir, "results.json")
         combined = {
@@ -473,8 +638,11 @@ def main():
             "temperature": args.temperature,
             "num_seqs": args.num_seqs,
             "enforce_eager": args.enforce_eager,
-            "scenarios": all_results,
         }
+        if all_results:
+            combined["scenarios"] = all_results
+        if latency_combined:
+            combined["latency_scenarios"] = latency_combined
         with open(results_path, "w") as f:
             json.dump(combined, f, indent=2)
         print(f"\n  Results saved to: {results_path}")

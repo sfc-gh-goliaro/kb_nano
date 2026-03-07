@@ -80,28 +80,67 @@ def format_table(all_results: list[dict], gpu: str) -> str:
     lines.append(f"# Benchmark Results — {gpu}")
     lines.append("")
 
-    for r in all_results:
+    sorted_results = sorted(all_results, key=lambda r: (r["model"], r["tp"]))
+
+    for r in sorted_results:
         lines.append(f"### {r['model']} (TP={r['tp']})")
         lines.append("")
-        lines.append(
-            "| Scenario | kb-nano tok/s | vLLM tok/s | Speedup | Avg Token Match |"
-        )
-        lines.append("|---|---|---|---|---|")
 
-        for s in r["scenarios"]:
-            kb = s["kb_nano_tok_per_s"]
-            v = s.get("vllm_tok_per_s", 0)
-            sp = s.get("speedup", 0)
-            a = s.get("alignment", {})
-            avg_match = a.get("avg_matching_tokens_per_request", 0)
-            avg_out = a.get("avg_output_len", 0)
-            match_str = f"{avg_match:.1f}/{avg_out:.0f}" if avg_out > 0 else "N/A"
-
-            sp_str = f"**{sp:.2f}x**" if sp >= 1.0 else f"{sp:.2f}x"
+        scenarios = r.get("scenarios", [])
+        if scenarios:
+            lines.append("#### Throughput")
+            lines.append("")
             lines.append(
-                f"| {s['scenario']} | {kb:,.0f} | {v:,.0f} | {sp_str} | {match_str} |"
+                "| Scenario | kb-nano tok/s | vLLM tok/s | Speedup "
+                "| Avg Token Match |"
             )
-        lines.append("")
+            lines.append("|---|---|---|---|---|")
+
+            for s in scenarios:
+                kb = s["kb_nano_tok_per_s"]
+                v = s.get("vllm_tok_per_s", 0)
+                sp = s.get("speedup", 0)
+                a = s.get("alignment", {})
+                avg_match = a.get("avg_matching_tokens_per_request", 0)
+                avg_out = a.get("avg_output_len", 0)
+                match_str = (f"{avg_match:.1f}/{avg_out:.0f}"
+                             if avg_out > 0 else "N/A")
+
+                sp_str = f"**{sp:.2f}x**" if sp >= 1.0 else f"{sp:.2f}x"
+                lines.append(
+                    f"| {s['scenario']} | {kb:,.0f} | {v:,.0f} "
+                    f"| {sp_str} | {match_str} |"
+                )
+            lines.append("")
+
+        lat_scenarios = r.get("latency_scenarios", [])
+        if lat_scenarios:
+            lines.append("#### Latency")
+            lines.append("")
+            lines.append(
+                "| Scenario | BS | IN | OUT | kb-nano median | vLLM median "
+                "| kb-nano ms/tok | vLLM ms/tok | Speedup |"
+            )
+            lines.append("|---|---|---|---|---|---|---|---|---|")
+            for ls in lat_scenarios:
+                kb_med = ls["kb_nano_median_s"]
+                kb_mpt = ls["kb_nano_ms_per_tok"]
+                v_med = ls.get("vllm_median_s")
+                v_mpt = ls.get("vllm_ms_per_tok")
+                speedup = ls.get("speedup")
+                if speedup is None and ls.get("ratio"):
+                    speedup = 1.0 / ls["ratio"]
+                sp_str = (f"**{speedup:.2f}x**" if speedup and speedup >= 1.0
+                          else (f"{speedup:.2f}x" if speedup else "N/A"))
+                v_med_str = f"{v_med:.4f}s" if v_med is not None else "N/A"
+                v_mpt_str = f"{v_mpt:.2f}" if v_mpt is not None else "N/A"
+                lines.append(
+                    f"| {ls['scenario']} | {ls['batch_size']} "
+                    f"| {ls['input_len']} | {ls['output_len']} "
+                    f"| {kb_med:.4f}s | {v_med_str} "
+                    f"| {kb_mpt:.2f} | {v_mpt_str} | {sp_str} |"
+                )
+            lines.append("")
 
     return "\n".join(lines)
 
@@ -197,6 +236,50 @@ def _make_speedup_fig(all_results: list[dict], gpu: str) -> plt.Figure:
     return fig
 
 
+def _make_latency_fig(all_results: list[dict], gpu: str) -> plt.Figure | None:
+    groups = []
+    for r in all_results:
+        label = _model_label(r)
+        for ls in r.get("latency_scenarios", []):
+            groups.append({
+                "label": f"{label}\n{ls['scenario']} (bs={ls['batch_size']})",
+                "kb": ls["kb_nano_median_s"] * 1000,
+                "vllm": ls.get("vllm_median_s", 0) * 1000,
+            })
+
+    if not groups:
+        return None
+
+    n = len(groups)
+    x = np.arange(n)
+    w = 0.35
+
+    fig, ax = plt.subplots(figsize=(max(10, n * 1.8), 6))
+    bars_kb = ax.bar(x - w / 2, [g["kb"] for g in groups], w,
+                     label="kb-nano", color=_PALETTE["kb-nano"])
+    bars_vl = ax.bar(x + w / 2, [g["vllm"] for g in groups], w,
+                     label="vLLM", color=_PALETTE["vLLM"])
+
+    ax.set_ylabel("Median Latency (ms)")
+    ax.set_title(f"kb-nano vs vLLM Latency — {gpu}")
+    ax.set_xticks(x)
+    ax.set_xticklabels([g["label"] for g in groups], fontsize=8, ha="center")
+    ax.legend()
+    ax.yaxis.set_major_formatter(matplotlib.ticker.FuncFormatter(
+        lambda v, _: f"{v:,.0f}"
+    ))
+
+    for bar in bars_kb:
+        ax.text(bar.get_x() + bar.get_width() / 2, bar.get_height(),
+                f"{bar.get_height():,.0f}", ha="center", va="bottom", fontsize=7)
+    for bar in bars_vl:
+        ax.text(bar.get_x() + bar.get_width() / 2, bar.get_height(),
+                f"{bar.get_height():,.0f}", ha="center", va="bottom", fontsize=7)
+
+    fig.tight_layout()
+    return fig
+
+
 def _make_alignment_fig(all_results: list[dict], gpu: str) -> plt.Figure:
     items = []
     for r in all_results:
@@ -271,10 +354,13 @@ def main():
         fig_tp = _make_throughput_fig(all_results, gpu)
         fig_sp = _make_speedup_fig(all_results, gpu)
         fig_al = _make_alignment_fig(all_results, gpu)
+        fig_lat = _make_latency_fig(all_results, gpu)
 
         fig_tp.savefig(str(plot_dir / "throughput.png"), dpi=150)
         fig_sp.savefig(str(plot_dir / "speedup.png"), dpi=150)
         fig_al.savefig(str(plot_dir / "alignment.png"), dpi=150)
+        if fig_lat is not None:
+            fig_lat.savefig(str(plot_dir / "latency.png"), dpi=150)
         plt.close("all")
 
         md_path = plot_dir / "results.md"
