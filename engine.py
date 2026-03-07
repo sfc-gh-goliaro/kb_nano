@@ -639,6 +639,11 @@ class ModelRunner:
         if self.enforce_eager:
             return self._run_decode_greedy_eager(n, ids_np, pos_np, sm_np, cl_np, bt_np)
 
+        self._run_graph_from_numpy(n, ids_np, pos_np, sm_np, cl_np, bt_np)
+        return self._greedy_from_hidden(n)
+
+    def _run_graph_from_numpy(self, n, ids_np, pos_np, sm_np, cl_np, bt_np):
+        """Copy numpy arrays into graph vars and replay the CUDA graph."""
         gv = self.graph_vars
         graph_bs = self._graph_bs_for_n[n]
         prev_n = getattr(self, '_prev_decode_n', -1)
@@ -654,9 +659,32 @@ class ModelRunner:
             torch.from_numpy(bt_np), non_blocking=True
         )
         self._prev_decode_n = n
-
         self.graphs[graph_bs].replay()
-        return self._greedy_from_hidden(n)
+
+    @torch.inference_mode()
+    def run_decode_greedy_fast_async(self, decode_data):
+        """Like run_decode_greedy_fast but starts async D2H copy.
+
+        Returns (has_result, n) -- caller must call _wait_async_tokens(n)
+        later to get the Python list of token IDs.
+        """
+        n, ids_np, pos_np, sm_np, cl_np, bt_np = decode_data
+
+        if self.enforce_eager:
+            result = self._run_decode_greedy_eager(n, ids_np, pos_np, sm_np, cl_np, bt_np)
+            if result is not None:
+                main_stream = torch.cuda.current_stream()
+                cs = self._copy_stream
+                with torch.cuda.stream(cs):
+                    cs.wait_stream(main_stream)
+                    self._pinned_token_ids[:n].copy_(result, non_blocking=True)
+                    self._copy_event.record(cs)
+                return True, n
+            return False, n
+
+        self._run_graph_from_numpy(n, ids_np, pos_np, sm_np, cl_np, bt_np)
+        has_result = self._greedy_from_hidden_async(n)
+        return has_result, n
 
     def _run_decode_greedy_eager(self, n, ids_np, pos_np, sm_np, cl_np, bt_np):
         """Eager decode path for greedy sampling with TP (no CUDA graphs)."""
@@ -712,6 +740,12 @@ class ModelRunner:
         self._np_cl = np.empty(max_bs, dtype=np.int32)
         self._np_bt = np.full((max_bs, max_num_blocks), -1, dtype=np.int32)
 
+        # Async D2H: pinned buffer + copy stream for pipelined decode
+        self._pinned_token_ids = torch.empty(max_bs, dtype=torch.int64,
+                                             device="cpu", pin_memory=True)
+        self._copy_stream = torch.cuda.Stream(device=dev)
+        self._copy_event = torch.cuda.Event()
+
     def _greedy_from_hidden(self, n):
         """Use CUDA-graph-captured LM head + local argmax, then allgather.
         
@@ -719,11 +753,12 @@ class ModelRunner:
         Caller must call .tolist() to sync.
         """
         gv = self.graph_vars
-        local_max_vals = gv["lm_max_vals"][:n]
-        local_max_idxs = gv["lm_max_idxs"][:n] + self.model.lm_head.vocab_start
 
         if self.world_size == 1:
-            return local_max_idxs
+            return gv["lm_max_idxs"][:n]
+
+        local_max_vals = gv["lm_max_vals"][:n]
+        local_max_idxs = gv["lm_max_idxs"][:n] + self.model.lm_head.vocab_start
 
         info = self._greedy_info[:n]
         info[:, 0] = local_max_vals
@@ -742,6 +777,28 @@ class ModelRunner:
         if self.rank == 0:
             return token_ids
         return None
+
+    def _greedy_from_hidden_async(self, n):
+        """Like _greedy_from_hidden but starts async D2H copy.
+
+        After calling this, the caller must eventually call
+        _wait_async_tokens(n) to get the Python list of token IDs.
+        Between the two calls, the CPU is free to do other work.
+        """
+        gpu_ids = self._greedy_from_hidden(n)
+        if gpu_ids is not None:
+            main_stream = torch.cuda.current_stream()
+            cs = self._copy_stream
+            with torch.cuda.stream(cs):
+                cs.wait_stream(main_stream)
+                self._pinned_token_ids[:n].copy_(gpu_ids, non_blocking=True)
+                self._copy_event.record(cs)
+        return gpu_ids is not None
+
+    def _wait_async_tokens(self, n):
+        """Wait for the async D2H copy to complete and return token list."""
+        self._copy_event.synchronize()
+        return self._pinned_token_ids[:n].tolist()
 
     def _prepare_decode_arrays(self, seqs):
         """Precompute numpy arrays for decode - uses pre-allocated buffers."""
@@ -775,7 +832,50 @@ class ModelRunner:
             bt_np[i, :blen] = b
             if blen < max_bt:
                 bt_np[i, blen:max_bt] = -1
+        self._prev_max_bt = max_bt
         return (n, ids_np[:n], pos_np[:n], sm_np[:n], cl_np[:n], bt_np[:n, :max_bt])
+
+    def _update_decode_arrays_incremental(self, n, token_ids, decode_seqs):
+        """Update pre-allocated decode arrays incrementally after a decode step.
+
+        Much faster than _prepare_decode_arrays: vectorized numpy ops +
+        only touches block table rows that crossed a block boundary.
+        """
+        ids_np = self._np_ids
+        pos_np = self._np_pos
+        sm_np = self._np_sm
+        cl_np = self._np_cl
+        bt_np = self._np_bt
+        bs = BLOCK_SIZE
+
+        ids_np[:n] = token_ids
+        pos_np[:n] += 1
+        cl_np[:n] += 1
+        sm_np[:n] += 1
+
+        boundary_mask = cl_np[:n] % bs == 1
+        if boundary_mask.any():
+            max_bt = 0
+            for i in np.where(boundary_mask)[0]:
+                seq = decode_seqs[i]
+                bt = seq.block_table
+                blen = len(bt)
+                sm_np[i] = bt[-1] * bs
+                bt_np[i, :blen] = bt
+                if blen > max_bt:
+                    max_bt = blen
+            if max_bt == 0:
+                max_bt = self._prev_max_bt
+            else:
+                for i in np.where(~boundary_mask)[0]:
+                    blen = len(decode_seqs[i].block_table)
+                    if blen > max_bt:
+                        max_bt = blen
+                self._prev_max_bt = max_bt
+        else:
+            max_bt = self._prev_max_bt
+        return (n, ids_np[:n], pos_np[:n], sm_np[:n], cl_np[:n],
+                bt_np[:n, :max_bt])
 
     def _write_decode_shm(self, n, ids_np, pos_np, sm_np, cl_np, bt_np):
         """Write decode arrays directly into SHM with binary layout.
@@ -836,6 +936,20 @@ class ModelRunner:
                 pd["n_calls"] += 1
             return result
         return self.run_decode_greedy(seqs)
+
+    def call_decode_greedy_async(self, decode_data):
+        """Launch greedy decode from precomputed arrays and start async D2H.
+
+        Returns (has_result, n). Caller must call
+        model_runner._wait_async_tokens(n) to get token IDs.
+        """
+        n = decode_data[0]
+        if self.world_size > 1 and self.rank == 0:
+            self._write_decode_shm(*decode_data)
+            self.shm.buf[self._SHM_FLAG_OFFSET] = 1
+            self._signal_workers()
+            return self.run_decode_greedy_fast_async(decode_data)
+        return self.run_decode_greedy_fast_async(decode_data)
 
     def run(self, seqs, is_prefill):
         input_ids, positions = (
@@ -1051,53 +1165,148 @@ class LlamaEngine:
             # FAST PATH: pure decode (most common steady-state)
             # No waiting/prefilling seqs, so skip the full scheduler.
             # =============================================================
-            if running and not waiting and not prefilling:
-                # Check how many seqs need a new block
+            if running and not waiting and not prefilling and use_greedy:
                 need_blocks = 0
                 for seq in running:
                     if len(seq) % block_size == 1:
                         need_blocks += 1
                 if need_blocks <= len(bm.free_block_ids):
+                    if _PROFILE:
+                        _fp_t0 = time.perf_counter()
                     decode_seqs = list(running)
                     for seq in decode_seqs:
                         if len(seq) % block_size == 1:
                             seq.block_table.append(bm.free_block_ids.popleft())
 
-                    if use_greedy:
-                        gpu_result = self.model_runner.call_decode_greedy(decode_seqs)
-                        if gpu_result is not None:
-                            token_ids = gpu_result.tolist()
-                            finished_set = set()
-                            for seq, tid in zip(decode_seqs, token_ids):
-                                seq.append_token(tid)
-                                done = len(seq.generated_ids) >= seq.max_tokens
-                                if not seq.ignore_eos:
-                                    done = done or tid == eos
-                                if done:
-                                    seq.status = SeqStatus.FINISHED
-                                    finished_set.add(id(seq))
-                                    bm.deallocate(seq)
-                            if finished_set:
-                                running = deque(s for s in running if id(s) not in finished_set)
-                    else:
-                        result = self.model_runner.call("run", decode_seqs, False)
-                        if result is not None:
-                            if collect_logits:
-                                for i, seq in enumerate(decode_seqs):
-                                    seq_logits[id(seq)].append(result[i:i+1].cpu())
-                            token_ids = self._sample(result, sp_list[0])
-                            finished_set = set()
-                            for seq, tid in zip(decode_seqs, token_ids):
-                                seq.append_token(tid)
-                                done = len(seq.generated_ids) >= seq.max_tokens
-                                if not seq.ignore_eos:
-                                    done = done or tid == eos
-                                if done:
-                                    seq.status = SeqStatus.FINISHED
-                                    finished_set.add(id(seq))
-                                    bm.deallocate(seq)
-                            if finished_set:
-                                running = deque(s for s in running if id(s) not in finished_set)
+                    mr = self.model_runner
+                    n_dc = len(decode_seqs)
+                    decode_data = mr._prepare_decode_arrays(decode_seqs)
+                    if _PROFILE:
+                        _fp_t1 = time.perf_counter()
+                    gpu_result = mr.run_decode_greedy_fast(decode_data)
+                    if _PROFILE:
+                        _fp_t2 = time.perf_counter()
+                    if gpu_result is not None:
+                        token_ids = gpu_result.tolist()
+                        if _PROFILE:
+                            _fp_t3 = time.perf_counter()
+                        any_finished = False
+                        for seq, tid in zip(decode_seqs, token_ids):
+                            seq.append_token(tid)
+                            done = len(seq.generated_ids) >= seq.max_tokens
+                            if not seq.ignore_eos:
+                                done = done or tid == eos
+                            if done:
+                                seq.status = SeqStatus.FINISHED
+                                bm.deallocate(seq)
+                                any_finished = True
+                        if any_finished:
+                            running = deque(s for s in running
+                                            if s.status != SeqStatus.FINISHED)
+                        if _PROFILE:
+                            _fp_t4 = time.perf_counter()
+                            _fp = getattr(self, '_fast_path_profile', None)
+                            if _fp is None:
+                                _fp = {'prep': 0., 'gpu': 0., 'tolist': 0.,
+                                       'post': 0., 'n': 0}
+                                self._fast_path_profile = _fp
+                            _fp['prep'] += _fp_t1 - _fp_t0
+                            _fp['gpu'] += _fp_t2 - _fp_t1
+                            _fp['tolist'] += _fp_t3 - _fp_t2
+                            _fp['post'] += _fp_t4 - _fp_t3
+                            _fp['n'] += 1
+
+                        # --- Inner decode loop: stay in fast path ---
+                        # Avoid re-entering the outer while loop overhead
+                        use_incr = True
+                        while running and not waiting and not prefilling:
+                            if any_finished:
+                                decode_seqs = list(running)
+                                n_dc = len(decode_seqs)
+                                any_finished = False
+                                use_incr = False
+
+                            need_blocks = 0
+                            for seq in decode_seqs:
+                                if len(seq) % block_size == 1:
+                                    need_blocks += 1
+                            if need_blocks > len(bm.free_block_ids):
+                                break
+                            for seq in decode_seqs:
+                                if len(seq) % block_size == 1:
+                                    seq.block_table.append(
+                                        bm.free_block_ids.popleft())
+
+                            if _PROFILE:
+                                _fp_t0 = time.perf_counter()
+                            if use_incr:
+                                decode_data = \
+                                    mr._update_decode_arrays_incremental(
+                                        n_dc, token_ids, decode_seqs)
+                            else:
+                                decode_data = mr._prepare_decode_arrays(
+                                    decode_seqs)
+                                use_incr = True
+                            if _PROFILE:
+                                _fp_t1 = time.perf_counter()
+                            gpu_result = mr.run_decode_greedy_fast(decode_data)
+                            if _PROFILE:
+                                _fp_t2 = time.perf_counter()
+                            if gpu_result is not None:
+                                token_ids = gpu_result.tolist()
+                                if _PROFILE:
+                                    _fp_t3 = time.perf_counter()
+                                for seq, tid in zip(decode_seqs, token_ids):
+                                    seq.append_token(tid)
+                                    done = (len(seq.generated_ids)
+                                            >= seq.max_tokens)
+                                    if not seq.ignore_eos:
+                                        done = done or tid == eos
+                                    if done:
+                                        seq.status = SeqStatus.FINISHED
+                                        bm.deallocate(seq)
+                                        any_finished = True
+                                if any_finished:
+                                    running = deque(
+                                        s for s in running
+                                        if s.status != SeqStatus.FINISHED)
+                                if _PROFILE:
+                                    _fp_t4 = time.perf_counter()
+                                    _fp['prep'] += _fp_t1 - _fp_t0
+                                    _fp['gpu'] += _fp_t2 - _fp_t1
+                                    _fp['tolist'] += _fp_t3 - _fp_t2
+                                    _fp['post'] += _fp_t4 - _fp_t3
+                                    _fp['n'] += 1
+                    continue
+
+            elif running and not waiting and not prefilling:
+                decode_seqs = list(running)
+                need_blocks = 0
+                for seq in decode_seqs:
+                    if len(seq) % block_size == 1:
+                        need_blocks += 1
+                if need_blocks <= len(bm.free_block_ids):
+                    for seq in decode_seqs:
+                        if len(seq) % block_size == 1:
+                            seq.block_table.append(bm.free_block_ids.popleft())
+                    result = self.model_runner.call("run", decode_seqs, False)
+                    if result is not None:
+                        if collect_logits:
+                            for i, seq in enumerate(decode_seqs):
+                                seq_logits[id(seq)].append(result[i:i+1].cpu())
+                        token_ids = self._sample(result, sp_list[0])
+                        finished_set = set()
+                        for seq, tid in zip(decode_seqs, token_ids):
+                            seq.append_token(tid)
+                            done = len(seq.generated_ids) >= seq.max_tokens
+                            if not seq.ignore_eos:
+                                done = done or tid == eos
+                            if done:
+                                seq.status = SeqStatus.FINISHED
+                                finished_set.add(id(seq))
+                                bm.deallocate(seq)
+                        if finished_set:
+                            running = deque(s for s in running if id(s) not in finished_set)
                     continue
 
             # =============================================================
@@ -1147,13 +1356,27 @@ class LlamaEngine:
             prefilling = still_prefilling
 
             # --- 3. Admit new seqs from waiting queue ---
+            total_peak = 0
+            for seq in decode_seqs:
+                total_peak += (seq.num_prompt_tokens + seq.max_tokens
+                               + block_size - 1) // block_size
+            for seq in running:
+                total_peak += (seq.num_prompt_tokens + seq.max_tokens
+                               + block_size - 1) // block_size
+            for seq in prefilling:
+                total_peak += (seq.num_prompt_tokens + seq.max_tokens
+                               + block_size - 1) // block_size
             while waiting and token_budget > 0:
                 seq = waiting[0]
                 prompt_len = seq.num_prompt_tokens
                 chunk = min(prompt_len, token_budget)
                 blocks_needed = (chunk + block_size - 1) // block_size
                 free = len(bm.free_block_ids)
-                if free < blocks_needed or free - blocks_needed < watermark_blocks:
+                if free < blocks_needed + watermark_blocks:
+                    break
+                seq_peak = (prompt_len + seq.max_tokens
+                            + block_size - 1) // block_size
+                if total_peak + seq_peak > num_blocks:
                     break
                 if len(prefill_seqs) + len(decode_seqs) >= MAX_NUM_SEQS:
                     break
@@ -1163,6 +1386,7 @@ class LlamaEngine:
                 prefill_seqs.append(seq)
                 prefill_chunk_sizes.append(chunk)
                 token_budget -= chunk
+                total_peak += seq_peak
 
             if not decode_seqs and not prefill_seqs:
                 continue
@@ -1236,20 +1460,15 @@ class LlamaEngine:
                     "run_mixed", prefill_seqs, prefill_chunk_sizes, decode_seqs,
                 )
                 if logits is not None:
-                    # logits has shape [n_pf_seqs + n_dc, vocab]
-                    # First n_pf_seqs rows are one-per-prefill-seq (last token),
-                    # next n_dc rows are decode seqs
                     pf_logits = logits[:n_pf]
                     dc_logits = logits[n_pf:]
 
-                    # Process prefill results
                     self._process_prefill_logits(
                         pf_logits, prefill_seqs, prefill_chunk_sizes,
                         sp_list[0], eos, collect_logits, seq_logits,
                         running, prefilling, bm, block_size,
                     )
 
-                    # Process decode results
                     if collect_logits:
                         for i, seq in enumerate(decode_seqs):
                             seq_logits[id(seq)].append(dc_logits[i:i+1].cpu())
