@@ -25,17 +25,19 @@ def _block_size() -> int:
     return BLOCK_SIZE
 
 
-class Attention(nn.Module):
+class LlamaAttention(nn.Module):
     """Multi-head attention with GQA and paged KV cache."""
 
     def __init__(self, hidden_size: int, num_attention_heads: int,
-                 num_key_value_heads: int, head_dim: int):
+                 num_key_value_heads: int, head_dim: int,
+                 rotary_emb: nn.Module | None = None):
         super().__init__()
         tp = _tp_size()
         self.num_heads = num_attention_heads // tp
         self.num_kv_heads = num_key_value_heads // tp
         self.head_dim = head_dim
         self.scaling = head_dim ** -0.5
+        self.rotary_emb = rotary_emb
 
         self.qkv_proj = QKVParallelLinear(
             hidden_size, head_dim,
@@ -70,17 +72,17 @@ class Attention(nn.Module):
             self.trtllm_decode._workspace = workspace
             self.trtllm_prefill._workspace = workspace
 
-    def forward(self, positions, hidden_states, rotary_emb):
+    def forward(self, positions, hidden_states):
         ctx = get_context()
         N = hidden_states.shape[0]
-        qkv = self.qkv_proj(hidden_states)
+        qkv, _ = self.qkv_proj(hidden_states)
         q_size = self.num_heads * self.head_dim
         kv_size = self.num_kv_heads * self.head_dim
         q, k, v = qkv.split([q_size, kv_size, kv_size], dim=-1)
         q = q.view(N, self.num_heads, self.head_dim)
         k = k.view(N, self.num_kv_heads, self.head_dim)
         v = v.view(N, self.num_kv_heads, self.head_dim)
-        q, k = rotary_emb(positions, q, k)
+        q, k = self.rotary_emb(positions, q, k)
 
         k_cache, v_cache = self.k_cache, self.v_cache
         if k_cache.numel() and v_cache.numel():
@@ -95,7 +97,8 @@ class Attention(nn.Module):
             o = self._forward_trtllm(q, k, v, k_cache, v_cache, ctx)
         else:
             o = self._forward_flash_attn(q, k, v, k_cache, v_cache, ctx)
-        return self.o_proj(o.reshape(N, self.num_heads * self.head_dim))
+        output, _ = self.o_proj(o.reshape(N, self.num_heads * self.head_dim))
+        return output
 
     # --- Pure prefill / decode paths ---
 

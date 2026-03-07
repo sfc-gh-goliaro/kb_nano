@@ -32,7 +32,8 @@ class ColumnParallelLinear(nn.Module):
         param.data.copy_(loaded_weight)
 
     def forward(self, x):
-        return self.linear_op(x, self.weight, self.bias)
+        output = self.linear_op(x, self.weight, self.bias)
+        return output, None
 
 
 class MergedColumnParallelLinear(nn.Module):
@@ -58,7 +59,8 @@ class MergedColumnParallelLinear(nn.Module):
         dst.copy_(src)
 
     def forward(self, x):
-        return self.linear_op(x, self.weight, self.bias)
+        output = self.linear_op(x, self.weight, self.bias)
+        return output, None
 
 
 class QKVParallelLinear(nn.Module):
@@ -97,7 +99,8 @@ class QKVParallelLinear(nn.Module):
         dst.copy_(src)
 
     def forward(self, x):
-        return self.linear_op(x, self.weight, self.bias)
+        output = self.linear_op(x, self.weight, self.bias)
+        return output, None
 
 
 class RowParallelLinear(nn.Module):
@@ -128,4 +131,4 @@ class RowParallelLinear(nn.Module):
         y = self.linear_op(x, self.weight, self.bias if self.tp_rank == 0 else None)
         if self.tp_size > 1:
             y = self.allreduce(y)
-        return y
+        return y, None
