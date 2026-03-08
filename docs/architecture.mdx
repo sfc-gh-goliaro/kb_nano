@@ -3,9 +3,11 @@ title: Architecture
 description: The L1–L4 operator hierarchy, interface mirroring, and how to extend kb-nano.
 ---
 
+kb-nano takes a **top-down, model-driven** approach: rather than collecting synthetic operators in isolation, benchmark tasks are dynamically instantiated from the configuration files of real production models. This ensures every operator is tested with realistic shapes, dtypes, and data flows. The layered hierarchy below makes it possible to benchmark a single kernel replacement while measuring its impact all the way up to full-model inference.
+
 ## The L1-L4 Hierarchy
 
-All model operators live under `tasks/baseline/` at four abstraction levels:
+All model operators live under [`tasks/baseline/`](https://github.com/sfc-gh-goliaro/kb-nano/tree/main/tasks/baseline) at four abstraction levels:
 
 - **L1** — Single-kernel ops (e.g. `rms_norm`, `silu_and_mul`, `rotary_emb`, `linear`)
 - **L2** — Multi-op blocks (e.g. `LlamaAttention`, `LlamaMLP`, `MixtralMoE`, `QKVParallelLinear`)
@@ -49,56 +51,4 @@ Every module's `__init__` and `forward` signatures are designed to mirror the co
 
 All parallel linear layers return `(output, bias)` tuples to match vLLM. `LlamaAttention` stores `rotary_emb` as an `__init__` parameter (not a `forward` argument), matching vLLM's design where each `LlamaAttention` owns its rotary embedding.
 
----
 
-## Adding a New Model
-
-Follow the L1 → L4 pattern:
-
-1. **L1**: Identify which single-kernel ops are needed. Reuse existing L1 ops where possible (e.g. `RMSNorm`, `SiluAndMul`). Write new L1 modules only for ops that don't exist yet.
-2. **L2**: Compose L1 ops into multi-op blocks (attention, MLP). Mirror the corresponding vLLM module's `__init__` and `forward` signatures.
-3. **L3**: Write a decoder layer that combines L2 attention + L2 MLP + L1 normalization.
-4. **L4**: Write the full model class (`NewModelForCausalLM`) with embedding, decoder stack, and LM head.
-
-Each module should be a drop-in match for its vLLM counterpart. The bench suite auto-discovers new operators from the import graph.
-
----
-
-## Writing a Candidate Kernel
-
-To write a replacement kernel for benchmarking:
-
-1. Read the baseline source to understand the `forward` signature.
-2. Write an `nn.Module` with the **exact same class name** and **exact same `forward` signature**.
-3. Place it at `tasks/candidate/L{level}/{op_name}.py` and run the benchmark.
-
-Example — replacing `RMSNorm`:
-
-```python
-# tasks/candidate/L1/rms_norm.py
-import torch
-import torch.nn as nn
-
-class RMSNorm(nn.Module):
-    def __init__(self, hidden_size: int, eps: float = 1e-6):
-        super().__init__()
-        self.eps = eps
-        self.weight = nn.Parameter(torch.ones(hidden_size))
-
-    def forward(self, x, residual=None):
-        if residual is not None:
-            x = x + residual
-            residual = x
-        variance = x.float().pow(2).mean(dim=-1, keepdim=True)
-        x = x * torch.rsqrt(variance + self.eps)
-        result = (self.weight * x).to(x.dtype)
-        if residual is not None:
-            return result, residual
-        return result
-```
-
-```bash
-python -m kb_nano.bench.kernels --target rms_norm
-```
-
-You can use pure PyTorch, Triton (`triton.jit`), inline CUDA (`torch.utils.cpp_extension.load_inline`), or external libraries. Avoid importing `vllm` or `sgl_kernel` in your replacement — the point is to provide an alternative implementation.

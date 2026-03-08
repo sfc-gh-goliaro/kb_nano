@@ -16,7 +16,7 @@
   },
   "rounded": "default",
   "navigation": {
-    "pages": ["getting-started", "architecture", "reference"]
+    "pages": ["getting-started", "architecture", "developer-guide"]
   },
   "topbarLinks": [
     {
