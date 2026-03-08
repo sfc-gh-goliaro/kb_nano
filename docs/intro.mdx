@@ -1,15 +1,22 @@
 ---
 title: Intro to KB Nano
-description: A quick start guide
+description: 
 ---
 
 Welcome to KB Nano, your launchpad for engineering the world's fastest GPU code. We provide a library of state-of-the-art GPU kernels and a rigorous benchmark suite to push the limits of hardware performance.
 
-{/* Tasks are derived top-down from real model configurations, so every kernel you write or generate is directly usable in practice. 
+## Why you'll love KB Nano
 
-The integrated engine supports tensor parallelism, paged KV caches, CUDA graph capture, and much more, letting you validate kernels end-to-end at state-of-the-art inference speeds. */}
+- 🚀 **Built from production** — Kernel specs, signatures, and baseline implementations are derived directly from SOTA production frameworks — every kernel you write is a drop-in replacement, not a toy exercise
+- 🧬 **Massive Kernel Coverage**: Stress-test 54 frontier architectures — benchmarking everything from *Linear Attention* and *Gated Delta Net* to *DeepSeek DSA*, *World Models*, *Diffusion*, and so much more — alongside the battle-tested ones powering production today
+- 🔭 **End-to-end benchmarking** — Test a single kernel (L1) or measure its ripple effect all the way up to full-model inference (L4)
+- 🛡️ **Hack-proof validation** — Property-based unit tests + end-to-end inference checks catch shortcuts that fool other benchmarks
+- 🎯 **Actionable profiling** — Hardware-level feedback via NVIDIA Nsight Compute tells you *exactly* where to optimize
+- 📏 **Reproducible by design** — Canonical dataset, standardized evaluation, deterministic results
 
-## Getting Started
+
+
+## Quickstart
 
 <Steps>
   <Step title="Clone and install">
@@ -117,82 +124,6 @@ The integrated engine supports tensor parallelism, paged KV caches, CUDA graph c
 
     A kernel benchmark is **PASS** if `kl_mean < 0.1`. Speedup > 1.0 means your implementation is faster than the baseline.
 
-    [More benchmarking options](#benchmarking)
+    [More benchmarking options](/benchmarking)
   </Step>
 </Steps>
-
----
-
-## Benchmarking
-
-kb-nano provides three complementary benchmarking tools.
-
-### E2E Benchmark CLI
-
-`python -m kb_nano.bench.e2e` mirrors vLLM's benchmarking CLI. The same flags work in both tools, making it easy to compare results:
-
-```bash
-# Throughput (mirrors vllm bench throughput)
-python -m kb_nano.bench.e2e throughput \
-    --model meta-llama/Llama-3.1-8B-Instruct \
-    --dataset-name random --random-input-len 512 --random-output-len 128 \
-    --num-prompts 200 --tp 4
-
-# Latency
-python -m kb_nano.bench.e2e latency \
-    --model meta-llama/Llama-3.1-8B-Instruct \
-    --input-len 128 --output-len 128
-
-# Evaluate candidate kernels from tasks/candidate/ against baseline
-python -m kb_nano.bench.e2e eval \
-    --model meta-llama/Llama-3.1-8B-Instruct \
-    --input-len 512 --output-len 128 --num-prompts 100
-```
-
-### Kernel Benchmark CLI
-
-`python -m kb_nano.bench.kernels` benchmarks a single operator replacement. It monkey-patches the target class, rebuilds the model, runs inference, and compares KL divergence, token match rate, and wall-clock speedup against the baseline.
-
-```bash
-# List all benchmarkable targets
-python -m kb_nano.bench.kernels --list
-
-# Show model-to-operator mapping
-python -m kb_nano.bench.kernels --map
-
-# Auto-discover candidate from tasks/candidate/
-python -m kb_nano.bench.kernels --target rms_norm
-
-# Specify a custom implementation explicitly
-python -m kb_nano.bench.kernels \
-    --target rms_norm \
-    --user-impl path/to/my_kernel.py:RMSNorm \
-    --model meta-llama/Llama-3.1-8B-Instruct \
-    --tp 1
-```
-
-A benchmark is **PASS** if `kl_mean < 0.1`. Speedup > 1.0 means your kernel is faster than the baseline.
-
----
-
-## LLM Kernel Agent
-
-The agent uses Claude to generate replacement kernels, validate them, and benchmark them end-to-end:
-
-```bash
-# Generate all L1 kernels for Llama
-python -m kb_nano.example \
-    --model meta-llama/Llama-3.1-8B-Instruct --level 1
-
-# CUDA-only kernels (no Triton/PyTorch builtins)
-python -m kb_nano.example \
-    --model meta-llama/Llama-3.1-8B-Instruct --level 1 --cuda-only
-
-# Mixtral L2 operators with TP
-python -m kb_nano.example \
-    --model mistralai/Mixtral-8x7B-Instruct-v0.1 --level 2 --tp 4
-```
-
-The agent discovers operators at the specified level, generates replacements in parallel, validates compilation and numerical correctness, patches all successful kernels into the model, and reports KL divergence, token match rate, and speedup. Failed kernels are retried with error feedback.
-
-Generated kernels are saved to `tasks/candidate/L{level}/{op_name}.py`.

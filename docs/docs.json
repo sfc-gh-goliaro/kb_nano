@@ -16,7 +16,20 @@
   },
   "rounded": "default",
   "navigation": {
-    "pages": ["getting-started", "architecture", "developer-guide"]
+    "groups": [
+      {
+        "group": "Start Here",
+        "pages": ["intro", "architecture"]
+      },
+      {
+        "group": "User Guide",
+        "pages": ["benchmarking", "building-an-agent"]
+      },
+      {
+        "group": "Developer Guide",
+        "pages": ["developer-guide"]
+      }
+    ]
   },
   "topbarLinks": [
     {
