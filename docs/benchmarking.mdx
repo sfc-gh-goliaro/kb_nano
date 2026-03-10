@@ -1,42 +1,68 @@
 ---
 title: Benchmarking
-description: Kernel-level and end-to-end benchmarking tools.
+description: Three-tier benchmarking infrastructure for kernel development.
 ---
 
-kb-nano provides hierarchical benchmarking tools. Start by testing individual kernels in isolation, then measure their end-to-end impact on the full model.
+kb-nano uses a three-tier benchmarking system. Each tier adds scope: isolated kernels → full-model inference → multi-model evaluation sweeps.
 
-## Kernel Benchmark CLI
+| Tier | Scope | CLI |
+|------|-------|-----|
+| 1 — Kernel | Single operator `forward()` in isolation | `python -m kb_nano.bench.kernels` |
+| 2 — E2E | Full-model throughput, latency, serving | `python -m kb_nano.bench.e2e` |
+| 3 — Eval | Standardized multi-model sweep | `python -m kb_nano.bench.eval` |
 
-`python -m kb_nano.bench.kernels` benchmarks a single operator replacement. It monkey-patches the target class, rebuilds the model, runs inference, and compares KL divergence, token match rate, and wall-clock speedup against the baseline.
+---
+
+## Tier 1: Kernel Benchmark
+
+Tests a single operator replacement by instantiating baseline and candidate `nn.Module`s side-by-side, copying weights, and comparing `forward()` outputs and timing across a registry of input shapes.
 
 ```bash
-# List all benchmarkable targets
+# Run all operators that have candidates in tasks/candidate/
+python -m kb_nano.bench.kernels
+
+# Single operator
+python -m kb_nano.bench.kernels --target rms_norm
+
+# Custom implementation file
+python -m kb_nano.bench.kernels \
+    --target rms_norm \
+    --user-impl path/to/my_kernel.py:RMSNorm
+
+# Filter by model / TP / category
+python -m kb_nano.bench.kernels --target rms_norm --model llama31 --tp 1
+
+# List available targets
 python -m kb_nano.bench.kernels --list
+python -m kb_nano.bench.kernels --list --level 1
 
 # Show model-to-operator mapping
 python -m kb_nano.bench.kernels --map
-
-# Auto-discover candidate from tasks/candidate/
-python -m kb_nano.bench.kernels --target rms_norm
-
-# Specify a custom implementation explicitly
-python -m kb_nano.bench.kernels \
-    --target rms_norm \
-    --user-impl path/to/my_kernel.py:RMSNorm \
-    --model meta-llama/Llama-3.1-8B-Instruct \
-    --tp 1
 ```
 
-A kernel benchmark is **PASS** if `kl_mean < 0.1`. Speedup > 1.0 means your implementation is faster than the baseline.
+**Key flags:**
+
+| Flag | Default | Description |
+|------|---------|-------------|
+| `--target` | all | Operator name (e.g. `rms_norm`, `attention`) |
+| `--user-impl` | auto | `path/to/file.py:ClassName` for custom kernel |
+| `--model` | all | Filter scenarios by model prefix |
+| `--tp` | all | Filter by TP degree(s) |
+| `--category` | all | Filter by category (e.g. `llm`) |
+| `--num-warmup` | 10 | Warmup iterations |
+| `--num-runs` | 100 | Timed iterations for median |
+| `--output-json` | `bench/results/kernels.json` | Results path |
+
+A scenario **passes** if max-abs-error < 0.01 (bfloat16 tolerance). Speedup > 1.0 means faster than baseline.
 
 ---
 
-## E2E Benchmark CLI
+## Tier 2: E2E Benchmark
 
-`python -m kb_nano.bench.e2e` mirrors vLLM's benchmarking CLI. The same flags work in both tools, making it easy to compare results:
+Full-model inference benchmarks. The CLI mirrors vLLM's interface, so the same flags work in both.
 
 ```bash
-# Throughput (mirrors vllm bench throughput)
+# Throughput
 python -m kb_nano.bench.e2e throughput \
     --model meta-llama/Llama-3.1-8B-Instruct \
     --dataset-name random --random-input-len 512 --random-output-len 128 \
@@ -47,8 +73,73 @@ python -m kb_nano.bench.e2e latency \
     --model meta-llama/Llama-3.1-8B-Instruct \
     --input-len 128 --output-len 128
 
-# Evaluate candidate kernels from tasks/candidate/ against baseline
-python -m kb_nano.bench.e2e eval \
-    --model meta-llama/Llama-3.1-8B-Instruct \
-    --input-len 512 --output-len 128 --num-prompts 100
+# Online serving
+python -m kb_nano.bench.e2e serve [args...]
 ```
+
+---
+
+## Tier 3: Eval Sweep
+
+Runs a standardized evaluation across all candidate kernels using fixed workloads. Each job pair (baseline vs candidate) runs in an isolated subprocess to prevent contamination.
+
+```bash
+# Full sweep (auto-detects models from candidates)
+python -m kb_nano.bench.eval
+
+# Specific model and TP
+python -m kb_nano.bench.eval \
+    --model meta-llama/Llama-3.1-8B-Instruct --tp 1 4
+
+# Filter by category
+python -m kb_nano.bench.eval --category llm
+
+# Control scale
+python -m kb_nano.bench.eval --num-prompts 500 --gpu-pool 4
+```
+
+**Key flags:**
+
+| Flag | Default | Description |
+|------|---------|-------------|
+| `--model` | auto | HuggingFace model name(s) |
+| `--tp` | `1 4` | TP degree(s) to evaluate |
+| `--category` | all | Filter by category |
+| `--num-prompts` | 1000 | Prompts per throughput workload |
+| `--gpu-pool` | 8 | GPUs available for scheduling |
+| `--seed` | 42 | Random seed |
+| `--output-json` | `bench/results/eval.json` | Results path |
+
+### Standardized workloads
+
+Eval uses fixed, non-configurable workloads for reproducibility:
+
+**Throughput** (per model/TP pair):
+- `prefill-heavy` — 1024 input, 512 output tokens
+- `balanced` — 512 input, 512 output tokens
+- `decode-heavy` — 512 input, 1024 output tokens
+
+**Latency** (per model/TP pair):
+- `single-request` — batch 1, 128 in/out tokens
+- `fixed-batch-32` — batch 32, 128 in/out tokens
+
+---
+
+## Input Registry
+
+Kernel benchmarks (Tier 1) draw input shapes from a YAML manifest at `bench/utils/inputs/llm.yaml`. Each entry specifies tensor shapes, dtypes, and init args for a given operator × model × TP × sequence-length combination.
+
+```bash
+# Regenerate the manifest from HuggingFace model configs
+python -m kb_nano.bench.utils.generate_inputs
+
+# Capture golden data for data-dependent operators
+python -m kb_nano.bench.utils.capture_golden \
+    --model meta-llama/Llama-3.1-8B-Instruct
+```
+
+---
+
+## Conflict Resolution
+
+When multiple candidate kernels overlap (e.g. an L2 `attention` kernel internally replaces an L1 `rms_norm`), the kernel swapper detects subsumption automatically and warns. Candidates are always applied bottom-up (L1 → L4).
