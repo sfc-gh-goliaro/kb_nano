@@ -1,18 +1,24 @@
-"""
-CLI entry point for the kb-nano kernel benchmark suite.
+"""CLI entry point for the kb-nano kernel benchmark suite.
 
 Usage:
+    # Test all operators that have candidates
+    python -m kb_nano.bench.kernels
+
+    # Test a specific operator
+    python -m kb_nano.bench.kernels --target rms_norm
+
+    # Filter to a specific model family
+    python -m kb_nano.bench.kernels --target rms_norm --model llama
+
+    # Filter to TP=4 scenarios only
+    python -m kb_nano.bench.kernels --target rms_norm --tp 4
+
+    # Restrict to LLM category
+    python -m kb_nano.bench.kernels --target rms_norm --category llm
+
+    # List available targets
     python -m kb_nano.bench.kernels --list
     python -m kb_nano.bench.kernels --list --level 1
-
-    python -m kb_nano.bench.kernels \\
-        --target rms_norm \\
-        --user-impl path/to/my_kernel.py:MyRMSNorm \\
-        --model meta-llama/Llama-3.1-8B-Instruct \\
-        --max-tokens 50
-
-    # Auto-discover from tasks/candidate/:
-    python -m kb_nano.bench.kernels --target rms_norm
 """
 
 from __future__ import annotations
@@ -23,9 +29,16 @@ import sys
 from pathlib import Path
 
 from kb_nano.infra.kernel_swapper import (
-    list_targets, print_model_operator_map, load_candidate, _CANDIDATE_DIR,
+    _CANDIDATE_DIR,
+    list_targets,
+    load_candidate,
+    print_model_operator_map,
 )
-from .runner import run_benchmark as benchmark
+
+from .result import KernelBenchResult
+from .runner import run_all_kernel_benchmarks, run_kernel_benchmark
+
+_DEFAULT_OUTPUT = "bench/results/kernels.json"
 
 
 def _import_from_path(spec_str: str):
@@ -53,7 +66,7 @@ def _import_from_path(spec_str: str):
 
 def main():
     parser = argparse.ArgumentParser(
-        description="kb-nano CUDA kernel benchmark suite",
+        description="kb-nano CUDA kernel benchmark suite (isolated forward() testing)",
     )
     parser.add_argument(
         "--list", action="store_true",
@@ -69,7 +82,8 @@ def main():
     )
     parser.add_argument(
         "--target", type=str, default=None,
-        help="Benchmark target name (e.g. 'rms_norm', 'attention')",
+        help="Benchmark target name (e.g. 'rms_norm', 'attention'). "
+             "Omit to test all operators with candidates.",
     )
     parser.add_argument(
         "--user-impl", type=str, default=None,
@@ -77,27 +91,27 @@ def main():
     )
     parser.add_argument(
         "--model", nargs="+", default=None,
-        help="HuggingFace model name(s) to benchmark against",
+        help="Filter scenarios by model key prefix (e.g. 'llama31' 'mixtral')",
     )
     parser.add_argument(
-        "--max-tokens", type=int, default=50,
-        help="Max tokens to generate per prompt (default: 50)",
+        "--tp", type=int, nargs="+", default=None,
+        help="Filter scenarios by TP degree(s) (e.g. 1 4)",
     )
     parser.add_argument(
-        "--tp", type=int, default=1,
-        help="Tensor parallelism degree (default: 1)",
+        "--category", type=str, default=None,
+        help="Filter scenarios by category (e.g. 'llm', 'vision')",
     )
     parser.add_argument(
-        "--seed", type=int, default=42,
-        help="Random seed (default: 42)",
+        "--num-warmup", type=int, default=10,
+        help="Number of warmup iterations (default: 10)",
     )
     parser.add_argument(
-        "--num-warmup", type=int, default=1,
-        help="Number of warmup iterations (default: 1)",
+        "--num-runs", type=int, default=100,
+        help="Number of timed runs for median (default: 100)",
     )
     parser.add_argument(
-        "--num-runs", type=int, default=3,
-        help="Number of timed runs to average (default: 3)",
+        "--output-json", type=str, default=None,
+        help=f"Path to save JSON results (default: {_DEFAULT_OUTPUT})",
     )
     args = parser.parse_args()
 
@@ -120,39 +134,46 @@ def main():
         print(f"\n{len(targets)} targets total.")
         return
 
-    if args.target is None:
-        parser.error("--target is required (or use --list to see available targets)")
+    output_path = args.output_json or _DEFAULT_OUTPUT
 
-    if args.user_impl is not None:
-        user_impl = _import_from_path(args.user_impl)
+    if args.target is not None:
+        if args.user_impl is not None:
+            user_impl = _import_from_path(args.user_impl)
+        else:
+            user_impl = load_candidate(args.target)
+            if user_impl is None:
+                parser.error(
+                    f"No candidate kernel found for {args.target!r} in "
+                    f"{_CANDIDATE_DIR}. Provide --user-impl or place the kernel "
+                    f"in tasks/candidate/L<level>/{args.target}.py"
+                )
+
+        op_result = run_kernel_benchmark(
+            target_name=args.target,
+            user_impl=user_impl,
+            models=args.model,
+            tp=args.tp,
+            category=args.category,
+            num_warmup=args.num_warmup,
+            num_runs=args.num_runs,
+        )
+
+        result = KernelBenchResult(operators=[op_result])
+        result.compute_aggregates()
     else:
-        user_impl = load_candidate(args.target)
-        if user_impl is None:
-            parser.error(
-                f"No candidate kernel found for {args.target!r} in "
-                f"{_CANDIDATE_DIR}. Provide --user-impl or place the kernel "
-                f"in tasks/candidate/L<level>/{args.target}.py"
-            )
+        result = run_all_kernel_benchmarks(
+            models=args.model,
+            tp=args.tp,
+            category=args.category,
+            num_warmup=args.num_warmup,
+            num_runs=args.num_runs,
+        )
 
-    results = benchmark(
-        target_name=args.target,
-        user_impl=user_impl,
-        models=args.model,
-        max_tokens=args.max_tokens,
-        tp=args.tp,
-        seed=args.seed,
-        num_warmup=args.num_warmup,
-        num_runs=args.num_runs,
-    )
+    result.print_table(single_target=(args.target is not None))
+    result.save_json(output_path)
+    print(f"\n  Results saved to: {output_path}")
 
-    print(f"\n{'=' * 70}")
-    print("  SUMMARY")
-    print(f"{'=' * 70}")
-    for r in results:
-        print(f"\n{r.report()}")
-
-    any_fail = any(r.kl_mean > 0.1 for r in results)
-    sys.exit(1 if any_fail else 0)
+    sys.exit(0 if result.all_passed() else 1)
 
 
 if __name__ == "__main__":

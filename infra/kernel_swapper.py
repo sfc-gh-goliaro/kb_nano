@@ -337,14 +337,87 @@ def discover_candidates() -> list[tuple[BenchTarget, type]]:
     return results
 
 
+def _sort_by_level(
+    candidates: list[tuple[BenchTarget, type]],
+) -> list[tuple[BenchTarget, type]]:
+    """Sort candidates by level (L1 first, then L2, L3, L4) for bottom-up patching."""
+    return sorted(candidates, key=lambda pair: pair[0].level)
+
+
+def _detect_subsumption(
+    candidates: list[tuple[BenchTarget, type]],
+) -> list[tuple[str, int, str, int]]:
+    """Detect when higher-level candidates subsume lower-level ones.
+
+    For each candidate at level > 1, walks its import tree and checks
+    whether any lower-level candidate targets the same baseline classes.
+
+    Returns list of (higher_name, higher_level, lower_name, lower_level) tuples.
+    """
+    warnings_list: list[tuple[str, int, str, int]] = []
+
+    low_level_targets: dict[str, BenchTarget] = {}
+    high_level_targets: list[tuple[BenchTarget, type]] = []
+
+    for target, user_cls in candidates:
+        if target.level == 1:
+            low_level_targets[target.name] = target
+        if target.level >= 2:
+            high_level_targets.append((target, user_cls))
+
+    if not low_level_targets or not high_level_targets:
+        return warnings_list
+
+    for higher_target, _ in high_level_targets:
+        higher_file = (
+            _KB_ROOT / "tasks" / "baseline"
+            / f"L{higher_target.level}" / f"{higher_target.name}.py"
+        )
+        if not higher_file.is_file():
+            continue
+        deps = _resolve_internal_imports(higher_file)
+        for dep_path in deps:
+            try:
+                dep_rel = dep_path.relative_to(_KB_ROOT)
+            except ValueError:
+                continue
+            dep_stem = dep_rel.stem
+            if dep_stem in low_level_targets:
+                warnings_list.append((
+                    higher_target.name,
+                    higher_target.level,
+                    dep_stem,
+                    low_level_targets[dep_stem].level,
+                ))
+
+    return warnings_list
+
+
 def apply_candidates(candidates: list[tuple[BenchTarget, type]]) -> list[tuple]:
     """Monkey-patch all candidate kernels into their baseline targets.
+
+    Applies patches in bottom-up order (L1 -> L2 -> L3 -> L4) so that
+    higher-level baseline code automatically picks up lower-level patches.
+    Detects and warns about subsumption conflicts.
 
     Returns combined undo info that can be passed to ``restore()`` to revert
     all patches.
     """
+    sorted_candidates = _sort_by_level(candidates)
+
+    subsumptions = _detect_subsumption(sorted_candidates)
+    for higher_name, higher_level, lower_name, lower_level in subsumptions:
+        print(
+            f"  WARNING: L{higher_level} {higher_name} subsumes "
+            f"L{lower_level} {lower_name}\n"
+            f"           L{lower_level} {lower_name} candidate will NOT be "
+            f"active inside L{higher_level} {higher_name}\n"
+            f"           (L{lower_level} {lower_name} candidate IS still "
+            f"active for other models/contexts)"
+        )
+
     all_undo: list[tuple] = []
-    for target, user_cls in candidates:
+    for target, user_cls in sorted_candidates:
         undo = patch_class(target, user_cls)
         all_undo.extend(undo)
     return all_undo
@@ -357,6 +430,7 @@ def print_candidate_summary(candidates: list[tuple[BenchTarget, type]]) -> None:
     print(f"\n{'=' * 70}")
     print("  CANDIDATE KERNELS")
     print(f"{'=' * 70}")
-    for target, cls in candidates:
+    sorted_candidates = _sort_by_level(candidates)
+    for target, cls in sorted_candidates:
         print(f"    L{target.level}  {target.name:<25} -> {cls.__name__}")
     print(f"{'=' * 70}\n")

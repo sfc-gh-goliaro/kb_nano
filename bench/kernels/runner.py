@@ -1,9 +1,9 @@
-"""
-Orchestrates baseline vs user-kernel inference runs.
+"""Isolated kernel-level benchmarking via direct forward() calls.
 
-Builds the model twice: once with baseline classes (for reference outputs),
-then again after monkey-patching the target class with the user's replacement
-(for user outputs). Evaluates correctness and performance.
+Instantiates baseline and candidate nn.Module instances, copies weights,
+loads inputs from the InputRegistry (random or golden), compares outputs
+and timing. No full model build required — per-kernel test time is seconds
+rather than minutes.
 """
 
 from __future__ import annotations
@@ -12,174 +12,270 @@ import time
 from typing import Any
 
 import torch
-from transformers import AutoConfig
+import torch.nn as nn
 
-from kb_nano.engine import GenerationOutput, LlamaEngine, SamplingParams
-from kb_nano.infra.kernel_swapper import BenchTarget, get, patch_class, restore
-from .evaluator import BenchResult, evaluate
+from kb_nano.bench.utils.input_registry import InputRegistry
+from kb_nano.infra.kernel_swapper import BenchTarget, discover_targets, get, load_candidate
 
-_MODEL_TYPE_TO_KEY = {
-    "llama": "llama31",
-    "mixtral": "mixtral",
-}
+from .result import KernelBenchResult, OperatorResult, ScenarioResult
 
-DEFAULT_PROMPTS = [
-    "What is 2 + 2?",
-    "Translate 'hello' into French, German, and Japanese.",
-    (
-        "Explain the difference between a stack and a queue in computer "
-        "science. Give a real-world analogy for each."
-    ),
-    (
-        "Write a Python function that computes the factorial of a number "
-        "using recursion. Include a docstring."
-    ),
-]
+_DEFAULT_REGISTRY = None
 
 
-def _detect_model_key(model_name: str) -> str:
-    """Map a HuggingFace model name to the registry model key."""
-    hf_config = AutoConfig.from_pretrained(model_name)
-    model_type = getattr(hf_config, "model_type", "llama")
-    key = _MODEL_TYPE_TO_KEY.get(model_type)
-    if key is None:
-        raise ValueError(
-            f"Unsupported model type {model_type!r} for model {model_name}. "
-            f"Supported: {list(_MODEL_TYPE_TO_KEY.keys())}"
-        )
-    return key
+def _get_registry() -> InputRegistry:
+    global _DEFAULT_REGISTRY
+    if _DEFAULT_REGISTRY is None:
+        _DEFAULT_REGISTRY = InputRegistry()
+    return _DEFAULT_REGISTRY
 
 
-def _applicable_models(target: BenchTarget, requested_models: list[str] | None) -> list[str]:
-    """Return the list of HF model names to benchmark against."""
-    if requested_models:
-        return requested_models
-    defaults = {
-        "llama31": "meta-llama/Llama-3.1-8B-Instruct",
-        "mixtral": "mistralai/Mixtral-8x7B-Instruct-v0.1",
+def _find_candidate_path(target_name: str, level: int) -> str:
+    """Return the relative path to the candidate file for display."""
+    return f"tasks/candidate/L{level}/{target_name}.py"
+
+
+def _instantiate_module(
+    cls: type,
+    init_args: dict[str, Any],
+    device: str = "cuda",
+) -> nn.Module:
+    """Create an nn.Module instance with init_args, handling common patterns."""
+    try:
+        module = cls(**init_args)
+    except TypeError:
+        module = cls()
+
+    module = module.to(device)
+    module.eval()
+    return module
+
+
+def _time_forward(
+    module: nn.Module,
+    inputs: dict[str, Any],
+    num_warmup: int,
+    num_runs: int,
+) -> tuple[Any, float]:
+    """Warmup + time forward() calls. Returns (output, median_ms)."""
+    tensor_inputs = {
+        k: v for k, v in inputs.items()
+        if isinstance(v, torch.Tensor)
     }
-    return [defaults[k] for k in target.models if k in defaults]
+    scalar_inputs = {
+        k: v for k, v in inputs.items()
+        if not isinstance(v, torch.Tensor)
+    }
 
+    with torch.no_grad():
+        for _ in range(num_warmup):
+            module(**tensor_inputs, **scalar_inputs)
 
-def _timed_generate(
-    engine: LlamaEngine,
-    prompts: list[str],
-    sampling_params: SamplingParams,
-    collect_logits: bool,
-    num_warmup: int = 1,
-    num_runs: int = 1,
-) -> tuple[list[GenerationOutput], float]:
-    """Run inference with warmup, return outputs and average wall-clock time."""
-    for _ in range(num_warmup):
-        engine.generate(prompts, sampling_params, collect_logits=False)
-
-    total_time = 0.0
-    outputs = None
-    for _ in range(num_runs):
         torch.cuda.synchronize()
-        t0 = time.perf_counter()
-        outputs = engine.generate(prompts, sampling_params, collect_logits=collect_logits)
-        torch.cuda.synchronize()
-        total_time += time.perf_counter() - t0
+        times = []
+        output = None
+        for _ in range(num_runs):
+            start = time.perf_counter()
+            output = module(**tensor_inputs, **scalar_inputs)
+            torch.cuda.synchronize()
+            times.append((time.perf_counter() - start) * 1000)
 
-    avg_time = total_time / num_runs
-    return outputs, avg_time
+    times.sort()
+    median_ms = times[len(times) // 2]
+    return output, median_ms
 
 
-def run_benchmark(
+def _compare_outputs(baseline_out: Any, candidate_out: Any) -> tuple[bool, float]:
+    """Compare outputs: return (allclose_pass, mean_abs_diff)."""
+    if isinstance(baseline_out, torch.Tensor) and isinstance(candidate_out, torch.Tensor):
+        if baseline_out.shape != candidate_out.shape:
+            return False, float("inf")
+        diff = (baseline_out.float() - candidate_out.float()).abs()
+        mean_diff = diff.mean().item()
+        passed = torch.allclose(
+            baseline_out.float(), candidate_out.float(),
+            atol=1e-5, rtol=1e-3,
+        )
+        return passed, mean_diff
+
+    if isinstance(baseline_out, (tuple, list)) and isinstance(candidate_out, (tuple, list)):
+        if len(baseline_out) != len(candidate_out):
+            return False, float("inf")
+        all_pass = True
+        total_diff = 0.0
+        count = 0
+        for b, c in zip(baseline_out, candidate_out):
+            if isinstance(b, torch.Tensor) and isinstance(c, torch.Tensor):
+                p, d = _compare_outputs(b, c)
+                all_pass = all_pass and p
+                total_diff += d
+                count += 1
+        mean_diff = total_diff / count if count > 0 else 0.0
+        return all_pass, mean_diff
+
+    return True, 0.0
+
+
+def run_kernel_benchmark(
     target_name: str,
-    user_impl: Any,
+    user_impl: type | None = None,
+    scenarios: list[str] | None = None,
     models: list[str] | None = None,
-    prompts: list[str] | None = None,
-    max_tokens: int = 50,
-    tp: int = 1,
-    seed: int = 42,
-    num_warmup: int = 1,
-    num_runs: int = 3,
-    enforce_eager: bool = True,
-) -> list[BenchResult]:
-    """Run the benchmark for a given target and user implementation.
+    tp: list[int] | None = None,
+    category: str | None = None,
+    num_warmup: int = 10,
+    num_runs: int = 100,
+    device: str = "cuda",
+) -> OperatorResult:
+    """Run isolated kernel benchmark for a single operator.
 
-    The user_impl must be an nn.Module subclass of the target's class.
-    The benchmark builds the model twice: once with baseline classes, then
-    again after patching with the user's class.
+    For each matching scenario in the InputRegistry:
+    1. Instantiate baseline and candidate with init_args
+    2. Copy baseline weights to candidate (via load_state_dict)
+    3. Prepare inputs (random or golden)
+    4. Warmup both
+    5. Time both (median of num_runs)
+    6. Compare outputs: allclose pass/fail, mean abs diff
 
     Args:
-        target_name: Canonical name from discovery (e.g. "rms_norm", "attention").
-        user_impl: nn.Module subclass of the target class.
-        models: HuggingFace model names to test. Defaults to all applicable.
-        prompts: Prompts for generation. Defaults to built-in set.
-        max_tokens: Max tokens per prompt.
-        tp: Tensor parallelism degree.
-        seed: Random seed for reproducibility.
-        num_warmup: Warmup iterations before timing.
-        num_runs: Timed iterations to average.
-        enforce_eager: Disable CUDA graphs (recommended for benchmarking replacements).
+        target_name: Operator name (e.g. 'rms_norm').
+        user_impl: nn.Module subclass for the candidate. Auto-discovered if None.
+        scenarios: Filter by scenario name patterns.
+        models: Filter by model key prefix.
+        tp: Filter by TP degrees.
+        category: Filter by category (not yet used).
+        num_warmup: Warmup iterations.
+        num_runs: Timed iterations for median.
+        device: Device for tensors.
 
     Returns:
-        List of BenchResult, one per model.
+        OperatorResult with per-scenario correctness and speedup.
     """
     target = get(target_name)
-    model_names = _applicable_models(target, models)
-    if prompts is None:
-        prompts = DEFAULT_PROMPTS
 
-    sp = SamplingParams(temperature=0.0, max_tokens=max_tokens, seed=seed)
-
-    results = []
-    for model_name in model_names:
-        model_key = _detect_model_key(model_name)
-        if model_key not in target.models:
-            print(f"  Skipping {model_name}: target {target_name!r} not applicable to {model_key}")
-            continue
-
-        print(f"\n{'=' * 70}")
-        print(f"  Benchmark: {target_name} on {model_name}")
-        print(f"  TP={tp}  max_tokens={max_tokens}  seed={seed}")
-        print(f"{'=' * 70}")
-
-        engine_kwargs = dict(
-            model_name=model_name,
-            seed=seed,
-            enforce_eager=enforce_eager,
-            tensor_parallel_size=tp,
-        )
-
-        print("  Building baseline model...")
-        engine = LlamaEngine(**engine_kwargs)
-        try:
-            print("  Running baseline...")
-            baseline_outputs, baseline_time = _timed_generate(
-                engine, prompts, sp, collect_logits=True,
-                num_warmup=num_warmup, num_runs=num_runs,
+    if user_impl is None:
+        user_impl = load_candidate(target_name)
+        if user_impl is None:
+            raise ValueError(
+                f"No candidate kernel found for {target_name!r}. "
+                f"Provide user_impl or place kernel in tasks/candidate/L{target.level}/{target_name}.py"
             )
-        finally:
-            engine._cleanup()
-            del engine
 
-        print(f"  Patching {target.target_cls.__name__} with {user_impl.__name__}...")
-        undo_info = patch_class(target, user_impl)
-        try:
-            print("  Building model with user implementation...")
-            engine = LlamaEngine(**engine_kwargs)
-            try:
-                print("  Running with user implementation...")
-                user_outputs, user_time = _timed_generate(
-                    engine, prompts, sp, collect_logits=True,
-                    num_warmup=num_warmup, num_runs=num_runs,
-                )
-            finally:
-                engine._cleanup()
-                del engine
-        finally:
-            restore(undo_info)
+    registry = _get_registry()
+    all_scenarios = registry.scenarios(
+        target_name, models=models, tp=tp, category=category,
+    )
 
-        result = evaluate(
-            target_name, model_name,
-            baseline_outputs, user_outputs,
-            baseline_time, user_time,
+    if scenarios:
+        all_scenarios = [
+            s for s in all_scenarios
+            if any(pat in s.name for pat in scenarios)
+        ]
+
+    if not all_scenarios:
+        print(f"  WARNING: No scenarios found for {target_name} in InputRegistry.")
+        return OperatorResult(
+            target=target_name,
+            level=target.level,
+            candidate_path=_find_candidate_path(target_name, target.level),
         )
-        print(f"\n{result.report()}")
-        results.append(result)
 
-    return results
+    candidate_path = _find_candidate_path(target_name, target.level)
+    scenario_results: list[ScenarioResult] = []
+
+    for scenario in all_scenarios:
+        try:
+            baseline_mod = _instantiate_module(target.target_cls, scenario.init_args, device)
+            candidate_mod = _instantiate_module(user_impl, scenario.init_args, device)
+
+            if hasattr(baseline_mod, "state_dict") and len(baseline_mod.state_dict()) > 0:
+                try:
+                    candidate_mod.load_state_dict(baseline_mod.state_dict(), strict=False)
+                except Exception:
+                    pass
+
+            inputs = registry.get_inputs(target_name, scenario.name, device=device)
+
+            baseline_out, baseline_ms = _time_forward(
+                baseline_mod, inputs, num_warmup, num_runs,
+            )
+            candidate_out, candidate_ms = _time_forward(
+                candidate_mod, inputs, num_warmup, num_runs,
+            )
+
+            correct, mean_diff = _compare_outputs(baseline_out, candidate_out)
+            speedup = baseline_ms / candidate_ms if candidate_ms > 0 else float("inf")
+
+            scenario_results.append(ScenarioResult(
+                name=scenario.name,
+                correct=correct,
+                mean_abs_diff=mean_diff,
+                baseline_ms=baseline_ms,
+                candidate_ms=candidate_ms,
+                speedup=speedup,
+            ))
+
+        except Exception as e:
+            print(f"  ERROR in scenario {scenario.name}: {e}")
+            scenario_results.append(ScenarioResult(
+                name=scenario.name,
+                correct=False,
+                mean_abs_diff=float("inf"),
+                baseline_ms=0.0,
+                candidate_ms=0.0,
+                speedup=0.0,
+            ))
+
+        finally:
+            for v in list(locals().values()):
+                if isinstance(v, nn.Module):
+                    del v
+
+    op_result = OperatorResult(
+        target=target_name,
+        level=target.level,
+        candidate_path=candidate_path,
+        scenarios=scenario_results,
+    )
+    op_result.compute_aggregates()
+    return op_result
+
+
+def run_all_kernel_benchmarks(
+    models: list[str] | None = None,
+    tp: list[int] | None = None,
+    category: str | None = None,
+    num_warmup: int = 10,
+    num_runs: int = 100,
+    device: str = "cuda",
+) -> KernelBenchResult:
+    """Run kernel benchmarks for all operators that have candidate implementations.
+
+    Discovers all candidate kernels and runs isolated benchmarks for each.
+    """
+    from kb_nano.infra.kernel_swapper import discover_candidates
+
+    candidates = discover_candidates()
+    if not candidates:
+        print("No candidate kernels found in tasks/candidate/.")
+        result = KernelBenchResult()
+        result.compute_aggregates()
+        return result
+
+    operators: list[OperatorResult] = []
+    for target, user_cls in candidates:
+        print(f"\n  Benchmarking {target.name} (L{target.level})...")
+        op_result = run_kernel_benchmark(
+            target.name,
+            user_impl=user_cls,
+            models=models,
+            tp=tp,
+            category=category,
+            num_warmup=num_warmup,
+            num_runs=num_runs,
+            device=device,
+        )
+        operators.append(op_result)
+
+    result = KernelBenchResult(operators=operators)
+    result.compute_aggregates()
+    return result

@@ -1,0 +1,38 @@
+"""Eval configuration for Tier 3 evaluation sweep."""
+
+from __future__ import annotations
+
+from dataclasses import dataclass, field
+
+
+MODEL_KEY_TO_DEFAULT_HF: dict[str, str] = {
+    "llama31": "meta-llama/Llama-3.1-8B-Instruct",
+    "mixtral": "mistralai/Mixtral-8x7B-Instruct-v0.1",
+}
+
+MODEL_CATEGORY: dict[str, str] = {
+    "meta-llama/Llama-3.1-8B-Instruct": "llm",
+    "meta-llama/Llama-3.1-70B-Instruct": "llm",
+    "mistralai/Mixtral-8x7B-Instruct-v0.1": "llm",
+}
+
+
+@dataclass
+class EvalConfig:
+    """Configuration for the eval sweep.
+
+    The experiments use fixed standardized workloads (3 throughput + 2 latency).
+    Filtering is only by model, TP degree, or category.
+    """
+    models: list[str] | None = None
+    tp_degrees: list[int] = field(default_factory=lambda: [1, 4])
+    categories: list[str] | None = None
+    seed: int = 42
+    temperature: float = 0.0
+    enforce_eager: bool = False
+    output_json: str = "bench/results/eval.json"
+    num_prompts: int = 1000
+
+    def get_model_category(self, model: str) -> str:
+        """Return the category for a model (default: 'llm')."""
+        return MODEL_CATEGORY.get(model, "llm")
