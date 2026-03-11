@@ -7,6 +7,52 @@ from dataclasses import dataclass, field
 import torch
 
 
+@dataclass(frozen=True)
+class AttnBackendConfig:
+    """Selects attention backend and associated KV cache parameters.
+
+    Blackwell (sm_100+) uses TRTLLM-gen kernels via FlashInfer (HND layout,
+    block_size=16).  Hopper and below use flash_attn (NHD layout,
+    block_size=256).  Auto-detection picks the optimal backend for the
+    current GPU.
+    """
+    backend: str = "flash_attn"
+    block_size: int = 256
+    kv_layout: str = "NHD"
+
+    @classmethod
+    def auto_detect(cls) -> "AttnBackendConfig":
+        if not torch.cuda.is_available():
+            return cls()
+        cc = torch.cuda.get_device_capability()
+        if cc[0] >= 10:
+            try:
+                from flashinfer.decode import trtllm_batch_decode_with_kv_cache  # noqa: F401
+                return cls(backend="trtllm", block_size=16, kv_layout="HND")
+            except ImportError:
+                pass
+        return cls()
+
+    @property
+    def use_trtllm(self) -> bool:
+        return self.backend == "trtllm"
+
+
+_ATTN_BACKEND_CONFIG: AttnBackendConfig | None = None
+
+
+def get_attn_backend_config() -> AttnBackendConfig:
+    global _ATTN_BACKEND_CONFIG
+    if _ATTN_BACKEND_CONFIG is None:
+        _ATTN_BACKEND_CONFIG = AttnBackendConfig.auto_detect()
+    return _ATTN_BACKEND_CONFIG
+
+
+def set_attn_backend_config(config: AttnBackendConfig) -> None:
+    global _ATTN_BACKEND_CONFIG
+    _ATTN_BACKEND_CONFIG = config
+
+
 @dataclass
 class Context:
     is_prefill: bool = False
