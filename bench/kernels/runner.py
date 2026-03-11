@@ -14,7 +14,7 @@ from typing import Any
 import torch
 from transformers import AutoConfig
 
-from kb_nano.engine import GenerationOutput, LlamaEngine, SamplingParams
+from kb_nano.engine import ATTN_BACKEND_CONFIG, GenerationOutput, LlamaEngine, SamplingParams
 from kb_nano.infra.kernel_swapper import BenchTarget, get, patch_class, restore
 from .evaluator import BenchResult, evaluate
 
@@ -178,6 +178,7 @@ def run_benchmark(
             target_name, model_name,
             baseline_outputs, user_outputs,
             baseline_time, user_time,
+            attn_backend=ATTN_BACKEND_CONFIG.backend,
         )
         print(f"\n{result.report()}")
         results.append(result)

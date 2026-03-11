@@ -29,7 +29,10 @@ import torch.distributed as dist
 import torch.multiprocessing as mp
 from transformers import AutoTokenizer
 
-from .infra.context import get_context, reset_context, set_context, set_mixed_context
+from .infra.context import (
+    AttnBackendConfig, get_attn_backend_config, get_context,
+    reset_context, set_context, set_mixed_context,
+)
 from .tasks.baseline.L1.allreduce import set_custom_ar
 from .weight_loader import load_model
 
@@ -60,25 +63,9 @@ _DEFAULT_MAX_NUM_BATCHED_TOKENS, _DEFAULT_MAX_NUM_SEQS = (
 _PROFILE = os.environ.get("KB_NANO_PROFILE", "0") == "1"
 
 
-def _detect_attn_backend() -> tuple[bool, int]:
-    """Return (use_trtllm, block_size) based on GPU compute capability.
-
-    Blackwell (sm_100+) uses TRTLLM-gen attention kernels via FlashInfer
-    with block_size=16.  Everything else uses flash_attn with block_size=256.
-    """
-    if not torch.cuda.is_available():
-        return False, 256
-    cc = torch.cuda.get_device_capability()
-    if cc[0] >= 10:
-        try:
-            from flashinfer.decode import trtllm_batch_decode_with_kv_cache  # noqa: F401
-            return True, 16
-        except ImportError:
-            pass
-    return False, 256
-
-
-USE_TRTLLM, BLOCK_SIZE = _detect_attn_backend()
+ATTN_BACKEND_CONFIG = get_attn_backend_config()
+USE_TRTLLM = ATTN_BACKEND_CONFIG.use_trtllm
+BLOCK_SIZE = ATTN_BACKEND_CONFIG.block_size
 USE_FLASHINFER = USE_TRTLLM  # back-compat alias
 
 
@@ -363,7 +350,7 @@ class ModelRunner:
 
     def _share_trtllm_workspace(self):
         """Replace per-layer TRTLLM workspace buffers with a single shared one."""
-        if not USE_TRTLLM:
+        if not ATTN_BACKEND_CONFIG.use_trtllm:
             return
         self._attn_layers = []
         for module in self.model.modules():
@@ -424,7 +411,7 @@ class ModelRunner:
         if self.rank == 0:
             print(f"  KV cache: {num_blocks} blocks x {BLOCK_SIZE} = {num_blocks * BLOCK_SIZE} token slots")
 
-        if USE_TRTLLM:
+        if ATTN_BACKEND_CONFIG.kv_layout == "HND":
             self.kv_cache = torch.empty(
                 2, num_layers, num_blocks, num_kv_heads, BLOCK_SIZE, head_dim,
             )
@@ -438,10 +425,10 @@ class ModelRunner:
             module.v_cache = self.kv_cache[1, layer_id]
             layer_id += 1
 
-        if self.rank == 0 and USE_TRTLLM:
-            print(f"  Attention backend: TRTLLM-gen via FlashInfer (block_size={BLOCK_SIZE})")
-        elif self.rank == 0:
-            print(f"  Attention backend: flash_attn (block_size={BLOCK_SIZE})")
+        if self.rank == 0:
+            cfg = ATTN_BACKEND_CONFIG
+            print(f"  Attention backend: {cfg.backend} "
+                  f"(block_size={cfg.block_size}, kv_layout={cfg.kv_layout})")
 
     def prepare_prefill(self, seqs):
         input_ids, positions = [], []
