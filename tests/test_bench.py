@@ -32,16 +32,16 @@ PACKAGE_NAME = os.path.basename(PACKAGE_DIR)
 
 sys.path.insert(0, PROJECT_ROOT)
 
-bench_pkg = __import__(f"{PACKAGE_NAME}.bench", fromlist=[
+swapper_mod = __import__(f"{PACKAGE_NAME}.infra.kernel_swapper", fromlist=[
     "list_targets", "models_for_target", "targets_for_model",
-    "print_model_operator_map", "BenchTarget", "BenchResult", "benchmark",
+    "print_model_operator_map", "BenchTarget", "get",
+    "patch_class", "restore", "replacement_context",
 ])
-discovery_mod = __import__(f"{PACKAGE_NAME}.bench.discovery", fromlist=["get"])
-evaluator_mod = __import__(f"{PACKAGE_NAME}.bench.evaluator", fromlist=[
+evaluator_mod = __import__(f"{PACKAGE_NAME}.bench.kernels.evaluator", fromlist=[
     "compute_kl_divergence", "compute_token_match_rate", "evaluate",
 ])
-replacement_mod = __import__(f"{PACKAGE_NAME}.bench.replacement", fromlist=[
-    "patch_class", "restore", "replacement_context",
+runner_mod = __import__(f"{PACKAGE_NAME}.bench.kernels.runner", fromlist=[
+    "run_benchmark",
 ])
 engine_mod = __import__(f"{PACKAGE_NAME}.engine", fromlist=["GenerationOutput"])
 
@@ -71,7 +71,7 @@ def test_discovery():
     print("  TEST: Discovery")
     print(f"{'=' * 60}")
 
-    targets = bench_pkg.list_targets()
+    targets = swapper_mod.list_targets()
     check(len(targets) > 0, "list_targets() returns non-empty list")
 
     for t in targets:
@@ -88,28 +88,28 @@ def test_discovery():
     else:
         check(True, "all targets have valid name, level, models, target_cls")
 
-    l1_targets = bench_pkg.list_targets(level=1)
+    l1_targets = swapper_mod.list_targets(level=1)
     check(
         len(l1_targets) > 0 and all(t.level == 1 for t in l1_targets),
         "list_targets(level=1) returns only L1 targets",
     )
 
-    rms = discovery_mod.get("rms_norm")
+    rms = swapper_mod.get("rms_norm")
     check(rms.name == "rms_norm" and rms.level == 1, 'get("rms_norm") returns correct target')
 
     try:
-        discovery_mod.get("nonexistent_op_xyz")
+        swapper_mod.get("nonexistent_op_xyz")
         check(False, 'get("nonexistent") raises KeyError')
     except KeyError:
         check(True, 'get("nonexistent") raises KeyError')
 
-    llama_targets = bench_pkg.targets_for_model("llama31")
+    llama_targets = swapper_mod.targets_for_model("llama31")
     check(
         len(llama_targets) > 0 and all("llama31" in t.models for t in llama_targets),
         'targets_for_model("llama31") all include "llama31"',
     )
 
-    rms_models = bench_pkg.models_for_target("rms_norm")
+    rms_models = swapper_mod.models_for_target("rms_norm")
     check("llama31" in rms_models, 'models_for_target("rms_norm") contains "llama31"')
 
 
@@ -190,7 +190,7 @@ def test_replacement():
     print("  TEST: Replacement patching")
     print(f"{'=' * 60}")
 
-    target = discovery_mod.get("rms_norm")
+    target = swapper_mod.get("rms_norm")
     rms_module = importlib.import_module(f"{PACKAGE_NAME}.{target.module_path}")
     original_cls = target.target_cls
 
@@ -201,7 +201,7 @@ def test_replacement():
         pass
 
     # patch_class swaps the class in the source module
-    undo = replacement_mod.patch_class(target, FakeRMSNorm)
+    undo = swapper_mod.patch_class(target, FakeRMSNorm)
     check(
         getattr(rms_module, original_cls.__name__) is FakeRMSNorm,
         "patch_class replaces the class in the source module",
@@ -214,7 +214,7 @@ def test_replacement():
     )
 
     # restore puts it back everywhere
-    replacement_mod.restore(undo)
+    swapper_mod.restore(undo)
     check(
         getattr(rms_module, original_cls.__name__) is original_cls,
         "restore brings back the original in source module",
@@ -225,7 +225,7 @@ def test_replacement():
     )
 
     # replacement_context works as a context manager
-    with replacement_mod.replacement_context(target, FakeRMSNorm):
+    with swapper_mod.replacement_context(target, FakeRMSNorm):
         check(
             getattr(rms_module, original_cls.__name__) is FakeRMSNorm,
             "replacement_context patches inside the block",
@@ -240,32 +240,35 @@ def test_replacement():
 # Part 2: Integration test (subprocess with GPU)
 # ---------------------------------------------------------------------------
 IDENTITY_WORKER = r'''
-import json, os, sys, gc
+import json, os, sys, gc, shutil
 cfg = json.loads(sys.argv[1])
 sys.path.insert(0, cfg["project_root"])
 
 def main():
     pkg = cfg["package_name"]
-    bench = __import__(f"{pkg}.bench", fromlist=["benchmark"])
-    rms_mod = __import__(f"{pkg}.tasks.baseline.L1.rms_norm", fromlist=["RMSNorm"])
-
-    results = bench.benchmark(
-        target_name="rms_norm",
-        user_impl=rms_mod.RMSNorm,
-        models=["meta-llama/Llama-3.1-8B-Instruct"],
-        prompts=["What is 2 + 2?"],
-        max_tokens=5,
-        num_warmup=0,
-        num_runs=1,
-        enforce_eager=True,
-    )
-    r = results[0]
-    with open(cfg["output_file"], "w") as f:
-        json.dump({
-            "kl_mean": r.kl_mean, "kl_max": r.kl_max,
-            "token_match_rate": r.token_match_rate,
-            "num_tokens": r.num_tokens, "speedup": r.speedup,
-        }, f)
+    runner = __import__(f"{pkg}.bench.kernels.runner", fromlist=["run_kernel_benchmark"])
+    pkg_dir = os.path.join(cfg["project_root"], cfg["package_name"])
+    baseline = os.path.join(pkg_dir, "tasks", "baseline", "L1", "rms_norm.py")
+    candidate_dir = os.path.join(pkg_dir, "tasks", "candidate", "L1")
+    candidate = os.path.join(candidate_dir, "rms_norm.py")
+    os.makedirs(candidate_dir, exist_ok=True)
+    shutil.copy2(baseline, candidate)
+    try:
+        result = runner.run_kernel_benchmark(
+            "rms_norm",
+            num_warmup=0,
+            num_runs=1,
+        )
+        with open(cfg["output_file"], "w") as f:
+            json.dump({
+                "passed": result.passed,
+                "failed": result.failed,
+                "avg_diff": result.avg_mean_abs_diff,
+                "avg_speedup": result.avg_speedup,
+            }, f)
+    finally:
+        if os.path.exists(candidate):
+            os.remove(candidate)
 
 if __name__ == "__main__":
     main()
@@ -277,41 +280,41 @@ cfg = json.loads(sys.argv[1])
 sys.path.insert(0, cfg["project_root"])
 
 def main():
-    import torch
-    import torch.nn as nn
-
     pkg = cfg["package_name"]
-    bench = __import__(f"{pkg}.bench", fromlist=["benchmark"])
+    runner = __import__(f"{pkg}.bench.kernels.runner", fromlist=["run_kernel_benchmark"])
+    pkg_dir = os.path.join(cfg["project_root"], cfg["package_name"])
+    candidate_dir = os.path.join(pkg_dir, "tasks", "candidate", "L1")
+    candidate = os.path.join(candidate_dir, "rms_norm.py")
+    os.makedirs(candidate_dir, exist_ok=True)
+    with open(candidate, "w") as f:
+        f.write("""
+import torch
+import torch.nn as nn
 
-    class BrokenRMSNorm(nn.Module):
-        def __init__(self, hidden_size: int, eps: float = 1e-6):
-            super().__init__()
-            self.eps = eps
-            self.weight = nn.Parameter(torch.ones(hidden_size))
-
-        def forward(self, x, residual=None):
-            if residual is None:
-                return torch.zeros_like(x)
-            else:
-                return torch.zeros_like(x), residual
-
-    results = bench.benchmark(
-        target_name="rms_norm",
-        user_impl=BrokenRMSNorm,
-        models=["meta-llama/Llama-3.1-8B-Instruct"],
-        prompts=["What is 2 + 2?"],
-        max_tokens=5,
-        num_warmup=0,
-        num_runs=1,
-        enforce_eager=True,
-    )
-    r = results[0]
-    with open(cfg["output_file"], "w") as f:
-        json.dump({
-            "kl_mean": r.kl_mean, "kl_max": r.kl_max,
-            "token_match_rate": r.token_match_rate,
-            "num_tokens": r.num_tokens,
-        }, f)
+class RMSNorm(nn.Module):
+    def __init__(self, hidden_size=4096, eps=1e-6):
+        super().__init__()
+        self.weight = nn.Parameter(torch.ones(hidden_size))
+    def forward(self, x, residual=None):
+        if residual is None:
+            return torch.zeros_like(x)
+        return torch.zeros_like(x), residual
+""")
+    try:
+        result = runner.run_kernel_benchmark(
+            "rms_norm",
+            num_warmup=0,
+            num_runs=1,
+        )
+        with open(cfg["output_file"], "w") as f:
+            json.dump({
+                "passed": result.passed,
+                "failed": result.failed,
+                "avg_diff": result.avg_mean_abs_diff,
+            }, f)
+    finally:
+        if os.path.exists(candidate):
+            os.remove(candidate)
 
 if __name__ == "__main__":
     main()

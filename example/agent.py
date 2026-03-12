@@ -91,7 +91,7 @@ def _detect_model_key(model_name: str) -> str:
 
 def discover_operators(model_name: str, level: int) -> list[OperatorSpec]:
     """Find all operators at the given level used by the given model."""
-    from kb_nano.bench.discovery import discover_targets
+    from kb_nano.infra.kernel_swapper import discover_targets
 
     model_key = _detect_model_key(model_name)
     targets = discover_targets()
@@ -604,10 +604,9 @@ def main():
     from importlib.util import spec_from_file_location, module_from_spec
 
     pkg = cfg["package_name"]
-    bench_discovery = __import__(f"{pkg}.bench.discovery", fromlist=["discover_targets", "get"])
-    bench_replacement = __import__(f"{pkg}.bench.replacement", fromlist=["patch_class", "restore"])
-    bench_evaluator = __import__(f"{pkg}.bench.evaluator", fromlist=["evaluate"])
-    engine_mod = __import__(f"{pkg}.engine", fromlist=["LlamaEngine", "SamplingParams"])
+    kernel_swapper = __import__(f"{pkg}.infra.kernel_swapper", fromlist=["get", "patch_class", "restore"])
+    bench_evaluator = __import__(f"{pkg}.bench.kernels.evaluator", fromlist=["evaluate"])
+    engine_mod = __import__(f"{pkg}.infra.engine", fromlist=["LlamaEngine", "SamplingParams"])
 
     LlamaEngine = engine_mod.LlamaEngine
     SamplingParams = engine_mod.SamplingParams
@@ -646,12 +645,12 @@ def main():
     patched_names = []
     for kern in kernels:
         try:
-            target = bench_discovery.get(kern["op_name"])
+            target = kernel_swapper.get(kern["op_name"])
             spec = spec_from_file_location("_gen_kernel_" + kern["op_name"], kern["code_file"])
             mod = module_from_spec(spec)
             spec.loader.exec_module(mod)
             user_cls = getattr(mod, kern["class_name"])
-            undo = bench_replacement.patch_class(target, user_cls)
+            undo = kernel_swapper.patch_class(target, user_cls)
             undo_list.extend(undo)
             patched_names.append(kern["op_name"])
             print(f"  [bench] Patched {kern['op_name']} -> {kern['class_name']}")
@@ -699,7 +698,7 @@ def main():
             "patched_ops": patched_names,
         }
     finally:
-        bench_replacement.restore(undo_list)
+        kernel_swapper.restore(undo_list)
 
     with open(cfg["output_file"], "w") as f:
         json.dump(results_out, f)

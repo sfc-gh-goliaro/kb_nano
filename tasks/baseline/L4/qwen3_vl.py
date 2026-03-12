@@ -205,15 +205,16 @@ class Qwen3Model(nn.Module):
     def __init__(self, config: Qwen3VLConfig):
         super().__init__()
         self.embed_tokens = VocabParallelEmbedding(config.vocab_size, config.hidden_size)
-        self.layers = nn.ModuleList([
-            LlamaDecoderLayer(config, qk_norm=True) for _ in range(config.num_hidden_layers)
-        ])
-        self.norm = RMSNorm(config.hidden_size, eps=config.rms_norm_eps)
         self.rotary_emb = MRotaryEmbedding(
             config.head_dim, config.max_position_embeddings,
             config.rope_theta, config.mrope_section,
             config.mrope_interleaved,
         )
+        self.layers = nn.ModuleList([
+            LlamaDecoderLayer(config, rotary_emb=self.rotary_emb, qk_norm=True)
+            for _ in range(config.num_hidden_layers)
+        ])
+        self.norm = RMSNorm(config.hidden_size, eps=config.rms_norm_eps)
 
     def forward(self, input_ids, positions, inputs_embeds=None,
                 deepstack_embeds=None):
@@ -223,9 +224,7 @@ class Qwen3Model(nn.Module):
             hidden_states = self.embed_tokens(input_ids)
         residual = None
         for layer_idx, layer in enumerate(self.layers):
-            hidden_states, residual = layer(
-                positions, hidden_states, residual, self.rotary_emb,
-            )
+            hidden_states, residual = layer(positions, hidden_states, residual)
             if deepstack_embeds and layer_idx < len(deepstack_embeds):
                 hidden_states = hidden_states + deepstack_embeds[layer_idx]
         hidden_states, _ = self.norm(hidden_states, residual)

@@ -35,7 +35,7 @@ A standalone, high-performance LLM inference engine supporting **Llama 3.1** and
 │   │   │   └── csrc/           # CUDA/C++ kernel sources (JIT-compiled)
 │   │   │       └── custom_allreduce_kernels.cu
 │   │   ├── L2/                 # Multi-op blocks
-│   │   │   ├── attention.py    # GQA attention
+│   │   │   ├── attention.py    # LlamaAttention (GQA + QKV proj + RoPE + output proj)
 │   │   │   ├── llama_mlp.py    # Llama SwiGLU MLP
 │   │   │   ├── mixtral_moe.py  # Mixtral MoE routing + experts
 │   │   │   ├── fused_experts.py# Fused expert execution
@@ -65,18 +65,11 @@ A standalone, high-performance LLM inference engine supporting **Llama 3.1** and
 ├── engine.py                   # Batched inference engine with paged KV cache and TP
 ├── weight_loader.py            # HuggingFace safetensors weight loading with TP sharding
 └── tests/                      # Test suite
-    ├── test_vllm_alignment.py  # Token-level correctness test vs vLLM (eager mode)
     ├── test_bench.py           # Bench module tests (discovery, evaluator, replacement, integration)
-    ├── bench_throughput.py     # Throughput benchmark vs vLLM (full speed)
+    ├── bench_vllm.py           # Multi-scenario throughput + latency + alignment benchmark vs vLLM
+    ├── utils/                  # Post-processing and visualization
+    │   └── parse_vllm_bench_results.py  # Generate tables and plots from bench_vllm.py results
     └── debug/                  # Profiling and debugging scripts
-        ├── profile_decode.py
-        ├── profile_decode_detail.py
-        ├── profile_gap.py
-        ├── profile_llama_tp1.py
-        ├── profile_llama_tp1_detail.py
-        ├── profile_mixtral_detail.py
-        ├── tune_moe_gemm.py
-        └── bench_moe.py
 ```
 
 ## Quick Start
@@ -86,27 +79,18 @@ A standalone, high-performance LLM inference engine supporting **Llama 3.1** and
 git clone git@github.com:sfc-gh-goliaro/kb-nano.git
 cd kb-nano
 
-# Single model test (vs vLLM)
-python tests/test_vllm_alignment.py --model meta-llama/Llama-3.1-8B-Instruct
+# Throughput + latency + alignment benchmark vs vLLM
+python tests/bench_vllm.py --model meta-llama/Llama-3.1-8B-Instruct
 
-# Multiple models with tensor parallelism
-python tests/test_vllm_alignment.py \
-    --model meta-llama/Llama-3.1-70B-Instruct mistralai/Mixtral-8x7B-Instruct-v0.1 \
-    --tp 4 --max-tokens 50
+# With tensor parallelism
+python tests/bench_vllm.py \
+    --model meta-llama/Llama-3.1-70B-Instruct --tp 4
 
 # Bench module tests (unit tests + GPU integration)
 python tests/test_bench.py
 
 # Bench module unit tests only (no GPU required)
 python tests/test_bench.py --unit-only
-
-# Throughput benchmark vs vLLM (both engines at full speed)
-python tests/bench_throughput.py --model meta-llama/Llama-3.1-8B-Instruct
-
-# With tensor parallelism and custom workload
-python tests/bench_throughput.py \
-    --model meta-llama/Llama-3.1-70B-Instruct --tp 4 \
-    --num-seqs 256 --max-input-len 1024 --max-output-len 1024
 ```
 
 ## Benchmarking
@@ -120,18 +104,13 @@ The benchmark suite lets you evaluate custom kernel implementations at 4 abstrac
 
 ```bash
 # List all targets and which models use them
-python -m kb_nano.bench --map
+python -m kb_nano.bench.kernels --map
 
 # List targets at a specific level
-python -m kb_nano.bench --list --level 1
+python -m kb_nano.bench.kernels --list --level 1
 
-# Benchmark a candidate kernel from tasks/candidate/ (auto-discovered)
-python -m kb_nano.bench --target rms_norm
-
-# Or specify a custom kernel explicitly
-python -m kb_nano.bench \
-    --target rms_norm \
-    --user-impl path/to/my_kernel.py:MyRMSNorm
+# Benchmark a candidate kernel from tasks/candidate/
+python -m kb_nano.bench.kernels --target rms_norm
 ```
 
 The model-to-operator mapping is derived automatically from the import graph — no manual annotations needed.
@@ -170,13 +149,37 @@ The agent discovers operators, generates replacements, validates they compile, p
 - PyTorch 2.x with CUDA
 - Triton
 - Flash Attention (`flash-attn`)
+- SGLang kernel library (`sgl-kernel`) — fused RMSNorm, SiLU, RoPE, MoE ops
+- FlashInfer (`flashinfer-python`) — TRTLLM-gen attention kernels on Blackwell+
 - Hugging Face (`transformers`, `huggingface_hub`, `safetensors`)
 - aiohttp (for the LLM kernel agent)
 - vLLM (only needed for running comparison tests)
+- matplotlib (only needed for benchmark plotting)
+
+### GPU architecture and library compatibility
+
+The pre-built wheels for `torch`, `sgl-kernel`, `flash-attn`, and `vllm` must all
+agree on the same PyTorch ABI and CUDA variant, otherwise you get `undefined symbol`
+errors at import time.
+
+**Tested stack (Blackwell B200, CUDA 13.0):**
+
+```bash
+pip install torch==2.9.1 torchvision==0.24.1 torchaudio==2.9.1 \
+    --index-url https://download.pytorch.org/whl/cu130
+pip install "sgl-kernel==0.3.21+cu130" \
+    --find-links https://docs.sglang.io/whl/cu130/sgl-kernel/
+pip install vllm==0.16.0
+pip install flash-attn
+```
+
+The engine auto-selects the attention backend based on GPU compute capability:
+**sm_100+** (Blackwell) uses TRTLLM-gen decode kernels via FlashInfer;
+**sm_90 and below** (Hopper, Ampere) uses Flash Attention.
 
 ## Performance
 
-Run `tests/bench_throughput.py` to reproduce. Workload uses random token IDs with `ignore_eos=True`, both engines with full optimizations (`enforce_eager=False`).
+Run `tests/bench_vllm.py` to reproduce. Workload uses random token IDs with `ignore_eos=True`, both engines with full optimizations (`enforce_eager=False`).
 
 **Hardware: 4x NVIDIA H200 (NVLink)**
 
@@ -195,6 +198,32 @@ Run `tests/bench_throughput.py` to reproduce. Workload uses random token IDs wit
 | Mixtral-8x7B | 4 |   64 |  512/256  |  3,397 |  4,401 | 1.30x |
 | Mixtral-8x7B | 4 |  128 |  512/256  |  4,720 |  7,230 | 1.53x |
 | Mixtral-8x7B | 4 |  256 | 1024/1024 |  9,769 |  9,852 | 1.01x |
+
+**Hardware: 4x NVIDIA B200 (NVLink)**
+
+Run `tests/bench_vllm.py` to reproduce. Three scenarios per model, 1000 sequences each, `temperature=0`.
+
+### Llama 3.1
+
+| Model | TP | Scenario | Input/Output | vLLM (tok/s) | Ours (tok/s) | Ratio |
+|-------|---:|----------|:------------:|-------------:|-------------:|------:|
+| Llama-3.1-8B  | 1 | prefill-heavy | 1024/512  | 14,448 | 15,039 | **1.04x** |
+| Llama-3.1-8B  | 1 | balanced      |  512/512  | 25,075 | 23,734 | 0.95x |
+| Llama-3.1-8B  | 1 | decode-heavy  |  512/1024 | 22,830 | 22,928 | **1.00x** |
+| Llama-3.1-8B  | 4 | prefill-heavy | 1024/512  | 38,843 | 36,873 | 0.95x |
+| Llama-3.1-8B  | 4 | balanced      |  512/512  | 47,568 | 52,756 | **1.11x** |
+| Llama-3.1-8B  | 4 | decode-heavy  |  512/1024 | 52,219 | 56,589 | **1.08x** |
+| Llama-3.1-70B | 4 | prefill-heavy | 1024/512  |  7,939 |  7,200 | 0.91x |
+| Llama-3.1-70B | 4 | balanced      |  512/512  | 11,622 | 10,542 | 0.91x |
+| Llama-3.1-70B | 4 | decode-heavy  |  512/1024 | 13,847 | 12,251 | 0.88x |
+
+### Mixtral-8x7B
+
+| Model | TP | Scenario | Input/Output | vLLM (tok/s) | Ours (tok/s) | Ratio |
+|-------|---:|----------|:------------:|-------------:|-------------:|------:|
+| Mixtral-8x7B | 4 | prefill-heavy | 1024/512  | 15,060 | 23,064 | **1.53x** |
+| Mixtral-8x7B | 4 | balanced      |  512/512  | 20,530 | 33,443 | **1.63x** |
+| Mixtral-8x7B | 4 | decode-heavy  |  512/1024 | 24,728 | 37,761 | **1.53x** |
 
 ### Key optimizations
 

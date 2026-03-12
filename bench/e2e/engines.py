@@ -1,0 +1,274 @@
+"""Engine abstraction and registry for E2E benchmarking.
+
+Defines the BenchEngine protocol that all model engines must implement,
+and an EngineRegistry that maps model names to engine classes.
+"""
+
+from __future__ import annotations
+
+from dataclasses import dataclass, field
+from typing import Any, Protocol, runtime_checkable
+
+from kb_nano.bench.utils.datasets import SampleRequest
+
+
+@dataclass
+class ThroughputResult:
+    """Result from a throughput benchmark run."""
+    elapsed_time: float = 0.0
+    total_input_tokens: int = 0
+    total_output_tokens: int = 0
+    requests_per_second: float = 0.0
+    tokens_per_second: float = 0.0
+    output_tokens_per_second: float = 0.0
+    outputs: list[dict] | None = None
+
+
+@dataclass
+class LatencyResult:
+    """Result from a latency benchmark run."""
+    avg_latency: float = 0.0
+    latencies: list[float] = field(default_factory=list)
+    percentiles: dict[str, float] = field(default_factory=dict)
+
+
+@runtime_checkable
+class BenchEngine(Protocol):
+    """Interface that all model engines must implement for E2E benchmarking."""
+
+    def warmup(self) -> None:
+        """Run warmup passes to prime CUDA graphs and caches."""
+        ...
+
+    def run_throughput(
+        self,
+        requests: list[SampleRequest],
+        temperature: float = 1.0,
+        top_p: float = 1.0,
+        seed: int = 42,
+    ) -> ThroughputResult:
+        """Run offline throughput benchmark."""
+        ...
+
+    def run_latency(
+        self,
+        input_len: int,
+        output_len: int,
+        batch_size: int,
+        num_warmup: int = 10,
+        num_iters: int = 30,
+        temperature: float = 1.0,
+        seed: int = 42,
+    ) -> LatencyResult:
+        """Run fixed-batch latency benchmark."""
+        ...
+
+    def cleanup(self) -> None:
+        """Release GPU memory and other resources."""
+        ...
+
+
+class LLMEngine:
+    """BenchEngine wrapper around kb-nano's LlamaEngine.
+
+    Handles all LLM architectures supported by LlamaEngine:
+    Llama, Mixtral, DeepSeek, Mamba, etc.
+    """
+
+    def __init__(
+        self,
+        model_name: str,
+        tp: int = 1,
+        seed: int = 42,
+        enforce_eager: bool = False,
+        gpu_memory_utilization: float = 0.9,
+        max_model_len: int | None = None,
+    ):
+        self.model_name = model_name
+        self.tp = tp
+        self.seed = seed
+        self.enforce_eager = enforce_eager
+        self.gpu_memory_utilization = gpu_memory_utilization
+        self.max_model_len = max_model_len
+        self._engine = None
+
+    def _get_engine(self):
+        if self._engine is None:
+            from kb_nano.infra.engine import LlamaEngine
+            kwargs: dict[str, Any] = {
+                "model_name": self.model_name,
+                "seed": self.seed,
+                "enforce_eager": self.enforce_eager,
+                "tensor_parallel_size": self.tp,
+                "gpu_memory_utilization": self.gpu_memory_utilization,
+            }
+            if self.max_model_len is not None:
+                kwargs["max_model_len"] = self.max_model_len
+            self._engine = LlamaEngine(**kwargs)
+        return self._engine
+
+    def warmup(self) -> None:
+        from kb_nano.infra.engine import SamplingParams
+        engine = self._get_engine()
+        engine.generate(["warmup"], SamplingParams(temperature=0.0, max_tokens=16))
+
+    def run_throughput(
+        self,
+        requests: list[SampleRequest],
+        temperature: float = 1.0,
+        top_p: float = 1.0,
+        seed: int = 42,
+    ) -> ThroughputResult:
+        import time
+        import torch
+        from kb_nano.infra.engine import SamplingParams
+
+        engine = self._get_engine()
+        prompts = [r.prompt for r in requests]
+        sp_list = [
+            SamplingParams(
+                temperature=temperature,
+                top_p=top_p,
+                max_tokens=r.expected_output_len,
+                ignore_eos=True,
+                seed=seed,
+            )
+            for r in requests
+        ]
+
+        torch.cuda.synchronize()
+        start = time.perf_counter()
+        outputs = engine.generate(prompts, sp_list)
+        torch.cuda.synchronize()
+        elapsed = time.perf_counter() - start
+
+        total_input = sum(
+            len(engine.tokenizer.encode(p)) if isinstance(p, str) else len(p)
+            for p in prompts
+        )
+        total_output = sum(len(o.token_ids) for o in outputs)
+        total_tokens = total_input + total_output
+
+        return ThroughputResult(
+            elapsed_time=elapsed,
+            total_input_tokens=total_input,
+            total_output_tokens=total_output,
+            requests_per_second=len(requests) / elapsed,
+            tokens_per_second=total_tokens / elapsed,
+            output_tokens_per_second=total_output / elapsed,
+            outputs=[
+                {"generated_text": o.generated_text, "token_ids": o.token_ids}
+                for o in outputs
+            ],
+        )
+
+    def run_latency(
+        self,
+        input_len: int,
+        output_len: int,
+        batch_size: int,
+        num_warmup: int = 10,
+        num_iters: int = 30,
+        temperature: float = 1.0,
+        seed: int = 42,
+    ) -> LatencyResult:
+        import time
+        import numpy as np
+        import torch
+        from kb_nano.infra.engine import SamplingParams
+
+        engine = self._get_engine()
+        dummy_prompts = np.random.randint(
+            10000, size=(batch_size, input_len)
+        ).tolist()
+
+        sp = SamplingParams(
+            temperature=temperature,
+            max_tokens=output_len,
+            ignore_eos=True,
+            seed=seed,
+        )
+
+        for _ in range(num_warmup):
+            torch.cuda.synchronize()
+            engine.generate(dummy_prompts, sp)
+            torch.cuda.synchronize()
+
+        latencies = []
+        for _ in range(num_iters):
+            torch.cuda.synchronize()
+            t0 = time.perf_counter()
+            engine.generate(dummy_prompts, sp)
+            torch.cuda.synchronize()
+            latencies.append(time.perf_counter() - t0)
+
+        lat_arr = np.array(latencies)
+        percentages = [10, 25, 50, 75, 90, 99]
+        pcts = np.percentile(lat_arr, percentages)
+
+        return LatencyResult(
+            avg_latency=float(np.mean(lat_arr)),
+            latencies=latencies,
+            percentiles={str(p): float(v) for p, v in zip(percentages, pcts)},
+        )
+
+    def cleanup(self) -> None:
+        if self._engine is not None:
+            self._engine._cleanup()
+            self._engine = None
+
+
+class EngineRegistry:
+    """Maps model names to engine classes for automatic dispatch."""
+
+    _registry: dict[str, type] = {}
+    _model_patterns: dict[str, type] = {
+        "llama": LLMEngine,
+        "mixtral": LLMEngine,
+        "mistral": LLMEngine,
+        "deepseek": LLMEngine,
+        "qwen": LLMEngine,
+        "mamba": LLMEngine,
+        "gemma": LLMEngine,
+        "phi": LLMEngine,
+    }
+
+    @classmethod
+    def register(cls, name: str, engine_class: type) -> None:
+        cls._registry[name] = engine_class
+
+    @classmethod
+    def get(cls, model_name: str) -> type:
+        """Resolve model name to engine class.
+
+        Checks exact matches in the registry first, then pattern matches
+        against known model families.
+        """
+        if model_name in cls._registry:
+            return cls._registry[model_name]
+
+        name_lower = model_name.lower()
+        for pattern, engine_cls in cls._model_patterns.items():
+            if pattern in name_lower:
+                return engine_cls
+
+        return LLMEngine
+
+    @classmethod
+    def create(
+        cls,
+        model_name: str,
+        tp: int = 1,
+        seed: int = 42,
+        enforce_eager: bool = False,
+        **kwargs,
+    ) -> Any:
+        """Create an engine instance for the given model."""
+        engine_cls = cls.get(model_name)
+        return engine_cls(
+            model_name=model_name,
+            tp=tp,
+            seed=seed,
+            enforce_eager=enforce_eager,
+            **kwargs,
+        )

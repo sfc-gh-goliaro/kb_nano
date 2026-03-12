@@ -26,10 +26,16 @@ class BenchResult:
     # Token-level match rate
     token_match_rate: float = 1.0
     num_tokens: int = 0
+    # Attention backend used for this run
+    attn_backend: str = ""
 
     def report(self) -> str:
         lines = [
             f"Benchmark: {self.target_name} on {self.model_name}",
+        ]
+        if self.attn_backend:
+            lines.append(f"  Attn backend:   {self.attn_backend}")
+        lines += [
             f"  KL divergence:  mean={self.kl_mean:.6f}  max={self.kl_max:.6f}",
             f"  Token match:    {self.token_match_rate:.1%} ({self.num_tokens} tokens)",
             f"  Baseline time:  {self.baseline_time:.3f}s",
@@ -88,6 +94,7 @@ def evaluate(
     user_outputs,
     baseline_time: float,
     user_time: float,
+    attn_backend: str = "",
 ) -> BenchResult:
     """Compare baseline and user outputs, producing a BenchResult."""
     all_kl_per_step = []
@@ -121,4 +128,5 @@ def evaluate(
         speedup=speedup,
         token_match_rate=match_rate,
         num_tokens=total_tokens,
+        attn_backend=attn_backend,
     )
