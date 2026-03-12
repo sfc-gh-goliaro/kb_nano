@@ -122,7 +122,7 @@ def main(args: argparse.Namespace):
             print_candidate_summary(candidates)
             undo_info = apply_candidates(candidates)
 
-    from kb_nano.engine import LlamaEngine, SamplingParams
+    from kb_nano.infra.engine import LlamaEngine, SamplingParams
 
     print("=" * 70)
     print("  kb-nano Latency Benchmark")

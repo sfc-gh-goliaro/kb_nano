@@ -99,9 +99,9 @@ def capture_golden_data(
     print(f"  Data-dependent ops: {DATA_DEPENDENT_OPS}")
 
     try:
-        from kb_nano.engine import LlamaEngine, SamplingParams
+        from kb_nano.infra.engine import LlamaEngine, SamplingParams
     except ImportError:
-        print("ERROR: Cannot import kb_nano.engine. Make sure the package is installed.")
+        print("ERROR: Cannot import kb_nano.infra.engine. Make sure the package is installed.")
         return saved_files
 
     engine = LlamaEngine(

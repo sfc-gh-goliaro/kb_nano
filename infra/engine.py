@@ -29,11 +29,11 @@ import torch.distributed as dist
 import torch.multiprocessing as mp
 from transformers import AutoTokenizer
 
-from .infra.context import (
+from .context import (
     AttnBackendConfig, get_attn_backend_config, get_context,
     reset_context, set_context, set_mixed_context,
 )
-from .tasks.baseline.L1.allreduce import set_custom_ar
+from ..tasks.baseline.L1.allreduce import set_custom_ar
 from .weight_loader import load_model
 
 MAX_MODEL_LEN = 131072
@@ -248,7 +248,7 @@ class ModelRunner:
         if world_size > 1:
             self.cpu_group = dist.new_group(backend="gloo")
             if not os.environ.get("KB_NANO_DISABLE_CUSTOM_AR", "0") == "1":
-                from .tasks.baseline.L1.allreduce import CustomAllreduce
+                from ..tasks.baseline.L1.allreduce import CustomAllreduce
                 self.custom_ar = CustomAllreduce(
                     self.cpu_group, rank, max_size=8 * 1024 * 1024
                 )
@@ -370,7 +370,7 @@ class ModelRunner:
         Must be called before warmup so only one buffer grows to max size
         instead of one per layer (saves ~14 GiB for 32-layer models).
         """
-        from .tasks.baseline.L1.silu_and_mul import SiluAndMul
+        from ..tasks.baseline.L1.silu_and_mul import SiluAndMul
         silu_modules = [
             m for m in self.model.modules() if isinstance(m, SiluAndMul)
         ]

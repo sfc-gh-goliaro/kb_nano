@@ -294,7 +294,7 @@ def _build_sampling_params(
     ignore_eos: bool = False,
 ):
     """Build a kb_nano SamplingParams from request fields."""
-    from kb_nano.engine import SamplingParams
+    from kb_nano.infra.engine import SamplingParams
 
     return SamplingParams(
         temperature=temperature if temperature is not None else 0.0,
@@ -620,7 +620,7 @@ def main():
             print_candidate_summary(candidates)
             apply_candidates(candidates)
 
-    from kb_nano.engine import LlamaEngine
+    from kb_nano.infra.engine import LlamaEngine
 
     logger.info("=" * 60)
     logger.info("  kb-nano OpenAI-compatible server")

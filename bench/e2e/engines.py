@@ -94,7 +94,7 @@ class LLMEngine:
 
     def _get_engine(self):
         if self._engine is None:
-            from kb_nano.engine import LlamaEngine
+            from kb_nano.infra.engine import LlamaEngine
             kwargs: dict[str, Any] = {
                 "model_name": self.model_name,
                 "seed": self.seed,
@@ -108,7 +108,7 @@ class LLMEngine:
         return self._engine
 
     def warmup(self) -> None:
-        from kb_nano.engine import SamplingParams
+        from kb_nano.infra.engine import SamplingParams
         engine = self._get_engine()
         engine.generate(["warmup"], SamplingParams(temperature=0.0, max_tokens=16))
 
@@ -121,7 +121,7 @@ class LLMEngine:
     ) -> ThroughputResult:
         import time
         import torch
-        from kb_nano.engine import SamplingParams
+        from kb_nano.infra.engine import SamplingParams
 
         engine = self._get_engine()
         prompts = [r.prompt for r in requests]
@@ -175,7 +175,7 @@ class LLMEngine:
         import time
         import numpy as np
         import torch
-        from kb_nano.engine import SamplingParams
+        from kb_nano.infra.engine import SamplingParams
 
         engine = self._get_engine()
         dummy_prompts = np.random.randint(

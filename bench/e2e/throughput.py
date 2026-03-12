@@ -57,7 +57,7 @@ def run_kb_nano(
     save_outputs: bool,
 ) -> dict:
     """Run kb-nano offline throughput benchmark (in-process)."""
-    from kb_nano.engine import LlamaEngine, SamplingParams
+    from kb_nano.infra.engine import LlamaEngine, SamplingParams
 
     engine = LlamaEngine(
         model_name=model,
