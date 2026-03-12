@@ -54,18 +54,16 @@ A standalone, high-performance LLM inference engine supporting **Llama 3.1** and
 │   ├── context.py              # Global inference context (paged KV cache coordination)
 │   └── tp.py                   # TP helper utilities (_tp_size, _tp_rank)
 ├── bench/                      # Benchmarking suite
-│   ├── discovery.py            # Auto-discovers targets via import graph analysis
-│   ├── replacement.py          # Class monkey-patching for swapping implementations
-│   ├── runner.py               # Benchmark orchestration (baseline vs user)
-│   ├── evaluator.py            # KL divergence + speedup metrics
-│   └── __main__.py             # CLI entry point
+│   ├── kernels/                # Isolated kernel-level benchmarking
+│   ├── eval/                   # Multi-model evaluation sweep
+│   └── e2e/                    # End-to-end throughput/latency benchmarks
 ├── example/                    # LLM-powered kernel generation agent
 │   ├── agent.py               # CLI agent: generates kernels via Claude, benchmarks them
 │   └── llm_api.py             # Corvo LLM endpoint helper (async + sync)
 ├── engine.py                   # Batched inference engine with paged KV cache and TP
 ├── weight_loader.py            # HuggingFace safetensors weight loading with TP sharding
 └── tests/                      # Test suite
-    ├── test_bench.py           # Bench module tests (discovery, evaluator, replacement, integration)
+    ├── test_bench.py           # Bench module tests (discovery, replacement, kernel and E2E integration)
     ├── bench_vllm.py           # Multi-scenario throughput + latency + alignment benchmark vs vLLM
     ├── utils/                  # Post-processing and visualization
     │   └── parse_vllm_bench_results.py  # Generate tables and plots from bench_vllm.py results
@@ -141,7 +139,7 @@ python -m kb_nano.example \
     --level 1 --max-retries 3 --llm-model claude-opus-4-6
 ```
 
-The agent discovers operators, generates replacements, validates they compile, patches them all into the model simultaneously, and reports KL divergence, token match rate, and speedup. Failed kernels are retried up to `--max-retries` times with error feedback to the LLM.
+The agent discovers operators, generates replacements, validates they compile, patches them all into the model simultaneously, and reports token match rate and speedup. Failed kernels are retried up to `--max-retries` times with error feedback to the LLM.
 
 ## Dependencies
 
