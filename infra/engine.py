@@ -39,8 +39,6 @@ from .weight_loader import load_model
 MAX_MODEL_LEN = 131072
 NCCL_PORT = int(os.environ.get("KB_NANO_NCCL_PORT", "29501"))
 
-QWEN_IMAGE_PAD_ID = 151655  # <|image_pad|>
-QWEN_VIDEO_PAD_ID = 151656  # <|video_pad|>
 
 
 def _detect_scheduling_defaults() -> tuple[int, int]:
@@ -1271,7 +1269,7 @@ class LlamaEngine:
                     t, h, w = thw
                     sizes.append(t * (h // merge_size) * (w // merge_size))
 
-                mask = token_ids == QWEN_IMAGE_PAD_ID
+                mask = token_ids == self.model_runner.config.image_token_id
                 if mask.any():
                     text_embeds[mask] = image_embeds.to(text_embeds.dtype)
 
@@ -1293,7 +1291,7 @@ class LlamaEngine:
                     video_embeds = vis_out
                     ds_features = []
 
-                mask = token_ids == QWEN_VIDEO_PAD_ID
+                mask = token_ids == self.model_runner.config.video_token_id
                 if mask.any():
                     text_embeds[mask] = video_embeds.to(text_embeds.dtype)
 
@@ -1385,13 +1383,13 @@ class LlamaEngine:
                 i_tok = 0
                 while i_tok < len(ids):
                     tid = ids[i_tok]
-                    if tid == QWEN_IMAGE_PAD_ID and seq.image_grid_thw and img_idx < len(seq.image_grid_thw):
+                    if tid == self.model_runner.config.image_token_id and seq.image_grid_thw and img_idx < len(seq.image_grid_thw):
                         image_offsets.append(i_tok)
                         t, h, w = seq.image_grid_thw[img_idx]
                         num_tokens = t * (h // merge_size) * (w // merge_size)
                         i_tok += num_tokens
                         img_idx += 1
-                    elif tid == QWEN_VIDEO_PAD_ID and seq.video_grid_thw and vid_idx < len(seq.video_grid_thw):
+                    elif tid == self.model_runner.config.video_token_id and seq.video_grid_thw and vid_idx < len(seq.video_grid_thw):
                         video_offsets.append(i_tok)
                         t, h, w = seq.video_grid_thw[vid_idx]
                         num_tokens = t * (h // merge_size) * (w // merge_size)

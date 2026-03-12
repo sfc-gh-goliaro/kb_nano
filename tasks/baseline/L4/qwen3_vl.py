@@ -60,6 +60,8 @@ class Qwen3VLConfig:
     tie_word_embeddings: bool = False
     mrope_section: list[int] = field(default_factory=lambda: [24, 20, 20])
     mrope_interleaved: bool = True
+    image_token_id: int = 151655
+    video_token_id: int = 151656
     vision: Qwen3VLVisionConfig = field(default_factory=Qwen3VLVisionConfig)
     dtype: torch.dtype = torch.bfloat16
 
@@ -84,6 +86,8 @@ class Qwen3VLConfig:
             tie_word_embeddings=text_config.tie_word_embeddings,
             mrope_section=rope.get("mrope_section", [24, 20, 20]),
             mrope_interleaved=rope.get("mrope_interleaved", True),
+            image_token_id=hf.image_token_id,
+            video_token_id=hf.video_token_id,
             vision=Qwen3VLVisionConfig(
                 depth=vc.depth,
                 hidden_size=vc.hidden_size,
