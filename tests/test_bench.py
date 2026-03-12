@@ -240,32 +240,35 @@ def test_replacement():
 # Part 2: Integration test (subprocess with GPU)
 # ---------------------------------------------------------------------------
 IDENTITY_WORKER = r'''
-import json, os, sys, gc
+import json, os, sys, gc, shutil
 cfg = json.loads(sys.argv[1])
 sys.path.insert(0, cfg["project_root"])
 
 def main():
     pkg = cfg["package_name"]
-    runner = __import__(f"{pkg}.bench.kernels.runner", fromlist=["run_benchmark"])
-    rms_mod = __import__(f"{pkg}.tasks.baseline.L1.rms_norm", fromlist=["RMSNorm"])
-
-    results = runner.run_benchmark(
-        target_name="rms_norm",
-        user_impl=rms_mod.RMSNorm,
-        models=["meta-llama/Llama-3.1-8B-Instruct"],
-        prompts=["What is 2 + 2?"],
-        max_tokens=5,
-        num_warmup=0,
-        num_runs=1,
-        enforce_eager=True,
-    )
-    r = results[0]
-    with open(cfg["output_file"], "w") as f:
-        json.dump({
-            "kl_mean": r.kl_mean, "kl_max": r.kl_max,
-            "token_match_rate": r.token_match_rate,
-            "num_tokens": r.num_tokens, "speedup": r.speedup,
-        }, f)
+    runner = __import__(f"{pkg}.bench.kernels.runner", fromlist=["run_kernel_benchmark"])
+    pkg_dir = os.path.join(cfg["project_root"], cfg["package_name"])
+    baseline = os.path.join(pkg_dir, "tasks", "baseline", "L1", "rms_norm.py")
+    candidate_dir = os.path.join(pkg_dir, "tasks", "candidate", "L1")
+    candidate = os.path.join(candidate_dir, "rms_norm.py")
+    os.makedirs(candidate_dir, exist_ok=True)
+    shutil.copy2(baseline, candidate)
+    try:
+        result = runner.run_kernel_benchmark(
+            "rms_norm",
+            num_warmup=0,
+            num_runs=1,
+        )
+        with open(cfg["output_file"], "w") as f:
+            json.dump({
+                "passed": result.passed,
+                "failed": result.failed,
+                "avg_diff": result.avg_mean_abs_diff,
+                "avg_speedup": result.avg_speedup,
+            }, f)
+    finally:
+        if os.path.exists(candidate):
+            os.remove(candidate)
 
 if __name__ == "__main__":
     main()
@@ -277,41 +280,41 @@ cfg = json.loads(sys.argv[1])
 sys.path.insert(0, cfg["project_root"])
 
 def main():
-    import torch
-    import torch.nn as nn
-
     pkg = cfg["package_name"]
-    runner = __import__(f"{pkg}.bench.kernels.runner", fromlist=["run_benchmark"])
+    runner = __import__(f"{pkg}.bench.kernels.runner", fromlist=["run_kernel_benchmark"])
+    pkg_dir = os.path.join(cfg["project_root"], cfg["package_name"])
+    candidate_dir = os.path.join(pkg_dir, "tasks", "candidate", "L1")
+    candidate = os.path.join(candidate_dir, "rms_norm.py")
+    os.makedirs(candidate_dir, exist_ok=True)
+    with open(candidate, "w") as f:
+        f.write("""
+import torch
+import torch.nn as nn
 
-    class BrokenRMSNorm(nn.Module):
-        def __init__(self, hidden_size: int, eps: float = 1e-6):
-            super().__init__()
-            self.eps = eps
-            self.weight = nn.Parameter(torch.ones(hidden_size))
-
-        def forward(self, x, residual=None):
-            if residual is None:
-                return torch.zeros_like(x)
-            else:
-                return torch.zeros_like(x), residual
-
-    results = runner.run_benchmark(
-        target_name="rms_norm",
-        user_impl=BrokenRMSNorm,
-        models=["meta-llama/Llama-3.1-8B-Instruct"],
-        prompts=["What is 2 + 2?"],
-        max_tokens=5,
-        num_warmup=0,
-        num_runs=1,
-        enforce_eager=True,
-    )
-    r = results[0]
-    with open(cfg["output_file"], "w") as f:
-        json.dump({
-            "kl_mean": r.kl_mean, "kl_max": r.kl_max,
-            "token_match_rate": r.token_match_rate,
-            "num_tokens": r.num_tokens,
-        }, f)
+class RMSNorm(nn.Module):
+    def __init__(self, hidden_size=4096, eps=1e-6):
+        super().__init__()
+        self.weight = nn.Parameter(torch.ones(hidden_size))
+    def forward(self, x, residual=None):
+        if residual is None:
+            return torch.zeros_like(x)
+        return torch.zeros_like(x), residual
+""")
+    try:
+        result = runner.run_kernel_benchmark(
+            "rms_norm",
+            num_warmup=0,
+            num_runs=1,
+        )
+        with open(cfg["output_file"], "w") as f:
+            json.dump({
+                "passed": result.passed,
+                "failed": result.failed,
+                "avg_diff": result.avg_mean_abs_diff,
+            }, f)
+    finally:
+        if os.path.exists(candidate):
+            os.remove(candidate)
 
 if __name__ == "__main__":
     main()

@@ -24,11 +24,6 @@ python -m kb_nano.bench.kernels
 # Single operator
 python -m kb_nano.bench.kernels --target rms_norm
 
-# Custom implementation file
-python -m kb_nano.bench.kernels \
-    --target rms_norm \
-    --user-impl path/to/my_kernel.py:RMSNorm
-
 # Filter by model / TP / category
 python -m kb_nano.bench.kernels --target rms_norm --model llama31 --tp 1
 
@@ -45,7 +40,6 @@ python -m kb_nano.bench.kernels --map
 | Flag | Default | Description |
 |------|---------|-------------|
 | `--target` | all | Operator name (e.g. `rms_norm`, `attention`) |
-| `--user-impl` | auto | `path/to/file.py:ClassName` for custom kernel |
 | `--model` | all | Filter scenarios by model prefix |
 | `--tp` | all | Filter by TP degree(s) |
 | `--category` | all | Filter by category (e.g. `llm`) |

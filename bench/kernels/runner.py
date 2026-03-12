@@ -117,7 +117,6 @@ def _compare_outputs(baseline_out: Any, candidate_out: Any) -> tuple[bool, float
 
 def run_kernel_benchmark(
     target_name: str,
-    user_impl: type | None = None,
     scenarios: list[str] | None = None,
     models: list[str] | None = None,
     tp: list[int] | None = None,
@@ -136,9 +135,11 @@ def run_kernel_benchmark(
     5. Time both (median of num_runs)
     6. Compare outputs: allclose pass/fail, mean abs diff
 
+    The candidate implementation is auto-discovered from
+    tasks/candidate/L{level}/{target_name}.py.
+
     Args:
         target_name: Operator name (e.g. 'rms_norm').
-        user_impl: nn.Module subclass for the candidate. Auto-discovered if None.
         scenarios: Filter by scenario name patterns.
         models: Filter by model key prefix.
         tp: Filter by TP degrees.
@@ -152,13 +153,12 @@ def run_kernel_benchmark(
     """
     target = get(target_name)
 
+    user_impl = load_candidate(target_name)
     if user_impl is None:
-        user_impl = load_candidate(target_name)
-        if user_impl is None:
-            raise ValueError(
-                f"No candidate kernel found for {target_name!r}. "
-                f"Provide user_impl or place kernel in tasks/candidate/L{target.level}/{target_name}.py"
-            )
+        raise ValueError(
+            f"No candidate kernel found for {target_name!r}. "
+            f"Place kernel in tasks/candidate/L{target.level}/{target_name}.py"
+        )
 
     registry = _get_registry()
     all_scenarios = registry.scenarios(
@@ -262,11 +262,10 @@ def run_all_kernel_benchmarks(
         return result
 
     operators: list[OperatorResult] = []
-    for target, user_cls in candidates:
+    for target, _ in candidates:
         print(f"\n  Benchmarking {target.name} (L{target.level})...")
         op_result = run_kernel_benchmark(
             target.name,
-            user_impl=user_cls,
             models=models,
             tp=tp,
             category=category,

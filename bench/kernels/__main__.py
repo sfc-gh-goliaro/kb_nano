@@ -24,14 +24,10 @@ Usage:
 from __future__ import annotations
 
 import argparse
-import importlib.util
 import sys
-from pathlib import Path
 
 from kb_nano.infra.kernel_swapper import (
-    _CANDIDATE_DIR,
     list_targets,
-    load_candidate,
     print_model_operator_map,
 )
 
@@ -39,29 +35,6 @@ from .result import KernelBenchResult
 from .runner import run_all_kernel_benchmarks, run_kernel_benchmark
 
 _DEFAULT_OUTPUT = "bench/results/kernels.json"
-
-
-def _import_from_path(spec_str: str):
-    """Import a callable from 'path/to/file.py:name' or 'module.path:name'."""
-    if ":" not in spec_str:
-        raise ValueError(
-            f"user-impl must be in 'path/to/file.py:ClassName' or "
-            f"'module.path:ClassName' format. Got: {spec_str!r}"
-        )
-    path_or_module, name = spec_str.rsplit(":", 1)
-
-    if path_or_module.endswith(".py"):
-        spec = importlib.util.spec_from_file_location("_user_impl", path_or_module)
-        if spec is None or spec.loader is None:
-            raise ImportError(f"Cannot load module from {path_or_module}")
-        mod = importlib.util.module_from_spec(spec)
-        spec.loader.exec_module(mod)
-    else:
-        mod = importlib.import_module(path_or_module)
-
-    if not hasattr(mod, name):
-        raise AttributeError(f"{path_or_module} has no attribute {name!r}")
-    return getattr(mod, name)
 
 
 def main():
@@ -84,10 +57,6 @@ def main():
         "--target", type=str, default=None,
         help="Benchmark target name (e.g. 'rms_norm', 'attention'). "
              "Omit to test all operators with candidates.",
-    )
-    parser.add_argument(
-        "--user-impl", type=str, default=None,
-        help="Path to user implementation: 'path/to/file.py:ClassName'",
     )
     parser.add_argument(
         "--model", nargs="+", default=None,
@@ -137,20 +106,8 @@ def main():
     output_path = args.output_json or _DEFAULT_OUTPUT
 
     if args.target is not None:
-        if args.user_impl is not None:
-            user_impl = _import_from_path(args.user_impl)
-        else:
-            user_impl = load_candidate(args.target)
-            if user_impl is None:
-                parser.error(
-                    f"No candidate kernel found for {args.target!r} in "
-                    f"{_CANDIDATE_DIR}. Provide --user-impl or place the kernel "
-                    f"in tasks/candidate/L<level>/{args.target}.py"
-                )
-
         op_result = run_kernel_benchmark(
             target_name=args.target,
-            user_impl=user_impl,
             models=args.model,
             tp=args.tp,
             category=args.category,

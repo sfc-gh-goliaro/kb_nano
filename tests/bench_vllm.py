@@ -338,9 +338,6 @@ def main():
         help="Sampling temperature (default: 0.0 for deterministic alignment)",
     )
     parser.add_argument("--enforce-eager", action="store_true", default=False)
-    parser.add_argument(
-        "--no-enforce-eager", dest="enforce_eager", action="store_false",
-    )
     parser.add_argument("--skip-vllm", action="store_true")
     parser.add_argument("--skip-throughput", action="store_true",
                         help="Skip the throughput phase (run latency only)")

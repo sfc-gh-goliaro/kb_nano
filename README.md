@@ -109,13 +109,8 @@ python -m kb_nano.bench.kernels --map
 # List targets at a specific level
 python -m kb_nano.bench.kernels --list --level 1
 
-# Benchmark a candidate kernel from tasks/candidate/ (auto-discovered)
+# Benchmark a candidate kernel from tasks/candidate/
 python -m kb_nano.bench.kernels --target rms_norm
-
-# Or specify a custom kernel explicitly
-python -m kb_nano.bench.kernels \
-    --target rms_norm \
-    --user-impl path/to/my_kernel.py:MyRMSNorm
 ```
 
 The model-to-operator mapping is derived automatically from the import graph — no manual annotations needed.

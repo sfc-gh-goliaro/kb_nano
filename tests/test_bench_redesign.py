@@ -774,20 +774,27 @@ def test_section_7():
     print("  SECTION 7: Kernel-level integration (GPU required)")
     print(f"{'=' * 60}")
 
-    # 7a. Identity replacement via the new runner
+    candidate_dir = os.path.join(PACKAGE_DIR, "tasks", "candidate", "L1")
+    candidate_file = os.path.join(candidate_dir, "rms_norm.py")
+    baseline_file = os.path.join(PACKAGE_DIR, "tasks", "baseline", "L1", "rms_norm.py")
+    had_candidate = os.path.exists(candidate_file)
+    if had_candidate:
+        original_candidate = open(candidate_file).read()
+
+    # 7a. Identity replacement via the new runner (copy baseline as candidate)
     with _Timeout(120):
         try:
+            import shutil
+            os.makedirs(candidate_dir, exist_ok=True)
+            shutil.copy2(baseline_file, candidate_file)
             result = subprocess.run(
                 [sys.executable, "-c", f"""
 import sys, json
 sys.path.insert(0, '{PROJECT_ROOT}')
 from {PACKAGE_NAME}.bench.kernels.runner import run_kernel_benchmark
-from {PACKAGE_NAME}.infra.kernel_swapper import get
 
-target = get('rms_norm')
 result = run_kernel_benchmark(
     'rms_norm',
-    user_impl=target.target_cls,
     num_warmup=2,
     num_runs=5,
 )
@@ -818,17 +825,15 @@ print(json.dumps({{
         except subprocess.TimeoutExpired:
             check(False, "7a. identity test timed out after 60s (possible hang)")
 
-    # 7b. Broken replacement
+    # 7b. Broken replacement (write broken candidate to candidates folder)
     with _Timeout(120):
         try:
-            result = subprocess.run(
-                [sys.executable, "-c", f"""
-import sys, json
-import torch, torch.nn as nn
-sys.path.insert(0, '{PROJECT_ROOT}')
-from {PACKAGE_NAME}.bench.kernels.runner import run_kernel_benchmark
+            with open(candidate_file, "w") as f:
+                f.write("""\
+import torch
+import torch.nn as nn
 
-class BrokenRMSNorm(nn.Module):
+class RMSNorm(nn.Module):
     def __init__(self, hidden_size=4096, eps=1e-6):
         super().__init__()
         self.weight = nn.Parameter(torch.ones(hidden_size))
@@ -836,10 +841,15 @@ class BrokenRMSNorm(nn.Module):
         if residual is None:
             return torch.zeros_like(x)
         return torch.zeros_like(x), residual
+""")
+            result = subprocess.run(
+                [sys.executable, "-c", f"""
+import sys, json
+sys.path.insert(0, '{PROJECT_ROOT}')
+from {PACKAGE_NAME}.bench.kernels.runner import run_kernel_benchmark
 
 result = run_kernel_benchmark(
     'rms_norm',
-    user_impl=BrokenRMSNorm,
     num_warmup=2,
     num_runs=5,
 )
@@ -868,16 +878,16 @@ print(json.dumps({{
         except subprocess.TimeoutExpired:
             check(False, "7b. broken test timed out after 60s")
 
-    # 7c. JSON output file via CLI (use --user-impl pointing to baseline RMSNorm)
+    # 7c. JSON output file via CLI (baseline as candidate in candidates folder)
     with _Timeout(180):
-        with tempfile.TemporaryDirectory() as tmpdir:
-            json_path = os.path.join(tmpdir, "kernels.json")
-            rms_path = os.path.join(PACKAGE_DIR, "tasks", "baseline", "L1", "rms_norm.py")
-            try:
+        try:
+            import shutil
+            shutil.copy2(baseline_file, candidate_file)
+            with tempfile.TemporaryDirectory() as tmpdir:
+                json_path = os.path.join(tmpdir, "kernels.json")
                 result = subprocess.run(
                     [sys.executable, "-m", "kb_nano.bench.kernels",
                      "--target", "rms_norm",
-                     "--user-impl", f"{rms_path}:RMSNorm",
                      "--output-json", json_path,
                      "--num-warmup", "2", "--num-runs", "5"],
                     timeout=120, cwd=PROJECT_ROOT,
@@ -896,8 +906,14 @@ print(json.dumps({{
                         "operators" in data and "total_scenarios" in data,
                         "7c. JSON has correct schema",
                     )
-            except subprocess.TimeoutExpired:
-                check(False, "7c. CLI test timed out after 120s")
+        except subprocess.TimeoutExpired:
+            check(False, "7c. CLI test timed out after 120s")
+        finally:
+            if had_candidate:
+                with open(candidate_file, "w") as f:
+                    f.write(original_candidate)
+            elif os.path.exists(candidate_file):
+                os.remove(candidate_file)
 
     # 7d. All-candidates default (skip if no candidates exist)
     with _Timeout(360):

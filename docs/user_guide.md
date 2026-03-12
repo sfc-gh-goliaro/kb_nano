@@ -47,9 +47,8 @@ python -m kb_nano.bench.e2e latency \
     --input-len 128 --output-len 128
 
 # Evaluate candidate kernels from tasks/candidate/ against baseline
-python -m kb_nano.bench.e2e eval \
-    --model meta-llama/Llama-3.1-8B-Instruct \
-    --input-len 512 --output-len 128 --num-prompts 100
+python -m kb_nano.bench.eval \
+    --model meta-llama/Llama-3.1-8B-Instruct
 ```
 
 ### Kernel Benchmark CLI
@@ -63,14 +62,13 @@ python -m kb_nano.bench.kernels --list
 # Show model-to-operator mapping
 python -m kb_nano.bench.kernels --map
 
-# Auto-discover candidate from tasks/candidate/
+# Benchmark a candidate from tasks/candidate/
 python -m kb_nano.bench.kernels --target rms_norm
 
-# Specify a custom implementation explicitly
+# Filter by model and TP degree
 python -m kb_nano.bench.kernels \
     --target rms_norm \
-    --user-impl path/to/my_kernel.py:RMSNorm \
-    --model meta-llama/Llama-3.1-8B-Instruct \
+    --model llama31 \
     --tp 1
 ```
 
