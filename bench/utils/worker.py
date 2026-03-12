@@ -91,7 +91,7 @@ def main():
             swapper.print_candidate_summary(candidates)
             swapper.apply_candidates(candidates)
 
-    mod = __import__(f"{pkg}.engine", fromlist=["LlamaEngine", "SamplingParams"])
+    mod = __import__(f"{pkg}.infra.engine", fromlist=["LlamaEngine", "SamplingParams"])
     LlamaEngine, SamplingParams = mod.LlamaEngine, mod.SamplingParams
 
     engine_kwargs = dict(
@@ -182,7 +182,7 @@ def main():
             swapper.print_candidate_summary(candidates)
             swapper.apply_candidates(candidates)
 
-    mod = __import__(f"{pkg}.engine", fromlist=["LlamaEngine", "SamplingParams"])
+    mod = __import__(f"{pkg}.infra.engine", fromlist=["LlamaEngine", "SamplingParams"])
     LlamaEngine, SamplingParams = mod.LlamaEngine, mod.SamplingParams
 
     engine_kwargs = dict(
