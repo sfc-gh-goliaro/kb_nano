@@ -1,4 +1,8 @@
-"""TRTLLM-gen paged attention decode kernel (via FlashInfer, Blackwell only)."""
+"""TRTLLM-gen paged attention decode kernel (via FlashInfer, Blackwell only).
+
+Accepts the same interface as FlashAttnDecode so that LlamaAttention can
+dispatch to either backend without branch logic.
+"""
 
 import torch
 import torch.nn as nn
@@ -6,11 +10,6 @@ from flashinfer.decode import trtllm_batch_decode_with_kv_cache
 
 
 class TRTLLMDecode(nn.Module):
-    """Wraps trtllm_batch_decode_with_kv_cache for paged KV cache decode.
-
-    Interface mirrors flash_attn_with_kvcache: takes block_tables and
-    cache_seqlens as GPU tensors, fully CUDA-graph-compatible.
-    """
     def __init__(self, num_qo_heads: int, num_kv_heads: int, head_dim: int,
                  workspace: torch.Tensor | None = None):
         super().__init__()
@@ -24,8 +23,11 @@ class TRTLLMDecode(nn.Module):
             )
         self._workspace = workspace
 
-    def forward(self, q, k_cache, v_cache, cache_seqlens, block_table,
-                max_seq_len, **kwargs):
+    def forward(self, q, k_cache, v_cache, cache_seqlens=None,
+                block_table=None, softmax_scale=None, causal=True,
+                max_seq_len=None, **kwargs):
+        if max_seq_len is None:
+            max_seq_len = int(cache_seqlens.max().item())
         return trtllm_batch_decode_with_kv_cache(
             query=q,
             kv_cache=(k_cache, v_cache),
@@ -33,7 +35,7 @@ class TRTLLMDecode(nn.Module):
             block_tables=block_table,
             seq_lens=cache_seqlens,
             max_seq_len=max_seq_len,
-            bmm1_scale=self.sm_scale,
+            bmm1_scale=softmax_scale if softmax_scale is not None else self.sm_scale,
             bmm2_scale=1.0,
             kv_layout="HND",
         )
