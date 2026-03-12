@@ -35,7 +35,7 @@ A standalone, high-performance LLM inference engine supporting **Llama 3.1** and
 │   │   │   └── csrc/           # CUDA/C++ kernel sources (JIT-compiled)
 │   │   │       └── custom_allreduce_kernels.cu
 │   │   ├── L2/                 # Multi-op blocks
-│   │   │   ├── attention.py    # GQA attention
+│   │   │   ├── attention.py    # LlamaAttention (GQA + QKV proj + RoPE + output proj)
 │   │   │   ├── llama_mlp.py    # Llama SwiGLU MLP
 │   │   │   ├── mixtral_moe.py  # Mixtral MoE routing + experts
 │   │   │   ├── fused_experts.py# Fused expert execution
@@ -65,10 +65,8 @@ A standalone, high-performance LLM inference engine supporting **Llama 3.1** and
 ├── engine.py                   # Batched inference engine with paged KV cache and TP
 ├── weight_loader.py            # HuggingFace safetensors weight loading with TP sharding
 └── tests/                      # Test suite
-    ├── test_vllm_alignment.py  # Token-level correctness test vs vLLM (eager mode)
     ├── test_bench.py           # Bench module tests (discovery, evaluator, replacement, integration)
-    ├── bench_vllm.py           # Multi-scenario throughput + alignment benchmark vs vLLM
-    ├── bench_throughput.py     # Throughput benchmark vs vLLM (full speed)
+    ├── bench_vllm.py           # Multi-scenario throughput + latency + alignment benchmark vs vLLM
     ├── utils/                  # Post-processing and visualization
     │   └── parse_vllm_bench_results.py  # Generate tables and plots from bench_vllm.py results
     └── debug/                  # Profiling and debugging scripts
@@ -81,27 +79,18 @@ A standalone, high-performance LLM inference engine supporting **Llama 3.1** and
 git clone git@github.com:sfc-gh-goliaro/kb-nano.git
 cd kb-nano
 
-# Single model test (vs vLLM)
-python tests/test_vllm_alignment.py --model meta-llama/Llama-3.1-8B-Instruct
+# Throughput + latency + alignment benchmark vs vLLM
+python tests/bench_vllm.py --model meta-llama/Llama-3.1-8B-Instruct
 
-# Multiple models with tensor parallelism
-python tests/test_vllm_alignment.py \
-    --model meta-llama/Llama-3.1-70B-Instruct mistralai/Mixtral-8x7B-Instruct-v0.1 \
-    --tp 4 --max-tokens 50
+# With tensor parallelism
+python tests/bench_vllm.py \
+    --model meta-llama/Llama-3.1-70B-Instruct --tp 4
 
 # Bench module tests (unit tests + GPU integration)
 python tests/test_bench.py
 
 # Bench module unit tests only (no GPU required)
 python tests/test_bench.py --unit-only
-
-# Throughput benchmark vs vLLM (both engines at full speed)
-python tests/bench_throughput.py --model meta-llama/Llama-3.1-8B-Instruct
-
-# With tensor parallelism and custom workload
-python tests/bench_throughput.py \
-    --model meta-llama/Llama-3.1-70B-Instruct --tp 4 \
-    --num-seqs 256 --max-input-len 1024 --max-output-len 1024
 ```
 
 ## Benchmarking
@@ -195,7 +184,7 @@ The engine auto-selects the attention backend based on GPU compute capability:
 
 ## Performance
 
-Run `tests/bench_throughput.py` to reproduce. Workload uses random token IDs with `ignore_eos=True`, both engines with full optimizations (`enforce_eager=False`).
+Run `tests/bench_vllm.py` to reproduce. Workload uses random token IDs with `ignore_eos=True`, both engines with full optimizations (`enforce_eager=False`).
 
 **Hardware: 4x NVIDIA H200 (NVLink)**
 
