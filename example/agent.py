@@ -605,7 +605,6 @@ def main():
 
     pkg = cfg["package_name"]
     kernel_swapper = __import__(f"{pkg}.infra.kernel_swapper", fromlist=["get", "patch_class", "restore"])
-    bench_evaluator = __import__(f"{pkg}.bench.kernels.evaluator", fromlist=["evaluate"])
     engine_mod = __import__(f"{pkg}.infra.engine", fromlist=["LlamaEngine", "SamplingParams"])
 
     LlamaEngine = engine_mod.LlamaEngine
@@ -631,7 +630,7 @@ def main():
         engine.generate(["warmup"], sp, collect_logits=False)
         torch.cuda.synchronize()
         t0 = time.perf_counter()
-        baseline_outputs = engine.generate(prompts, sp, collect_logits=True)
+        baseline_outputs = engine.generate(prompts, sp)
         torch.cuda.synchronize()
         baseline_time = time.perf_counter() - t0
     finally:
@@ -667,26 +666,26 @@ def main():
             engine.generate(["warmup"], sp, collect_logits=False)
             torch.cuda.synchronize()
             t0 = time.perf_counter()
-            user_outputs = engine.generate(prompts, sp, collect_logits=True)
+            user_outputs = engine.generate(prompts, sp)
             torch.cuda.synchronize()
             user_time = time.perf_counter() - t0
         finally:
             engine._cleanup()
             del engine
 
-        result = bench_evaluator.evaluate(
-            "all_patched", model_name,
-            baseline_outputs, user_outputs,
-            baseline_time, user_time,
-        )
+        total_match = 0
+        total_tokens = 0
+        for bo, uo in zip(baseline_outputs, user_outputs):
+            n = min(len(bo.token_ids), len(uo.token_ids))
+            total_match += sum(1 for a, b in zip(bo.token_ids[:n], uo.token_ids[:n]) if a == b)
+            total_tokens += n
+
         results_out = {
-            "kl_mean": result.kl_mean,
-            "kl_max": result.kl_max,
-            "token_match_rate": result.token_match_rate,
-            "num_tokens": result.num_tokens,
-            "baseline_time": result.baseline_time,
-            "user_time": result.user_time,
-            "speedup": result.speedup,
+            "token_match_rate": total_match / total_tokens if total_tokens else 1.0,
+            "num_tokens": total_tokens,
+            "baseline_time": baseline_time,
+            "user_time": user_time,
+            "speedup": baseline_time / user_time if user_time > 0 else float("inf"),
             "patched_ops": patched_names,
             "success": True,
         }
@@ -859,22 +858,17 @@ def print_benchmark_report(bench_result: dict) -> None:
         return
 
     print(f"  Patched operators: {bench_result['patched_ops']}")
-    print(f"  KL divergence:     mean={bench_result['kl_mean']:.6f}  "
-          f"max={bench_result['kl_max']:.6f}")
     print(f"  Token match rate:  {bench_result['token_match_rate']:.1%} "
           f"({bench_result['num_tokens']} tokens)")
     print(f"  Baseline time:     {bench_result['baseline_time']:.3f}s")
     print(f"  User time:         {bench_result['user_time']:.3f}s")
     print(f"  Speedup:           {bench_result['speedup']:.2f}x")
 
-    kl = bench_result["kl_mean"]
     match = bench_result["token_match_rate"]
     speedup = bench_result["speedup"]
 
     print(f"\n  Verdict: ", end="")
-    if kl > 0.1:
-        print("POOR correctness (KL > 0.1)")
-    elif match < 0.5:
+    if match < 0.5:
         print("POOR correctness (token match < 50%)")
     elif speedup >= 1.0:
         print(f"GOOD -- {speedup:.2f}x speedup with acceptable correctness")

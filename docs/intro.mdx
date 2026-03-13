@@ -121,7 +121,7 @@ Welcome to KB Nano, your launchpad for engineering the world's fastest GPU code.
         --model meta-llama/Llama-3.1-8B-Instruct
     ```
 
-    A kernel benchmark is **PASS** if `kl_mean < 0.1`. Speedup > 1.0 means your implementation is faster than the baseline.
+    A kernel benchmark is **PASS** if the candidate output passes `allclose` against the baseline. Speedup > 1.0 means your implementation is faster than the baseline.
 
     [More benchmarking options](/benchmarking)
   </Step>

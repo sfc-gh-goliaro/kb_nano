@@ -12,7 +12,7 @@ The agent follows a four-stage pipeline:
 1. **Discover** — Given a model and an operator level (L1–L4), the agent queries the benchmark registry to find all target operators.
 2. **Generate** — For each operator, the agent sends the baseline source code to an LLM with a prompt requesting a faster replacement. All operators are generated in parallel.
 3. **Validate** — Each generated kernel is compiled and checked: does the class name match? Does `__init__` succeed? If validation fails, the error is fed back to the LLM for retry (up to `--max-retries` attempts).
-4. **Benchmark** — All successful kernels are patched into the model and benchmarked end-to-end, measuring KL divergence, token match rate, and wall-clock speedup. If a kernel causes a runtime failure, the agent identifies it, re-generates it, and re-runs the benchmark.
+4. **Benchmark** — All successful kernels are patched into the model and benchmarked end-to-end, measuring token match rate and wall-clock speedup. If a kernel causes a runtime failure, the agent identifies it, re-generates it, and re-runs the benchmark.
 
 ## Running the Example Agent
 

@@ -53,7 +53,7 @@ python -m kb_nano.bench.eval \
 
 ### Kernel Benchmark CLI
 
-`python -m kb_nano.bench.kernels` benchmarks a single operator replacement. It monkey-patches the target class, rebuilds the model, runs inference, and compares KL divergence, token match rate, and wall-clock speedup against the baseline.
+`python -m kb_nano.bench.kernels` benchmarks a single operator replacement. It instantiates the baseline and candidate modules, compares their `forward()` outputs for correctness (`allclose` + mean absolute difference), and measures wall-clock speedup.
 
 ```bash
 # List all benchmarkable targets
@@ -72,7 +72,7 @@ python -m kb_nano.bench.kernels \
     --tp 1
 ```
 
-A benchmark is **PASS** if `kl_mean < 0.1`. Speedup > 1.0 means your kernel is faster than the baseline.
+A benchmark is **PASS** if the candidate output passes `allclose` against the baseline. Speedup > 1.0 means your kernel is faster than the baseline.
 
 ### vLLM Alignment Test
 
@@ -119,7 +119,7 @@ python -m kb_nano.example \
     --model mistralai/Mixtral-8x7B-Instruct-v0.1 --level 2 --tp 4
 ```
 
-The agent discovers operators at the specified level, generates replacements in parallel, validates compilation and numerical correctness, patches all successful kernels into the model, and reports KL divergence, token match rate, and speedup. Failed kernels are retried with error feedback.
+The agent discovers operators at the specified level, generates replacements in parallel, validates compilation and numerical correctness, patches all successful kernels into the model, and reports token match rate and speedup. Failed kernels are retried with error feedback.
 
 Generated kernels are saved to `tasks/candidate/L{level}/{op_name}.py`.
 

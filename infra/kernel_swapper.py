@@ -16,7 +16,7 @@ infra/kernel_swapper.py:
    them in bulk.
 
 Used by:
-  - bench/kernels/{runner,evaluator,__main__}.py  (kernel-level benchmarking)
+  - bench/kernels/{runner,__main__}.py             (kernel-level benchmarking)
   - bench/e2e/{throughput,latency,serve}.py       (auto-detect all candidates)
   - infra/server.py                               (auto-detect all candidates)
   - example/{agent,create_stubs}.py               (target introspection)
