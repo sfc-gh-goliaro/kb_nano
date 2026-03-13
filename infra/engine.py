@@ -122,6 +122,8 @@ class Sequence:
         self.video_grid_thw = None
         self.mrope_position_delta: int = 0
         self.mrope_positions = None  # (3, seq_len) tensor computed at prefill
+        self._cached_embeds = None  # cached vision encoder output (full seq embeddings)
+        self._cached_deepstack = None  # cached deepstack embeddings
 
     def __len__(self):
         if self.token_ids is not None:
@@ -184,6 +186,10 @@ class Sequence:
             self._last_token = state[-1]
         self.prompt_ids = []
         self.generated_ids = []
+        self.mrope_positions = None
+        self.mrope_position_delta = 0
+        self._cached_embeds = None
+        self._cached_deepstack = None
 
 
 # ---------------------------------------------------------------------------
@@ -567,6 +573,8 @@ class ModelRunner:
         input_ids, positions = [], []
         slot_mapping = []
         block_size = self.block_size
+        use_mrope = self.is_qwen_vl
+        mrope_pos_list = [] if use_mrope else None
 
         # --- Prefill portion ---
         pf_cu_q, pf_cu_k = [0], [0]
@@ -577,7 +585,15 @@ class ModelRunner:
             start_pos = seq.num_computed_tokens
             chunk_ids = seq.token_ids[start_pos:start_pos + chunk_size]
             input_ids.extend(chunk_ids)
-            positions.extend(range(start_pos, start_pos + chunk_size))
+            if use_mrope and seq.mrope_positions is not None:
+                mrope_pos_list.append(seq.mrope_positions[:, start_pos:start_pos + chunk_size])
+            else:
+                positions.extend(range(start_pos, start_pos + chunk_size))
+                if use_mrope:
+                    mrope_pos_list.append(
+                        torch.arange(start_pos, start_pos + chunk_size,
+                                     dtype=torch.int64).unsqueeze(0).expand(3, -1)
+                    )
 
             kv_len = start_pos + chunk_size
             pf_cu_q.append(pf_cu_q[-1] + chunk_size)
@@ -611,7 +627,14 @@ class ModelRunner:
         dc_max_bt = 0
         for i, seq in enumerate(decode_seqs):
             input_ids.append(seq.last_token)
-            positions.append(len(seq) - 1)
+            base_pos = len(seq) - 1
+            if use_mrope:
+                decode_pos = base_pos + seq.mrope_position_delta
+                mrope_pos_list.append(
+                    torch.full((3, 1), decode_pos, dtype=torch.int64)
+                )
+            else:
+                positions.append(base_pos)
             dc_cl[i] = len(seq)
             slot_mapping.append(
                 seq.block_table[-1] * block_size + seq.last_block_num_tokens - 1
@@ -626,7 +649,6 @@ class ModelRunner:
             dc_bt[i, :len(b)] = b
         dc_max_cl = int(dc_cl[:nd].max()) if nd > 0 else 0
 
-        # logit_indices: last token of each prefill chunk + all decode tokens
         logit_idx = []
         for i in range(num_prefill_seqs):
             logit_idx.append(pf_cu_q[i + 1] - 1)
@@ -648,15 +670,18 @@ class ModelRunner:
             decode_max_context_len=dc_max_cl,
             logit_indices=torch.tensor(logit_idx, dtype=torch.int64, pin_memory=True).cuda(non_blocking=True),
         )
-        return (
-            torch.tensor(input_ids, dtype=torch.int64, pin_memory=True).cuda(non_blocking=True),
-            torch.tensor(positions, dtype=torch.int64, pin_memory=True).cuda(non_blocking=True),
-        )
+
+        input_ids_t = torch.tensor(input_ids, dtype=torch.int64, pin_memory=True).cuda(non_blocking=True)
+        if use_mrope:
+            positions_t = torch.cat(mrope_pos_list, dim=1).to(torch.int64).pin_memory().cuda(non_blocking=True)
+        else:
+            positions_t = torch.tensor(positions, dtype=torch.int64, pin_memory=True).cuda(non_blocking=True)
+        return (input_ids_t, positions_t)
 
     @torch.inference_mode()
     def run_model(self, input_ids, positions, is_prefill, inputs_embeds=None,
                   deepstack_embeds=None):
-        if is_prefill or self.enforce_eager or input_ids.size(0) > self.graph_bs_list[-1]:
+        if is_prefill or self.enforce_eager or not self.graph_bs_list or input_ids.size(0) > self.graph_bs_list[-1]:
             if inputs_embeds is not None:
                 return self.model.compute_logits(
                     self.model(input_ids, positions, inputs_embeds=inputs_embeds,
@@ -696,7 +721,7 @@ class ModelRunner:
         """
         n, ids_np, pos_np, sm_np, cl_np, bt_np = decode_data
 
-        if self.enforce_eager:
+        if self.enforce_eager or not self.graph_bs_list or n > self.graph_bs_list[-1]:
             return self._run_decode_greedy_eager(n, ids_np, pos_np, sm_np, cl_np, bt_np)
 
         self._run_graph_from_numpy(n, ids_np, pos_np, sm_np, cl_np, bt_np)
@@ -730,7 +755,7 @@ class ModelRunner:
         """
         n, ids_np, pos_np, sm_np, cl_np, bt_np = decode_data
 
-        if self.enforce_eager:
+        if self.enforce_eager or not self.graph_bs_list or n > self.graph_bs_list[-1]:
             result = self._run_decode_greedy_eager(n, ids_np, pos_np, sm_np, cl_np, bt_np)
             if result is not None:
                 main_stream = torch.cuda.current_stream()
@@ -1047,6 +1072,17 @@ class ModelRunner:
 
     @torch.inference_mode()
     def capture_cudagraph(self):
+        from ..tasks.baseline.L2.fused_experts import FusedExperts
+        if FusedExperts._use_shared_cache and not FusedExperts._use_flashinfer:
+            print("  MoE model detected without FlashInfer — skipping CUDA graph capture (using eager mode for decode)")
+            self.enforce_eager = True
+            self.graph_bs_list = []
+            self.graphs = {}
+            self.graph_pool = None
+            self.graph_vars = None
+            self._graph_bs_for_n = []
+            return
+
         from contextlib import nullcontext
         max_bs = self.max_num_seqs
         max_num_blocks = (self.max_model_len + BLOCK_SIZE - 1) // BLOCK_SIZE
@@ -1247,6 +1283,9 @@ class LlamaEngine:
     def _run_vision_encoder(self, seqs):
         """Run vision encoder for sequences with multimodal data and merge embeddings.
 
+        Caches embeddings on the Sequence object so the vision encoder only
+        runs once per sequence even with chunked prefill.
+
         Returns (inputs_embeds, deepstack_embeds) where deepstack_embeds is a list
         of tensors for Qwen3-VL DeepStack, or None for Qwen2-VL.
         """
@@ -1256,6 +1295,12 @@ class LlamaEngine:
         all_deepstack = [] if has_deepstack else None
 
         for seq in seqs:
+            if seq._cached_embeds is not None:
+                all_inputs_embeds.append(seq._cached_embeds)
+                if has_deepstack:
+                    all_deepstack.append(seq._cached_deepstack or [])
+                continue
+
             token_ids = torch.tensor(seq.token_ids, dtype=torch.int64, device="cuda")
             text_embeds = model.get_input_embeddings()(token_ids)
             seq_deepstack = [] if has_deepstack else None
@@ -1288,6 +1333,8 @@ class LlamaEngine:
                             ds_expanded[mask] = ds_feat.to(text_embeds.dtype)
                         seq_deepstack.append(ds_expanded)
 
+                seq.pixel_values = None
+
             if seq.video_pixel_values is not None:
                 video_pv = seq.video_pixel_values.cuda()
                 grid_thw = seq.video_grid_thw
@@ -1313,9 +1360,13 @@ class LlamaEngine:
                         else:
                             seq_deepstack.append(ds_expanded)
 
+                seq.video_pixel_values = None
+
+            seq._cached_embeds = text_embeds
+            seq._cached_deepstack = seq_deepstack
             all_inputs_embeds.append(text_embeds)
             if has_deepstack:
-                all_deepstack.append(seq_deepstack)
+                all_deepstack.append(seq_deepstack or [])
 
         inputs_embeds = torch.cat(all_inputs_embeds, dim=0)
 
@@ -1333,6 +1384,32 @@ class LlamaEngine:
             return inputs_embeds, deepstack_embeds
 
         return inputs_embeds, None
+
+    def _slice_mm_embeds(self, prefill_seqs, prefill_chunk_sizes,
+                         inputs_embeds, deepstack_embeds):
+        """Slice full-sequence embeddings to match chunked prefill tokens."""
+        parts = []
+        offset = 0
+        for seq, chunk_size in zip(prefill_seqs, prefill_chunk_sizes):
+            seq_len = len(seq.token_ids)
+            start = seq.num_computed_tokens
+            parts.append(inputs_embeds[offset + start:offset + start + chunk_size])
+            offset += seq_len
+        sliced = torch.cat(parts, dim=0)
+
+        sliced_ds = None
+        if deepstack_embeds is not None:
+            sliced_ds = []
+            for level_embed in deepstack_embeds:
+                level_parts = []
+                off = 0
+                for seq, chunk_size in zip(prefill_seqs, prefill_chunk_sizes):
+                    seq_len = len(seq.token_ids)
+                    start = seq.num_computed_tokens
+                    level_parts.append(level_embed[off + start:off + start + chunk_size])
+                    off += seq_len
+                sliced_ds.append(torch.cat(level_parts, dim=0))
+        return sliced, sliced_ds
 
     @torch.inference_mode()
     def generate(self, prompts, sampling_params, collect_logits: bool = False,
@@ -1457,6 +1534,8 @@ class LlamaEngine:
         def _finish_seq(seq: Sequence) -> None:
             nonlocal _pbar_pending, _pbar_pending_in, _pbar_pending_out
             seq.status = SeqStatus.FINISHED
+            seq._cached_embeds = None
+            seq._cached_deepstack = None
             bm.deallocate(seq)
             if pbar is not None:
                 _pbar_pending += 1
@@ -1772,15 +1851,31 @@ class LlamaEngine:
                 # Pure prefill (no running decode seqs)
                 has_mm = self.is_qwen_vl and any(
                     s.pixel_values is not None or s.video_pixel_values is not None
+                    or s._cached_embeds is not None
                     for s in prefill_seqs
                 )
                 if has_mm:
-                    inputs_embeds, deepstack_embeds = self._run_vision_encoder(prefill_seqs)
-                    input_ids_t, positions_t = self.model_runner.prepare_prefill(prefill_seqs)
+                    full_embeds, full_ds = self._run_vision_encoder(prefill_seqs)
+                    is_chunked = any(
+                        cs < len(s.token_ids) - s.num_computed_tokens
+                        or s.num_computed_tokens > 0
+                        for s, cs in zip(prefill_seqs, prefill_chunk_sizes)
+                    )
+                    if is_chunked:
+                        chunk_embeds, chunk_ds = self._slice_mm_embeds(
+                            prefill_seqs, prefill_chunk_sizes,
+                            full_embeds, full_ds,
+                        )
+                        input_ids_t, positions_t = self.model_runner.prepare_mixed_batch(
+                            prefill_seqs, prefill_chunk_sizes, [],
+                        )
+                    else:
+                        chunk_embeds, chunk_ds = full_embeds, full_ds
+                        input_ids_t, positions_t = self.model_runner.prepare_prefill(prefill_seqs)
                     logits = self.model_runner.run_model(
                         input_ids_t, positions_t, True,
-                        inputs_embeds=inputs_embeds,
-                        deepstack_embeds=deepstack_embeds,
+                        inputs_embeds=chunk_embeds,
+                        deepstack_embeds=chunk_ds,
                     )
                     reset_context()
                 else:
@@ -1798,17 +1893,37 @@ class LlamaEngine:
                 # Mixed batch: prefill + decode together
                 has_mm = self.is_qwen_vl and any(
                     s.pixel_values is not None or s.video_pixel_values is not None
+                    or s._cached_embeds is not None
                     for s in prefill_seqs
                 )
                 if has_mm:
-                    inputs_embeds, deepstack_embeds = self._run_vision_encoder(prefill_seqs)
+                    full_embeds, full_ds = self._run_vision_encoder(prefill_seqs)
+                    chunk_embeds, chunk_ds = self._slice_mm_embeds(
+                        prefill_seqs, prefill_chunk_sizes,
+                        full_embeds, full_ds,
+                    )
                     input_ids_t, positions_t = self.model_runner.prepare_mixed_batch(
                         prefill_seqs, prefill_chunk_sizes, decode_seqs,
                     )
+                    n_prefill_tokens = chunk_embeds.size(0)
+                    n_decode_tokens = len(decode_seqs)
+                    model = self.model_runner.model
+                    decode_ids = input_ids_t[n_prefill_tokens:]
+                    decode_embeds = model.get_input_embeddings()(decode_ids)
+                    combined_embeds = torch.cat([chunk_embeds, decode_embeds], dim=0)
+                    combined_ds = None
+                    if chunk_ds is not None:
+                        combined_ds = []
+                        for level_embed in chunk_ds:
+                            pad = torch.zeros(
+                                n_decode_tokens, level_embed.size(1),
+                                dtype=level_embed.dtype, device=level_embed.device,
+                            )
+                            combined_ds.append(torch.cat([level_embed, pad], dim=0))
                     logits = self.model_runner.run_model(
                         input_ids_t, positions_t, True,
-                        inputs_embeds=inputs_embeds,
-                        deepstack_embeds=deepstack_embeds,
+                        inputs_embeds=combined_embeds,
+                        deepstack_embeds=combined_ds,
                     )
                     reset_context()
                 else:
@@ -1883,11 +1998,11 @@ class LlamaEngine:
         for i, (seq, chunk) in enumerate(zip(prefill_seqs, prefill_chunk_sizes)):
             seq.num_computed_tokens += chunk
             if seq.num_remaining_prefill == 0:
-                # Prefill complete — sample first decode token
+                seq._cached_embeds = None
+                seq._cached_deepstack = None
                 sample_seqs.append(seq)
                 sample_logits.append(logits[i:i+1])
             else:
-                # More prefill chunks needed
                 prefilling.append(seq)
 
         if not sample_seqs:

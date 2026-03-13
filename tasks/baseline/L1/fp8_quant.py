@@ -77,17 +77,27 @@ class PerTokenGroupQuantFP8(nn.Module):
     def __init__(self, group_size: int = 128):
         super().__init__()
         self.group_size = group_size
+        self._q_buf = None
+        self._s_buf = None
 
     def forward(self, x: torch.Tensor) -> tuple[torch.Tensor, torch.Tensor]:
         assert x.shape[-1] % self.group_size == 0
         assert x.is_contiguous()
 
-        x_q = torch.empty(x.shape, device=x.device, dtype=_FP8_DTYPE)
-        x_s = torch.empty(
-            x.shape[:-1] + (x.shape[-1] // self.group_size,),
-            device=x.device,
-            dtype=torch.float32,
-        )
+        q_shape = x.shape
+        s_shape = x.shape[:-1] + (x.shape[-1] // self.group_size,)
+        n = x.numel()
+        s_n = 1
+        for d in s_shape:
+            s_n *= d
+
+        if self._q_buf is None or self._q_buf.numel() < n:
+            self._q_buf = torch.empty(n, device=x.device, dtype=_FP8_DTYPE)
+        if self._s_buf is None or self._s_buf.numel() < s_n:
+            self._s_buf = torch.empty(s_n, device=x.device, dtype=torch.float32)
+
+        x_q = self._q_buf[:n].view(q_shape)
+        x_s = self._s_buf[:s_n].view(s_shape)
 
         if _HAS_VLLM_CUDA_QUANT:
             torch.ops._C.per_token_group_fp8_quant(

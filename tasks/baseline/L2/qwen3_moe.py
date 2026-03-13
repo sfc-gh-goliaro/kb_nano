@@ -13,6 +13,7 @@ from sgl_kernel.moe import topk_softmax as _sgl_topk_softmax
 
 from ....infra.tp import _tp_rank, _tp_size
 from ..L1.allreduce import AllReduce
+from ..L1.flashinfer_moe import is_available as _fi_available, swap_w13_to_w31
 from .fused_experts import FusedExperts
 
 
@@ -82,6 +83,8 @@ class Qwen3MoE(nn.Module):
         self.allreduce = AllReduce()
         self._topk_weights = None
         self._topk_ids = None
+        self._topk_weights_bf16 = None
+        self._weights_prepared = False
 
     def _w13_weight_loader(self, param, loaded_weight, expert_id: int = -1,
                            is_w1: bool = True):
@@ -165,12 +168,31 @@ class Qwen3MoE(nn.Module):
         s = loaded_weight.transpose(1, 2)
         param.data.copy_(s[:, :, rank * scale_cols_per_shard:(rank + 1) * scale_cols_per_shard])
 
+    def _prepare_flashinfer_weights(self):
+        """Swap W13 -> W31 layout and clamp scales for FlashInfer kernels.
+
+        Called lazily on first forward after weights are loaded.
+        """
+        if self._weights_prepared:
+            return
+        self._weights_prepared = True
+        if not _fi_available():
+            return
+        self.w13.data = swap_w13_to_w31(self.w13.data)
+        self.w13_scale_inv.data = swap_w13_to_w31(self.w13_scale_inv.data)
+        _MIN_BLOCK_SCALE = 1e-10
+        self.w13_scale_inv.data.clamp_(min=_MIN_BLOCK_SCALE)
+        self.w2_scale_inv.data.clamp_(min=_MIN_BLOCK_SCALE)
+
     def _ensure_routing_buffers(self, M, device):
         if self._topk_weights is None or self._topk_weights.size(0) < M:
             self._topk_weights = torch.empty(M, self.top_k, device=device, dtype=torch.float32)
             self._topk_ids = torch.empty(M, self.top_k, device=device, dtype=torch.int32)
+            self._topk_weights_bf16 = torch.empty(M, self.top_k, device=device, dtype=torch.bfloat16)
 
     def forward(self, hidden_states: torch.Tensor) -> torch.Tensor:
+        self._prepare_flashinfer_weights()
+
         orig_shape = hidden_states.shape
         hidden_states = hidden_states.view(-1, self.hidden_size)
         M = hidden_states.size(0)
@@ -181,13 +203,15 @@ class Qwen3MoE(nn.Module):
         topk_ids = self._topk_ids[:M]
         _sgl_topk_softmax(topk_weights, topk_ids, router_logits,
                           renormalize=self.norm_topk_prob)
-        topk_weights = topk_weights.to(hidden_states.dtype)
+        topk_weights_bf16 = self._topk_weights_bf16[:M]
+        topk_weights_bf16.copy_(topk_weights)
 
         out = self.fused_experts(
             hidden_states, self.w13, self.w2,
-            topk_weights, topk_ids, self.num_experts,
+            topk_weights_bf16, topk_ids, self.num_experts,
             w13_scale_inv=self.w13_scale_inv,
             w2_scale_inv=self.w2_scale_inv,
+            intermediate_size=self.moe_intermediate_per_tp,
         )
 
         if self.tp_size > 1:
