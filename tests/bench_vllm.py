@@ -2,17 +2,22 @@
 """
 Throughput and alignment benchmark: kb-nano baseline vs vLLM.
 
-Runs three scenarios (prefill-heavy, balanced, decode-heavy) with random
-token IDs, compares throughput and per-token alignment.
+For LLM models: runs three text-only scenarios (prefill-heavy, balanced,
+decode-heavy) with random token IDs.
+
+For VLM models (Qwen2-VL, Qwen3-VL): runs three throughput scenarios
+(text-only, image, video) and two latency scenarios (single-image,
+single-video) using real multimodal datasets (VisionArena, MMVU).
 
 Each engine (vLLM, kb-nano) is loaded once in a single long-lived subprocess
 that processes all scenarios sequentially, avoiding repeated model loading.
 
 Usage:
+    # LLM benchmark
     python tests/bench_vllm.py --model meta-llama/Llama-3.1-8B-Instruct
 
-    python tests/bench_vllm.py \
-        --model meta-llama/Llama-3.1-70B-Instruct --tp 4
+    # VLM benchmark (auto-detected from model name)
+    python tests/bench_vllm.py --model Qwen/Qwen2-VL-7B-Instruct
 
     python tests/bench_vllm.py --skip-vllm  # kb-nano only
 """
@@ -66,8 +71,29 @@ LATENCY_SCENARIOS = [
     {"name": "fixed-batch-32",  "input_len": 128, "output_len": 128, "batch_size": 32},
 ]
 
+VLM_SCENARIOS = [
+    {"name": "text-only",  "modality": "text",  "input_len": 512, "output_len": 1024},
+    {"name": "image",      "modality": "image", "output_len": 512,
+     "dataset": "lmarena-ai/VisionArena-Chat", "dataset_split": "train"},
+    {"name": "video",      "modality": "video", "output_len": 512,
+     "dataset": "yale-nlp/MMVU", "dataset_split": "validation"},
+]
+
+VLM_LATENCY_SCENARIOS = [
+    {"name": "single-image", "modality": "image", "output_len": 128, "batch_size": 1,
+     "dataset": "lmarena-ai/VisionArena-Chat", "dataset_split": "train"},
+    {"name": "single-video", "modality": "video", "output_len": 128, "batch_size": 1,
+     "dataset": "yale-nlp/MMVU", "dataset_split": "validation"},
+]
+
+
+def _is_vlm_model(model_name: str) -> bool:
+    lower = model_name.lower()
+    return "qwen" in lower and "vl" in lower
+
+
 # ---------------------------------------------------------------------------
-# Multi-scenario vLLM subprocess worker
+# Multi-scenario vLLM subprocess worker (LLM, text-only)
 # ---------------------------------------------------------------------------
 VLLM_WORKER = r'''
 import json, os, sys, time
@@ -281,6 +307,354 @@ if __name__ == "__main__":
 
 
 # ---------------------------------------------------------------------------
+# Multi-scenario vLLM subprocess worker (VLM, multi-modal)
+# ---------------------------------------------------------------------------
+VLLM_VLM_WORKER = r'''
+import json, os, sys, time
+os.environ.setdefault("VLLM_WORKER_MULTIPROC_METHOD", "spawn")
+
+def _load_mm_samples(dataset_name, dataset_split, num_seqs, seed):
+    """Load multimodal samples using vllm's dataset infrastructure."""
+    if "VisionArena" in dataset_name:
+        from vllm.benchmarks.datasets import VisionArenaDataset
+        ds = VisionArenaDataset(
+            dataset_path=dataset_name,
+            dataset_split=dataset_split,
+            random_seed=seed,
+        )
+    elif "MMVU" in dataset_name:
+        from vllm.benchmarks.datasets import MMVUDataset
+        ds = MMVUDataset(
+            dataset_path=dataset_name,
+            dataset_split=dataset_split,
+            random_seed=seed,
+        )
+    else:
+        raise ValueError(f"Unsupported dataset: {dataset_name}")
+    from transformers import AutoTokenizer
+    tokenizer = AutoTokenizer.from_pretrained(
+        os.environ["_BENCH_MODEL_NAME"], trust_remote_code=True)
+    return ds.sample(tokenizer, num_seqs, enable_multimodal_chat=True)
+
+
+def main():
+    from vllm import LLM, SamplingParams
+
+    with open(sys.argv[1]) as f:
+        cfg = json.load(f)
+
+    os.environ["_BENCH_MODEL_NAME"] = cfg["model"]
+
+    llm = LLM(
+        model=cfg["model"],
+        seed=cfg["seed"],
+        enforce_eager=cfg.get("enforce_eager", False),
+        tensor_parallel_size=cfg["tp"],
+        gpu_memory_utilization=cfg.get("gpu_memory_utilization", 0.9),
+        max_model_len=cfg["max_model_len"],
+        enable_prefix_caching=False,
+    )
+
+    llm.generate(
+        [dict(prompt_token_ids=[0] * 16)],
+        SamplingParams(temperature=0.0, max_tokens=16),
+    )
+
+    scenarios = cfg["scenarios"]
+    all_results = []
+    temperature = cfg.get("temperature", 0.0)
+
+    for scenario in scenarios:
+        modality = scenario.get("modality", "text")
+
+        if modality == "text":
+            prompt_token_ids = scenario["prompt_token_ids"]
+            output_lens = scenario["output_lens"]
+            sp_list = [
+                SamplingParams(temperature=temperature,
+                               ignore_eos=True, max_tokens=ol)
+                for ol in output_lens
+            ]
+            vllm_prompts = [dict(prompt_token_ids=p) for p in prompt_token_ids]
+            start = time.perf_counter()
+            outputs = llm.generate(vllm_prompts, sp_list)
+            elapsed = time.perf_counter() - start
+        else:
+            samples = _load_mm_samples(
+                scenario["dataset"], scenario["dataset_split"],
+                scenario["num_seqs"], cfg["seed"],
+            )
+            sp_list = [
+                SamplingParams(temperature=temperature,
+                               ignore_eos=True,
+                               max_tokens=s.expected_output_len)
+                for s in samples
+            ]
+            chat_prompts = [s.prompt for s in samples]
+            start = time.perf_counter()
+            outputs = llm.chat(chat_prompts, sp_list, use_tqdm=True)
+            elapsed = time.perf_counter() - start
+
+        total_prompt_tokens = sum(
+            len(o.prompt_token_ids) if o.prompt_token_ids else 0
+            for o in outputs
+        )
+        total_output_tokens = sum(
+            sum(len(c.token_ids) for c in o.outputs if c)
+            for o in outputs
+        )
+        result = {
+            "name": scenario["name"],
+            "elapsed": elapsed,
+            "total_prompt_tokens": total_prompt_tokens,
+            "total_output_tokens": total_output_tokens,
+            "outputs": [
+                {"text": o.outputs[0].text,
+                 "token_ids": list(o.outputs[0].token_ids)}
+                for o in outputs
+            ],
+        }
+        all_results.append(result)
+
+    latency_results = []
+    for ls in cfg.get("latency_scenarios", []):
+        modality = ls.get("modality", "text")
+
+        if modality == "text":
+            prompts = [dict(prompt_token_ids=p) for p in ls["prompt_token_ids"]]
+            sp = SamplingParams(temperature=0.0,
+                                ignore_eos=True, max_tokens=ls["output_len"])
+            run_fn = lambda: llm.generate(prompts, sp, use_tqdm=False)
+        else:
+            samples = _load_mm_samples(
+                ls["dataset"], ls["dataset_split"], 1, cfg["seed"],
+            )
+            sp = SamplingParams(temperature=0.0, ignore_eos=True,
+                                max_tokens=ls["output_len"])
+            chat_prompts = [samples[0].prompt]
+            run_fn = lambda: llm.chat(chat_prompts, sp, use_tqdm=False)
+
+        num_warmup = ls.get("num_warmup", 3)
+        num_iters = ls.get("num_iters", 5)
+        for _ in range(num_warmup):
+            run_fn()
+        latencies = []
+        for _ in range(num_iters):
+            t0 = time.perf_counter()
+            run_fn()
+            latencies.append(time.perf_counter() - t0)
+        latency_results.append({
+            "name": ls["name"],
+            "batch_size": ls["batch_size"],
+            "output_len": ls["output_len"],
+            "num_iters": num_iters,
+            "latencies": latencies,
+        })
+
+    del llm
+
+    with open(cfg["output_file"], "w") as f:
+        json.dump({"throughput": all_results, "latency": latency_results}, f)
+
+if __name__ == "__main__":
+    main()
+'''
+
+# ---------------------------------------------------------------------------
+# Multi-scenario kb-nano subprocess worker (VLM, multi-modal)
+# ---------------------------------------------------------------------------
+KB_NANO_VLM_WORKER = r'''
+import json, sys, time
+
+def _load_raw_mm_data(dataset_name, dataset_split, num_seqs, seed):
+    """Load raw PIL images or video frames from HF datasets."""
+    from datasets import load_dataset
+    data = load_dataset(dataset_name, split=dataset_split, streaming=True,
+                        trust_remote_code=True)
+    data = data.shuffle(seed=seed)
+
+    results = []
+    if "VisionArena" in dataset_name:
+        for i, item in enumerate(data):
+            if len(results) >= num_seqs:
+                break
+            prompt = item["conversation"][0][0]["content"]
+            from PIL import Image
+            img = item["images"][0]
+            if isinstance(img, dict) and "bytes" in img:
+                from io import BytesIO
+                img = Image.open(BytesIO(img["bytes"]))
+            if isinstance(img, Image.Image):
+                img = img.convert("RGB")
+            results.append({"prompt": prompt, "images": [[img]]})
+    elif "MMVU" in dataset_name:
+        from huggingface_hub import snapshot_download
+        local_root = snapshot_download(dataset_name, repo_type="dataset")
+        remote_root = f"https://huggingface.co/datasets/{dataset_name}/resolve/main"
+        for i, item in enumerate(data):
+            if len(results) >= num_seqs:
+                break
+            prompt = item["question"] + " " + " ".join(
+                f"{k}.{v}" for k, v in item["choices"].items())
+            video_path = item["video"].replace(remote_root, local_root)
+            from vllm.assets.video import VideoAsset
+            import decord
+            decord.bridge.set_bridge("torch")
+            vr = decord.VideoReader(video_path)
+            total = len(vr)
+            num_frames = min(total, 16)
+            indices = [int(i * total / num_frames) for i in range(num_frames)]
+            from PIL import Image
+            frames = [Image.fromarray(
+                vr[idx].numpy()).convert("RGB") for idx in indices]
+            results.append({"prompt": prompt, "videos": [[frames]]})
+    return results
+
+
+def main():
+    with open(sys.argv[1]) as f:
+        cfg = json.load(f)
+    sys.path.insert(0, cfg["project_root"])
+    pkg = cfg["package_name"]
+
+    mod = __import__(f"{pkg}.infra.engine", fromlist=["LlamaEngine", "SamplingParams"])
+    LlamaEngine, SamplingParams = mod.LlamaEngine, mod.SamplingParams
+
+    engine_kwargs = dict(
+        model_name=cfg["model"],
+        seed=cfg["seed"],
+        enforce_eager=cfg.get("enforce_eager", False),
+        tensor_parallel_size=cfg["tp"],
+    )
+    if "gpu_memory_utilization" in cfg:
+        engine_kwargs["gpu_memory_utilization"] = cfg["gpu_memory_utilization"]
+    if "max_model_len" in cfg:
+        engine_kwargs["max_model_len"] = cfg["max_model_len"]
+    engine = LlamaEngine(**engine_kwargs)
+
+    engine.generate(["warmup"], SamplingParams(temperature=0.0, max_tokens=16))
+
+    import torch
+    scenarios = cfg["scenarios"]
+    all_results = []
+    temperature = cfg.get("temperature", 0.0)
+    top_p = cfg.get("top_p", 1.0)
+
+    for scenario in scenarios:
+        modality = scenario.get("modality", "text")
+
+        if modality == "text":
+            prompts = scenario["prompt_token_ids"]
+            output_lens = scenario["output_lens"]
+            sp_list = [
+                SamplingParams(temperature=temperature, top_p=top_p,
+                               max_tokens=ol, ignore_eos=True)
+                for ol in output_lens
+            ]
+            engine.block_manager.reset()
+            torch.cuda.synchronize()
+            start = time.perf_counter()
+            outputs = engine.generate(prompts, sp_list, use_tqdm=True)
+            torch.cuda.synchronize()
+            elapsed = time.perf_counter() - start
+            total_input_tokens = sum(len(p) for p in prompts)
+        else:
+            mm_data = _load_raw_mm_data(
+                scenario["dataset"], scenario["dataset_split"],
+                scenario["num_seqs"], cfg["seed"],
+            )
+            sp = SamplingParams(temperature=temperature, top_p=top_p,
+                                max_tokens=scenario["output_len"],
+                                ignore_eos=True)
+            all_outputs = []
+            total_input_tokens = 0
+            engine.block_manager.reset()
+            torch.cuda.synchronize()
+            start = time.perf_counter()
+            for item in mm_data:
+                out = engine.generate(
+                    [item["prompt"]], sp,
+                    images=item.get("images"),
+                    videos=item.get("videos"),
+                )
+                all_outputs.extend(out)
+            torch.cuda.synchronize()
+            elapsed = time.perf_counter() - start
+            outputs = all_outputs
+
+        total_output_tokens = sum(len(o.token_ids) for o in outputs)
+
+        result = {
+            "name": scenario["name"],
+            "elapsed": elapsed,
+            "total_input_tokens": total_input_tokens if modality == "text" else 0,
+            "total_output_tokens": total_output_tokens,
+            "outputs": [
+                {"generated_text": o.generated_text,
+                 "token_ids": o.token_ids}
+                for o in outputs
+            ],
+        }
+        all_results.append(result)
+
+    latency_results = []
+    for ls in cfg.get("latency_scenarios", []):
+        modality = ls.get("modality", "text")
+
+        if modality == "text":
+            prompts = ls["prompt_token_ids"]
+            sp = SamplingParams(temperature=0.0, ignore_eos=True,
+                                max_tokens=ls["output_len"])
+            def run_fn():
+                engine.block_manager.reset()
+                torch.cuda.synchronize()
+                engine.generate(prompts, sp)
+                torch.cuda.synchronize()
+        else:
+            mm_data = _load_raw_mm_data(
+                ls["dataset"], ls["dataset_split"], 1, cfg["seed"],
+            )
+            item = mm_data[0]
+            sp = SamplingParams(temperature=0.0, ignore_eos=True,
+                                max_tokens=ls["output_len"])
+            def run_fn(item=item):
+                engine.block_manager.reset()
+                torch.cuda.synchronize()
+                engine.generate(
+                    [item["prompt"]], sp,
+                    images=item.get("images"),
+                    videos=item.get("videos"),
+                )
+                torch.cuda.synchronize()
+
+        num_warmup = ls.get("num_warmup", 3)
+        num_iters = ls.get("num_iters", 5)
+        for _ in range(num_warmup):
+            run_fn()
+        latencies = []
+        for _ in range(num_iters):
+            t0 = time.perf_counter()
+            run_fn()
+            latencies.append(time.perf_counter() - t0)
+        latency_results.append({
+            "name": ls["name"],
+            "batch_size": ls["batch_size"],
+            "output_len": ls["output_len"],
+            "num_iters": num_iters,
+            "latencies": latencies,
+        })
+
+    with open(cfg["output_file"], "w") as f:
+        json.dump({"throughput": all_results, "latency": latency_results}, f)
+
+    del engine
+
+if __name__ == "__main__":
+    main()
+'''
+
+
+# ---------------------------------------------------------------------------
 # Alignment check
 # ---------------------------------------------------------------------------
 def compute_alignment(
@@ -353,67 +727,106 @@ def main():
     args = parser.parse_args()
 
     gpu = _detect_gpu_name()
+    is_vlm = _is_vlm_model(args.model)
 
     if args.output_dir is None:
         short = args.model.split("/")[-1]
         repo_root = Path(__file__).resolve().parent.parent
         args.output_dir = str(repo_root / "tests" / "results" / gpu / f"{short}_tp{args.tp}")
 
+    throughput_scenarios = VLM_SCENARIOS if is_vlm else SCENARIOS
+    latency_scenarios = VLM_LATENCY_SCENARIOS if is_vlm else LATENCY_SCENARIOS
+
     # Pre-generate all scenario data
     scenario_data = []
     global_max_seq_len = 0
     if not args.skip_throughput:
-        for i, scenario in enumerate(SCENARIOS):
-            rng_seed = args.seed + i
-            random.seed(rng_seed)
-            np.random.seed(rng_seed)
-            input_len = scenario["input_len"]
-            output_len = scenario["output_len"]
-            prompt_token_ids = [
-                [randint(0, 10000) for _ in range(input_len)]
-                for _ in range(args.num_seqs)
-            ]
-            output_lens = [output_len] * args.num_seqs
-            max_seq_len = input_len + output_len
-            if max_seq_len > global_max_seq_len:
-                global_max_seq_len = max_seq_len
-            scenario_data.append({
-                "name": scenario["name"],
-                "input_len": input_len,
-                "output_len": output_len,
-                "prompt_token_ids": prompt_token_ids,
-                "output_lens": output_lens,
-            })
+        for i, scenario in enumerate(throughput_scenarios):
+            modality = scenario.get("modality", "text") if is_vlm else "text"
+            if modality == "text":
+                rng_seed = args.seed + i
+                random.seed(rng_seed)
+                np.random.seed(rng_seed)
+                input_len = scenario["input_len"]
+                output_len = scenario["output_len"]
+                prompt_token_ids = [
+                    [randint(0, 10000) for _ in range(input_len)]
+                    for _ in range(args.num_seqs)
+                ]
+                output_lens = [output_len] * args.num_seqs
+                max_seq_len = input_len + output_len
+                if max_seq_len > global_max_seq_len:
+                    global_max_seq_len = max_seq_len
+                scenario_data.append({
+                    "name": scenario["name"],
+                    "modality": "text",
+                    "input_len": input_len,
+                    "output_len": output_len,
+                    "prompt_token_ids": prompt_token_ids,
+                    "output_lens": output_lens,
+                })
+            else:
+                # Image/video: dataset is loaded inside the subprocess worker.
+                # We need a generous max_model_len for vision tokens.
+                max_seq_len = 8192 + scenario["output_len"]
+                if max_seq_len > global_max_seq_len:
+                    global_max_seq_len = max_seq_len
+                scenario_data.append({
+                    "name": scenario["name"],
+                    "modality": modality,
+                    "output_len": scenario["output_len"],
+                    "dataset": scenario["dataset"],
+                    "dataset_split": scenario["dataset_split"],
+                    "num_seqs": args.num_seqs,
+                })
 
     # Pre-generate latency scenario data
     latency_data = []
     if not args.skip_latency:
-        for j, ls in enumerate(LATENCY_SCENARIOS):
-            rng_seed = args.seed + 100 + j
-            random.seed(rng_seed)
-            np.random.seed(rng_seed)
-            bs = ls["batch_size"]
-            prompt_token_ids = [
-                [randint(0, 10000) for _ in range(ls["input_len"])]
-                for _ in range(bs)
-            ]
-            seq_len = ls["input_len"] + ls["output_len"]
-            if seq_len > global_max_seq_len:
-                global_max_seq_len = seq_len
-            latency_data.append({
-                "name": ls["name"],
-                "input_len": ls["input_len"],
-                "output_len": ls["output_len"],
-                "batch_size": bs,
-                "prompt_token_ids": prompt_token_ids,
-                "num_warmup": 3,
-                "num_iters": args.latency_iters,
-            })
+        for j, ls in enumerate(latency_scenarios):
+            modality = ls.get("modality", "text") if is_vlm else "text"
+            if modality == "text":
+                rng_seed = args.seed + 100 + j
+                random.seed(rng_seed)
+                np.random.seed(rng_seed)
+                bs = ls["batch_size"]
+                prompt_token_ids = [
+                    [randint(0, 10000) for _ in range(ls["input_len"])]
+                    for _ in range(bs)
+                ]
+                seq_len = ls["input_len"] + ls["output_len"]
+                if seq_len > global_max_seq_len:
+                    global_max_seq_len = seq_len
+                latency_data.append({
+                    "name": ls["name"],
+                    "modality": "text",
+                    "input_len": ls["input_len"],
+                    "output_len": ls["output_len"],
+                    "batch_size": bs,
+                    "prompt_token_ids": prompt_token_ids,
+                    "num_warmup": 3,
+                    "num_iters": args.latency_iters,
+                })
+            else:
+                max_seq_len = 8192 + ls["output_len"]
+                if max_seq_len > global_max_seq_len:
+                    global_max_seq_len = max_seq_len
+                latency_data.append({
+                    "name": ls["name"],
+                    "modality": modality,
+                    "output_len": ls["output_len"],
+                    "batch_size": ls["batch_size"],
+                    "dataset": ls["dataset"],
+                    "dataset_split": ls["dataset_split"],
+                    "num_warmup": 3,
+                    "num_iters": args.latency_iters,
+                })
 
     print("=" * 70)
     print("  kb-nano Baseline vs vLLM -- Multi-Scenario Benchmark")
     print("=" * 70)
     print(f"  Model          : {args.model}")
+    print(f"  Model type     : {'VLM' if is_vlm else 'LLM'}")
     print(f"  TP             : {args.tp}")
     print(f"  Seqs/scenario  : {args.num_seqs}")
     print(f"  Temperature    : {args.temperature}")
@@ -422,13 +835,16 @@ def main():
     print(f"  Max seq len    : {global_max_seq_len}")
     print(f"  Output dir     : {args.output_dir}")
     if not args.skip_throughput:
-        print(f"  Scenarios      : {', '.join(s['name'] for s in SCENARIOS)}")
+        print(f"  Scenarios      : {', '.join(s['name'] for s in throughput_scenarios)}")
     else:
         print(f"  Scenarios      : (throughput skipped)")
     if latency_data:
-        print(f"  Latency        : {', '.join(s['name'] for s in LATENCY_SCENARIOS)}"
+        print(f"  Latency        : {', '.join(s['name'] for s in latency_scenarios)}"
               f" ({args.latency_iters} iters)")
     print("=" * 70)
+
+    vllm_worker = VLLM_VLM_WORKER if is_vlm else VLLM_WORKER
+    kb_worker = KB_NANO_VLM_WORKER if is_vlm else KB_NANO_WORKER
 
     # -- Run vLLM (one subprocess, all scenarios) --
     vllm_raw = None
@@ -445,7 +861,7 @@ def main():
             "latency_scenarios": latency_data,
         }
         vllm_raw = run_worker(
-            VLLM_WORKER, vllm_config,
+            vllm_worker, vllm_config,
             f"vLLM [{short_name}] all scenarios (TP={args.tp})",
         )
 
@@ -466,7 +882,7 @@ def main():
     }
     short_name = args.model.split("/")[-1]
     kb_raw = run_worker(
-        KB_NANO_WORKER, kb_config,
+        kb_worker, kb_config,
         f"kb-nano [{short_name}] all scenarios (TP={args.tp})",
     )
     if kb_raw is None:
@@ -482,19 +898,20 @@ def main():
         kb_results = kb_raw["throughput"]
         vllm_results = vllm_raw["throughput"] if vllm_raw else None
 
-        for i, scenario in enumerate(SCENARIOS):
+        for i, scenario in enumerate(throughput_scenarios):
             kb_data = kb_results[i]
             kb_tps = kb_data["total_output_tokens"] / kb_data["elapsed"]
 
             result = {
                 "scenario": scenario["name"],
-                "input_len": scenario["input_len"],
-                "output_len": scenario["output_len"],
                 "num_seqs": args.num_seqs,
                 "kb_nano_elapsed": kb_data["elapsed"],
                 "kb_nano_output_tokens": kb_data["total_output_tokens"],
                 "kb_nano_tok_per_s": kb_tps,
             }
+            if "input_len" in scenario:
+                result["input_len"] = scenario["input_len"]
+            result["output_len"] = scenario["output_len"]
 
             if vllm_results is not None:
                 v_data = vllm_results[i]
@@ -529,11 +946,18 @@ def main():
         print(f"\n\n{'=' * 90}")
         print("  THROUGHPUT SUMMARY")
         print(f"{'=' * 90}")
-        header = (
-            f"  {'SCENARIO':<16} {'IN':>5} {'OUT':>5} "
-            f"{'KB-NANO tok/s':>15} {'vLLM tok/s':>12} {'SPEEDUP':>8} "
-            f"{'AVG MATCH TOKS':>15}"
-        )
+        if is_vlm:
+            header = (
+                f"  {'SCENARIO':<16} {'OUT':>5} "
+                f"{'KB-NANO tok/s':>15} {'vLLM tok/s':>12} {'SPEEDUP':>8} "
+                f"{'AVG MATCH TOKS':>15}"
+            )
+        else:
+            header = (
+                f"  {'SCENARIO':<16} {'IN':>5} {'OUT':>5} "
+                f"{'KB-NANO tok/s':>15} {'vLLM tok/s':>12} {'SPEEDUP':>8} "
+                f"{'AVG MATCH TOKS':>15}"
+            )
         print(header)
         print(f"  {'-' * 84}")
 
@@ -552,11 +976,18 @@ def main():
             else:
                 match_str = "N/A"
 
-            print(
-                f"  {r['scenario']:<16} {r['input_len']:>5} {r['output_len']:>5} "
-                f"{kb_tps_str:>15} {v_tps_str:>12} {speedup_str:>8} "
-                f"{match_str:>15}"
-            )
+            if is_vlm:
+                print(
+                    f"  {r['scenario']:<16} {r['output_len']:>5} "
+                    f"{kb_tps_str:>15} {v_tps_str:>12} {speedup_str:>8} "
+                    f"{match_str:>15}"
+                )
+            else:
+                print(
+                    f"  {r['scenario']:<16} {r['input_len']:>5} {r['output_len']:>5} "
+                    f"{kb_tps_str:>15} {v_tps_str:>12} {speedup_str:>8} "
+                    f"{match_str:>15}"
+                )
 
         print(f"{'=' * 90}")
 
@@ -567,11 +998,11 @@ def main():
         print("  LATENCY SUMMARY")
         print(f"{'=' * 110}")
         print(
-            f"  {'SCENARIO':<18} {'BS':>4} {'IN':>5} {'OUT':>5} {'ITERS':>6}"
+            f"  {'SCENARIO':<18} {'BS':>4} {'OUT':>5} {'ITERS':>6}"
             f"  {'KB-NANO med':>12} {'vLLM med':>12}"
             f"  {'KB-NANO ms/tok':>15} {'vLLM ms/tok':>12} {'SPEEDUP':>8}"
         )
-        print(f"  {'-' * 104}")
+        print(f"  {'-' * 100}")
 
         for i, kb_lat in enumerate(kb_latency):
             kb_lats = np.array(kb_lat["latencies"])
@@ -585,7 +1016,6 @@ def main():
             lat_result = {
                 "scenario": kb_lat["name"],
                 "batch_size": bs,
-                "input_len": kb_lat["input_len"],
                 "output_len": out_len,
                 "num_iters": kb_lat["num_iters"],
                 "kb_nano_median_s": kb_med,
@@ -593,6 +1023,8 @@ def main():
                 "kb_nano_ms_per_tok": kb_ms_per_tok,
                 "kb_nano_latencies": kb_lat["latencies"],
             }
+            if "input_len" in kb_lat:
+                lat_result["input_len"] = kb_lat["input_len"]
 
             v_med_str = "N/A"
             speedup_str = "N/A"
@@ -614,7 +1046,7 @@ def main():
                 lat_result["vllm_latencies"] = v_lat["latencies"]
 
             print(
-                f"  {kb_lat['name']:<18} {bs:>4} {kb_lat['input_len']:>5}"
+                f"  {kb_lat['name']:<18} {bs:>4}"
                 f" {out_len:>5} {kb_lat['num_iters']:>6}"
                 f"  {kb_med:.4f}s{'':<3} {v_med_str:>12}"
                 f"  {kb_ms_per_tok:>13.2f}   {v_ms_str:>10} {speedup_str:>8}"
@@ -630,6 +1062,7 @@ def main():
         combined = {
             "gpu": gpu,
             "model": args.model,
+            "model_type": "vlm" if is_vlm else "llm",
             "tp": args.tp,
             "seed": args.seed,
             "temperature": args.temperature,

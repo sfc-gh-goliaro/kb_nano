@@ -3,11 +3,13 @@
 These workloads are constants that ensure reproducible, comparable results
 across runs and users. They are not configurable by design.
 
-Throughput workloads: 3 scenarios covering prefill-heavy, balanced, and
-decode-heavy request mixes, each with 1000 requests.
+LLM workloads (text-only, random token IDs):
+  Throughput: 3 scenarios (prefill-heavy, balanced, decode-heavy), 1000 reqs each.
+  Latency: 2 scenarios (single-request, fixed-batch-32).
 
-Latency workloads: 2 scenarios covering single-request and fixed-batch-32
-inference latency.
+VLM workloads (multi-modal):
+  Throughput: 3 scenarios (text-only, image, video), 1000 reqs each.
+  Latency: 2 scenarios (single-image, single-video), batch_size=1.
 """
 
 from __future__ import annotations
@@ -47,6 +49,58 @@ LATENCY_WORKLOADS: list[LatencyWorkload] = [
 ALL_WORKLOADS = {
     "throughput": THROUGHPUT_WORKLOADS,
     "latency": LATENCY_WORKLOADS,
+}
+
+
+# ---------------------------------------------------------------------------
+# VLM workloads (multi-modal)
+# ---------------------------------------------------------------------------
+
+@dataclass(frozen=True)
+class VLMThroughputWorkload:
+    name: str
+    modality: str  # "text", "image", "video"
+    input_len: int | None  # fixed input token length (text only)
+    output_len: int
+    dataset_name: str | None = None  # HF dataset (image/video only)
+    num_requests: int = 1000
+
+
+VLM_THROUGHPUT_WORKLOADS: list[VLMThroughputWorkload] = [
+    VLMThroughputWorkload(
+        "text-only", "text", input_len=512, output_len=1024),
+    VLMThroughputWorkload(
+        "image", "image", input_len=None, output_len=512,
+        dataset_name="lmarena-ai/VisionArena-Chat"),
+    VLMThroughputWorkload(
+        "video", "video", input_len=None, output_len=512,
+        dataset_name="yale-nlp/MMVU"),
+]
+
+
+@dataclass(frozen=True)
+class VLMLatencyWorkload:
+    name: str
+    modality: str  # "image", "video"
+    output_len: int
+    batch_size: int = 1
+    dataset_name: str | None = None
+    num_warmup: int = 3
+    num_iters: int = 5
+
+
+VLM_LATENCY_WORKLOADS: list[VLMLatencyWorkload] = [
+    VLMLatencyWorkload(
+        "single-image", "image", output_len=128,
+        dataset_name="lmarena-ai/VisionArena-Chat"),
+    VLMLatencyWorkload(
+        "single-video", "video", output_len=128,
+        dataset_name="yale-nlp/MMVU"),
+]
+
+ALL_VLM_WORKLOADS = {
+    "throughput": VLM_THROUGHPUT_WORKLOADS,
+    "latency": VLM_LATENCY_WORKLOADS,
 }
 
 
