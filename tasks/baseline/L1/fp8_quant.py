@@ -1,7 +1,7 @@
 """Per-token-group FP8 activation quantization.
 
 Quantizes BF16 activations to float8_e4m3fn with per-group scale factors.
-Ported from vLLM's _per_token_group_quant_fp8 Triton kernel.
+Uses vLLM's CUDA kernel when available, falls back to Triton.
 """
 
 import torch
@@ -12,6 +12,14 @@ import triton.language as tl
 _FP8_DTYPE = torch.float8_e4m3fn
 _FP8_MAX = torch.finfo(_FP8_DTYPE).max  # 448.0
 _FP8_MIN = -_FP8_MAX
+
+_HAS_VLLM_CUDA_QUANT = False
+try:
+    from vllm import _custom_ops  # noqa: F401
+    _HAS_VLLM_CUDA_QUANT = (hasattr(torch.ops, "_C")
+                             and hasattr(torch.ops._C, "per_token_group_fp8_quant"))
+except ImportError:
+    pass
 
 
 @triton.jit
@@ -80,6 +88,14 @@ class PerTokenGroupQuantFP8(nn.Module):
             device=x.device,
             dtype=torch.float32,
         )
+
+        if _HAS_VLLM_CUDA_QUANT:
+            torch.ops._C.per_token_group_fp8_quant(
+                x, x_q, x_s,
+                self.group_size, 1e-10,
+                _FP8_MIN, _FP8_MAX, False,
+            )
+            return x_q, x_s
 
         M = x.numel() // self.group_size
         N = self.group_size

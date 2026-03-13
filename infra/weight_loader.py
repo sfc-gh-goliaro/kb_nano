@@ -333,7 +333,13 @@ def _detect_model_type(model_name: str) -> str:
 
 def _move_model_to_device(model: torch.nn.Module, device: torch.device,
                           dtype: torch.dtype) -> torch.nn.Module:
-    """Move model to device, skipping dtype cast for FP8 parameters."""
+    """Move model to device, casting to dtype but preserving FP8 weights
+    and float32 scale parameters.
+
+    Scale parameters (weight_scale_inv) must stay float32 for block-scaled
+    FP8 GEMM kernels. All other float32 params (vision encoder, embeddings,
+    norms) are cast to the target dtype.
+    """
     has_fp8 = any(
         p.dtype == torch.float8_e4m3fn for p in model.parameters()
     )
@@ -341,8 +347,17 @@ def _move_model_to_device(model: torch.nn.Module, device: torch.device,
         return model.to(device=device, dtype=dtype)
 
     model = model.to(device=device)
+    scale_params = set()
+    for name, param in model.named_parameters():
+        if "scale_inv" in name or "q_norm" in name or "k_norm" in name:
+            scale_params.add(id(param))
+
     for param in model.parameters():
-        if param.dtype != torch.float8_e4m3fn:
+        if param.dtype == torch.float8_e4m3fn:
+            continue
+        if id(param) in scale_params:
+            continue
+        if param.dtype != dtype:
             param.data = param.data.to(dtype=dtype)
     return model
 

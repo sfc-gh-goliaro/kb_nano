@@ -328,6 +328,7 @@ def _load_mm_samples(dataset_name, dataset_split, num_seqs, seed):
             dataset_path=dataset_name,
             dataset_split=dataset_split,
             random_seed=seed,
+            no_stream=True,
         )
     else:
         raise ValueError(f"Unsupported dataset: {dataset_name}")
@@ -353,6 +354,7 @@ def main():
         gpu_memory_utilization=cfg.get("gpu_memory_utilization", 0.9),
         max_model_len=cfg["max_model_len"],
         enable_prefix_caching=False,
+        limit_mm_per_prompt={"image": 1, "video": 1},
     )
 
     llm.generate(
@@ -469,8 +471,9 @@ import json, sys, time
 def _load_raw_mm_data(dataset_name, dataset_split, num_seqs, seed):
     """Load raw PIL images or video frames from HF datasets."""
     from datasets import load_dataset
-    data = load_dataset(dataset_name, split=dataset_split, streaming=True,
-                        trust_remote_code=True)
+    use_streaming = "MMVU" not in dataset_name
+    data = load_dataset(dataset_name, split=dataset_split,
+                        streaming=use_streaming)
     data = data.shuffle(seed=seed)
 
     results = []
@@ -497,7 +500,6 @@ def _load_raw_mm_data(dataset_name, dataset_split, num_seqs, seed):
             prompt = item["question"] + " " + " ".join(
                 f"{k}.{v}" for k, v in item["choices"].items())
             video_path = item["video"].replace(remote_root, local_root)
-            from vllm.assets.video import VideoAsset
             import decord
             decord.bridge.set_bridge("torch")
             vr = decord.VideoReader(video_path)
@@ -717,6 +719,8 @@ def main():
                         help="Skip the throughput phase (run latency only)")
     parser.add_argument("--skip-latency", action="store_true",
                         help="Skip the latency benchmark phase")
+    parser.add_argument("--text-only", action="store_true",
+                        help="Run only text-only scenarios (skip image/video)")
     parser.add_argument("--latency-iters", type=int, default=5,
                         help="Timed iterations per latency scenario (default: 5)")
     parser.add_argument(
@@ -736,6 +740,9 @@ def main():
 
     throughput_scenarios = VLM_SCENARIOS if is_vlm else SCENARIOS
     latency_scenarios = VLM_LATENCY_SCENARIOS if is_vlm else LATENCY_SCENARIOS
+    if args.text_only:
+        throughput_scenarios = [s for s in throughput_scenarios if s.get("modality", "text") == "text"]
+        latency_scenarios = [s for s in latency_scenarios if s.get("modality", "text") == "text"]
 
     # Pre-generate all scenario data
     scenario_data = []
@@ -768,7 +775,7 @@ def main():
             else:
                 # Image/video: dataset is loaded inside the subprocess worker.
                 # We need a generous max_model_len for vision tokens.
-                max_seq_len = 8192 + scenario["output_len"]
+                max_seq_len = 32768
                 if max_seq_len > global_max_seq_len:
                     global_max_seq_len = max_seq_len
                 scenario_data.append({
@@ -808,7 +815,7 @@ def main():
                     "num_iters": args.latency_iters,
                 })
             else:
-                max_seq_len = 8192 + ls["output_len"]
+                max_seq_len = 32768
                 if max_seq_len > global_max_seq_len:
                     global_max_seq_len = max_seq_len
                 latency_data.append({

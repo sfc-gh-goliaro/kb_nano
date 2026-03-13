@@ -1,14 +1,22 @@
-"""Triton W8A8 block-scaled FP8 GEMM kernel.
+"""Block-scaled FP8 GEMM: DeepGEMM (preferred) with Triton fallback.
 
 Computes C = A @ B^T where A and B are in float8_e4m3fn with per-block
-scale factors. Accumulates in FP32, outputs configurable dtype.
-Ported from vLLM's _w8a8_triton_block_scaled_mm kernel.
+scale factors. Uses DeepGEMM on Blackwell/Hopper GPUs for maximum
+throughput, falling back to a Triton kernel otherwise.
 """
 
 import torch
 import torch.nn as nn
 import triton
 import triton.language as tl
+
+_HAS_DEEP_GEMM = False
+_deep_gemm = None
+try:
+    import deep_gemm as _deep_gemm
+    _HAS_DEEP_GEMM = hasattr(_deep_gemm, "fp8_gemm_nt")
+except ImportError:
+    pass
 
 
 @triton.jit
@@ -96,13 +104,22 @@ class W8A8BlockScaledMM(nn.Module):
         block_size: tuple[int, int],
         output_dtype: torch.dtype = torch.bfloat16,
     ) -> torch.Tensor:
-        block_n, block_k = block_size
-
         assert A.shape[-1] == B.shape[-1]
         assert A.is_contiguous()
         M = A.numel() // A.shape[-1]
         N, K = B.shape
 
+        if _HAS_DEEP_GEMM and output_dtype == torch.bfloat16 and N % 64 == 0 and K % 128 == 0:
+            C = torch.empty((M, N), dtype=output_dtype, device=A.device)
+            _deep_gemm.fp8_gemm_nt(
+                (A.view(M, K), As.view(M, -1)),
+                (B, Bs),
+                C,
+                disable_ue8m0_cast=True,
+            )
+            return C
+
+        block_n, block_k = block_size
         C = torch.empty((M, N), dtype=output_dtype, device=A.device)
 
         config = {

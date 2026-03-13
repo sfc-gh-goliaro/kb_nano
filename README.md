@@ -1,11 +1,13 @@
 # kb-nano
 
-A standalone, high-performance LLM inference engine supporting **Llama 3.1** and **Mixtral-8x7B** with tensor parallelism. No vLLM dependency at runtime — just PyTorch, Triton, and Flash Attention.
+A standalone, high-performance LLM inference engine supporting **Llama 3.1**, **Mixtral-8x7B**, **Qwen2-VL**, and **Qwen3-VL** with tensor parallelism. No vLLM dependency at runtime — just PyTorch, Triton, and Flash Attention.
 
 ## Features
 
 - **Llama 3.1** (8B, 70B) with frequency-scaled RoPE
 - **Mixtral-8x7B** with fused Triton MoE grouped-GEMM kernels
+- **Qwen2-VL** (7B, 72B) vision-language model with image and video support
+- **Qwen3-VL** (8B-FP8, 235B-A22B-FP8) with FP8 block-scaled quantization and MoE
 - **Tensor parallelism** (TP) with custom IPC-based all-reduce for multi-GPU inference
 - **Paged KV cache** with Triton store kernels
 - **CUDA graph capture** for decode steps
@@ -83,6 +85,15 @@ python tests/bench_vllm.py --model meta-llama/Llama-3.1-8B-Instruct
 # With tensor parallelism
 python tests/bench_vllm.py \
     --model meta-llama/Llama-3.1-70B-Instruct --tp 4
+
+# Qwen VL models (text + image + video scenarios)
+python tests/bench_vllm.py --model Qwen/Qwen2-VL-7B-Instruct
+python tests/bench_vllm.py --model Qwen/Qwen3-VL-8B-Instruct-FP8
+
+# Large MoE models (text-only, enforce eager)
+python tests/bench_vllm.py \
+    --model Qwen/Qwen3-VL-235B-A22B-Instruct-FP8 --tp 4 \
+    --text-only --enforce-eager
 
 # Bench module tests (unit tests + GPU integration)
 python tests/test_bench.py
@@ -223,6 +234,37 @@ Run `tests/bench_vllm.py` to reproduce. Three scenarios per model, 1000 sequence
 | Mixtral-8x7B | 4 | balanced      |  512/512  | 20,530 | 33,443 | **1.63x** |
 | Mixtral-8x7B | 4 | decode-heavy  |  512/1024 | 24,728 | 37,761 | **1.53x** |
 
+### Qwen2-VL / Qwen3-VL
+
+Throughput: decode-heavy workload (512 input, 1024 output), 1000 sequences each, `temperature=0`. Image/video throughput uses VisionArena and MMVU datasets respectively (512 output tokens).
+
+| Model | TP | Modality | vLLM (tok/s) | Ours (tok/s) | Ratio | Match |
+|-------|---:|----------|-------------:|-------------:|------:|------:|
+| Qwen2-VL-7B   | 1 | text  | 19,096 | 18,716 | 0.98x | 949/1024 |
+| Qwen2-VL-7B   | 1 | image |  1,619 |    268 | 0.17x |  30/512 |
+| Qwen2-VL-7B   | 1 | video |    246 |    258 | **1.05x** |  25/512 |
+| Qwen2-VL-72B  | 4 | text  |  5,823 |  5,811 | **1.00x** | 888/1024 |
+| Qwen3-VL-8B-FP8  | 1 | text  | 15,218 | 12,411 | 0.82x | 733/1024 |
+| Qwen3-VL-8B-FP8  | 1 | image |  1,691 |    165 | 0.10x |  17/512 |
+| Qwen3-VL-8B-FP8  | 1 | video |    193 |    173 | 0.90x |  12/512 |
+| Qwen3-VL-235B-A22B-FP8 | 4 | text  |  8,092 |  7,181 | 0.89x |  73/1024 |
+
+Latency: single request (batch_size=1), 128 output tokens, median of 5 iterations.
+
+| Model | TP | Modality | vLLM (ms) | Ours (ms) | Speedup |
+|-------|---:|----------|----------:|----------:|--------:|
+| Qwen2-VL-7B  | 1 | image |  480 |  514 | 0.93x |
+| Qwen2-VL-7B  | 1 | video |  772 |  560 | **1.38x** |
+| Qwen3-VL-8B-FP8 | 1 | image |  722 |  778 | 0.93x |
+| Qwen3-VL-8B-FP8 | 1 | video | 1,096 |  789 | **1.39x** |
+
+**Notes:**
+- Image throughput is limited by sequential vision encoder processing in kb-nano (vLLM batches image encoding)
+- Video latency beats vLLM due to efficient sequential processing of short video clips
+- FP8 models use DeepGEMM for block-scaled FP8 GEMM and vLLM's CUDA `per_token_group_fp8_quant` for activation quantization
+- 235B MoE model uses `enforce_eager=True` (CUDA graph capture with shared MoE caches is a known limitation)
+- Token matching for FP8 MoE models is lower due to accumulated quantization differences affecting expert routing decisions
+
 ### Key optimizations
 
 - **Fused RMSNorm**: Uses `sgl_kernel`'s fused residual-add + RMSNorm CUDA kernel, eliminating multiple kernel launches per norm call
@@ -234,3 +276,7 @@ Run `tests/bench_vllm.py` to reproduce. Three scenarios per model, 1000 sequence
 - **SHM spin-wait signaling**: Workers spin on a shared-memory sequence counter instead of `multiprocessing.Event`, reducing per-step signaling latency from ~0.48ms to ~0.004ms
 - **LM head in CUDA graph**: The LM head projection and local argmax are captured inside the CUDA graph alongside the transformer body
 - **Greedy fast path**: For greedy decoding with TP, uses local argmax + small all-gather instead of gathering full logits across ranks
+- **FP8 block-scaled GEMM**: DeepGEMM integration for W8A8 block-scaled FP8 linear layers (Qwen3-VL-FP8 models), with Triton fallback
+- **FP8 MoE grouped GEMM**: Triton kernel for FP8 expert execution with per-block weight scales and per-token-group activation scales
+- **M-RoPE**: Multi-dimensional rotary position embeddings for vision-language models (Qwen2-VL, Qwen3-VL)
+- **Shared MoE caches**: Class-level intermediate buffer sharing across MoE layers to reduce memory footprint for large MoE models

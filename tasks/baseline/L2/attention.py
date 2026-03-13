@@ -69,6 +69,13 @@ class LlamaAttention(nn.Module):
             q = self.q_norm(q.reshape(-1, self.head_dim)).view(N, self.num_heads * self.head_dim)
             k = self.k_norm(k.reshape(-1, self.head_dim)).view(N, self.num_kv_heads * self.head_dim)
 
-        q, k = self.rotary_emb(positions, q, k)
+        if positions.ndim == 2:
+            q = q.view(N, self.num_heads, self.head_dim)
+            k = k.view(N, self.num_kv_heads, self.head_dim)
+            q, k = self.rotary_emb(positions, q, k)
+            q = q.view(N, self.num_heads * self.head_dim)
+            k = k.view(N, self.num_kv_heads * self.head_dim)
+        else:
+            q, k = self.rotary_emb(positions, q, k)
         attn_output = self.attn(q, k, v)
         return self.o_proj(attn_output)

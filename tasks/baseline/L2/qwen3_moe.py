@@ -87,54 +87,83 @@ class Qwen3MoE(nn.Module):
                            is_w1: bool = True):
         """Load fused gate_up_proj expert weights.
 
-        For fused 3D tensors from checkpoint (expert_id == -1), loads directly.
-        For per-expert loading (Mixtral style), loads per expert/shard.
+        Checkpoint stores gate_up_proj as [E, hidden, 2*intermediate].
+        Our param is [E, 2*intermediate_per_tp, hidden] so we transpose
+        dims 1,2 then split and shard the intermediate dimension.
         """
         tp, rank = _tp_size(), _tp_rank()
         N = self.moe_intermediate_per_tp
         if expert_id == -1:
-            # Fused 3D tensor: [E, 2*intermediate, hidden]
-            # Need to TP-shard the intermediate dim
-            gate = loaded_weight[:, :loaded_weight.shape[1] // 2, :]
-            up = loaded_weight[:, loaded_weight.shape[1] // 2:, :]
+            # Checkpoint: [E, hidden, 2*intermediate] -> transpose to [E, 2*intermediate, hidden]
+            w = loaded_weight.transpose(1, 2)
+            gate = w[:, :w.shape[1] // 2, :]
+            up = w[:, w.shape[1] // 2:, :]
             gate_shard = gate[:, rank * N:(rank + 1) * N, :]
             up_shard = up[:, rank * N:(rank + 1) * N, :]
             param.data[:, :N, :].copy_(gate_shard)
             param.data[:, N:, :].copy_(up_shard)
         else:
-            shard = loaded_weight.narrow(0, rank * N, N)
+            # Per-expert: [hidden, intermediate] -> [intermediate, hidden]
+            w = loaded_weight.t()
+            shard = w.narrow(0, rank * N, N)
             offset = 0 if is_w1 else N
             param.data[expert_id, offset:offset + N, :].copy_(shard)
 
     def _w2_weight_loader(self, param, loaded_weight, expert_id: int = -1):
-        """Load down_proj expert weights."""
+        """Load down_proj expert weights.
+
+        Checkpoint stores w2 as [E, intermediate, hidden]. Our param is
+        [E, hidden, intermediate_per_tp] so we transpose dims 1,2 then
+        shard the (now last) intermediate dimension.
+        """
         tp, rank = _tp_size(), _tp_rank()
         N = self.moe_intermediate_per_tp
         if expert_id == -1:
-            param.data.copy_(loaded_weight[:, :, rank * N:(rank + 1) * N])
+            # loaded: [E, intermediate, hidden] -> transpose to [E, hidden, intermediate]
+            w = loaded_weight.transpose(1, 2)
+            param.data.copy_(w[:, :, rank * N:(rank + 1) * N])
         else:
-            param.data[expert_id].copy_(loaded_weight.narrow(1, rank * N, N))
+            # loaded: [intermediate, hidden] -> [hidden, intermediate]
+            w = loaded_weight.t()
+            param.data[expert_id].copy_(w[:, rank * N:(rank + 1) * N])
 
     def _w13_scale_weight_loader(self, param, loaded_weight):
-        """Load fused gate_up_proj scale tensor [E, scale_rows, scale_cols]."""
+        """Load fused gate_up_proj scale tensor.
+
+        Checkpoint stores scales for gate_up_proj=[E, hidden, 2*intermediate]
+        layout as [E, ceil(hidden/bn), ceil(2*intermediate/bk)].
+        Our param matches [E, 2*intermediate_per_tp, hidden] layout so we
+        transpose to [E, ceil(2*intermediate/bk), ceil(hidden/bn)] then
+        split and shard.
+        """
         tp, rank = _tp_size(), _tp_rank()
         bs_n = self._fp8_block_size[0]
         N = self.moe_intermediate_per_tp
         scale_rows_per_shard = _ceildiv(N, bs_n)
-        gate_scales = loaded_weight[:, :loaded_weight.shape[1] // 2, :]
-        up_scales = loaded_weight[:, loaded_weight.shape[1] // 2:, :]
+        # Transpose scale dims to match transposed weight layout
+        s = loaded_weight.transpose(1, 2)
+        gate_scales = s[:, :s.shape[1] // 2, :]
+        up_scales = s[:, s.shape[1] // 2:, :]
         gate_shard = gate_scales[:, rank * scale_rows_per_shard:(rank + 1) * scale_rows_per_shard, :]
         up_shard = up_scales[:, rank * scale_rows_per_shard:(rank + 1) * scale_rows_per_shard, :]
         param.data[:, :scale_rows_per_shard, :].copy_(gate_shard)
         param.data[:, scale_rows_per_shard:, :].copy_(up_shard)
 
     def _w2_scale_weight_loader(self, param, loaded_weight):
-        """Load down_proj scale tensor [E, scale_rows, scale_cols]."""
+        """Load down_proj scale tensor.
+
+        Checkpoint stores scales for w2=[E, intermediate, hidden] layout as
+        [E, ceil(intermediate/bn), ceil(hidden/bk)].
+        Our param matches w2=[E, hidden, intermediate_per_tp] layout so we
+        transpose to [E, ceil(hidden/bn), ceil(intermediate/bk)] then shard.
+        """
         tp, rank = _tp_size(), _tp_rank()
         bs_k = self._fp8_block_size[1]
         N = self.moe_intermediate_per_tp
         scale_cols_per_shard = _ceildiv(N, bs_k)
-        param.data.copy_(loaded_weight[:, :, rank * scale_cols_per_shard:(rank + 1) * scale_cols_per_shard])
+        # Transpose scale dims to match transposed weight layout
+        s = loaded_weight.transpose(1, 2)
+        param.data.copy_(s[:, :, rank * scale_cols_per_shard:(rank + 1) * scale_cols_per_shard])
 
     def _ensure_routing_buffers(self, M, device):
         if self._topk_weights is None or self._topk_weights.size(0) < M:

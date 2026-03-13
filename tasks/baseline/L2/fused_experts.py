@@ -40,6 +40,10 @@ class FusedExperts(nn.Module):
         output: [M, K]
     """
 
+    _shared_cache1 = None
+    _shared_cache3 = None
+    _use_shared_cache = False
+
     def __init__(self, block_size: tuple[int, int] | None = None):
         super().__init__()
         self.block_size = block_size
@@ -59,6 +63,13 @@ class FusedExperts(nn.Module):
         self.moe_grouped_gemm = MoeGroupedGemm()
 
     def _get_cache(self, name, size, device, dtype):
+        if FusedExperts._use_shared_cache:
+            shared_name = f"_shared{name}"
+            cache = getattr(FusedExperts, shared_name)
+            if cache is None or cache.size(0) < size[0] or cache.size(1) < size[1]:
+                cache = torch.empty(size, device=device, dtype=dtype)
+                setattr(FusedExperts, shared_name, cache)
+            return cache[:size[0], :size[1]]
         cache = getattr(self, name)
         if cache is None or cache.size(0) < size[0] or cache.size(1) < size[1]:
             cache = torch.empty(size, device=device, dtype=dtype)

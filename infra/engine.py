@@ -246,10 +246,12 @@ class ModelRunner:
         self.max_num_batched_tokens = max_num_batched_tokens if max_num_batched_tokens is not None else _DEFAULT_MAX_NUM_BATCHED_TOKENS
 
         torch.cuda.set_device(rank)
+        from datetime import timedelta
         dist.init_process_group(
             "nccl", f"tcp://localhost:{NCCL_PORT}",
             world_size=world_size, rank=rank,
             device_id=torch.device(f"cuda:{rank}"),
+            timeout=timedelta(hours=1),
         )
 
         self.custom_ar = None
@@ -372,21 +374,27 @@ class ModelRunner:
         torch.cuda.empty_cache()
 
     def _share_activation_buffers(self):
-        """Share a single SiluAndMul activation buffer across all layers.
+        """Share activation buffers across all layers.
 
-        Layers execute sequentially so the buffer is safe to reuse.
-        Must be called before warmup so only one buffer grows to max size
-        instead of one per layer (saves ~14 GiB for 32-layer models).
+        Layers execute sequentially so buffers are safe to reuse.
+        Shares SiluAndMul activation buffers and FusedExperts MoE
+        intermediate caches to avoid per-layer allocation.
         """
         from ..tasks.baseline.L1.silu_and_mul import SiluAndMul
         silu_modules = [
             m for m in self.model.modules() if isinstance(m, SiluAndMul)
         ]
-        if len(silu_modules) <= 1:
-            return
-        shared = silu_modules[0]._act_buf
-        for m in silu_modules[1:]:
-            m.set_shared_buffer(shared)
+        if len(silu_modules) > 1:
+            shared = silu_modules[0]._act_buf
+            for m in silu_modules[1:]:
+                m.set_shared_buffer(shared)
+
+        from ..tasks.baseline.L2.fused_experts import FusedExperts
+        fused_experts = [
+            m for m in self.model.modules() if isinstance(m, FusedExperts)
+        ]
+        if len(fused_experts) > 1:
+            FusedExperts._use_shared_cache = True
 
     def warmup_model(self):
         torch.cuda.empty_cache()
