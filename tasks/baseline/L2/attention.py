@@ -28,7 +28,8 @@ class LlamaAttention(nn.Module):
                  rotary_emb: nn.Module | None = None,
                  bias: bool = False,
                  qk_norm: bool = False,
-                 rms_norm_eps: float = 1e-6):
+                 rms_norm_eps: float = 1e-6,
+                 fp8_block_size: tuple[int, int] | None = None):
         super().__init__()
         tp = _tp_size()
         self.num_heads = num_attention_heads // tp
@@ -40,9 +41,11 @@ class LlamaAttention(nn.Module):
             hidden_size, head_dim,
             num_attention_heads, num_key_value_heads,
             bias=bias,
+            fp8_block_size=fp8_block_size,
         )
         self.o_proj = RowParallelLinear(
             num_attention_heads * head_dim, hidden_size,
+            fp8_block_size=fp8_block_size,
         )
 
         self.q_norm = RMSNorm(head_dim, eps=rms_norm_eps) if qk_norm else None

@@ -1,57 +1,33 @@
-"""Qwen3-VL model: vision encoder with DeepStack + Qwen3 language model with M-RoPE.
+"""Qwen3-VL-MoE model: vision encoder with DeepStack + Qwen3-MoE language model.
 
-Supports image and video inputs through the vision encoder pipeline.
-Key differences from Qwen2-VL:
-- Vision encoder uses SiLU activation, learned position embeddings, DeepStack
-- Language model uses QK-norm (per-head RMSNorm) instead of QKV bias
-- mrope_interleaved=True for Qwen3-VL
+Combines Qwen3VisionTransformer (BF16) with a Qwen3-MoE language model
+using 128 FP8 experts, top-8 routing, and moe_intermediate_size=768.
 """
 
 from __future__ import annotations
 
 from dataclasses import dataclass, field
 
-import numpy as np
 import torch
 import torch.nn as nn
-import torch.nn.functional as F
 from transformers import AutoConfig
 
 from ..L1.mrope import MRotaryEmbedding
 from ..L1.rms_norm import RMSNorm
-from ..L1.vision_rotary_emb import VisionRotaryEmbedding
 from ..L1.mrope_input_positions import MRopeInputPositions
 from ..L2.parallel_embedding import ParallelLMHead, VocabParallelEmbedding
-from ..L2.vision_patch_embed import VisionPatchEmbed
-from ..L2.vision_patch_merger import VisionPatchMerger
-from ..L2.vision_pos_embed_interpolate import VisionPosEmbedInterpolate
-from ..L3.llama_decoder import LlamaDecoderLayer
-from ..L3.vision_block import VisionBlock
+from ..L3.qwen3_moe_decoder import Qwen3MoeDecoderLayer
+from .qwen3_vl import Qwen3VLVisionConfig, Qwen3VisionTransformer
 
 
 @dataclass
-class Qwen3VLVisionConfig:
-    depth: int = 27
-    hidden_size: int = 1152
-    in_channels: int = 3
-    num_heads: int = 16
-    intermediate_size: int = 4304
-    hidden_act: str = "gelu_pytorch_tanh"
-    patch_size: int = 16
-    spatial_merge_size: int = 2
-    temporal_patch_size: int = 2
-    out_hidden_size: int = 4096
-    deepstack_visual_indexes: list[int] = field(default_factory=lambda: [8, 16, 24])
-    num_position_embeddings: int = 2304
-
-
-@dataclass
-class Qwen3VLConfig:
-    hidden_size: int = 4096
-    intermediate_size: int = 12288
-    num_hidden_layers: int = 36
+class Qwen3VLMoeConfig:
+    hidden_size: int = 2048
+    intermediate_size: int = 6144
+    moe_intermediate_size: int = 768
+    num_hidden_layers: int = 48
     num_attention_heads: int = 32
-    num_key_value_heads: int = 8
+    num_key_value_heads: int = 4
     head_dim: int = 128
     vocab_size: int = 151936
     max_position_embeddings: int = 262144
@@ -62,12 +38,16 @@ class Qwen3VLConfig:
     mrope_interleaved: bool = True
     image_token_id: int = 151655
     video_token_id: int = 151656
+    num_experts: int = 128
+    num_experts_per_tok: int = 8
+    norm_topk_prob: bool = True
+    decoder_sparse_step: int = 1
     vision: Qwen3VLVisionConfig = field(default_factory=Qwen3VLVisionConfig)
     dtype: torch.dtype = torch.bfloat16
     fp8_block_size: tuple[int, int] | None = None
 
     @classmethod
-    def from_pretrained(cls, model_name: str) -> "Qwen3VLConfig":
+    def from_pretrained(cls, model_name: str) -> "Qwen3VLMoeConfig":
         hf = AutoConfig.from_pretrained(model_name)
         vc = hf.vision_config
         text_config = hf.get_text_config()
@@ -84,6 +64,7 @@ class Qwen3VLConfig:
         return cls(
             hidden_size=text_config.hidden_size,
             intermediate_size=text_config.intermediate_size,
+            moe_intermediate_size=text_config.moe_intermediate_size,
             num_hidden_layers=text_config.num_hidden_layers,
             num_attention_heads=text_config.num_attention_heads,
             num_key_value_heads=text_config.num_key_value_heads,
@@ -93,11 +74,15 @@ class Qwen3VLConfig:
             max_position_embeddings=text_config.max_position_embeddings,
             rms_norm_eps=text_config.rms_norm_eps,
             rope_theta=text_config.rope_theta,
-            tie_word_embeddings=text_config.tie_word_embeddings,
+            tie_word_embeddings=hf.tie_word_embeddings,
             mrope_section=rope.get("mrope_section", [24, 20, 20]),
             mrope_interleaved=rope.get("mrope_interleaved", True),
             image_token_id=hf.image_token_id,
             video_token_id=hf.video_token_id,
+            num_experts=text_config.num_experts,
+            num_experts_per_tok=text_config.num_experts_per_tok,
+            norm_topk_prob=getattr(text_config, "norm_topk_prob", True),
+            decoder_sparse_step=getattr(text_config, "decoder_sparse_step", 1),
             vision=Qwen3VLVisionConfig(
                 depth=vc.depth,
                 hidden_size=vc.hidden_size,
@@ -108,7 +93,7 @@ class Qwen3VLConfig:
                 patch_size=vc.patch_size,
                 spatial_merge_size=vc.spatial_merge_size,
                 temporal_patch_size=vc.temporal_patch_size,
-                out_hidden_size=getattr(vc, "out_hidden_size", 4096),
+                out_hidden_size=getattr(vc, "out_hidden_size", 2048),
                 deepstack_visual_indexes=getattr(vc, "deepstack_visual_indexes", [8, 16, 24]),
                 num_position_embeddings=getattr(vc, "num_position_embeddings", 2304),
             ),
@@ -116,108 +101,8 @@ class Qwen3VLConfig:
         )
 
 
-# ---- Vision Encoder Components ----
-
-_ACTIVATION_MAP = {
-    "silu": F.silu,
-    "gelu": F.gelu,
-    "gelu_pytorch_tanh": lambda x: F.gelu(x, approximate="tanh"),
-}
-
-
-class Qwen3VisionTransformer(nn.Module):
-    def __init__(self, vision_config: Qwen3VLVisionConfig):
-        super().__init__()
-        self.spatial_merge_size = vision_config.spatial_merge_size
-        self.deepstack_visual_indexes = vision_config.deepstack_visual_indexes
-        self.out_hidden_size = vision_config.out_hidden_size * (
-            1 + len(self.deepstack_visual_indexes)
-        )
-
-        self.patch_embed = VisionPatchEmbed(
-            vision_config.patch_size, vision_config.temporal_patch_size,
-            vision_config.in_channels, vision_config.hidden_size, bias=True,
-        )
-
-        self.pos_embed_interp = VisionPosEmbedInterpolate(
-            vision_config.num_position_embeddings,
-            vision_config.hidden_size,
-            vision_config.spatial_merge_size,
-        )
-
-        head_dim = vision_config.hidden_size // vision_config.num_heads
-        self.rotary_emb = VisionRotaryEmbedding(head_dim // 2)
-
-        act_fn = _ACTIVATION_MAP.get(vision_config.hidden_act, F.silu)
-
-        self.blocks = nn.ModuleList([
-            VisionBlock(
-                vision_config.hidden_size, vision_config.num_heads,
-                vision_config.intermediate_size, act_fn=act_fn,
-            )
-            for _ in range(vision_config.depth)
-        ])
-
-        self.merger = VisionPatchMerger(
-            vision_config.out_hidden_size, vision_config.hidden_size,
-            vision_config.spatial_merge_size,
-        )
-        self.deepstack_merger_list = nn.ModuleList([
-            VisionPatchMerger(
-                vision_config.out_hidden_size, vision_config.hidden_size,
-                vision_config.spatial_merge_size, use_postshuffle_norm=True,
-            )
-            for _ in range(len(self.deepstack_visual_indexes))
-        ])
-
-    def forward(self, x: torch.Tensor, grid_thw: torch.Tensor | list):
-        device = self.patch_embed.proj.weight.device
-        dtype = self.patch_embed.proj.weight.dtype
-        x = x.to(device=device, dtype=dtype)
-        hidden_states = self.patch_embed(x)
-
-        if isinstance(grid_thw, list):
-            grid_thw_list = grid_thw
-            grid_thw_np = np.array(grid_thw, dtype=np.int32)
-        else:
-            grid_thw_list = grid_thw.tolist()
-            grid_thw_np = grid_thw.numpy()
-
-        pos_embeds = self.pos_embed_interp(grid_thw_list, dtype, device)
-        hidden_states = hidden_states + pos_embeds
-
-        rotary_cos, rotary_sin = self.rotary_emb(
-            grid_thw_list, self.spatial_merge_size, dtype, device,
-        )
-
-        cu_seqlens = np.repeat(
-            grid_thw_np[:, 1] * grid_thw_np[:, 2], grid_thw_np[:, 0]
-        ).cumsum(axis=0, dtype=np.int32)
-        cu_seqlens = np.concatenate([np.zeros(1, dtype=np.int32), cu_seqlens])
-        cu_seqlens = torch.from_numpy(cu_seqlens).to(device)
-        max_seqlen = int((cu_seqlens[1:] - cu_seqlens[:-1]).max().item())
-
-        hidden_states = hidden_states.unsqueeze(1)
-        deepstack_features = []
-        for layer_num, blk in enumerate(self.blocks):
-            hidden_states = blk(hidden_states, cu_seqlens,
-                                rotary_cos, rotary_sin, max_seqlen)
-            if layer_num in self.deepstack_visual_indexes:
-                idx = self.deepstack_visual_indexes.index(layer_num)
-                deepstack_features.append(
-                    self.deepstack_merger_list[idx](hidden_states)
-                )
-
-        hidden_states = self.merger(hidden_states)
-        if deepstack_features:
-            return hidden_states, deepstack_features
-        return hidden_states, []
-
-
-# ---- Language Model ----
-
-class Qwen3Model(nn.Module):
-    def __init__(self, config: Qwen3VLConfig):
+class Qwen3MoeModel(nn.Module):
+    def __init__(self, config: Qwen3VLMoeConfig):
         super().__init__()
         self.embed_tokens = VocabParallelEmbedding(config.vocab_size, config.hidden_size)
         self.rotary_emb = MRotaryEmbedding(
@@ -226,7 +111,7 @@ class Qwen3Model(nn.Module):
             config.mrope_interleaved,
         )
         self.layers = nn.ModuleList([
-            LlamaDecoderLayer(config, rotary_emb=self.rotary_emb, qk_norm=True)
+            Qwen3MoeDecoderLayer(config, rotary_emb=self.rotary_emb)
             for _ in range(config.num_hidden_layers)
         ])
         self.norm = RMSNorm(config.hidden_size, eps=config.rms_norm_eps)
@@ -246,20 +131,18 @@ class Qwen3Model(nn.Module):
         return hidden_states
 
 
-class Qwen3VLForConditionalGeneration(nn.Module):
+class Qwen3VLMoeForConditionalGeneration(nn.Module):
     packed_modules_mapping = {
         "q_proj": ("qkv_proj", "q"),
         "k_proj": ("qkv_proj", "k"),
         "v_proj": ("qkv_proj", "v"),
-        "gate_proj": ("gate_up_proj", 0),
-        "up_proj": ("gate_up_proj", 1),
     }
 
-    def __init__(self, config: Qwen3VLConfig):
+    def __init__(self, config: Qwen3VLMoeConfig):
         super().__init__()
         self.config = config
         self.visual = Qwen3VisionTransformer(config.vision)
-        self.model = Qwen3Model(config)
+        self.model = Qwen3MoeModel(config)
         self.lm_head = ParallelLMHead(config.vocab_size, config.hidden_size)
         self._mrope_positions = MRopeInputPositions()
 

@@ -1,8 +1,8 @@
-"""Decoder layer: attention + MLP with RMSNorm residual connections.
+"""Qwen3-VL-MoE decoder layer: FP8 attention + FP8 MoE with RMSNorm residual connections.
 
-Unified across Llama, Qwen2, and Qwen3 architectures:
-  - bias:    Qwen2 uses bias=True on QKV projection.
-  - qk_norm: Qwen3 applies per-head RMSNorm to Q and K before RoPE.
+Uses LlamaAttention with qk_norm=True and FP8 weights for the attention block,
+and Qwen3MoE for the MoE block. Named `block_sparse_moe` for weight loading
+consistency with the Mixtral pattern.
 """
 
 from __future__ import annotations
@@ -11,23 +11,22 @@ import torch.nn as nn
 
 from ..L1.rms_norm import RMSNorm
 from ..L2.attention import LlamaAttention
-from ..L2.llama_mlp import LlamaMLP
+from ..L2.qwen3_moe import Qwen3MoE
 
 
-class LlamaDecoderLayer(nn.Module):
-    def __init__(self, config, rotary_emb: nn.Module | None = None,
-                 bias: bool = False, qk_norm: bool = False):
+class Qwen3MoeDecoderLayer(nn.Module):
+    def __init__(self, config, rotary_emb: nn.Module | None = None):
         super().__init__()
         fp8 = getattr(config, "fp8_block_size", None)
         self.self_attn = LlamaAttention(
             config.hidden_size, config.num_attention_heads,
             config.num_key_value_heads, config.head_dim,
             rotary_emb=rotary_emb,
-            bias=bias, qk_norm=qk_norm,
+            qk_norm=True,
             rms_norm_eps=config.rms_norm_eps,
             fp8_block_size=fp8,
         )
-        self.mlp = LlamaMLP(config)
+        self.mlp = Qwen3MoE(config)
         self.input_layernorm = RMSNorm(config.hidden_size, eps=config.rms_norm_eps)
         self.post_attention_layernorm = RMSNorm(config.hidden_size, eps=config.rms_norm_eps)
 

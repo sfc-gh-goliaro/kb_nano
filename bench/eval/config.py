@@ -8,8 +8,10 @@ from dataclasses import dataclass, field
 MODEL_KEY_TO_DEFAULT_HF: dict[str, str] = {
     "llama31": "meta-llama/Llama-3.1-8B-Instruct",
     "mixtral": "mistralai/Mixtral-8x7B-Instruct-v0.1",
-    "qwen2_vl": "Qwen/Qwen2-VL-7B-Instruct",
-    "qwen3_vl": "Qwen/Qwen3-VL-8B-Instruct",
+    "qwen2_vl_7b": "Qwen/Qwen2-VL-7B-Instruct",
+    "qwen2_vl_72b": "Qwen/Qwen2-VL-72B-Instruct",
+    "qwen3_vl_8b": "Qwen/Qwen3-VL-8B-Instruct-FP8",
+    "qwen3_vl_moe": "Qwen/Qwen3-VL-30B-A3B-Instruct-FP8",
 }
 
 MODEL_CATEGORY: dict[str, str] = {
@@ -17,7 +19,9 @@ MODEL_CATEGORY: dict[str, str] = {
     "meta-llama/Llama-3.1-70B-Instruct": "llm",
     "mistralai/Mixtral-8x7B-Instruct-v0.1": "llm",
     "Qwen/Qwen2-VL-7B-Instruct": "vlm",
-    "Qwen/Qwen3-VL-8B-Instruct": "vlm",
+    "Qwen/Qwen2-VL-72B-Instruct": "vlm",
+    "Qwen/Qwen3-VL-8B-Instruct-FP8": "vlm",
+    "Qwen/Qwen3-VL-30B-A3B-Instruct-FP8": "vlm",
 }
 
 

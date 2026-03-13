@@ -1,8 +1,10 @@
 """
-Weight loader for Llama 3.1, Mixtral, Qwen2-VL, and Qwen3-VL with tensor parallelism.
+Weight loader for Llama 3.1, Mixtral, Qwen2-VL, Qwen3-VL, and Qwen3-VL-MoE
+with tensor parallelism.
 
 Loads weights from HuggingFace safetensors and distributes them
 across TP shards using the weight_loader callbacks on each parameter.
+Supports FP8 quantized models (float8_e4m3fn weights + block scale factors).
 """
 
 from __future__ import annotations
@@ -22,6 +24,7 @@ from ..tasks.baseline.L4.llama import LlamaConfig, LlamaForCausalLM
 from ..tasks.baseline.L4.mixtral import MixtralConfig, MixtralForCausalLM
 from ..tasks.baseline.L4.qwen2_vl import Qwen2VLConfig, Qwen2VLForConditionalGeneration
 from ..tasks.baseline.L4.qwen3_vl import Qwen3VLConfig, Qwen3VLForConditionalGeneration
+from ..tasks.baseline.L4.qwen3_vl_moe import Qwen3VLMoeConfig, Qwen3VLMoeForConditionalGeneration
 
 
 def default_weight_loader(param: torch.nn.Parameter, loaded_weight: torch.Tensor):
@@ -36,6 +39,14 @@ def download_model(model_name: str) -> str:
 
 _EXPERT_RE = re.compile(
     r"(.+\.block_sparse_moe)\.experts\.(\d+)\.(w[123])\.weight"
+)
+
+# Qwen3-VL-MoE fused 3D expert tensors (no per-expert index in name)
+_FUSED_EXPERT_RE = re.compile(
+    r"(.+\.mlp)\.experts\.(gate_up_proj|down_proj)$"
+)
+_FUSED_EXPERT_SCALE_RE = re.compile(
+    r"(.+\.mlp)\.experts\.(gate_up_proj|down_proj)_scale_inv$"
 )
 
 
@@ -119,9 +130,22 @@ def _load_vision_qkv(model, param_prefix: str, loaded_weight: torch.Tensor,
     return 1
 
 
+def _is_scale_inv_tensor(name: str) -> tuple[bool, str]:
+    """Check if a tensor name is a weight_scale_inv and return the base weight name.
+
+    FP8 checkpoints store scale factors as e.g.:
+      model.layers.0.self_attn.q_proj.weight_scale_inv
+    This maps to the weight_scale_inv parameter on the packed linear.
+    """
+    if name.endswith(".weight_scale_inv"):
+        base = name[: -len(".weight_scale_inv")]
+        return True, base
+    return False, name
+
+
 def load_weights(model, model_path: str, model_type: str = "llama") -> None:
     """Load weights with support for packed modules, MoE experts, vision
-    encoder QKV, and TP sharding.
+    encoder QKV, TP sharding, and FP8 scale_inv tensors.
     """
     packed = getattr(model, "packed_modules_mapping", {})
     safetensor_files = sorted(glob(os.path.join(model_path, "*.safetensors")))
@@ -129,7 +153,7 @@ def load_weights(model, model_path: str, model_type: str = "llama") -> None:
         raise FileNotFoundError(f"No .safetensors files found in {model_path}")
 
     is_qwen2_vl = model_type == "qwen2_vl"
-    is_qwen3_vl = model_type == "qwen3_vl"
+    is_qwen3_vl = model_type in ("qwen3_vl", "qwen3_vl_moe")
     is_qwen_vl = is_qwen2_vl or is_qwen3_vl
 
     print(f"  Loading weights from {len(safetensor_files)} safetensors file(s)...")
@@ -144,6 +168,11 @@ def load_weights(model, model_path: str, model_type: str = "llama") -> None:
                     mapped_name = _remap_qwen3_vl_name(weight_name)
                 else:
                     mapped_name = weight_name
+
+                # Detect scale_inv tensors -- remap before further processing
+                is_scale, scale_base = _is_scale_inv_tensor(mapped_name)
+                if is_scale:
+                    mapped_name = scale_base + ".weight_scale_inv"
 
                 # Handle Qwen2-VL merger: ln_q -> norm, mlp.0 -> fc1, mlp.2 -> fc2
                 if is_qwen2_vl:
@@ -197,7 +226,39 @@ def load_weights(model, model_path: str, model_type: str = "llama") -> None:
                         )
                         continue
 
-                # Handle MoE expert weights
+                # Handle Qwen3-VL-MoE fused 3D expert weights + scales
+                m_fused = _FUSED_EXPERT_RE.match(mapped_name)
+                if m_fused:
+                    mlp_prefix, proj_name = m_fused.groups()
+                    if proj_name == "gate_up_proj":
+                        param_name = f"{mlp_prefix}.w13"
+                    else:
+                        param_name = f"{mlp_prefix}.w2"
+                    try:
+                        param = model.get_parameter(param_name)
+                    except AttributeError:
+                        continue
+                    param.weight_loader(param, f.get_tensor(weight_name))
+                    loaded += 1
+                    continue
+
+                m_fused_scale = _FUSED_EXPERT_SCALE_RE.match(mapped_name)
+                if m_fused_scale:
+                    mlp_prefix, proj_name = m_fused_scale.groups()
+                    if proj_name == "gate_up_proj":
+                        param_name = f"{mlp_prefix}.w13_scale_inv"
+                    else:
+                        param_name = f"{mlp_prefix}.w2_scale_inv"
+                    try:
+                        param = model.get_parameter(param_name)
+                    except AttributeError:
+                        continue
+                    weight_loader = getattr(param, "weight_loader", default_weight_loader)
+                    weight_loader(param, f.get_tensor(weight_name))
+                    loaded += 1
+                    continue
+
+                # Handle per-expert MoE weights (Mixtral style)
                 m = _EXPERT_RE.match(mapped_name)
                 if m:
                     moe_prefix, expert_id_str, w_name = m.groups()
@@ -218,20 +279,37 @@ def load_weights(model, model_path: str, model_type: str = "llama") -> None:
                     loaded += 1
                     continue
 
-                # Handle packed modules (qkv_proj, gate_up_proj)
+                # Handle packed modules (qkv_proj, gate_up_proj) and their scale_inv
                 matched = False
                 for orig_key, (packed_name, shard_id) in packed.items():
-                    if orig_key in mapped_name:
-                        param_name = mapped_name.replace(orig_key, packed_name)
-                        try:
-                            param = model.get_parameter(param_name)
-                        except AttributeError:
+                    if is_scale:
+                        scale_suffix = ".weight_scale_inv"
+                        check_key = orig_key + scale_suffix
+                        if check_key in mapped_name:
+                            param_name = mapped_name.replace(
+                                check_key, packed_name + scale_suffix
+                            )
+                            try:
+                                param = model.get_parameter(param_name)
+                            except AttributeError:
+                                break
+                            weight_loader = getattr(param, "weight_loader")
+                            weight_loader(param, f.get_tensor(weight_name), shard_id)
+                            loaded += 1
+                            matched = True
                             break
-                        weight_loader = getattr(param, "weight_loader")
-                        weight_loader(param, f.get_tensor(weight_name), shard_id)
-                        loaded += 1
-                        matched = True
-                        break
+                    else:
+                        if orig_key in mapped_name:
+                            param_name = mapped_name.replace(orig_key, packed_name)
+                            try:
+                                param = model.get_parameter(param_name)
+                            except AttributeError:
+                                break
+                            weight_loader = getattr(param, "weight_loader")
+                            weight_loader(param, f.get_tensor(weight_name), shard_id)
+                            loaded += 1
+                            matched = True
+                            break
                 if matched:
                     continue
                 if "rotary_emb" in mapped_name:
@@ -251,6 +329,22 @@ def _detect_model_type(model_name: str) -> str:
     hf_config = AutoConfig.from_pretrained(model_name)
     model_type = getattr(hf_config, "model_type", "llama")
     return model_type
+
+
+def _move_model_to_device(model: torch.nn.Module, device: torch.device,
+                          dtype: torch.dtype) -> torch.nn.Module:
+    """Move model to device, skipping dtype cast for FP8 parameters."""
+    has_fp8 = any(
+        p.dtype == torch.float8_e4m3fn for p in model.parameters()
+    )
+    if not has_fp8:
+        return model.to(device=device, dtype=dtype)
+
+    model = model.to(device=device)
+    for param in model.parameters():
+        if param.dtype != torch.float8_e4m3fn:
+            param.data = param.data.to(dtype=dtype)
+    return model
 
 
 def load_model(
@@ -276,6 +370,12 @@ def load_model(
         config.dtype = dtype
         print("  Allocating Qwen3-VL model...")
         model = Qwen3VLForConditionalGeneration(config)
+    elif model_type == "qwen3_vl_moe":
+        config = Qwen3VLMoeConfig.from_pretrained(model_name)
+        config.dtype = dtype
+        print(f"  Allocating Qwen3-VL-MoE model ({config.num_experts} experts, "
+              f"top-{config.num_experts_per_tok})...")
+        model = Qwen3VLMoeForConditionalGeneration(config)
     else:
         config = LlamaConfig.from_pretrained(model_name)
         config.dtype = dtype
@@ -283,6 +383,6 @@ def load_model(
         model = LlamaForCausalLM(config)
 
     load_weights(model, model_path, model_type)
-    model = model.to(device=device, dtype=dtype)
+    model = _move_model_to_device(model, device, dtype)
     model.eval()
     return model, config
