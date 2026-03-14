@@ -469,11 +469,11 @@ if __name__ == "__main__":
 KB_NANO_VLM_WORKER = r'''
 import json, sys, time
 
-def _load_raw_mm_data(dataset_name, dataset_split, num_seqs, seed):
-    """Load raw PIL images or video frames from HF datasets.
+def _load_mm_samples(dataset_name, dataset_split, num_seqs, seed):
+    """Load multimodal samples using vllm's dataset infrastructure.
 
-    Uses vLLM's dataset infrastructure to ensure identical data ordering
-    as the vLLM benchmark worker.
+    Returns the same chat-format messages that vLLM's worker uses,
+    ensuring identical data ordering and prompt structure.
     """
     from transformers import AutoTokenizer
     import os
@@ -487,36 +487,6 @@ def _load_raw_mm_data(dataset_name, dataset_split, num_seqs, seed):
             dataset_split=dataset_split,
             random_seed=seed,
         )
-        samples = ds.sample(tokenizer, num_seqs, enable_multimodal_chat=True)
-        results = []
-        for s in samples:
-            chat = s.prompt
-            text_parts = []
-            images = []
-            for msg in chat:
-                if msg["role"] == "user":
-                    for c in msg["content"]:
-                        if c.get("type") == "text":
-                            text_parts.append(c["text"])
-                        elif c.get("type") == "image_url":
-                            import base64
-                            from io import BytesIO
-                            from PIL import Image
-                            url = c["image_url"]["url"]
-                            if url.startswith("data:image/"):
-                                b64 = url.split(",", 1)[1]
-                                img = Image.open(BytesIO(base64.b64decode(b64))).convert("RGB")
-                            elif url.startswith(("http://", "https://", "file://")):
-                                import urllib.request
-                                path = url.replace("file://", "")
-                                img = Image.open(path).convert("RGB")
-                            else:
-                                img = Image.open(url).convert("RGB")
-                            images.append(img)
-            prompt = " ".join(text_parts) if text_parts else ""
-            results.append({"prompt": prompt, "images": [images] if images else None})
-        return results
-
     elif "MMVU" in dataset_name:
         from vllm.benchmarks.datasets import MMVUDataset
         ds = MMVUDataset(
@@ -525,43 +495,29 @@ def _load_raw_mm_data(dataset_name, dataset_split, num_seqs, seed):
             random_seed=seed,
             no_stream=True,
         )
-        samples = ds.sample(tokenizer, num_seqs, enable_multimodal_chat=True)
-        results = []
-        for s in samples:
-            chat = s.prompt
-            text_parts = []
-            videos_list = []
-            for msg in chat:
-                if msg["role"] == "user":
-                    for c in msg["content"]:
-                        if c.get("type") == "text":
-                            text_parts.append(c["text"])
-                        elif c.get("type") == "video_url":
-                            video_url = c["video_url"]["url"]
-                            video_path = video_url
-                            for prefix in ("file://", "https://", "http://"):
-                                if video_path.startswith(prefix):
-                                    video_path = video_path[len(prefix):]
-                                    break
-                            if not os.path.exists(video_path):
-                                from huggingface_hub import snapshot_download
-                                local_root = snapshot_download(dataset_name, repo_type="dataset")
-                                remote_root = f"https://huggingface.co/datasets/{dataset_name}/resolve/main"
-                                video_path = video_url.replace("file://", "").replace(remote_root, local_root)
-                            import decord
-                            decord.bridge.set_bridge("torch")
-                            from PIL import Image
-                            vr = decord.VideoReader(video_path)
-                            total = len(vr)
-                            num_frames = min(total, 16)
-                            indices = [int(i * total / num_frames) for i in range(num_frames)]
-                            frames = [Image.fromarray(
-                                vr[idx].numpy()).convert("RGB") for idx in indices]
-                            videos_list.append(frames)
-            prompt = " ".join(text_parts) if text_parts else ""
-            results.append({"prompt": prompt, "videos": [videos_list[0]] if videos_list else None})
-        return results
-    return []
+    else:
+        raise ValueError(f"Unsupported dataset: {dataset_name}")
+    return ds.sample(tokenizer, num_seqs, enable_multimodal_chat=True)
+
+
+def _preprocess_samples(engine, samples, use_tqdm=False):
+    """Pre-process chat-format samples through the engine's HF processor.
+
+    Returns a list of pre-processed dicts ready for engine.generate().
+    """
+    import sys
+    iter_samples = samples
+    if use_tqdm:
+        try:
+            from tqdm import tqdm
+            iter_samples = tqdm(samples, desc="Preprocessing", file=sys.stderr)
+        except ImportError:
+            pass
+    results = []
+    for s in iter_samples:
+        pp = engine.preprocess_chat(s.prompt)
+        results.append(pp)
+    return results
 
 
 def main():
@@ -614,25 +570,19 @@ def main():
             elapsed = time.perf_counter() - start
             total_input_tokens = sum(len(p) for p in prompts)
         else:
-            mm_data = _load_raw_mm_data(
+            samples = _load_mm_samples(
                 scenario["dataset"], scenario["dataset_split"],
                 scenario["num_seqs"], cfg["seed"],
             )
+            preprocessed = _preprocess_samples(engine, samples, use_tqdm=True)
             sp = SamplingParams(temperature=temperature, top_p=top_p,
                                 max_tokens=scenario["output_len"],
                                 ignore_eos=True)
-            prompts = [item["prompt"] for item in mm_data]
-            all_images = [item.get("images") for item in mm_data]
-            all_videos = [item.get("videos") for item in mm_data]
-            total_input_tokens = 0
+            total_input_tokens = sum(len(pp["token_ids"]) for pp in preprocessed)
             engine.block_manager.reset()
             torch.cuda.synchronize()
             start = time.perf_counter()
-            outputs = engine.generate(
-                prompts, sp,
-                images=all_images, videos=all_videos,
-                use_tqdm=True,
-            )
+            outputs = engine.generate(preprocessed, sp, use_tqdm=True)
             torch.cuda.synchronize()
             elapsed = time.perf_counter() - start
 
@@ -641,7 +591,7 @@ def main():
         result = {
             "name": scenario["name"],
             "elapsed": elapsed,
-            "total_input_tokens": total_input_tokens if modality == "text" else 0,
+            "total_input_tokens": total_input_tokens,
             "total_output_tokens": total_output_tokens,
             "outputs": [
                 {"generated_text": o.generated_text,
@@ -665,20 +615,17 @@ def main():
                 engine.generate(prompts, sp)
                 torch.cuda.synchronize()
         else:
-            mm_data = _load_raw_mm_data(
+            samples = _load_mm_samples(
                 ls["dataset"], ls["dataset_split"], 1, cfg["seed"],
             )
-            item = mm_data[0]
+            preprocessed = _preprocess_samples(engine, samples)
+            pp_item = preprocessed[0]
             sp = SamplingParams(temperature=0.0, ignore_eos=True,
                                 max_tokens=ls["output_len"])
-            def run_fn(item=item):
+            def run_fn(pp_item=pp_item):
                 engine.block_manager.reset()
                 torch.cuda.synchronize()
-                engine.generate(
-                    [item["prompt"]], sp,
-                    images=item.get("images"),
-                    videos=item.get("videos"),
-                )
+                engine.generate([pp_item], sp)
                 torch.cuda.synchronize()
 
         num_warmup = ls.get("num_warmup", 3)

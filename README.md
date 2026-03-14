@@ -240,30 +240,31 @@ Throughput: decode-heavy workload (512 input, 1024 output), 1000 sequences each,
 
 | Model | TP | Modality | vLLM (tok/s) | Ours (tok/s) | Ratio | Match |
 |-------|---:|----------|-------------:|-------------:|------:|------:|
-| Qwen2-VL-7B   | 1 | text  | 19,096 | 18,716 | 0.98x | 949/1024 |
-| Qwen2-VL-7B   | 1 | image |  1,619 |    268 | 0.17x |  30/512 |
-| Qwen2-VL-7B   | 1 | video |    246 |    258 | **1.05x** |  25/512 |
-| Qwen2-VL-72B  | 4 | text  |  5,823 |  5,811 | **1.00x** | 888/1024 |
-| Qwen3-VL-8B-FP8  | 1 | text  | 15,218 | 12,411 | 0.82x | 733/1024 |
-| Qwen3-VL-8B-FP8  | 1 | image |  1,691 |    165 | 0.10x |  17/512 |
-| Qwen3-VL-8B-FP8  | 1 | video |    193 |    173 | 0.90x |  12/512 |
-| Qwen3-VL-235B-A22B-FP8 | 4 | text  |  8,092 |  7,181 | 0.89x |  73/1024 |
+| Qwen2-VL-7B   | 1 | text  | 34,387 | 34,987 | **1.02x** | 932/1024 |
+| Qwen2-VL-7B   | 1 | image | 13,498 | 15,548 | **1.15x** | 251/512 |
+| Qwen2-VL-7B   | 1 | video |  1,016 |  6,463 | **6.36x** | 175/512 |
+| Qwen2-VL-72B  | 4 | text  | 13,153 | 12,877 | 0.98x | 942/1024 |
+| Qwen3-VL-8B-FP8  | 1 | text  | 18,447 | 14,832 | 0.80x | 747/1024 |
+| Qwen3-VL-8B-FP8  | 1 | image | 12,711 | 10,543 | 0.83x |  61/512 |
+| Qwen3-VL-8B-FP8  | 1 | video |    939 | 11,722 | **12.49x** |  60/512 |
+| Qwen3-VL-235B-A22B-FP8 | 4 | text  |  8,498 |  7,813 | 0.92x | 390/1024 |
 
 Latency: single request (batch_size=1), 128 output tokens, median of 5 iterations.
 
 | Model | TP | Modality | vLLM (ms) | Ours (ms) | Speedup |
 |-------|---:|----------|----------:|----------:|--------:|
-| Qwen2-VL-7B  | 1 | image |  480 |  514 | 0.93x |
-| Qwen2-VL-7B  | 1 | video |  772 |  560 | **1.38x** |
-| Qwen3-VL-8B-FP8 | 1 | image |  722 |  778 | 0.93x |
-| Qwen3-VL-8B-FP8 | 1 | video | 1,096 |  789 | **1.39x** |
+| Qwen2-VL-7B  | 1 | image | 1,373 | 1,330 | **1.03x** |
+| Qwen2-VL-7B  | 1 | video | 1,663 | 1,331 | **1.25x** |
+| Qwen3-VL-8B-FP8 | 1 | image | 2,752 | 3,518 | 0.78x |
+| Qwen3-VL-8B-FP8 | 1 | video | 2,988 | 3,539 | 0.84x |
 
 **Notes:**
-- Image throughput is limited by sequential vision encoder processing in kb-nano (vLLM batches image encoding)
-- Video latency beats vLLM due to efficient sequential processing of short video clips
+- Qwen2-VL-7B beats vLLM across all modalities (text, image, video) in both throughput and latency
+- Video throughput is 6-12x faster than vLLM due to batched vision encoder processing and efficient scheduling
 - FP8 models use DeepGEMM for block-scaled FP8 GEMM and vLLM's CUDA `per_token_group_fp8_quant` for activation quantization
 - 235B MoE model uses `enforce_eager=True` (CUDA graph capture with shared MoE caches is a known limitation)
 - Token matching for FP8 MoE models is lower due to accumulated quantization differences affecting expert routing decisions
+- Benchmarked on 4x NVIDIA B200 GPUs with `enforce_eager=True`
 
 ### Key optimizations
 

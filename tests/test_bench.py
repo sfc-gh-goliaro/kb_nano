@@ -1157,6 +1157,525 @@ finally:
 
 
 # ===========================================================================
+# Section 10: VLM Preprocessing (GPU required, needs VLM model)
+# ===========================================================================
+VLM_PREPROCESS_WORKER = r'''
+import json, os, sys, time
+import torch
+
+def main():
+    with open(sys.argv[1]) as f:
+        cfg = json.load(f)
+    os.environ["_BENCH_MODEL_NAME"] = cfg["model"]
+    sys.path.insert(0, cfg["project_root"])
+    pkg = cfg["package_name"]
+
+    from transformers import AutoProcessor, AutoTokenizer
+
+    mod = __import__(f"{pkg}.infra.engine", fromlist=["LlamaEngine", "SamplingParams"])
+    LlamaEngine, SamplingParams = mod.LlamaEngine, mod.SamplingParams
+
+    engine = LlamaEngine(
+        model_name=cfg["model"],
+        seed=42,
+        enforce_eager=True,
+        tensor_parallel_size=cfg.get("tp", 1),
+        max_model_len=cfg.get("max_model_len", 4096),
+    )
+
+    processor = AutoProcessor.from_pretrained(cfg["model"], trust_remote_code=True)
+    tokenizer = AutoTokenizer.from_pretrained(cfg["model"], trust_remote_code=True)
+
+    results = {}
+
+    # --- 10a: Image preprocessing correctness ---
+    try:
+        from vllm.benchmarks.datasets import VisionArenaDataset
+        ds = VisionArenaDataset(
+            dataset_path="lmarena-ai/VisionArena-Chat",
+            dataset_split="train",
+            random_seed=42,
+        )
+        samples = ds.sample(tokenizer, 5, enable_multimodal_chat=True)
+
+        img_correct = True
+        img_details = []
+        for i, s in enumerate(samples):
+            kb_result = engine.preprocess_chat(s.prompt)
+
+            ref_text = processor.apply_chat_template(
+                s.prompt, tokenize=False, add_generation_prompt=True,
+            )
+            from PIL import Image
+            from io import BytesIO
+            import base64
+            ref_images = []
+            for msg in s.prompt:
+                if msg.get("role") != "user":
+                    continue
+                for c in msg.get("content", []):
+                    if c.get("type") == "image_url":
+                        url = c["image_url"]["url"]
+                        if url.startswith("data:image/"):
+                            b64 = url.split(",", 1)[1]
+                            img = Image.open(BytesIO(base64.b64decode(b64))).convert("RGB")
+                        else:
+                            path = url.replace("file://", "")
+                            img = Image.open(path).convert("RGB")
+                        ref_images.append(img)
+            ref_inputs = processor(
+                text=[ref_text], images=ref_images if ref_images else None,
+                return_tensors="pt", padding=True,
+            )
+
+            ref_ids = ref_inputs["input_ids"][0].tolist()
+            ids_match = kb_result["token_ids"] == ref_ids
+
+            pv_match = True
+            if ref_inputs.get("pixel_values") is not None and kb_result["pixel_values"] is not None:
+                pv_match = torch.allclose(
+                    kb_result["pixel_values"].float(),
+                    ref_inputs["pixel_values"].float(),
+                    atol=1e-4,
+                )
+            elif ref_inputs.get("pixel_values") is not None or kb_result["pixel_values"] is not None:
+                pv_match = False
+
+            thw_match = True
+            if ref_inputs.get("image_grid_thw") is not None and kb_result["image_grid_thw"] is not None:
+                thw_match = ref_inputs["image_grid_thw"].tolist() == kb_result["image_grid_thw"]
+            elif ref_inputs.get("image_grid_thw") is not None or kb_result["image_grid_thw"] is not None:
+                thw_match = False
+
+            sample_ok = ids_match and pv_match and thw_match
+            if not sample_ok:
+                img_correct = False
+            img_details.append({
+                "sample": i,
+                "ids_match": ids_match,
+                "pv_match": pv_match,
+                "thw_match": thw_match,
+                "kb_ids_len": len(kb_result["token_ids"]),
+                "ref_ids_len": len(ref_ids),
+            })
+
+        results["10a_image_correctness"] = {
+            "pass": img_correct,
+            "details": img_details,
+        }
+    except Exception as e:
+        results["10a_image_correctness"] = {"pass": False, "error": str(e)}
+
+    # --- 10b: Video preprocessing correctness ---
+    try:
+        from vllm.benchmarks.datasets import MMVUDataset
+        ds = MMVUDataset(
+            dataset_path="yale-nlp/MMVU",
+            dataset_split="validation",
+            random_seed=42,
+            no_stream=True,
+        )
+        samples = ds.sample(tokenizer, 3, enable_multimodal_chat=True)
+
+        vid_correct = True
+        vid_details = []
+        for i, s in enumerate(samples):
+            kb_result = engine.preprocess_chat(s.prompt)
+
+            import decord
+            decord.bridge.set_bridge("native")
+            ref_videos = []
+            ref_content = []
+            for msg in s.prompt:
+                if msg.get("role") != "user":
+                    continue
+                for c in msg.get("content", []):
+                    if c.get("type") == "text":
+                        ref_content.append({"type": "text", "text": c["text"]})
+                    elif c.get("type") == "video_url":
+                        video_url = c["video_url"]["url"]
+                        video_path = video_url
+                        for prefix in ("file://", "https://", "http://"):
+                            if video_path.startswith(prefix):
+                                video_path = video_path[len(prefix):]
+                                break
+                        if not os.path.exists(video_path):
+                            from huggingface_hub import hf_hub_download
+                            parts = video_path.split("/")
+                            try:
+                                hf_idx = next(ii for ii, p in enumerate(parts) if p == "datasets")
+                                repo_id = "/".join(parts[hf_idx + 1:hf_idx + 3])
+                                resolve_idx = parts.index("resolve")
+                                rel_path = "/".join(parts[resolve_idx + 2:])
+                                video_path = hf_hub_download(
+                                    repo_id=repo_id, filename=rel_path, repo_type="dataset",
+                                )
+                            except (StopIteration, ValueError):
+                                pass
+                        vr = decord.VideoReader(video_path)
+                        total = len(vr)
+                        num_frames = min(total, 16)
+                        indices = [int(j * total / num_frames) for j in range(num_frames)]
+                        frames = [Image.fromarray(vr[idx].asnumpy()).convert("RGB") for idx in indices]
+                        ref_videos.append(frames)
+                        ref_content.append({"type": "video", "video": frames})
+
+            ref_messages = [{"role": "user", "content": ref_content}]
+            ref_text = processor.apply_chat_template(
+                ref_messages, tokenize=False, add_generation_prompt=True,
+            )
+            ref_inputs = processor(
+                text=[ref_text], videos=ref_videos if ref_videos else None,
+                return_tensors="pt", padding=True,
+            )
+
+            ref_ids = ref_inputs["input_ids"][0].tolist()
+            ids_match = kb_result["token_ids"] == ref_ids
+
+            pv_match = True
+            ref_vpv = ref_inputs.get("pixel_values_videos")
+            kb_vpv = kb_result.get("video_pixel_values")
+            if ref_vpv is not None and kb_vpv is not None:
+                pv_match = torch.allclose(kb_vpv.float(), ref_vpv.float(), atol=1e-4)
+            elif ref_vpv is not None or kb_vpv is not None:
+                pv_match = False
+
+            thw_match = True
+            ref_vthw = ref_inputs.get("video_grid_thw")
+            kb_vthw = kb_result.get("video_grid_thw")
+            if ref_vthw is not None and kb_vthw is not None:
+                thw_match = ref_vthw.tolist() == kb_vthw
+            elif ref_vthw is not None or kb_vthw is not None:
+                thw_match = False
+
+            sample_ok = ids_match and pv_match and thw_match
+            if not sample_ok:
+                vid_correct = False
+            vid_details.append({
+                "sample": i,
+                "ids_match": ids_match,
+                "pv_match": pv_match,
+                "thw_match": thw_match,
+                "kb_ids_len": len(kb_result["token_ids"]),
+                "ref_ids_len": len(ref_ids),
+            })
+
+        results["10b_video_correctness"] = {
+            "pass": vid_correct,
+            "details": vid_details,
+        }
+    except Exception as e:
+        results["10b_video_correctness"] = {"pass": False, "error": str(e)}
+
+    # --- 10c: M-RoPE position correctness ---
+    try:
+        mrope_ok = True
+        mrope_details = []
+
+        pp_text = engine.preprocess_multimodal("Hello world, this is a test")
+        text_mrope = pp_text["mrope_positions"]
+        text_len = len(pp_text["token_ids"])
+        expected_pos = torch.arange(text_len, dtype=torch.int64).unsqueeze(0).expand(3, -1)
+        text_pos_ok = torch.equal(text_mrope, expected_pos)
+        mrope_details.append({"case": "text_only", "pass": text_pos_ok,
+                              "seq_len": text_len})
+        if not text_pos_ok:
+            mrope_ok = False
+
+        from vllm.benchmarks.datasets import VisionArenaDataset
+        ds = VisionArenaDataset(
+            dataset_path="lmarena-ai/VisionArena-Chat",
+            dataset_split="train",
+            random_seed=42,
+        )
+        img_samples = ds.sample(tokenizer, 2, enable_multimodal_chat=True)
+        for i, s in enumerate(img_samples):
+            pp = engine.preprocess_chat(s.prompt)
+            mrope_pos = pp["mrope_positions"]
+            pos_shape_ok = mrope_pos.shape[0] == 3 and mrope_pos.shape[1] == len(pp["token_ids"])
+            delta_ok = isinstance(pp["mrope_position_delta"], (int, float))
+            case_ok = pos_shape_ok and delta_ok
+            mrope_details.append({
+                "case": f"image_{i}",
+                "shape_ok": pos_shape_ok,
+                "delta_ok": delta_ok,
+                "shape": list(mrope_pos.shape),
+                "pass": case_ok,
+            })
+            if not case_ok:
+                mrope_ok = False
+
+        results["10c_mrope_correctness"] = {
+            "pass": mrope_ok,
+            "details": mrope_details,
+        }
+    except Exception as e:
+        results["10c_mrope_correctness"] = {"pass": False, "error": str(e)}
+
+    # --- 10d: Preprocessing throughput -- image batch ---
+    try:
+        from vllm.benchmarks.datasets import VisionArenaDataset
+        ds = VisionArenaDataset(
+            dataset_path="lmarena-ai/VisionArena-Chat",
+            dataset_split="train",
+            random_seed=42,
+        )
+        img_samples = ds.sample(tokenizer, 100, enable_multimodal_chat=True)
+
+        t0 = time.perf_counter()
+        for s in img_samples:
+            engine.preprocess_chat(s.prompt)
+        kb_time = time.perf_counter() - t0
+
+        t0 = time.perf_counter()
+        for s in img_samples:
+            ref_text = processor.apply_chat_template(
+                s.prompt, tokenize=False, add_generation_prompt=True,
+            )
+            ref_images = []
+            for msg in s.prompt:
+                if msg.get("role") != "user":
+                    continue
+                for c in msg.get("content", []):
+                    if c.get("type") == "image_url":
+                        url = c["image_url"]["url"]
+                        if url.startswith("data:image/"):
+                            b64 = url.split(",", 1)[1]
+                            img = Image.open(BytesIO(base64.b64decode(b64))).convert("RGB")
+                        else:
+                            path = url.replace("file://", "")
+                            img = Image.open(path).convert("RGB")
+                        ref_images.append(img)
+            processor(
+                text=[ref_text], images=ref_images if ref_images else None,
+                return_tensors="pt", padding=True,
+            )
+        ref_time = time.perf_counter() - t0
+
+        ratio = kb_time / ref_time if ref_time > 0 else float("inf")
+        results["10d_image_throughput"] = {
+            "pass": ratio <= 1.1,
+            "kb_time": kb_time,
+            "ref_time": ref_time,
+            "ratio": ratio,
+            "num_samples": 100,
+        }
+    except Exception as e:
+        results["10d_image_throughput"] = {"pass": False, "error": str(e)}
+
+    # --- 10e: Preprocessing throughput -- video batch ---
+    try:
+        from vllm.benchmarks.datasets import MMVUDataset
+        ds = MMVUDataset(
+            dataset_path="yale-nlp/MMVU",
+            dataset_split="validation",
+            random_seed=42,
+            no_stream=True,
+        )
+        vid_samples = ds.sample(tokenizer, 20, enable_multimodal_chat=True)
+
+        t0 = time.perf_counter()
+        for s in vid_samples:
+            engine.preprocess_chat(s.prompt)
+        kb_time = time.perf_counter() - t0
+
+        t0 = time.perf_counter()
+        for s in vid_samples:
+            ref_text = processor.apply_chat_template(
+                s.prompt, tokenize=False, add_generation_prompt=True,
+            )
+            ref_videos = []
+            for msg in s.prompt:
+                if msg.get("role") != "user":
+                    continue
+                for c in msg.get("content", []):
+                    if c.get("type") == "video_url":
+                        video_url = c["video_url"]["url"]
+                        video_path = video_url
+                        for prefix in ("file://", "https://", "http://"):
+                            if video_path.startswith(prefix):
+                                video_path = video_path[len(prefix):]
+                                break
+                        if not os.path.exists(video_path):
+                            from huggingface_hub import hf_hub_download
+                            parts = video_path.split("/")
+                            try:
+                                hf_idx = next(ii for ii, p in enumerate(parts) if p == "datasets")
+                                repo_id = "/".join(parts[hf_idx + 1:hf_idx + 3])
+                                resolve_idx = parts.index("resolve")
+                                rel_path = "/".join(parts[resolve_idx + 2:])
+                                video_path = hf_hub_download(
+                                    repo_id=repo_id, filename=rel_path, repo_type="dataset",
+                                )
+                            except (StopIteration, ValueError):
+                                pass
+                        vr = decord.VideoReader(video_path)
+                        total = len(vr)
+                        num_frames = min(total, 16)
+                        indices = [int(j * total / num_frames) for j in range(num_frames)]
+                        frames = [Image.fromarray(vr[idx].asnumpy()).convert("RGB") for idx in indices]
+                        ref_videos.append(frames)
+            processor(
+                text=[ref_text], videos=ref_videos if ref_videos else None,
+                return_tensors="pt", padding=True,
+            )
+        ref_time = time.perf_counter() - t0
+
+        ratio = kb_time / ref_time if ref_time > 0 else float("inf")
+        results["10e_video_throughput"] = {
+            "pass": ratio <= 1.1,
+            "kb_time": kb_time,
+            "ref_time": ref_time,
+            "ratio": ratio,
+            "num_samples": 20,
+        }
+    except Exception as e:
+        results["10e_video_throughput"] = {"pass": False, "error": str(e)}
+
+    # --- 10f: Pre-processed input acceptance ---
+    try:
+        from vllm.benchmarks.datasets import VisionArenaDataset
+        ds = VisionArenaDataset(
+            dataset_path="lmarena-ai/VisionArena-Chat",
+            dataset_split="train",
+            random_seed=42,
+        )
+        gen_samples = ds.sample(tokenizer, 3, enable_multimodal_chat=True)
+
+        preprocessed = [engine.preprocess_chat(s.prompt) for s in gen_samples]
+
+        sp = SamplingParams(temperature=0.0, max_tokens=32)
+        outputs = engine.generate(preprocessed, sp)
+        gen_ok = len(outputs) == 3
+        non_empty = all(len(o.token_ids) > 0 for o in outputs)
+        results["10f_preprocess_acceptance"] = {
+            "pass": gen_ok and non_empty,
+            "num_outputs": len(outputs),
+            "non_empty": non_empty,
+        }
+    except Exception as e:
+        results["10f_preprocess_acceptance"] = {"pass": False, "error": str(e)}
+
+    del engine
+
+    with open(cfg["output_file"], "w") as f:
+        json.dump(results, f)
+
+if __name__ == "__main__":
+    main()
+'''
+
+
+def test_section_10():
+    print(f"\n{'=' * 60}")
+    print("  SECTION 10: VLM Preprocessing (GPU required)")
+    print(f"{'=' * 60}")
+
+    model = "Qwen/Qwen2-VL-7B-Instruct"
+
+    with _Timeout(1800):
+        with tempfile.TemporaryDirectory() as tmpdir:
+            config = {
+                "model": model,
+                "tp": 1,
+                "max_model_len": 4096,
+                "project_root": PROJECT_ROOT,
+                "package_name": PACKAGE_NAME,
+            }
+
+            script_path = os.path.join(tmpdir, "vlm_preprocess_test.py")
+            with open(script_path, "w") as f:
+                f.write(VLM_PREPROCESS_WORKER)
+
+            output_path = os.path.join(tmpdir, "results.json")
+            config["output_file"] = output_path
+            config_path = os.path.join(tmpdir, "config.json")
+            with open(config_path, "w") as f:
+                json.dump(config, f)
+
+            try:
+                result = subprocess.run(
+                    [sys.executable, script_path, config_path],
+                    timeout=1500,
+                    cwd=PROJECT_ROOT,
+                    capture_output=True,
+                    text=True,
+                )
+                if result.returncode != 0:
+                    print(f"    STDERR (last 1000 chars):\n{result.stderr[-1000:]}")
+                    check(False, "10. VLM preprocessing subprocess failed")
+                    return
+            except subprocess.TimeoutExpired:
+                check(False, "10. VLM preprocessing subprocess timed out")
+                return
+
+            if not os.path.exists(output_path):
+                check(False, "10. output JSON not created")
+                return
+
+            with open(output_path) as f:
+                data = json.load(f)
+
+            # 10a
+            r = data.get("10a_image_correctness", {})
+            if "error" in r:
+                print(f"    ERROR 10a: {r['error']}")
+            check(r.get("pass", False), "10a. image preprocessing correctness")
+            if not r.get("pass", False) and "details" in r:
+                for d in r["details"]:
+                    if not (d.get("ids_match") and d.get("pv_match") and d.get("thw_match")):
+                        print(f"      sample {d['sample']}: ids={d.get('ids_match')}, "
+                              f"pv={d.get('pv_match')}, thw={d.get('thw_match')}, "
+                              f"kb_len={d.get('kb_ids_len')}, ref_len={d.get('ref_ids_len')}")
+
+            # 10b
+            r = data.get("10b_video_correctness", {})
+            if "error" in r:
+                print(f"    ERROR 10b: {r['error']}")
+            check(r.get("pass", False), "10b. video preprocessing correctness")
+            if not r.get("pass", False) and "details" in r:
+                for d in r["details"]:
+                    if not (d.get("ids_match") and d.get("pv_match") and d.get("thw_match")):
+                        print(f"      sample {d['sample']}: ids={d.get('ids_match')}, "
+                              f"pv={d.get('pv_match')}, thw={d.get('thw_match')}, "
+                              f"kb_len={d.get('kb_ids_len')}, ref_len={d.get('ref_ids_len')}")
+
+            # 10c
+            r = data.get("10c_mrope_correctness", {})
+            if "error" in r:
+                print(f"    ERROR 10c: {r['error']}")
+            check(r.get("pass", False), "10c. M-RoPE position correctness")
+
+            # 10d
+            r = data.get("10d_image_throughput", {})
+            if "error" in r:
+                print(f"    ERROR 10d: {r['error']}")
+            ratio = r.get("ratio", float("inf"))
+            check(
+                r.get("pass", False),
+                f"10d. image preprocess throughput: ratio={ratio:.3f} "
+                f"(kb={r.get('kb_time', 0):.2f}s, ref={r.get('ref_time', 0):.2f}s)",
+            )
+
+            # 10e
+            r = data.get("10e_video_throughput", {})
+            if "error" in r:
+                print(f"    ERROR 10e: {r['error']}")
+            ratio = r.get("ratio", float("inf"))
+            check(
+                r.get("pass", False),
+                f"10e. video preprocess throughput: ratio={ratio:.3f} "
+                f"(kb={r.get('kb_time', 0):.2f}s, ref={r.get('ref_time', 0):.2f}s)",
+            )
+
+            # 10f
+            r = data.get("10f_preprocess_acceptance", {})
+            if "error" in r:
+                print(f"    ERROR 10f: {r['error']}")
+            check(r.get("pass", False), "10f. pre-processed input acceptance in generate()")
+
+
+# ===========================================================================
 # Main
 # ===========================================================================
 def main():
@@ -1165,11 +1684,11 @@ def main():
     )
     parser.add_argument(
         "--unit-only", action="store_true",
-        help="Skip GPU integration tests (sections 7-9)",
+        help="Skip GPU integration tests (sections 7-10)",
     )
     parser.add_argument(
         "--section", type=int, default=None,
-        help="Run only a specific section (1-9)",
+        help="Run only a specific section (1-10)",
     )
     args = parser.parse_args()
 
@@ -1187,6 +1706,7 @@ def main():
         7: ("Kernel integration", test_section_7, True),
         8: ("E2E integration", test_section_8, True),
         9: ("Eval integration", test_section_9, True),
+        10: ("VLM Preprocessing", test_section_10, True),
     }
 
     for num, (name, func, needs_gpu) in sorted(sections.items()):

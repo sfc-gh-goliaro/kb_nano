@@ -785,7 +785,7 @@ class ModelRunner:
         positions = self._eager_positions[:n]
         slot_mapping = self._eager_slot_mapping[:n]
         context_lens = self._eager_context_lens[:n]
-        block_tables = self._eager_block_tables[:n, :bt_cols]
+        block_tables = self._eager_block_tables[:n, :bt_cols].contiguous()
 
         set_context(
             False,
@@ -1279,12 +1279,202 @@ class LlamaEngine:
         return (token_ids, pixel_values, image_grid_thw,
                 video_pixel_values, video_grid_thw)
 
+    def preprocess_multimodal(self, prompt, images=None, videos=None):
+        """Public API: preprocess a multimodal prompt into a dict suitable for generate().
+
+        Returns a dict with keys: token_ids, pixel_values, image_grid_thw,
+        video_pixel_values, video_grid_thw, mrope_positions, mrope_position_delta.
+        Pass the returned dict as an element of the prompts list to generate().
+        """
+        (ids, pixel_values, image_grid_thw,
+         video_pv, video_grid_thw) = self._preprocess_multimodal(
+            prompt, images=images, videos=videos,
+        )
+        image_grid_thw_list = image_grid_thw.tolist() if image_grid_thw is not None else None
+        video_grid_thw_list = video_grid_thw.tolist() if video_grid_thw is not None else None
+
+        model = self.model_runner.model
+        merge_size = model.config.vision.spatial_merge_size
+        image_offsets = []
+        video_offsets = []
+        img_idx = 0
+        vid_idx = 0
+        i_tok = 0
+        while i_tok < len(ids):
+            tid = ids[i_tok]
+            if tid == self.model_runner.config.image_token_id and image_grid_thw_list and img_idx < len(image_grid_thw_list):
+                image_offsets.append(i_tok)
+                t, h, w = image_grid_thw_list[img_idx]
+                num_tokens = t * (h // merge_size) * (w // merge_size)
+                i_tok += num_tokens
+                img_idx += 1
+            elif tid == self.model_runner.config.video_token_id and video_grid_thw_list and vid_idx < len(video_grid_thw_list):
+                video_offsets.append(i_tok)
+                t, h, w = video_grid_thw_list[vid_idx]
+                num_tokens = t * (h // merge_size) * (w // merge_size)
+                i_tok += num_tokens
+                vid_idx += 1
+            else:
+                i_tok += 1
+
+        mrope_positions, delta = model.get_mrope_input_positions(
+            ids,
+            image_grid_thw=image_grid_thw_list,
+            video_grid_thw=video_grid_thw_list,
+            image_offsets=image_offsets if image_offsets else None,
+            video_offsets=video_offsets if video_offsets else None,
+        )
+        return {
+            "token_ids": ids,
+            "pixel_values": pixel_values,
+            "image_grid_thw": image_grid_thw_list,
+            "video_pixel_values": video_pv,
+            "video_grid_thw": video_grid_thw_list,
+            "mrope_positions": mrope_positions,
+            "mrope_position_delta": delta,
+        }
+
+    def preprocess_chat(self, messages):
+        """Preprocess an OpenAI-format chat message list into a dict for generate().
+
+        Extracts images/videos from the message content, applies the chat
+        template through the HF processor, and computes M-RoPE positions.
+        This matches the preprocessing path used by vLLM's llm.chat().
+        """
+        from PIL import Image
+        import base64
+        from io import BytesIO
+
+        images = []
+        videos = []
+        for msg in messages:
+            if msg.get("role") != "user":
+                continue
+            for c in msg.get("content", []):
+                ctype = c.get("type", "")
+                if ctype == "image_url":
+                    url = c["image_url"]["url"]
+                    if url.startswith("data:image/"):
+                        b64 = url.split(",", 1)[1]
+                        img = Image.open(BytesIO(base64.b64decode(b64))).convert("RGB")
+                    else:
+                        path = url.replace("file://", "")
+                        img = Image.open(path).convert("RGB")
+                    images.append(img)
+                elif ctype == "video_url":
+                    video_url = c["video_url"]["url"]
+                    video_path = video_url
+                    for prefix in ("file://", "https://", "http://"):
+                        if video_path.startswith(prefix):
+                            video_path = video_path[len(prefix):]
+                            break
+                    if not os.path.exists(video_path):
+                        from huggingface_hub import hf_hub_download
+                        parts = video_path.split("/")
+                        try:
+                            hf_idx = next(i for i, p in enumerate(parts) if p == "datasets")
+                            repo_id = "/".join(parts[hf_idx + 1:hf_idx + 3])
+                            resolve_idx = parts.index("resolve")
+                            rel_path = "/".join(parts[resolve_idx + 2:])
+                            video_path = hf_hub_download(
+                                repo_id=repo_id, filename=rel_path, repo_type="dataset",
+                            )
+                        except (StopIteration, ValueError):
+                            pass
+                    import decord
+                    decord.bridge.set_bridge("native")
+                    vr = decord.VideoReader(video_path)
+                    total = len(vr)
+                    num_frames = min(total, 16)
+                    indices = [int(i * total / num_frames) for i in range(num_frames)]
+                    frames = [Image.fromarray(vr[idx].asnumpy()).convert("RGB")
+                              for idx in indices]
+                    videos.append(frames)
+
+        content_parts = []
+        for msg in messages:
+            if msg.get("role") != "user":
+                continue
+            for c in msg.get("content", []):
+                ctype = c.get("type", "")
+                if ctype == "text":
+                    content_parts.append({"type": "text", "text": c["text"]})
+                elif ctype == "image_url":
+                    content_parts.append({"type": "image", "image": images[len([
+                        p for p in content_parts if p.get("type") == "image"
+                    ])]})
+                elif ctype == "video_url":
+                    content_parts.append({"type": "video", "video": videos[len([
+                        p for p in content_parts if p.get("type") == "video"
+                    ])]})
+
+        proc_messages = [{"role": "user", "content": content_parts}]
+        text = self.processor.apply_chat_template(
+            proc_messages, tokenize=False, add_generation_prompt=True,
+        )
+        proc_images = images if images else None
+        proc_videos = videos if videos else None
+        inputs = self.processor(
+            text=[text], images=proc_images, videos=proc_videos,
+            return_tensors="pt", padding=True,
+        )
+        ids = inputs["input_ids"][0].tolist()
+        pixel_values = inputs.get("pixel_values", None)
+        image_grid_thw = inputs.get("image_grid_thw", None)
+        video_pv = inputs.get("pixel_values_videos", None)
+        video_grid_thw = inputs.get("video_grid_thw", None)
+
+        image_grid_thw_list = image_grid_thw.tolist() if image_grid_thw is not None else None
+        video_grid_thw_list = video_grid_thw.tolist() if video_grid_thw is not None else None
+
+        model = self.model_runner.model
+        merge_size = model.config.vision.spatial_merge_size
+        image_offsets = []
+        video_offsets = []
+        img_idx = 0
+        vid_idx = 0
+        i_tok = 0
+        while i_tok < len(ids):
+            tid = ids[i_tok]
+            if tid == self.model_runner.config.image_token_id and image_grid_thw_list and img_idx < len(image_grid_thw_list):
+                image_offsets.append(i_tok)
+                t, h, w = image_grid_thw_list[img_idx]
+                num_tokens = t * (h // merge_size) * (w // merge_size)
+                i_tok += num_tokens
+                img_idx += 1
+            elif tid == self.model_runner.config.video_token_id and video_grid_thw_list and vid_idx < len(video_grid_thw_list):
+                video_offsets.append(i_tok)
+                t, h, w = video_grid_thw_list[vid_idx]
+                num_tokens = t * (h // merge_size) * (w // merge_size)
+                i_tok += num_tokens
+                vid_idx += 1
+            else:
+                i_tok += 1
+
+        mrope_positions, delta = model.get_mrope_input_positions(
+            ids,
+            image_grid_thw=image_grid_thw_list,
+            video_grid_thw=video_grid_thw_list,
+            image_offsets=image_offsets if image_offsets else None,
+            video_offsets=video_offsets if video_offsets else None,
+        )
+        return {
+            "token_ids": ids,
+            "pixel_values": pixel_values,
+            "image_grid_thw": image_grid_thw_list,
+            "video_pixel_values": video_pv,
+            "video_grid_thw": video_grid_thw_list,
+            "mrope_positions": mrope_positions,
+            "mrope_position_delta": delta,
+        }
+
     @torch.inference_mode()
     def _run_vision_encoder(self, seqs):
         """Run vision encoder for sequences with multimodal data and merge embeddings.
 
-        Caches embeddings on the Sequence object so the vision encoder only
-        runs once per sequence even with chunked prefill.
+        Batches pixel values across sequences into single model.visual() calls
+        (matching vLLM's approach) for better GPU utilization. Caches embeddings
+        on the Sequence object so the vision encoder only runs once per sequence.
 
         Returns (inputs_embeds, deepstack_embeds) where deepstack_embeds is a list
         of tensors for Qwen3-VL DeepStack, or None for Qwen2-VL.
@@ -1293,97 +1483,151 @@ class LlamaEngine:
         all_inputs_embeds = []
         has_deepstack = hasattr(model.visual, 'deepstack_merger_list')
         all_deepstack = [] if has_deepstack else None
+        merge_size = model.config.vision.spatial_merge_size
 
-        for seq in seqs:
+        uncached = []
+        seq_to_idx = {}
+        for i, seq in enumerate(seqs):
+            seq_to_idx[id(seq)] = i
             if seq._cached_embeds is not None:
                 all_inputs_embeds.append(seq._cached_embeds)
                 if has_deepstack:
                     all_deepstack.append(seq._cached_deepstack or [])
-                continue
+            else:
+                uncached.append(seq)
+                all_inputs_embeds.append(None)
+                if has_deepstack:
+                    all_deepstack.append(None)
 
+        if not uncached:
+            inputs_embeds = torch.cat(all_inputs_embeds, dim=0)
+            if has_deepstack and all_deepstack:
+                return inputs_embeds, self._merge_deepstack(all_deepstack, all_inputs_embeds)
+            return inputs_embeds, None
+
+        # Batch image pixel values across all uncached sequences
+        img_pv_parts = []
+        img_thw_parts = []
+        img_sizes_per_seq = {}
+        for seq in uncached:
+            if seq.pixel_values is not None:
+                pv = seq.pixel_values.cuda() if not seq.pixel_values.is_cuda else seq.pixel_values
+                img_pv_parts.append(pv)
+                thw = seq.image_grid_thw
+                img_thw_parts.extend(thw)
+                sizes = [t * (h // merge_size) * (w // merge_size) for t, h, w in thw]
+                img_sizes_per_seq[id(seq)] = sizes
+
+        batched_img_embeds = None
+        batched_img_ds = None
+        if img_pv_parts:
+            cat_pv = torch.cat(img_pv_parts, dim=0)
+            vis_out = model.visual(cat_pv, grid_thw=img_thw_parts)
+            if has_deepstack:
+                batched_img_embeds, batched_img_ds = vis_out
+            else:
+                batched_img_embeds = vis_out
+
+        # Batch video pixel values across all uncached sequences
+        vid_pv_parts = []
+        vid_thw_parts = []
+        vid_sizes_per_seq = {}
+        for seq in uncached:
+            if seq.video_pixel_values is not None:
+                pv = seq.video_pixel_values.cuda() if not seq.video_pixel_values.is_cuda else seq.video_pixel_values
+                vid_pv_parts.append(pv)
+                thw = seq.video_grid_thw
+                vid_thw_parts.extend(thw)
+                sizes = [t * (h // merge_size) * (w // merge_size) for t, h, w in thw]
+                vid_sizes_per_seq[id(seq)] = sizes
+
+        batched_vid_embeds = None
+        batched_vid_ds = None
+        if vid_pv_parts:
+            cat_pv = torch.cat(vid_pv_parts, dim=0)
+            vis_out = model.visual(cat_pv, grid_thw=vid_thw_parts)
+            if has_deepstack:
+                batched_vid_embeds, batched_vid_ds = vis_out
+            else:
+                batched_vid_embeds = vis_out
+
+        # Distribute batched embeddings back to individual sequences
+        img_offset = 0
+        vid_offset = 0
+        for seq in uncached:
             token_ids = torch.tensor(seq.token_ids, dtype=torch.int64, device="cuda")
             text_embeds = model.get_input_embeddings()(token_ids)
             seq_deepstack = [] if has_deepstack else None
 
-            if seq.pixel_values is not None:
-                pixel_values = seq.pixel_values.cuda()
-                grid_thw = seq.image_grid_thw
-                vis_out = model.visual(pixel_values, grid_thw=grid_thw)
-
-                if has_deepstack:
-                    image_embeds, ds_features = vis_out
-                else:
-                    image_embeds = vis_out
-                    ds_features = []
-
-                merge_size = model.config.vision.spatial_merge_size
-                sizes = []
-                for thw in grid_thw:
-                    t, h, w = thw
-                    sizes.append(t * (h // merge_size) * (w // merge_size))
+            if seq.pixel_values is not None and id(seq) in img_sizes_per_seq:
+                total_tokens = sum(img_sizes_per_seq[id(seq)])
+                seq_img_embeds = batched_img_embeds[img_offset:img_offset + total_tokens]
 
                 mask = token_ids == self.model_runner.config.image_token_id
                 if mask.any():
-                    text_embeds[mask] = image_embeds.to(text_embeds.dtype)
+                    text_embeds[mask] = seq_img_embeds.to(text_embeds.dtype)
 
-                if has_deepstack and ds_features:
-                    for ds_feat in ds_features:
+                if has_deepstack and batched_img_ds:
+                    for ds_level in batched_img_ds:
                         ds_expanded = torch.zeros_like(text_embeds)
                         if mask.any():
-                            ds_expanded[mask] = ds_feat.to(text_embeds.dtype)
+                            ds_expanded[mask] = ds_level[img_offset:img_offset + total_tokens].to(text_embeds.dtype)
                         seq_deepstack.append(ds_expanded)
 
+                img_offset += total_tokens
                 seq.pixel_values = None
 
-            if seq.video_pixel_values is not None:
-                video_pv = seq.video_pixel_values.cuda()
-                grid_thw = seq.video_grid_thw
-                vis_out = model.visual(video_pv, grid_thw=grid_thw)
-
-                if has_deepstack:
-                    video_embeds, ds_features = vis_out
-                else:
-                    video_embeds = vis_out
-                    ds_features = []
+            if seq.video_pixel_values is not None and id(seq) in vid_sizes_per_seq:
+                total_tokens = sum(vid_sizes_per_seq[id(seq)])
+                seq_vid_embeds = batched_vid_embeds[vid_offset:vid_offset + total_tokens]
 
                 mask = token_ids == self.model_runner.config.video_token_id
                 if mask.any():
-                    text_embeds[mask] = video_embeds.to(text_embeds.dtype)
+                    text_embeds[mask] = seq_vid_embeds.to(text_embeds.dtype)
 
-                if has_deepstack and ds_features:
-                    for i, ds_feat in enumerate(ds_features):
+                if has_deepstack and batched_vid_ds:
+                    for i, ds_level in enumerate(batched_vid_ds):
                         ds_expanded = torch.zeros_like(text_embeds)
                         if mask.any():
-                            ds_expanded[mask] = ds_feat.to(text_embeds.dtype)
+                            ds_expanded[mask] = ds_level[vid_offset:vid_offset + total_tokens].to(text_embeds.dtype)
                         if i < len(seq_deepstack):
                             seq_deepstack[i] = seq_deepstack[i] + ds_expanded
                         else:
                             seq_deepstack.append(ds_expanded)
 
+                vid_offset += total_tokens
                 seq.video_pixel_values = None
 
             seq._cached_embeds = text_embeds
             seq._cached_deepstack = seq_deepstack
-            all_inputs_embeds.append(text_embeds)
+
+            idx = seq_to_idx[id(seq)]
+            all_inputs_embeds[idx] = text_embeds
             if has_deepstack:
-                all_deepstack.append(seq_deepstack or [])
+                all_deepstack[idx] = seq_deepstack or []
 
         inputs_embeds = torch.cat(all_inputs_embeds, dim=0)
 
         if has_deepstack and all_deepstack:
-            num_levels = max(len(ds) for ds in all_deepstack)
-            deepstack_embeds = []
-            for level in range(num_levels):
-                level_parts = []
-                for ds in all_deepstack:
-                    if level < len(ds):
-                        level_parts.append(ds[level])
-                    else:
-                        level_parts.append(torch.zeros_like(all_inputs_embeds[0]))
-                deepstack_embeds.append(torch.cat(level_parts, dim=0))
-            return inputs_embeds, deepstack_embeds
+            return inputs_embeds, self._merge_deepstack(all_deepstack, all_inputs_embeds)
 
         return inputs_embeds, None
+
+    def _merge_deepstack(self, all_deepstack, all_inputs_embeds):
+        """Merge per-sequence deepstack features into batched tensors."""
+        num_levels = max((len(ds) for ds in all_deepstack if ds), default=0)
+        if num_levels == 0:
+            return None
+        deepstack_embeds = []
+        for level in range(num_levels):
+            level_parts = []
+            for ds, ie in zip(all_deepstack, all_inputs_embeds):
+                if ds and level < len(ds):
+                    level_parts.append(ds[level])
+                else:
+                    level_parts.append(torch.zeros_like(ie))
+            deepstack_embeds.append(torch.cat(level_parts, dim=0))
+        return deepstack_embeds
 
     def _slice_mm_embeds(self, prefill_seqs, prefill_chunk_sizes,
                          inputs_embeds, deepstack_embeds):
@@ -1447,7 +1691,17 @@ class LlamaEngine:
             img = images[i] if i < len(images) else None
             vid = videos[i] if i < len(videos) else None
 
-            if self.is_qwen_vl and (img is not None or vid is not None):
+            if isinstance(prompt, dict) and "token_ids" in prompt:
+                pp = prompt
+                ids = pp["token_ids"]
+                seq = Sequence(ids, max_tokens=sp.max_tokens, ignore_eos=sp.ignore_eos)
+                seq.pixel_values = pp.get("pixel_values")
+                seq.image_grid_thw = pp.get("image_grid_thw")
+                seq.video_pixel_values = pp.get("video_pixel_values")
+                seq.video_grid_thw = pp.get("video_grid_thw")
+                seq.mrope_positions = pp.get("mrope_positions")
+                seq.mrope_position_delta = pp.get("mrope_position_delta", 0)
+            elif self.is_qwen_vl and (img is not None or vid is not None):
                 (ids, pixel_values, image_grid_thw,
                  video_pv, video_grid_thw) = self._preprocess_multimodal(
                     prompt, images=img, videos=vid,
@@ -1458,7 +1712,6 @@ class LlamaEngine:
                 seq.video_pixel_values = video_pv
                 seq.video_grid_thw = video_grid_thw.tolist() if video_grid_thw is not None else None
 
-                # Compute M-RoPE positions
                 model = self.model_runner.model
                 merge_size = model.config.vision.spatial_merge_size
                 image_offsets = []
