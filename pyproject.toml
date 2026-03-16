@@ -20,7 +20,7 @@ dependencies = [
 ]
 
 [project.scripts]
-kb_nano = "kb_nano.cli:main"
+kb_nano = "kb_nano.__main__:main"
 
 [tool.setuptools.package-dir]
 "kb_nano" = "."
