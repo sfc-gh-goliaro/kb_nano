@@ -85,12 +85,26 @@ def main():
         num_prompts=args.num_prompts,
     )
 
-    report = asyncio.run(run_eval(config, gpu_pool=args.gpu_pool))
-    report.print_table()
+    from kb_nano.bench.tracking import tracker
 
-    output_path = args.output_json or _default_output
-    report.save_json(output_path)
-    print(f"\n  Results saved to: {output_path}")
+    eval_params = {
+        "models": str(args.model) if args.model else "auto",
+        "tp_degrees": str(args.tp),
+        "categories": str(args.category) if args.category else "all",
+        "num_prompts": args.num_prompts,
+        "seed": args.seed,
+        "temperature": args.temperature,
+    }
+
+    with tracker.start_run("eval", params=eval_params, tags={"tier": "eval"}):
+        report = asyncio.run(run_eval(config, gpu_pool=args.gpu_pool))
+        tracker.log_eval(report)
+
+        report.print_table()
+
+        output_path = args.output_json or _default_output
+        report.save_json(output_path)
+        print(f"\n  Results saved to: {output_path}")
 
     sys.exit(1 if report.failed_jobs > 0 else 0)
 

@@ -38,6 +38,7 @@ from dataclasses import dataclass
 from pathlib import Path
 
 from kb_nano import CANDIDATE_DIR, CUDA_BUILD_CACHE, KB_ROOT, PREV_ATTEMPTS_DIR, PROJECT_ROOT
+from kb_nano.bench.tracking import tracker
 
 _PROJECT_ROOT = str(PROJECT_ROOT)
 if _PROJECT_ROOT not in sys.path:
@@ -952,6 +953,25 @@ def main():
     )
     args = parser.parse_args()
 
+    # --- MLflow tracking: wrap entire agent run ---
+    agent_params = {
+        "model": args.model,
+        "level": args.level,
+        "cuda_only": args.cuda_only,
+        "max_retries": args.max_retries,
+        "llm_model": args.llm_model,
+        "tp": args.tp,
+        "max_tokens": args.max_tokens,
+        "seed": args.seed,
+    }
+    run_name = f"agent_L{args.level}_{args.model.split('/')[-1]}"
+
+    with tracker.start_run(run_name, params=agent_params, tags={"tier": "agent"}):
+        _run_agent(args)
+
+
+def _run_agent(args):
+    """Core agent logic, called within a tracking context."""
     _archive_existing_candidates()
     _CANDIDATE_DIR.mkdir(parents=True, exist_ok=True)
     _CUDA_BUILD_CACHE.mkdir(parents=True, exist_ok=True)
@@ -991,6 +1011,10 @@ def main():
 
     print_generation_report(kernels)
 
+    # Log each generated kernel to MLflow
+    for k in kernels:
+        tracker.log_kernel(k.op_name, args.level, k.code, error=k.error)
+
     # Step 3: Per-operator unit tests with random data (parallel via threads)
     op_by_name = {op.name: op for op in ops}
     testable = [k for k in kernels if k.success and k.file_path]
@@ -1015,6 +1039,17 @@ def main():
         t_test = time.perf_counter() - t_test_start
         print(f"  Unit tests completed in {t_test:.1f}s")
         print_unit_test_report(unit_results)
+
+        # Log unit test results to MLflow
+        for op_name, res in unit_results.items():
+            max_diff = res.get("max_diff")
+            tracker.log_metrics({
+                f"utest_{op_name}_success": int(res.get("success", False)),
+                **(
+                    {f"utest_{op_name}_max_diff": max_diff}
+                    if max_diff is not None else {}
+                ),
+            })
 
         # Exclude kernels that failed unit tests from e2e benchmark
         for k in kernels:
@@ -1068,6 +1103,13 @@ def main():
             continue
 
     print_benchmark_report(bench_result)
+
+    # Log e2e benchmark results to MLflow
+    e2e_metrics = {"e2e_success": int(bench_result.get("success", False))}
+    if bench_result.get("success"):
+        e2e_metrics["e2e_speedup"] = bench_result["speedup"]
+        e2e_metrics["e2e_token_match_rate"] = bench_result["token_match_rate"]
+    tracker.log_metrics(e2e_metrics)
 
 
 async def _regen_single(op, old_kernel, error_text, cuda_only, max_retries, llm_model):

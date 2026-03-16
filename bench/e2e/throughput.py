@@ -372,6 +372,11 @@ def main(args: argparse.Namespace):
         "output_tokens_per_second": total_output / elapsed,
     }
 
+    # Log to MLflow
+    from kb_nano.bench.tracking import tracker
+
+    tracker.log_e2e(results, bench_type="throughput")
+
     if args.output_json:
         output_json = args.output_json
     else:

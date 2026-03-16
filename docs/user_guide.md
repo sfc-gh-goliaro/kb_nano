@@ -113,6 +113,176 @@ Generated kernels are saved to `tasks/candidate/L{level}/{op_name}.py`.
 
 ---
 
+## Experiment Tracking
+
+Every `kb_nano agent`, `kb_nano kernels`, `kb_nano eval`, and `kb_nano e2e` run is automatically logged to [MLflow](https://mlflow.org). This provides:
+
+- **Kernel lineage**: Every generated kernel is stored as an MLflow artifact, linked to the run parameters that produced it.
+- **Benchmark history**: Speedup, correctness, and mean absolute difference for every operator across every benchmark run.
+- **Comparison**: Use the MLflow UI to compare runs side-by-side and visualize speedup trends.
+
+### What gets logged
+
+| Command | Logged data |
+|---------|-------------|
+| `kb_nano agent` | Run params, per-op generation success/attempts, unit test results, e2e speedup, kernel source code |
+| `kb_nano kernels` | Bench params, per-operator per-scenario speedup/correctness, kernel source code |
+| `kb_nano eval` | Per-model throughput/latency speedup, alignment rate, wall-clock time |
+| `kb_nano e2e` | Throughput (tokens/s), latency (percentiles), serve metrics (TTFT, TPOT, ITL) |
+
+### Querying from the CLI
+
+```bash
+kb_nano history                  # recent runs
+kb_nano history --op rms_norm    # history for one operator
+kb_nano history --best           # best speedup per operator
+kb_nano history --limit 50       # show more results
+```
+
+#### Sample output: `kb_nano history`
+
+```
+======================================================================
+  RECENT TRACKED RUNS
+======================================================================
+  TIMESTAMP          RUN NAME                            KEY METRICS
+  ──────────────────────────────────────────────────────────────────
+  2026-03-16 16:44   e2e_throughput_Llama-3.1-8B         tokens_per_second=15000.0
+  2026-03-16 16:44   kernels_rms_norm                    avg_speedup=1.64x  total_passed=2  total_failed=0
+  2026-03-16 16:44   agent_L1_Llama-3.1-8B               e2e_speedup=1.15x  e2e_token_match_rate=97.0%
+======================================================================
+```
+
+#### Sample output: `kb_nano history --op rms_norm`
+
+```
+======================================================================
+  TRACKING HISTORY: rms_norm
+======================================================================
+  TIMESTAMP          RUN NAME                     SPEEDUP   PASS  MEAN_DIFF     RUN ID
+  ──────────────────────────────────────────────────────────────────
+  2026-03-16 16:44   kernels_rms_norm               1.64x    2/2    1.2e-06   a1b2c3d4
+  2026-03-15 14:20   kernels_rms_norm               1.31x    2/2    2.1e-06   e5f6a7b8
+  2026-03-14 09:55   agent_L1_Llama-3.1-8B          1.12x    2/2    3.4e-05   c9d0e1f2
+======================================================================
+```
+
+#### Sample output: `kb_nano history --best`
+
+```
+======================================================================
+  BEST SPEEDUP PER OPERATOR (from kernel benchmarks)
+======================================================================
+  OPERATOR                  BEST SPEEDUP DATE               RUN ID
+  ──────────────────────────────────────────────────────────────────
+  rms_norm                         1.64x 2026-03-16 16:44   a1b2c3d4
+  rotary_emb                       1.22x 2026-03-15 11:30   d3e4f5a6
+  silu_and_mul                     1.45x 2026-03-14 09:55   b7c8d9e0
+======================================================================
+```
+
+### Tracking API for custom agents
+
+Any kernel optimization script can use the tracking API directly:
+
+```python
+from kb_nano.bench.tracking import tracker
+
+with tracker.start_run("my-run", params={"model": "llama", "level": 1}):
+    # Log a generated kernel (stored as MLflow artifact)
+    tracker.log_kernel("rms_norm", level=1, code=kernel_source)
+
+    # Log kernel benchmark results (pass KernelBenchResult directly)
+    tracker.log_kernel_bench(result)
+
+    # Log eval results (pass EvalReport directly)
+    tracker.log_eval(report)
+
+    # Log e2e results
+    tracker.log_e2e(results_dict, bench_type="throughput")
+
+    # Log any custom metrics
+    tracker.log_metrics({"my_score": 0.95, "compile_time": 12.3})
+```
+
+The full API surface is five logging functions plus one context manager:
+
+| Function | Purpose |
+|----------|---------|
+| `tracker.start_run(name, params, tags)` | Context manager that opens an MLflow run |
+| `tracker.log_kernel(op, level, code)` | Log kernel source code as artifact |
+| `tracker.log_kernel_bench(result)` | Log `KernelBenchResult` metrics |
+| `tracker.log_eval(report)` | Log `EvalReport` metrics |
+| `tracker.log_e2e(results, bench_type)` | Log E2E benchmark metrics |
+| `tracker.log_metrics(dict)` | Log arbitrary key-value metrics |
+
+### MLflow Web UI
+
+```bash
+kb_nano mlflow-ui
+# Open http://localhost:5000 in your browser
+# Press Ctrl+C to stop
+```
+
+The UI launches a local MLflow server at http://localhost:5000 backed by the `mlruns/` directory. All runs are logged under the `kb_nano` experiment.
+
+#### Navigating the UI
+
+1. **Experiment list** (left sidebar): Select the `kb_nano` experiment to see all tracked runs.
+2. **Runs table**: Each row is a tracked run (agent, kernel benchmark, eval, or e2e). Columns show run name, start time, duration, and logged metrics. Click column headers to sort -- e.g., sort by `e2e_speedup` to find your fastest runs.
+3. **Filtering**: Use the search bar to filter runs by parameters or metrics. Examples:
+   - `params.level = "1"` -- show only L1 runs
+   - `params.cuda_only = "True"` -- show CUDA-only agent runs
+   - `metrics.e2e_speedup > 1.0` -- show runs that beat the baseline
+   - `tags.tier = "agent"` -- show only agent runs (vs `"kernel"`, `"eval"`, `"e2e"`)
+
+#### Inspecting a run
+
+Click any run to open its detail page:
+
+- **Parameters**: Model, level, TP degree, LLM model, seed, and other run configuration.
+- **Metrics**: Per-operator generation success (`gen_rms_norm_success`), unit test results (`utest_rms_norm_success`, `utest_rms_norm_max_diff`), and e2e results (`e2e_speedup`, `e2e_token_match_rate`).
+- **Artifacts**: Browse the `kernels/` folder to view and download the exact source code of every generated kernel. Failed generations store error traces under `errors/`.
+
+#### Comparing runs
+
+1. Select two or more runs using the checkboxes in the runs table.
+2. Click **Compare**. The comparison view shows:
+   - **Parameter diff**: Which parameters changed between runs (e.g., `cuda_only: True` vs `False`).
+   - **Metric comparison**: Side-by-side metric values -- useful for seeing how `e2e_speedup` or `e2e_token_match_rate` changed across iterations.
+   - **Artifact diff**: Compare kernel source code between runs to see how the generated code evolved.
+
+#### Downloading kernel artifacts
+
+From any run's artifact browser, click a kernel file (e.g., `kernels/rms_norm.py`) to preview its contents. Click the download button to save it locally. This is useful for recovering a high-performing kernel from a previous run:
+
+```bash
+# Or query artifacts programmatically:
+python -c "
+import mlflow
+mlflow.set_tracking_uri('file://$(pwd)/mlruns')
+client = mlflow.tracking.MlflowClient()
+client.download_artifacts('<run_id>', 'kernels/rms_norm.py', '/tmp/')
+"
+```
+
+#### Tracking data structure
+
+Each run is tagged with a `tier` that indicates its source:
+
+| Tag | Source command | Key metrics |
+|-----|---------------|-------------|
+| `agent` | `kb_nano agent` | `gen_{op}_success`, `utest_{op}_success`, `e2e_speedup`, `e2e_token_match_rate` |
+| `kernel` | `kb_nano kernels` | `{op}_avg_speedup`, `{op}_passed`, `{op}_failed`, `avg_speedup` |
+| `eval` | `kb_nano eval` | `avg_throughput_speedup`, `avg_latency_speedup`, `alignment_rate` |
+| `e2e` | `kb_nano e2e` | `tokens_per_second`, `avg_latency`, `mean_ttft_ms` (varies by bench type) |
+
+### Disabling tracking
+
+Tracking is always-on when `mlflow` is installed. To disable it, uninstall mlflow: `pip uninstall mlflow`. The system degrades gracefully -- a single warning is printed, and all tracking calls become no-ops.
+
+---
+
 ## Design Philosophy
 
 ### The L1-L4 Hierarchy

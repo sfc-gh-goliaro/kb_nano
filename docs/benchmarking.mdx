@@ -134,6 +134,12 @@ kb_nano capture-golden \
 
 ---
 
+## Experiment Tracking
+
+All three benchmark tiers automatically log their results to MLflow. After any `kb_nano kernels`, `kb_nano e2e`, or `kb_nano eval` run, you can query the results with `kb_nano history` or browse them in the MLflow web UI via `kb_nano mlflow-ui`. See [Experiment Tracking](/experiment-tracking) for details.
+
+---
+
 ## Conflict Resolution
 
 When multiple candidate kernels overlap (e.g. an L2 `attention` kernel internally replaces an L1 `rms_norm`), the kernel swapper detects subsumption automatically and warns. Candidates are always applied bottom-up (L1 → L4).

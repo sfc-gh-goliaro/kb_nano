@@ -41,6 +41,9 @@ RESULTS_DIR = Path(
     os.environ.get("KB_NANO_RESULTS_DIR", str(KB_ROOT / "bench" / "results"))
 )
 
+# --- MLflow tracking ---
+MLFLOW_TRACKING_DIR = KB_ROOT / "mlruns"
+
 # --- Agent build cache ---
 CUDA_BUILD_CACHE = KB_ROOT / "agent" / "_cuda_build_cache"
 

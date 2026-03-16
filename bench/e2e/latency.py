@@ -209,6 +209,11 @@ def main(args: argparse.Namespace):
         "percentiles": {str(p): float(v) for p, v in zip(percentages, percentiles)},
     }
 
+    # Log to MLflow
+    from kb_nano.bench.tracking import tracker
+
+    tracker.log_e2e(results, bench_type="latency")
+
     if args.output_json:
         output_json = args.output_json
     else:

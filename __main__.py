@@ -46,6 +46,12 @@ def main():
     elif command == "create-stubs":
         from kb_nano.agent.create_stubs import main as stubs_main
         stubs_main()
+    elif command == "history":
+        from kb_nano.bench.tracking.history import history_main
+        history_main()
+    elif command == "mlflow-ui":
+        from kb_nano.bench.tracking.history import mlflow_ui_main
+        mlflow_ui_main()
     elif command in ("-h", "--help", "help"):
         _print_usage()
     else:
@@ -63,6 +69,8 @@ def _print_usage():
     print("  e2e              End-to-end benchmarks (throughput, latency, serve)")
     print("  agent            LLM-powered kernel generation agent")
     print("  create-stubs     Create skeleton replacement modules")
+    print("  history          Query tracked experiment runs (MLflow)")
+    print("  mlflow-ui        Launch the MLflow web UI")
     print("  generate-inputs  Generate YAML input manifests")
     print("  capture-golden   Capture golden tensor data for data-dependent ops")
     print()
