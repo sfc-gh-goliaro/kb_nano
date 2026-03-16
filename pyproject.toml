@@ -18,6 +18,7 @@ dependencies = [
     "sgl-kernel",
     "decord",
     "mlflow>=2.10",
+    "pandas",
 ]
 
 [project.optional-dependencies]

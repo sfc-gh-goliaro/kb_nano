@@ -880,6 +880,199 @@ def print_benchmark_report(bench_result: dict) -> None:
 
 
 # ---------------------------------------------------------------------------
+# NCU profiling analysis
+# ---------------------------------------------------------------------------
+_NCU_JUDGE_SYSTEM = (
+    "You are a senior CUDA performance engineer. Read the NCU profiling metrics "
+    "for baseline and candidate kernels and identify **exactly one** "
+    "highest-impact performance bottleneck. Propose a concrete optimization. "
+    "Be surgical and metrics-driven. Return JSON only."
+)
+
+_NCU_JUDGE_PROMPT = """\
+## Operator: {op_name}
+## Baseline implementation
+```python
+{baseline_source}
+```
+
+## Candidate implementation
+```python
+{candidate_source}
+```
+
+## Current speedup: {speedup:.2f}x
+
+## Baseline NCU Metrics
+{baseline_metrics}
+
+## Candidate NCU Metrics
+{candidate_metrics}
+
+Identify the single biggest performance bottleneck in the candidate kernel \
+based on the NCU metrics. Return ONLY a JSON object:
+```json
+{{
+    "bottleneck": "<max 30 words>",
+    "optimisation": "<max 35 words>",
+    "modification_plan": "<max 35 words>"
+}}
+```
+"""
+
+
+def run_ncu_analysis(
+    kernels: list[GeneratedKernel],
+    ops: list[OperatorSpec],
+    bench_result: dict,
+    llm_model: str,
+) -> dict[str, dict]:
+    """Run NCU profiling on successful kernels and get optimization advice.
+
+    Returns {op_name: {"bottleneck": ..., "optimisation": ..., "modification_plan": ...}}.
+    """
+    from kb_nano.bench.kernels.ncu_profiler import (
+        find_ncu_binary,
+        load_ncu_metrics,
+        metrics_to_prompt,
+        profile_kernel,
+    )
+    from kb_nano.bench.utils.input_registry import InputRegistry
+
+    if find_ncu_binary() is None:
+        print("  WARNING: ncu binary not found — skipping NCU analysis.")
+        return {}
+
+    op_by_name = {op.name: op for op in ops}
+    registry = InputRegistry()
+    advice: dict[str, dict] = {}
+
+    successful = [k for k in kernels if k.success and k.file_path]
+    if not successful:
+        return {}
+
+    for kernel in successful:
+        op = op_by_name.get(kernel.op_name)
+        if op is None:
+            continue
+
+        # Find target for module_path
+        try:
+            from kb_nano.infra.kernel_swapper import get as get_target
+            target = get_target(kernel.op_name)
+        except Exception:
+            continue
+
+        # Get first available scenario for profiling
+        scenarios = registry.scenarios(kernel.op_name)
+        if not scenarios:
+            continue
+        scenario = scenarios[0]
+
+        print(f"  [ncu] Profiling {kernel.op_name} ({scenario.name})...")
+
+        # Profile baseline
+        baseline_csv = profile_kernel(
+            target_name=kernel.op_name,
+            scenario_name=scenario.name,
+            class_name=kernel.class_name,
+            module_source="baseline",
+            module_path=target.module_path,
+            init_args=scenario.init_args,
+            label="baseline",
+        )
+
+        # Profile candidate
+        candidate_csv = profile_kernel(
+            target_name=kernel.op_name,
+            scenario_name=scenario.name,
+            class_name=kernel.class_name,
+            module_source=kernel.file_path,
+            module_path=target.module_path,
+            init_args=scenario.init_args,
+            label="candidate",
+        )
+
+        baseline_json = "{}"
+        candidate_json = "{}"
+        if baseline_csv:
+            try:
+                baseline_json = metrics_to_prompt(load_ncu_metrics(baseline_csv))
+            except Exception:
+                pass
+        if candidate_csv:
+            try:
+                candidate_json = metrics_to_prompt(load_ncu_metrics(candidate_csv))
+            except Exception:
+                pass
+
+        if baseline_json == "{}" and candidate_json == "{}":
+            continue
+
+        # Build judge prompt
+        speedup = bench_result.get("speedup", 1.0)
+        prompt = _NCU_JUDGE_PROMPT.format(
+            op_name=kernel.op_name,
+            baseline_source=op.source_code,
+            candidate_source=kernel.code[:4000],
+            speedup=speedup,
+            baseline_metrics=baseline_json,
+            candidate_metrics=candidate_json,
+        )
+
+        # Call LLM for optimization advice
+        try:
+            response = asyncio.run(_call_ncu_judge(
+                prompt, llm_model,
+            ))
+            parsed = extract_python_code(response) or response
+            import json as _json
+            parsed_json = _json.loads(parsed) if isinstance(parsed, str) else parsed
+            advice[kernel.op_name] = parsed_json
+        except Exception as e:
+            print(f"  WARNING: NCU judge failed for {kernel.op_name}: {e}")
+            # Store raw metrics as fallback
+            advice[kernel.op_name] = {
+                "baseline_metrics": baseline_json,
+                "candidate_metrics": candidate_json,
+                "error": str(e),
+            }
+
+    return advice
+
+
+async def _call_ncu_judge(prompt: str, llm_model: str) -> str:
+    """Call the LLM judge for NCU analysis."""
+    import aiohttp
+    async with aiohttp.ClientSession() as session:
+        return await call_llm_async(
+            prompt, model_name=llm_model, max_tokens=1024, temperature=0.0,
+            system=_NCU_JUDGE_SYSTEM, session=session,
+        )
+
+
+def print_ncu_advice(advice: dict[str, dict]) -> None:
+    """Print NCU optimization advice."""
+    print(f"\n{'=' * 70}")
+    print("  NCU OPTIMIZATION ANALYSIS")
+    print(f"{'=' * 70}")
+
+    for op_name, info in sorted(advice.items()):
+        print(f"\n  {op_name}:")
+        if "error" in info:
+            print(f"    (judge failed: {info['error'][:100]})")
+            continue
+        if "bottleneck" in info:
+            print(f"    Bottleneck:   {info['bottleneck']}")
+        if "optimisation" in info:
+            print(f"    Optimization: {info['optimisation']}")
+        if "modification_plan" in info:
+            print(f"    Plan:         {info['modification_plan']}")
+
+    print(f"\n{'=' * 70}")
+
+
+# ---------------------------------------------------------------------------
 # Candidate directory management
 # ---------------------------------------------------------------------------
 def _candidate_has_kernels() -> bool:
@@ -950,6 +1143,10 @@ def main():
     parser.add_argument(
         "--skip-unit-tests", action="store_true",
         help="Skip per-operator unit tests and go straight to e2e benchmark",
+    )
+    parser.add_argument(
+        "--skip-profile", action="store_true",
+        help="Skip NCU profiling analysis after benchmark",
     )
     args = parser.parse_args()
 
@@ -1110,6 +1307,22 @@ def _run_agent(args):
         e2e_metrics["e2e_speedup"] = bench_result["speedup"]
         e2e_metrics["e2e_token_match_rate"] = bench_result["token_match_rate"]
     tracker.log_metrics(e2e_metrics)
+
+    # Step 5: NCU profiling and optimization analysis
+    if bench_result.get("success") and not args.skip_profile:
+        print("\n  Running NCU profiling for optimization analysis...")
+        advice = run_ncu_analysis(kernels, ops, bench_result, args.llm_model)
+        if advice:
+            print_ncu_advice(advice)
+            # Log NCU advice to MLflow
+            try:
+                tracker.log_metrics({
+                    f"ncu_{op}_has_advice": 1
+                    for op in advice
+                    if "bottleneck" in advice[op]
+                })
+            except Exception:
+                pass
 
 
 async def _regen_single(op, old_kernel, error_text, cuda_only, max_retries, llm_model):

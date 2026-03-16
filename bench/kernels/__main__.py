@@ -82,6 +82,14 @@ def main():
         "--output-json", type=str, default=None,
         help="Path to save JSON results (default: bench/results/kernels_<timestamp>.json)",
     )
+    parser.add_argument(
+        "--profile", action="store_true",
+        help="Run NCU (Nsight Compute) profiling on baseline and candidate kernels",
+    )
+    parser.add_argument(
+        "--num-ncu-launches", type=int, default=20,
+        help="Number of kernel launches NCU profiles (default: 20)",
+    )
     args = parser.parse_args()
 
     if args.map:
@@ -115,6 +123,8 @@ def main():
         "category": args.category,
         "num_warmup": args.num_warmup,
         "num_runs": args.num_runs,
+        "profile": args.profile,
+        "num_ncu_launches": args.num_ncu_launches,
     }
 
     with tracker.start_run(run_name, params=bench_params, tags={"tier": "kernel"}):
@@ -126,6 +136,8 @@ def main():
                 category=args.category,
                 num_warmup=args.num_warmup,
                 num_runs=args.num_runs,
+                profile=args.profile,
+                num_ncu_launches=args.num_ncu_launches,
             )
 
             result = KernelBenchResult(operators=[op_result])
@@ -137,6 +149,8 @@ def main():
                 category=args.category,
                 num_warmup=args.num_warmup,
                 num_runs=args.num_runs,
+                profile=args.profile,
+                num_ncu_launches=args.num_ncu_launches,
             )
 
         tracker.log_kernel_bench(result)

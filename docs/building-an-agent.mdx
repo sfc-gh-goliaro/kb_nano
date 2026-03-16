@@ -13,6 +13,7 @@ The agent follows a four-stage pipeline:
 2. **Generate** — For each operator, the agent sends the baseline source code to an LLM with a prompt requesting a faster replacement. All operators are generated in parallel.
 3. **Validate** — Each generated kernel is compiled and checked: does the class name match? Does `__init__` succeed? If validation fails, the error is fed back to the LLM for retry (up to `--max-retries` attempts).
 4. **Benchmark** — All successful kernels are patched into the model and benchmarked end-to-end, measuring token match rate and wall-clock speedup. If a kernel causes a runtime failure, the agent identifies it, re-generates it, and re-runs the benchmark.
+5. **Profile & Analyze** — After a successful benchmark, NCU profiling runs on each kernel to collect hardware metrics. A "judge" LLM reads the metrics and identifies the single biggest bottleneck with a concrete optimization suggestion. Skip this step with `--skip-profile`.
 
 ## Running the Agent
 
@@ -41,6 +42,7 @@ Key flags:
 | `--tp` | Tensor parallelism degree (default: 1) |
 | `--llm-model` | LLM model for generation (default: `claude-opus-4-6`) |
 | `--skip-unit-tests` | Skip per-operator unit tests, go straight to E2E benchmark |
+| `--skip-profile` | Skip NCU profiling analysis after benchmark |
 
 Generated kernels are saved to `tasks/candidate/L{level}/{op_name}.py`.
 
@@ -88,3 +90,63 @@ with tracker.start_run("my-agent-run", params={"model": "llama", "level": 1}):
 ```
 
 Use `kb_nano history` to query past runs from the CLI, or `kb_nano mlflow-ui` to launch the web UI. See [Experiment Tracking](/experiment-tracking) for full details.
+
+### NCU Profiling in the Agent Loop
+
+After a successful benchmark, the agent automatically runs NCU profiling on each kernel and sends the metrics to a "judge" LLM that identifies the single biggest bottleneck:
+
+<Expandable title="Sample NCU optimization analysis output">
+```
+======================================================================
+  NCU OPTIMIZATION ANALYSIS
+======================================================================
+
+  rms_norm:
+    Bottleneck:   Low DRAM throughput (0.1% of peak) indicates the kernel
+                  is latency-bound on small batch sizes
+    Optimization: Fuse the normalization with the preceding residual add
+                  to reduce kernel launch overhead
+    Plan:         Combine add+variance+normalize into a single kernel
+                  with vectorized loads (float4)
+
+  silu_and_mul:
+    Bottleneck:   Memory bandwidth underutilized at 23% of peak with
+                  high L1 miss rate (54%)
+    Optimization: Use vectorized loads/stores (float4) to improve memory
+                  coalescing and L1 cache utilization
+    Plan:         Replace scalar element-wise access with 128-bit
+                  vectorized loads, process 4 elements per thread
+
+======================================================================
+```
+</Expandable>
+
+This output is designed as feedback for the next generation iteration. When building a custom agent, you can use the NCU profiling functions directly:
+
+```python
+from kb_nano.bench.kernels.ncu_profiler import (
+    profile_scenario,
+    load_ncu_metrics,
+    metrics_to_prompt,
+)
+
+# Profile a single scenario
+result = profile_scenario(
+    target_name="rms_norm",
+    scenario=scenario,
+    target=target,
+    candidate_path="tasks/candidate/L1/rms_norm.py",
+)
+
+# Access the agent-ready JSON metrics
+baseline_json = result["baseline_metrics"]
+candidate_json = result["candidate_metrics"]
+
+# Feed into your optimization prompt
+prompt = f"""
+The candidate kernel achieves {speedup:.2f}x speedup.
+Baseline metrics: {baseline_json}
+Candidate metrics: {candidate_json}
+Identify the biggest bottleneck and suggest an optimization.
+"""
+```

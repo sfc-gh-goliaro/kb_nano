@@ -188,6 +188,22 @@ def log_kernel_bench(result: KernelBenchResult) -> None:
     _mlflow.log_metric("total_scenarios", result.total_scenarios)
     _mlflow.log_metric("avg_mean_abs_diff", result.avg_mean_abs_diff)
 
+    # NCU profiling artifacts
+    for op in result.operators:
+        for s in op.scenarios:
+            if s.baseline_ncu and s.baseline_ncu.metrics_json != "{}":
+                safe_name = s.name.replace("/", "_")
+                _mlflow.log_text(
+                    s.baseline_ncu.metrics_json,
+                    f"ncu_profiles/{op.target}/{safe_name}/baseline.json",
+                )
+            if s.candidate_ncu and s.candidate_ncu.metrics_json != "{}":
+                safe_name = s.name.replace("/", "_")
+                _mlflow.log_text(
+                    s.candidate_ncu.metrics_json,
+                    f"ncu_profiles/{op.target}/{safe_name}/candidate.json",
+                )
+
 
 # ---------------------------------------------------------------------------
 # Benchmark logging — eval tier
