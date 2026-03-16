@@ -74,3 +74,17 @@ for op in ops:
 ### Benchmarking
 
 Once your agent has produced kernels, place them at `tasks/candidate/L{level}/{op_name}.py` and use the [benchmarking tools](/benchmarking) to evaluate them — either programmatically via `run_benchmark(...)` or from the CLI.
+
+### Experiment Tracking
+
+All `kb_nano agent` runs are automatically logged to MLflow. You can also use the [tracking API](/experiment-tracking#tracking-api) in your own agent to log kernel generations, benchmark results, and custom metrics:
+
+```python
+from kb_nano.bench.tracking import tracker
+
+with tracker.start_run("my-agent-run", params={"model": "llama", "level": 1}):
+    tracker.log_kernel("rms_norm", level=1, code=kernel_source)
+    tracker.log_metrics({"compile_time_s": 12.3, "my_score": 0.95})
+```
+
+Use `kb_nano history` to query past runs from the CLI, or `kb_nano mlflow-ui` to launch the web UI. See [Experiment Tracking](/experiment-tracking) for full details.

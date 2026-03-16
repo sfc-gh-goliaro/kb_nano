@@ -23,7 +23,7 @@
       },
       {
         "group": "User Guide",
-        "pages": ["benchmarking", "building-an-agent"]
+        "pages": ["benchmarking", "building-an-agent", "experiment-tracking"]
       },
       {
         "group": "Developer Guide",
