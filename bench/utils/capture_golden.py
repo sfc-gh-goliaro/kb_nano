@@ -26,7 +26,7 @@ from pathlib import Path
 
 import torch
 
-from kb_nano.paths import GOLDEN_DIR
+from kb_nano import GOLDEN_DIR
 
 _GOLDEN_DIR = GOLDEN_DIR
 

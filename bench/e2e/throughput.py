@@ -129,7 +129,7 @@ def run_kb_nano_subprocess(
     max_model_len: int | None = None,
 ) -> dict | None:
     """Run kb-nano offline throughput benchmark in a subprocess."""
-    from kb_nano.paths import KB_ROOT, PROJECT_ROOT
+    from kb_nano import KB_ROOT, PROJECT_ROOT
     kb_root = str(PROJECT_ROOT)
     package_name = KB_ROOT.name
 
@@ -375,7 +375,7 @@ def main(args: argparse.Namespace):
     if args.output_json:
         output_json = args.output_json
     else:
-        from kb_nano.paths import run_output_path
+        from kb_nano import run_output_path
         output_json = str(run_output_path("throughput"))
 
     os.makedirs(os.path.dirname(output_json) or ".", exist_ok=True)

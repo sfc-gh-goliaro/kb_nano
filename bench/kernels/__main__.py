@@ -34,7 +34,7 @@ from kb_nano.infra.kernel_swapper import (
 from .result import KernelBenchResult
 from .runner import run_all_kernel_benchmarks, run_kernel_benchmark
 
-from kb_nano.paths import run_output_path
+from kb_nano import run_output_path
 
 
 def main():

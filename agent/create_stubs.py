@@ -21,7 +21,7 @@ import sys
 import time
 from pathlib import Path
 
-from kb_nano.paths import CANDIDATE_DIR, PREV_ATTEMPTS_DIR, PROJECT_ROOT
+from kb_nano import CANDIDATE_DIR, PREV_ATTEMPTS_DIR, PROJECT_ROOT
 
 _PROJECT_ROOT = str(PROJECT_ROOT)
 if _PROJECT_ROOT not in sys.path:

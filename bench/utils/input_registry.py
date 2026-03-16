@@ -14,7 +14,7 @@ from typing import Any
 import torch
 import yaml
 
-from kb_nano.paths import GOLDEN_DIR, INPUTS_DIR
+from kb_nano import GOLDEN_DIR, INPUTS_DIR
 
 _INPUTS_DIR = INPUTS_DIR
 _GOLDEN_DIR = GOLDEN_DIR

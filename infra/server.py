@@ -605,7 +605,7 @@ def main():
     }
 
     # Add project root to path so kb_nano is importable
-    from kb_nano.paths import PROJECT_ROOT
+    from kb_nano import PROJECT_ROOT
     project_root = str(PROJECT_ROOT)
     if project_root not in sys.path:
         sys.path.insert(0, project_root)

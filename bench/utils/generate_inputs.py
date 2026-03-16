@@ -18,7 +18,7 @@ from pathlib import Path
 
 import yaml
 
-from kb_nano.paths import INPUTS_DIR
+from kb_nano import INPUTS_DIR
 
 _INPUTS_DIR = INPUTS_DIR
 

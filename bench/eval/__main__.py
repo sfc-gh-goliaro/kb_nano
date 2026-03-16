@@ -26,7 +26,7 @@ import sys
 from .config import EvalConfig
 from .runner import run_eval
 
-from kb_nano.paths import run_output_path
+from kb_nano import run_output_path
 
 
 def main():

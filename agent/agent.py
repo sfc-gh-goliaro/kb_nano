@@ -37,7 +37,7 @@ from concurrent.futures import ThreadPoolExecutor
 from dataclasses import dataclass
 from pathlib import Path
 
-from kb_nano.paths import CANDIDATE_DIR, CUDA_BUILD_CACHE, KB_ROOT, PREV_ATTEMPTS_DIR, PROJECT_ROOT
+from kb_nano import CANDIDATE_DIR, CUDA_BUILD_CACHE, KB_ROOT, PREV_ATTEMPTS_DIR, PROJECT_ROOT
 
 _PROJECT_ROOT = str(PROJECT_ROOT)
 if _PROJECT_ROOT not in sys.path:

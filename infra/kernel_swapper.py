@@ -35,7 +35,7 @@ from pathlib import Path
 
 import torch.nn as nn
 
-from kb_nano.paths import BASELINE_DIR, CANDIDATE_DIR, KB_ROOT
+from kb_nano import BASELINE_DIR, CANDIDATE_DIR, KB_ROOT
 
 _KB_ROOT = KB_ROOT
 _CANDIDATE_DIR = CANDIDATE_DIR

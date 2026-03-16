@@ -38,7 +38,7 @@ def _run_subprocess(
     max_seq_len: int,
 ) -> dict | None:
     """Run a single E2E subprocess (baseline or candidate)."""
-    from kb_nano.paths import KB_ROOT, PROJECT_ROOT
+    from kb_nano import KB_ROOT, PROJECT_ROOT
     kb_root = str(PROJECT_ROOT)
     package_name = KB_ROOT.name
 
