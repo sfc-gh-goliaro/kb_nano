@@ -244,9 +244,9 @@ Throughput: decode-heavy workload (512 input, 1024 output), 1000 sequences each,
 | Qwen2-VL-7B   | 1 | image | 13,498 | 15,548 | **1.15x** | 251/512 |
 | Qwen2-VL-7B   | 1 | video |  1,016 |  6,463 | **6.36x** | 175/512 |
 | Qwen2-VL-72B  | 4 | text  | 13,153 | 12,877 | 0.98x | 942/1024 |
-| Qwen3-VL-8B-FP8  | 1 | text  | 18,447 | 14,832 | 0.80x | 747/1024 |
-| Qwen3-VL-8B-FP8  | 1 | image | 12,711 | 10,543 | 0.83x |  61/512 |
-| Qwen3-VL-8B-FP8  | 1 | video |    939 | 11,722 | **12.49x** |  60/512 |
+| Qwen3-VL-8B-FP8  | 1 | text  | 22,967 | 21,622 | 0.94x | 773/1024 |
+| Qwen3-VL-8B-FP8  | 1 | image | 14,053 | 12,452 | 0.89x |  66/512 |
+| Qwen3-VL-8B-FP8  | 1 | video |  1,051 |  7,764 | **7.39x** |  52/512 |
 | Qwen3-VL-235B-A22B-FP8 | 4 | text  |  8,498 |  7,813 | 0.92x | 390/1024 |
 
 Latency: single request (batch_size=1), 128 output tokens, median of 5 iterations.
@@ -255,19 +255,21 @@ Latency: single request (batch_size=1), 128 output tokens, median of 5 iteration
 |-------|---:|----------|----------:|----------:|--------:|
 | Qwen2-VL-7B  | 1 | image | 1,373 | 1,330 | **1.03x** |
 | Qwen2-VL-7B  | 1 | video | 1,663 | 1,331 | **1.25x** |
-| Qwen3-VL-8B-FP8 | 1 | image | 2,752 | 3,518 | 0.78x |
-| Qwen3-VL-8B-FP8 | 1 | video | 2,988 | 3,539 | 0.84x |
+| Qwen3-VL-8B-FP8 | 1 | image |   515 |   837 | 0.62x |
+| Qwen3-VL-8B-FP8 | 1 | video |   803 | 1,156 | 0.69x |
 
 **Notes:**
 - Qwen2-VL-7B beats vLLM across all modalities (text, image, video) in both throughput and latency
-- Video throughput is 6-12x faster than vLLM due to batched vision encoder processing and efficient scheduling
+- Qwen3-VL-8B-FP8 text throughput reaches 0.94x parity with vLLM thanks to `torch.compile` decoder layer fusion
+- Video throughput is 6-7x faster than vLLM due to batched vision encoder processing and efficient scheduling
 - FP8 models use DeepGEMM for block-scaled FP8 GEMM and vLLM's CUDA `per_token_group_fp8_quant` for activation quantization
 - 235B MoE model uses `enforce_eager=True` (CUDA graph capture with shared MoE caches is a known limitation)
 - Token matching for FP8 MoE models is lower due to accumulated quantization differences affecting expert routing decisions
-- Benchmarked on 4x NVIDIA B200 GPUs with `enforce_eager=True`
 
 ### Key optimizations
 
+- **torch.compile decoder layers**: Opaque kernels (DeepGEMM, flash_attn, RoPE, FP8 quant) registered as `torch.library` custom ops; fusible ops (RMSNorm, SiLU) use PyTorch-native forward paths so Inductor fuses `residual_add + RMSNorm` and `SiLU * gate` across decoder layers
+- **torch.compile vision encoder**: Vision transformer blocks compiled with `dynamic=True` for variable-length vision token sequences
 - **Fused RMSNorm**: Custom Triton fused residual-add + RMSNorm kernel, replacing `sgl_kernel` which had a stride bug zeroing even-indexed elements on Blackwell
 - **Fused SiLU-and-Mul**: Single-kernel SiLU activation with gate multiplication
 - **Inplace RoPE**: Applies rotary position embeddings in-place with cos/sin cache
