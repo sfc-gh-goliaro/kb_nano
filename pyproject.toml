@@ -17,7 +17,11 @@ dependencies = [
     "vllm==0.16.0",
     "sgl-kernel",
     "decord",
+    "mlflow>=2.10",
 ]
+
+[project.optional-dependencies]
+tracking = ["mlflow>=2.10"]
 
 [project.scripts]
 kb_nano = "kb_nano.__main__:main"

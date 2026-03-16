@@ -35,12 +35,20 @@ def main():
         parser.print_help()
         sys.exit(1)
 
-    if args.command == "throughput":
-        throughput.main(args)
-    elif args.command == "latency":
-        latency.main(args)
-    elif args.command == "serve":
-        serve.main(args)
+    from kb_nano.bench.tracking import tracker
+
+    model = getattr(args, "model", "unknown")
+    tp = getattr(args, "tp", 1)
+    e2e_params = {"model": model, "tp": tp, "bench_type": args.command}
+    run_name = f"e2e_{args.command}_{model.split('/')[-1]}"
+
+    with tracker.start_run(run_name, params=e2e_params, tags={"tier": "e2e"}):
+        if args.command == "throughput":
+            throughput.main(args)
+        elif args.command == "latency":
+            latency.main(args)
+        elif args.command == "serve":
+            serve.main(args)
 
 
 if __name__ == "__main__":

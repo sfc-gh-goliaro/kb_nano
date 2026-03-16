@@ -218,3 +218,6 @@ bench/utils/golden_data/
 agent/_cuda_build_cache/
 tasks/candidate/L*/
 tasks/candidate/prev-attempts/
+
+# MLflow tracking store
+mlruns/

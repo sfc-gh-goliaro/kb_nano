@@ -56,7 +56,8 @@ A standalone, high-performance LLM inference engine supporting **Llama 3.1** and
 ├── bench/                      # Benchmarking suite
 │   ├── kernels/                # Isolated kernel-level benchmarking
 │   ├── eval/                   # Multi-model evaluation sweep
-│   └── e2e/                    # End-to-end throughput/latency benchmarks
+│   ├── e2e/                    # End-to-end throughput/latency benchmarks
+│   └── tracking/               # MLflow experiment tracking API
 ├── agent/                      # LLM-powered kernel generation agent
 │   ├── agent.py               # CLI agent: generates kernels via Claude, benchmarks them
 │   └── llm_api.py             # Corvo LLM endpoint helper (async + sync)
@@ -162,6 +163,77 @@ kb_nano agent \
 
 The agent discovers operators, generates replacements, validates they compile, patches them all into the model simultaneously, and reports token match rate and speedup. Failed kernels are retried up to `--max-retries` times with error feedback to the LLM.
 
+## Experiment Tracking
+
+kb_nano automatically logs all benchmark runs and agent runs to [MLflow](https://mlflow.org) for experiment tracking and kernel lineage.
+
+```bash
+# List recent tracked runs
+kb_nano history
+
+# Show history for a specific operator
+kb_nano history --op rms_norm
+
+# Show best-ever speedup for each operator
+kb_nano history --best
+
+# Launch the MLflow web UI
+kb_nano mlflow-ui
+# Open http://localhost:5000
+```
+
+Sample output from `kb_nano history`:
+
+```
+======================================================================
+  RECENT TRACKED RUNS
+======================================================================
+  TIMESTAMP          RUN NAME                            KEY METRICS
+  ──────────────────────────────────────────────────────────────────
+  2026-03-16 16:44   e2e_throughput_Llama-3.1-8B         tokens_per_second=15000.0
+  2026-03-16 16:44   kernels_rms_norm                    avg_speedup=1.64x  total_passed=2  total_failed=0
+  2026-03-16 16:44   agent_L1_Llama-3.1-8B               e2e_speedup=1.15x  e2e_token_match_rate=97.0%
+======================================================================
+```
+
+Sample output from `kb_nano history --best`:
+
+```
+======================================================================
+  BEST SPEEDUP PER OPERATOR (from kernel benchmarks)
+======================================================================
+  OPERATOR                  BEST SPEEDUP DATE               RUN ID
+  ──────────────────────────────────────────────────────────────────
+  rms_norm                         1.64x 2026-03-16 16:44   a1b2c3d4
+  rotary_emb                       1.22x 2026-03-15 11:30   d3e4f5a6
+  silu_and_mul                     1.45x 2026-03-14 09:55   b7c8d9e0
+======================================================================
+```
+
+### Tracking API
+
+Any kernel optimization agent or script can use the tracking API:
+
+```python
+from kb_nano.bench.tracking import tracker
+
+with tracker.start_run("my-optimization-v3", params={
+    "model": "meta-llama/Llama-3.1-8B-Instruct",
+    "level": 1,
+    "strategy": "triton-fused",
+}):
+    # Log generated kernel source code as artifact
+    tracker.log_kernel("rms_norm", level=1, code=kernel_source)
+
+    # Log kernel benchmark results (accepts KernelBenchResult directly)
+    tracker.log_kernel_bench(bench_result)
+
+    # Log any custom metrics
+    tracker.log_metrics({"compile_time_s": 12.3})
+```
+
+Tracking data is stored locally in `mlruns/` (gitignored). If `mlflow` is not installed, all tracking calls are silently skipped.
+
 ## Dependencies
 
 - Python 3.10+
@@ -172,6 +244,7 @@ The agent discovers operators, generates replacements, validates they compile, p
 - FlashInfer (`flashinfer-python`) — TRTLLM-gen attention kernels on Blackwell+
 - Hugging Face (`transformers`, `huggingface_hub`, `safetensors`)
 - aiohttp (for the LLM kernel agent)
+- MLflow (experiment tracking — gracefully skipped if not installed)
 - vLLM (only needed for running comparison tests)
 - matplotlib (only needed for benchmark plotting)
 

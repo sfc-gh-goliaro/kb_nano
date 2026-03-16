@@ -105,30 +105,45 @@ def main():
 
     output_path = args.output_json or str(run_output_path("kernels"))
 
-    if args.target is not None:
-        op_result = run_kernel_benchmark(
-            target_name=args.target,
-            models=args.model,
-            tp=args.tp,
-            category=args.category,
-            num_warmup=args.num_warmup,
-            num_runs=args.num_runs,
-        )
+    from kb_nano.bench.tracking import tracker
 
-        result = KernelBenchResult(operators=[op_result])
-        result.compute_aggregates()
-    else:
-        result = run_all_kernel_benchmarks(
-            models=args.model,
-            tp=args.tp,
-            category=args.category,
-            num_warmup=args.num_warmup,
-            num_runs=args.num_runs,
-        )
+    run_name = f"kernels_{args.target or 'all'}"
+    bench_params = {
+        "target": args.target or "all",
+        "model_filter": str(args.model) if args.model else None,
+        "tp_filter": str(args.tp) if args.tp else None,
+        "category": args.category,
+        "num_warmup": args.num_warmup,
+        "num_runs": args.num_runs,
+    }
 
-    result.print_table(single_target=(args.target is not None))
-    result.save_json(output_path)
-    print(f"\n  Results saved to: {output_path}")
+    with tracker.start_run(run_name, params=bench_params, tags={"tier": "kernel"}):
+        if args.target is not None:
+            op_result = run_kernel_benchmark(
+                target_name=args.target,
+                models=args.model,
+                tp=args.tp,
+                category=args.category,
+                num_warmup=args.num_warmup,
+                num_runs=args.num_runs,
+            )
+
+            result = KernelBenchResult(operators=[op_result])
+            result.compute_aggregates()
+        else:
+            result = run_all_kernel_benchmarks(
+                models=args.model,
+                tp=args.tp,
+                category=args.category,
+                num_warmup=args.num_warmup,
+                num_runs=args.num_runs,
+            )
+
+        tracker.log_kernel_bench(result)
+
+        result.print_table(single_target=(args.target is not None))
+        result.save_json(output_path)
+        print(f"\n  Results saved to: {output_path}")
 
     sys.exit(0 if result.all_passed() else 1)
 

@@ -621,6 +621,11 @@ async def main_async(args: argparse.Namespace):
         "p99_e2el_ms": metrics.p99_e2el_ms,
     }
 
+    # Log to MLflow
+    from kb_nano.bench.tracking import tracker
+
+    tracker.log_e2e(result_json, bench_type="serve")
+
     if args.output_json:
         os.makedirs(os.path.dirname(args.output_json) or ".", exist_ok=True)
         with open(args.output_json, "w") as f:
