@@ -26,3 +26,9 @@ class LlamaMLP(nn.Module):
         x = self.gate_up_proj(x)
         x = self.act_fn(x)
         return self.down_proj(x)
+
+    def forward_fp8(self, input_fp8, input_scale):
+        """Forward with pre-quantized FP8 input for gate_up_proj."""
+        x = self.gate_up_proj.forward_fp8(input_fp8, input_scale)
+        x = self.act_fn(x)
+        return self.down_proj(x)

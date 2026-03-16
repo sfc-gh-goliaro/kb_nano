@@ -170,6 +170,22 @@ class Qwen3VisionTransformer(nn.Module):
             for _ in range(len(self.deepstack_visual_indexes))
         ])
 
+    def _run_blocks(self, hidden_states, cu_seqlens, rotary_cos, rotary_sin,
+                    max_seqlen):
+        """Inner compute loop -- compilable with torch.compile."""
+        hidden_states = hidden_states.unsqueeze(1)
+        deepstack_features = []
+        for layer_num, blk in enumerate(self.blocks):
+            hidden_states = blk(hidden_states, cu_seqlens,
+                                rotary_cos, rotary_sin, max_seqlen)
+            if layer_num in self.deepstack_visual_indexes:
+                idx = self.deepstack_visual_indexes.index(layer_num)
+                deepstack_features.append(
+                    self.deepstack_merger_list[idx](hidden_states)
+                )
+        hidden_states = self.merger(hidden_states)
+        return hidden_states, deepstack_features
+
     def forward(self, x: torch.Tensor, grid_thw: torch.Tensor | list):
         device = self.patch_embed.proj.weight.device
         dtype = self.patch_embed.proj.weight.dtype
@@ -197,18 +213,9 @@ class Qwen3VisionTransformer(nn.Module):
         cu_seqlens = torch.from_numpy(cu_seqlens).to(device)
         max_seqlen = int((cu_seqlens[1:] - cu_seqlens[:-1]).max().item())
 
-        hidden_states = hidden_states.unsqueeze(1)
-        deepstack_features = []
-        for layer_num, blk in enumerate(self.blocks):
-            hidden_states = blk(hidden_states, cu_seqlens,
-                                rotary_cos, rotary_sin, max_seqlen)
-            if layer_num in self.deepstack_visual_indexes:
-                idx = self.deepstack_visual_indexes.index(layer_num)
-                deepstack_features.append(
-                    self.deepstack_merger_list[idx](hidden_states)
-                )
-
-        hidden_states = self.merger(hidden_states)
+        hidden_states, deepstack_features = self._run_blocks(
+            hidden_states, cu_seqlens, rotary_cos, rotary_sin, max_seqlen,
+        )
         if deepstack_features:
             return hidden_states, deepstack_features
         return hidden_states, []

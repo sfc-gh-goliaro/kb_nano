@@ -56,6 +56,31 @@ class LlamaAttention(nn.Module):
             num_kv_heads=self.num_kv_heads,
         )
 
+    def forward_fp8(self, positions, hidden_fp8, hidden_scale):
+        """Forward with pre-quantized FP8 input (from fused RMSNorm+FP8)."""
+        N = hidden_fp8.shape[0]
+        qkv = self.qkv_proj.forward_fp8(hidden_fp8, hidden_scale)
+        q_size = self.num_heads * self.head_dim
+        kv_size = self.num_kv_heads * self.head_dim
+        q, k, v = qkv.split([q_size, kv_size, kv_size], dim=-1)
+
+        if self.q_norm is not None:
+            q = q.view(N, self.num_heads, self.head_dim)
+            k = k.view(N, self.num_kv_heads, self.head_dim)
+            q = self.q_norm(q.reshape(-1, self.head_dim)).view(N, self.num_heads * self.head_dim)
+            k = self.k_norm(k.reshape(-1, self.head_dim)).view(N, self.num_kv_heads * self.head_dim)
+
+        if positions.ndim == 2:
+            q = q.view(N, self.num_heads, self.head_dim)
+            k = k.view(N, self.num_kv_heads, self.head_dim)
+            q, k = self.rotary_emb(positions, q, k)
+            q = q.view(N, self.num_heads * self.head_dim)
+            k = k.view(N, self.num_kv_heads * self.head_dim)
+        else:
+            q, k = self.rotary_emb(positions, q, k)
+        attn_output = self.attn(q, k, v)
+        return self.o_proj(attn_output)
+
     def forward(self, positions, hidden_states):
         N = hidden_states.shape[0]
         qkv = self.qkv_proj(hidden_states)

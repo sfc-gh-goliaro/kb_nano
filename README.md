@@ -268,7 +268,7 @@ Latency: single request (batch_size=1), 128 output tokens, median of 5 iteration
 
 ### Key optimizations
 
-- **Fused RMSNorm**: Uses `sgl_kernel`'s fused residual-add + RMSNorm CUDA kernel, eliminating multiple kernel launches per norm call
+- **Fused RMSNorm**: Custom Triton fused residual-add + RMSNorm kernel, replacing `sgl_kernel` which had a stride bug zeroing even-indexed elements on Blackwell
 - **Fused SiLU-and-Mul**: Single-kernel SiLU activation with gate multiplication
 - **Inplace RoPE**: Applies rotary position embeddings in-place with cos/sin cache
 - **Fused MoE routing**: `topk_softmax` fuses softmax + top-k into a single kernel for expert routing

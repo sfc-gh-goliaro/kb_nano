@@ -3,9 +3,16 @@
 Unified across Llama, Qwen2, and Qwen3 architectures:
   - bias:    Qwen2 uses bias=True on QKV projection.
   - qk_norm: Qwen3 applies per-head RMSNorm to Q and K before RoPE.
+
+Optional fused RMSNorm+FP8 path (KB_NANO_FUSED_NORM=1): fuses norm and
+per-token-group FP8 quantization into a single Triton kernel. Saves one
+kernel launch per norm but is counterproductive under CUDA graph mode
+where launch overhead is already amortized. Beneficial in eager mode.
 """
 
 from __future__ import annotations
+
+import os
 
 import torch.nn as nn
 
@@ -19,6 +26,7 @@ class LlamaDecoderLayer(nn.Module):
                  bias: bool = False, qk_norm: bool = False):
         super().__init__()
         fp8 = getattr(config, "fp8_block_size", None)
+        self._use_fused_norm_fp8 = False
         self.self_attn = LlamaAttention(
             config.hidden_size, config.num_attention_heads,
             config.num_key_value_heads, config.head_dim,
@@ -31,7 +39,28 @@ class LlamaDecoderLayer(nn.Module):
         self.input_layernorm = RMSNorm(config.hidden_size, eps=config.rms_norm_eps)
         self.post_attention_layernorm = RMSNorm(config.hidden_size, eps=config.rms_norm_eps)
 
+        if fp8 is not None and os.environ.get("KB_NANO_FUSED_NORM") == "1":
+            from ..L1.fused_rmsnorm_fp8 import FusedRMSNormFP8Quant
+            self._fused_input_norm = FusedRMSNormFP8Quant(
+                config.hidden_size, eps=config.rms_norm_eps,
+                group_size=fp8[1],
+            )
+            self._fused_post_norm = FusedRMSNormFP8Quant(
+                config.hidden_size, eps=config.rms_norm_eps,
+                group_size=fp8[1],
+            )
+            # Share weights with the existing RMSNorm modules so weight
+            # loading works without changes
+            del self._fused_input_norm.weight
+            del self._fused_post_norm.weight
+            self._fused_input_norm.weight = self.input_layernorm.weight
+            self._fused_post_norm.weight = self.post_attention_layernorm.weight
+            self._use_fused_norm_fp8 = True
+
     def forward(self, positions, hidden_states, residual):
+        if self._use_fused_norm_fp8:
+            return self._forward_fused_fp8(positions, hidden_states, residual)
+
         if residual is None:
             hidden_states, residual = self.input_layernorm(hidden_states), hidden_states
         else:
@@ -39,4 +68,28 @@ class LlamaDecoderLayer(nn.Module):
         hidden_states = self.self_attn(positions, hidden_states)
         hidden_states, residual = self.post_attention_layernorm(hidden_states, residual)
         hidden_states = self.mlp(hidden_states)
+        return hidden_states, residual
+
+    def _forward_fused_fp8(self, positions, hidden_states, residual):
+        """FP8 path: fused RMSNorm + FP8 quant → skip internal quant in linear."""
+        # Input layernorm + FP8 quant
+        # The add-variant kernel writes x+residual into the *residual*
+        # buffer (not x), so residual never aliases shared_out_buf.
+        if residual is None:
+            fp8_out, fp8_scale, residual = self._fused_input_norm(
+                hidden_states, None)
+        else:
+            fp8_out, fp8_scale, residual = self._fused_input_norm(
+                hidden_states, residual)
+
+        # Attention with pre-quantized input
+        hidden_states = self.self_attn.forward_fp8(
+            positions, fp8_out, fp8_scale)
+
+        # Post-attention layernorm + FP8 quant
+        fp8_out, fp8_scale, residual = self._fused_post_norm(
+            hidden_states, residual)
+
+        # MLP with pre-quantized input
+        hidden_states = self.mlp.forward_fp8(fp8_out, fp8_scale)
         return hidden_states, residual

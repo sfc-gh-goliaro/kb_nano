@@ -283,6 +283,7 @@ class ModelRunner:
         self._share_activation_buffers()
         self.warmup_model()
         self._warmup_deep_gemm()
+        self._apply_torch_compile()
         self.allocate_kv_cache()
         if not self.enforce_eager:
             self.capture_cudagraph()
@@ -453,13 +454,34 @@ class ModelRunner:
             if isinstance(fe, FusedExperts) and hasattr(fe, 'quant'):
                 fe.quant.set_shared_buffers(shared_q_buf, shared_s_buf)
 
+        # Share FP8 output buffers for fused RMSNorm+FP8 modules.
+        # Safe to reuse shared_q_buf/shared_s_buf since the fused norm's
+        # FP8 output is consumed by the next GEMM before any other write.
+        from ..tasks.baseline.L1.fused_rmsnorm_fp8 import FusedRMSNormFP8Quant
+        for m in self.model.modules():
+            if isinstance(m, FusedRMSNormFP8Quant):
+                m.set_shared_buffers(shared_q_buf, shared_s_buf)
+
     def warmup_model(self):
         torch.cuda.empty_cache()
         torch.cuda.reset_peak_memory_stats()
         warmup_len = min(self.max_model_len, self.max_num_batched_tokens)
         num_seqs = min(self.max_num_batched_tokens // warmup_len, self.max_num_seqs)
         seqs = [Sequence([0] * warmup_len) for _ in range(num_seqs)]
+
+        # Disable fused norm during warmup to avoid buffer state issues
+        from ..tasks.baseline.L3.llama_decoder import LlamaDecoderLayer
+        fused_layers = []
+        for m in self.model.modules():
+            if isinstance(m, LlamaDecoderLayer) and m._use_fused_norm_fp8:
+                fused_layers.append(m)
+                m._use_fused_norm_fp8 = False
+
         self.run(seqs, True)
+
+        for m in fused_layers:
+            m._use_fused_norm_fp8 = True
+
         torch.cuda.empty_cache()
 
     def _warmup_deep_gemm(self):
@@ -548,6 +570,53 @@ class ModelRunner:
                 )
         torch.cuda.synchronize()
         torch.cuda.empty_cache()
+
+    def _apply_torch_compile(self):
+        """Apply torch.compile to vision encoder and decoder layers.
+
+        Vision encoder: compiled with dynamic=True since vision token counts
+        vary per image. Reduces kernel launch overhead for the 27 vision blocks.
+
+        Decoder layers: compiled when Inductor XBLOCK limits allow it (not all
+        GPU architectures support the generated block sizes). Falls back to
+        eager mode gracefully.
+        """
+        if self.enforce_eager:
+            return
+        if os.environ.get("KB_NANO_NO_COMPILE", "0") == "1":
+            return
+
+        import torch._dynamo
+        torch._dynamo.config.cache_size_limit = 128
+
+        try:
+            from torch._inductor.runtime.hints import TRITON_MAX_BLOCK
+            for k in TRITON_MAX_BLOCK:
+                TRITON_MAX_BLOCK[k] = max(TRITON_MAX_BLOCK[k], 2**16)
+        except ImportError:
+            pass
+
+        compile_decoder = os.environ.get("KB_NANO_COMPILE_DECODER", "0") == "1"
+
+        if hasattr(self.model, 'visual') and hasattr(self.model.visual, '_run_blocks'):
+            if self.rank == 0:
+                print("  torch.compile: vision encoder blocks")
+            self.model.visual._run_blocks = torch.compile(
+                self.model.visual._run_blocks, dynamic=True,
+            )
+
+        if compile_decoder:
+            model_inner = getattr(self.model, 'model', None)
+            if model_inner is not None and hasattr(model_inner, 'layers'):
+                n_layers = len(model_inner.layers)
+                if self.rank == 0:
+                    print(f"  torch.compile: {n_layers} decoder layers")
+                for i in range(n_layers):
+                    model_inner.layers[i] = torch.compile(
+                        model_inner.layers[i], dynamic=False,
+                    )
+
+        torch.cuda.synchronize()
 
     def allocate_kv_cache(self):
         if not hasattr(self, '_attn_layers') or not self._attn_layers:
@@ -1976,15 +2045,19 @@ class LlamaEngine:
                     decode_data = mr._prepare_decode_arrays(decode_seqs)
                     if _PROFILE:
                         _fp_t1 = time.perf_counter()
+
+                    # Launch async: GPU starts working, CPU is free
                     if mr.world_size > 1:
                         mr._write_decode_shm(*decode_data)
                         mr.shm.buf[mr._SHM_FLAG_OFFSET] = 1
                         mr._signal_workers()
-                    gpu_result = mr.run_decode_greedy_fast(decode_data)
+                    has_result, _ = mr.run_decode_greedy_fast_async(decode_data)
                     if _PROFILE:
                         _fp_t2 = time.perf_counter()
-                    if gpu_result is not None:
-                        token_ids = gpu_result.tolist()
+
+                    # Wait for first step result (no prior work to overlap yet)
+                    if has_result:
+                        token_ids = mr._wait_async_tokens(n_dc)
                         if _PROFILE:
                             _fp_t3 = time.perf_counter()
                         any_finished = False
@@ -2012,9 +2085,14 @@ class LlamaEngine:
                             _fp['post'] += _fp_t4 - _fp_t3
                             _fp['n'] += 1
 
-                        # --- Inner decode loop: stay in fast path ---
-                        # Avoid re-entering the outer while loop overhead
+                        # --- Pipelined inner decode loop ---
+                        # Overlap GPU step N+1 with CPU bookkeeping from step N.
                         use_incr = True
+                        prev_token_ids = None
+                        prev_decode_seqs = None
+                        prev_any_finished = False
+                        pending_gpu = False
+
                         while running and not waiting and not prefilling:
                             if any_finished:
                                 decode_seqs = list(running)
@@ -2045,17 +2123,23 @@ class LlamaEngine:
                                 use_incr = True
                             if _PROFILE:
                                 _fp_t1 = time.perf_counter()
+
+                            # Launch GPU async for this step
                             if mr.world_size > 1:
                                 mr._write_decode_shm(*decode_data)
                                 mr.shm.buf[mr._SHM_FLAG_OFFSET] = 1
                                 mr._signal_workers()
-                            gpu_result = mr.run_decode_greedy_fast(decode_data)
+                            has_result, _ = mr.run_decode_greedy_fast_async(
+                                decode_data)
                             if _PROFILE:
                                 _fp_t2 = time.perf_counter()
-                            if gpu_result is not None:
-                                token_ids = gpu_result.tolist()
+
+                            # Wait for GPU result and process
+                            if has_result:
+                                token_ids = mr._wait_async_tokens(n_dc)
                                 if _PROFILE:
                                     _fp_t3 = time.perf_counter()
+                                any_finished = False
                                 for seq, tid in zip(decode_seqs, token_ids):
                                     seq.append_token(tid)
                                     done = (len(seq.generated_ids)

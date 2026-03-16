@@ -503,20 +503,23 @@ def _load_mm_samples(dataset_name, dataset_split, num_seqs, seed):
 def _preprocess_samples(engine, samples, use_tqdm=False):
     """Pre-process chat-format samples through the engine's HF processor.
 
+    Uses ThreadPoolExecutor to overlap CPU-bound HF processor calls
+    (image resizing, tokenization, M-RoPE computation) across samples.
     Returns a list of pre-processed dicts ready for engine.generate().
     """
     import sys
-    iter_samples = samples
+    from concurrent.futures import ThreadPoolExecutor
+    num_workers = min(8, len(samples))
+    def process_one(s):
+        return engine.preprocess_chat(s.prompt)
+    with ThreadPoolExecutor(max_workers=num_workers) as pool:
+        results = list(pool.map(process_one, samples))
     if use_tqdm:
         try:
             from tqdm import tqdm
-            iter_samples = tqdm(samples, desc="Preprocessing", file=sys.stderr)
+            tqdm.write(f"Preprocessed {len(results)} samples", file=sys.stderr)
         except ImportError:
             pass
-    results = []
-    for s in iter_samples:
-        pp = engine.preprocess_chat(s.prompt)
-        results.append(pp)
     return results
 
 

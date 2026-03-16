@@ -116,6 +116,16 @@ class Qwen2VisionTransformer(nn.Module):
             vision_config.spatial_merge_size,
         )
 
+    def _run_blocks(self, hidden_states, cu_seqlens, rotary_cos, rotary_sin,
+                    max_seqlen):
+        """Inner compute loop -- compilable with torch.compile."""
+        hidden_states = hidden_states.unsqueeze(1)
+        for blk in self.blocks:
+            hidden_states = blk(hidden_states, cu_seqlens,
+                                rotary_cos, rotary_sin, max_seqlen)
+        hidden_states = self.merger(hidden_states)
+        return hidden_states
+
     def forward(self, x: torch.Tensor, grid_thw: torch.Tensor | list):
         x = x.to(device=self.patch_embed.proj.weight.device,
                   dtype=self.patch_embed.proj.weight.dtype)
@@ -141,12 +151,7 @@ class Qwen2VisionTransformer(nn.Module):
         cu_seqlens = torch.from_numpy(cu_seqlens).to(x.device)
         max_seqlen = int((cu_seqlens[1:] - cu_seqlens[:-1]).max().item())
 
-        x = x.unsqueeze(1)
-        for blk in self.blocks:
-            x = blk(x, cu_seqlens, rotary_cos, rotary_sin, max_seqlen)
-
-        x = self.merger(x)
-        return x
+        return self._run_blocks(x, cu_seqlens, rotary_cos, rotary_sin, max_seqlen)
 
 
 # ---- Language Model ----

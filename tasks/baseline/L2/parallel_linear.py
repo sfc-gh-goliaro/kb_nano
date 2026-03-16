@@ -121,6 +121,11 @@ class MergedColumnParallelLinear(nn.Module):
             return self.linear_op(x, self.weight, self.weight_scale_inv, self.bias)
         return self.linear_op(x, self.weight, self.bias)
 
+    def forward_fp8(self, input_fp8, input_scale):
+        """Forward with pre-quantized FP8 input."""
+        return self.linear_op(input_fp8, self.weight, self.weight_scale_inv,
+                              self.bias, input_scale=input_scale)
+
 
 class QKVParallelLinear(nn.Module):
     """Q, K, V projections merged and sharded across TP."""
@@ -195,6 +200,11 @@ class QKVParallelLinear(nn.Module):
         if hasattr(self, "weight_scale_inv"):
             return self.linear_op(x, self.weight, self.weight_scale_inv, self.bias)
         return self.linear_op(x, self.weight, self.bias)
+
+    def forward_fp8(self, input_fp8, input_scale):
+        """Forward with pre-quantized FP8 input."""
+        return self.linear_op(input_fp8, self.weight, self.weight_scale_inv,
+                              self.bias, input_scale=input_scale)
 
 
 class RowParallelLinear(nn.Module):
