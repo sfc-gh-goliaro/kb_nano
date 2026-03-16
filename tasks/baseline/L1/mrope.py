@@ -137,13 +137,14 @@ class MRotaryEmbedding(nn.Module):
             self.cos_sin_cache = cache
         q_shape = query.shape
         k_shape = key.shape
-        _sgl_rope(
-            positions_1d,
-            query.view(q_shape[0], -1),
-            key.view(k_shape[0], -1),
-            self.head_dim,
-            cache,
-        )
+        q_flat = query.view(q_shape[0], -1)
+        k_flat = key.view(k_shape[0], -1)
+        if torch.compiler.is_compiling():
+            torch.ops.kb_nano.rope_inplace(
+                positions_1d, q_flat, k_flat, self.head_dim, cache,
+            )
+        else:
+            _sgl_rope(positions_1d, q_flat, k_flat, self.head_dim, cache)
         return query, key
 
     def forward(self, positions, query, key):
@@ -157,7 +158,6 @@ class MRotaryEmbedding(nn.Module):
         if positions.ndim == 1:
             return self._apply_sgl_rope(positions, query, key)
 
-        # 2D M-RoPE: positions (3, seq_len) with potentially different T/H/W dims (multimodal prefill)
         cache = self.cos_sin_cache
         if cache.dtype != query.dtype:
             cache = cache.to(query.dtype)
@@ -179,13 +179,22 @@ class MRotaryEmbedding(nn.Module):
         pad_n_qh = triton.next_power_of_2(n_qh)
         pad_n_kh = triton.next_power_of_2(n_kh)
 
-        _mrope_kernel[(num_tokens,)](
-            q_flat, k_flat, cos_3d, sin_3d,
-            num_tokens, n_qh, n_kh, hd, hd,
-            pad_n_qh, pad_n_kh, pad_hd,
-            self.mrope_section[0], self.mrope_section[1], self.mrope_section[2],
-            self.mrope_interleaved,
-        )
+        if torch.compiler.is_compiling():
+            torch.ops.kb_nano.mrope_inplace(
+                q_flat, k_flat, cos_3d, sin_3d,
+                num_tokens, n_qh, n_kh, hd,
+                pad_n_qh, pad_n_kh, pad_hd,
+                self.mrope_section[0], self.mrope_section[1],
+                self.mrope_section[2], self.mrope_interleaved,
+            )
+        else:
+            _mrope_kernel[(num_tokens,)](
+                q_flat, k_flat, cos_3d, sin_3d,
+                num_tokens, n_qh, n_kh, hd, hd,
+                pad_n_qh, pad_n_kh, pad_hd,
+                self.mrope_section[0], self.mrope_section[1],
+                self.mrope_section[2], self.mrope_interleaved,
+            )
 
         query.copy_(q_flat.view_as(query))
         key.copy_(k_flat.view_as(key))

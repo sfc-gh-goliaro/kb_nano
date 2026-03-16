@@ -244,7 +244,7 @@ class Qwen3Model(nn.Module):
             hidden_states = inputs_embeds
         else:
             hidden_states = self.embed_tokens(input_ids)
-        residual = None
+        residual = torch.zeros_like(hidden_states)
         for layer_idx, layer in enumerate(self.layers):
             hidden_states, residual = layer(positions, hidden_states, residual)
             if deepstack_embeds and layer_idx < len(deepstack_embeds):

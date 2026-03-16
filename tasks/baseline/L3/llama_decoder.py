@@ -61,10 +61,7 @@ class LlamaDecoderLayer(nn.Module):
         if self._use_fused_norm_fp8:
             return self._forward_fused_fp8(positions, hidden_states, residual)
 
-        if residual is None:
-            hidden_states, residual = self.input_layernorm(hidden_states), hidden_states
-        else:
-            hidden_states, residual = self.input_layernorm(hidden_states, residual)
+        hidden_states, residual = self.input_layernorm(hidden_states, residual)
         hidden_states = self.self_attn(positions, hidden_states)
         hidden_states, residual = self.post_attention_layernorm(hidden_states, residual)
         hidden_states = self.mlp(hidden_states)
@@ -72,15 +69,8 @@ class LlamaDecoderLayer(nn.Module):
 
     def _forward_fused_fp8(self, positions, hidden_states, residual):
         """FP8 path: fused RMSNorm + FP8 quant → skip internal quant in linear."""
-        # Input layernorm + FP8 quant
-        # The add-variant kernel writes x+residual into the *residual*
-        # buffer (not x), so residual never aliases shared_out_buf.
-        if residual is None:
-            fp8_out, fp8_scale, residual = self._fused_input_norm(
-                hidden_states, None)
-        else:
-            fp8_out, fp8_scale, residual = self._fused_input_norm(
-                hidden_states, residual)
+        fp8_out, fp8_scale, residual = self._fused_input_norm(
+            hidden_states, residual)
 
         # Attention with pre-quantized input
         hidden_states = self.self_attn.forward_fp8(

@@ -81,5 +81,10 @@ class RotaryEmbedding(nn.Module):
         if cache.dtype != torch.float32:
             cache = cache.float()
             self.cos_sin_cache = cache
-        _sgl_rope(positions, query, key, self.head_dim, cache)
+        if torch.compiler.is_compiling():
+            torch.ops.kb_nano.rope_inplace(
+                positions, query, key, self.head_dim, cache,
+            )
+        else:
+            _sgl_rope(positions, query, key, self.head_dim, cache)
         return query, key

@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import torch
 import torch.nn as nn
+import torch.nn.functional as F
 
 from sgl_kernel import silu_and_mul as _sgl_silu_and_mul
 
@@ -30,7 +31,15 @@ class SiluAndMul(nn.Module):
     def set_shared_buffer(self, shared: _ActivationBuffer):
         self._act_buf = shared
 
+    @staticmethod
+    def forward_native(x):
+        """Pure PyTorch implementation that torch.compile / Inductor can fuse."""
+        d = x.shape[-1] // 2
+        return F.silu(x[..., :d]) * x[..., d:]
+
     def forward(self, x):
+        if torch.compiler.is_compiling():
+            return self.forward_native(x)
         half = x.size(-1) // 2
         out = self._act_buf.get(x.size(0), half, x.device, x.dtype)
         return _sgl_silu_and_mul(x, out)

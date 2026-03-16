@@ -64,6 +64,7 @@ class Attention(nn.Module):
             self.decode_op._workspace = workspace
             self.prefill_op._workspace = workspace
 
+    @torch.compiler.disable
     def forward(self, query: torch.Tensor, key: torch.Tensor,
                 value: torch.Tensor) -> torch.Tensor:
         ctx = get_context()

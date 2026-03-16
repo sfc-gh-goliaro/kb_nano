@@ -577,14 +577,18 @@ class ModelRunner:
         Vision encoder: compiled with dynamic=True since vision token counts
         vary per image. Reduces kernel launch overhead for the 27 vision blocks.
 
-        Decoder layers: compiled when Inductor XBLOCK limits allow it (not all
-        GPU architectures support the generated block sizes). Falls back to
-        eager mode gracefully.
+        Decoder layers: compiled with fullgraph=False. Opaque kernels
+        (DeepGEMM, flash_attn, RoPE, etc.) are registered as torch.library
+        custom ops; fusible ops (RMSNorm, SiLU) use PyTorch-native
+        implementations during tracing so Inductor can fuse them.
         """
         if self.enforce_eager:
             return
         if os.environ.get("KB_NANO_NO_COMPILE", "0") == "1":
             return
+
+        # Register custom ops before any compilation
+        import kb_nano.tasks.baseline.L1.custom_ops  # noqa: F401
 
         import torch._dynamo
         torch._dynamo.config.cache_size_limit = 128
@@ -596,7 +600,7 @@ class ModelRunner:
         except ImportError:
             pass
 
-        compile_decoder = os.environ.get("KB_NANO_COMPILE_DECODER", "0") == "1"
+        skip_decoder = os.environ.get("KB_NANO_NO_COMPILE_DECODER", "0") == "1"
 
         if hasattr(self.model, 'visual') and hasattr(self.model.visual, '_run_blocks'):
             if self.rank == 0:
@@ -605,15 +609,17 @@ class ModelRunner:
                 self.model.visual._run_blocks, dynamic=True,
             )
 
-        if compile_decoder:
+        if not skip_decoder:
             model_inner = getattr(self.model, 'model', None)
             if model_inner is not None and hasattr(model_inner, 'layers'):
                 n_layers = len(model_inner.layers)
                 if self.rank == 0:
-                    print(f"  torch.compile: {n_layers} decoder layers")
+                    print(f"  torch.compile: {n_layers} decoder layers "
+                          f"(fullgraph=False)")
                 for i in range(n_layers):
                     model_inner.layers[i] = torch.compile(
-                        model_inner.layers[i], dynamic=False,
+                        model_inner.layers[i],
+                        fullgraph=False,
                     )
 
         torch.cuda.synchronize()
@@ -1320,9 +1326,14 @@ class ModelRunner:
                     context_lens=context_lens[:bs], block_tables=block_tables[:bs],
                     max_context_len=self.max_model_len,
                 )
-                outputs[:bs] = self.model(input_ids[:bs], positions[:bs])
-                lm_logits[:bs] = lm_head.linear_op(outputs[:bs], lm_head.weight).float()
-                lm_max_vals[:bs], lm_max_idxs[:bs] = lm_logits[:bs].max(dim=-1)
+                # Run enough warmup iterations for torch.compile to finish.
+                # First call triggers Dynamo tracing + Inductor compilation;
+                # second call ensures the compiled code runs cleanly before
+                # we record it into a CUDA graph.
+                for _ in range(2):
+                    outputs[:bs] = self.model(input_ids[:bs], positions[:bs])
+                    lm_logits[:bs] = lm_head.linear_op(outputs[:bs], lm_head.weight).float()
+                    lm_max_vals[:bs], lm_max_idxs[:bs] = lm_logits[:bs].max(dim=-1)
 
                 with torch.cuda.graph(graph, self.graph_pool):
                     outputs[:bs] = self.model(input_ids[:bs], positions[:bs])

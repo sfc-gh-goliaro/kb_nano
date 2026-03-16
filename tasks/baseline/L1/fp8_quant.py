@@ -106,6 +106,14 @@ class PerTokenGroupQuantFP8(nn.Module):
         for d in s_shape:
             s_n *= d
 
+        if torch.compiler.is_compiling():
+            x_q = torch.empty(q_shape, device=x.device, dtype=_FP8_DTYPE)
+            x_s = torch.empty(s_shape, device=x.device, dtype=torch.float32)
+            torch.ops.kb_nano.per_token_group_quant_fp8(
+                x, x_q, x_s, self.group_size, _USE_UE8M0,
+            )
+            return x_q, x_s
+
         if self._q_buf is None or self._q_buf.numel() < n:
             self._q_buf = torch.empty(n, device=x.device, dtype=_FP8_DTYPE)
         if self._s_buf is None or self._s_buf.numel() < s_n:

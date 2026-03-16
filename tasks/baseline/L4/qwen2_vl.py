@@ -176,7 +176,7 @@ class Qwen2Model(nn.Module):
             hidden_states = inputs_embeds
         else:
             hidden_states = self.embed_tokens(input_ids)
-        residual = None
+        residual = torch.zeros_like(hidden_states)
         for layer in self.layers:
             hidden_states, residual = layer(positions, hidden_states, residual)
         hidden_states, _ = self.norm(hidden_states, residual)

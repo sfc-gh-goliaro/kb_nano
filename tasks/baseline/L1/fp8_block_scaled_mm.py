@@ -127,19 +127,33 @@ class W8A8BlockScaledMM(nn.Module):
         M = A.numel() // A.shape[-1]
         N, K = B.shape
 
-        C = self._get_output(M, N, output_dtype, A.device)
+        if torch.compiler.is_compiling():
+            C = torch.empty(M, N, dtype=output_dtype, device=A.device)
+        else:
+            C = self._get_output(M, N, output_dtype, A.device)
 
         if _HAS_DEEP_GEMM and output_dtype == torch.bfloat16 and N % 64 == 0 and K % 128 == 0:
-            kwargs = {} if _DEEP_GEMM_E8M0 else {"disable_ue8m0_cast": True}
-            _deep_gemm.fp8_gemm_nt(
-                (A.view(M, K), As.view(M, -1)),
-                (B, Bs),
-                C,
-                **kwargs,
-            )
+            if torch.compiler.is_compiling():
+                torch.ops.kb_nano.deep_gemm_fp8_nt(
+                    A.view(M, K), As.view(M, -1), B, Bs, C, _DEEP_GEMM_E8M0,
+                )
+            else:
+                kwargs = {} if _DEEP_GEMM_E8M0 else {"disable_ue8m0_cast": True}
+                _deep_gemm.fp8_gemm_nt(
+                    (A.view(M, K), As.view(M, -1)),
+                    (B, Bs),
+                    C,
+                    **kwargs,
+                )
             return C
 
         block_n, block_k = block_size
+
+        if torch.compiler.is_compiling():
+            torch.ops.kb_nano.triton_block_scaled_mm(
+                A, B, As, Bs, C, block_n, block_k,
+            )
+            return C
 
         config = {
             "BLOCK_SIZE_M": 64,

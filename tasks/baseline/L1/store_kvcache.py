@@ -63,6 +63,10 @@ def _store_kvcache_hnd_kernel(
 class StoreKVCache(nn.Module):
     """NHD layout store: [num_blocks, block_size, num_kv_heads, head_dim]."""
     def forward(self, key, value, k_cache, v_cache, slot_mapping):
+        if torch.compiler.is_compiling():
+            torch.ops.kb_nano.store_kvcache(key, value, k_cache, v_cache,
+                                            slot_mapping)
+            return
         N, num_heads, head_dim = key.shape
         D = num_heads * head_dim
         _store_kvcache_kernel[(N,)](
@@ -78,6 +82,10 @@ class StoreKVCacheHND(nn.Module):
         self.page_size = page_size
 
     def forward(self, key, value, k_cache, v_cache, slot_mapping):
+        if torch.compiler.is_compiling():
+            torch.ops.kb_nano.store_kvcache_hnd(key, value, k_cache, v_cache,
+                                                slot_mapping, self.page_size)
+            return
         N, num_kv_heads, head_dim = key.shape
         _store_kvcache_hnd_kernel[(N, num_kv_heads)](
             key, key.stride(0), value, value.stride(0),

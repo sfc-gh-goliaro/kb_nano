@@ -113,10 +113,28 @@ def _fused_add_rmsnorm(x, residual, weight, eps):
 class RMSNorm(nn.Module):
     def __init__(self, hidden_size: int, eps: float = 1e-6):
         super().__init__()
+        self.hidden_size = hidden_size
         self.eps = eps
         self.weight = nn.Parameter(torch.ones(hidden_size))
 
+    @staticmethod
+    def forward_native(x, weight, eps, residual=None):
+        """Pure PyTorch implementation that torch.compile / Inductor can fuse."""
+        orig_dtype = x.dtype
+        x = x.float()
+        if residual is not None:
+            x = x + residual
+            residual = x.to(orig_dtype)
+        variance = x.pow(2).mean(dim=-1, keepdim=True)
+        x = x * torch.rsqrt(variance + eps)
+        x = x.to(orig_dtype) * weight
+        if residual is None:
+            return x
+        return x, residual
+
     def forward(self, x, residual=None):
+        if torch.compiler.is_compiling():
+            return self.forward_native(x, self.weight, self.eps, residual)
         if residual is None:
             return _rmsnorm(x, self.weight, self.eps)
         else:
