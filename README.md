@@ -236,7 +236,7 @@ Run `tests/bench_vllm.py` to reproduce. Three scenarios per model, 1000 sequence
 
 ### Qwen2-VL / Qwen3-VL
 
-Throughput: decode-heavy workload (512 input, 1024 output for text; 512 output for image/video), `temperature=0`. Qwen2-VL uses 1000 sequences; Qwen3-VL uses 50 sequences. Image/video throughput uses VisionArena and MMVU datasets respectively.
+Throughput: decode-heavy workload (512 input, 1024 output for text; 512 output for image/video), `temperature=0`, 1000 sequences per scenario. Image/video throughput uses VisionArena and MMVU datasets respectively.
 
 | Model | TP | Modality | vLLM (tok/s) | Ours (tok/s) | Ratio | Match |
 |-------|---:|----------|-------------:|-------------:|------:|------:|
@@ -244,10 +244,10 @@ Throughput: decode-heavy workload (512 input, 1024 output for text; 512 output f
 | Qwen2-VL-7B   | 1 | image | 13,498 | 15,548 | **1.15x** | 251/512 |
 | Qwen2-VL-7B   | 1 | video |  1,016 |  6,463 | **6.36x** | 175/512 |
 | Qwen2-VL-72B  | 4 | text  | 13,153 | 12,877 | 0.98x | 942/1024 |
-| Qwen3-VL-8B-FP8  | 1 | text  |  9,643 |  8,318 | 0.86x | 787/1024 |
-| Qwen3-VL-8B-FP8  | 1 | image |  2,911 |  4,620 | **1.59x** |  47/512 |
-| Qwen3-VL-8B-FP8  | 1 | video |    785 |    894 | **1.14x** |  81/512 |
-| Qwen3-VL-235B-A22B-FP8 | 4 | text  |    503 |    430 | 0.85x | 465/1024 |
+| Qwen3-VL-8B-FP8  | 1 | text  | 22,971 | 21,669 | 0.94x | 749/1024 |
+| Qwen3-VL-8B-FP8  | 1 | image | 13,967 | 10,705 | 0.77x |  51/512 |
+| Qwen3-VL-8B-FP8  | 1 | video |    842 |    812 | 0.96x |  83/512 |
+| Qwen3-VL-235B-A22B-FP8 | 4 | text  |  8,162 |  7,386 | 0.90x | 387/1024 |
 
 Latency: single request (batch_size=1), 128 output tokens, median of 5 iterations.
 
@@ -255,15 +255,16 @@ Latency: single request (batch_size=1), 128 output tokens, median of 5 iteration
 |-------|---:|----------|----------:|----------:|--------:|
 | Qwen2-VL-7B  | 1 | image | 1,373 | 1,330 | **1.03x** |
 | Qwen2-VL-7B  | 1 | video | 1,663 | 1,331 | **1.25x** |
-| Qwen3-VL-8B-FP8 | 1 | image |   730 |   772 | 0.95x |
-| Qwen3-VL-8B-FP8 | 1 | video | 1,021 | 1,178 | 0.87x |
+| Qwen3-VL-8B-FP8 | 1 | image |   730 |   765 | 0.95x |
+| Qwen3-VL-8B-FP8 | 1 | video | 1,130 | 1,197 | 0.94x |
 
 **Notes:**
 - Qwen2-VL-7B beats vLLM across all modalities (text, image, video) in both throughput and latency
-- Qwen3-VL-8B-FP8 beats vLLM on image throughput (1.59x) and video throughput (1.14x)
+- Qwen3-VL-8B-FP8 latency is within 6% of vLLM across all modalities
 - FP8 models use DeepGEMM with E8M0 block scales for linear layers; MoE expert layers use FlashInfer native CUDA kernels (sm90+) or Triton grouped GEMM with float32 block scales
 - 235B MoE model uses `enforce_eager=True` and TP=4 (CUDA graph capture with shared MoE caches is a known limitation)
 - Token matching for FP8 models is lower due to accumulated quantization differences (E8M0 scale rounding, expert routing sensitivity)
+- Vision encoder uses selective torch.compile (merger-only mode) for optimal token match / throughput tradeoff
 - Benchmarked on 4x NVIDIA B200 GPUs
 
 ### Key optimizations

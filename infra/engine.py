@@ -279,8 +279,9 @@ class ModelRunner:
             model_name, torch.device(f"cuda:{rank}"), dtype,
         )
         self.is_qwen_vl = hasattr(self.config, "mrope_section")
+        vision_compile = os.environ.get("KB_NANO_VISION_COMPILE", "merger-only")
         if self.is_qwen_vl and hasattr(self.model, 'visual') and not enforce_eager:
-            self.model.visual._compile_blocks()
+            self.model.visual._compile_blocks(compile_mode=vision_compile)
         self._share_trtllm_workspace()
         self._share_activation_buffers()
         self.warmup_model()

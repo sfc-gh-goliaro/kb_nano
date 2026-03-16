@@ -171,21 +171,28 @@ class Qwen3VisionTransformer(nn.Module):
         ])
         self._compiled = False
 
-    def _compile_blocks(self):
-        """Compile vision MLP and mergers with torch.compile for better fusion."""
-        if self._compiled:
+    def _compile_blocks(self, compile_mode: str = "all"):
+        """Compile vision MLP and/or mergers with torch.compile for better fusion.
+
+        Args:
+            compile_mode: "all" compiles MLPs + mergers (default),
+                          "merger-only" compiles only mergers (better token match),
+                          "none" skips all compilation.
+        """
+        if self._compiled or compile_mode == "none":
             return
         self._compiled = True
+        _compile = lambda m: torch.compile(
+            m, mode="max-autotune-no-cudagraphs", dynamic=True,
+        )
         try:
-            for blk in self.blocks:
-                blk.mlp = torch.compile(blk.mlp, mode="max-autotune-no-cudagraphs",
-                                        dynamic=True)
-            self.merger = torch.compile(self.merger, mode="max-autotune-no-cudagraphs",
-                                        dynamic=True)
-            for i, m in enumerate(self.deepstack_merger_list):
-                self.deepstack_merger_list[i] = torch.compile(
-                    m, mode="max-autotune-no-cudagraphs", dynamic=True,
-                )
+            if compile_mode == "all":
+                for blk in self.blocks:
+                    blk.mlp = _compile(blk.mlp)
+            if compile_mode in ("all", "merger-only"):
+                self.merger = _compile(self.merger)
+                for i, m in enumerate(self.deepstack_merger_list):
+                    self.deepstack_merger_list[i] = _compile(m)
         except Exception:
             pass  # Graceful fallback if compile fails
 
