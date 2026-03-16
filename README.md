@@ -236,7 +236,7 @@ Run `tests/bench_vllm.py` to reproduce. Three scenarios per model, 1000 sequence
 
 ### Qwen2-VL / Qwen3-VL
 
-Throughput: decode-heavy workload (512 input, 1024 output), 1000 sequences each, `temperature=0`. Image/video throughput uses VisionArena and MMVU datasets respectively (512 output tokens).
+Throughput: decode-heavy workload (512 input, 1024 output for text; 512 output for image/video), `temperature=0`. Qwen2-VL uses 1000 sequences; Qwen3-VL uses 50 sequences. Image/video throughput uses VisionArena and MMVU datasets respectively.
 
 | Model | TP | Modality | vLLM (tok/s) | Ours (tok/s) | Ratio | Match |
 |-------|---:|----------|-------------:|-------------:|------:|------:|
@@ -244,10 +244,10 @@ Throughput: decode-heavy workload (512 input, 1024 output), 1000 sequences each,
 | Qwen2-VL-7B   | 1 | image | 13,498 | 15,548 | **1.15x** | 251/512 |
 | Qwen2-VL-7B   | 1 | video |  1,016 |  6,463 | **6.36x** | 175/512 |
 | Qwen2-VL-72B  | 4 | text  | 13,153 | 12,877 | 0.98x | 942/1024 |
-| Qwen3-VL-8B-FP8  | 1 | text  | 18,447 | 14,832 | 0.80x | 747/1024 |
-| Qwen3-VL-8B-FP8  | 1 | image | 12,711 | 10,543 | 0.83x |  61/512 |
-| Qwen3-VL-8B-FP8  | 1 | video |    939 | 11,722 | **12.49x** |  60/512 |
-| Qwen3-VL-235B-A22B-FP8 | 4 | text  |  8,498 |  7,813 | 0.92x | 390/1024 |
+| Qwen3-VL-8B-FP8  | 1 | text  |  9,643 |  8,318 | 0.86x | 787/1024 |
+| Qwen3-VL-8B-FP8  | 1 | image |  2,911 |  4,620 | **1.59x** |  47/512 |
+| Qwen3-VL-8B-FP8  | 1 | video |    785 |    894 | **1.14x** |  81/512 |
+| Qwen3-VL-235B-A22B-FP8 | 4 | text  |    503 |    430 | 0.85x | 465/1024 |
 
 Latency: single request (batch_size=1), 128 output tokens, median of 5 iterations.
 
@@ -255,16 +255,16 @@ Latency: single request (batch_size=1), 128 output tokens, median of 5 iteration
 |-------|---:|----------|----------:|----------:|--------:|
 | Qwen2-VL-7B  | 1 | image | 1,373 | 1,330 | **1.03x** |
 | Qwen2-VL-7B  | 1 | video | 1,663 | 1,331 | **1.25x** |
-| Qwen3-VL-8B-FP8 | 1 | image | 2,752 | 3,518 | 0.78x |
-| Qwen3-VL-8B-FP8 | 1 | video | 2,988 | 3,539 | 0.84x |
+| Qwen3-VL-8B-FP8 | 1 | image |   730 |   772 | 0.95x |
+| Qwen3-VL-8B-FP8 | 1 | video | 1,021 | 1,178 | 0.87x |
 
 **Notes:**
 - Qwen2-VL-7B beats vLLM across all modalities (text, image, video) in both throughput and latency
-- Video throughput is 6-12x faster than vLLM due to batched vision encoder processing and efficient scheduling
-- FP8 models use DeepGEMM for block-scaled FP8 GEMM and vLLM's CUDA `per_token_group_fp8_quant` for activation quantization
-- 235B MoE model uses `enforce_eager=True` (CUDA graph capture with shared MoE caches is a known limitation)
-- Token matching for FP8 MoE models is lower due to accumulated quantization differences affecting expert routing decisions
-- Benchmarked on 4x NVIDIA B200 GPUs with `enforce_eager=True`
+- Qwen3-VL-8B-FP8 beats vLLM on image throughput (1.59x) and video throughput (1.14x)
+- FP8 models use DeepGEMM with E8M0 block scales for linear layers; MoE expert layers use FlashInfer native CUDA kernels (sm90+) or Triton grouped GEMM with float32 block scales
+- 235B MoE model uses `enforce_eager=True` and TP=4 (CUDA graph capture with shared MoE caches is a known limitation)
+- Token matching for FP8 models is lower due to accumulated quantization differences (E8M0 scale rounding, expert routing sensitivity)
+- Benchmarked on 4x NVIDIA B200 GPUs
 
 ### Key optimizations
 
@@ -279,5 +279,6 @@ Latency: single request (batch_size=1), 128 output tokens, median of 5 iteration
 - **Greedy fast path**: For greedy decoding with TP, uses local argmax + small all-gather instead of gathering full logits across ranks
 - **FP8 block-scaled GEMM**: DeepGEMM integration for W8A8 block-scaled FP8 linear layers (Qwen3-VL-FP8 models), with Triton fallback
 - **FP8 MoE grouped GEMM**: Triton kernel for FP8 expert execution with per-block weight scales and per-token-group activation scales
+- **FlashInfer native MoE**: On sm90+ GPUs, replaces the full MoE pipeline (align → quant → GEMM1 → SiLU → quant → GEMM2 → sum) with monolithic CUTLASS/TRT-LLM kernels
 - **M-RoPE**: Multi-dimensional rotary position embeddings for vision-language models (Qwen2-VL, Qwen3-VL)
 - **Shared MoE caches**: Class-level intermediate buffer sharing across MoE layers to reduce memory footprint for large MoE models

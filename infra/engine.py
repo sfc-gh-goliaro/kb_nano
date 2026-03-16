@@ -1334,11 +1334,6 @@ class LlamaEngine:
             image_offsets=image_offsets if image_offsets else None,
             video_offsets=video_offsets if video_offsets else None,
         )
-        # Pre-transfer pixel values to GPU to overlap with CPU preprocessing
-        if pixel_values is not None:
-            pixel_values = pixel_values.to("cuda", non_blocking=True)
-        if video_pv is not None:
-            video_pv = video_pv.to("cuda", non_blocking=True)
         return {
             "token_ids": ids,
             "pixel_values": pixel_values,
@@ -1362,6 +1357,7 @@ class LlamaEngine:
 
         images = []
         videos = []
+        video_metadata_list = []
         for msg in messages:
             if msg.get("role") != "user":
                 continue
@@ -1397,14 +1393,29 @@ class LlamaEngine:
                         except (StopIteration, ValueError):
                             pass
                     import decord
+                    import numpy as np
                     decord.bridge.set_bridge("native")
                     vr = decord.VideoReader(video_path)
                     total = len(vr)
-                    num_frames = min(total, 16)
-                    indices = [int(i * total / num_frames) for i in range(num_frames)]
-                    frames = [Image.fromarray(vr[idx].asnumpy()).convert("RGB")
-                              for idx in indices]
+                    fps = float(vr.get_avg_fps())
+                    # Sample 32 frames uniformly (matches vLLM's default
+                    # VideoMediaIO num_frames=32 with OpenCV backend).
+                    num_frames = min(32, total)
+                    if num_frames == total:
+                        indices = list(range(total))
+                    else:
+                        indices = np.linspace(
+                            0, total - 1, num_frames, dtype=int
+                        ).tolist()
+                    frames = vr.get_batch(indices).asnumpy()
                     videos.append(frames)
+                    video_metadata_list.append({
+                        "total_num_frames": total,
+                        "fps": fps,
+                        "duration": total / fps if fps > 0 else 0,
+                        "frames_indices": indices,
+                        "do_sample_frames": num_frames == total,
+                    })
 
         content_parts = []
         for msg in messages:
@@ -1429,10 +1440,22 @@ class LlamaEngine:
         )
         proc_images = images if images else None
         proc_videos = videos if videos else None
-        inputs = self.processor(
+        proc_kwargs = dict(
             text=[text], images=proc_images, videos=proc_videos,
             return_tensors="pt", padding=True,
         )
+        if video_metadata_list:
+            # Strip do_sample_frames from metadata (VideoMetadata doesn't
+            # accept it) and pass as a processor kwarg instead.
+            clean_metadata = []
+            do_sample = False
+            for vm in video_metadata_list:
+                vm_copy = {k: v for k, v in vm.items() if k != "do_sample_frames"}
+                do_sample = vm.get("do_sample_frames", False)
+                clean_metadata.append(vm_copy)
+            proc_kwargs["video_metadata"] = clean_metadata
+            proc_kwargs["do_sample_frames"] = do_sample
+        inputs = self.processor(**proc_kwargs)
         ids = inputs["input_ids"][0].tolist()
         pixel_values = inputs.get("pixel_values", None)
         image_grid_thw = inputs.get("image_grid_thw", None)
@@ -1473,11 +1496,8 @@ class LlamaEngine:
             image_offsets=image_offsets if image_offsets else None,
             video_offsets=video_offsets if video_offsets else None,
         )
-        # Pre-transfer pixel values to GPU to overlap with CPU preprocessing
-        if pixel_values is not None:
-            pixel_values = pixel_values.to("cuda", non_blocking=True)
-        if video_pv is not None:
-            video_pv = video_pv.to("cuda", non_blocking=True)
+        # Keep pixel values on CPU during preprocessing; _run_vision_encoder
+        # transfers to GPU on demand (avoids OOM when preprocessing many samples).
         return {
             "token_ids": ids,
             "pixel_values": pixel_values,

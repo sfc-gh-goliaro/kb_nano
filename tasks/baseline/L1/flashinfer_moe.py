@@ -145,7 +145,8 @@ class FlashInferFusedMoE(nn.Module):
         if hidden_states.dtype != torch.float8_e4m3fn:
             if self._quant is None:
                 from .fp8_quant import PerTokenGroupQuantFP8
-                self._quant = PerTokenGroupQuantFP8(group_size=128)
+                # MoE kernels require float32 scales, not packed E8M0 int32
+                self._quant = PerTokenGroupQuantFP8(group_size=128, use_packed_e8m0=False)
             hidden_fp8, a_scale = self._quant(hidden_states)
         else:
             hidden_fp8 = hidden_states

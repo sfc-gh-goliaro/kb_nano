@@ -4,6 +4,9 @@ Computes C = A @ B^T where A and B are in float8_e4m3fn with per-block
 scale factors. Uses DeepGEMM on Blackwell/Hopper GPUs for large M
 (prefill), Triton for small M (decode) where DeepGEMM has too much
 overhead, falling back to Triton always when DeepGEMM is unavailable.
+
+On Blackwell, uses E8M0 (power-of-2) scales and packed scale layout
+to match vLLM's DeepGEMM path exactly.
 """
 
 import torch
@@ -13,9 +16,13 @@ import triton.language as tl
 
 _HAS_DEEP_GEMM = False
 _deep_gemm = None
+_USE_E8M0 = False
 try:
     import deep_gemm as _deep_gemm
     _HAS_DEEP_GEMM = hasattr(_deep_gemm, "fp8_gemm_nt")
+    if _HAS_DEEP_GEMM:
+        from vllm.utils.deep_gemm import is_deep_gemm_e8m0_used
+        _USE_E8M0 = is_deep_gemm_e8m0_used()
 except ImportError:
     pass
 
@@ -110,12 +117,17 @@ class W8A8BlockScaledMM(nn.Module):
         M = A.numel() // A.shape[-1]
         N, K = B.shape
 
-        if _HAS_DEEP_GEMM and output_dtype == torch.bfloat16 and N % 64 == 0 and K % 128 == 0 and M >= 256:
+        if _HAS_DEEP_GEMM and output_dtype == torch.bfloat16 and N % 64 == 0 and K % 128 == 0:
             C = torch.empty((M, N), dtype=output_dtype, device=A.device)
+            # When using E8M0, As is already a packed int32 tensor from
+            # per_token_group_quant_fp8_packed_for_deepgemm; pass as-is.
+            # Otherwise, As is float32 and needs reshaping.
+            As_dg = As if _USE_E8M0 else As.view(M, -1)
             _deep_gemm.fp8_gemm_nt(
-                (A.view(M, K), As.view(M, -1)),
+                (A.view(M, K), As_dg),
                 (B, Bs),
                 C,
+                disable_ue8m0_cast=not _USE_E8M0,
             )
             return C
 

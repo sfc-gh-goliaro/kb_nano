@@ -399,5 +399,75 @@ def load_model(
 
     load_weights(model, model_path, model_type)
     model = _move_model_to_device(model, device, dtype)
+    _postprocess_fp8_weights_for_deepgemm(model)
     model.eval()
     return model, config
+
+
+def _postprocess_fp8_weights_for_deepgemm(model: torch.nn.Module) -> None:
+    """Requantize FP8 weights with E8M0 scales and transform scale layout
+    for DeepGEMM on Blackwell. No-op if E8M0 is not in use.
+
+    The transformed scales have a different shape and dtype (int32) than the
+    original float32 scales, so parameters are replaced entirely.
+    """
+    try:
+        from vllm.utils.deep_gemm import is_deep_gemm_e8m0_used
+        if not is_deep_gemm_e8m0_used():
+            return
+    except (ImportError, AssertionError):
+        return
+
+    from vllm.model_executor.layers.quantization.utils.fp8_utils import (
+        deepgemm_post_process_fp8_weight_block,
+    )
+
+    count = 0
+    # Only process regular linear layers (weight/weight_scale_inv).
+    # MoE expert weights (w13/w2) use flashinfer/triton kernels, not DeepGEMM,
+    # so they must NOT be post-processed for E8M0.
+    weight_scale_pairs = [
+        ('weight', 'weight_scale_inv'),
+    ]
+    for name, module in model.named_modules():
+        for w_attr, ws_attr in weight_scale_pairs:
+            w = getattr(module, w_attr, None)
+            ws = getattr(module, ws_attr, None)
+            if w is None or ws is None:
+                continue
+            if not isinstance(w, torch.nn.Parameter):
+                continue
+            if w.dtype != torch.float8_e4m3fn:
+                continue
+            if ws.dtype != torch.float32:
+                continue
+
+            # Determine block size
+            linear_op = getattr(module, 'linear_op', None)
+            if linear_op is not None and hasattr(linear_op, 'block_size'):
+                block_size = linear_op.block_size
+            elif hasattr(module, '_fp8_block_size'):
+                block_size = module._fp8_block_size
+            else:
+                w_shape = w.shape[-2:]
+                s_shape = ws.shape[-2:]
+                N, K = w_shape
+                sn, sk = s_shape
+                block_size = (N // sn if sn > 0 else 128,
+                              K // sk if sk > 0 else 128)
+
+            w_new, ws_new = deepgemm_post_process_fp8_weight_block(
+                w.data, ws.data,
+                quant_block_shape=block_size,
+                use_e8m0=True,
+            )
+            # Weight data stays same shape/dtype — update in-place
+            w.data = w_new
+            # Scale data changes shape and dtype (float32 -> int32 with
+            # DeepGEMM layout), so replace the parameter entirely.
+            setattr(module, ws_attr,
+                    torch.nn.Parameter(ws_new, requires_grad=False))
+            count += 1
+
+    if count > 0:
+        print(f"  Post-processed {count} FP8 weight tensors for DeepGEMM E8M0")

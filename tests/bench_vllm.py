@@ -780,8 +780,9 @@ def main():
                 })
             else:
                 # Image/video: dataset is loaded inside the subprocess worker.
-                # We need a generous max_model_len for vision tokens.
-                max_seq_len = 32768
+                # Use 20480 to accommodate large vision inputs while leaving
+                # enough KV cache room on single-GPU FP8 models.
+                max_seq_len = 20480
                 if max_seq_len > global_max_seq_len:
                     global_max_seq_len = max_seq_len
                 scenario_data.append({
@@ -821,7 +822,7 @@ def main():
                     "num_iters": args.latency_iters,
                 })
             else:
-                max_seq_len = 32768
+                max_seq_len = 20480
                 if max_seq_len > global_max_seq_len:
                     global_max_seq_len = max_seq_len
                 latency_data.append({

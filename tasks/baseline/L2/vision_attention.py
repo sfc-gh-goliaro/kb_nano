@@ -2,14 +2,17 @@
 
 Non-causal, no KV cache. Uses flash_attn_varlen_func with cu_seqlens
 for variable-length sequence support within the vision encoder.
+
+Uses vLLM's bundled flash_attn (vllm_flash_attn) for both attention and
+rotary embeddings so that numerical results match vLLM exactly.
 """
 
 from __future__ import annotations
 
 import torch
 import torch.nn as nn
-from flash_attn import flash_attn_varlen_func
-from flash_attn.ops.triton.rotary import apply_rotary
+from vllm.vllm_flash_attn import flash_attn_varlen_func
+from vllm.vllm_flash_attn.layers.rotary import apply_rotary_emb
 
 from ....infra.tp import _tp_size, _tp_rank
 from .parallel_linear import QKVParallelLinear, RowParallelLinear
@@ -55,14 +58,14 @@ class VisionAttention(nn.Module):
         v = v.view(seq_len, batch_size, self.num_heads, self.head_dim)
 
         # batch_size is always 1 for vision encoder. Work directly with
-        # (batch=1, seq, heads, dim) layout for apply_rotary, then flatten.
+        # (batch=1, seq, heads, dim) layout for apply_rotary_emb, then flatten.
         q = q.transpose(0, 1).contiguous()
         k = k.transpose(0, 1).contiguous()
         v = v.transpose(0, 1)
 
         if rotary_pos_emb_cos is not None and rotary_pos_emb_sin is not None:
             qk = torch.cat([q, k], dim=0)
-            qk = apply_rotary(qk, rotary_pos_emb_cos, rotary_pos_emb_sin)
+            qk = apply_rotary_emb(qk, rotary_pos_emb_cos, rotary_pos_emb_sin)
             q, k = qk.chunk(2, dim=0)
 
         # Flatten batch dim for varlen

@@ -64,7 +64,7 @@ class FusedExperts(nn.Module):
         if block_size is not None:
             from ..L1.fp8_quant import PerTokenGroupQuantFP8
             from ..L1.fp8_moe_grouped_gemm import FP8MoeGroupedGemm
-            self.quant = PerTokenGroupQuantFP8(group_size=block_size[1])
+            self.quant = PerTokenGroupQuantFP8(group_size=block_size[1], use_packed_e8m0=False)
             self.fp8_moe_grouped_gemm = FP8MoeGroupedGemm()
 
         self.moe_grouped_gemm = MoeGroupedGemm()

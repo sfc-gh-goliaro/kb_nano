@@ -1,7 +1,8 @@
 """Per-token-group FP8 activation quantization.
 
 Quantizes BF16 activations to float8_e4m3fn with per-group scale factors.
-Uses vLLM's CUDA kernel when available, falls back to Triton.
+On Blackwell with DeepGEMM E8M0, uses vLLM's packed UE8M0 quantization
+for exact numerical match. Otherwise uses sgl_kernel, vLLM CUDA, or Triton.
 """
 
 import torch
@@ -13,17 +14,35 @@ _FP8_DTYPE = torch.float8_e4m3fn
 _FP8_MAX = torch.finfo(_FP8_DTYPE).max  # 448.0
 _FP8_MIN = -_FP8_MAX
 
-_HAS_SGL_QUANT = False
+# Check if E8M0 packed quantization is available (Blackwell + DeepGEMM)
+_HAS_PACKED_E8M0 = False
+_packed_quant = None
 try:
-    from sgl_kernel import sgl_per_token_group_quant_fp8 as _sgl_quant
-    # Verify it works (some versions need sglang installed)
-    _sgl_quant.__module__  # basic smoke check
-    _HAS_SGL_QUANT = True
-except (ImportError, AttributeError):
+    from vllm.utils.deep_gemm import is_deep_gemm_e8m0_used
+    if is_deep_gemm_e8m0_used():
+        from vllm.model_executor.layers.quantization.utils.fp8_utils import (
+            per_token_group_quant_fp8_packed_for_deepgemm as _packed_quant,
+        )
+        _HAS_PACKED_E8M0 = True
+except (ImportError, AssertionError):
     pass
 
+_HAS_SGL_QUANT = False
+if not _HAS_PACKED_E8M0:
+    try:
+        from sgl_kernel import sgl_per_token_group_quant_fp8 as _sgl_quant
+        # Some sgl_kernel versions require sglang at runtime; do a real call.
+        _test_x = torch.ones(1, 128, dtype=torch.bfloat16, device="cuda")
+        _test_q = torch.empty(1, 128, dtype=_FP8_DTYPE, device="cuda")
+        _test_s = torch.empty(1, 1, dtype=torch.float32, device="cuda")
+        _sgl_quant(_test_x, _test_q, _test_s, 128, 1e-10, _FP8_MIN, _FP8_MAX)
+        del _test_x, _test_q, _test_s
+        _HAS_SGL_QUANT = True
+    except Exception:
+        pass
+
 _HAS_VLLM_CUDA_QUANT = False
-if not _HAS_SGL_QUANT:
+if not _HAS_PACKED_E8M0 and not _HAS_SGL_QUANT:
     try:
         from vllm import _custom_ops  # noqa: F401
         _HAS_VLLM_CUDA_QUANT = (hasattr(torch.ops, "_C")
@@ -88,9 +107,10 @@ class PerTokenGroupQuantFP8(nn.Module):
     _shared_s_buf: torch.Tensor | None = None
     _use_shared = False
 
-    def __init__(self, group_size: int = 128):
+    def __init__(self, group_size: int = 128, use_packed_e8m0: bool = True):
         super().__init__()
         self.group_size = group_size
+        self._use_packed_e8m0 = use_packed_e8m0 and _HAS_PACKED_E8M0
         self._q_buf = None
         self._s_buf = None
 
@@ -119,6 +139,9 @@ class PerTokenGroupQuantFP8(nn.Module):
     def forward(self, x: torch.Tensor) -> tuple[torch.Tensor, torch.Tensor]:
         assert x.shape[-1] % self.group_size == 0
         assert x.is_contiguous()
+
+        if self._use_packed_e8m0:
+            return _packed_quant(x, group_size=self.group_size)
 
         q_shape = x.shape
         s_shape = x.shape[:-1] + (x.shape[-1] // self.group_size,)

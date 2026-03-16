@@ -180,9 +180,11 @@ class Qwen3MoE(nn.Module):
             return
         self.w13.data = swap_w13_to_w31(self.w13.data)
         self.w13_scale_inv.data = swap_w13_to_w31(self.w13_scale_inv.data)
-        _MIN_BLOCK_SCALE = 1e-10
-        self.w13_scale_inv.data.clamp_(min=_MIN_BLOCK_SCALE)
-        self.w2_scale_inv.data.clamp_(min=_MIN_BLOCK_SCALE)
+        # Skip scale clamping when scales are int32 (E8M0 post-processed)
+        if self.w13_scale_inv.dtype.is_floating_point:
+            _MIN_BLOCK_SCALE = 1e-10
+            self.w13_scale_inv.data.clamp_(min=_MIN_BLOCK_SCALE)
+            self.w2_scale_inv.data.clamp_(min=_MIN_BLOCK_SCALE)
 
     def _ensure_routing_buffers(self, M, device):
         if self._topk_weights is None or self._topk_weights.size(0) < M:
