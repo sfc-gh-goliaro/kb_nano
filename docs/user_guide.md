@@ -9,20 +9,8 @@ A standalone LLM inference engine with a benchmarking suite for evaluating custo
 ```bash
 git clone git@github.com:sfc-gh-goliaro/kb-nano.git
 cd kb-nano
-
-# Throughput + latency + alignment benchmark vs vLLM
-python tests/bench_vllm.py --model meta-llama/Llama-3.1-8B-Instruct
-
-# E2E throughput benchmark (mirrors vLLM's benchmark_throughput.py)
-python -m kb_nano.bench.e2e throughput \
-    --model meta-llama/Llama-3.1-8B-Instruct \
-    --dataset-name random --random-input-len 512 --random-output-len 128
-
-# Kernel-level benchmark (swap an operator, measure correctness + speedup)
-python -m kb_nano.bench.kernels --target rms_norm
+pip install .
 ```
-
-No `pip install` step is required. Run scripts from the repository root; `kb_nano` is used as a local package. See the README for dependency installation.
 
 ---
 
@@ -32,41 +20,41 @@ kb-nano provides three complementary benchmarking tools.
 
 ### E2E Benchmark CLI
 
-`python -m kb_nano.bench.e2e` mirrors vLLM's benchmarking CLI. The same flags work in both tools, making it easy to compare results:
+`kb_nano e2e` mirrors vLLM's benchmarking CLI. The same flags work in both tools, making it easy to compare results:
 
 ```bash
 # Throughput (mirrors `vllm bench throughput`)
-python -m kb_nano.bench.e2e throughput \
+kb_nano e2e throughput \
     --model meta-llama/Llama-3.1-8B-Instruct \
     --dataset-name random --random-input-len 512 --random-output-len 128 \
     --num-prompts 200 --tp 4
 
 # Latency
-python -m kb_nano.bench.e2e latency \
+kb_nano e2e latency \
     --model meta-llama/Llama-3.1-8B-Instruct \
     --input-len 128 --output-len 128
 
 # Evaluate candidate kernels from tasks/candidate/ against baseline
-python -m kb_nano.bench.eval \
+kb_nano eval \
     --model meta-llama/Llama-3.1-8B-Instruct
 ```
 
 ### Kernel Benchmark CLI
 
-`python -m kb_nano.bench.kernels` benchmarks a single operator replacement. It instantiates the baseline and candidate modules, compares their `forward()` outputs for correctness (`allclose` + mean absolute difference), and measures wall-clock speedup.
+`kb_nano kernels` benchmarks a single operator replacement. It instantiates the baseline and candidate modules, compares their `forward()` outputs for correctness (`allclose` + mean absolute difference), and measures wall-clock speedup.
 
 ```bash
 # List all benchmarkable targets
-python -m kb_nano.bench.kernels --list
+kb_nano kernels --list
 
 # Show model-to-operator mapping
-python -m kb_nano.bench.kernels --map
+kb_nano kernels --map
 
 # Benchmark a candidate from tasks/candidate/
-python -m kb_nano.bench.kernels --target rms_norm
+kb_nano kernels --target rms_norm
 
 # Filter by model and TP degree
-python -m kb_nano.bench.kernels \
+kb_nano kernels \
     --target rms_norm \
     --model llama31 \
     --tp 1
@@ -107,15 +95,15 @@ The agent uses Claude to generate replacement kernels, validate them, and benchm
 
 ```bash
 # Generate all L1 kernels for Llama
-python -m kb_nano.agent \
+kb_nano agent \
     --model meta-llama/Llama-3.1-8B-Instruct --level 1
 
 # CUDA-only kernels (no Triton/PyTorch builtins)
-python -m kb_nano.agent \
+kb_nano agent \
     --model meta-llama/Llama-3.1-8B-Instruct --level 1 --cuda-only
 
 # Mixtral L2 operators with TP
-python -m kb_nano.agent \
+kb_nano agent \
     --model mistralai/Mixtral-8x7B-Instruct-v0.1 --level 2 --tp 4
 ```
 
@@ -222,7 +210,7 @@ class RMSNorm(nn.Module):
 ```
 
 ```bash
-python -m kb_nano.bench.kernels --target rms_norm
+kb_nano kernels --target rms_norm
 ```
 
 You can use pure PyTorch, Triton (`triton.jit`), inline CUDA (`torch.utils.cpp_extension.load_inline`), or external libraries. Avoid importing `vllm` or `sgl_kernel` in your replacement -- the point is to provide an alternative implementation.
@@ -249,6 +237,6 @@ You can use pure PyTorch, Triton (`triton.jit`), inline CUDA (`torch.utils.cpp_e
 
 **HuggingFace auth**: Run `huggingface-cli login` for gated models like Llama.
 
-**Bench target not found**: Run `python -m kb_nano.bench.kernels --list` to see available targets. Names match file names under `tasks/baseline/` (without `.py`).
+**Bench target not found**: Run `kb_nano kernels --list` to see available targets. Names match file names under `tasks/baseline/` (without `.py`).
 
 **Class name mismatch**: Your replacement class must have the exact same name as the baseline class (e.g. `RMSNorm`, not `MyRMSNorm`).

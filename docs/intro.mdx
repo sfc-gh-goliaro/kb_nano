@@ -23,9 +23,8 @@ Welcome to KB Nano, your launchpad for engineering the world's fastest GPU code.
     ```bash
     git clone git@github.com:sfc-gh-goliaro/kb_nano.git
     cd kb_nano
-    pip install -r requirements.txt
+    pip install .
     ```
-    No further installation required — `kb_nano` is used as a local package.
   </Step>
   <Step title="Explore the baselines">
     Each supported model architecture is implemented in a modular fashion under `tasks/baseline/`, organized in four levels from individual kernels (L1) up to full models (L4). See [Architecture](/architecture) for details on the hierarchy and interface conventions.
@@ -114,10 +113,10 @@ Welcome to KB Nano, your launchpad for engineering the world's fastest GPU code.
 
     ```bash
     # Kernel-level: correctness + speedup for a single operator
-    python -m kb_nano.bench.kernels --target rms_norm
+    kb_nano kernels --target rms_norm
 
     # E2E: throughput with your candidates swapped into the model
-    python -m kb_nano.bench.eval \
+    kb_nano eval \
         --model meta-llama/Llama-3.1-8B-Instruct
     ```
 

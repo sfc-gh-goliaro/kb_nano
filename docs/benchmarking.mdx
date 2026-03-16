@@ -7,9 +7,9 @@ kb-nano uses a three-tier benchmarking system. Each tier adds scope: isolated ke
 
 | Tier | Scope | CLI |
 |------|-------|-----|
-| 1 — Kernel | Single operator `forward()` in isolation | `python -m kb_nano.bench.kernels` |
-| 2 — E2E | Full-model throughput, latency, serving | `python -m kb_nano.bench.e2e` |
-| 3 — Eval | Standardized multi-model sweep | `python -m kb_nano.bench.eval` |
+| 1 — Kernel | Single operator `forward()` in isolation | `kb_nano kernels` |
+| 2 — E2E | Full-model throughput, latency, serving | `kb_nano e2e` |
+| 3 — Eval | Standardized multi-model sweep | `kb_nano eval` |
 
 ---
 
@@ -19,20 +19,20 @@ Tests a single operator replacement by instantiating baseline and candidate `nn.
 
 ```bash
 # Run all operators that have candidates in tasks/candidate/
-python -m kb_nano.bench.kernels
+kb_nano kernels
 
 # Single operator
-python -m kb_nano.bench.kernels --target rms_norm
+kb_nano kernels --target rms_norm
 
 # Filter by model / TP / category
-python -m kb_nano.bench.kernels --target rms_norm --model llama31 --tp 1
+kb_nano kernels --target rms_norm --model llama31 --tp 1
 
 # List available targets
-python -m kb_nano.bench.kernels --list
-python -m kb_nano.bench.kernels --list --level 1
+kb_nano kernels --list
+kb_nano kernels --list --level 1
 
 # Show model-to-operator mapping
-python -m kb_nano.bench.kernels --map
+kb_nano kernels --map
 ```
 
 **Key flags:**
@@ -57,18 +57,18 @@ Full-model inference benchmarks. The CLI mirrors vLLM's interface, so the same f
 
 ```bash
 # Throughput
-python -m kb_nano.bench.e2e throughput \
+kb_nano e2e throughput \
     --model meta-llama/Llama-3.1-8B-Instruct \
     --dataset-name random --random-input-len 512 --random-output-len 128 \
     --num-prompts 200 --tp 4
 
 # Latency
-python -m kb_nano.bench.e2e latency \
+kb_nano e2e latency \
     --model meta-llama/Llama-3.1-8B-Instruct \
     --input-len 128 --output-len 128
 
 # Online serving
-python -m kb_nano.bench.e2e serve [args...]
+kb_nano e2e serve [args...]
 ```
 
 ---
@@ -79,17 +79,17 @@ Runs a standardized evaluation across all candidate kernels using fixed workload
 
 ```bash
 # Full sweep (auto-detects models from candidates)
-python -m kb_nano.bench.eval
+kb_nano eval
 
 # Specific model and TP
-python -m kb_nano.bench.eval \
+kb_nano eval \
     --model meta-llama/Llama-3.1-8B-Instruct --tp 1 4
 
 # Filter by category
-python -m kb_nano.bench.eval --category llm
+kb_nano eval --category llm
 
 # Control scale
-python -m kb_nano.bench.eval --num-prompts 500 --gpu-pool 4
+kb_nano eval --num-prompts 500 --gpu-pool 4
 ```
 
 **Key flags:**
@@ -125,10 +125,10 @@ Kernel benchmarks (Tier 1) draw input shapes from a YAML manifest at `bench/util
 
 ```bash
 # Regenerate the manifest from HuggingFace model configs
-python -m kb_nano.bench.utils.generate_inputs
+kb_nano generate-inputs
 
 # Capture golden data for data-dependent operators
-python -m kb_nano.bench.utils.capture_golden \
+kb_nano capture-golden \
     --model meta-llama/Llama-3.1-8B-Instruct
 ```
 
