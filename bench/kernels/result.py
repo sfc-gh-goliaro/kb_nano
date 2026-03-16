@@ -8,6 +8,12 @@ from dataclasses import asdict, dataclass, field
 
 
 @dataclass
+class NcuProfileResult:
+    """NCU profiling metrics for a single kernel (baseline or candidate)."""
+    metrics_json: str  # JSON string from metrics_to_prompt()
+
+
+@dataclass
 class ScenarioResult:
     """Result from a single scenario of a kernel benchmark."""
     name: str
@@ -16,6 +22,8 @@ class ScenarioResult:
     baseline_ms: float
     candidate_ms: float
     speedup: float
+    baseline_ncu: NcuProfileResult | None = None
+    candidate_ncu: NcuProfileResult | None = None
 
 
 @dataclass
@@ -38,6 +46,34 @@ class OperatorResult:
         if self.scenarios:
             self.avg_mean_abs_diff = sum(s.mean_abs_diff for s in self.scenarios) / len(self.scenarios)
             self.avg_speedup = sum(s.speedup for s in self.scenarios) / len(self.scenarios)
+
+
+def _parse_ncu_json(ncu: NcuProfileResult | None) -> dict:
+    """Parse a NcuProfileResult's JSON into a flat {metric: value} dict."""
+    if ncu is None:
+        return {}
+    try:
+        data = json.loads(ncu.metrics_json)
+    except (json.JSONDecodeError, TypeError):
+        return {}
+    # The JSON may be keyed by kernel name; flatten to first kernel's metrics
+    if isinstance(data, dict):
+        for v in data.values():
+            if isinstance(v, dict):
+                return v
+            if isinstance(v, list) and v and isinstance(v[0], dict):
+                return v[0]
+    return {}
+
+
+def _ncu_val(data: dict, key: str) -> str:
+    """Format a single NCU metric value for display."""
+    v = data.get(key)
+    if v is None:
+        return "n/a"
+    if isinstance(v, (int, float)):
+        return f"{v:.1f}"
+    return str(v)
 
 
 @dataclass
@@ -95,6 +131,30 @@ class KernelBenchResult:
             print(f"  OVERALL: {op.passed}/{op.total_scenarios} PASS    "
                   f"avg speedup: {op.avg_speedup:.2f}x")
             print(f"{'=' * 70}")
+
+            # NCU profile summary (if any scenario has profiling data)
+            profiled = [s for s in op.scenarios if s.baseline_ncu or s.candidate_ncu]
+            if profiled:
+                print(f"\n  NCU PROFILE SUMMARY")
+                print(f"  {'─' * 66}")
+                _HEADLINE_KEYS = [
+                    ("dram__throughput.avg.pct_of_peak_sustained_elapsed", "DRAM Thpt%"),
+                    ("sm__warps_active.avg.pct_of_peak_sustained_active", "Warp Active%"),
+                    ("l1tex__t_sector_hit_rate.pct", "L1 Hit%"),
+                    ("smsp__warp_issue_stalled_memory_dependency_per_warp_active.pct", "Mem Stall%"),
+                ]
+                for s in profiled:
+                    print(f"\n  {s.name}")
+                    header = f"  {'METRIC':<20} {'BASELINE':>12} {'CANDIDATE':>12}"
+                    print(header)
+                    print(f"  {'─' * 44}")
+                    baseline_data = _parse_ncu_json(s.baseline_ncu)
+                    candidate_data = _parse_ncu_json(s.candidate_ncu)
+                    for metric_key, short_name in _HEADLINE_KEYS:
+                        bval = _ncu_val(baseline_data, metric_key)
+                        cval = _ncu_val(candidate_data, metric_key)
+                        print(f"  {short_name:<20} {bval:>12} {cval:>12}")
+                print(f"  {'─' * 66}")
 
         if not single_target and len(self.operators) > 1:
             print(f"\n{'=' * 70}")

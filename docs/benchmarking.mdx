@@ -46,8 +46,126 @@ kb_nano kernels --map
 | `--num-warmup` | 10 | Warmup iterations |
 | `--num-runs` | 100 | Timed iterations for median |
 | `--output-json` | `bench/results/kernels.json` | Results path |
+| `--profile` | off | Run NCU (Nsight Compute) profiling on baseline and candidate |
+| `--num-ncu-launches` | 20 | Number of kernel launches NCU captures |
 
 A scenario **passes** if max-abs-error < 0.01 (bfloat16 tolerance). Speedup > 1.0 means faster than baseline.
+
+### NCU Profiling
+
+Add `--profile` to any kernel benchmark to collect hardware-level metrics via NVIDIA Nsight Compute. This profiles **both** baseline and candidate kernels for every scenario, giving you a side-by-side view of where GPU time is spent.
+
+```bash
+# Profile a single operator
+kb_nano kernels --target rms_norm --profile
+
+# Faster profiling (fewer launches)
+kb_nano kernels --target rms_norm --profile --num-ncu-launches 5
+
+# Profile all candidate operators
+kb_nano kernels --profile
+```
+
+The profiler collects 23 hardware metrics across six categories:
+
+| Category | Metrics |
+|----------|---------|
+| SM activity | Active cycles, warp occupancy % |
+| Occupancy limits | Block/register/shared-memory limits, registers per thread |
+| Compute | Total instructions, FP32 pipe %, tensor pipe % |
+| Memory | DRAM read/write bytes, DRAM throughput %, bandwidth |
+| Cache | L1/L2 hit rates, L1/L2 throughput % |
+| Warp stalls | Memory dependency, short/long scoreboard, barrier, branch stalls |
+
+After the timing table, a **NCU Profile Summary** shows headline metrics for each scenario:
+
+<Expandable title="Sample output: kb_nano kernels --target rms_norm --profile">
+```
+======================================================================
+  Kernel Benchmark: rms_norm
+  Candidate: tasks/candidate/L1/rms_norm.py
+  Scenarios: 9 (from InputRegistry)
+======================================================================
+
+  SCENARIO                                  CORRECT    MEAN_DIFF    SPEEDUP
+  ──────────────────────────────────────────────────────────────────
+  llama31-8b/decode-bs1/tp1                    FAIL      3.0e-01      0.22x
+  llama31-8b/decode-bs8/tp1                    FAIL      3.0e-01      0.23x
+  llama31-8b/decode-bs32/tp1                   FAIL      3.0e-01      0.20x
+  llama31-8b/decode-bs128/tp1                  FAIL      3.0e-01      0.21x
+  llama31-8b/prefill-128/tp1                   FAIL      4.0e-01      0.27x
+  llama31-8b/prefill-512/tp1                   FAIL      4.0e-01      0.25x
+  llama31-70b/decode-bs1/tp4                   FAIL      3.0e-01      0.23x
+  llama31-70b/decode-bs32/tp4                  FAIL      3.0e-01      0.22x
+  llama31-70b/prefill-512/tp4                  FAIL      4.0e-01      0.31x
+  ──────────────────────────────────────────────────────────────────
+  OVERALL: 0/9 PASS    avg speedup: 0.24x
+======================================================================
+
+  NCU PROFILE SUMMARY
+  ──────────────────────────────────────────────────────────────────
+
+  llama31-8b/decode-bs32/tp1
+  METRIC                   BASELINE    CANDIDATE
+  ────────────────────────────────────────────
+  DRAM Thpt%                    0.1          0.0
+  Warp Active%                 38.1         40.1
+  L1 Hit%                      45.8         45.4
+  Mem Stall%                    n/a          n/a
+
+  llama31-8b/prefill-512/tp1
+  METRIC                   BASELINE    CANDIDATE
+  ────────────────────────────────────────────
+  DRAM Thpt%                    0.0          0.0
+  Warp Active%                 50.6         51.8
+  L1 Hit%                      45.4         45.5
+  Mem Stall%                    n/a          n/a
+  ──────────────────────────────────────────────────────────────────
+```
+</Expandable>
+
+The full 23-metric profile for each scenario is saved in the JSON output and logged to MLflow as artifacts (see [Experiment Tracking](/experiment-tracking)). This detailed JSON is designed for **agent consumption** — an LLM can read it to identify bottlenecks and suggest specific optimizations.
+
+<Expandable title="Sample NCU JSON (from results JSON)">
+```json
+{
+  "void rmsnorm_kernel<float, 1024>(...)": {
+    "sm__cycles_active.avg": 1842.5,
+    "sm__warps_active.avg.pct_of_peak_sustained_active": 50.6,
+    "launch__occupancy_limit_blocks": 32,
+    "launch__occupancy_limit_registers": 5,
+    "launch__occupancy_limit_shared_mem": 32,
+    "launch__registers_per_thread": 44,
+    "sm__inst_executed.sum": 44032,
+    "sm__inst_executed_pipe_fp32.avg.pct_of_peak_sustained_active": 8.3,
+    "sm__inst_executed_pipe_tensor.avg.pct_of_peak_sustained_active": 0.0,
+    "dram__bytes_read.sum": 131072,
+    "dram__bytes_write.sum": 65536,
+    "dram__throughput.avg.pct_of_peak_sustained_elapsed": 12.4,
+    "dram__bytes.sum.per_second": 45000000000,
+    "gpu__dram_throughput.avg.pct_of_peak_sustained_elapsed": 12.4,
+    "l1tex__t_sector_hit_rate.pct": 45.8,
+    "l1tex__throughput.avg.pct_of_peak_sustained_active": 22.1,
+    "lts__t_sector_hit_rate.pct": 80.2,
+    "lts__throughput.avg.pct_of_peak_sustained_active": 5.6,
+    "smsp__warp_issue_stalled_memory_dependency_per_warp_active.pct": 18.3,
+    "smsp__warp_issue_stalled_short_scoreboard_per_warp_active.pct": 4.1,
+    "smsp__warp_issue_stalled_long_scoreboard_per_warp_active.pct": 2.0,
+    "smsp__warp_issue_stalled_barrier_per_warp_active.pct": 0.5,
+    "smsp__warp_issue_stalled_branch_resolving_per_warp_active.pct": 0.1,
+    "smsp__sass_average_branch_targets_threads_uniform.pct": 98.7
+  }
+}
+```
+</Expandable>
+
+**Requirements:** NCU profiling requires NVIDIA Nsight Compute (`ncu`) to be installed (part of the [CUDA Toolkit](https://developer.nvidia.com/cuda-toolkit)). If `ncu` is not found on `PATH`, the `--profile` flag prints a warning and falls back to timing-only benchmarks. On some systems, NCU requires elevated privileges — run with `sudo` or configure [NVIDIA permissions](https://developer.nvidia.com/nsight-compute).
+
+**When to use NCU profiling:**
+- After a kernel benchmark shows unexpected speedup or slowdown, to understand *why*
+- To identify bottlenecks (memory-bound vs compute-bound, low occupancy, warp stalls)
+- As input to an agent's optimization loop — the JSON format is designed for LLM consumption
+- NCU is only supported at Tier 1 (kernel-level). For Tier 2/3, use the timing metrics to measure end-to-end impact, then drill down with Tier 1 + NCU on specific operators.
 
 ---
 

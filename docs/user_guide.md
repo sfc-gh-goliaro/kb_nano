@@ -107,7 +107,7 @@ kb_nano agent \
     --model mistralai/Mixtral-8x7B-Instruct-v0.1 --level 2 --tp 4
 ```
 
-The agent discovers operators at the specified level, generates replacements in parallel, validates compilation and numerical correctness, patches all successful kernels into the model, and reports token match rate and speedup. Failed kernels are retried with error feedback.
+The agent discovers operators at the specified level, generates replacements in parallel, validates compilation and numerical correctness, patches all successful kernels into the model, and reports token match rate and speedup. Failed kernels are retried with error feedback. After a successful benchmark, NCU profiling automatically analyzes each kernel and a judge LLM identifies the biggest bottleneck with an optimization suggestion. Use `--skip-profile` to skip this step.
 
 Generated kernels are saved to `tasks/candidate/L{level}/{op_name}.py`.
 
@@ -126,7 +126,7 @@ Every `kb_nano agent`, `kb_nano kernels`, `kb_nano eval`, and `kb_nano e2e` run 
 | Command | Logged data |
 |---------|-------------|
 | `kb_nano agent` | Run params, per-op generation success/attempts, unit test results, e2e speedup, kernel source code |
-| `kb_nano kernels` | Bench params, per-operator per-scenario speedup/correctness, kernel source code |
+| `kb_nano kernels` | Bench params, per-operator per-scenario speedup/correctness, kernel source code, NCU profile JSON (when `--profile` is used) |
 | `kb_nano eval` | Per-model throughput/latency speedup, alignment rate, wall-clock time |
 | `kb_nano e2e` | Throughput (tokens/s), latency (percentiles), serve metrics (TTFT, TPOT, ITL) |
 
@@ -385,6 +385,41 @@ kb_nano kernels --target rms_norm
 
 You can use pure PyTorch, Triton (`triton.jit`), inline CUDA (`torch.utils.cpp_extension.load_inline`), or external libraries. Avoid importing `vllm` or `sgl_kernel` in your replacement -- the point is to provide an alternative implementation.
 
+### NCU Profiling
+
+Add `--profile` to any kernel benchmark to collect hardware-level metrics via NVIDIA Nsight Compute. This profiles both baseline and candidate kernels, giving you actionable data about *why* a kernel is fast or slow.
+
+```bash
+# Profile a single operator
+kb_nano kernels --target rms_norm --profile
+
+# Faster profiling (fewer launches)
+kb_nano kernels --target rms_norm --profile --num-ncu-launches 5
+
+# Profile all candidate operators
+kb_nano kernels --profile
+```
+
+This produces the standard timing table plus an NCU Profile Summary:
+
+```
+  NCU PROFILE SUMMARY
+  ──────────────────────────────────────────────────────────────────
+
+  llama31-8b/decode-bs32/tp1
+  METRIC                   BASELINE    CANDIDATE
+  ────────────────────────────────────────────
+  DRAM Thpt%                    0.1          0.0
+  Warp Active%                 38.1         40.1
+  L1 Hit%                      45.8         45.4
+  Mem Stall%                    n/a          n/a
+  ──────────────────────────────────────────────────────────────────
+```
+
+The full 23-metric profile is saved in the JSON output and logged to MLflow as artifacts under `ncu_profiles/`. The JSON is designed for agent consumption -- an LLM can read it to identify bottlenecks and suggest optimizations.
+
+**Requirements:** NVIDIA Nsight Compute (`ncu`) must be on `PATH`. If missing, `--profile` prints a warning and falls back to timing-only. On some systems, NCU requires `sudo`.
+
 ---
 
 ## Reference
@@ -410,3 +445,7 @@ You can use pure PyTorch, Triton (`triton.jit`), inline CUDA (`torch.utils.cpp_e
 **Bench target not found**: Run `kb_nano kernels --list` to see available targets. Names match file names under `tasks/baseline/` (without `.py`).
 
 **Class name mismatch**: Your replacement class must have the exact same name as the baseline class (e.g. `RMSNorm`, not `MyRMSNorm`).
+
+**NCU not found**: Install NVIDIA Nsight Compute (part of the CUDA Toolkit). Ensure `ncu` is on your `PATH`.
+
+**NCU permission denied**: NCU may require elevated privileges. Run with `sudo` or configure NVIDIA permissions for your user.

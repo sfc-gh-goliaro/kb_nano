@@ -18,7 +18,7 @@ Tracking data is stored locally in `mlruns/` (gitignored). If `mlflow` is not in
 | Command | Logged data |
 |---------|-------------|
 | `kb_nano agent` | Run params, per-op generation success/failure, unit test results, e2e speedup, kernel source code |
-| `kb_nano kernels` | Bench params, per-operator per-scenario speedup/correctness, kernel source code |
+| `kb_nano kernels` | Bench params, per-operator per-scenario speedup/correctness, kernel source code, NCU profile JSON (when `--profile` is used) |
 | `kb_nano eval` | Per-model throughput/latency speedup, alignment rate, wall-clock time |
 | `kb_nano e2e` | Throughput (tokens/s), latency (percentiles), serve metrics (TTFT, TPOT, ITL) |
 
@@ -27,7 +27,7 @@ Each run is tagged with a `tier` to distinguish its source:
 | Tier tag | Source | Key metrics |
 |----------|--------|-------------|
 | `agent` | `kb_nano agent` | `gen_{op}_success`, `utest_{op}_success`, `e2e_speedup`, `e2e_token_match_rate` |
-| `kernel` | `kb_nano kernels` | `{op}_avg_speedup`, `{op}_passed`, `{op}_failed`, `avg_speedup` |
+| `kernel` | `kb_nano kernels` | `{op}_avg_speedup`, `{op}_passed`, `{op}_failed`, `avg_speedup` + NCU profile artifacts |
 | `eval` | `kb_nano eval` | `avg_throughput_speedup`, `avg_latency_speedup`, `alignment_rate` |
 | `e2e` | `kb_nano e2e` | `tokens_per_second`, `avg_latency`, `mean_ttft_ms` (varies by bench type) |
 
@@ -122,7 +122,7 @@ Click any run row to open its detail page:
 
 - **Parameters** — model, level, TP degree, LLM model, seed, and other run configuration
 - **Metrics** — per-operator generation success (`gen_rms_norm_success`), unit test results (`utest_rms_norm_success`, `utest_rms_norm_max_diff`), and end-to-end results (`e2e_speedup`, `e2e_token_match_rate`)
-- **Artifacts** — browse the `kernels/` folder to view and download the exact source code of every generated kernel; failed generations store error traces under `errors/`
+- **Artifacts** — browse the `kernels/` folder to view and download the exact source code of every generated kernel; failed generations store error traces under `errors/`. When `--profile` is used, NCU metrics are stored under `ncu_profiles/{operator}/{scenario}/baseline.json` and `candidate.json`
 
 ### Comparing Runs
 

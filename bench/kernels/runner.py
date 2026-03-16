@@ -17,7 +17,7 @@ import torch.nn as nn
 from kb_nano.bench.utils.input_registry import InputRegistry
 from kb_nano.infra.kernel_swapper import BenchTarget, discover_targets, get, load_candidate
 
-from .result import KernelBenchResult, OperatorResult, ScenarioResult
+from .result import KernelBenchResult, NcuProfileResult, OperatorResult, ScenarioResult
 
 _DEFAULT_REGISTRY = None
 
@@ -124,6 +124,8 @@ def run_kernel_benchmark(
     num_warmup: int = 10,
     num_runs: int = 100,
     device: str = "cuda",
+    profile: bool = False,
+    num_ncu_launches: int = 20,
 ) -> OperatorResult:
     """Run isolated kernel benchmark for a single operator.
 
@@ -147,6 +149,8 @@ def run_kernel_benchmark(
         num_warmup: Warmup iterations.
         num_runs: Timed iterations for median.
         device: Device for tensors.
+        profile: Run NCU profiling on baseline and candidate.
+        num_ncu_launches: Number of forward() calls NCU captures.
 
     Returns:
         OperatorResult with per-scenario correctness and speedup.
@@ -205,6 +209,33 @@ def run_kernel_benchmark(
             correct, mean_diff = _compare_outputs(baseline_out, candidate_out)
             speedup = baseline_ms / candidate_ms if candidate_ms > 0 else float("inf")
 
+            baseline_ncu = None
+            candidate_ncu = None
+            if profile:
+                try:
+                    from kb_nano import KB_ROOT
+                    from .ncu_profiler import profile_scenario as _profile_scenario
+
+                    candidate_file = str(
+                        KB_ROOT / "tasks" / "candidate" / f"L{target.level}" / f"{target_name}.py"
+                    )
+                    ncu_result = _profile_scenario(
+                        target_name=target_name,
+                        scenario=scenario,
+                        target=target,
+                        candidate_path=candidate_file,
+                        num_launches=num_ncu_launches,
+                    )
+                    if ncu_result is not None:
+                        baseline_ncu = NcuProfileResult(
+                            metrics_json=ncu_result["baseline_metrics"],
+                        )
+                        candidate_ncu = NcuProfileResult(
+                            metrics_json=ncu_result["candidate_metrics"],
+                        )
+                except Exception as e:
+                    print(f"  WARNING: NCU profiling failed for {scenario.name}: {e}")
+
             scenario_results.append(ScenarioResult(
                 name=scenario.name,
                 correct=correct,
@@ -212,6 +243,8 @@ def run_kernel_benchmark(
                 baseline_ms=baseline_ms,
                 candidate_ms=candidate_ms,
                 speedup=speedup,
+                baseline_ncu=baseline_ncu,
+                candidate_ncu=candidate_ncu,
             ))
 
         except Exception as e:
@@ -247,6 +280,8 @@ def run_all_kernel_benchmarks(
     num_warmup: int = 10,
     num_runs: int = 100,
     device: str = "cuda",
+    profile: bool = False,
+    num_ncu_launches: int = 20,
 ) -> KernelBenchResult:
     """Run kernel benchmarks for all operators that have candidate implementations.
 
@@ -272,6 +307,8 @@ def run_all_kernel_benchmarks(
             num_warmup=num_warmup,
             num_runs=num_runs,
             device=device,
+            profile=profile,
+            num_ncu_launches=num_ncu_launches,
         )
         operators.append(op_result)
 

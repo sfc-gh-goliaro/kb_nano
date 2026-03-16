@@ -115,6 +115,9 @@ Welcome to KB Nano, your launchpad for engineering the world's fastest GPU code.
     # Kernel-level: correctness + speedup for a single operator
     kb_nano kernels --target rms_norm
 
+    # With hardware profiling (NCU): understand *why* it's fast or slow
+    kb_nano kernels --target rms_norm --profile
+
     # E2E: throughput with your candidates swapped into the model
     kb_nano eval \
         --model meta-llama/Llama-3.1-8B-Instruct
