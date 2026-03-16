@@ -19,7 +19,7 @@ Used by:
   - bench/kernels/{runner,__main__}.py             (kernel-level benchmarking)
   - bench/e2e/{throughput,latency,serve}.py       (auto-detect all candidates)
   - infra/server.py                               (auto-detect all candidates)
-  - example/{agent,create_stubs}.py               (target introspection)
+  - agent/{agent,create_stubs}.py               (target introspection)
 """
 
 from __future__ import annotations
@@ -35,8 +35,10 @@ from pathlib import Path
 
 import torch.nn as nn
 
-_KB_ROOT = Path(__file__).resolve().parent.parent
-_CANDIDATE_DIR = _KB_ROOT / "tasks" / "candidate"
+from kb_nano import BASELINE_DIR, CANDIDATE_DIR, KB_ROOT
+
+_KB_ROOT = KB_ROOT
+_CANDIDATE_DIR = CANDIDATE_DIR
 
 _L4_MODEL_KEYS: dict[str, str] = {
     "llama": "llama31",

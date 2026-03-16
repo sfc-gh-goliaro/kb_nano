@@ -1,0 +1,26 @@
+[build-system]
+requires = ["setuptools>=64", "wheel"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "kb_nano"
+version = "0.1.0"
+description = "A CUDA kernel benchmarking library for LLM inference"
+readme = "README.md"
+requires-python = ">=3.10"
+dependencies = [
+    "torch>=2.0",
+    "numpy",
+    "pyyaml",
+    "transformers",
+    "tqdm",
+    "vllm==0.16.0",
+    "sgl-kernel",
+    "decord",
+]
+
+[project.scripts]
+kb_nano = "kb_nano.__main__:main"
+
+[tool.setuptools.package-dir]
+"kb_nano" = "."

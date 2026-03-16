@@ -26,7 +26,7 @@ import sys
 from .config import EvalConfig
 from .runner import run_eval
 
-_DEFAULT_OUTPUT = "bench/results/eval.json"
+from kb_nano import run_output_path
 
 
 def main():
@@ -68,9 +68,11 @@ def main():
     )
     parser.add_argument(
         "--output-json", type=str, default=None,
-        help=f"Path to save JSON results (default: {_DEFAULT_OUTPUT})",
+        help="Path to save JSON results (default: bench/results/eval_<timestamp>.json)",
     )
     args = parser.parse_args()
+
+    _default_output = str(run_output_path("eval"))
 
     config = EvalConfig(
         models=args.model,
@@ -79,14 +81,14 @@ def main():
         seed=args.seed,
         temperature=args.temperature,
         enforce_eager=args.enforce_eager,
-        output_json=args.output_json or _DEFAULT_OUTPUT,
+        output_json=args.output_json or _default_output,
         num_prompts=args.num_prompts,
     )
 
     report = asyncio.run(run_eval(config, gpu_pool=args.gpu_pool))
     report.print_table()
 
-    output_path = args.output_json or _DEFAULT_OUTPUT
+    output_path = args.output_json or _default_output
     report.save_json(output_path)
     print(f"\n  Results saved to: {output_path}")
 

@@ -34,7 +34,7 @@ from kb_nano.infra.kernel_swapper import (
 from .result import KernelBenchResult
 from .runner import run_all_kernel_benchmarks, run_kernel_benchmark
 
-_DEFAULT_OUTPUT = "bench/results/kernels.json"
+from kb_nano import run_output_path
 
 
 def main():
@@ -80,7 +80,7 @@ def main():
     )
     parser.add_argument(
         "--output-json", type=str, default=None,
-        help=f"Path to save JSON results (default: {_DEFAULT_OUTPUT})",
+        help="Path to save JSON results (default: bench/results/kernels_<timestamp>.json)",
     )
     args = parser.parse_args()
 
@@ -103,7 +103,7 @@ def main():
         print(f"\n{len(targets)} targets total.")
         return
 
-    output_path = args.output_json or _DEFAULT_OUTPUT
+    output_path = args.output_json or str(run_output_path("kernels"))
 
     if args.target is not None:
         op_result = run_kernel_benchmark(

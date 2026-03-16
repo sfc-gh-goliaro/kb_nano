@@ -30,7 +30,7 @@ class EvalConfig:
     seed: int = 42
     temperature: float = 0.0
     enforce_eager: bool = False
-    output_json: str = "bench/results/eval.json"
+    output_json: str = ""  # resolved at runtime by __main__.py
     num_prompts: int = 1000
 
     def get_model_category(self, model: str) -> str:

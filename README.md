@@ -57,7 +57,7 @@ A standalone, high-performance LLM inference engine supporting **Llama 3.1** and
 │   ├── kernels/                # Isolated kernel-level benchmarking
 │   ├── eval/                   # Multi-model evaluation sweep
 │   └── e2e/                    # End-to-end throughput/latency benchmarks
-├── example/                    # LLM-powered kernel generation agent
+├── agent/                      # LLM-powered kernel generation agent
 │   ├── agent.py               # CLI agent: generates kernels via Claude, benchmarks them
 │   └── llm_api.py             # Corvo LLM endpoint helper (async + sync)
 ├── engine.py                   # Batched inference engine with paged KV cache and TP
@@ -77,6 +77,22 @@ A standalone, high-performance LLM inference engine supporting **Llama 3.1** and
 git clone git@github.com:sfc-gh-goliaro/kb-nano.git
 cd kb-nano
 
+# Install
+pip install .
+
+# Now all commands work from any directory:
+kb_nano kernels --list
+kb_nano eval --help
+kb_nano e2e throughput --help
+
+# Or use python -m from any directory:
+python -m kb_nano kernels --list
+python -m kb_nano eval --help
+```
+
+### Benchmarking vs vLLM
+
+```bash
 # Throughput + latency + alignment benchmark vs vLLM
 python tests/bench_vllm.py --model meta-llama/Llama-3.1-8B-Instruct
 
@@ -102,13 +118,18 @@ The benchmark suite lets you evaluate custom kernel implementations at 4 abstrac
 
 ```bash
 # List all targets and which models use them
-python -m kb_nano.bench.kernels --map
+kb_nano kernels --map
 
 # List targets at a specific level
-python -m kb_nano.bench.kernels --list --level 1
+kb_nano kernels --list --level 1
 
 # Benchmark a candidate kernel from tasks/candidate/
-python -m kb_nano.bench.kernels --target rms_norm
+kb_nano kernels --target rms_norm
+
+# Results are auto-saved with timestamps:
+#   bench/results/kernels_20260313_143022.json
+# Override with --output-json:
+kb_nano kernels --target rms_norm --output-json my_results.json
 ```
 
 The model-to-operator mapping is derived automatically from the import graph — no manual annotations needed.
@@ -119,22 +140,22 @@ The agent uses Claude Opus 4.6 to automatically generate replacement kernels for
 
 ```bash
 # Generate all L1 kernels for Llama, benchmark them
-python -m kb_nano.example \
+kb_nano agent \
     --model meta-llama/Llama-3.1-8B-Instruct \
     --level 1
 
 # Force CUDA-only kernels (no Triton/PyTorch builtins)
-python -m kb_nano.example \
+kb_nano agent \
     --model meta-llama/Llama-3.1-8B-Instruct \
     --level 1 --cuda-only
 
 # Mixtral with tensor parallelism
-python -m kb_nano.example \
+kb_nano agent \
     --model mistralai/Mixtral-8x7B-Instruct-v0.1 \
     --level 2 --tp 4
 
 # Custom retry limit and LLM model
-python -m kb_nano.example \
+kb_nano agent \
     --model meta-llama/Llama-3.1-8B-Instruct \
     --level 1 --max-retries 3 --llm-model claude-opus-4-6
 ```

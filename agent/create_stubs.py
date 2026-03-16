@@ -6,10 +6,10 @@ forward signatures but delegates to the baseline implementation, giving the
 user a starting point for writing a custom kernel.
 
 Usage:
-    python -m kb_nano.example.create_stubs
-    python -m kb_nano.example.create_stubs --level 1
-    python -m kb_nano.example.create_stubs --architecture llama
-    python -m kb_nano.example.create_stubs --level 1 --architecture mixtral
+    python -m kb_nano.agent.create_stubs
+    python -m kb_nano.agent.create_stubs --level 1
+    python -m kb_nano.agent.create_stubs --architecture llama
+    python -m kb_nano.agent.create_stubs --level 1 --architecture mixtral
 """
 
 from __future__ import annotations
@@ -21,13 +21,14 @@ import sys
 import time
 from pathlib import Path
 
-_PROJECT_ROOT = str(Path(__file__).resolve().parent.parent.parent)
+from kb_nano import CANDIDATE_DIR, PREV_ATTEMPTS_DIR, PROJECT_ROOT
+
+_PROJECT_ROOT = str(PROJECT_ROOT)
 if _PROJECT_ROOT not in sys.path:
     sys.path.insert(0, _PROJECT_ROOT)
 
-_KB_ROOT = Path(__file__).resolve().parent.parent
-_CANDIDATE_DIR = _KB_ROOT / "tasks" / "candidate"
-_PREV_ATTEMPTS_DIR = _CANDIDATE_DIR / "prev-attempts"
+_CANDIDATE_DIR = CANDIDATE_DIR
+_PREV_ATTEMPTS_DIR = PREV_ATTEMPTS_DIR
 
 
 def _candidate_has_kernels() -> bool:
@@ -297,7 +298,7 @@ def main():
 
     print(f"\nDone. Stubs written to {_CANDIDATE_DIR}")
     print("Edit the forward() methods to add your custom implementations,")
-    print("then benchmark with: python -m kb_nano.bench.kernels --target <name>")
+    print("then benchmark with: kb_nano kernels --target <name>")
 
 
 if __name__ == "__main__":

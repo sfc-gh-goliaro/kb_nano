@@ -215,6 +215,6 @@ bench/results/
 bench/utils/golden_data/
 
 # Agent-generated kernels and build cache
-example/_cuda_build_cache/
+agent/_cuda_build_cache/
 tasks/candidate/L*/
 tasks/candidate/prev-attempts/
