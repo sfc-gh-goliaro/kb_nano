@@ -14,8 +14,10 @@ from typing import Any
 import torch
 import yaml
 
-_INPUTS_DIR = Path(__file__).resolve().parent / "inputs"
-_GOLDEN_DIR = Path(__file__).resolve().parent / "golden_data"
+from kb_nano.paths import GOLDEN_DIR, INPUTS_DIR
+
+_INPUTS_DIR = INPUTS_DIR
+_GOLDEN_DIR = GOLDEN_DIR
 
 _DTYPE_MAP: dict[str, torch.dtype] = {
     "float32": torch.float32,

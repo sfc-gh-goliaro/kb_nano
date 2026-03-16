@@ -18,7 +18,9 @@ from pathlib import Path
 
 import yaml
 
-_INPUTS_DIR = Path(__file__).resolve().parent / "inputs"
+from kb_nano.paths import INPUTS_DIR
+
+_INPUTS_DIR = INPUTS_DIR
 
 CANONICAL_M_VALUES = {
     "decode": [1, 8, 32, 128],

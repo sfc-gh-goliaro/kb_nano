@@ -210,10 +210,15 @@ def main(args: argparse.Namespace):
     }
 
     if args.output_json:
-        os.makedirs(os.path.dirname(args.output_json) or ".", exist_ok=True)
-        with open(args.output_json, "w") as f:
-            json.dump(results, f, indent=2)
-        print(f"\n  Results saved to: {args.output_json}")
+        output_json = args.output_json
+    else:
+        from kb_nano.paths import run_output_path
+        output_json = str(run_output_path("latency"))
+
+    os.makedirs(os.path.dirname(output_json) or ".", exist_ok=True)
+    with open(output_json, "w") as f:
+        json.dump(results, f, indent=2)
+    print(f"\n  Results saved to: {output_json}")
 
     if args.save_outputs and last_outputs is not None:
         output_data = {

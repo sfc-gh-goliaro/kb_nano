@@ -21,13 +21,14 @@ import sys
 import time
 from pathlib import Path
 
-_PROJECT_ROOT = str(Path(__file__).resolve().parent.parent.parent)
+from kb_nano.paths import CANDIDATE_DIR, PREV_ATTEMPTS_DIR, PROJECT_ROOT
+
+_PROJECT_ROOT = str(PROJECT_ROOT)
 if _PROJECT_ROOT not in sys.path:
     sys.path.insert(0, _PROJECT_ROOT)
 
-_KB_ROOT = Path(__file__).resolve().parent.parent
-_CANDIDATE_DIR = _KB_ROOT / "tasks" / "candidate"
-_PREV_ATTEMPTS_DIR = _CANDIDATE_DIR / "prev-attempts"
+_CANDIDATE_DIR = CANDIDATE_DIR
+_PREV_ATTEMPTS_DIR = PREV_ATTEMPTS_DIR
 
 
 def _candidate_has_kernels() -> bool:

@@ -37,16 +37,18 @@ from concurrent.futures import ThreadPoolExecutor
 from dataclasses import dataclass
 from pathlib import Path
 
-_PROJECT_ROOT = str(Path(__file__).resolve().parent.parent.parent)
+from kb_nano.paths import CANDIDATE_DIR, CUDA_BUILD_CACHE, KB_ROOT, PREV_ATTEMPTS_DIR, PROJECT_ROOT
+
+_PROJECT_ROOT = str(PROJECT_ROOT)
 if _PROJECT_ROOT not in sys.path:
     sys.path.insert(0, _PROJECT_ROOT)
 
 from kb_nano.example.llm_api import call_llm_async
 
-_KB_ROOT = Path(__file__).resolve().parent.parent
-_CANDIDATE_DIR = _KB_ROOT / "tasks" / "candidate"
-_PREV_ATTEMPTS_DIR = _CANDIDATE_DIR / "prev-attempts"
-_CUDA_BUILD_CACHE = Path(__file__).resolve().parent / "_cuda_build_cache"
+_KB_ROOT = KB_ROOT
+_CANDIDATE_DIR = CANDIDATE_DIR
+_PREV_ATTEMPTS_DIR = PREV_ATTEMPTS_DIR
+_CUDA_BUILD_CACHE = CUDA_BUILD_CACHE
 
 
 # ---------------------------------------------------------------------------
@@ -96,7 +98,7 @@ def discover_operators(model_name: str, level: int) -> list[OperatorSpec]:
     model_key = _detect_model_key(model_name)
     targets = discover_targets()
 
-    kb_root = Path(__file__).resolve().parent.parent
+    kb_root = KB_ROOT
 
     ops = []
     for t in targets:
@@ -398,8 +400,8 @@ def run_unit_test(kernel: GeneratedKernel, op: OperatorSpec) -> dict:
     Returns a dict with 'success', 'close', 'max_diff', etc.
     Runs in a subprocess to isolate CUDA state.
     """
-    pkg_dir = Path(__file__).resolve().parent.parent
-    project_root = str(pkg_dir.parent)
+    pkg_dir = KB_ROOT
+    project_root = str(PROJECT_ROOT)
     package_name = pkg_dir.name
 
     tmp_dir = tempfile.mkdtemp(prefix="kb_utest_")
@@ -762,8 +764,8 @@ def run_benchmark(
 
     output_file = os.path.join(tmp_dir, "_results.json")
 
-    pkg_dir = Path(__file__).resolve().parent.parent
-    project_root = str(pkg_dir.parent)
+    pkg_dir = KB_ROOT
+    project_root = str(PROJECT_ROOT)
     package_name = pkg_dir.name
 
     config = {

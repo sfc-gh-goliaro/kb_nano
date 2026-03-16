@@ -38,8 +38,9 @@ def _run_subprocess(
     max_seq_len: int,
 ) -> dict | None:
     """Run a single E2E subprocess (baseline or candidate)."""
-    kb_root = str(Path(__file__).resolve().parent.parent.parent.parent)
-    package_name = Path(__file__).resolve().parent.parent.parent.name
+    from kb_nano.paths import KB_ROOT, PROJECT_ROOT
+    kb_root = str(PROJECT_ROOT)
+    package_name = KB_ROOT.name
 
     label_suffix = "baseline" if no_candidate_kernels else "candidate"
     config = {

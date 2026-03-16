@@ -26,7 +26,9 @@ from pathlib import Path
 
 import torch
 
-_GOLDEN_DIR = Path(__file__).resolve().parent / "golden_data"
+from kb_nano.paths import GOLDEN_DIR
+
+_GOLDEN_DIR = GOLDEN_DIR
 
 DATA_DEPENDENT_OPS = [
     "moe_align",

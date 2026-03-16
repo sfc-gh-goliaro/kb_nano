@@ -35,8 +35,10 @@ from pathlib import Path
 
 import torch.nn as nn
 
-_KB_ROOT = Path(__file__).resolve().parent.parent
-_CANDIDATE_DIR = _KB_ROOT / "tasks" / "candidate"
+from kb_nano.paths import BASELINE_DIR, CANDIDATE_DIR, KB_ROOT
+
+_KB_ROOT = KB_ROOT
+_CANDIDATE_DIR = CANDIDATE_DIR
 
 _L4_MODEL_KEYS: dict[str, str] = {
     "llama": "llama31",
