@@ -107,15 +107,15 @@ The agent uses Claude to generate replacement kernels, validate them, and benchm
 
 ```bash
 # Generate all L1 kernels for Llama
-python -m kb_nano.example \
+python -m kb_nano.agent \
     --model meta-llama/Llama-3.1-8B-Instruct --level 1
 
 # CUDA-only kernels (no Triton/PyTorch builtins)
-python -m kb_nano.example \
+python -m kb_nano.agent \
     --model meta-llama/Llama-3.1-8B-Instruct --level 1 --cuda-only
 
 # Mixtral L2 operators with TP
-python -m kb_nano.example \
+python -m kb_nano.agent \
     --model mistralai/Mixtral-8x7B-Instruct-v0.1 --level 2 --tp 4
 ```
 

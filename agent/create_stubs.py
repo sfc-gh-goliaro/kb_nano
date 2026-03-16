@@ -6,10 +6,10 @@ forward signatures but delegates to the baseline implementation, giving the
 user a starting point for writing a custom kernel.
 
 Usage:
-    python -m kb_nano.example.create_stubs
-    python -m kb_nano.example.create_stubs --level 1
-    python -m kb_nano.example.create_stubs --architecture llama
-    python -m kb_nano.example.create_stubs --level 1 --architecture mixtral
+    python -m kb_nano.agent.create_stubs
+    python -m kb_nano.agent.create_stubs --level 1
+    python -m kb_nano.agent.create_stubs --architecture llama
+    python -m kb_nano.agent.create_stubs --level 1 --architecture mixtral
 """
 
 from __future__ import annotations

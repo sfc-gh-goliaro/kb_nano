@@ -5,7 +5,7 @@ Dispatches to the appropriate subcommand:
     kb_nano kernels [args...]
     kb_nano eval [args...]
     kb_nano e2e throughput|latency|serve [args...]
-    kb_nano example [args...]
+    kb_nano agent [args...]
     kb_nano generate-inputs [args...]
     kb_nano capture-golden [args...]
     kb_nano create-stubs [args...]
@@ -34,8 +34,8 @@ def main():
     elif command == "e2e":
         from kb_nano.bench.e2e.__main__ import main as e2e_main
         e2e_main()
-    elif command == "example":
-        from kb_nano.example.agent import main as agent_main
+    elif command == "agent":
+        from kb_nano.agent.agent import main as agent_main
         agent_main()
     elif command == "generate-inputs":
         from kb_nano.bench.utils.generate_inputs import main as gen_main
@@ -44,7 +44,7 @@ def main():
         from kb_nano.bench.utils.capture_golden import main as cap_main
         cap_main()
     elif command == "create-stubs":
-        from kb_nano.example.create_stubs import main as stubs_main
+        from kb_nano.agent.create_stubs import main as stubs_main
         stubs_main()
     elif command in ("-h", "--help", "help"):
         _print_usage()
@@ -61,7 +61,7 @@ def _print_usage():
     print("  kernels          Isolated kernel-level benchmarks")
     print("  eval             Multi-model evaluation sweep")
     print("  e2e              End-to-end benchmarks (throughput, latency, serve)")
-    print("  example          LLM-powered kernel generation agent")
+    print("  agent            LLM-powered kernel generation agent")
     print("  create-stubs     Create skeleton replacement modules")
     print("  generate-inputs  Generate YAML input manifests")
     print("  capture-golden   Capture golden tensor data for data-dependent ops")

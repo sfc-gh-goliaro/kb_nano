@@ -57,7 +57,7 @@ A standalone, high-performance LLM inference engine supporting **Llama 3.1** and
 │   ├── kernels/                # Isolated kernel-level benchmarking
 │   ├── eval/                   # Multi-model evaluation sweep
 │   └── e2e/                    # End-to-end throughput/latency benchmarks
-├── example/                    # LLM-powered kernel generation agent
+├── agent/                      # LLM-powered kernel generation agent
 │   ├── agent.py               # CLI agent: generates kernels via Claude, benchmarks them
 │   └── llm_api.py             # Corvo LLM endpoint helper (async + sync)
 ├── engine.py                   # Batched inference engine with paged KV cache and TP
@@ -140,22 +140,22 @@ The agent uses Claude Opus 4.6 to automatically generate replacement kernels for
 
 ```bash
 # Generate all L1 kernels for Llama, benchmark them
-kb_nano example \
+kb_nano agent \
     --model meta-llama/Llama-3.1-8B-Instruct \
     --level 1
 
 # Force CUDA-only kernels (no Triton/PyTorch builtins)
-kb_nano example \
+kb_nano agent \
     --model meta-llama/Llama-3.1-8B-Instruct \
     --level 1 --cuda-only
 
 # Mixtral with tensor parallelism
-kb_nano example \
+kb_nano agent \
     --model mistralai/Mixtral-8x7B-Instruct-v0.1 \
     --level 2 --tp 4
 
 # Custom retry limit and LLM model
-kb_nano example \
+kb_nano agent \
     --model meta-llama/Llama-3.1-8B-Instruct \
     --level 1 --max-retries 3 --llm-model claude-opus-4-6
 ```

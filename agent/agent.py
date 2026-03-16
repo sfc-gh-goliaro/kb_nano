@@ -6,15 +6,15 @@ replacement kernels for kb_nano operators, then benchmarks them using
 the kb_nano.bench suite.
 
 Usage:
-    python -m kb_nano.example.agent \
+    python -m kb_nano.agent.agent \
         --model meta-llama/Llama-3.1-8B-Instruct \
         --level 1
 
-    python -m kb_nano.example.agent \
+    python -m kb_nano.agent.agent \
         --model meta-llama/Llama-3.1-8B-Instruct \
         --level 1 --cuda-only --max-retries 3
 
-    python -m kb_nano.example.agent \
+    python -m kb_nano.agent.agent \
         --model mistralai/Mixtral-8x7B-Instruct-v0.1 \
         --level 2 --tp 4
 """
@@ -43,7 +43,7 @@ _PROJECT_ROOT = str(PROJECT_ROOT)
 if _PROJECT_ROOT not in sys.path:
     sys.path.insert(0, _PROJECT_ROOT)
 
-from kb_nano.example.llm_api import call_llm_async
+from kb_nano.agent.llm_api import call_llm_async
 
 _KB_ROOT = KB_ROOT
 _CANDIDATE_DIR = CANDIDATE_DIR

@@ -19,7 +19,7 @@ Used by:
   - bench/kernels/{runner,__main__}.py             (kernel-level benchmarking)
   - bench/e2e/{throughput,latency,serve}.py       (auto-detect all candidates)
   - infra/server.py                               (auto-detect all candidates)
-  - example/{agent,create_stubs}.py               (target introspection)
+  - agent/{agent,create_stubs}.py               (target introspection)
 """
 
 from __future__ import annotations

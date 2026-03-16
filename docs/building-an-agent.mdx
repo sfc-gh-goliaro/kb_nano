@@ -3,7 +3,7 @@ title: Building an Agent
 description: Use an LLM to automatically generate and benchmark replacement kernels.
 ---
 
-kb-nano includes an example agent that uses an LLM to generate replacement kernels, validate them, and benchmark them end-to-end — all in a single run. You can use it as-is or as a starting point for building your own agent.
+kb-nano includes an agent that uses an LLM to generate replacement kernels, validate them, and benchmark them end-to-end — all in a single run. You can use it as-is or as a starting point for building your own agent.
 
 ## How the Agent Works
 
@@ -14,19 +14,19 @@ The agent follows a four-stage pipeline:
 3. **Validate** — Each generated kernel is compiled and checked: does the class name match? Does `__init__` succeed? If validation fails, the error is fed back to the LLM for retry (up to `--max-retries` attempts).
 4. **Benchmark** — All successful kernels are patched into the model and benchmarked end-to-end, measuring token match rate and wall-clock speedup. If a kernel causes a runtime failure, the agent identifies it, re-generates it, and re-runs the benchmark.
 
-## Running the Example Agent
+## Running the Agent
 
 ```bash
 # Generate all L1 kernels for Llama
-python -m kb_nano.example \
+python -m kb_nano.agent \
     --model meta-llama/Llama-3.1-8B-Instruct --level 1
 
 # CUDA-only kernels (no Triton/PyTorch builtins)
-python -m kb_nano.example \
+python -m kb_nano.agent \
     --model meta-llama/Llama-3.1-8B-Instruct --level 1 --cuda-only
 
 # Mixtral L2 operators with TP
-python -m kb_nano.example \
+python -m kb_nano.agent \
     --model mistralai/Mixtral-8x7B-Instruct-v0.1 --level 2 --tp 4
 ```
 
@@ -48,12 +48,12 @@ Generated kernels are saved to `tasks/candidate/L{level}/{op_name}.py`.
 
 ## Building Your Own Agent
 
-The example agent in `example/agent.py` is structured around a few composable pieces you can reuse or replace:
+The agent in `agent/agent.py` is structured around a few composable pieces you can reuse or replace:
 
 ### Operator Discovery
 
 ```python
-from kb_nano.example.agent import discover_operators
+from kb_nano.agent.agent import discover_operators
 
 ops = discover_operators("meta-llama/Llama-3.1-8B-Instruct", level=1)
 for op in ops:

@@ -42,7 +42,7 @@ RESULTS_DIR = Path(
 )
 
 # --- Agent build cache ---
-CUDA_BUILD_CACHE = KB_ROOT / "example" / "_cuda_build_cache"
+CUDA_BUILD_CACHE = KB_ROOT / "agent" / "_cuda_build_cache"
 
 
 def run_output_path(tool: str, ext: str = "json") -> Path:
