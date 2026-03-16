@@ -570,21 +570,25 @@ def main():
             elapsed = time.perf_counter() - start
             total_input_tokens = sum(len(p) for p in prompts)
         else:
+            # Load dataset samples (not timed — matches vLLM which also
+            # loads the dataset outside the timed block).
             samples = _load_mm_samples(
                 scenario["dataset"], scenario["dataset_split"],
                 scenario["num_seqs"], cfg["seed"],
             )
-            preprocessed = _preprocess_samples(engine, samples, use_tqdm=True)
             sp = SamplingParams(temperature=temperature, top_p=top_p,
                                 max_tokens=scenario["output_len"],
                                 ignore_eos=True)
-            total_input_tokens = sum(len(pp["token_ids"]) for pp in preprocessed)
+            # Preprocess + generate inside the timed block to match
+            # vLLM's llm.chat() which includes preprocessing.
             engine.block_manager.reset()
             torch.cuda.synchronize()
             start = time.perf_counter()
+            preprocessed = _preprocess_samples(engine, samples, use_tqdm=True)
             outputs = engine.generate(preprocessed, sp, use_tqdm=True)
             torch.cuda.synchronize()
             elapsed = time.perf_counter() - start
+            total_input_tokens = sum(len(pp["token_ids"]) for pp in preprocessed)
 
         total_output_tokens = sum(len(o.token_ids) for o in outputs)
 
@@ -615,17 +619,20 @@ def main():
                 engine.generate(prompts, sp)
                 torch.cuda.synchronize()
         else:
+            # For latency, load the sample once (vLLM also loads once),
+            # but preprocess inside each timed iteration to match
+            # vLLM's llm.chat() which re-processes each call.
             samples = _load_mm_samples(
                 ls["dataset"], ls["dataset_split"], 1, cfg["seed"],
             )
-            preprocessed = _preprocess_samples(engine, samples)
-            pp_item = preprocessed[0]
+            sample_prompt = samples[0].prompt
             sp = SamplingParams(temperature=0.0, ignore_eos=True,
                                 max_tokens=ls["output_len"])
-            def run_fn(pp_item=pp_item):
+            def run_fn(sample_prompt=sample_prompt):
+                pp = engine.preprocess_chat(sample_prompt)
                 engine.block_manager.reset()
                 torch.cuda.synchronize()
-                engine.generate([pp_item], sp)
+                engine.generate([pp], sp)
                 torch.cuda.synchronize()
 
         num_warmup = ls.get("num_warmup", 3)

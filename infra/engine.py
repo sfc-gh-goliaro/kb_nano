@@ -279,6 +279,8 @@ class ModelRunner:
             model_name, torch.device(f"cuda:{rank}"), dtype,
         )
         self.is_qwen_vl = hasattr(self.config, "mrope_section")
+        if self.is_qwen_vl and hasattr(self.model, 'visual') and not enforce_eager:
+            self.model.visual._compile_blocks()
         self._share_trtllm_workspace()
         self._share_activation_buffers()
         self.warmup_model()
@@ -401,6 +403,14 @@ class ModelRunner:
         ]
         if len(fused_experts) > 1:
             FusedExperts._use_shared_cache = True
+
+        # Share FP8 quantization buffers across layers (safe since sequential)
+        from ..tasks.baseline.L1.fp8_quant import PerTokenGroupQuantFP8
+        fp8_quants = [
+            m for m in self.model.modules() if isinstance(m, PerTokenGroupQuantFP8)
+        ]
+        if len(fp8_quants) > 1:
+            PerTokenGroupQuantFP8._use_shared = True
 
     def warmup_model(self):
         torch.cuda.empty_cache()
@@ -1324,6 +1334,11 @@ class LlamaEngine:
             image_offsets=image_offsets if image_offsets else None,
             video_offsets=video_offsets if video_offsets else None,
         )
+        # Pre-transfer pixel values to GPU to overlap with CPU preprocessing
+        if pixel_values is not None:
+            pixel_values = pixel_values.to("cuda", non_blocking=True)
+        if video_pv is not None:
+            video_pv = video_pv.to("cuda", non_blocking=True)
         return {
             "token_ids": ids,
             "pixel_values": pixel_values,
@@ -1458,6 +1473,11 @@ class LlamaEngine:
             image_offsets=image_offsets if image_offsets else None,
             video_offsets=video_offsets if video_offsets else None,
         )
+        # Pre-transfer pixel values to GPU to overlap with CPU preprocessing
+        if pixel_values is not None:
+            pixel_values = pixel_values.to("cuda", non_blocking=True)
+        if video_pv is not None:
+            video_pv = video_pv.to("cuda", non_blocking=True)
         return {
             "token_ids": ids,
             "pixel_values": pixel_values,
@@ -1842,11 +1862,11 @@ class LlamaEngine:
                         mr._write_decode_shm(*decode_data)
                         mr.shm.buf[mr._SHM_FLAG_OFFSET] = 1
                         mr._signal_workers()
-                    gpu_result = mr.run_decode_greedy_fast(decode_data)
+                    has_result, n_async = mr.run_decode_greedy_fast_async(decode_data)
                     if _PROFILE:
                         _fp_t2 = time.perf_counter()
-                    if gpu_result is not None:
-                        token_ids = gpu_result.tolist()
+                    if has_result:
+                        token_ids = mr._wait_async_tokens(n_async)
                         if _PROFILE:
                             _fp_t3 = time.perf_counter()
                         any_finished = False
@@ -1875,7 +1895,9 @@ class LlamaEngine:
                             _fp['n'] += 1
 
                         # --- Inner decode loop: stay in fast path ---
-                        # Avoid re-entering the outer while loop overhead
+                        # Avoid re-entering the outer while loop overhead.
+                        # Uses async D2H pipelining: start async copy of
+                        # current results while launching next GPU step.
                         use_incr = True
                         while running and not waiting and not prefilling:
                             if any_finished:
@@ -1911,11 +1933,11 @@ class LlamaEngine:
                                 mr._write_decode_shm(*decode_data)
                                 mr.shm.buf[mr._SHM_FLAG_OFFSET] = 1
                                 mr._signal_workers()
-                            gpu_result = mr.run_decode_greedy_fast(decode_data)
+                            has_result, n_async = mr.run_decode_greedy_fast_async(decode_data)
                             if _PROFILE:
                                 _fp_t2 = time.perf_counter()
-                            if gpu_result is not None:
-                                token_ids = gpu_result.tolist()
+                            if has_result:
+                                token_ids = mr._wait_async_tokens(n_async)
                                 if _PROFILE:
                                     _fp_t3 = time.perf_counter()
                                 for seq, tid in zip(decode_seqs, token_ids):

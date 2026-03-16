@@ -13,13 +13,23 @@ _FP8_DTYPE = torch.float8_e4m3fn
 _FP8_MAX = torch.finfo(_FP8_DTYPE).max  # 448.0
 _FP8_MIN = -_FP8_MAX
 
-_HAS_VLLM_CUDA_QUANT = False
+_HAS_SGL_QUANT = False
 try:
-    from vllm import _custom_ops  # noqa: F401
-    _HAS_VLLM_CUDA_QUANT = (hasattr(torch.ops, "_C")
-                             and hasattr(torch.ops._C, "per_token_group_fp8_quant"))
-except ImportError:
+    from sgl_kernel import sgl_per_token_group_quant_fp8 as _sgl_quant
+    # Verify it works (some versions need sglang installed)
+    _sgl_quant.__module__  # basic smoke check
+    _HAS_SGL_QUANT = True
+except (ImportError, AttributeError):
     pass
+
+_HAS_VLLM_CUDA_QUANT = False
+if not _HAS_SGL_QUANT:
+    try:
+        from vllm import _custom_ops  # noqa: F401
+        _HAS_VLLM_CUDA_QUANT = (hasattr(torch.ops, "_C")
+                                 and hasattr(torch.ops._C, "per_token_group_fp8_quant"))
+    except ImportError:
+        pass
 
 
 @triton.jit
@@ -74,11 +84,37 @@ class PerTokenGroupQuantFP8(nn.Module):
         x_s: [*, K // group_size] in float32
     """
 
+    _shared_q_buf: torch.Tensor | None = None
+    _shared_s_buf: torch.Tensor | None = None
+    _use_shared = False
+
     def __init__(self, group_size: int = 128):
         super().__init__()
         self.group_size = group_size
         self._q_buf = None
         self._s_buf = None
+
+    @property
+    def _q(self):
+        return PerTokenGroupQuantFP8._shared_q_buf if PerTokenGroupQuantFP8._use_shared else self._q_buf
+
+    @_q.setter
+    def _q(self, val):
+        if PerTokenGroupQuantFP8._use_shared:
+            PerTokenGroupQuantFP8._shared_q_buf = val
+        else:
+            self._q_buf = val
+
+    @property
+    def _s(self):
+        return PerTokenGroupQuantFP8._shared_s_buf if PerTokenGroupQuantFP8._use_shared else self._s_buf
+
+    @_s.setter
+    def _s(self, val):
+        if PerTokenGroupQuantFP8._use_shared:
+            PerTokenGroupQuantFP8._shared_s_buf = val
+        else:
+            self._s_buf = val
 
     def forward(self, x: torch.Tensor) -> tuple[torch.Tensor, torch.Tensor]:
         assert x.shape[-1] % self.group_size == 0
@@ -91,13 +127,22 @@ class PerTokenGroupQuantFP8(nn.Module):
         for d in s_shape:
             s_n *= d
 
-        if self._q_buf is None or self._q_buf.numel() < n:
-            self._q_buf = torch.empty(n, device=x.device, dtype=_FP8_DTYPE)
-        if self._s_buf is None or self._s_buf.numel() < s_n:
-            self._s_buf = torch.empty(s_n, device=x.device, dtype=torch.float32)
+        q_buf = self._q
+        s_buf = self._s
+        if q_buf is None or q_buf.numel() < n:
+            q_buf = torch.empty(n, device=x.device, dtype=_FP8_DTYPE)
+            self._q = q_buf
+        if s_buf is None or s_buf.numel() < s_n:
+            s_buf = torch.empty(s_n, device=x.device, dtype=torch.float32)
+            self._s = s_buf
 
-        x_q = self._q_buf[:n].view(q_shape)
-        x_s = self._s_buf[:s_n].view(s_shape)
+        x_q = q_buf[:n].view(q_shape)
+        x_s = s_buf[:s_n].view(s_shape)
+
+        if _HAS_SGL_QUANT:
+            _sgl_quant(x, x_q, x_s, self.group_size, 1e-10,
+                       _FP8_MIN, _FP8_MAX)
+            return x_q, x_s
 
         if _HAS_VLLM_CUDA_QUANT:
             torch.ops._C.per_token_group_fp8_quant(

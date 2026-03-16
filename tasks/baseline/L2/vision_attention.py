@@ -36,6 +36,7 @@ class VisionAttention(nn.Module):
             embed_dim, self.head_dim, num_heads, num_heads, bias=True,
         )
         self.proj = RowParallelLinear(projection_size, embed_dim, bias=True)
+        self._scale = self.head_dim ** -0.5
 
     def forward(
         self, x: torch.Tensor,
@@ -53,10 +54,11 @@ class VisionAttention(nn.Module):
         k = k.view(seq_len, batch_size, self.num_heads, self.head_dim)
         v = v.view(seq_len, batch_size, self.num_heads, self.head_dim)
 
-        # Transpose to (batch, seq, heads, dim)
+        # batch_size is always 1 for vision encoder. Work directly with
+        # (batch=1, seq, heads, dim) layout for apply_rotary, then flatten.
         q = q.transpose(0, 1).contiguous()
         k = k.transpose(0, 1).contiguous()
-        v = v.transpose(0, 1).contiguous()
+        v = v.transpose(0, 1)
 
         if rotary_pos_emb_cos is not None and rotary_pos_emb_sin is not None:
             qk = torch.cat([q, k], dim=0)
@@ -64,12 +66,10 @@ class VisionAttention(nn.Module):
             q, k = qk.chunk(2, dim=0)
 
         # Flatten batch dim for varlen
-        q = q.reshape(-1, self.num_heads, self.head_dim)
-        k = k.reshape(-1, self.num_heads, self.head_dim)
-        v = v.reshape(-1, self.num_heads, self.head_dim)
-
-        if max_seqlen is None:
-            max_seqlen = (cu_seqlens[1:] - cu_seqlens[:-1]).max().item()
+        total = seq_len * batch_size
+        q = q.reshape(total, self.num_heads, self.head_dim)
+        k = k.reshape(total, self.num_heads, self.head_dim)
+        v = v.reshape(total, self.num_heads, self.head_dim)
 
         out = flash_attn_varlen_func(
             q, k, v,
@@ -77,7 +77,7 @@ class VisionAttention(nn.Module):
             cu_seqlens_k=cu_seqlens,
             max_seqlen_q=max_seqlen,
             max_seqlen_k=max_seqlen,
-            softmax_scale=self.head_dim ** -0.5,
+            softmax_scale=self._scale,
             causal=False,
         )
 

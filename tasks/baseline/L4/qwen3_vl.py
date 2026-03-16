@@ -169,6 +169,25 @@ class Qwen3VisionTransformer(nn.Module):
             )
             for _ in range(len(self.deepstack_visual_indexes))
         ])
+        self._compiled = False
+
+    def _compile_blocks(self):
+        """Compile vision MLP and mergers with torch.compile for better fusion."""
+        if self._compiled:
+            return
+        self._compiled = True
+        try:
+            for blk in self.blocks:
+                blk.mlp = torch.compile(blk.mlp, mode="max-autotune-no-cudagraphs",
+                                        dynamic=True)
+            self.merger = torch.compile(self.merger, mode="max-autotune-no-cudagraphs",
+                                        dynamic=True)
+            for i, m in enumerate(self.deepstack_merger_list):
+                self.deepstack_merger_list[i] = torch.compile(
+                    m, mode="max-autotune-no-cudagraphs", dynamic=True,
+                )
+        except Exception:
+            pass  # Graceful fallback if compile fails
 
     def forward(self, x: torch.Tensor, grid_thw: torch.Tensor | list):
         device = self.patch_embed.proj.weight.device
@@ -190,12 +209,14 @@ class Qwen3VisionTransformer(nn.Module):
             grid_thw_list, self.spatial_merge_size, dtype, device,
         )
 
-        cu_seqlens = np.repeat(
+        seqlens = np.repeat(
             grid_thw_np[:, 1] * grid_thw_np[:, 2], grid_thw_np[:, 0]
-        ).cumsum(axis=0, dtype=np.int32)
-        cu_seqlens = np.concatenate([np.zeros(1, dtype=np.int32), cu_seqlens])
+        )
+        max_seqlen = int(seqlens.max())
+        cu_seqlens = np.concatenate([
+            np.zeros(1, dtype=np.int32), seqlens.cumsum(dtype=np.int32),
+        ])
         cu_seqlens = torch.from_numpy(cu_seqlens).to(device)
-        max_seqlen = int((cu_seqlens[1:] - cu_seqlens[:-1]).max().item())
 
         hidden_states = hidden_states.unsqueeze(1)
         deepstack_features = []

@@ -32,17 +32,22 @@ class VisionRotaryEmbedding(nn.Module):
         device: torch.device,
     ) -> tuple[torch.Tensor, torch.Tensor]:
         sms = spatial_merge_size
-        pos_ids = []
+        pos_parts = []
         max_grid_size = 0
         for t, h, w in grid_thw_list:
-            hpos = np.broadcast_to(np.arange(h).reshape(h, 1), (h, w))
-            wpos = np.broadcast_to(np.arange(w).reshape(1, w), (h, w))
-            hpos = hpos.reshape(h // sms, sms, w // sms, sms).transpose(0, 2, 1, 3).flatten()
-            wpos = wpos.reshape(h // sms, sms, w // sms, sms).transpose(0, 2, 1, 3).flatten()
+            hpos = np.arange(h, dtype=np.int32).reshape(h, 1).repeat(w, axis=1)
+            wpos = np.arange(w, dtype=np.int32).reshape(1, w).repeat(h, axis=0)
+            hpos = hpos.reshape(h // sms, sms, w // sms, sms).transpose(0, 2, 1, 3).reshape(-1)
+            wpos = wpos.reshape(h // sms, sms, w // sms, sms).transpose(0, 2, 1, 3).reshape(-1)
             hw = np.stack([hpos, wpos], axis=-1)
-            pos_ids.append(np.tile(hw, (t, 1)) if t > 1 else hw)
-            max_grid_size = max(max_grid_size, h, w)
-        pos_ids = torch.from_numpy(np.concatenate(pos_ids, axis=0)).to(device)
+            if t > 1:
+                hw = np.tile(hw, (t, 1))
+            pos_parts.append(hw)
+            if h > max_grid_size:
+                max_grid_size = h
+            if w > max_grid_size:
+                max_grid_size = w
+        pos_ids = torch.from_numpy(np.concatenate(pos_parts, axis=0)).to(device)
 
         cache = self.cos_sin_cache[:max_grid_size].to(dtype=dtype)
         cos, sin = cache.chunk(2, dim=-1)

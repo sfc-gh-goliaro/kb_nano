@@ -1,8 +1,9 @@
-"""Block-scaled FP8 GEMM: DeepGEMM (preferred) with Triton fallback.
+"""Block-scaled FP8 GEMM: DeepGEMM for large batches, Triton for small batches.
 
 Computes C = A @ B^T where A and B are in float8_e4m3fn with per-block
-scale factors. Uses DeepGEMM on Blackwell/Hopper GPUs for maximum
-throughput, falling back to a Triton kernel otherwise.
+scale factors. Uses DeepGEMM on Blackwell/Hopper GPUs for large M
+(prefill), Triton for small M (decode) where DeepGEMM has too much
+overhead, falling back to Triton always when DeepGEMM is unavailable.
 """
 
 import torch
@@ -109,13 +110,12 @@ class W8A8BlockScaledMM(nn.Module):
         M = A.numel() // A.shape[-1]
         N, K = B.shape
 
-        if _HAS_DEEP_GEMM and output_dtype == torch.bfloat16 and N % 64 == 0 and K % 128 == 0:
+        if _HAS_DEEP_GEMM and output_dtype == torch.bfloat16 and N % 64 == 0 and K % 128 == 0 and M >= 256:
             C = torch.empty((M, N), dtype=output_dtype, device=A.device)
             _deep_gemm.fp8_gemm_nt(
                 (A.view(M, K), As.view(M, -1)),
                 (B, Bs),
                 C,
-                disable_ue8m0_cast=True,
             )
             return C
 
