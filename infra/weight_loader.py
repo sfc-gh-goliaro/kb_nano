@@ -331,6 +331,68 @@ def _detect_model_type(model_name: str) -> str:
     return model_type
 
 
+def _requant_fp8_e8m0_2d(w: torch.Tensor, s: torch.Tensor,
+                          block_m: int, block_k: int):
+    """Re-quantize a single 2D FP8 weight tensor with E8M0 scales in-place."""
+    _FP8_DTYPE = torch.float8_e4m3fn
+    fp8_max = torch.finfo(_FP8_DTYPE).max
+
+    M, K = w.shape
+    s_exp = torch.repeat_interleave(
+        torch.repeat_interleave(s, block_m, dim=0), block_k, dim=1
+    )[:M, :K]
+    w_dq = w.to(torch.float32) * s_exp
+
+    pad_m = (block_m - M % block_m) % block_m
+    pad_k = (block_k - K % block_k) % block_k
+    if pad_m > 0 or pad_k > 0:
+        w_dq = torch.nn.functional.pad(w_dq, (0, pad_k, 0, pad_m))
+
+    Mpad, Kpad = w_dq.shape
+    w_view = w_dq.view(Mpad // block_m, block_m, Kpad // block_k, block_k)
+    w_amax = w_view.abs().float().amax(dim=(1, 3), keepdim=True).clamp(1e-4)
+    sf = torch.exp2(torch.ceil(torch.log2(w_amax / fp8_max)))
+    w_scaled = (w_view / sf).to(_FP8_DTYPE)
+    new_w = w_scaled.reshape(Mpad, Kpad)[:M, :K].contiguous()
+    new_s = sf.view(Mpad // block_m, Kpad // block_k)
+
+    w.copy_(new_w)
+    s.copy_(new_s)
+
+
+def _requant_fp8_weights_e8m0(model: torch.nn.Module, block_size: tuple[int, int] = (128, 128)):
+    """Re-quantize FP8 weights so that per-block scales are E8M0 (power-of-2).
+
+    DeepGEMM on Blackwell (sm_100+) operates in native E8M0 mode and expects
+    scales to be powers of 2. The original checkpoint stores arbitrary float32
+    scales. Simply rounding scales without adjusting weights breaks the
+    invariant weight_fp8 * scale ≈ original_weight.
+
+    This function dequantizes each FP8 weight block back to float32 using the
+    original scales, then re-quantizes with E8M0-compatible scales.
+    """
+    block_m, block_k = block_size
+
+    for module in model.modules():
+        # Regular 2D linear weights
+        w = getattr(module, 'weight', None)
+        s = getattr(module, 'weight_scale_inv', None)
+        if (w is not None and s is not None
+                and w.dtype == torch.float8_e4m3fn
+                and s.dtype == torch.float32 and w.ndim == 2):
+            _requant_fp8_e8m0_2d(w.data, s.data, block_m, block_k)
+
+        # 3D MoE expert weights (w13, w2)
+        for wname, sname in [('w13', 'w13_scale_inv'), ('w2', 'w2_scale_inv')]:
+            w3d = getattr(module, wname, None)
+            s3d = getattr(module, sname, None)
+            if (w3d is not None and s3d is not None
+                    and w3d.dtype == torch.float8_e4m3fn
+                    and s3d.dtype == torch.float32 and w3d.ndim == 3):
+                for i in range(w3d.size(0)):
+                    _requant_fp8_e8m0_2d(w3d.data[i], s3d.data[i], block_m, block_k)
+
+
 def _move_model_to_device(model: torch.nn.Module, device: torch.device,
                           dtype: torch.dtype) -> torch.nn.Module:
     """Move model to device, casting to dtype but preserving FP8 weights
@@ -339,6 +401,9 @@ def _move_model_to_device(model: torch.nn.Module, device: torch.device,
     Scale parameters (weight_scale_inv) must stay float32 for block-scaled
     FP8 GEMM kernels. All other float32 params (vision encoder, embeddings,
     norms) are cast to the target dtype.
+
+    On Blackwell (sm_100+), FP8 weights are re-quantized with E8M0
+    (power-of-2) scales to match DeepGEMM's native E8M0 mode.
     """
     has_fp8 = any(
         p.dtype == torch.float8_e4m3fn for p in model.parameters()
@@ -347,6 +412,12 @@ def _move_model_to_device(model: torch.nn.Module, device: torch.device,
         return model.to(device=device, dtype=dtype)
 
     model = model.to(device=device)
+
+    use_e8m0 = (device.type == "cuda"
+                and torch.cuda.get_device_capability(device.index or 0)[0] >= 10)
+    if use_e8m0:
+        _requant_fp8_weights_e8m0(model)
+
     scale_params = set()
     for name, param in model.named_parameters():
         if "scale_inv" in name or "q_norm" in name or "k_norm" in name:

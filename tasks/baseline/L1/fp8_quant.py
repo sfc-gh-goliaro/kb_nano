@@ -21,6 +21,9 @@ try:
 except ImportError:
     pass
 
+_USE_UE8M0 = (torch.cuda.is_available()
+              and torch.cuda.get_device_capability(0)[0] >= 10)
+
 
 @triton.jit
 def _per_token_group_quant_fp8_kernel(
@@ -33,6 +36,7 @@ def _per_token_group_quant_fp8_kernel(
     eps,
     fp8_min,
     fp8_max,
+    USE_UE8M0: tl.constexpr,
     BLOCK: tl.constexpr,
 ):
     groups_per_row = y_num_columns // group_size
@@ -55,7 +59,8 @@ def _per_token_group_quant_fp8_kernel(
 
     y = tl.load(y_ptr + cols, mask=mask, other=0.0).to(tl.float32)
     _absmax = tl.maximum(tl.max(tl.abs(y)), eps)
-    y_s = _absmax / fp8_max
+    scale_raw = _absmax / fp8_max
+    y_s = tl.math.exp2(tl.ceil(tl.log2(scale_raw))) if USE_UE8M0 else scale_raw
     y_q = tl.clamp(y / y_s, fp8_min, fp8_max).to(y_q_ptr.dtype.element_ty)
 
     tl.store(y_q_ptr + cols, y_q, mask=mask)
@@ -80,6 +85,16 @@ class PerTokenGroupQuantFP8(nn.Module):
         self._q_buf = None
         self._s_buf = None
 
+    def preallocate(self, max_elements: int, device: torch.device):
+        """Pre-allocate buffers to avoid resizing during CUDA graph capture."""
+        s_elements = max_elements // self.group_size
+        self._q_buf = torch.empty(max_elements, device=device, dtype=_FP8_DTYPE)
+        self._s_buf = torch.empty(s_elements, device=device, dtype=torch.float32)
+
+    def set_shared_buffers(self, q_buf: torch.Tensor, s_buf: torch.Tensor):
+        self._q_buf = q_buf
+        self._s_buf = s_buf
+
     def forward(self, x: torch.Tensor) -> tuple[torch.Tensor, torch.Tensor]:
         assert x.shape[-1] % self.group_size == 0
         assert x.is_contiguous()
@@ -103,7 +118,7 @@ class PerTokenGroupQuantFP8(nn.Module):
             torch.ops._C.per_token_group_fp8_quant(
                 x, x_q, x_s,
                 self.group_size, 1e-10,
-                _FP8_MIN, _FP8_MAX, False,
+                _FP8_MIN, _FP8_MAX, _USE_UE8M0,
             )
             return x_q, x_s
 
@@ -120,6 +135,7 @@ class PerTokenGroupQuantFP8(nn.Module):
             1e-10,
             fp8_min=_FP8_MIN,
             fp8_max=_FP8_MAX,
+            USE_UE8M0=_USE_UE8M0,
             BLOCK=BLOCK,
             num_warps=num_warps,
             num_stages=1,

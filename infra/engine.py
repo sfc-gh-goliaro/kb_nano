@@ -282,6 +282,7 @@ class ModelRunner:
         self._share_trtllm_workspace()
         self._share_activation_buffers()
         self.warmup_model()
+        self._warmup_deep_gemm()
         self.allocate_kv_cache()
         if not self.enforce_eager:
             self.capture_cudagraph()
@@ -383,8 +384,9 @@ class ModelRunner:
         """Share activation buffers across all layers.
 
         Layers execute sequentially so buffers are safe to reuse.
-        Shares SiluAndMul activation buffers and FusedExperts MoE
-        intermediate caches to avoid per-layer allocation.
+        Shares SiluAndMul activation buffers, FusedExperts MoE
+        intermediate caches, and FP8 quant/GEMM output buffers
+        to avoid per-layer allocation.
         """
         from ..tasks.baseline.L1.silu_and_mul import SiluAndMul
         silu_modules = [
@@ -402,6 +404,55 @@ class ModelRunner:
         if len(fused_experts) > 1:
             FusedExperts._use_shared_cache = True
 
+        self._share_fp8_buffers()
+
+    def _share_fp8_buffers(self):
+        """Share FP8 quantization and GEMM output buffers across layers.
+
+        All FP8Linear instances in the model share a single set of quant
+        buffers (q_buf, s_buf) and a single GEMM output buffer since
+        decoder layers execute sequentially.
+        """
+        from ..tasks.baseline.L1.fp8_linear import FP8Linear
+        fp8_linears = [
+            m for m in self.model.modules() if isinstance(m, FP8Linear)
+        ]
+        if len(fp8_linears) <= 1:
+            return
+
+        max_elements = self.max_num_batched_tokens * self.config.hidden_size
+        inter_size = getattr(self.config, "intermediate_size", self.config.hidden_size)
+        max_elements = max(max_elements, self.max_num_batched_tokens * inter_size * 2)
+        group_size = fp8_linears[0].block_size[1]
+        device = f"cuda:{self.rank}"
+
+        _FP8_DTYPE = torch.float8_e4m3fn
+        shared_q_buf = torch.empty(max_elements, device=device, dtype=_FP8_DTYPE)
+        shared_s_buf = torch.empty(
+            max_elements // group_size, device=device, dtype=torch.float32,
+        )
+        for m in fp8_linears:
+            m.quant.set_shared_buffers(shared_q_buf, shared_s_buf)
+
+        num_heads = self.config.num_attention_heads // self.world_size
+        num_kv_heads = self.config.num_key_value_heads // self.world_size
+        head_dim = self.config.head_dim
+        qkv_n = (num_heads + 2 * num_kv_heads) * head_dim
+        gate_up_n = inter_size * 2 // self.world_size
+        max_n = max(qkv_n, gate_up_n, self.config.hidden_size)
+        max_m = self.max_num_batched_tokens
+        shared_out_buf = torch.empty(
+            max_m * max_n, device=device, dtype=torch.bfloat16,
+        )
+        for m in fp8_linears:
+            m.mm.set_shared_buffer(shared_out_buf)
+
+        # Also share quant buffers in FusedExperts FP8 path
+        from ..tasks.baseline.L2.fused_experts import FusedExperts
+        for fe in self.model.modules():
+            if isinstance(fe, FusedExperts) and hasattr(fe, 'quant'):
+                fe.quant.set_shared_buffers(shared_q_buf, shared_s_buf)
+
     def warmup_model(self):
         torch.cuda.empty_cache()
         torch.cuda.reset_peak_memory_stats()
@@ -409,6 +460,93 @@ class ModelRunner:
         num_seqs = min(self.max_num_batched_tokens // warmup_len, self.max_num_seqs)
         seqs = [Sequence([0] * warmup_len) for _ in range(num_seqs)]
         self.run(seqs, True)
+        torch.cuda.empty_cache()
+
+    def _warmup_deep_gemm(self):
+        """Pre-JIT DeepGEMM kernels for all (M, N, K) shapes used during inference.
+
+        DeepGEMM compiles CUDA kernels on first invocation per unique shape.
+        Without warmup, JIT compilation stalls the pipeline mid-inference.
+        """
+        try:
+            import deep_gemm as dg
+            if not hasattr(dg, "fp8_gemm_nt"):
+                return
+        except ImportError:
+            return
+
+        from ..tasks.baseline.L1.fp8_linear import FP8Linear
+        fp8_linears = [m for m in self.model.modules() if isinstance(m, FP8Linear)]
+        if not fp8_linears:
+            return
+
+        seen_shapes: set[tuple[int, int]] = set()
+        weight_info: list[tuple[int, int, torch.Tensor, torch.Tensor]] = []
+        for parent in self.model.modules():
+            if not hasattr(parent, 'linear_op'):
+                continue
+            if not isinstance(parent.linear_op, FP8Linear):
+                continue
+            w = parent.weight
+            if w.dtype != torch.float8_e4m3fn:
+                continue
+            N, K = w.shape
+            if N % 64 != 0 or K % 128 != 0:
+                continue
+            key = (N, K)
+            if key in seen_shapes:
+                continue
+            seen_shapes.add(key)
+            ws = parent.weight_scale_inv
+            weight_info.append((N, K, w, ws))
+
+        if not weight_info:
+            return
+
+        max_tokens = self.max_num_batched_tokens
+        device = f"cuda:{self.rank}"
+        num_sms = torch.cuda.get_device_properties(self.rank).multi_processor_count
+
+        m_values = set()
+        m_values.update([1, 2, 4] + list(range(8, 65, 8)))
+        block_ms = [64, 128, 256]
+        all_ns = set(N for N, K, _, _ in weight_info)
+        for N in all_ns:
+            block_ns = list(range(16, min(257, N + 1), 16))
+            for block_m in block_ms:
+                for block_n in block_ns:
+                    for wave in range(1, 11):
+                        target_blocks = wave * num_sms
+                        cdiv_n = (N + block_n - 1) // block_n
+                        m = target_blocks * block_m // cdiv_n if cdiv_n else 0
+                        if 1 <= m <= max_tokens:
+                            m_values.add(m)
+                    for multiple in range(1, max_tokens // block_m + 1):
+                        m = multiple * block_m
+                        if m <= max_tokens:
+                            m_values.add(m)
+
+        sorted_m = sorted(m for m in m_values if m <= max_tokens)
+        total = len(sorted_m) * len(weight_info)
+        if self.rank == 0:
+            print(f"  DeepGEMM warmup: {total} kernels "
+                  f"({len(sorted_m)} M-values x {len(weight_info)} weight shapes)")
+
+        e8m0 = torch.cuda.get_device_capability(self.rank)[0] >= 10
+        dg_kwargs = {} if e8m0 else {"disable_ue8m0_cast": True}
+
+        for N, K, w, ws in weight_info:
+            a = torch.empty(max_tokens, K, device=device, dtype=torch.float8_e4m3fn)
+            a_s = torch.empty(max_tokens, K // 128, device=device, dtype=torch.float32)
+            out = torch.empty(max_tokens, N, device=device, dtype=torch.bfloat16)
+            for m in sorted_m:
+                dg.fp8_gemm_nt(
+                    (a[:m], a_s[:m]),
+                    (w, ws),
+                    out[:m],
+                    **dg_kwargs,
+                )
+        torch.cuda.synchronize()
         torch.cuda.empty_cache()
 
     def allocate_kv_cache(self):

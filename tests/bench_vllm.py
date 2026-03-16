@@ -574,14 +574,14 @@ def main():
                 scenario["dataset"], scenario["dataset_split"],
                 scenario["num_seqs"], cfg["seed"],
             )
-            preprocessed = _preprocess_samples(engine, samples, use_tqdm=True)
             sp = SamplingParams(temperature=temperature, top_p=top_p,
                                 max_tokens=scenario["output_len"],
                                 ignore_eos=True)
-            total_input_tokens = sum(len(pp["token_ids"]) for pp in preprocessed)
             engine.block_manager.reset()
             torch.cuda.synchronize()
             start = time.perf_counter()
+            preprocessed = _preprocess_samples(engine, samples, use_tqdm=True)
+            total_input_tokens = sum(len(pp["token_ids"]) for pp in preprocessed)
             outputs = engine.generate(preprocessed, sp, use_tqdm=True)
             torch.cuda.synchronize()
             elapsed = time.perf_counter() - start
@@ -618,14 +618,13 @@ def main():
             samples = _load_mm_samples(
                 ls["dataset"], ls["dataset_split"], 1, cfg["seed"],
             )
-            preprocessed = _preprocess_samples(engine, samples)
-            pp_item = preprocessed[0]
             sp = SamplingParams(temperature=0.0, ignore_eos=True,
                                 max_tokens=ls["output_len"])
-            def run_fn(pp_item=pp_item):
+            def run_fn(samples=samples):
+                preprocessed = _preprocess_samples(engine, samples)
                 engine.block_manager.reset()
                 torch.cuda.synchronize()
-                engine.generate([pp_item], sp)
+                engine.generate(preprocessed, sp)
                 torch.cuda.synchronize()
 
         num_warmup = ls.get("num_warmup", 3)

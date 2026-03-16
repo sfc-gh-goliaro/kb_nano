@@ -12,9 +12,12 @@ import triton.language as tl
 
 _HAS_DEEP_GEMM = False
 _deep_gemm = None
+_DEEP_GEMM_E8M0 = False
 try:
     import deep_gemm as _deep_gemm
     _HAS_DEEP_GEMM = hasattr(_deep_gemm, "fp8_gemm_nt")
+    if _HAS_DEEP_GEMM and torch.cuda.is_available():
+        _DEEP_GEMM_E8M0 = torch.cuda.get_device_capability(0)[0] >= 10
 except ImportError:
     pass
 
@@ -95,6 +98,21 @@ class W8A8BlockScaledMM(nn.Module):
         C:  [M, N] in output_dtype
     """
 
+    def __init__(self):
+        super().__init__()
+        self._out_buf: torch.Tensor | None = None
+
+    def _get_output(self, M: int, N: int, dtype: torch.dtype, device: torch.device) -> torch.Tensor:
+        needed = M * N
+        buf = self._out_buf
+        if buf is None or buf.numel() < needed:
+            buf = torch.empty(needed, dtype=dtype, device=device)
+            self._out_buf = buf
+        return buf[:needed].view(M, N)
+
+    def set_shared_buffer(self, buf: torch.Tensor):
+        self._out_buf = buf.view(-1) if buf.ndim > 1 else buf
+
     def forward(
         self,
         A: torch.Tensor,
@@ -109,18 +127,19 @@ class W8A8BlockScaledMM(nn.Module):
         M = A.numel() // A.shape[-1]
         N, K = B.shape
 
+        C = self._get_output(M, N, output_dtype, A.device)
+
         if _HAS_DEEP_GEMM and output_dtype == torch.bfloat16 and N % 64 == 0 and K % 128 == 0:
-            C = torch.empty((M, N), dtype=output_dtype, device=A.device)
+            kwargs = {} if _DEEP_GEMM_E8M0 else {"disable_ue8m0_cast": True}
             _deep_gemm.fp8_gemm_nt(
                 (A.view(M, K), As.view(M, -1)),
                 (B, Bs),
                 C,
-                disable_ue8m0_cast=True,
+                **kwargs,
             )
             return C
 
         block_n, block_k = block_size
-        C = torch.empty((M, N), dtype=output_dtype, device=A.device)
 
         config = {
             "BLOCK_SIZE_M": 64,
