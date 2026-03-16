@@ -220,9 +220,62 @@ The full API surface is five logging functions plus one context manager:
 
 ```bash
 kb_nano mlflow-ui
+# Open http://localhost:5000 in your browser
+# Press Ctrl+C to stop
 ```
 
-The UI runs at http://localhost:5000. You can compare metrics across runs, download kernel artifacts (the exact source code), and filter/search by parameters.
+The UI launches a local MLflow server at http://localhost:5000 backed by the `mlruns/` directory. All runs are logged under the `kb_nano` experiment.
+
+#### Navigating the UI
+
+1. **Experiment list** (left sidebar): Select the `kb_nano` experiment to see all tracked runs.
+2. **Runs table**: Each row is a tracked run (agent, kernel benchmark, eval, or e2e). Columns show run name, start time, duration, and logged metrics. Click column headers to sort -- e.g., sort by `e2e_speedup` to find your fastest runs.
+3. **Filtering**: Use the search bar to filter runs by parameters or metrics. Examples:
+   - `params.level = "1"` -- show only L1 runs
+   - `params.cuda_only = "True"` -- show CUDA-only agent runs
+   - `metrics.e2e_speedup > 1.0` -- show runs that beat the baseline
+   - `tags.tier = "agent"` -- show only agent runs (vs `"kernel"`, `"eval"`, `"e2e"`)
+
+#### Inspecting a run
+
+Click any run to open its detail page:
+
+- **Parameters**: Model, level, TP degree, LLM model, seed, and other run configuration.
+- **Metrics**: Per-operator generation success (`gen_rms_norm_success`), unit test results (`utest_rms_norm_success`, `utest_rms_norm_max_diff`), and e2e results (`e2e_speedup`, `e2e_token_match_rate`).
+- **Artifacts**: Browse the `kernels/` folder to view and download the exact source code of every generated kernel. Failed generations store error traces under `errors/`.
+
+#### Comparing runs
+
+1. Select two or more runs using the checkboxes in the runs table.
+2. Click **Compare**. The comparison view shows:
+   - **Parameter diff**: Which parameters changed between runs (e.g., `cuda_only: True` vs `False`).
+   - **Metric comparison**: Side-by-side metric values -- useful for seeing how `e2e_speedup` or `e2e_token_match_rate` changed across iterations.
+   - **Artifact diff**: Compare kernel source code between runs to see how the generated code evolved.
+
+#### Downloading kernel artifacts
+
+From any run's artifact browser, click a kernel file (e.g., `kernels/rms_norm.py`) to preview its contents. Click the download button to save it locally. This is useful for recovering a high-performing kernel from a previous run:
+
+```bash
+# Or query artifacts programmatically:
+python -c "
+import mlflow
+mlflow.set_tracking_uri('file://$(pwd)/mlruns')
+client = mlflow.tracking.MlflowClient()
+client.download_artifacts('<run_id>', 'kernels/rms_norm.py', '/tmp/')
+"
+```
+
+#### Tracking data structure
+
+Each run is tagged with a `tier` that indicates its source:
+
+| Tag | Source command | Key metrics |
+|-----|---------------|-------------|
+| `agent` | `kb_nano agent` | `gen_{op}_success`, `utest_{op}_success`, `e2e_speedup`, `e2e_token_match_rate` |
+| `kernel` | `kb_nano kernels` | `{op}_avg_speedup`, `{op}_passed`, `{op}_failed`, `avg_speedup` |
+| `eval` | `kb_nano eval` | `avg_throughput_speedup`, `avg_latency_speedup`, `alignment_rate` |
+| `e2e` | `kb_nano e2e` | `tokens_per_second`, `avg_latency`, `mean_ttft_ms` (varies by bench type) |
 
 ### Disabling tracking
 

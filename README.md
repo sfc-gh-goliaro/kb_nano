@@ -234,6 +234,22 @@ with tracker.start_run("my-optimization-v3", params={
 
 Tracking data is stored locally in `mlruns/` (gitignored). If `mlflow` is not installed, all tracking calls are silently skipped.
 
+### MLflow Web UI
+
+```bash
+kb_nano mlflow-ui
+# Open http://localhost:5000
+```
+
+The UI shows all tracked runs under the `kb_nano` experiment. You can:
+
+- **Sort and filter** runs by metrics (`metrics.e2e_speedup > 1.0`) or parameters (`params.level = "1"`, `tags.tier = "agent"`)
+- **Inspect** any run to see its parameters, per-operator metrics, and generated kernel source code (stored as artifacts under `kernels/`)
+- **Compare** multiple runs side-by-side to see how metrics and kernel code evolved across iterations
+- **Download** kernel artifacts to recover high-performing kernels from previous runs
+
+Each run is tagged with a `tier` (`agent`, `kernel`, `eval`, or `e2e`) indicating which command produced it. See the [user guide](docs/user_guide.md#mlflow-web-ui) for detailed UI walkthrough.
+
 ## Dependencies
 
 - Python 3.10+
