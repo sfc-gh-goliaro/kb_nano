@@ -43,6 +43,8 @@ _CANDIDATE_DIR = CANDIDATE_DIR
 _L4_MODEL_KEYS: dict[str, str] = {
     "llama": "llama31",
     "mixtral": "mixtral",
+    "qwen2_vl": "qwen2_vl",
+    "qwen3_vl": "qwen3_vl",
 }
 
 
