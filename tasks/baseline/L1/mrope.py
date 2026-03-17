@@ -169,12 +169,17 @@ class MRotaryEmbedding(nn.Module):
         cos_3d = cos.contiguous()
         sin_3d = sin.contiguous()
 
-        q_flat = query.view(num_tokens, -1).contiguous()
-        k_flat = key.view(num_tokens, -1).contiguous()
-
-        n_qh = query.shape[1]
-        n_kh = key.shape[1]
         hd = self.head_dim
+        q_was_2d = query.ndim == 2
+        if q_was_2d:
+            n_qh = query.shape[1] // hd
+            n_kh = key.shape[1] // hd
+        else:
+            n_qh = query.shape[1]
+            n_kh = key.shape[1]
+
+        q_flat = query.reshape(num_tokens, -1).contiguous()
+        k_flat = key.reshape(num_tokens, -1).contiguous()
         pad_hd = triton.next_power_of_2(hd)
         pad_n_qh = triton.next_power_of_2(n_qh)
         pad_n_kh = triton.next_power_of_2(n_kh)

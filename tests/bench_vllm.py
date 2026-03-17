@@ -307,46 +307,207 @@ if __name__ == "__main__":
 
 
 # ---------------------------------------------------------------------------
+# Shared multimodal data loading (no vLLM imports -- cv2, numpy, PIL only)
+# Inlined into both VLM workers so each subprocess is self-contained.
+# ---------------------------------------------------------------------------
+_MM_PRELOAD_FN = r'''
+import math
+import numpy as np
+from io import BytesIO
+from PIL import Image
+from tqdm import tqdm
+
+def _load_video_opencv(video_path, num_frames=32):
+    """Load video frames with OpenCV, matching vLLM's OpenCVVideoBackend."""
+    import cv2
+
+    cap = cv2.VideoCapture(video_path)
+    if not cap.isOpened():
+        raise ValueError(f"Could not open video: {video_path}")
+
+    total_frames_num = int(cap.get(cv2.CAP_PROP_FRAME_COUNT))
+    original_fps = cap.get(cv2.CAP_PROP_FPS)
+    duration = total_frames_num / original_fps if original_fps > 0 else 0
+
+    num_frames_to_sample = total_frames_num
+    if num_frames > 0:
+        num_frames_to_sample = min(num_frames, total_frames_num)
+    num_frames_to_sample = max(1, num_frames_to_sample)
+
+    if num_frames_to_sample == total_frames_num:
+        frame_idx = list(range(num_frames_to_sample))
+    else:
+        frame_idx = np.linspace(
+            0, total_frames_num - 1, num_frames_to_sample, dtype=int
+        ).tolist()
+
+    frame_idx_set = set(frame_idx)
+    max_idx = max(frame_idx)
+
+    width = int(cap.get(cv2.CAP_PROP_FRAME_WIDTH))
+    height = int(cap.get(cv2.CAP_PROP_FRAME_HEIGHT))
+    frames = np.empty((num_frames_to_sample, height, width, 3), dtype=np.uint8)
+
+    i = 0
+    valid_frame_indices = []
+    for idx in range(max_idx + 1):
+        ok = cap.grab()
+        if not ok:
+            continue
+        if idx in frame_idx_set:
+            ret, frame = cap.retrieve()
+            if ret:
+                frames[i] = cv2.cvtColor(frame, cv2.COLOR_BGR2RGB)
+                valid_frame_indices.append(idx)
+                i += 1
+
+    cap.release()
+    valid_num_frames = len(valid_frame_indices)
+    frames = frames[:valid_num_frames]
+
+    metadata = {
+        "total_num_frames": total_frames_num,
+        "fps": original_fps,
+        "duration": duration,
+        "video_backend": "opencv",
+        "frames_indices": valid_frame_indices,
+        "do_sample_frames": valid_num_frames == total_frames_num,
+    }
+    return frames, metadata
+
+
+def _preload_mm_data(dataset_name, dataset_split, num_seqs, seed,
+                     num_video_frames=32):
+    """Pre-download and load all images/videos into memory.
+
+    Returns list of dicts with keys:
+      - prompt: str
+      - images: list[PIL.Image] or None
+      - video_frames: np.ndarray (T,H,W,3) or None
+      - video_metadata: dict or None
+    """
+    from datasets import load_dataset
+    use_streaming = "MMVU" not in dataset_name
+    data = load_dataset(dataset_name, split=dataset_split,
+                        streaming=use_streaming)
+    data = data.shuffle(seed=seed)
+
+    results = []
+    if "VisionArena" in dataset_name:
+        pbar = tqdm(data, total=num_seqs, desc="Loading images")
+        for item in pbar:
+            if len(results) >= num_seqs:
+                break
+            try:
+                prompt = item["conversation"][0][0]["content"]
+                if "base64" in prompt or len(prompt) > 4096:
+                    continue
+                img = item["images"][0]
+                if isinstance(img, dict) and "bytes" in img:
+                    img = Image.open(BytesIO(img["bytes"]))
+                if not isinstance(img, Image.Image):
+                    continue
+                img = img.convert("RGB")
+                w, h = img.size
+                if w * h > 2048 * 2048:
+                    continue
+            except Exception:
+                continue
+            results.append({
+                "prompt": prompt,
+                "images": [img],
+                "video_frames": None,
+                "video_metadata": None,
+            })
+            pbar.update(0)
+        pbar.close()
+    elif "MMVU" in dataset_name:
+        from huggingface_hub import snapshot_download
+        local_root = snapshot_download(dataset_name, repo_type="dataset")
+        remote_root = (
+            f"https://huggingface.co/datasets/{dataset_name}/resolve/main"
+        )
+        pbar = tqdm(data, total=num_seqs, desc="Loading videos")
+        for item in pbar:
+            if len(results) >= num_seqs:
+                break
+            prompt = item["question"] + " " + " ".join(
+                f"{k}.{v}" for k, v in item["choices"].items())
+            video_path = item["video"].replace(remote_root, local_root)
+            frames, metadata = _load_video_opencv(
+                video_path, num_frames=num_video_frames)
+            results.append({
+                "prompt": prompt,
+                "images": None,
+                "video_frames": frames,
+                "video_metadata": metadata,
+            })
+            pbar.update(0)
+        pbar.close()
+    return results
+
+
+def _filter_and_prepare(mm_data, processor, max_input_tokens):
+    """Filter items by token count and pre-compute chat text in one pass."""
+    prepared = []
+    for item in tqdm(mm_data, desc="Filtering & preparing prompts"):
+        try:
+            messages = [{"role": "user", "content": []}]
+            images_for_proc = None
+            videos_for_proc = None
+            if item["images"] is not None:
+                for img in item["images"]:
+                    messages[0]["content"].append(
+                        {"type": "image", "image": img})
+                images_for_proc = item["images"]
+            if item["video_frames"] is not None:
+                frames_pil = [
+                    Image.fromarray(item["video_frames"][j]).convert("RGB")
+                    for j in range(item["video_frames"].shape[0])
+                ]
+                messages[0]["content"].append(
+                    {"type": "video", "video": frames_pil})
+                videos_for_proc = [frames_pil]
+            messages[0]["content"].append(
+                {"type": "text", "text": item["prompt"]})
+            text = processor.apply_chat_template(
+                messages, tokenize=False, add_generation_prompt=True)
+            inputs = processor(
+                text=[text],
+                images=images_for_proc,
+                videos=videos_for_proc,
+                return_tensors="pt",
+                padding=True,
+            )
+            num_tokens = inputs["input_ids"].shape[1]
+            if num_tokens <= max_input_tokens:
+                item["chat_text"] = text
+                prepared.append(item)
+        except Exception:
+            continue
+    return prepared
+'''
+
+# ---------------------------------------------------------------------------
 # Multi-scenario vLLM subprocess worker (VLM, multi-modal)
 # ---------------------------------------------------------------------------
-VLLM_VLM_WORKER = r'''
+VLLM_VLM_WORKER = _MM_PRELOAD_FN + r'''
 import json, os, sys, time
 os.environ.setdefault("VLLM_WORKER_MULTIPROC_METHOD", "spawn")
-
-def _load_mm_samples(dataset_name, dataset_split, num_seqs, seed):
-    """Load multimodal samples using vllm's dataset infrastructure."""
-    if "VisionArena" in dataset_name:
-        from vllm.benchmarks.datasets import VisionArenaDataset
-        ds = VisionArenaDataset(
-            dataset_path=dataset_name,
-            dataset_split=dataset_split,
-            random_seed=seed,
-        )
-    elif "MMVU" in dataset_name:
-        from vllm.benchmarks.datasets import MMVUDataset
-        ds = MMVUDataset(
-            dataset_path=dataset_name,
-            dataset_split=dataset_split,
-            random_seed=seed,
-        )
-    else:
-        raise ValueError(f"Unsupported dataset: {dataset_name}")
-    from transformers import AutoTokenizer
-    tokenizer = AutoTokenizer.from_pretrained(
-        os.environ["_BENCH_MODEL_NAME"], trust_remote_code=True)
-    return ds.sample(tokenizer, num_seqs, enable_multimodal_chat=True)
 
 
 def main():
     from vllm import LLM, SamplingParams
+    from transformers import AutoProcessor
 
     with open(sys.argv[1]) as f:
         cfg = json.load(f)
 
-    os.environ["_BENCH_MODEL_NAME"] = cfg["model"]
+    model_name = cfg["model"]
+    processor = AutoProcessor.from_pretrained(model_name, trust_remote_code=True)
 
     llm = LLM(
-        model=cfg["model"],
+        model=model_name,
         seed=cfg["seed"],
         enforce_eager=cfg.get("enforce_eager", False),
         tensor_parallel_size=cfg["tp"],
@@ -380,19 +541,36 @@ def main():
             outputs = llm.generate(vllm_prompts, sp_list)
             elapsed = time.perf_counter() - start
         else:
-            samples = _load_mm_samples(
+            mm_data = _preload_mm_data(
                 scenario["dataset"], scenario["dataset_split"],
                 scenario["num_seqs"], cfg["seed"],
             )
-            sp_list = [
-                SamplingParams(temperature=temperature,
-                               ignore_eos=True,
-                               max_tokens=s.expected_output_len)
-                for s in samples
-            ]
-            chat_prompts = [s.prompt for s in samples]
+            max_input_tokens = cfg["max_model_len"] - scenario["output_len"]
+            mm_data = _filter_and_prepare(
+                mm_data, processor, max_input_tokens)
+            print(f"  vLLM: {len(mm_data)} items after token-count filter "
+                  f"(max_input={max_input_tokens})")
+            sp_list = []
+            vllm_prompts = []
+            for item in mm_data:
+                sp_list.append(
+                    SamplingParams(temperature=temperature,
+                                   ignore_eos=True,
+                                   max_tokens=scenario["output_len"]))
+                mm_dict = {}
+                if item["images"] is not None:
+                    mm_dict["image"] = item["images"]
+                if item["video_frames"] is not None:
+                    mm_dict["video"] = [
+                        (item["video_frames"], item["video_metadata"])
+                    ]
+                vllm_prompts.append(dict(
+                    prompt=item["chat_text"],
+                    multi_modal_data=mm_dict,
+                ))
+
             start = time.perf_counter()
-            outputs = llm.chat(chat_prompts, sp_list, use_tqdm=True)
+            outputs = llm.generate(vllm_prompts, sp_list, use_tqdm=True)
             elapsed = time.perf_counter() - start
 
         total_prompt_tokens = sum(
@@ -426,13 +604,25 @@ def main():
                                 ignore_eos=True, max_tokens=ls["output_len"])
             run_fn = lambda: llm.generate(prompts, sp, use_tqdm=False)
         else:
-            samples = _load_mm_samples(
+            mm_data = _preload_mm_data(
                 ls["dataset"], ls["dataset_split"], 1, cfg["seed"],
             )
+            max_lat_tokens = cfg["max_model_len"] - ls["output_len"]
+            mm_data = _filter_and_prepare(
+                mm_data, processor, max_lat_tokens)
+            item = mm_data[0]
             sp = SamplingParams(temperature=0.0, ignore_eos=True,
                                 max_tokens=ls["output_len"])
-            chat_prompts = [samples[0].prompt]
-            run_fn = lambda: llm.chat(chat_prompts, sp, use_tqdm=False)
+            mm_dict = {}
+            if item["images"] is not None:
+                mm_dict["image"] = item["images"]
+            if item["video_frames"] is not None:
+                mm_dict["video"] = [
+                    (item["video_frames"], item["video_metadata"])
+                ]
+            lat_prompt = dict(prompt=item["chat_text"],
+                              multi_modal_data=mm_dict)
+            run_fn = lambda: llm.generate([lat_prompt], sp, use_tqdm=False)
 
         num_warmup = ls.get("num_warmup", 3)
         num_iters = ls.get("num_iters", 5)
@@ -463,52 +653,8 @@ if __name__ == "__main__":
 # ---------------------------------------------------------------------------
 # Multi-scenario kb-nano subprocess worker (VLM, multi-modal)
 # ---------------------------------------------------------------------------
-KB_NANO_VLM_WORKER = r'''
+KB_NANO_VLM_WORKER = _MM_PRELOAD_FN + r'''
 import json, sys, time
-
-def _load_raw_mm_data(dataset_name, dataset_split, num_seqs, seed):
-    """Load raw PIL images or video frames from HF datasets."""
-    from datasets import load_dataset
-    data = load_dataset(dataset_name, split=dataset_split, streaming=True,
-                        trust_remote_code=True)
-    data = data.shuffle(seed=seed)
-
-    results = []
-    if "VisionArena" in dataset_name:
-        for i, item in enumerate(data):
-            if len(results) >= num_seqs:
-                break
-            prompt = item["conversation"][0][0]["content"]
-            from PIL import Image
-            img = item["images"][0]
-            if isinstance(img, dict) and "bytes" in img:
-                from io import BytesIO
-                img = Image.open(BytesIO(img["bytes"]))
-            if isinstance(img, Image.Image):
-                img = img.convert("RGB")
-            results.append({"prompt": prompt, "images": [[img]]})
-    elif "MMVU" in dataset_name:
-        from huggingface_hub import snapshot_download
-        local_root = snapshot_download(dataset_name, repo_type="dataset")
-        remote_root = f"https://huggingface.co/datasets/{dataset_name}/resolve/main"
-        for i, item in enumerate(data):
-            if len(results) >= num_seqs:
-                break
-            prompt = item["question"] + " " + " ".join(
-                f"{k}.{v}" for k, v in item["choices"].items())
-            video_path = item["video"].replace(remote_root, local_root)
-            from vllm.assets.video import VideoAsset
-            import decord
-            decord.bridge.set_bridge("torch")
-            vr = decord.VideoReader(video_path)
-            total = len(vr)
-            num_frames = min(total, 16)
-            indices = [int(i * total / num_frames) for i in range(num_frames)]
-            from PIL import Image
-            frames = [Image.fromarray(
-                vr[idx].numpy()).convert("RGB") for idx in indices]
-            results.append({"prompt": prompt, "videos": [[frames]]})
-    return results
 
 
 def main():
@@ -516,6 +662,10 @@ def main():
         cfg = json.load(f)
     sys.path.insert(0, cfg["project_root"])
     pkg = cfg["package_name"]
+
+    from transformers import AutoProcessor
+    processor = AutoProcessor.from_pretrained(
+        cfg["model"], trust_remote_code=True)
 
     mod = __import__(f"{pkg}.infra.engine", fromlist=["LlamaEngine", "SamplingParams"])
     LlamaEngine, SamplingParams = mod.LlamaEngine, mod.SamplingParams
@@ -559,28 +709,49 @@ def main():
             elapsed = time.perf_counter() - start
             total_input_tokens = sum(len(p) for p in prompts)
         else:
-            mm_data = _load_raw_mm_data(
+            mm_data = _preload_mm_data(
                 scenario["dataset"], scenario["dataset_split"],
                 scenario["num_seqs"], cfg["seed"],
             )
-            sp = SamplingParams(temperature=temperature, top_p=top_p,
-                                max_tokens=scenario["output_len"],
-                                ignore_eos=True)
-            all_outputs = []
+            max_input_tokens = cfg["max_model_len"] - scenario["output_len"]
+            mm_data = _filter_and_prepare(
+                mm_data, processor, max_input_tokens)
+            print(f"  kb-nano: {len(mm_data)} items after token-count filter "
+                  f"(max_input={max_input_tokens})")
+
+            prompts = [item["prompt"] for item in mm_data]
+            batch_images = []
+            batch_videos = []
+            for item in mm_data:
+                if item["images"] is not None:
+                    batch_images.append(item["images"])
+                else:
+                    batch_images.append(None)
+                if item["video_frames"] is not None:
+                    frames_pil = [
+                        Image.fromarray(item["video_frames"][j]).convert("RGB")
+                        for j in range(item["video_frames"].shape[0])
+                    ]
+                    batch_videos.append([frames_pil])
+                else:
+                    batch_videos.append(None)
+
+            sp_list = [
+                SamplingParams(temperature=temperature, top_p=top_p,
+                               max_tokens=scenario["output_len"],
+                               ignore_eos=True)
+            ] * len(mm_data)
+
             total_input_tokens = 0
             engine.block_manager.reset()
             torch.cuda.synchronize()
             start = time.perf_counter()
-            for item in mm_data:
-                out = engine.generate(
-                    [item["prompt"]], sp,
-                    images=item.get("images"),
-                    videos=item.get("videos"),
-                )
-                all_outputs.extend(out)
+            outputs = engine.generate(prompts, sp_list,
+                                      images=batch_images,
+                                      videos=batch_videos,
+                                      use_tqdm=True)
             torch.cuda.synchronize()
             elapsed = time.perf_counter() - start
-            outputs = all_outputs
 
         total_output_tokens = sum(len(o.token_ids) for o in outputs)
 
@@ -611,19 +782,32 @@ def main():
                 engine.generate(prompts, sp)
                 torch.cuda.synchronize()
         else:
-            mm_data = _load_raw_mm_data(
+            mm_data = _preload_mm_data(
                 ls["dataset"], ls["dataset_split"], 1, cfg["seed"],
             )
+            max_lat_tokens = cfg["max_model_len"] - ls["output_len"]
+            mm_data = _filter_and_prepare(
+                mm_data, processor, max_lat_tokens)
             item = mm_data[0]
             sp = SamplingParams(temperature=0.0, ignore_eos=True,
                                 max_tokens=ls["output_len"])
-            def run_fn(item=item):
+            lat_images = None
+            lat_videos = None
+            if item["images"] is not None:
+                lat_images = [item["images"]]
+            if item["video_frames"] is not None:
+                lat_frames_pil = [
+                    Image.fromarray(item["video_frames"][j]).convert("RGB")
+                    for j in range(item["video_frames"].shape[0])
+                ]
+                lat_videos = [[lat_frames_pil]]
+            def run_fn(p=item["prompt"], imgs=lat_images, vids=lat_videos):
                 engine.block_manager.reset()
                 torch.cuda.synchronize()
                 engine.generate(
-                    [item["prompt"]], sp,
-                    images=item.get("images"),
-                    videos=item.get("videos"),
+                    [p], sp,
+                    images=imgs,
+                    videos=vids,
                 )
                 torch.cuda.synchronize()
 
@@ -724,6 +908,11 @@ def main():
         help="Directory to save per-scenario outputs and results JSON "
              "(default: tests/results/<gpu>/<model>_tp<tp>)",
     )
+    parser.add_argument(
+        "--modality", type=str, default="all",
+        choices=["all", "text", "image", "video"],
+        help="Run only scenarios matching this modality (VLM models only, default: all)",
+    )
     args = parser.parse_args()
 
     gpu = _detect_gpu_name()
@@ -736,6 +925,16 @@ def main():
 
     throughput_scenarios = VLM_SCENARIOS if is_vlm else SCENARIOS
     latency_scenarios = VLM_LATENCY_SCENARIOS if is_vlm else LATENCY_SCENARIOS
+
+    if is_vlm and args.modality != "all":
+        throughput_scenarios = [
+            s for s in throughput_scenarios
+            if s.get("modality", "text") == args.modality
+        ]
+        latency_scenarios = [
+            s for s in latency_scenarios
+            if s.get("modality", "text") == args.modality
+        ]
 
     # Pre-generate all scenario data
     scenario_data = []
@@ -767,8 +966,8 @@ def main():
                 })
             else:
                 # Image/video: dataset is loaded inside the subprocess worker.
-                # We need a generous max_model_len for vision tokens.
-                max_seq_len = 8192 + scenario["output_len"]
+                # Large images can produce many vision tokens; be generous.
+                max_seq_len = 16384 + scenario["output_len"]
                 if max_seq_len > global_max_seq_len:
                     global_max_seq_len = max_seq_len
                 scenario_data.append({
@@ -808,7 +1007,7 @@ def main():
                     "num_iters": args.latency_iters,
                 })
             else:
-                max_seq_len = 8192 + ls["output_len"]
+                max_seq_len = 16384 + ls["output_len"]
                 if max_seq_len > global_max_seq_len:
                     global_max_seq_len = max_seq_len
                 latency_data.append({
@@ -827,6 +1026,8 @@ def main():
     print("=" * 70)
     print(f"  Model          : {args.model}")
     print(f"  Model type     : {'VLM' if is_vlm else 'LLM'}")
+    if is_vlm and args.modality != "all":
+        print(f"  Modality       : {args.modality}")
     print(f"  TP             : {args.tp}")
     print(f"  Seqs/scenario  : {args.num_seqs}")
     print(f"  Temperature    : {args.temperature}")

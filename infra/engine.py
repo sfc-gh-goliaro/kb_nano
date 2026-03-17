@@ -1717,6 +1717,20 @@ class LlamaEngine:
             n_pf = len(prefill_seqs)
             n_dc = len(decode_seqs)
 
+            # Multimodal prefills must be processed atomically (the vision
+            # encoder uses bidirectional attention over the full image/video).
+            # Allocate any remaining blocks so prepare_prefill sees a fully
+            # populated block_table, matching vLLM v1's encoder scheduling.
+            if n_pf > 0 and self.is_qwen_vl:
+                for idx, seq in enumerate(prefill_seqs):
+                    has_mm = (getattr(seq, 'pixel_values', None) is not None
+                              or getattr(seq, 'video_pixel_values', None) is not None)
+                    if has_mm:
+                        extra = seq.num_blocks - len(seq.block_table)
+                        if extra > 0:
+                            bm.allocate_n(seq, extra)
+                        prefill_chunk_sizes[idx] = seq.num_remaining_prefill
+
             if n_pf == 0 and use_greedy:
                 # Pure decode with CUDA graphs (fast path)
                 gpu_result = self.model_runner.call_decode_greedy(decode_seqs)
@@ -1793,7 +1807,24 @@ class LlamaEngine:
                     for s in prefill_seqs
                 )
                 if has_mm:
-                    inputs_embeds, deepstack_embeds = self._run_vision_encoder(prefill_seqs)
+                    # Like vLLM v1: inputs_embeds must cover ALL tokens
+                    # (prefill + decode). Build prefill embeds via vision
+                    # encoder, then append text embeddings for decode tokens.
+                    pf_embeds, deepstack_embeds = self._run_vision_encoder(prefill_seqs)
+                    embed_fn = self.model_runner.model.get_input_embeddings()
+                    dc_ids = torch.tensor(
+                        [s.last_token for s in decode_seqs],
+                        dtype=torch.int64, device="cuda",
+                    )
+                    dc_embeds = embed_fn(dc_ids)
+                    inputs_embeds = torch.cat([pf_embeds, dc_embeds], dim=0)
+                    if deepstack_embeds is not None:
+                        dc_zeros = torch.zeros_like(dc_embeds).unsqueeze(0).expand(
+                            len(deepstack_embeds), -1, -1)
+                        deepstack_embeds = [
+                            torch.cat([ds, dc_zeros[i]], dim=0)
+                            for i, ds in enumerate(deepstack_embeds)
+                        ]
                     input_ids_t, positions_t = self.model_runner.prepare_mixed_batch(
                         prefill_seqs, prefill_chunk_sizes, decode_seqs,
                     )
