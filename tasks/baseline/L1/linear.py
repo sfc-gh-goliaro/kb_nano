@@ -5,6 +5,8 @@ import math
 import torch
 import torch.nn as nn
 import torch.nn.functional as F
+import triton
+import triton.language as tl
 
 import deep_gemm
 
@@ -15,6 +17,39 @@ class Linear(nn.Module):
 
 
 _FP8_INFO = torch.finfo(torch.float8_e4m3fn)
+_GROUP_SIZE: tl.constexpr = 128
+
+
+@triton.jit
+def _fp8_group_quant_kernel(
+    x_ptr, out_ptr, scale_ptr,
+    stride_x_row, stride_out_row, stride_s_row,
+    num_cols,
+    fp8_max: tl.constexpr,
+    GROUP_SIZE: tl.constexpr,
+):
+    pid = tl.program_id(0)
+    groups_per_row = num_cols // GROUP_SIZE
+    row = pid // groups_per_row
+    group = pid % groups_per_row
+
+    x_base = x_ptr + row * stride_x_row + group * GROUP_SIZE
+    cols = tl.arange(0, GROUP_SIZE)
+    x = tl.load(x_base + cols).to(tl.float32)
+
+    absmax = tl.max(tl.abs(x))
+    absmax = tl.maximum(absmax, 1e-12)
+    scale = tl.math.exp2(tl.math.ceil(tl.math.log2(absmax / fp8_max)))
+
+    x_scaled = x / scale
+    x_clamped = tl.clamp(x_scaled, -fp8_max, fp8_max)
+    x_fp8 = x_clamped.to(out_ptr.dtype.element_ty)
+
+    out_base = out_ptr + row * stride_out_row + group * GROUP_SIZE
+    tl.store(out_base + cols, x_fp8)
+
+    scale_base = scale_ptr + row * stride_s_row + group
+    tl.store(scale_base, scale)
 
 
 def _per_token_group_quant_fp8(x: torch.Tensor,
@@ -22,18 +57,18 @@ def _per_token_group_quant_fp8(x: torch.Tensor,
                                out_scale: torch.Tensor) -> None:
     """In-place per-token-group FP8 quantization with UE8M0 (power-of-two) scales.
 
-    Writes directly into pre-allocated buffers so the op is
-    CUDA-graph-capturable.
+    Single Triton kernel launch, writes to pre-allocated buffers for
+    CUDA-graph compatibility.
     """
     M, K = x.shape
-    x_view = x.reshape(M, K // 128, 128)
-    amax = x_view.abs().float().amax(dim=-1, keepdim=True).clamp(min=1e-12)
-    scale = torch.pow(2.0, torch.ceil(torch.log2(amax / _FP8_INFO.max)))
-    out_fp8.copy_(
-        (x_view / scale).clamp(_FP8_INFO.min, _FP8_INFO.max)
-        .to(torch.float8_e4m3fn).reshape(M, K)
+    groups_per_row = K // _GROUP_SIZE
+    _fp8_group_quant_kernel[(M * groups_per_row,)](
+        x, out_fp8, out_scale,
+        x.stride(0), out_fp8.stride(0), out_scale.stride(0),
+        K,
+        fp8_max=_FP8_INFO.max,
+        GROUP_SIZE=_GROUP_SIZE,
     )
-    out_scale.copy_(scale.squeeze(-1))
 
 
 class Fp8Linear(nn.Module):
@@ -74,9 +109,10 @@ class Fp8Linear(nn.Module):
             input_scale = self._s_buf[:M]
             output = self._o_buf[:M]
         else:
-            q_input, input_scale = deep_gemm.per_token_cast_to_fp8(
-                input_2d, use_ue8m0=True,
-            )
+            num_groups = math.ceil(K / self.BLOCK_SIZE)
+            q_input = torch.empty(M, K, dtype=torch.float8_e4m3fn, device=input_2d.device)
+            input_scale = torch.empty(M, num_groups, dtype=torch.float32, device=input_2d.device)
+            _per_token_group_quant_fp8(input_2d, q_input, input_scale)
             output = torch.empty(M, N, dtype=torch.bfloat16, device=input_2d.device)
 
         deep_gemm.fp8_gemm_nt(
