@@ -223,6 +223,28 @@ Run `tests/bench_vllm.py` to reproduce. Three scenarios per model, 1000 sequence
 | Mixtral-8x7B | 4 | balanced      |  512/512  | 20,530 | 33,443 | **1.63x** |
 | Mixtral-8x7B | 4 | decode-heavy  |  512/1024 | 24,728 | 37,761 | **1.53x** |
 
+### Qwen2-VL / Qwen3-VL (VLM)
+
+Throughput (1000 sequences per scenario, `temperature=0`, `max_model_len=16896`):
+
+| Model | TP | Scenario | Output | vLLM (tok/s) | Ours (tok/s) | Ratio | Avg Match Tokens |
+|-------|---:|----------|-------:|-------------:|-------------:|------:|-----------------:|
+| Qwen2-VL-7B  | 1 | text-only | 1024 | 35,717 | 35,900 | **1.01x** | 941.1/1024 |
+| Qwen2-VL-7B  | 1 | image     |  512 | 15,474 | 12,123 | 0.78x | 79.7/512 |
+| Qwen2-VL-7B  | 1 | video     |  512 |  3,769 |  2,255 | 0.60x | 152.4/512 |
+| Qwen3-VL-8B  | 1 | text-only | 1024 | 20,888 | 20,453 | 0.98x | 890.2/1024 |
+| Qwen3-VL-8B  | 1 | image     |  512 | 16,191 | 11,260 | 0.70x | 27.9/512 |
+| Qwen3-VL-8B  | 1 | video     |  512 |  3,877 |  7,497 | **1.93x** | 62.6/512 |
+
+Latency (batch size 1, 128 output tokens, 5 iterations):
+
+| Model | TP | Scenario | vLLM median | Ours median | Ratio |
+|-------|---:|----------|------------:|------------:|------:|
+| Qwen2-VL-7B  | 1 | single-image | 0.486s | 0.523s | 0.93x |
+| Qwen2-VL-7B  | 1 | single-video | 0.541s | 0.659s | 0.82x |
+| Qwen3-VL-8B  | 1 | single-image | 0.560s | 0.597s | 0.94x |
+| Qwen3-VL-8B  | 1 | single-video | 0.615s | 0.607s | **1.01x** |
+
 ### Key optimizations
 
 - **Fused RMSNorm**: Uses `sgl_kernel`'s fused residual-add + RMSNorm CUDA kernel, eliminating multiple kernel launches per norm call
