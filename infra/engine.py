@@ -671,6 +671,10 @@ class ModelRunner:
         slot_mapping = []
         block_size = self.block_size
 
+        use_mrope = self.is_qwen_vl and any(
+            getattr(s, 'mrope_positions', None) is not None for s in prefill_seqs)
+        mrope_pos_list = [] if use_mrope else None
+
         # --- Prefill portion ---
         pf_cu_q, pf_cu_k = [0], [0]
         pf_max_sq, pf_max_sk = 0, 0
@@ -680,7 +684,15 @@ class ModelRunner:
             start_pos = seq.num_computed_tokens
             chunk_ids = seq.token_ids[start_pos:start_pos + chunk_size]
             input_ids.extend(chunk_ids)
-            positions.extend(range(start_pos, start_pos + chunk_size))
+            if use_mrope and seq.mrope_positions is not None:
+                mrope_pos_list.append(seq.mrope_positions[:, start_pos:start_pos + chunk_size])
+            else:
+                positions.extend(range(start_pos, start_pos + chunk_size))
+                if use_mrope:
+                    mrope_pos_list.append(
+                        torch.arange(start_pos, start_pos + chunk_size,
+                                     dtype=torch.int64).unsqueeze(0).expand(3, -1)
+                    )
 
             kv_len = start_pos + chunk_size
             pf_cu_q.append(pf_cu_q[-1] + chunk_size)
@@ -714,7 +726,14 @@ class ModelRunner:
         dc_max_bt = 0
         for i, seq in enumerate(decode_seqs):
             input_ids.append(seq.last_token)
-            positions.append(len(seq) - 1)
+            pos = len(seq) - 1
+            if use_mrope:
+                delta = getattr(seq, 'mrope_position_delta', 0)
+                p = pos + delta
+                mrope_pos_list.append(
+                    torch.tensor([[p], [p], [p]], dtype=torch.int64))
+            else:
+                positions.append(pos)
             dc_cl[i] = len(seq)
             slot_mapping.append(
                 seq.block_table[-1] * block_size + seq.last_block_num_tokens - 1
@@ -729,7 +748,6 @@ class ModelRunner:
             dc_bt[i, :len(b)] = b
         dc_max_cl = int(dc_cl[:nd].max()) if nd > 0 else 0
 
-        # logit_indices: last token of each prefill chunk + all decode tokens
         logit_idx = []
         for i in range(num_prefill_seqs):
             logit_idx.append(pf_cu_q[i + 1] - 1)
@@ -751,10 +769,13 @@ class ModelRunner:
             decode_max_context_len=dc_max_cl,
             logit_indices=torch.tensor(logit_idx, dtype=torch.int64, pin_memory=True).cuda(non_blocking=True),
         )
-        return (
-            torch.tensor(input_ids, dtype=torch.int64, pin_memory=True).cuda(non_blocking=True),
-            torch.tensor(positions, dtype=torch.int64, pin_memory=True).cuda(non_blocking=True),
-        )
+
+        input_ids_t = torch.tensor(input_ids, dtype=torch.int64, pin_memory=True).cuda(non_blocking=True)
+        if use_mrope:
+            positions_t = torch.cat(mrope_pos_list, dim=1).to(torch.int64).pin_memory().cuda(non_blocking=True)
+        else:
+            positions_t = torch.tensor(positions, dtype=torch.int64, pin_memory=True).cuda(non_blocking=True)
+        return input_ids_t, positions_t
 
     @torch.inference_mode()
     def run_model(self, input_ids, positions, is_prefill, inputs_embeds=None,
@@ -1349,12 +1370,16 @@ class LlamaEngine:
                 video_pixel_values, video_grid_thw)
 
     @torch.inference_mode()
-    def _run_vision_encoder(self, seqs):
+    def _run_vision_encoder(self, seqs, chunk_sizes=None):
         """Run vision encoder with batching and caching.
 
         Images are batched into a single model.visual() call (concatenated
         pixel_values, stacked grid_thw). Videos are processed one-by-one to
         avoid OOM. Results are cached by id(seq) for reuse across steps.
+
+        If chunk_sizes is provided, only produces embeddings for the chunk
+        range [num_computed_tokens : num_computed_tokens + chunk_size] per seq,
+        enabling chunked multimodal prefill.
 
         Returns (inputs_embeds, deepstack_embeds) where deepstack_embeds is a
         list of tensors for Qwen3-VL DeepStack, or None for Qwen2-VL.
@@ -1366,7 +1391,6 @@ class LlamaEngine:
         video_token_id = self.model_runner.config.video_token_id
 
         # --- Phase 1: Run encoder for uncached sequences ---
-        # Collect uncached image inputs for batched encoding
         img_seqs = []
         img_pv_list = []
         img_thw_list = []
@@ -1401,7 +1425,6 @@ class LlamaEngine:
             for i, seq in enumerate(img_seqs):
                 thw = seq.image_grid_thw
                 n_items = len(thw) if isinstance(thw, list) else thw.shape[0]
-                seq_sizes = sizes[embed_idx:embed_idx + n_items]
                 seq_embeds = torch.cat(
                     per_seq_embeds[embed_idx:embed_idx + n_items], dim=0
                 ) if n_items > 1 else per_seq_embeds[embed_idx]
@@ -1418,7 +1441,6 @@ class LlamaEngine:
 
             del batched_pv, batched_thw
 
-        # Process uncached videos one-by-one
         for seq in seqs:
             if seq.video_pixel_values is not None and id(seq) not in self.encoder_cache:
                 video_pv = seq.video_pixel_values.cuda()
@@ -1441,28 +1463,45 @@ class LlamaEngine:
         all_deepstack = [] if has_deepstack else None
         embed_fn = model.get_input_embeddings()
 
-        for seq in seqs:
-            token_ids = torch.tensor(seq.token_ids, dtype=torch.int64, device="cuda")
-            text_embeds = embed_fn(token_ids)
+        for seq_idx, seq in enumerate(seqs):
+            full_ids = torch.tensor(seq.token_ids, dtype=torch.int64, device="cuda")
+
+            if chunk_sizes is not None:
+                start = seq.num_computed_tokens
+                end = start + chunk_sizes[seq_idx]
+                chunk_ids = full_ids[start:end]
+            else:
+                chunk_ids = full_ids
+                start = 0
+                end = len(full_ids)
+
+            text_embeds = embed_fn(chunk_ids)
             seq_deepstack = [] if has_deepstack else None
 
             cached = self.encoder_cache.get(id(seq))
             if cached is not None:
                 embeds, ds_features, modality = cached
-                if modality == "image":
-                    tok_id = image_token_id
-                else:
-                    tok_id = video_token_id
+                tok_id = image_token_id if modality == "image" else video_token_id
 
-                mask = token_ids == tok_id
+                mask = chunk_ids == tok_id
                 if mask.any():
-                    text_embeds[mask] = embeds.to(text_embeds.dtype)
+                    if chunk_sizes is not None:
+                        full_mask = full_ids == tok_id
+                        chunk_vis_start = full_mask[:start].sum().item()
+                        n_vis_in_chunk = mask.sum().item()
+                        chunk_embeds = embeds[chunk_vis_start:chunk_vis_start + n_vis_in_chunk]
+                        text_embeds[mask] = chunk_embeds.to(text_embeds.dtype)
+                    else:
+                        text_embeds[mask] = embeds.to(text_embeds.dtype)
 
                 if has_deepstack and ds_features:
                     for i_ds, ds_feat in enumerate(ds_features):
                         ds_expanded = torch.zeros_like(text_embeds)
                         if mask.any():
-                            ds_expanded[mask] = ds_feat.to(text_embeds.dtype)
+                            if chunk_sizes is not None:
+                                ds_expanded[mask] = ds_feat[chunk_vis_start:chunk_vis_start + n_vis_in_chunk].to(text_embeds.dtype)
+                            else:
+                                ds_expanded[mask] = ds_feat.to(text_embeds.dtype)
                         if modality == "video" and i_ds < len(seq_deepstack):
                             seq_deepstack[i_ds] = seq_deepstack[i_ds] + ds_expanded
                         else:
@@ -1523,7 +1562,11 @@ class LlamaEngine:
         if videos is None:
             videos = [None] * len(prompts)
 
-        for i, (prompt, sp) in enumerate(zip(prompts, sp_list)):
+        _preprocess_t0 = time.perf_counter()
+
+        def _make_seq(i):
+            prompt = prompts[i]
+            sp = sp_list[i]
             img = images[i] if i < len(images) else None
             vid = videos[i] if i < len(videos) else None
 
@@ -1538,7 +1581,6 @@ class LlamaEngine:
                 seq.video_pixel_values = video_pv
                 seq.video_grid_thw = video_grid_thw.tolist() if video_grid_thw is not None else None
 
-                # Compute M-RoPE positions
                 model = self.model_runner.model
                 merge_size = model.config.vision.spatial_merge_size
                 image_offsets = []
@@ -1575,19 +1617,27 @@ class LlamaEngine:
             elif self.is_qwen_vl:
                 ids = prompt if isinstance(prompt, list) else self.tokenizer.encode(prompt)
                 seq = Sequence(ids, max_tokens=sp.max_tokens, ignore_eos=sp.ignore_eos)
-                # Text-only with M-RoPE: all 3 dims same
                 seq.mrope_positions = torch.arange(len(ids), dtype=torch.int64).unsqueeze(0).expand(3, -1)
                 seq.mrope_position_delta = 0
             else:
                 ids = prompt if isinstance(prompt, list) else self.tokenizer.encode(prompt)
                 seq = Sequence(ids, max_tokens=sp.max_tokens, ignore_eos=sp.ignore_eos)
+            return seq
 
+        from concurrent.futures import ThreadPoolExecutor
+        with ThreadPoolExecutor(max_workers=8) as pool:
+            all_seqs_ordered = list(pool.map(_make_seq, range(len(prompts))))
+
+        for seq in all_seqs_ordered:
             waiting.append(seq)
             if collect_logits:
                 seq_logits[id(seq)] = []
 
         all_seqs = list(waiting)
         num_prompts = len(prompts)
+        _preprocess_time = time.perf_counter() - _preprocess_t0
+        if os.environ.get("KB_NANO_STEP_PROFILE") == "1":
+            print(f"[Profile] Preprocessing {num_prompts} seqs: {_preprocess_time:.3f}s")
 
         pbar = None
         if use_tqdm:
@@ -1610,6 +1660,15 @@ class LlamaEngine:
         _pbar_pending = 0
         _pbar_pending_in = 0
         _pbar_pending_out = 0
+
+        step_profile = {
+            "pure_decode": 0, "decode_tokens": 0, "decode_time": 0.0,
+            "pure_mm_prefill": 0, "mm_prefill_tokens": 0, "mm_prefill_time": 0.0,
+            "pure_text_prefill": 0, "text_prefill_tokens": 0,
+            "mixed_mm": 0, "mixed_mm_pf_tokens": 0, "mixed_mm_dc_tokens": 0, "mixed_mm_time": 0.0,
+            "mixed_text": 0, "mixed_text_pf_tokens": 0, "mixed_text_dc_tokens": 0,
+        }
+        _step_profile_active = os.environ.get("KB_NANO_STEP_PROFILE") == "1"
 
         def _finish_seq(seq: Sequence) -> None:
             nonlocal _pbar_pending, _pbar_pending_in, _pbar_pending_out
@@ -1652,6 +1711,10 @@ class LlamaEngine:
                     if len(seq) % block_size == 1:
                         need_blocks += 1
                 if need_blocks <= len(bm.free_block_ids):
+                    if _step_profile_active:
+                        _spt0 = time.perf_counter()
+                        step_profile["fast_decode"] = step_profile.get("fast_decode", 0) + 1
+                        step_profile["fast_decode_tokens"] = step_profile.get("fast_decode_tokens", 0) + len(running)
                     if _PROFILE:
                         _fp_t0 = time.perf_counter()
                     decode_seqs = list(running)
@@ -1700,8 +1763,6 @@ class LlamaEngine:
                             _fp['post'] += _fp_t4 - _fp_t3
                             _fp['n'] += 1
 
-                        # --- Inner decode loop: stay in fast path ---
-                        # Avoid re-entering the outer while loop overhead
                         use_incr = True
                         while running and not waiting and not prefilling:
                             if any_finished:
@@ -1716,6 +1777,9 @@ class LlamaEngine:
                                     need_blocks += 1
                             if need_blocks > len(bm.free_block_ids):
                                 break
+                            if os.environ.get("KB_NANO_STEP_PROFILE") == "1":
+                                step_profile["fast_decode"] = step_profile.get("fast_decode", 0) + 1
+                                step_profile["fast_decode_tokens"] = step_profile.get("fast_decode_tokens", 0) + n_dc
                             for seq in decode_seqs:
                                 if len(seq) % block_size == 1:
                                     seq.block_table.append(
@@ -1764,6 +1828,8 @@ class LlamaEngine:
                                     _fp['tolist'] += _fp_t3 - _fp_t2
                                     _fp['post'] += _fp_t4 - _fp_t3
                                     _fp['n'] += 1
+                    if _step_profile_active:
+                        step_profile["decode_time"] += time.perf_counter() - _spt0
                     continue
 
             elif running and not waiting and not prefilling:
@@ -1853,7 +1919,6 @@ class LlamaEngine:
                 total_peak += (seq.num_prompt_tokens + seq.max_tokens
                                + block_size - 1) // block_size
             encoder_budget = self.max_num_batched_tokens
-            num_video_prefills = 0
             while waiting and token_budget > 0:
                 seq = waiting[0]
                 prompt_len = seq.num_prompt_tokens
@@ -1861,13 +1926,9 @@ class LlamaEngine:
                 has_mm = self.is_qwen_vl and (
                     getattr(seq, 'pixel_values', None) is not None
                     or getattr(seq, 'video_pixel_values', None) is not None)
-                is_video = (getattr(seq, 'video_pixel_values', None)
-                            is not None)
 
                 if has_mm:
-                    chunk = prompt_len
-                    if is_video and num_video_prefills >= 1:
-                        break
+                    chunk = min(prompt_len, token_budget)
                     if chunk > encoder_budget:
                         break
                 else:
@@ -1892,8 +1953,6 @@ class LlamaEngine:
                 total_peak += seq_peak
                 if has_mm:
                     encoder_budget -= chunk
-                if is_video:
-                    num_video_prefills += 1
 
             if not decode_seqs and not prefill_seqs:
                 continue
@@ -1903,6 +1962,35 @@ class LlamaEngine:
             # =============================================================
             n_pf = len(prefill_seqs)
             n_dc = len(decode_seqs)
+
+            if _step_profile_active:
+                _spt0 = time.perf_counter()
+                _sp = step_profile
+                has_mm_step = self.is_qwen_vl and any(
+                    s.pixel_values is not None or s.video_pixel_values is not None
+                    for s in prefill_seqs
+                )
+                _sp_cat = None
+                if n_pf == 0:
+                    _sp["pure_decode"] += 1
+                    _sp["decode_tokens"] += n_dc
+                    _sp_cat = "decode_time"
+                elif n_dc == 0 and has_mm_step:
+                    _sp["pure_mm_prefill"] += 1
+                    _sp["mm_prefill_tokens"] += sum(prefill_chunk_sizes)
+                    _sp_cat = "mm_prefill_time"
+                elif n_dc == 0:
+                    _sp["pure_text_prefill"] += 1
+                    _sp["text_prefill_tokens"] += sum(prefill_chunk_sizes)
+                elif has_mm_step:
+                    _sp["mixed_mm"] += 1
+                    _sp["mixed_mm_pf_tokens"] += sum(prefill_chunk_sizes)
+                    _sp["mixed_mm_dc_tokens"] += n_dc
+                    _sp_cat = "mixed_mm_time"
+                else:
+                    _sp["mixed_text"] += 1
+                    _sp["mixed_text_pf_tokens"] += sum(prefill_chunk_sizes)
+                    _sp["mixed_text_dc_tokens"] += n_dc
 
             if n_pf == 0 and use_greedy:
                 # Pure decode with CUDA graphs (fast path)
@@ -1954,14 +2042,20 @@ class LlamaEngine:
                     for s in prefill_seqs
                 )
                 if has_mm:
-                    inputs_embeds, deepstack_embeds = self._run_vision_encoder(prefill_seqs)
-                    input_ids_t, positions_t = self.model_runner.prepare_prefill(prefill_seqs)
+                    inputs_embeds, deepstack_embeds = self._run_vision_encoder(
+                        prefill_seqs, chunk_sizes=prefill_chunk_sizes)
+                    input_ids_t, positions_t = self.model_runner.prepare_mixed_batch(
+                        prefill_seqs, prefill_chunk_sizes, [],
+                    )
                     logits = self.model_runner.run_model(
                         input_ids_t, positions_t, True,
                         inputs_embeds=inputs_embeds,
                         deepstack_embeds=deepstack_embeds,
                     )
                     reset_context()
+                    if _step_profile_active:
+                        torch.cuda.synchronize()
+                        step_profile["mm_prefill_time"] += time.perf_counter() - _spt0
                 else:
                     logits = self.model_runner.call(
                         "run_mixed", prefill_seqs, prefill_chunk_sizes, [],
@@ -1980,10 +2074,8 @@ class LlamaEngine:
                     for s in prefill_seqs
                 )
                 if has_mm:
-                    # Like vLLM v1: inputs_embeds must cover ALL tokens
-                    # (prefill + decode). Build prefill embeds via vision
-                    # encoder, then append text embeddings for decode tokens.
-                    pf_embeds, deepstack_embeds = self._run_vision_encoder(prefill_seqs)
+                    pf_embeds, deepstack_embeds = self._run_vision_encoder(
+                        prefill_seqs, chunk_sizes=prefill_chunk_sizes)
                     embed_fn = self.model_runner.model.get_input_embeddings()
                     dc_ids = torch.tensor(
                         [s.last_token for s in decode_seqs],
@@ -2007,6 +2099,9 @@ class LlamaEngine:
                         deepstack_embeds=deepstack_embeds,
                     )
                     reset_context()
+                    if _step_profile_active:
+                        torch.cuda.synchronize()
+                        step_profile["mixed_mm_time"] += time.perf_counter() - _spt0
                 else:
                     logits = self.model_runner.call(
                         "run_mixed", prefill_seqs, prefill_chunk_sizes, decode_seqs,
@@ -2045,6 +2140,21 @@ class LlamaEngine:
         if pbar is not None:
             _flush_pbar()
             pbar.close()
+
+        if _step_profile_active:
+            sp = step_profile
+            fd = sp.get("fast_decode", 0)
+            fdt = sp.get("fast_decode_tokens", 0)
+            slow = (sp["pure_decode"] + sp["pure_mm_prefill"]
+                    + sp["pure_text_prefill"] + sp["mixed_mm"] + sp["mixed_text"])
+            total = fd + slow
+            print(f"\n[Step Profile] total_steps={total} (fast_decode={fd}, scheduled={slow})")
+            print(f"  fast_decode:       {fd:6d} steps, {fdt:10d} tokens, {sp['decode_time']:.3f}s")
+            print(f"  pure_decode:       {sp['pure_decode']:6d} steps, {sp['decode_tokens']:10d} tokens")
+            print(f"  pure_text_prefill: {sp['pure_text_prefill']:6d} steps, {sp['text_prefill_tokens']:10d} tokens")
+            print(f"  pure_mm_prefill:   {sp['pure_mm_prefill']:6d} steps, {sp['mm_prefill_tokens']:10d} tokens, {sp['mm_prefill_time']:.3f}s")
+            print(f"  mixed_text:        {sp['mixed_text']:6d} steps, pf={sp['mixed_text_pf_tokens']:10d} dc={sp['mixed_text_dc_tokens']:10d}")
+            print(f"  mixed_mm:          {sp['mixed_mm']:6d} steps, pf={sp['mixed_mm_pf_tokens']:10d} dc={sp['mixed_mm_dc_tokens']:10d}, {sp['mixed_mm_time']:.3f}s")
 
         # Return in original order
         return [
