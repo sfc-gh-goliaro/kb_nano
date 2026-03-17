@@ -1,0 +1,85 @@
+"""Qwen3-Next decoder layer: hybrid GDN/full attention + MoE.
+
+Dispatches to GDN linear attention or full attention based on layer type.
+All layers use MoE (every layer is sparse in Qwen3-Next).
+Uses GemmaRMSNorm (weight + 1 convention).
+"""
+
+from __future__ import annotations
+
+import torch.nn as nn
+
+from ..L1.gemma_rms_norm import GemmaRMSNorm
+from ..L2.qwen3_next_gdn_attention import Qwen3NextGDNAttention
+from ..L2.qwen3_next_attention import Qwen3NextAttention
+from ..L2.qwen3_next_moe import Qwen3NextMoE
+
+
+class Qwen3NextDecoderLayer(nn.Module):
+    def __init__(self, config, layer_idx: int):
+        super().__init__()
+        self.layer_idx = layer_idx
+        self.layer_type = config.layer_types[layer_idx]
+
+        if self.layer_type == "linear_attention":
+            self.linear_attn = Qwen3NextGDNAttention(
+                hidden_size=config.hidden_size,
+                num_k_heads=config.linear_num_key_heads,
+                num_v_heads=config.linear_num_value_heads,
+                head_k_dim=config.linear_key_head_dim,
+                head_v_dim=config.linear_value_head_dim,
+                conv_kernel_size=config.linear_conv_kernel_dim,
+                rms_norm_eps=config.rms_norm_eps,
+            )
+        elif self.layer_type == "full_attention":
+            self.self_attn = Qwen3NextAttention(
+                hidden_size=config.hidden_size,
+                num_attention_heads=config.num_attention_heads,
+                num_key_value_heads=config.num_key_value_heads,
+                head_dim=config.head_dim,
+                rms_norm_eps=config.rms_norm_eps,
+            )
+        else:
+            raise ValueError(f"Invalid layer_type: {self.layer_type}")
+
+        # MoE for all layers
+        self.mlp = Qwen3NextMoE(config)
+
+        self.input_layernorm = GemmaRMSNorm(config.hidden_size, eps=config.rms_norm_eps)
+        self.post_attention_layernorm = GemmaRMSNorm(
+            config.hidden_size, eps=config.rms_norm_eps
+        )
+
+    def forward(self, hidden_states, residual, positions=None,
+                rotary_emb=None, layer_state=None):
+        # sgl_kernel RMSNorm requires 2D
+        shape = hidden_states.shape
+        h2d = hidden_states.reshape(-1, shape[-1])
+
+        if residual is None:
+            residual = h2d
+            hidden_states = self.input_layernorm(h2d)
+        else:
+            residual = residual.reshape(-1, shape[-1])
+            hidden_states, residual = self.input_layernorm(h2d, residual)
+
+        # Attention
+        if self.layer_type == "linear_attention":
+            hidden_states = hidden_states.reshape(shape)
+            hidden_states = self.linear_attn(hidden_states, layer_state=layer_state)
+        else:
+            hidden_states = hidden_states.reshape(shape)
+            hidden_states = self.self_attn(
+                hidden_states, rotary_emb=rotary_emb, positions=positions,
+                layer_state=layer_state,
+            )
+
+        # Post-attention norm + MLP
+        shape_out = hidden_states.shape
+        h2d = hidden_states.reshape(-1, shape_out[-1])
+        r2d = residual.reshape(-1, shape_out[-1]) if residual.dim() != 2 else residual
+        hidden_states, residual = self.post_attention_layernorm(h2d, r2d)
+        hidden_states = hidden_states.reshape(shape_out)
+        hidden_states = self.mlp(hidden_states)
+
+        return hidden_states, residual
