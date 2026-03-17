@@ -71,7 +71,13 @@ class QKVParallelLinear(nn.Module):
         tp = _tp_size()
         self.head_size = head_size
         self.num_heads = total_num_heads // tp
-        self.num_kv_heads = total_num_kv_heads // tp
+        # Replicate KV heads when not evenly divisible by TP
+        if total_num_kv_heads % tp == 0:
+            self.num_kv_heads = total_num_kv_heads // tp
+            self._replicate_kv = False
+        else:
+            self.num_kv_heads = total_num_kv_heads
+            self._replicate_kv = True
         output_size = (self.num_heads + 2 * self.num_kv_heads) * head_size
         self.weight = nn.Parameter(torch.empty(output_size, hidden_size))
         self.weight.weight_loader = self._weight_loader
@@ -86,14 +92,16 @@ class QKVParallelLinear(nn.Module):
         if shard_id == "q":
             shard_size = self.num_heads * self.head_size
             shard_offset = 0
+            src = loaded_weight.chunk(tp, 0)[rank]
         elif shard_id == "k":
             shard_size = self.num_kv_heads * self.head_size
             shard_offset = self.num_heads * self.head_size
+            src = loaded_weight if self._replicate_kv else loaded_weight.chunk(tp, 0)[rank]
         else:
             shard_size = self.num_kv_heads * self.head_size
             shard_offset = self.num_heads * self.head_size + self.num_kv_heads * self.head_size
+            src = loaded_weight if self._replicate_kv else loaded_weight.chunk(tp, 0)[rank]
         dst = param.data.narrow(0, shard_offset, shard_size)
-        src = loaded_weight.chunk(tp, 0)[rank]
         dst.copy_(src)
 
     def forward(self, x):
