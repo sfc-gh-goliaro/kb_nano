@@ -355,6 +355,27 @@ Latency (batch size 1, 128 output tokens, 5 iterations):
 | Qwen3-VL-8B  | 1 | single-image | 0.559s | 0.578s | 0.97x |
 | Qwen3-VL-8B  | 1 | single-video | 0.613s | 0.593s | **1.03x** |
 
+### Qwen3-VL FP8 (W8A8 block-quantized)
+
+FP8 support uses `Qwen/Qwen3-VL-8B-Instruct-FP8` with block-scaled FP8 GEMM via DeepGEMM. Vision encoder and lm_head remain in BF16; only LLM decoder layers use FP8.
+
+Throughput (1000 sequences per scenario, `temperature=0`, `max_model_len=16896`):
+
+| Model | TP | Scenario | Output | vLLM (tok/s) | Ours (tok/s) | Ratio | Avg Match Tokens |
+|-------|---:|----------|-------:|-------------:|-------------:|------:|-----------------:|
+| Qwen3-VL-8B-FP8 | 1 | text-only | 1024 | 23,002 | 13,508 | 0.59x | 765.3/1024 |
+| Qwen3-VL-8B-FP8 | 1 | image     |  512 | 16,282 |  8,248 | 0.51x |   74.3/512 |
+| Qwen3-VL-8B-FP8 | 1 | video     |  512 |  3,325 |  7,409 | **2.23x** | 102.2/512 |
+
+Latency (batch size 1, 128 output tokens, 5 iterations):
+
+| Model | TP | Scenario | vLLM median | Ours median | Ratio |
+|-------|---:|----------|------------:|------------:|------:|
+| Qwen3-VL-8B-FP8 | 1 | single-image | 0.514s | 0.917s | 0.56x |
+| Qwen3-VL-8B-FP8 | 1 | single-video | 0.556s | 0.928s | 0.60x |
+
+Note: vLLM uses `torch.compile` + DeepGEMM E8M0 with fused quantization kernels, giving it a significant advantage on text-heavy and image workloads. kb-nano uses eager-mode FP8 with in-place per-token-group quantization and CUDA graph capture for decode.
+
 ### Key optimizations
 
 - **Fused RMSNorm**: Uses `sgl_kernel`'s fused residual-add + RMSNorm CUDA kernel, eliminating multiple kernel launches per norm call

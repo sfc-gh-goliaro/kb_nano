@@ -206,7 +206,7 @@ class Qwen3VisionTransformer(nn.Module):
 # ---- Language Model ----
 
 class Qwen3Model(nn.Module):
-    def __init__(self, config: Qwen3VLConfig):
+    def __init__(self, config: Qwen3VLConfig, quant_config: dict | None = None):
         super().__init__()
         self.embed_tokens = VocabParallelEmbedding(config.vocab_size, config.hidden_size)
         self.rotary_emb = MRotaryEmbedding(
@@ -215,7 +215,8 @@ class Qwen3Model(nn.Module):
             config.mrope_interleaved,
         )
         self.layers = nn.ModuleList([
-            LlamaDecoderLayer(config, rotary_emb=self.rotary_emb, qk_norm=True)
+            LlamaDecoderLayer(config, rotary_emb=self.rotary_emb, qk_norm=True,
+                              quant_config=quant_config)
             for _ in range(config.num_hidden_layers)
         ])
         self.norm = RMSNorm(config.hidden_size, eps=config.rms_norm_eps)
@@ -244,11 +245,12 @@ class Qwen3VLForConditionalGeneration(nn.Module):
         "up_proj": ("gate_up_proj", 1),
     }
 
-    def __init__(self, config: Qwen3VLConfig):
+    def __init__(self, config: Qwen3VLConfig, quant_config: dict | None = None):
         super().__init__()
         self.config = config
+        self.quant_config = quant_config
         self.visual = Qwen3VisionTransformer(config.vision)
-        self.model = Qwen3Model(config)
+        self.model = Qwen3Model(config, quant_config=quant_config)
         self.lm_head = ParallelLMHead(config.vocab_size, config.hidden_size)
         self._mrope_positions = MRopeInputPositions()
 

@@ -275,6 +275,7 @@ class ModelRunner:
         self._share_trtllm_workspace()
         self._share_activation_buffers()
         self.warmup_model()
+        self._warmup_deepgemm()
         self.allocate_kv_cache()
         if not self.enforce_eager:
             self.capture_cudagraph()
@@ -402,6 +403,56 @@ class ModelRunner:
         self.run(seqs, True)
 
         torch.cuda.empty_cache()
+
+    def _warmup_deepgemm(self):
+        """Pre-JIT DeepGEMM FP8 kernels for all weight shapes at decode batch
+        sizes, and pre-allocate FP8 activation buffers for CUDA graph capture."""
+        from ..tasks.baseline.L1.linear import Fp8Linear
+        import deep_gemm
+
+        fp8_modules = []
+        for module in self.model.modules():
+            linear_op = getattr(module, 'linear_op', None)
+            if isinstance(linear_op, Fp8Linear):
+                fp8_modules.append((module, linear_op))
+
+        if not fp8_modules:
+            return
+
+        max_tokens = self.max_num_seqs
+        device = next(self.model.parameters()).device
+        bs_list = [1, 2, 4, 8] + list(range(16, max_tokens + 1, 16))
+
+        seen_shapes = set()
+        for module, linear_op in fp8_modules:
+            w = module.weight
+            ws = module.weight_scale_inv
+            N, K = w.shape
+
+            linear_op._ensure_buffers(max_tokens, K, N, device)
+
+            key = (N, K)
+            if key in seen_shapes:
+                continue
+            seen_shapes.add(key)
+
+            a_fp8 = linear_op._a_buf
+            a_scale = linear_op._s_buf
+            out = linear_op._o_buf
+
+            for num_tokens in bs_list:
+                if num_tokens > max_tokens:
+                    break
+                deep_gemm.fp8_gemm_nt(
+                    (a_fp8[:num_tokens], a_scale[:num_tokens]),
+                    (w, ws),
+                    out[:num_tokens],
+                )
+
+        torch.cuda.synchronize()
+        torch.cuda.empty_cache()
+        if self.rank == 0:
+            print(f"  DeepGEMM warmup: {len(seen_shapes)} unique FP8 weight shapes")
 
     def _warmup_vision_encoder(self):
         """Run vision encoder with worst-case dummy inputs to capture peak
