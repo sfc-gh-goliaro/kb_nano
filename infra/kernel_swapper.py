@@ -41,10 +41,14 @@ _KB_ROOT = KB_ROOT
 _CANDIDATE_DIR = CANDIDATE_DIR
 
 _L4_MODEL_KEYS: dict[str, str] = {
+    "gla": "gla",
     "llama": "llama31",
+    "mamba": "mamba",
+    "mamba2": "mamba2",
     "mixtral": "mixtral",
     "qwen2_vl": "qwen2_vl",
     "qwen3_vl": "qwen3_vl",
+    "rwkv7": "rwkv7",
 }
 
 

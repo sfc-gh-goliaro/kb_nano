@@ -27,47 +27,27 @@ import numpy as np
 import torch
 import torch.distributed as dist
 import torch.multiprocessing as mp
-from transformers import AutoTokenizer
+from transformers import AutoConfig, AutoTokenizer
 
-from .context import (
-    AttnBackendConfig, get_attn_backend_config, get_context,
-    reset_context, set_context, set_mixed_context,
-)
+from .context import get_context, reset_context, set_context, set_mixed_context
+from .gla_state import GLAStateManager
+from .kimi_linear_state import KimiLinearStateManager
+from .mamba_state import MambaStateManager
+from .rwkv7_state import RWKV7StateManager
 from ..tasks.baseline.L1.allreduce import set_custom_ar
 from .weight_loader import load_model
 
-MAX_MODEL_LEN = 131072
+BLOCK_SIZE = 256
+MAX_NUM_BATCHED_TOKENS = 16384
+MAX_NUM_SEQS = 512
+MAX_MODEL_LEN = 8192
 NCCL_PORT = int(os.environ.get("KB_NANO_NCCL_PORT", "29501"))
 
-
-
-def _detect_scheduling_defaults() -> tuple[int, int]:
-    """Choose max_num_batched_tokens and max_num_seqs based on GPU memory.
-
-    Mirrors vLLM's heuristic: high-memory GPUs (>=70 GiB, non-A100) get
-    larger defaults; everything else gets conservative values.
-    """
-    if not torch.cuda.is_available():
-        return 8192, 256
-    _GiB = 1 << 30
-    _, total = torch.cuda.mem_get_info()
-    name = torch.cuda.get_device_name(0).lower()
-    if total >= 70 * _GiB and "a100" not in name:
-        return 16384, 1024
-    return 8192, 256
-
-
-_DEFAULT_MAX_NUM_BATCHED_TOKENS, _DEFAULT_MAX_NUM_SEQS = (
-    _detect_scheduling_defaults()
-)
+# Placeholder token IDs for Qwen VL models
+QWEN_IMAGE_PAD_ID = 151655  # <|image_pad|>
+QWEN_VIDEO_PAD_ID = 151656  # <|video_pad|>
 
 _PROFILE = os.environ.get("KB_NANO_PROFILE", "0") == "1"
-
-
-ATTN_BACKEND_CONFIG = get_attn_backend_config()
-USE_TRTLLM = ATTN_BACKEND_CONFIG.use_trtllm
-BLOCK_SIZE = ATTN_BACKEND_CONFIG.block_size
-USE_FLASHINFER = USE_TRTLLM  # back-compat alias
 
 
 # ---------------------------------------------------------------------------
@@ -115,6 +95,7 @@ class Sequence:
         self.block_table: list[int] = []
         self.status = SeqStatus.WAITING
         self.num_computed_tokens: int = 0
+        self.state_slot: int | None = None
         # Multimodal fields
         self.pixel_values = None  # preprocessed image pixels
         self.image_grid_thw = None  # list of [t, h, w] per image
@@ -157,26 +138,28 @@ class Sequence:
         blocks_after = (total_after + BLOCK_SIZE - 1) // BLOCK_SIZE
         return max(0, blocks_after - len(self.block_table))
 
-    def preempt(self):
-        """Reset to re-prefillable state (vLLM-style recompute preemption)."""
-        self.token_ids = list(self.prompt_ids)
-        self.generated_ids.clear()
-        self.block_table.clear()
-        self.num_computed_tokens = 0
-        self.status = SeqStatus.WAITING
-
     def append_token(self, token_id):
         self.token_ids.append(token_id)
         self.generated_ids.append(token_id)
 
     def __getstate__(self):
         """Minimal pickling for shared memory transfer to non-rank-0 workers."""
-        return (len(self), len(self.prompt_ids), self.block_table,
-                self.num_computed_tokens,
-                self.token_ids if not self.generated_ids else self.last_token)
+        return (
+            len(self),
+            len(self.prompt_ids),
+            self.block_table,
+            self.num_computed_tokens,
+            self.state_slot,
+            self.token_ids if not self.generated_ids else self.last_token,
+        )
 
     def __setstate__(self, state):
-        self._num_tokens, num_prompt, self.block_table, self.num_computed_tokens = state[:-1]
+        if len(state) == 6:
+            self._num_tokens, num_prompt, self.block_table, self.num_computed_tokens, self.state_slot = state[:-1]
+        else:
+            # Backward-compatible fallback for older pickled tuples.
+            self._num_tokens, num_prompt, self.block_table, self.num_computed_tokens = state[:-1]
+            self.state_slot = None
         if isinstance(state[-1], list):
             self.token_ids = state[-1]
         else:
@@ -191,12 +174,7 @@ class Sequence:
 # ---------------------------------------------------------------------------
 class BlockManager:
     def __init__(self, num_blocks: int):
-        self._num_blocks = num_blocks
         self.free_block_ids: deque[int] = deque(range(num_blocks))
-
-    def reset(self):
-        """Return all blocks to the free pool."""
-        self.free_block_ids = deque(range(self._num_blocks))
 
     def can_allocate(self, seq):
         return len(self.free_block_ids) >= seq.num_blocks
@@ -230,21 +208,13 @@ class BlockManager:
 class ModelRunner:
     def __init__(self, model_name: str, rank: int, world_size: int,
                  dtype: torch.dtype, enforce_eager: bool,
-                 event, shm_name: str,
-                 gpu_memory_utilization: float = 0.9,
-                 max_model_len: int = MAX_MODEL_LEN,
-                 max_num_seqs: int | None = None,
-                 max_num_batched_tokens: int | None = None):
-        self.model_name = model_name
+                 event, shm_name: str):
         self.rank = rank
         self.world_size = world_size
         self.enforce_eager = enforce_eager
         self.event = event
         self.block_size = BLOCK_SIZE
-        self.gpu_memory_utilization = gpu_memory_utilization
-        self.max_model_len = ((max_model_len + BLOCK_SIZE - 1) // BLOCK_SIZE + 2) * BLOCK_SIZE
-        self.max_num_seqs = max_num_seqs if max_num_seqs is not None else _DEFAULT_MAX_NUM_SEQS
-        self.max_num_batched_tokens = max_num_batched_tokens if max_num_batched_tokens is not None else _DEFAULT_MAX_NUM_BATCHED_TOKENS
+        self._model_dtype = dtype
 
         torch.cuda.set_device(rank)
         dist.init_process_group(
@@ -263,7 +233,6 @@ class ModelRunner:
                 )
                 set_custom_ar(self.custom_ar)
 
-        self.dtype = dtype
         default_dtype = torch.get_default_dtype()
         torch.set_default_dtype(dtype)
         torch.set_default_device("cuda")
@@ -271,14 +240,21 @@ class ModelRunner:
         self.model, self.config = load_model(
             model_name, torch.device(f"cuda:{rank}"), dtype,
         )
+        model_type = getattr(self.config, "model_type", "")
+        self.model_family = (
+            "mamba" if model_type in {"mamba", "mamba2", "gla", "rwkv7", "kimi_linear", "qwen3_next"}
+            else "attention"
+        )
+        self.is_moe = hasattr(self.config, "num_local_experts")
         self.is_qwen_vl = hasattr(self.config, "mrope_section")
-        self._share_trtllm_workspace()
-        self._share_activation_buffers()
-        self.warmup_model()
-        self.allocate_kv_cache()
-        if not self.enforce_eager:
-            self.capture_cudagraph()
-        self._init_greedy_buffers()
+        if self.model_family == "attention":
+            self.warmup_model()
+            self.allocate_kv_cache()
+            if not self.enforce_eager:
+                self.capture_cudagraph()
+            self._init_greedy_buffers()
+        else:
+            self.allocate_mamba_state_cache()
         torch.set_default_device("cpu")
         torch.set_default_dtype(default_dtype)
 
@@ -357,156 +333,15 @@ class ModelRunner:
             self._signal_workers()
         return getattr(self, method_name)(*args)
 
-    def _share_trtllm_workspace(self):
-        """Replace per-layer TRTLLM workspace buffers with a single shared one."""
-        if not ATTN_BACKEND_CONFIG.use_trtllm:
-            return
-        self._attn_layers = []
-        for module in self.model.modules():
-            if hasattr(module, "k_cache") and hasattr(module, "v_cache"):
-                self._attn_layers.append(module)
-        trtllm_workspace = torch.zeros(
-            512 * 1024 * 1024, dtype=torch.uint8, device=f"cuda:{self.rank}"
-        )
-        for layer in self._attn_layers:
-            layer.set_trtllm_workspace(trtllm_workspace)
-        torch.cuda.empty_cache()
-
-    def _share_activation_buffers(self):
-        """Share a single SiluAndMul activation buffer across all layers.
-
-        Layers execute sequentially so the buffer is safe to reuse.
-        Must be called before warmup so only one buffer grows to max size
-        instead of one per layer (saves ~14 GiB for 32-layer models).
-        """
-        from ..tasks.baseline.L1.silu_and_mul import SiluAndMul
-        silu_modules = [
-            m for m in self.model.modules() if isinstance(m, SiluAndMul)
-        ]
-        if len(silu_modules) <= 1:
-            return
-        shared = silu_modules[0]._act_buf
-        for m in silu_modules[1:]:
-            m.set_shared_buffer(shared)
-
     def warmup_model(self):
         torch.cuda.empty_cache()
         torch.cuda.reset_peak_memory_stats()
-
-        if self.is_qwen_vl:
-            self._warmup_vision_encoder()
-
-        warmup_len = min(self.max_model_len, self.max_num_batched_tokens)
-        num_seqs = min(self.max_num_batched_tokens // warmup_len, self.max_num_seqs)
-        seqs = [Sequence([0] * warmup_len) for _ in range(num_seqs)]
+        num_seqs = min(MAX_NUM_BATCHED_TOKENS // MAX_MODEL_LEN, MAX_NUM_SEQS)
+        seqs = [Sequence([0] * MAX_MODEL_LEN) for _ in range(num_seqs)]
         self.run(seqs, True)
-
         torch.cuda.empty_cache()
 
-    def _warmup_vision_encoder(self):
-        """Run vision encoder with worst-case dummy inputs to capture peak
-        activation memory, following vLLM's profile_run() approach."""
-        import math
-        from PIL import Image
-
-        model = self.model
-        vision_cfg = self.config.vision
-        patch_size = vision_cfg.patch_size
-        merge_size = vision_cfg.spatial_merge_size
-        temporal_patch_size = getattr(vision_cfg, "temporal_patch_size", 2)
-
-        max_pixels = getattr(vision_cfg, "max_pixels", None)
-        if max_pixels is None:
-            max_pixels = 1280 * 28 * 28
-
-        unit = patch_size * merge_size
-        max_patches = max_pixels // (unit * unit)
-
-        def _closest_factor_pair(n):
-            for d in range(math.isqrt(n), 0, -1):
-                if n % d == 0:
-                    return d, n // d
-            return 1, n
-
-        hf, wf = 1, max_patches
-        for s in range(max_patches, 0, -1):
-            hf, wf = _closest_factor_pair(s)
-            if wf / hf <= 200:
-                break
-        img_h, img_w = unit * hf, unit * wf
-
-        if self.rank == 0:
-            print(f"  Vision warmup: image {img_w}x{img_h}")
-
-        dummy_img = Image.new("RGB", (img_w, img_h), color=255)
-        from transformers import AutoProcessor
-        processor = AutoProcessor.from_pretrained(
-            self.model_name, trust_remote_code=True)
-        messages = [{"role": "user", "content": [
-            {"type": "image", "image": dummy_img},
-            {"type": "text", "text": "x"},
-        ]}]
-        text = processor.apply_chat_template(
-            messages, tokenize=False, add_generation_prompt=True)
-        inputs = processor(
-            text=[text], images=[dummy_img], return_tensors="pt", padding=True)
-
-        pv = inputs["pixel_values"].cuda()
-        grid_thw = inputs["image_grid_thw"].cpu()
-        with torch.inference_mode():
-            vis_out = model.visual(pv, grid_thw=grid_thw)
-
-        self._warmup_encoder_cache = {}
-        if isinstance(vis_out, tuple):
-            embeds, ds = vis_out
-            self._warmup_encoder_cache["img"] = (embeds, ds)
-        else:
-            self._warmup_encoder_cache["img"] = vis_out
-
-        num_frames = 32
-        padded_nf = num_frames + num_frames % temporal_patch_size
-        vid_h = min(img_h, 420)
-        vid_w = min(img_w, 420)
-        vid_h = (vid_h // unit) * unit or unit
-        vid_w = (vid_w // unit) * unit or unit
-
-        if self.rank == 0:
-            print(f"  Vision warmup: video {num_frames}f {vid_w}x{vid_h}")
-
-        dummy_vid = np.full(
-            (num_frames, vid_h, vid_w, 3), 255, dtype=np.uint8)
-        messages = [{"role": "user", "content": [
-            {"type": "video", "video": list(dummy_vid)},
-            {"type": "text", "text": "x"},
-        ]}]
-        text = processor.apply_chat_template(
-            messages, tokenize=False, add_generation_prompt=True)
-        vid_frames_pil = [Image.fromarray(f) for f in dummy_vid]
-        inputs = processor(
-            text=[text], videos=[vid_frames_pil],
-            return_tensors="pt", padding=True)
-
-        vpv = inputs["pixel_values_videos"].cuda()
-        vgrid = inputs["video_grid_thw"].cpu()
-        with torch.inference_mode():
-            vis_out = model.visual(vpv, grid_thw=vgrid)
-
-        if isinstance(vis_out, tuple):
-            embeds, ds = vis_out
-            self._warmup_encoder_cache["vid"] = (embeds, ds)
-        else:
-            self._warmup_encoder_cache["vid"] = vis_out
-
-        del processor, dummy_img, dummy_vid, vid_frames_pil, pv, vpv
-        del inputs, messages, text
-
     def allocate_kv_cache(self):
-        if not hasattr(self, '_attn_layers') or not self._attn_layers:
-            self._attn_layers = []
-            for module in self.model.modules():
-                if hasattr(module, "k_cache") and hasattr(module, "v_cache"):
-                    self._attn_layers.append(module)
-
         free, total = torch.cuda.mem_get_info()
         used = total - free
         peak = torch.cuda.memory_stats()["allocated_bytes.all.peak"]
@@ -516,38 +351,169 @@ class ModelRunner:
         num_layers = self.config.num_hidden_layers
         elem_size = torch.finfo(torch.get_default_dtype()).bits // 8
         block_bytes = 2 * num_layers * BLOCK_SIZE * num_kv_heads * head_dim * elem_size
-        num_blocks = int(total * self.gpu_memory_utilization - used - peak + current) // block_bytes
-        if self.is_qwen_vl:
-            num_blocks = int(num_blocks * 0.95)
+        num_blocks = int(total * 0.9 - used - peak + current) // block_bytes
         assert num_blocks > 0, f"Not enough GPU memory for KV cache on rank {self.rank}"
         self.num_blocks = num_blocks
         if self.rank == 0:
             print(f"  KV cache: {num_blocks} blocks x {BLOCK_SIZE} = {num_blocks * BLOCK_SIZE} token slots")
 
-        if ATTN_BACKEND_CONFIG.kv_layout == "HND":
-            self.kv_cache = torch.empty(
-                2, num_layers, num_blocks, num_kv_heads, BLOCK_SIZE, head_dim,
-            )
-        else:
-            self.kv_cache = torch.empty(
-                2, num_layers, num_blocks, BLOCK_SIZE, num_kv_heads, head_dim,
-            )
+        self.kv_cache = torch.empty(
+            2, num_layers, num_blocks, BLOCK_SIZE, num_kv_heads, head_dim,
+        )
         layer_id = 0
-        for module in self._attn_layers:
-            module.k_cache = self.kv_cache[0, layer_id]
-            module.v_cache = self.kv_cache[1, layer_id]
-            layer_id += 1
+        for module in self.model.modules():
+            if hasattr(module, "k_cache") and hasattr(module, "v_cache"):
+                module.k_cache = self.kv_cache[0, layer_id]
+                module.v_cache = self.kv_cache[1, layer_id]
+                layer_id += 1
 
+    def allocate_mamba_state_cache(self):
+        free, total = torch.cuda.mem_get_info()
+        used = total - free
+        peak = torch.cuda.memory_stats()["allocated_bytes.all.peak"]
+        current = torch.cuda.memory_stats()["allocated_bytes.all.current"]
+        model_type = getattr(self.config, "model_type", "")
+        num_layers = self.config.num_hidden_layers
+
+        if model_type == "kimi_linear":
+            # Kimi-Linear: lightweight slot-based state (dicts populated at runtime)
+            num_slots = MAX_NUM_SEQS
+            self.mamba_state_manager = KimiLinearStateManager(
+                num_hidden_layers=num_layers,
+                num_slots=num_slots,
+            )
+            self.num_state_slots = num_slots
+            if self.rank == 0:
+                print(f"  Kimi-Linear state cache: {num_slots} sequence slots")
+            return
+
+        if model_type == "qwen3_next":
+            # Qwen3-Next: lightweight slot-based state (dicts populated at runtime)
+            # Reuse KimiLinearStateManager for simplicity
+            num_slots = MAX_NUM_SEQS
+            self.mamba_state_manager = KimiLinearStateManager(
+                num_hidden_layers=num_layers,
+                num_slots=num_slots,
+            )
+            self.num_state_slots = num_slots
+            if self.rank == 0:
+                print(f"  Qwen3-Next state cache: {num_slots} sequence slots")
+            return
+
+        if model_type == "gla":
+            num_heads = self.config.num_heads
+            key_dim = int(self.config.hidden_size * self.config.expand_k)
+            value_dim = int(self.config.hidden_size * self.config.expand_v)
+            head_k_dim = key_dim // num_heads
+            head_v_dim = value_dim // num_heads
+            state_dtype = torch.float32
+            elem_size = torch.finfo(state_dtype).bits // 8
+            per_layer_bytes = num_heads * head_k_dim * head_v_dim * elem_size
+            per_slot_bytes = num_layers * per_layer_bytes
+            budget = int(total * 0.9 - used - peak + current)
+            num_slots = max(1, min(MAX_NUM_SEQS, budget // max(1, per_slot_bytes)))
+
+            self.mamba_state_manager = GLAStateManager(
+                num_hidden_layers=num_layers,
+                num_heads=num_heads,
+                head_k_dim=head_k_dim,
+                head_v_dim=head_v_dim,
+                num_slots=num_slots,
+                dtype=state_dtype,
+                device=torch.device(f"cuda:{self.rank}"),
+            )
+            self.num_state_slots = num_slots
+            if self.rank == 0:
+                print(f"  GLA state cache: {num_slots} sequence slots")
+            return
+
+        if model_type == "rwkv7":
+            num_heads = int(self.config.num_heads)
+            head_dim = int(self.config.head_dim)
+            value_dims = getattr(self.config, "value_dim", None)
+            if value_dims is None:
+                value_dims = [self.config.hidden_size] * num_layers
+            elif isinstance(value_dims, int):
+                value_dims = [value_dims] * num_layers
+            head_v_dims = [int(v // num_heads) for v in value_dims]
+
+            conv_elem_size = torch.finfo(self._model_dtype).bits // 8
+            recurrent_elem_size = torch.finfo(torch.float32).bits // 8
+            conv_bytes = num_layers * 2 * self.config.hidden_size * conv_elem_size
+            recurrent_bytes = sum(
+                num_heads * head_dim * head_v_dim * recurrent_elem_size
+                for head_v_dim in head_v_dims
+            )
+            per_slot_bytes = conv_bytes + recurrent_bytes
+            budget = int(total * 0.9 - used - peak + current)
+            num_slots = max(1, min(MAX_NUM_SEQS, budget // max(1, per_slot_bytes)))
+
+            self.mamba_state_manager = RWKV7StateManager(
+                num_hidden_layers=num_layers,
+                hidden_size=self.config.hidden_size,
+                num_heads=num_heads,
+                head_dim=head_dim,
+                head_v_dims=head_v_dims,
+                num_slots=num_slots,
+                conv_dtype=self._model_dtype,
+                recurrent_dtype=torch.float32,
+                device=torch.device(f"cuda:{self.rank}"),
+            )
+            self.num_state_slots = num_slots
+            if self.rank == 0:
+                print(f"  RWKV7 state cache: {num_slots} sequence slots")
+            return
+
+        elem_size = torch.finfo(self._model_dtype).bits // 8
+        if model_type == "mamba2":
+            intermediate_size = getattr(
+                self.config,
+                "intermediate_size",
+                int(self.config.expand * self.config.hidden_size),
+            )
+            conv_dim = intermediate_size + 2 * self.config.n_groups * self.config.state_size
+            ssm_state_shape = (
+                self.config.num_heads,
+                self.config.head_dim,
+                self.config.state_size,
+            )
+            per_layer_bytes = (
+                conv_dim * self.config.conv_kernel
+                + self.config.num_heads * self.config.head_dim * self.config.state_size
+            ) * elem_size
+        else:
+            conv_dim = self.config.intermediate_size
+            ssm_state_shape = (self.config.intermediate_size, self.config.state_size)
+            per_layer_bytes = (
+                conv_dim * self.config.conv_kernel
+                + self.config.intermediate_size * self.config.state_size
+            ) * elem_size
+
+        per_slot_bytes = num_layers * per_layer_bytes
+        budget = int(total * 0.9 - used - peak + current)
+        num_slots = max(1, min(MAX_NUM_SEQS, budget // max(1, per_slot_bytes)))
+
+        self.mamba_state_manager = MambaStateManager(
+            num_hidden_layers=num_layers,
+            conv_dim=conv_dim,
+            ssm_state_shape=ssm_state_shape,
+            conv_kernel=self.config.conv_kernel,
+            num_slots=num_slots,
+            dtype=self._model_dtype,
+            device=torch.device(f"cuda:{self.rank}"),
+        )
+        self.num_state_slots = num_slots
         if self.rank == 0:
-            cfg = ATTN_BACKEND_CONFIG
-            print(f"  Attention backend: {cfg.backend} "
-                  f"(block_size={cfg.block_size}, kv_layout={cfg.kv_layout})")
+            print(f"  Mamba state cache: {num_slots} sequence slots")
 
-        if hasattr(self, '_warmup_encoder_cache'):
-            del self._warmup_encoder_cache
-            import gc
-            gc.collect()
-            torch.cuda.empty_cache()
+    def can_allocate_mamba_state(self):
+        return self.mamba_state_manager.has_free_slot()
+
+    def allocate_mamba_state(self, seq):
+        self.mamba_state_manager.allocate(seq)
+
+    def deallocate_mamba_state(self, seq):
+        self.mamba_state_manager.deallocate(seq)
 
     def prepare_prefill(self, seqs):
         input_ids, positions = [], []
@@ -555,7 +521,6 @@ class ModelRunner:
         max_sq, max_sk = 0, 0
         slot_mapping = []
         max_bt = 0
-        has_block_tables = False
         use_mrope = self.is_qwen_vl and any(s.mrope_positions is not None for s in seqs)
         mrope_pos_list = [] if use_mrope else None
 
@@ -576,7 +541,6 @@ class ModelRunner:
             max_sk = max(sl, max_sk)
             if not seq.block_table:  # warmup
                 continue
-            has_block_tables = True
             for i in range(seq.num_blocks):
                 start = seq.block_table[i] * BLOCK_SIZE
                 end = start + (BLOCK_SIZE if i != seq.num_blocks - 1
@@ -638,18 +602,15 @@ class ModelRunner:
             blen = len(seq.block_table)
             if blen > max_bt:
                 max_bt = blen
-
         bt = np.full((n, max_bt), -1, dtype=np.int32)
         for i, seq in enumerate(seqs):
             b = seq.block_table
             bt[i, :len(b)] = b
-        max_cl = int(cl[:n].max())
         set_context(
             False,
             slot_mapping=torch.from_numpy(sm).pin_memory().cuda(non_blocking=True),
             context_lens=torch.from_numpy(cl).pin_memory().cuda(non_blocking=True),
             block_tables=torch.from_numpy(bt).pin_memory().cuda(non_blocking=True),
-            max_context_len=max_cl,
         )
         if use_mrope:
             positions_t = torch.from_numpy(mrope_pos).pin_memory().cuda(non_blocking=True)
@@ -661,121 +622,79 @@ class ModelRunner:
         )
 
     def prepare_mixed_batch(self, prefill_seqs, prefill_chunk_sizes, decode_seqs):
-        """Prepare a unified mixed batch: [prefill_tokens... | decode_tokens...].
+        """Prepare a unified mixed batch with full prefills and decode tokens.
 
-        The attention layer receives split metadata so it can dispatch
-        prefill tokens to the prefill kernel and decode tokens to the
-        decode kernel independently.
+        All attention reads from the paged KV cache via block_table.
+        cu_seqlens_q/k cover all sequences (prefill + decode).
         """
         input_ids, positions = [], []
         slot_mapping = []
+        cu_seqlens_q, cu_seqlens_k = [0], [0]
+        max_sq, max_sk = 0, 0
+
         block_size = self.block_size
+        all_seqs = list(prefill_seqs) + list(decode_seqs)
+        max_bt = 0
 
-        use_mrope = self.is_qwen_vl and any(
-            getattr(s, 'mrope_positions', None) is not None for s in prefill_seqs)
-        mrope_pos_list = [] if use_mrope else None
-
-        # --- Prefill portion ---
-        pf_cu_q, pf_cu_k = [0], [0]
-        pf_max_sq, pf_max_sk = 0, 0
-        pf_max_bt = 0
-
+        # Prefill sequences: q_len = prompt_len, k_len = prompt_len
         for seq, chunk_size in zip(prefill_seqs, prefill_chunk_sizes):
-            start_pos = seq.num_computed_tokens
-            chunk_ids = seq.token_ids[start_pos:start_pos + chunk_size]
-            input_ids.extend(chunk_ids)
-            if use_mrope and seq.mrope_positions is not None:
-                mrope_pos_list.append(seq.mrope_positions[:, start_pos:start_pos + chunk_size])
-            else:
-                positions.extend(range(start_pos, start_pos + chunk_size))
-                if use_mrope:
-                    mrope_pos_list.append(
-                        torch.arange(start_pos, start_pos + chunk_size,
-                                     dtype=torch.int64).unsqueeze(0).expand(3, -1)
-                    )
-
-            kv_len = start_pos + chunk_size
-            pf_cu_q.append(pf_cu_q[-1] + chunk_size)
-            pf_cu_k.append(pf_cu_k[-1] + kv_len)
-            pf_max_sq = max(chunk_size, pf_max_sq)
-            pf_max_sk = max(kv_len, pf_max_sk)
-
-            for p in range(start_pos, start_pos + chunk_size):
-                slot_mapping.append(
-                    seq.block_table[p // block_size] * block_size + (p % block_size)
-                )
+            sl = chunk_size
+            input_ids.extend(seq.token_ids[:sl])
+            positions.extend(range(sl))
+            cu_seqlens_q.append(cu_seqlens_q[-1] + sl)
+            cu_seqlens_k.append(cu_seqlens_k[-1] + sl)
+            max_sq = max(sl, max_sq)
+            max_sk = max(sl, max_sk)
+            for i in range(seq.num_blocks):
+                start = seq.block_table[i] * block_size
+                end = start + (block_size if i != seq.num_blocks - 1
+                               else seq.last_block_num_tokens)
+                slot_mapping.extend(range(start, end))
             blen = len(seq.block_table)
-            if blen > pf_max_bt:
-                pf_max_bt = blen
+            if blen > max_bt:
+                max_bt = blen
 
         num_prefill_tokens = len(input_ids)
-        num_prefill_seqs = len(prefill_seqs)
 
-        # Build prefill block table
-        prefill_block_tables = None
-        if pf_max_bt > 0 and num_prefill_seqs > 0:
-            pbt = np.full((num_prefill_seqs, pf_max_bt), -1, dtype=np.int32)
-            for i, seq in enumerate(prefill_seqs):
-                b = seq.block_table
-                pbt[i, :len(b)] = b
-            prefill_block_tables = torch.from_numpy(pbt).pin_memory().cuda(non_blocking=True)
-
-        # --- Decode portion ---
-        nd = len(decode_seqs)
-        dc_cl = np.empty(nd, dtype=np.int32)
-        dc_max_bt = 0
-        for i, seq in enumerate(decode_seqs):
+        # Decode sequences: q_len = 1, k_len = full context length
+        for seq in decode_seqs:
             input_ids.append(seq.last_token)
-            pos = len(seq) - 1
-            if use_mrope:
-                delta = getattr(seq, 'mrope_position_delta', 0)
-                p = pos + delta
-                mrope_pos_list.append(
-                    torch.tensor([[p], [p], [p]], dtype=torch.int64))
-            else:
-                positions.append(pos)
-            dc_cl[i] = len(seq)
+            positions.append(len(seq) - 1)
+            cu_seqlens_q.append(cu_seqlens_q[-1] + 1)
+            cu_seqlens_k.append(cu_seqlens_k[-1] + len(seq))
+            max_sk = max(len(seq), max_sk)
+            max_sq = max(1, max_sq)
             slot_mapping.append(
                 seq.block_table[-1] * block_size + seq.last_block_num_tokens - 1
             )
             blen = len(seq.block_table)
-            if blen > dc_max_bt:
-                dc_max_bt = blen
+            if blen > max_bt:
+                max_bt = blen
 
-        dc_bt = np.full((nd, dc_max_bt), -1, dtype=np.int32) if nd > 0 else np.empty((0, 0), dtype=np.int32)
-        for i, seq in enumerate(decode_seqs):
+        num_decode_tokens = len(decode_seqs)
+
+        # Unified block table for all sequences
+        n_all = len(all_seqs)
+        bt = np.full((n_all, max_bt), -1, dtype=np.int32)
+        for i, seq in enumerate(all_seqs):
             b = seq.block_table
-            dc_bt[i, :len(b)] = b
-        dc_max_cl = int(dc_cl[:nd].max()) if nd > 0 else 0
-
-        logit_idx = []
-        for i in range(num_prefill_seqs):
-            logit_idx.append(pf_cu_q[i + 1] - 1)
-        for j in range(nd):
-            logit_idx.append(num_prefill_tokens + j)
+            bt[i, :len(b)] = b
 
         set_mixed_context(
+            cu_seqlens_q=torch.tensor(cu_seqlens_q, dtype=torch.int32, pin_memory=True).cuda(non_blocking=True),
+            cu_seqlens_k=torch.tensor(cu_seqlens_k, dtype=torch.int32, pin_memory=True).cuda(non_blocking=True),
+            max_seqlen_q=max_sq,
+            max_seqlen_k=max_sk,
             slot_mapping=torch.tensor(slot_mapping, dtype=torch.int32, pin_memory=True).cuda(non_blocking=True),
             num_prefill_tokens=num_prefill_tokens,
-            num_decode_tokens=nd,
-            num_prefill_seqs=num_prefill_seqs,
-            prefill_cu_seqlens_q=torch.tensor(pf_cu_q, dtype=torch.int32, pin_memory=True).cuda(non_blocking=True),
-            prefill_cu_seqlens_k=torch.tensor(pf_cu_k, dtype=torch.int32, pin_memory=True).cuda(non_blocking=True),
-            prefill_max_seqlen_q=pf_max_sq,
-            prefill_max_seqlen_k=pf_max_sk,
-            prefill_block_tables=prefill_block_tables,
-            decode_context_lens=torch.from_numpy(dc_cl).pin_memory().cuda(non_blocking=True) if nd > 0 else None,
-            decode_block_tables=torch.from_numpy(dc_bt).pin_memory().cuda(non_blocking=True) if nd > 0 else None,
-            decode_max_context_len=dc_max_cl,
-            logit_indices=torch.tensor(logit_idx, dtype=torch.int64, pin_memory=True).cuda(non_blocking=True),
+            num_decode_tokens=num_decode_tokens,
+            decode_context_lens=None,
+            decode_block_tables=torch.from_numpy(bt).pin_memory().cuda(non_blocking=True),
         )
-
-        input_ids_t = torch.tensor(input_ids, dtype=torch.int64, pin_memory=True).cuda(non_blocking=True)
-        if use_mrope:
-            positions_t = torch.cat(mrope_pos_list, dim=1).to(torch.int64).pin_memory().cuda(non_blocking=True)
-        else:
-            positions_t = torch.tensor(positions, dtype=torch.int64, pin_memory=True).cuda(non_blocking=True)
-        return input_ids_t, positions_t
+        return (
+            torch.tensor(input_ids, dtype=torch.int64, pin_memory=True).cuda(non_blocking=True),
+            torch.tensor(positions, dtype=torch.int64, pin_memory=True).cuda(non_blocking=True),
+        )
 
     @torch.inference_mode()
     def run_model(self, input_ids, positions, is_prefill, inputs_embeds=None,
@@ -823,11 +742,6 @@ class ModelRunner:
         if self.enforce_eager:
             return self._run_decode_greedy_eager(n, ids_np, pos_np, sm_np, cl_np, bt_np)
 
-        self._run_graph_from_numpy(n, ids_np, pos_np, sm_np, cl_np, bt_np)
-        return self._greedy_from_hidden(n)
-
-    def _run_graph_from_numpy(self, n, ids_np, pos_np, sm_np, cl_np, bt_np):
-        """Copy numpy arrays into graph vars and replay the CUDA graph."""
         gv = self.graph_vars
         graph_bs = self._graph_bs_for_n[n]
         prev_n = getattr(self, '_prev_decode_n', -1)
@@ -843,32 +757,9 @@ class ModelRunner:
             torch.from_numpy(bt_np), non_blocking=True
         )
         self._prev_decode_n = n
+
         self.graphs[graph_bs].replay()
-
-    @torch.inference_mode()
-    def run_decode_greedy_fast_async(self, decode_data):
-        """Like run_decode_greedy_fast but starts async D2H copy.
-
-        Returns (has_result, n) -- caller must call _wait_async_tokens(n)
-        later to get the Python list of token IDs.
-        """
-        n, ids_np, pos_np, sm_np, cl_np, bt_np = decode_data
-
-        if self.enforce_eager:
-            result = self._run_decode_greedy_eager(n, ids_np, pos_np, sm_np, cl_np, bt_np)
-            if result is not None:
-                main_stream = torch.cuda.current_stream()
-                cs = self._copy_stream
-                with torch.cuda.stream(cs):
-                    cs.wait_stream(main_stream)
-                    self._pinned_token_ids[:n].copy_(result, non_blocking=True)
-                    self._copy_event.record(cs)
-                return True, n
-            return False, n
-
-        self._run_graph_from_numpy(n, ids_np, pos_np, sm_np, cl_np, bt_np)
-        has_result = self._greedy_from_hidden_async(n)
-        return has_result, n
+        return self._greedy_from_hidden(n)
 
     def _run_decode_greedy_eager(self, n, ids_np, pos_np, sm_np, cl_np, bt_np):
         """Eager decode path for greedy sampling with TP (no CUDA graphs)."""
@@ -891,7 +782,6 @@ class ModelRunner:
             slot_mapping=slot_mapping,
             context_lens=context_lens,
             block_tables=block_tables,
-            max_context_len=int(cl_np.max()),
         )
         hidden = self.model(input_ids, positions)
         lm_head = self.model.lm_head
@@ -915,7 +805,7 @@ class ModelRunner:
 
     def _init_greedy_buffers(self):
         """Pre-allocate buffers for gather_greedy to avoid per-step allocation."""
-        max_bs = self.max_num_seqs
+        max_bs = MAX_NUM_SEQS
         dev = f"cuda:{self.rank}"
         self._greedy_info = torch.zeros(max_bs, 2, dtype=torch.float32, device=dev)
         self._greedy_gathered = [
@@ -925,7 +815,7 @@ class ModelRunner:
         self._greedy_all_info = torch.zeros(self.world_size, max_bs, 2, dtype=torch.float32, device=dev)
         self._greedy_arange = torch.arange(max_bs, device=dev)
 
-        max_num_blocks = (self.max_model_len + BLOCK_SIZE - 1) // BLOCK_SIZE
+        max_num_blocks = (MAX_MODEL_LEN + BLOCK_SIZE - 1) // BLOCK_SIZE
         self._np_ids = np.empty(max_bs, dtype=np.int64)
         self._np_pos = np.empty(max_bs, dtype=np.int64)
         self._np_sm = np.empty(max_bs, dtype=np.int32)
@@ -938,12 +828,6 @@ class ModelRunner:
         self._eager_context_lens = torch.zeros(max_bs, dtype=torch.int32, device=dev)
         self._eager_block_tables = torch.zeros(max_bs, max_num_blocks, dtype=torch.int32, device=dev)
 
-        # Async D2H: pinned buffer + copy stream for pipelined decode
-        self._pinned_token_ids = torch.empty(max_bs, dtype=torch.int64,
-                                             device="cpu", pin_memory=True)
-        self._copy_stream = torch.cuda.Stream(device=dev)
-        self._copy_event = torch.cuda.Event()
-
     def _greedy_from_hidden(self, n):
         """Use CUDA-graph-captured LM head + local argmax, then allgather.
         
@@ -951,12 +835,11 @@ class ModelRunner:
         Caller must call .tolist() to sync.
         """
         gv = self.graph_vars
-
-        if self.world_size == 1:
-            return gv["lm_max_idxs"][:n]
-
         local_max_vals = gv["lm_max_vals"][:n]
         local_max_idxs = gv["lm_max_idxs"][:n] + self.model.lm_head.vocab_start
+
+        if self.world_size == 1:
+            return local_max_idxs
 
         info = self._greedy_info[:n]
         info[:, 0] = local_max_vals
@@ -976,28 +859,6 @@ class ModelRunner:
             return token_ids
         return None
 
-    def _greedy_from_hidden_async(self, n):
-        """Like _greedy_from_hidden but starts async D2H copy.
-
-        After calling this, the caller must eventually call
-        _wait_async_tokens(n) to get the Python list of token IDs.
-        Between the two calls, the CPU is free to do other work.
-        """
-        gpu_ids = self._greedy_from_hidden(n)
-        if gpu_ids is not None:
-            main_stream = torch.cuda.current_stream()
-            cs = self._copy_stream
-            with torch.cuda.stream(cs):
-                cs.wait_stream(main_stream)
-                self._pinned_token_ids[:n].copy_(gpu_ids, non_blocking=True)
-                self._copy_event.record(cs)
-        return gpu_ids is not None
-
-    def _wait_async_tokens(self, n):
-        """Wait for the async D2H copy to complete and return token list."""
-        self._copy_event.synchronize()
-        return self._pinned_token_ids[:n].tolist()
-
     def _prepare_decode_arrays(self, seqs):
         """Precompute numpy arrays for decode - uses pre-allocated buffers."""
         n = len(seqs)
@@ -1006,24 +867,15 @@ class ModelRunner:
         sm_np = self._np_sm
         cl_np = self._np_cl
         max_bt = 0
-        bs = BLOCK_SIZE
         for i, seq in enumerate(seqs):
-            tids = seq.token_ids
-            if tids is not None:
-                slen = len(tids)
-                ids_np[i] = tids[-1]
-            else:
-                slen = seq._num_tokens
-                ids_np[i] = seq._last_token
+            ids_np[i] = seq.last_token
             if self.is_qwen_vl:
-                pos_np[i] = slen - 1 + seq.mrope_position_delta
+                pos_np[i] = len(seq) - 1 + seq.mrope_position_delta
             else:
-                pos_np[i] = slen - 1
-            cl_np[i] = slen
-            bt = seq.block_table
-            blen = len(bt)
-            r = slen % bs
-            sm_np[i] = bt[-1] * bs + (r - 1 if r else bs - 1)
+                pos_np[i] = len(seq) - 1
+            cl_np[i] = len(seq)
+            sm_np[i] = seq.block_table[-1] * BLOCK_SIZE + seq.last_block_num_tokens - 1
+            blen = len(seq.block_table)
             if blen > max_bt:
                 max_bt = blen
         bt_np = self._np_bt
@@ -1033,50 +885,210 @@ class ModelRunner:
             bt_np[i, :blen] = b
             if blen < max_bt:
                 bt_np[i, blen:max_bt] = -1
-        self._prev_max_bt = max_bt
         return (n, ids_np[:n], pos_np[:n], sm_np[:n], cl_np[:n], bt_np[:n, :max_bt])
 
-    def _update_decode_arrays_incremental(self, n, token_ids, decode_seqs):
-        """Update pre-allocated decode arrays incrementally after a decode step.
+    @torch.inference_mode()
+    def _run_mamba_seq(self, seq, is_prefill):
+        if seq.state_slot is None:
+            raise RuntimeError("Mamba sequence has no allocated state slot")
+        slot_cache = self.mamba_state_manager.get_slot_cache(seq.state_slot)
 
-        Much faster than _prepare_decode_arrays: vectorized numpy ops +
-        only touches block table rows that crossed a block boundary.
-        """
-        ids_np = self._np_ids
-        pos_np = self._np_pos
-        sm_np = self._np_sm
-        cl_np = self._np_cl
-        bt_np = self._np_bt
-        bs = BLOCK_SIZE
-
-        ids_np[:n] = token_ids
-        pos_np[:n] += 1
-        cl_np[:n] += 1
-        sm_np[:n] += 1
-
-        boundary_mask = cl_np[:n] % bs == 1
-        if boundary_mask.any():
-            max_bt = 0
-            for i in np.where(boundary_mask)[0]:
-                seq = decode_seqs[i]
-                bt = seq.block_table
-                blen = len(bt)
-                sm_np[i] = bt[-1] * bs
-                bt_np[i, :blen] = bt
-                if blen > max_bt:
-                    max_bt = blen
-            if max_bt == 0:
-                max_bt = self._prev_max_bt
-            else:
-                for i in np.where(~boundary_mask)[0]:
-                    blen = len(decode_seqs[i].block_table)
-                    if blen > max_bt:
-                        max_bt = blen
-                self._prev_max_bt = max_bt
+        if is_prefill:
+            input_ids = torch.tensor(
+                seq.prompt_ids, dtype=torch.int64, device=f"cuda:{self.rank}",
+            ).unsqueeze(0)
+            cache_position = torch.arange(
+                self.config.conv_kernel, dtype=torch.long, device=input_ids.device,
+            )
         else:
-            max_bt = self._prev_max_bt
-        return (n, ids_np[:n], pos_np[:n], sm_np[:n], cl_np[:n],
-                bt_np[:n, :max_bt])
+            input_ids = torch.tensor(
+                [[seq.last_token]], dtype=torch.int64, device=f"cuda:{self.rank}",
+            )
+            cache_position = torch.tensor(
+                [seq.num_computed_tokens], dtype=torch.long, device=input_ids.device,
+            )
+
+        hidden_states = self.model(
+            input_ids,
+            cache_params=slot_cache,
+            cache_position=cache_position,
+        )
+        logits = self.model.compute_logits(hidden_states[:, -1:, :])[:, -1, :]
+
+        if is_prefill:
+            seq.num_computed_tokens = seq.num_prompt_tokens
+        else:
+            seq.num_computed_tokens += 1
+        return logits
+
+    @torch.inference_mode()
+    def _run_mamba_batch(self, seqs, is_prefill):
+        outputs = [self._run_mamba_seq(seq, is_prefill) for seq in seqs]
+        if not outputs:
+            return None
+        return torch.cat(outputs, dim=0)
+
+    @torch.inference_mode()
+    def _run_gla_seq(self, seq, is_prefill):
+        if seq.state_slot is None:
+            raise RuntimeError("GLA sequence has no allocated state slot")
+        slot_cache = self.mamba_state_manager.get_slot_cache(seq.state_slot)
+
+        if is_prefill:
+            input_ids = torch.tensor(
+                seq.prompt_ids, dtype=torch.int64, device=f"cuda:{self.rank}",
+            ).unsqueeze(0)
+        else:
+            input_ids = torch.tensor(
+                [[seq.last_token]], dtype=torch.int64, device=f"cuda:{self.rank}",
+            )
+
+        hidden_states = self.model(
+            input_ids,
+            past_key_values=slot_cache,
+            use_cache=True,
+        )
+        logits = self.model.compute_logits(hidden_states[:, -1:, :])[:, -1, :]
+
+        if is_prefill:
+            seq.num_computed_tokens = seq.num_prompt_tokens
+        else:
+            seq.num_computed_tokens += 1
+        return logits
+
+    @torch.inference_mode()
+    def _run_gla_batch(self, seqs, is_prefill):
+        outputs = [self._run_gla_seq(seq, is_prefill) for seq in seqs]
+        if not outputs:
+            return None
+        return torch.cat(outputs, dim=0)
+
+    @torch.inference_mode()
+    def _run_rwkv7_seq(self, seq, is_prefill):
+        if seq.state_slot is None:
+            raise RuntimeError("RWKV7 sequence has no allocated state slot")
+        slot_cache = self.mamba_state_manager.get_slot_cache(seq.state_slot)
+
+        if is_prefill:
+            input_ids = torch.tensor(
+                seq.prompt_ids,
+                dtype=torch.int64,
+                device=f"cuda:{self.rank}",
+            ).unsqueeze(0)
+        else:
+            input_ids = torch.tensor(
+                [[seq.last_token]],
+                dtype=torch.int64,
+                device=f"cuda:{self.rank}",
+            )
+
+        hidden_states = self.model(
+            input_ids,
+            past_key_values=slot_cache,
+            use_cache=True,
+        )
+        logits = self.model.compute_logits(hidden_states[:, -1:, :])[:, -1, :]
+
+        if is_prefill:
+            seq.num_computed_tokens = seq.num_prompt_tokens
+        else:
+            seq.num_computed_tokens += 1
+        return logits
+
+    @torch.inference_mode()
+    def _run_rwkv7_batch(self, seqs, is_prefill):
+        outputs = [self._run_rwkv7_seq(seq, is_prefill) for seq in seqs]
+        if not outputs:
+            return None
+        return torch.cat(outputs, dim=0)
+
+    @torch.inference_mode()
+    def _run_kimi_linear_seq(self, seq, is_prefill):
+        if seq.state_slot is None:
+            raise RuntimeError("Kimi-Linear sequence has no allocated state slot")
+        slot_cache = self.mamba_state_manager.get_slot_cache(seq.state_slot)
+
+        if is_prefill:
+            # Use token_ids (preserved across pickle) instead of prompt_ids
+            # (stripped by __getstate__ for workers)
+            input_ids = torch.tensor(
+                seq.token_ids, dtype=torch.int64, device=f"cuda:{self.rank}",
+            ).unsqueeze(0)
+        else:
+            input_ids = torch.tensor(
+                [[seq.last_token]], dtype=torch.int64, device=f"cuda:{self.rank}",
+            )
+
+        T = input_ids.shape[1]
+        positions = torch.arange(
+            seq.num_computed_tokens,
+            seq.num_computed_tokens + T,
+            dtype=torch.int64,
+            device=input_ids.device,
+        )
+
+        hidden_states = self.model(
+            input_ids,
+            positions=positions,
+            past_key_values=slot_cache,
+            use_cache=True,
+        )
+        logits = self.model.compute_logits(hidden_states[:, -1:, :])[:, -1, :]
+
+        if is_prefill:
+            seq.num_computed_tokens = T
+        else:
+            seq.num_computed_tokens += 1
+        return logits
+
+    @torch.inference_mode()
+    def _run_kimi_linear_batch(self, seqs, is_prefill):
+        outputs = [self._run_kimi_linear_seq(seq, is_prefill) for seq in seqs]
+        if not outputs:
+            return None
+        return torch.cat(outputs, dim=0)
+
+    def _run_qwen3_next_seq(self, seq, is_prefill):
+        if seq.state_slot is None:
+            raise RuntimeError("Qwen3-Next sequence has no allocated state slot")
+        slot_cache = self.mamba_state_manager.get_slot_cache(seq.state_slot)
+
+        if is_prefill:
+            input_ids = torch.tensor(
+                seq.token_ids, dtype=torch.int64, device=f"cuda:{self.rank}",
+            ).unsqueeze(0)
+        else:
+            input_ids = torch.tensor(
+                [[seq.last_token]], dtype=torch.int64, device=f"cuda:{self.rank}",
+            )
+
+        T = input_ids.shape[1]
+        positions = torch.arange(
+            seq.num_computed_tokens,
+            seq.num_computed_tokens + T,
+            dtype=torch.int64,
+            device=input_ids.device,
+        )
+
+        hidden_states = self.model(
+            input_ids,
+            positions=positions,
+            layer_states=slot_cache,
+        )
+        logits = self.model.compute_logits(hidden_states[:, -1:, :])[:, -1, :]
+
+        if is_prefill:
+            seq.num_computed_tokens = T
+        else:
+            seq.num_computed_tokens += 1
+        return logits
+
+    @torch.inference_mode()
+    def _run_qwen3_next_batch(self, seqs, is_prefill):
+        outputs = [self._run_qwen3_next_seq(seq, is_prefill) for seq in seqs]
+        if not outputs:
+            return None
+        return torch.cat(outputs, dim=0)
 
     def _write_decode_shm(self, n, ids_np, pos_np, sm_np, cl_np, bt_np):
         """Write decode arrays directly into SHM with binary layout.
@@ -1138,21 +1150,18 @@ class ModelRunner:
             return result
         return self.run_decode_greedy(seqs)
 
-    def call_decode_greedy_async(self, decode_data):
-        """Launch greedy decode from precomputed arrays and start async D2H.
-
-        Returns (has_result, n). Caller must call
-        model_runner._wait_async_tokens(n) to get token IDs.
-        """
-        n = decode_data[0]
-        if self.world_size > 1 and self.rank == 0:
-            self._write_decode_shm(*decode_data)
-            self.shm.buf[self._SHM_FLAG_OFFSET] = 1
-            self._signal_workers()
-            return self.run_decode_greedy_fast_async(decode_data)
-        return self.run_decode_greedy_fast_async(decode_data)
-
     def run(self, seqs, is_prefill):
+        if self.model_family == "mamba":
+            model_type = getattr(self.config, "model_type", "")
+            if model_type == "gla":
+                return self._run_gla_batch(seqs, is_prefill)
+            if model_type == "rwkv7":
+                return self._run_rwkv7_batch(seqs, is_prefill)
+            if model_type == "kimi_linear":
+                return self._run_kimi_linear_batch(seqs, is_prefill)
+            if model_type == "qwen3_next":
+                return self._run_qwen3_next_batch(seqs, is_prefill)
+            return self._run_mamba_batch(seqs, is_prefill)
         input_ids, positions = (
             self.prepare_prefill(seqs) if is_prefill
             else self.prepare_decode(seqs)
@@ -1172,8 +1181,8 @@ class ModelRunner:
     @torch.inference_mode()
     def capture_cudagraph(self):
         from contextlib import nullcontext
-        max_bs = self.max_num_seqs
-        max_num_blocks = (self.max_model_len + BLOCK_SIZE - 1) // BLOCK_SIZE
+        max_bs = MAX_NUM_SEQS
+        max_num_blocks = (MAX_MODEL_LEN + BLOCK_SIZE - 1) // BLOCK_SIZE
         input_ids = torch.zeros(max_bs, dtype=torch.int64)
         positions = torch.zeros(max_bs, dtype=torch.int64)
         slot_mapping = torch.full((max_bs,), -1, dtype=torch.int32)
@@ -1199,7 +1208,6 @@ class ModelRunner:
                 set_context(
                     False, slot_mapping=slot_mapping[:bs],
                     context_lens=context_lens[:bs], block_tables=block_tables[:bs],
-                    max_context_len=self.max_model_len,
                 )
                 outputs[:bs] = self.model(input_ids[:bs], positions[:bs])
                 lm_logits[:bs] = lm_head.linear_op(outputs[:bs], lm_head.weight).float()
@@ -1242,26 +1250,24 @@ class LlamaEngine:
         seed: int = 42,
         enforce_eager: bool = False,
         tensor_parallel_size: int = 1,
-        gpu_memory_utilization: float = 0.9,
-        max_model_len: int = MAX_MODEL_LEN,
-        max_num_seqs: int | None = None,
-        max_num_batched_tokens: int | None = None,
     ):
         self.model_name = model_name
         self.seed = seed
-        self.max_num_seqs = max_num_seqs if max_num_seqs is not None else _DEFAULT_MAX_NUM_SEQS
-        self.max_num_batched_tokens = max_num_batched_tokens if max_num_batched_tokens is not None else _DEFAULT_MAX_NUM_BATCHED_TOKENS
         self._set_seeds(seed)
+        model_type = getattr(AutoConfig.from_pretrained(model_name, trust_remote_code=True), "model_type", "")
+        self.model_family = (
+            "mamba" if model_type in {"mamba", "mamba2", "gla", "rwkv7", "kimi_linear", "qwen3_next"}
+            else "attention"
+        )
+        self.model_type = model_type
+        if self.model_family == "mamba":
+            if tensor_parallel_size != 1 and model_type not in {"kimi_linear", "qwen3_next"}:
+                raise ValueError("Recurrent-family currently supports tensor_parallel_size=1 only")
+            if not enforce_eager:
+                enforce_eager = True
 
         # Unique shared memory name to avoid collisions
         shm_name = f"sllama_{uuid.uuid4().hex[:8]}"
-
-        mr_kwargs = dict(
-            gpu_memory_utilization=gpu_memory_utilization,
-            max_model_len=max_model_len,
-            max_num_seqs=self.max_num_seqs,
-            max_num_batched_tokens=self.max_num_batched_tokens,
-        )
 
         # Launch non-rank-0 workers
         self.workers = []
@@ -1273,7 +1279,6 @@ class LlamaEngine:
                 target=ModelRunner,
                 args=(model_name, i, tensor_parallel_size, dtype,
                       enforce_eager, event, shm_name),
-                kwargs=mr_kwargs,
             )
             p.start()
             self.workers.append(p)
@@ -1283,13 +1288,13 @@ class LlamaEngine:
         self.model_runner = ModelRunner(
             model_name, 0, tensor_parallel_size, dtype,
             enforce_eager, self.events, shm_name,
-            **mr_kwargs,
         )
-        self.block_manager = BlockManager(self.model_runner.num_blocks)
-        print(f"  Scheduling: max_num_seqs={self.max_num_seqs}, "
-              f"max_num_batched_tokens={self.max_num_batched_tokens}")
+        self.block_manager = (
+            BlockManager(self.model_runner.num_blocks)
+            if self.model_family == "attention" else None
+        )
 
-        self.tokenizer = AutoTokenizer.from_pretrained(model_name)
+        self.tokenizer = AutoTokenizer.from_pretrained(model_name, trust_remote_code=True)
         if self.tokenizer.pad_token_id is None:
             self.tokenizer.pad_token_id = self.tokenizer.eos_token_id
 
@@ -1298,8 +1303,6 @@ class LlamaEngine:
         if self.is_qwen_vl:
             from transformers import AutoProcessor
             self.processor = AutoProcessor.from_pretrained(model_name)
-
-        self.encoder_cache: dict[int, tuple] = {}
 
         atexit.register(self._cleanup)
 
@@ -1370,84 +1373,53 @@ class LlamaEngine:
                 video_pixel_values, video_grid_thw)
 
     @torch.inference_mode()
-    def _run_vision_encoder(self, seqs, chunk_sizes=None):
-        """Run vision encoder with batching and caching.
+    def _run_vision_encoder(self, seqs):
+        """Run vision encoder for sequences with multimodal data and merge embeddings.
 
-        Images are batched into a single model.visual() call (concatenated
-        pixel_values, stacked grid_thw). Videos are processed one-by-one to
-        avoid OOM. Results are cached by id(seq) for reuse across steps.
-
-        If chunk_sizes is provided, only produces embeddings for the chunk
-        range [num_computed_tokens : num_computed_tokens + chunk_size] per seq,
-        enabling chunked multimodal prefill.
-
-        Returns (inputs_embeds, deepstack_embeds) where deepstack_embeds is a
-        list of tensors for Qwen3-VL DeepStack, or None for Qwen2-VL.
+        Returns (inputs_embeds, deepstack_embeds) where deepstack_embeds is a list
+        of tensors for Qwen3-VL DeepStack, or None for Qwen2-VL.
         """
         model = self.model_runner.model
+        all_inputs_embeds = []
         has_deepstack = hasattr(model.visual, 'deepstack_merger_list')
-        merge_size = model.config.vision.spatial_merge_size
-        image_token_id = self.model_runner.config.image_token_id
-        video_token_id = self.model_runner.config.video_token_id
+        all_deepstack = [] if has_deepstack else None
 
-        # --- Phase 1: Run encoder for uncached sequences ---
-        img_seqs = []
-        img_pv_list = []
-        img_thw_list = []
         for seq in seqs:
-            if seq.pixel_values is not None and id(seq) not in self.encoder_cache:
-                img_seqs.append(seq)
-                img_pv_list.append(seq.pixel_values.cuda())
-                thw = seq.image_grid_thw
-                if not isinstance(thw, torch.Tensor):
-                    thw = torch.tensor(thw, dtype=torch.long)
-                img_thw_list.append(thw)
+            token_ids = torch.tensor(seq.token_ids, dtype=torch.int64, device="cuda")
+            text_embeds = model.get_input_embeddings()(token_ids)
+            seq_deepstack = [] if has_deepstack else None
 
-        if img_seqs:
-            batched_pv = torch.cat(img_pv_list, dim=0)
-            batched_thw = torch.cat(img_thw_list, dim=0).cpu()
-            vis_out = model.visual(batched_pv, grid_thw=batched_thw)
+            if seq.pixel_values is not None:
+                pixel_values = seq.pixel_values.cuda()
+                grid_thw = seq.image_grid_thw
+                vis_out = model.visual(pixel_values, grid_thw=grid_thw)
 
-            if has_deepstack:
-                all_img_embeds, all_ds_features = vis_out
-            else:
-                all_img_embeds = vis_out
-                all_ds_features = None
-
-            sizes = (batched_thw.prod(-1) // (merge_size ** 2)).tolist()
-            per_seq_embeds = all_img_embeds.split(sizes)
-            if all_ds_features is not None:
-                per_seq_ds = [ds.split(sizes) for ds in all_ds_features]
-            else:
-                per_seq_ds = None
-
-            embed_idx = 0
-            for i, seq in enumerate(img_seqs):
-                thw = seq.image_grid_thw
-                n_items = len(thw) if isinstance(thw, list) else thw.shape[0]
-                seq_embeds = torch.cat(
-                    per_seq_embeds[embed_idx:embed_idx + n_items], dim=0
-                ) if n_items > 1 else per_seq_embeds[embed_idx]
-                if per_seq_ds is not None:
-                    seq_ds = [
-                        torch.cat(ds[embed_idx:embed_idx + n_items], dim=0)
-                        if n_items > 1 else ds[embed_idx]
-                        for ds in per_seq_ds
-                    ]
+                if has_deepstack:
+                    image_embeds, ds_features = vis_out
                 else:
-                    seq_ds = []
-                self.encoder_cache[id(seq)] = (seq_embeds, seq_ds, "image")
-                embed_idx += n_items
+                    image_embeds = vis_out
+                    ds_features = []
 
-            del batched_pv, batched_thw
+                merge_size = model.config.vision.spatial_merge_size
+                sizes = []
+                for thw in grid_thw:
+                    t, h, w = thw
+                    sizes.append(t * (h // merge_size) * (w // merge_size))
 
-        for seq in seqs:
-            if seq.video_pixel_values is not None and id(seq) not in self.encoder_cache:
+                mask = token_ids == QWEN_IMAGE_PAD_ID
+                if mask.any():
+                    text_embeds[mask] = image_embeds.to(text_embeds.dtype)
+
+                if has_deepstack and ds_features:
+                    for ds_feat in ds_features:
+                        ds_expanded = torch.zeros_like(text_embeds)
+                        if mask.any():
+                            ds_expanded[mask] = ds_feat.to(text_embeds.dtype)
+                        seq_deepstack.append(ds_expanded)
+
+            if seq.video_pixel_values is not None:
                 video_pv = seq.video_pixel_values.cuda()
                 grid_thw = seq.video_grid_thw
-                if not isinstance(grid_thw, torch.Tensor):
-                    grid_thw = torch.tensor(grid_thw, dtype=torch.long)
-                grid_thw = grid_thw.cpu()
                 vis_out = model.visual(video_pv, grid_thw=grid_thw)
 
                 if has_deepstack:
@@ -1455,55 +1427,18 @@ class LlamaEngine:
                 else:
                     video_embeds = vis_out
                     ds_features = []
-                self.encoder_cache[id(seq)] = (video_embeds, ds_features, "video")
-                del video_pv
 
-        # --- Phase 2: Merge vision embeddings into text embeddings ---
-        all_inputs_embeds = []
-        all_deepstack = [] if has_deepstack else None
-        embed_fn = model.get_input_embeddings()
-
-        for seq_idx, seq in enumerate(seqs):
-            full_ids = torch.tensor(seq.token_ids, dtype=torch.int64, device="cuda")
-
-            if chunk_sizes is not None:
-                start = seq.num_computed_tokens
-                end = start + chunk_sizes[seq_idx]
-                chunk_ids = full_ids[start:end]
-            else:
-                chunk_ids = full_ids
-                start = 0
-                end = len(full_ids)
-
-            text_embeds = embed_fn(chunk_ids)
-            seq_deepstack = [] if has_deepstack else None
-
-            cached = self.encoder_cache.get(id(seq))
-            if cached is not None:
-                embeds, ds_features, modality = cached
-                tok_id = image_token_id if modality == "image" else video_token_id
-
-                mask = chunk_ids == tok_id
+                mask = token_ids == QWEN_VIDEO_PAD_ID
                 if mask.any():
-                    if chunk_sizes is not None:
-                        full_mask = full_ids == tok_id
-                        chunk_vis_start = full_mask[:start].sum().item()
-                        n_vis_in_chunk = mask.sum().item()
-                        chunk_embeds = embeds[chunk_vis_start:chunk_vis_start + n_vis_in_chunk]
-                        text_embeds[mask] = chunk_embeds.to(text_embeds.dtype)
-                    else:
-                        text_embeds[mask] = embeds.to(text_embeds.dtype)
+                    text_embeds[mask] = video_embeds.to(text_embeds.dtype)
 
                 if has_deepstack and ds_features:
-                    for i_ds, ds_feat in enumerate(ds_features):
+                    for i, ds_feat in enumerate(ds_features):
                         ds_expanded = torch.zeros_like(text_embeds)
                         if mask.any():
-                            if chunk_sizes is not None:
-                                ds_expanded[mask] = ds_feat[chunk_vis_start:chunk_vis_start + n_vis_in_chunk].to(text_embeds.dtype)
-                            else:
-                                ds_expanded[mask] = ds_feat.to(text_embeds.dtype)
-                        if modality == "video" and i_ds < len(seq_deepstack):
-                            seq_deepstack[i_ds] = seq_deepstack[i_ds] + ds_expanded
+                            ds_expanded[mask] = ds_feat.to(text_embeds.dtype)
+                        if i < len(seq_deepstack):
+                            seq_deepstack[i] = seq_deepstack[i] + ds_expanded
                         else:
                             seq_deepstack.append(ds_expanded)
 
@@ -1514,32 +1449,24 @@ class LlamaEngine:
         inputs_embeds = torch.cat(all_inputs_embeds, dim=0)
 
         if has_deepstack and all_deepstack:
-            num_levels = max((len(ds) for ds in all_deepstack), default=0)
-            if num_levels > 0:
-                deepstack_embeds = []
-                for level in range(num_levels):
-                    level_parts = []
-                    for ds in all_deepstack:
-                        if level < len(ds):
-                            level_parts.append(ds[level])
-                        else:
-                            level_parts.append(
-                                torch.zeros_like(all_inputs_embeds[0]))
-                    deepstack_embeds.append(torch.cat(level_parts, dim=0))
-                return inputs_embeds, deepstack_embeds
+            num_levels = max(len(ds) for ds in all_deepstack)
+            deepstack_embeds = []
+            for level in range(num_levels):
+                level_parts = []
+                for ds in all_deepstack:
+                    if level < len(ds):
+                        level_parts.append(ds[level])
+                    else:
+                        level_parts.append(torch.zeros_like(all_inputs_embeds[0]))
+                deepstack_embeds.append(torch.cat(level_parts, dim=0))
+            return inputs_embeds, deepstack_embeds
 
         return inputs_embeds, None
 
     @torch.inference_mode()
     def generate(self, prompts, sampling_params, collect_logits: bool = False,
-                 images=None, videos=None, use_tqdm: bool = False):
-        """Generate completions for a batch of prompts.
-
-        Uses unified chunked-prefill scheduling: every GPU step processes
-        both decode tokens (for running seqs) and prefill chunks (for
-        new/continuing seqs) in a single forward pass, matching vLLM's
-        approach.
-        """
+                 images=None, videos=None):
+        """Generate completions for a batch of prompts."""
         if isinstance(sampling_params, list):
             sp_list = sampling_params
         else:
@@ -1550,9 +1477,8 @@ class LlamaEngine:
             self._set_seeds(seed)
 
         eos = self.tokenizer.eos_token_id
-        waiting: deque[Sequence] = deque()
-        running: deque[Sequence] = deque()
-        prefilling: deque[Sequence] = deque()
+        waiting = deque()
+        running = deque()
 
         seq_logits: dict[int, list[torch.Tensor]] = {}
 
@@ -1562,11 +1488,7 @@ class LlamaEngine:
         if videos is None:
             videos = [None] * len(prompts)
 
-        _preprocess_t0 = time.perf_counter()
-
-        def _make_seq(i):
-            prompt = prompts[i]
-            sp = sp_list[i]
+        for i, (prompt, sp) in enumerate(zip(prompts, sp_list)):
             img = images[i] if i < len(images) else None
             vid = videos[i] if i < len(videos) else None
 
@@ -1581,6 +1503,7 @@ class LlamaEngine:
                 seq.video_pixel_values = video_pv
                 seq.video_grid_thw = video_grid_thw.tolist() if video_grid_thw is not None else None
 
+                # Compute M-RoPE positions
                 model = self.model_runner.model
                 merge_size = model.config.vision.spatial_merge_size
                 image_offsets = []
@@ -1590,13 +1513,13 @@ class LlamaEngine:
                 i_tok = 0
                 while i_tok < len(ids):
                     tid = ids[i_tok]
-                    if tid == self.model_runner.config.image_token_id and seq.image_grid_thw and img_idx < len(seq.image_grid_thw):
+                    if tid == QWEN_IMAGE_PAD_ID and seq.image_grid_thw and img_idx < len(seq.image_grid_thw):
                         image_offsets.append(i_tok)
                         t, h, w = seq.image_grid_thw[img_idx]
                         num_tokens = t * (h // merge_size) * (w // merge_size)
                         i_tok += num_tokens
                         img_idx += 1
-                    elif tid == self.model_runner.config.video_token_id and seq.video_grid_thw and vid_idx < len(seq.video_grid_thw):
+                    elif tid == QWEN_VIDEO_PAD_ID and seq.video_grid_thw and vid_idx < len(seq.video_grid_thw):
                         video_offsets.append(i_tok)
                         t, h, w = seq.video_grid_thw[vid_idx]
                         num_tokens = t * (h // merge_size) * (w // merge_size)
@@ -1617,403 +1540,57 @@ class LlamaEngine:
             elif self.is_qwen_vl:
                 ids = prompt if isinstance(prompt, list) else self.tokenizer.encode(prompt)
                 seq = Sequence(ids, max_tokens=sp.max_tokens, ignore_eos=sp.ignore_eos)
+                # Text-only with M-RoPE: all 3 dims same
                 seq.mrope_positions = torch.arange(len(ids), dtype=torch.int64).unsqueeze(0).expand(3, -1)
                 seq.mrope_position_delta = 0
             else:
                 ids = prompt if isinstance(prompt, list) else self.tokenizer.encode(prompt)
                 seq = Sequence(ids, max_tokens=sp.max_tokens, ignore_eos=sp.ignore_eos)
-            return seq
 
-        from concurrent.futures import ThreadPoolExecutor
-        with ThreadPoolExecutor(max_workers=8) as pool:
-            all_seqs_ordered = list(pool.map(_make_seq, range(len(prompts))))
-
-        for seq in all_seqs_ordered:
             waiting.append(seq)
             if collect_logits:
                 seq_logits[id(seq)] = []
 
         all_seqs = list(waiting)
-        num_prompts = len(prompts)
-        _preprocess_time = time.perf_counter() - _preprocess_t0
-        if os.environ.get("KB_NANO_STEP_PROFILE") == "1":
-            print(f"[Profile] Preprocessing {num_prompts} seqs: {_preprocess_time:.3f}s")
 
-        pbar = None
-        if use_tqdm:
-            from tqdm import tqdm as _tqdm
-            pbar = _tqdm(total=num_prompts, desc="Processed prompts",
-                         dynamic_ncols=True,
-                         postfix="est. speed input: 0.00 toks/s, "
-                                 "output: 0.00 toks/s")
-        num_finished = 0
-        total_in_toks = 0
-        total_out_toks = 0
+        if self.model_family == "mamba":
+            while waiting or running:
+                prefill_seqs = []
+                while (
+                    waiting
+                    and len(prefill_seqs) < MAX_NUM_SEQS
+                    and self.model_runner.can_allocate_mamba_state()
+                ):
+                    seq = waiting.popleft()
+                    self.model_runner.allocate_mamba_state(seq)
+                    seq.status = SeqStatus.RUNNING
+                    running.append(seq)
+                    prefill_seqs.append(seq)
 
-        use_greedy = (sp_list[0].temperature == 0.0
-                      and not collect_logits)
-        block_size = BLOCK_SIZE
-        bm = self.block_manager
-        num_blocks = bm._num_blocks
-        watermark_blocks = max(int(num_blocks * 0.01), 1)
-
-        _pbar_pending = 0
-        _pbar_pending_in = 0
-        _pbar_pending_out = 0
-
-        step_profile = {
-            "pure_decode": 0, "decode_tokens": 0, "decode_time": 0.0,
-            "pure_mm_prefill": 0, "mm_prefill_tokens": 0, "mm_prefill_time": 0.0,
-            "pure_text_prefill": 0, "text_prefill_tokens": 0,
-            "mixed_mm": 0, "mixed_mm_pf_tokens": 0, "mixed_mm_dc_tokens": 0, "mixed_mm_time": 0.0,
-            "mixed_text": 0, "mixed_text_pf_tokens": 0, "mixed_text_dc_tokens": 0,
-        }
-        _step_profile_active = os.environ.get("KB_NANO_STEP_PROFILE") == "1"
-
-        def _finish_seq(seq: Sequence) -> None:
-            nonlocal _pbar_pending, _pbar_pending_in, _pbar_pending_out
-            seq.status = SeqStatus.FINISHED
-            bm.deallocate(seq)
-            self.encoder_cache.pop(id(seq), None)
-            if pbar is not None:
-                _pbar_pending += 1
-                _pbar_pending_in += seq.num_prompt_tokens
-                _pbar_pending_out += len(seq.generated_ids)
-
-        def _flush_pbar() -> None:
-            nonlocal _pbar_pending, _pbar_pending_in, _pbar_pending_out
-            nonlocal total_in_toks, total_out_toks
-            if _pbar_pending == 0:
-                return
-            total_in_toks += _pbar_pending_in
-            total_out_toks += _pbar_pending_out
-            elapsed = pbar.format_dict["elapsed"]
-            if elapsed > 0:
-                pbar.postfix = (
-                    f"est. speed input: {total_in_toks / elapsed:.2f}"
-                    f" toks/s, output: "
-                    f"{total_out_toks / elapsed:.2f} toks/s")
-            pbar.update(_pbar_pending)
-            _pbar_pending = 0
-            _pbar_pending_in = 0
-            _pbar_pending_out = 0
-
-        while waiting or running or prefilling:
-            if pbar is not None:
-                _flush_pbar()
-            # =============================================================
-            # FAST PATH: pure decode (most common steady-state)
-            # No waiting/prefilling seqs, so skip the full scheduler.
-            # =============================================================
-            if running and not waiting and not prefilling and use_greedy:
-                need_blocks = 0
-                for seq in running:
-                    if len(seq) % block_size == 1:
-                        need_blocks += 1
-                if need_blocks <= len(bm.free_block_ids):
-                    if _step_profile_active:
-                        _spt0 = time.perf_counter()
-                        step_profile["fast_decode"] = step_profile.get("fast_decode", 0) + 1
-                        step_profile["fast_decode_tokens"] = step_profile.get("fast_decode_tokens", 0) + len(running)
-                    if _PROFILE:
-                        _fp_t0 = time.perf_counter()
-                    decode_seqs = list(running)
-                    for seq in decode_seqs:
-                        if len(seq) % block_size == 1:
-                            seq.block_table.append(bm.free_block_ids.popleft())
-
-                    mr = self.model_runner
-                    n_dc = len(decode_seqs)
-                    decode_data = mr._prepare_decode_arrays(decode_seqs)
-                    if _PROFILE:
-                        _fp_t1 = time.perf_counter()
-                    if mr.world_size > 1:
-                        mr._write_decode_shm(*decode_data)
-                        mr.shm.buf[mr._SHM_FLAG_OFFSET] = 1
-                        mr._signal_workers()
-                    gpu_result = mr.run_decode_greedy_fast(decode_data)
-                    if _PROFILE:
-                        _fp_t2 = time.perf_counter()
-                    if gpu_result is not None:
-                        token_ids = gpu_result.tolist()
-                        if _PROFILE:
-                            _fp_t3 = time.perf_counter()
-                        any_finished = False
-                        for seq, tid in zip(decode_seqs, token_ids):
-                            seq.append_token(tid)
-                            done = len(seq.generated_ids) >= seq.max_tokens
-                            if not seq.ignore_eos:
-                                done = done or tid == eos
-                            if done:
-                                _finish_seq(seq)
-                                any_finished = True
-                        if any_finished:
-                            running = deque(s for s in running
-                                            if s.status != SeqStatus.FINISHED)
-                        if _PROFILE:
-                            _fp_t4 = time.perf_counter()
-                            _fp = getattr(self, '_fast_path_profile', None)
-                            if _fp is None:
-                                _fp = {'prep': 0., 'gpu': 0., 'tolist': 0.,
-                                       'post': 0., 'n': 0}
-                                self._fast_path_profile = _fp
-                            _fp['prep'] += _fp_t1 - _fp_t0
-                            _fp['gpu'] += _fp_t2 - _fp_t1
-                            _fp['tolist'] += _fp_t3 - _fp_t2
-                            _fp['post'] += _fp_t4 - _fp_t3
-                            _fp['n'] += 1
-
-                        use_incr = True
-                        while running and not waiting and not prefilling:
-                            if any_finished:
-                                decode_seqs = list(running)
-                                n_dc = len(decode_seqs)
-                                any_finished = False
-                                use_incr = False
-
-                            need_blocks = 0
-                            for seq in decode_seqs:
-                                if len(seq) % block_size == 1:
-                                    need_blocks += 1
-                            if need_blocks > len(bm.free_block_ids):
-                                break
-                            if os.environ.get("KB_NANO_STEP_PROFILE") == "1":
-                                step_profile["fast_decode"] = step_profile.get("fast_decode", 0) + 1
-                                step_profile["fast_decode_tokens"] = step_profile.get("fast_decode_tokens", 0) + n_dc
-                            for seq in decode_seqs:
-                                if len(seq) % block_size == 1:
-                                    seq.block_table.append(
-                                        bm.free_block_ids.popleft())
-
-                            if _PROFILE:
-                                _fp_t0 = time.perf_counter()
-                            if use_incr:
-                                decode_data = \
-                                    mr._update_decode_arrays_incremental(
-                                        n_dc, token_ids, decode_seqs)
-                            else:
-                                decode_data = mr._prepare_decode_arrays(
-                                    decode_seqs)
-                                use_incr = True
-                            if _PROFILE:
-                                _fp_t1 = time.perf_counter()
-                            if mr.world_size > 1:
-                                mr._write_decode_shm(*decode_data)
-                                mr.shm.buf[mr._SHM_FLAG_OFFSET] = 1
-                                mr._signal_workers()
-                            gpu_result = mr.run_decode_greedy_fast(decode_data)
-                            if _PROFILE:
-                                _fp_t2 = time.perf_counter()
-                            if gpu_result is not None:
-                                token_ids = gpu_result.tolist()
-                                if _PROFILE:
-                                    _fp_t3 = time.perf_counter()
-                                for seq, tid in zip(decode_seqs, token_ids):
-                                    seq.append_token(tid)
-                                    done = (len(seq.generated_ids)
-                                            >= seq.max_tokens)
-                                    if not seq.ignore_eos:
-                                        done = done or tid == eos
-                                    if done:
-                                        _finish_seq(seq)
-                                        any_finished = True
-                                if any_finished:
-                                    running = deque(
-                                        s for s in running
-                                        if s.status != SeqStatus.FINISHED)
-                                if _PROFILE:
-                                    _fp_t4 = time.perf_counter()
-                                    _fp['prep'] += _fp_t1 - _fp_t0
-                                    _fp['gpu'] += _fp_t2 - _fp_t1
-                                    _fp['tolist'] += _fp_t3 - _fp_t2
-                                    _fp['post'] += _fp_t4 - _fp_t3
-                                    _fp['n'] += 1
-                    if _step_profile_active:
-                        step_profile["decode_time"] += time.perf_counter() - _spt0
-                    continue
-
-            elif running and not waiting and not prefilling:
-                decode_seqs = list(running)
-                need_blocks = 0
-                for seq in decode_seqs:
-                    if len(seq) % block_size == 1:
-                        need_blocks += 1
-                if need_blocks <= len(bm.free_block_ids):
-                    for seq in decode_seqs:
-                        if len(seq) % block_size == 1:
-                            seq.block_table.append(bm.free_block_ids.popleft())
-                    result = self.model_runner.call("run", decode_seqs, False)
-                    if result is not None:
+                if prefill_seqs:
+                    logits = self.model_runner.call("run", prefill_seqs, True)
+                    if logits is not None:
                         if collect_logits:
-                            for i, seq in enumerate(decode_seqs):
-                                seq_logits[id(seq)].append(result[i:i+1].cpu())
-                        token_ids = self._sample(result, sp_list[0])
+                            for i, seq in enumerate(prefill_seqs):
+                                seq_logits[id(seq)].append(logits[i:i+1].cpu())
+                        token_ids = self._sample(logits, sp_list[0])
                         finished_set = set()
-                        for seq, tid in zip(decode_seqs, token_ids):
+                        for seq, tid in zip(prefill_seqs, token_ids):
                             seq.append_token(tid)
                             done = len(seq.generated_ids) >= seq.max_tokens
                             if not seq.ignore_eos:
                                 done = done or tid == eos
                             if done:
-                                _finish_seq(seq)
+                                seq.status = SeqStatus.FINISHED
                                 finished_set.add(id(seq))
+                                self.model_runner.deallocate_mamba_state(seq)
                         if finished_set:
                             running = deque(s for s in running if id(s) not in finished_set)
+
+                if not running:
                     continue
 
-            # =============================================================
-            # SCHEDULE: one unified step
-            # =============================================================
-            token_budget = self.max_num_batched_tokens
-
-            # --- 1. Allocate blocks for decode seqs that need a new block ---
-            decode_seqs: list[Sequence] = []
-            new_running: deque[Sequence] = deque()
-            while running:
-                seq = running.popleft()
-                if len(decode_seqs) >= self.max_num_seqs:
-                    new_running.append(seq)
-                    continue
-                needs_block = (len(seq) % block_size == 1)
-                if needs_block:
-                    if not bm.free_block_ids:
-                        bm.deallocate(seq)
-                        seq.preempt()
-                        waiting.appendleft(seq)
-                        continue
-                    seq.block_table.append(bm.free_block_ids.popleft())
-                decode_seqs.append(seq)
-            running = new_running
-            token_budget -= len(decode_seqs)
-
-            # --- 2. Continue prefilling seqs already mid-prefill ---
-            prefill_seqs: list[Sequence] = []
-            prefill_chunk_sizes: list[int] = []
-            still_prefilling: deque[Sequence] = deque()
-            while prefilling and token_budget > 0:
-                seq = prefilling.popleft()
-                remaining = seq.num_remaining_prefill
-                chunk = min(remaining, token_budget)
-                blocks_needed = seq.blocks_needed_for(chunk)
-                if blocks_needed > 0:
-                    if len(bm.free_block_ids) < blocks_needed:
-                        still_prefilling.append(seq)
-                        continue
-                    bm.allocate_n(seq, blocks_needed)
-                prefill_seqs.append(seq)
-                prefill_chunk_sizes.append(chunk)
-                token_budget -= chunk
-            while prefilling:
-                still_prefilling.append(prefilling.popleft())
-            prefilling = still_prefilling
-
-            # --- 3. Admit new seqs from waiting queue ---
-            total_peak = 0
-            for seq in decode_seqs:
-                total_peak += (seq.num_prompt_tokens + seq.max_tokens
-                               + block_size - 1) // block_size
-            for seq in running:
-                total_peak += (seq.num_prompt_tokens + seq.max_tokens
-                               + block_size - 1) // block_size
-            for seq in prefilling:
-                total_peak += (seq.num_prompt_tokens + seq.max_tokens
-                               + block_size - 1) // block_size
-            encoder_budget = self.max_num_batched_tokens
-            while waiting and token_budget > 0:
-                seq = waiting[0]
-                prompt_len = seq.num_prompt_tokens
-
-                has_mm = self.is_qwen_vl and (
-                    getattr(seq, 'pixel_values', None) is not None
-                    or getattr(seq, 'video_pixel_values', None) is not None)
-
-                if has_mm:
-                    chunk = min(prompt_len, token_budget)
-                    if chunk > encoder_budget:
-                        break
-                else:
-                    chunk = min(prompt_len, token_budget)
-
-                blocks_needed = (chunk + block_size - 1) // block_size
-                free = len(bm.free_block_ids)
-                if free < blocks_needed + watermark_blocks:
-                    break
-                seq_peak = (prompt_len + seq.max_tokens
-                            + block_size - 1) // block_size
-                if total_peak + seq_peak > num_blocks:
-                    break
-                if len(prefill_seqs) + len(decode_seqs) >= self.max_num_seqs:
-                    break
-                waiting.popleft()
-                bm.allocate_n(seq, blocks_needed)
-                seq.status = SeqStatus.PREFILLING
-                prefill_seqs.append(seq)
-                prefill_chunk_sizes.append(chunk)
-                token_budget -= chunk
-                total_peak += seq_peak
-                if has_mm:
-                    encoder_budget -= chunk
-
-            if not decode_seqs and not prefill_seqs:
-                continue
-
-            # =============================================================
-            # EXECUTE: single forward pass
-            # =============================================================
-            n_pf = len(prefill_seqs)
-            n_dc = len(decode_seqs)
-
-            if _step_profile_active:
-                _spt0 = time.perf_counter()
-                _sp = step_profile
-                has_mm_step = self.is_qwen_vl and any(
-                    s.pixel_values is not None or s.video_pixel_values is not None
-                    for s in prefill_seqs
-                )
-                _sp_cat = None
-                if n_pf == 0:
-                    _sp["pure_decode"] += 1
-                    _sp["decode_tokens"] += n_dc
-                    _sp_cat = "decode_time"
-                elif n_dc == 0 and has_mm_step:
-                    _sp["pure_mm_prefill"] += 1
-                    _sp["mm_prefill_tokens"] += sum(prefill_chunk_sizes)
-                    _sp_cat = "mm_prefill_time"
-                elif n_dc == 0:
-                    _sp["pure_text_prefill"] += 1
-                    _sp["text_prefill_tokens"] += sum(prefill_chunk_sizes)
-                elif has_mm_step:
-                    _sp["mixed_mm"] += 1
-                    _sp["mixed_mm_pf_tokens"] += sum(prefill_chunk_sizes)
-                    _sp["mixed_mm_dc_tokens"] += n_dc
-                    _sp_cat = "mixed_mm_time"
-                else:
-                    _sp["mixed_text"] += 1
-                    _sp["mixed_text_pf_tokens"] += sum(prefill_chunk_sizes)
-                    _sp["mixed_text_dc_tokens"] += n_dc
-
-            if n_pf == 0 and use_greedy:
-                # Pure decode with CUDA graphs (fast path)
-                gpu_result = self.model_runner.call_decode_greedy(decode_seqs)
-                if gpu_result is not None:
-                    token_ids = gpu_result.tolist()
-                    finished_set = set()
-                    for seq, tid in zip(decode_seqs, token_ids):
-                        seq.append_token(tid)
-                        done = len(seq.generated_ids) >= seq.max_tokens
-                        if not seq.ignore_eos:
-                            done = done or tid == eos
-                        if done:
-                            _finish_seq(seq)
-                            finished_set.add(id(seq))
-                        else:
-                            running.append(seq)
-                    if finished_set:
-                        running = deque(s for s in running if id(s) not in finished_set)
-                else:
-                    running.extend(decode_seqs)
-            elif n_pf == 0:
-                # Pure decode, non-greedy
+                decode_seqs = list(running)
                 result = self.model_runner.call("run", decode_seqs, False)
                 if result is not None:
                     if collect_logits:
@@ -2027,134 +1604,215 @@ class LlamaEngine:
                         if not seq.ignore_eos:
                             done = done or tid == eos
                         if done:
-                            _finish_seq(seq)
+                            seq.status = SeqStatus.FINISHED
                             finished_set.add(id(seq))
-                        else:
-                            running.append(seq)
+                            self.model_runner.deallocate_mamba_state(seq)
                     if finished_set:
                         running = deque(s for s in running if id(s) not in finished_set)
-                else:
-                    running.extend(decode_seqs)
-            elif n_dc == 0:
-                # Pure prefill (no running decode seqs)
-                has_mm = self.is_qwen_vl and any(
-                    s.pixel_values is not None or s.video_pixel_values is not None
-                    for s in prefill_seqs
+
+            return [
+                GenerationOutput(
+                    prompt=(prompts[i] if isinstance(prompts[i], str) else ""),
+                    generated_text=self.tokenizer.decode(
+                        all_seqs[i].generated_ids, skip_special_tokens=True,
+                    ),
+                    token_ids=all_seqs[i].generated_ids,
+                    logits_history=(
+                        seq_logits.get(id(all_seqs[i])) if collect_logits else None
+                    ),
                 )
+                for i in range(len(prompts))
+            ]
+
+        use_greedy = (sp_list[0].temperature == 0.0
+                      and not collect_logits)
+        block_size = BLOCK_SIZE
+
+        profile = _PROFILE
+        if profile:
+            _pf_time = 0.0
+            _pf_steps = 0
+            _pf_tokens = 0
+            _dc_time = 0.0
+            _dc_steps = 0
+            _dc_tokens = 0
+            _dc_sched_time = 0.0
+            _dc_call_time = 0.0
+            _dc_tolist_time = 0.0
+            _dc_post_time = 0.0
+            _dc_bs_counts = []
+
+        while waiting or running:
+            # --- Prefill one batch (if any waiting) ---
+            prefill_seqs = []
+            num_batched_tokens = 0
+            while waiting:
+                seq = waiting[0]
+                seq_len = len(seq)
+                if num_batched_tokens + seq_len > MAX_NUM_BATCHED_TOKENS:
+                    break
+                if len(prefill_seqs) >= MAX_NUM_SEQS:
+                    break
+                if not self.block_manager.can_allocate(seq):
+                    break
+                waiting.popleft()
+                self.block_manager.allocate(seq)
+                seq.status = SeqStatus.RUNNING
+                running.append(seq)
+                prefill_seqs.append(seq)
+                num_batched_tokens += seq_len
+
+            if prefill_seqs:
+                if profile:
+                    _t0 = time.perf_counter()
+                # Check if any sequences have multimodal data
+                has_mm = any(s.pixel_values is not None or s.video_pixel_values is not None
+                             for s in prefill_seqs)
                 if has_mm:
-                    inputs_embeds, deepstack_embeds = self._run_vision_encoder(
-                        prefill_seqs, chunk_sizes=prefill_chunk_sizes)
-                    input_ids_t, positions_t = self.model_runner.prepare_mixed_batch(
-                        prefill_seqs, prefill_chunk_sizes, [],
-                    )
+                    inputs_embeds, deepstack_embeds = self._run_vision_encoder(prefill_seqs)
+                    input_ids_t, positions_t = self.model_runner.prepare_prefill(prefill_seqs)
                     logits = self.model_runner.run_model(
                         input_ids_t, positions_t, True,
                         inputs_embeds=inputs_embeds,
                         deepstack_embeds=deepstack_embeds,
                     )
                     reset_context()
-                    if _step_profile_active:
-                        torch.cuda.synchronize()
-                        step_profile["mm_prefill_time"] += time.perf_counter() - _spt0
                 else:
-                    logits = self.model_runner.call(
-                        "run_mixed", prefill_seqs, prefill_chunk_sizes, [],
-                    )
+                    logits = self.model_runner.call("run", prefill_seqs, True)
                 if logits is not None:
-                    self._process_prefill_logits(
-                        logits, prefill_seqs, prefill_chunk_sizes,
-                        sp_list[0], eos, collect_logits, seq_logits,
-                        running, prefilling, bm, block_size,
-                        finish_seq=_finish_seq,
-                    )
-            else:
-                # Mixed batch: prefill + decode together
-                has_mm = self.is_qwen_vl and any(
-                    s.pixel_values is not None or s.video_pixel_values is not None
-                    for s in prefill_seqs
-                )
-                if has_mm:
-                    pf_embeds, deepstack_embeds = self._run_vision_encoder(
-                        prefill_seqs, chunk_sizes=prefill_chunk_sizes)
-                    embed_fn = self.model_runner.model.get_input_embeddings()
-                    dc_ids = torch.tensor(
-                        [s.last_token for s in decode_seqs],
-                        dtype=torch.int64, device="cuda",
-                    )
-                    dc_embeds = embed_fn(dc_ids)
-                    inputs_embeds = torch.cat([pf_embeds, dc_embeds], dim=0)
-                    if deepstack_embeds is not None:
-                        dc_zeros = torch.zeros_like(dc_embeds).unsqueeze(0).expand(
-                            len(deepstack_embeds), -1, -1)
-                        deepstack_embeds = [
-                            torch.cat([ds, dc_zeros[i]], dim=0)
-                            for i, ds in enumerate(deepstack_embeds)
-                        ]
-                    input_ids_t, positions_t = self.model_runner.prepare_mixed_batch(
-                        prefill_seqs, prefill_chunk_sizes, decode_seqs,
-                    )
-                    logits = self.model_runner.run_model(
-                        input_ids_t, positions_t, True,
-                        inputs_embeds=inputs_embeds,
-                        deepstack_embeds=deepstack_embeds,
-                    )
-                    reset_context()
-                    if _step_profile_active:
-                        torch.cuda.synchronize()
-                        step_profile["mixed_mm_time"] += time.perf_counter() - _spt0
-                else:
-                    logits = self.model_runner.call(
-                        "run_mixed", prefill_seqs, prefill_chunk_sizes, decode_seqs,
-                    )
-                if logits is not None:
-                    pf_logits = logits[:n_pf]
-                    dc_logits = logits[n_pf:]
-
-                    self._process_prefill_logits(
-                        pf_logits, prefill_seqs, prefill_chunk_sizes,
-                        sp_list[0], eos, collect_logits, seq_logits,
-                        running, prefilling, bm, block_size,
-                        finish_seq=_finish_seq,
-                    )
-
                     if collect_logits:
-                        for i, seq in enumerate(decode_seqs):
-                            seq_logits[id(seq)].append(dc_logits[i:i+1].cpu())
-                    dc_token_ids = self._sample(dc_logits, sp_list[0])
-                    finished_set = set()
-                    for seq, tid in zip(decode_seqs, dc_token_ids):
+                        for i, seq in enumerate(prefill_seqs):
+                            seq_logits[id(seq)].append(logits[i:i+1].cpu())
+                    token_ids = self._sample(logits, sp_list[0])
+                    for seq, tid in zip(prefill_seqs, token_ids):
+                        seq.num_computed_tokens = len(seq)
                         seq.append_token(tid)
                         done = len(seq.generated_ids) >= seq.max_tokens
                         if not seq.ignore_eos:
                             done = done or tid == eos
                         if done:
-                            _finish_seq(seq)
+                            seq.status = SeqStatus.FINISHED
+                            running.remove(seq)
+                            self.block_manager.deallocate(seq)
+                if profile:
+                    _pf_time += time.perf_counter() - _t0
+                    _pf_steps += 1
+                    _pf_tokens += num_batched_tokens
+
+            # --- Decode all running sequences (CUDA graph path) ---
+            if not running:
+                continue
+
+            if profile:
+                _t_sched = time.perf_counter()
+
+            bm = self.block_manager
+            free = bm.free_block_ids
+            decode_seqs = []
+            temp = deque()
+            while running and len(decode_seqs) < MAX_NUM_SEQS:
+                seq = running.popleft()
+                if len(seq) % block_size == 1 and not free:
+                    break
+                if len(seq) % block_size == 1:
+                    seq.block_table.append(free.popleft())
+                decode_seqs.append(seq)
+                temp.append(seq)
+            running.extendleft(reversed(temp))
+
+            if not decode_seqs:
+                if not waiting:
+                    break
+                continue
+
+            if profile:
+                _dc_sched_time += time.perf_counter() - _t_sched
+                _dc_bs_counts.append(len(decode_seqs))
+                _t_call = time.perf_counter()
+
+            if use_greedy:
+                gpu_result = self.model_runner.call_decode_greedy(decode_seqs)
+                if profile:
+                    _dc_call_time += time.perf_counter() - _t_call
+                    _t_tolist = time.perf_counter()
+                if gpu_result is not None:
+                    token_ids = gpu_result.tolist()
+                    if profile:
+                        _dc_tolist_time += time.perf_counter() - _t_tolist
+                        _t_post = time.perf_counter()
+                    finished_set = set()
+                    for seq, tid in zip(decode_seqs, token_ids):
+                        seq.append_token(tid)
+                        done = len(seq.generated_ids) >= seq.max_tokens
+                        if not seq.ignore_eos:
+                            done = done or tid == eos
+                        if done:
+                            seq.status = SeqStatus.FINISHED
                             finished_set.add(id(seq))
-                        else:
-                            running.append(seq)
+                            bm.deallocate(seq)
                     if finished_set:
                         running = deque(s for s in running if id(s) not in finished_set)
-                else:
-                    running.extend(decode_seqs)
+                    if profile:
+                        _dc_post_time += time.perf_counter() - _t_post
+                elif profile:
+                    _dc_tolist_time += time.perf_counter() - _t_tolist
+                    _dc_post_time += 0.0
+            else:
+                result = self.model_runner.call("run", decode_seqs, False)
+                if profile:
+                    _dc_call_time += time.perf_counter() - _t_call
+                    _t_tolist = time.perf_counter()
+                    _dc_tolist_time += 0.0
+                    _t_post = time.perf_counter()
+                if result is not None:
+                    if collect_logits:
+                        for i, seq in enumerate(decode_seqs):
+                            seq_logits[id(seq)].append(result[i:i+1].cpu())
+                    token_ids = self._sample(result, sp_list[0])
+                    finished_set = set()
+                    for seq, tid in zip(decode_seqs, token_ids):
+                        seq.append_token(tid)
+                        done = len(seq.generated_ids) >= seq.max_tokens
+                        if not seq.ignore_eos:
+                            done = done or tid == eos
+                        if done:
+                            seq.status = SeqStatus.FINISHED
+                            finished_set.add(id(seq))
+                            bm.deallocate(seq)
+                    if finished_set:
+                        running = deque(s for s in running if id(s) not in finished_set)
+                if profile:
+                    _dc_post_time += time.perf_counter() - _t_post
 
-        if pbar is not None:
-            _flush_pbar()
-            pbar.close()
+            if profile:
+                _dc_steps += 1
+                _dc_tokens += len(decode_seqs)
 
-        if _step_profile_active:
-            sp = step_profile
-            fd = sp.get("fast_decode", 0)
-            fdt = sp.get("fast_decode_tokens", 0)
-            slow = (sp["pure_decode"] + sp["pure_mm_prefill"]
-                    + sp["pure_text_prefill"] + sp["mixed_mm"] + sp["mixed_text"])
-            total = fd + slow
-            print(f"\n[Step Profile] total_steps={total} (fast_decode={fd}, scheduled={slow})")
-            print(f"  fast_decode:       {fd:6d} steps, {fdt:10d} tokens, {sp['decode_time']:.3f}s")
-            print(f"  pure_decode:       {sp['pure_decode']:6d} steps, {sp['decode_tokens']:10d} tokens")
-            print(f"  pure_text_prefill: {sp['pure_text_prefill']:6d} steps, {sp['text_prefill_tokens']:10d} tokens")
-            print(f"  pure_mm_prefill:   {sp['pure_mm_prefill']:6d} steps, {sp['mm_prefill_tokens']:10d} tokens, {sp['mm_prefill_time']:.3f}s")
-            print(f"  mixed_text:        {sp['mixed_text']:6d} steps, pf={sp['mixed_text_pf_tokens']:10d} dc={sp['mixed_text_dc_tokens']:10d}")
-            print(f"  mixed_mm:          {sp['mixed_mm']:6d} steps, pf={sp['mixed_mm_pf_tokens']:10d} dc={sp['mixed_mm_dc_tokens']:10d}, {sp['mixed_mm_time']:.3f}s")
+        if profile:
+            self._profile_data = {
+                "prefill_time": _pf_time,
+                "prefill_steps": _pf_steps,
+                "prefill_tokens": _pf_tokens,
+                "decode_time": _dc_time,
+                "decode_steps": _dc_steps,
+                "decode_tokens": _dc_tokens,
+                "decode_sched_time": _dc_sched_time,
+                "decode_call_time": _dc_call_time,
+                "decode_tolist_time": _dc_tolist_time,
+                "decode_post_time": _dc_post_time,
+                "decode_bs_counts": _dc_bs_counts,
+            }
+            self._profile_data["decode_time"] = (
+                _dc_sched_time + _dc_call_time + _dc_tolist_time + _dc_post_time
+            )
+            cp = getattr(self.model_runner, '_call_profile', None)
+            if cp and cp["n_calls"] > 0:
+                self._profile_data["call_detail"] = {
+                    "prepare_ms": cp["prepare"] / cp["n_calls"] * 1000,
+                    "signal_ms": cp["signal"] / cp["n_calls"] * 1000,
+                    "gpu_exec_ms": cp["gpu_exec"] / cp["n_calls"] * 1000,
+                    "n_calls": cp["n_calls"],
+                }
 
         # Return in original order
         return [
@@ -2170,51 +1828,3 @@ class LlamaEngine:
             )
             for i in range(len(prompts))
         ]
-
-    def _process_prefill_logits(
-        self, logits, prefill_seqs, prefill_chunk_sizes,
-        sp, eos, collect_logits, seq_logits,
-        running, prefilling, bm, block_size,
-        finish_seq=None,
-    ):
-        """Handle output from prefill sequences after a forward pass.
-
-        For sequences whose prefill is complete, sample the first decode
-        token. For sequences still mid-prefill, update num_computed_tokens
-        and move them to the prefilling queue.
-        """
-        # Separate seqs into "done prefilling" vs "still prefilling"
-        sample_seqs = []
-        sample_logits = []
-        for i, (seq, chunk) in enumerate(zip(prefill_seqs, prefill_chunk_sizes)):
-            seq.num_computed_tokens += chunk
-            if seq.num_remaining_prefill == 0:
-                # Prefill complete — sample first decode token
-                sample_seqs.append(seq)
-                sample_logits.append(logits[i:i+1])
-            else:
-                # More prefill chunks needed
-                prefilling.append(seq)
-
-        if not sample_seqs:
-            return
-
-        sample_logits_t = torch.cat(sample_logits, dim=0)
-        if collect_logits:
-            for i, seq in enumerate(sample_seqs):
-                seq_logits[id(seq)].append(sample_logits_t[i:i+1].cpu())
-        token_ids = self._sample(sample_logits_t, sp)
-        for seq, tid in zip(sample_seqs, token_ids):
-            seq.append_token(tid)
-            seq.status = SeqStatus.RUNNING
-            done = len(seq.generated_ids) >= seq.max_tokens
-            if not seq.ignore_eos:
-                done = done or tid == eos
-            if done:
-                if finish_seq is not None:
-                    finish_seq(seq)
-                else:
-                    seq.status = SeqStatus.FINISHED
-                    bm.deallocate(seq)
-            else:
-                running.append(seq)
