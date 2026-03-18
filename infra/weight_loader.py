@@ -17,6 +17,7 @@ from huggingface_hub import snapshot_download
 from safetensors import safe_open
 from transformers import AutoConfig
 
+from .tp import _tp_size
 from ..tasks.baseline.L4.llama import LlamaConfig, LlamaForCausalLM
 from ..tasks.baseline.L4.llama4 import Llama4Config, Llama4ForCausalLM
 from ..tasks.baseline.L4.mixtral import MixtralConfig, MixtralForCausalLM
@@ -370,6 +371,18 @@ def load_model(
         config.dtype = dtype
         print("  Allocating Llama model...")
         model = LlamaForCausalLM(config)
+
+    tp = _tp_size()
+    if hasattr(config, "num_attention_heads") and config.num_attention_heads % tp != 0:
+        raise ValueError(
+            f"TP degree {tp} is incompatible with {config.num_attention_heads} Q heads "
+            f"(num_attention_heads must be divisible by tensor_parallel_size)"
+        )
+    if hasattr(config, "num_key_value_heads") and config.num_key_value_heads % tp != 0:
+        raise ValueError(
+            f"TP degree {tp} is incompatible with {config.num_key_value_heads} KV heads "
+            f"(num_key_value_heads must be divisible by tensor_parallel_size)"
+        )
 
     load_weights(model, model_path, model_type)
     model = model.to(device=device, dtype=dtype)
