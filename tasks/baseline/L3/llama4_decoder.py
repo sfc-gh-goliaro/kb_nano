@@ -1,4 +1,7 @@
-"""Llama 4 decoder layer: attention + MoE with NoPE support.
+"""Llama 4 decoder layer: attention + MoE/MLP with NoPE support.
+
+MoE vs dense MLP is selected per layer via ``interleave_moe_layer_step``
+(matching vLLM's ``Llama4DecoderLayer``).
 
 Weight names match checkpoint:
   layers.{i}.self_attn.{q,k,v,o}_proj.weight
@@ -9,11 +12,21 @@ Weight names match checkpoint:
 
 from __future__ import annotations
 
+from dataclasses import dataclass
+
 import torch.nn as nn
 
 from ..L1.rms_norm import RMSNorm
 from ..L2.llama4_attention import Llama4Attention
 from ..L2.llama4_moe import Llama4MoE
+from ..L2.llama_mlp import LlamaMLP
+
+
+@dataclass
+class _DenseMlpConfig:
+    """Minimal config for LlamaMLP on dense (non-MoE) layers."""
+    hidden_size: int
+    intermediate_size: int
 
 
 class Llama4DecoderLayer(nn.Module):
@@ -32,7 +45,18 @@ class Llama4DecoderLayer(nn.Module):
             attn_scale=getattr(config, "attn_scale", 0.1),
             rms_norm_eps=config.rms_norm_eps,
         )
-        self.feed_forward = Llama4MoE(config)
+
+        step = getattr(config, "interleave_moe_layer_step", 1)
+        is_moe_layer = step > 0 and (layer_idx + 1) % step == 0
+        if is_moe_layer:
+            self.feed_forward = Llama4MoE(config)
+        else:
+            mlp_cfg = _DenseMlpConfig(
+                hidden_size=config.hidden_size,
+                intermediate_size=getattr(config, "intermediate_size_mlp", config.intermediate_size),
+            )
+            self.feed_forward = LlamaMLP(mlp_cfg)
+
         self.input_layernorm = RMSNorm(config.hidden_size, eps=config.rms_norm_eps)
         self.post_attention_layernorm = RMSNorm(config.hidden_size, eps=config.rms_norm_eps)
 

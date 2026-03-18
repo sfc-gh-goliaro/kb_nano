@@ -40,6 +40,8 @@ class Llama4Config:
     rope_original_max_position_embeddings: int = 8192
     num_local_experts: int = 16
     num_experts_per_tok: int = 1
+    interleave_moe_layer_step: int = 1
+    intermediate_size_mlp: int = 16384
     no_rope_layers: list = field(default_factory=list)
     use_qk_norm: bool = True
     attn_temperature_tuning: bool = True
@@ -77,6 +79,8 @@ class Llama4Config:
             ),
             num_local_experts=text.num_local_experts,
             num_experts_per_tok=text.num_experts_per_tok,
+            interleave_moe_layer_step=getattr(text, "interleave_moe_layer_step", 1),
+            intermediate_size_mlp=getattr(text, "intermediate_size_mlp", 16384),
             no_rope_layers=no_rope_layers if isinstance(no_rope_layers, list) else list(no_rope_layers),
             use_qk_norm=getattr(text, "use_qk_norm", True),
             attn_temperature_tuning=getattr(text, "attn_temperature_tuning", True),
