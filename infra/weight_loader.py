@@ -398,6 +398,17 @@ def load_model(
     if model_type == "gpt_oss":
         config = GptOssConfig.from_pretrained(model_name)
         config.dtype = dtype
+        from .tp import _tp_size
+        tp = _tp_size()
+        if tp > 1:
+            assert config.num_attention_heads % tp == 0, (
+                f"num_attention_heads ({config.num_attention_heads}) must be "
+                f"divisible by tp ({tp})"
+            )
+            assert config.num_key_value_heads % tp == 0, (
+                f"num_key_value_heads ({config.num_key_value_heads}) must be "
+                f"divisible by tp ({tp})"
+            )
         print(f"  Allocating GPT-OSS model ({config.num_local_experts} experts, "
               f"top-{config.num_experts_per_tok})...")
         model = GptOssForCausalLM(config)

@@ -6,6 +6,7 @@ from dataclasses import dataclass, field
 
 
 MODEL_KEY_TO_DEFAULT_HF: dict[str, str] = {
+    "gpt_oss": "openai/gpt-oss-20b",
     "llama31": "meta-llama/Llama-3.1-8B-Instruct",
     "mixtral": "mistralai/Mixtral-8x7B-Instruct-v0.1",
     "qwen2_vl": "Qwen/Qwen2-VL-7B-Instruct",
@@ -13,6 +14,7 @@ MODEL_KEY_TO_DEFAULT_HF: dict[str, str] = {
 }
 
 MODEL_CATEGORY: dict[str, str] = {
+    "openai/gpt-oss-20b": "llm",
     "meta-llama/Llama-3.1-8B-Instruct": "llm",
     "meta-llama/Llama-3.1-70B-Instruct": "llm",
     "mistralai/Mixtral-8x7B-Instruct-v0.1": "llm",
