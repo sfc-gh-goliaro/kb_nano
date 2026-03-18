@@ -26,10 +26,12 @@ class RMSNorm(nn.Module):
             else:
                 _sgl_fused_add_rmsnorm(x, residual, self.weight, self.eps)
                 return x, residual
-        if residual is not None:
-            x = x + residual
-            residual = x
-        x = F.rms_norm(x, (self.hidden_size,), eps=self.eps)
-        if residual is None:
-            return x
-        return x, residual
+        else:
+            if residual is None:
+                x = F.rms_norm(x, (self.hidden_size,), eps=self.eps)
+                return x
+            else:
+                x = x + residual
+                residual = x
+                x = F.rms_norm(x, (self.hidden_size,), eps=self.eps)
+                return x, residual
