@@ -18,7 +18,7 @@ from huggingface_hub import snapshot_download
 from safetensors import safe_open
 from transformers import AutoConfig
 
-from ..tasks.baseline.L1.linear import Fp8Linear, postprocess_fp8_weights
+from ..tasks.baseline.L1.fp8_linear import Fp8Linear, postprocess_fp8_weights
 from ..tasks.baseline.L4.llama import LlamaConfig, LlamaForCausalLM
 from ..tasks.baseline.L4.mixtral import MixtralConfig, MixtralForCausalLM
 from ..tasks.baseline.L4.qwen2_vl import Qwen2VLConfig, Qwen2VLForConditionalGeneration

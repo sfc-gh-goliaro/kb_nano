@@ -8,7 +8,8 @@ import torch
 import torch.nn as nn
 
 from ....infra.tp import _tp_size, _tp_rank
-from ..L1.linear import Linear, Fp8Linear
+from ..L1.linear import Linear
+from ..L1.fp8_linear import Fp8Linear
 from ..L1.allreduce import AllReduce
 
 _FP8_BLOCK = 128
