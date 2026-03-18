@@ -34,6 +34,11 @@ def download_model(model_name: str) -> str:
     )
 
 
+_EXPERT_RE = re.compile(
+    r"(.+\.block_sparse_moe)\.experts\.(\d+)\.(w[123])\.weight"
+)
+
+
 # Qwen2-VL weight name remapping: checkpoint -> model parameter
 # Checkpoint uses `model.` prefix for language, `visual.` for vision.
 # Our model uses `model.` for language backbone and `visual.` for vision.
@@ -258,6 +263,27 @@ def load_weights(model, model_path: str, model_type: str = "llama") -> None:
                             model, prefix, f.get_tensor(weight_name), wb,
                         )
                         continue
+
+                # Handle MoE expert weights
+                m = _EXPERT_RE.match(mapped_name)
+                if m:
+                    moe_prefix, expert_id_str, w_name = m.groups()
+                    expert_id = int(expert_id_str)
+                    if w_name in ("w1", "w3"):
+                        param_name = f"{moe_prefix}.w13"
+                        param = model.get_parameter(param_name)
+                        param.weight_loader(
+                            param, f.get_tensor(weight_name),
+                            expert_id, is_w1=(w_name == "w1"),
+                        )
+                    else:
+                        param_name = f"{moe_prefix}.w2"
+                        param = model.get_parameter(param_name)
+                        param.weight_loader(
+                            param, f.get_tensor(weight_name), expert_id,
+                        )
+                    loaded += 1
+                    continue
 
                 # Handle packed modules (qkv_proj, gate_up_proj)
                 matched = False
