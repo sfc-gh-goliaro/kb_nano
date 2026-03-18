@@ -27,13 +27,9 @@ import numpy as np
 import torch
 import torch.distributed as dist
 import torch.multiprocessing as mp
-from transformers import AutoConfig, AutoTokenizer
+from transformers import AutoTokenizer
 
 from .context import get_context, reset_context, set_context, set_mixed_context
-from .gla_state import GLAStateManager
-from .kimi_linear_state import KimiLinearStateManager
-from .mamba_state import MambaStateManager
-from .rwkv7_state import RWKV7StateManager
 from ..tasks.baseline.L1.allreduce import set_custom_ar
 from .weight_loader import load_model
 
@@ -95,7 +91,6 @@ class Sequence:
         self.block_table: list[int] = []
         self.status = SeqStatus.WAITING
         self.num_computed_tokens: int = 0
-        self.state_slot: int | None = None
         # Multimodal fields
         self.pixel_values = None  # preprocessed image pixels
         self.image_grid_thw = None  # list of [t, h, w] per image
@@ -149,17 +144,11 @@ class Sequence:
             len(self.prompt_ids),
             self.block_table,
             self.num_computed_tokens,
-            self.state_slot,
             self.token_ids if not self.generated_ids else self.last_token,
         )
 
     def __setstate__(self, state):
-        if len(state) == 6:
-            self._num_tokens, num_prompt, self.block_table, self.num_computed_tokens, self.state_slot = state[:-1]
-        else:
-            # Backward-compatible fallback for older pickled tuples.
-            self._num_tokens, num_prompt, self.block_table, self.num_computed_tokens = state[:-1]
-            self.state_slot = None
+        self._num_tokens, num_prompt, self.block_table, self.num_computed_tokens = state[:-1]
         if isinstance(state[-1], list):
             self.token_ids = state[-1]
         else:
@@ -240,21 +229,13 @@ class ModelRunner:
         self.model, self.config = load_model(
             model_name, torch.device(f"cuda:{rank}"), dtype,
         )
-        model_type = getattr(self.config, "model_type", "")
-        self.model_family = (
-            "mamba" if model_type in {"mamba", "mamba2", "gla", "rwkv7", "kimi_linear", "qwen3_next"}
-            else "attention"
-        )
         self.is_moe = hasattr(self.config, "num_local_experts")
         self.is_qwen_vl = hasattr(self.config, "mrope_section")
-        if self.model_family == "attention":
-            self.warmup_model()
-            self.allocate_kv_cache()
-            if not self.enforce_eager:
-                self.capture_cudagraph()
-            self._init_greedy_buffers()
-        else:
-            self.allocate_mamba_state_cache()
+        self.warmup_model()
+        self.allocate_kv_cache()
+        if not self.enforce_eager:
+            self.capture_cudagraph()
+        self._init_greedy_buffers()
         torch.set_default_device("cpu")
         torch.set_default_dtype(default_dtype)
 
@@ -366,154 +347,6 @@ class ModelRunner:
                 module.k_cache = self.kv_cache[0, layer_id]
                 module.v_cache = self.kv_cache[1, layer_id]
                 layer_id += 1
-
-    def allocate_mamba_state_cache(self):
-        free, total = torch.cuda.mem_get_info()
-        used = total - free
-        peak = torch.cuda.memory_stats()["allocated_bytes.all.peak"]
-        current = torch.cuda.memory_stats()["allocated_bytes.all.current"]
-        model_type = getattr(self.config, "model_type", "")
-        num_layers = self.config.num_hidden_layers
-
-        if model_type == "kimi_linear":
-            # Kimi-Linear: lightweight slot-based state (dicts populated at runtime)
-            num_slots = MAX_NUM_SEQS
-            self.mamba_state_manager = KimiLinearStateManager(
-                num_hidden_layers=num_layers,
-                num_slots=num_slots,
-            )
-            self.num_state_slots = num_slots
-            if self.rank == 0:
-                print(f"  Kimi-Linear state cache: {num_slots} sequence slots")
-            return
-
-        if model_type == "qwen3_next":
-            # Qwen3-Next: lightweight slot-based state (dicts populated at runtime)
-            # Reuse KimiLinearStateManager for simplicity
-            num_slots = MAX_NUM_SEQS
-            self.mamba_state_manager = KimiLinearStateManager(
-                num_hidden_layers=num_layers,
-                num_slots=num_slots,
-            )
-            self.num_state_slots = num_slots
-            if self.rank == 0:
-                print(f"  Qwen3-Next state cache: {num_slots} sequence slots")
-            return
-
-        if model_type == "gla":
-            num_heads = self.config.num_heads
-            key_dim = int(self.config.hidden_size * self.config.expand_k)
-            value_dim = int(self.config.hidden_size * self.config.expand_v)
-            head_k_dim = key_dim // num_heads
-            head_v_dim = value_dim // num_heads
-            state_dtype = torch.float32
-            elem_size = torch.finfo(state_dtype).bits // 8
-            per_layer_bytes = num_heads * head_k_dim * head_v_dim * elem_size
-            per_slot_bytes = num_layers * per_layer_bytes
-            budget = int(total * 0.9 - used - peak + current)
-            num_slots = max(1, min(MAX_NUM_SEQS, budget // max(1, per_slot_bytes)))
-
-            self.mamba_state_manager = GLAStateManager(
-                num_hidden_layers=num_layers,
-                num_heads=num_heads,
-                head_k_dim=head_k_dim,
-                head_v_dim=head_v_dim,
-                num_slots=num_slots,
-                dtype=state_dtype,
-                device=torch.device(f"cuda:{self.rank}"),
-            )
-            self.num_state_slots = num_slots
-            if self.rank == 0:
-                print(f"  GLA state cache: {num_slots} sequence slots")
-            return
-
-        if model_type == "rwkv7":
-            num_heads = int(self.config.num_heads)
-            head_dim = int(self.config.head_dim)
-            value_dims = getattr(self.config, "value_dim", None)
-            if value_dims is None:
-                value_dims = [self.config.hidden_size] * num_layers
-            elif isinstance(value_dims, int):
-                value_dims = [value_dims] * num_layers
-            head_v_dims = [int(v // num_heads) for v in value_dims]
-
-            conv_elem_size = torch.finfo(self._model_dtype).bits // 8
-            recurrent_elem_size = torch.finfo(torch.float32).bits // 8
-            conv_bytes = num_layers * 2 * self.config.hidden_size * conv_elem_size
-            recurrent_bytes = sum(
-                num_heads * head_dim * head_v_dim * recurrent_elem_size
-                for head_v_dim in head_v_dims
-            )
-            per_slot_bytes = conv_bytes + recurrent_bytes
-            budget = int(total * 0.9 - used - peak + current)
-            num_slots = max(1, min(MAX_NUM_SEQS, budget // max(1, per_slot_bytes)))
-
-            self.mamba_state_manager = RWKV7StateManager(
-                num_hidden_layers=num_layers,
-                hidden_size=self.config.hidden_size,
-                num_heads=num_heads,
-                head_dim=head_dim,
-                head_v_dims=head_v_dims,
-                num_slots=num_slots,
-                conv_dtype=self._model_dtype,
-                recurrent_dtype=torch.float32,
-                device=torch.device(f"cuda:{self.rank}"),
-            )
-            self.num_state_slots = num_slots
-            if self.rank == 0:
-                print(f"  RWKV7 state cache: {num_slots} sequence slots")
-            return
-
-        elem_size = torch.finfo(self._model_dtype).bits // 8
-        if model_type == "mamba2":
-            intermediate_size = getattr(
-                self.config,
-                "intermediate_size",
-                int(self.config.expand * self.config.hidden_size),
-            )
-            conv_dim = intermediate_size + 2 * self.config.n_groups * self.config.state_size
-            ssm_state_shape = (
-                self.config.num_heads,
-                self.config.head_dim,
-                self.config.state_size,
-            )
-            per_layer_bytes = (
-                conv_dim * self.config.conv_kernel
-                + self.config.num_heads * self.config.head_dim * self.config.state_size
-            ) * elem_size
-        else:
-            conv_dim = self.config.intermediate_size
-            ssm_state_shape = (self.config.intermediate_size, self.config.state_size)
-            per_layer_bytes = (
-                conv_dim * self.config.conv_kernel
-                + self.config.intermediate_size * self.config.state_size
-            ) * elem_size
-
-        per_slot_bytes = num_layers * per_layer_bytes
-        budget = int(total * 0.9 - used - peak + current)
-        num_slots = max(1, min(MAX_NUM_SEQS, budget // max(1, per_slot_bytes)))
-
-        self.mamba_state_manager = MambaStateManager(
-            num_hidden_layers=num_layers,
-            conv_dim=conv_dim,
-            ssm_state_shape=ssm_state_shape,
-            conv_kernel=self.config.conv_kernel,
-            num_slots=num_slots,
-            dtype=self._model_dtype,
-            device=torch.device(f"cuda:{self.rank}"),
-        )
-        self.num_state_slots = num_slots
-        if self.rank == 0:
-            print(f"  Mamba state cache: {num_slots} sequence slots")
-
-    def can_allocate_mamba_state(self):
-        return self.mamba_state_manager.has_free_slot()
-
-    def allocate_mamba_state(self, seq):
-        self.mamba_state_manager.allocate(seq)
-
-    def deallocate_mamba_state(self, seq):
-        self.mamba_state_manager.deallocate(seq)
 
     def prepare_prefill(self, seqs):
         input_ids, positions = [], []
@@ -887,209 +720,6 @@ class ModelRunner:
                 bt_np[i, blen:max_bt] = -1
         return (n, ids_np[:n], pos_np[:n], sm_np[:n], cl_np[:n], bt_np[:n, :max_bt])
 
-    @torch.inference_mode()
-    def _run_mamba_seq(self, seq, is_prefill):
-        if seq.state_slot is None:
-            raise RuntimeError("Mamba sequence has no allocated state slot")
-        slot_cache = self.mamba_state_manager.get_slot_cache(seq.state_slot)
-
-        if is_prefill:
-            input_ids = torch.tensor(
-                seq.prompt_ids, dtype=torch.int64, device=f"cuda:{self.rank}",
-            ).unsqueeze(0)
-            cache_position = torch.arange(
-                self.config.conv_kernel, dtype=torch.long, device=input_ids.device,
-            )
-        else:
-            input_ids = torch.tensor(
-                [[seq.last_token]], dtype=torch.int64, device=f"cuda:{self.rank}",
-            )
-            cache_position = torch.tensor(
-                [seq.num_computed_tokens], dtype=torch.long, device=input_ids.device,
-            )
-
-        hidden_states = self.model(
-            input_ids,
-            cache_params=slot_cache,
-            cache_position=cache_position,
-        )
-        logits = self.model.compute_logits(hidden_states[:, -1:, :])[:, -1, :]
-
-        if is_prefill:
-            seq.num_computed_tokens = seq.num_prompt_tokens
-        else:
-            seq.num_computed_tokens += 1
-        return logits
-
-    @torch.inference_mode()
-    def _run_mamba_batch(self, seqs, is_prefill):
-        outputs = [self._run_mamba_seq(seq, is_prefill) for seq in seqs]
-        if not outputs:
-            return None
-        return torch.cat(outputs, dim=0)
-
-    @torch.inference_mode()
-    def _run_gla_seq(self, seq, is_prefill):
-        if seq.state_slot is None:
-            raise RuntimeError("GLA sequence has no allocated state slot")
-        slot_cache = self.mamba_state_manager.get_slot_cache(seq.state_slot)
-
-        if is_prefill:
-            input_ids = torch.tensor(
-                seq.prompt_ids, dtype=torch.int64, device=f"cuda:{self.rank}",
-            ).unsqueeze(0)
-        else:
-            input_ids = torch.tensor(
-                [[seq.last_token]], dtype=torch.int64, device=f"cuda:{self.rank}",
-            )
-
-        hidden_states = self.model(
-            input_ids,
-            past_key_values=slot_cache,
-            use_cache=True,
-        )
-        logits = self.model.compute_logits(hidden_states[:, -1:, :])[:, -1, :]
-
-        if is_prefill:
-            seq.num_computed_tokens = seq.num_prompt_tokens
-        else:
-            seq.num_computed_tokens += 1
-        return logits
-
-    @torch.inference_mode()
-    def _run_gla_batch(self, seqs, is_prefill):
-        outputs = [self._run_gla_seq(seq, is_prefill) for seq in seqs]
-        if not outputs:
-            return None
-        return torch.cat(outputs, dim=0)
-
-    @torch.inference_mode()
-    def _run_rwkv7_seq(self, seq, is_prefill):
-        if seq.state_slot is None:
-            raise RuntimeError("RWKV7 sequence has no allocated state slot")
-        slot_cache = self.mamba_state_manager.get_slot_cache(seq.state_slot)
-
-        if is_prefill:
-            input_ids = torch.tensor(
-                seq.prompt_ids,
-                dtype=torch.int64,
-                device=f"cuda:{self.rank}",
-            ).unsqueeze(0)
-        else:
-            input_ids = torch.tensor(
-                [[seq.last_token]],
-                dtype=torch.int64,
-                device=f"cuda:{self.rank}",
-            )
-
-        hidden_states = self.model(
-            input_ids,
-            past_key_values=slot_cache,
-            use_cache=True,
-        )
-        logits = self.model.compute_logits(hidden_states[:, -1:, :])[:, -1, :]
-
-        if is_prefill:
-            seq.num_computed_tokens = seq.num_prompt_tokens
-        else:
-            seq.num_computed_tokens += 1
-        return logits
-
-    @torch.inference_mode()
-    def _run_rwkv7_batch(self, seqs, is_prefill):
-        outputs = [self._run_rwkv7_seq(seq, is_prefill) for seq in seqs]
-        if not outputs:
-            return None
-        return torch.cat(outputs, dim=0)
-
-    @torch.inference_mode()
-    def _run_kimi_linear_seq(self, seq, is_prefill):
-        if seq.state_slot is None:
-            raise RuntimeError("Kimi-Linear sequence has no allocated state slot")
-        slot_cache = self.mamba_state_manager.get_slot_cache(seq.state_slot)
-
-        if is_prefill:
-            # Use token_ids (preserved across pickle) instead of prompt_ids
-            # (stripped by __getstate__ for workers)
-            input_ids = torch.tensor(
-                seq.token_ids, dtype=torch.int64, device=f"cuda:{self.rank}",
-            ).unsqueeze(0)
-        else:
-            input_ids = torch.tensor(
-                [[seq.last_token]], dtype=torch.int64, device=f"cuda:{self.rank}",
-            )
-
-        T = input_ids.shape[1]
-        positions = torch.arange(
-            seq.num_computed_tokens,
-            seq.num_computed_tokens + T,
-            dtype=torch.int64,
-            device=input_ids.device,
-        )
-
-        hidden_states = self.model(
-            input_ids,
-            positions=positions,
-            past_key_values=slot_cache,
-            use_cache=True,
-        )
-        logits = self.model.compute_logits(hidden_states[:, -1:, :])[:, -1, :]
-
-        if is_prefill:
-            seq.num_computed_tokens = T
-        else:
-            seq.num_computed_tokens += 1
-        return logits
-
-    @torch.inference_mode()
-    def _run_kimi_linear_batch(self, seqs, is_prefill):
-        outputs = [self._run_kimi_linear_seq(seq, is_prefill) for seq in seqs]
-        if not outputs:
-            return None
-        return torch.cat(outputs, dim=0)
-
-    def _run_qwen3_next_seq(self, seq, is_prefill):
-        if seq.state_slot is None:
-            raise RuntimeError("Qwen3-Next sequence has no allocated state slot")
-        slot_cache = self.mamba_state_manager.get_slot_cache(seq.state_slot)
-
-        if is_prefill:
-            input_ids = torch.tensor(
-                seq.token_ids, dtype=torch.int64, device=f"cuda:{self.rank}",
-            ).unsqueeze(0)
-        else:
-            input_ids = torch.tensor(
-                [[seq.last_token]], dtype=torch.int64, device=f"cuda:{self.rank}",
-            )
-
-        T = input_ids.shape[1]
-        positions = torch.arange(
-            seq.num_computed_tokens,
-            seq.num_computed_tokens + T,
-            dtype=torch.int64,
-            device=input_ids.device,
-        )
-
-        hidden_states = self.model(
-            input_ids,
-            positions=positions,
-            layer_states=slot_cache,
-        )
-        logits = self.model.compute_logits(hidden_states[:, -1:, :])[:, -1, :]
-
-        if is_prefill:
-            seq.num_computed_tokens = T
-        else:
-            seq.num_computed_tokens += 1
-        return logits
-
-    @torch.inference_mode()
-    def _run_qwen3_next_batch(self, seqs, is_prefill):
-        outputs = [self._run_qwen3_next_seq(seq, is_prefill) for seq in seqs]
-        if not outputs:
-            return None
-        return torch.cat(outputs, dim=0)
-
     def _write_decode_shm(self, n, ids_np, pos_np, sm_np, cl_np, bt_np):
         """Write decode arrays directly into SHM with binary layout.
         
@@ -1151,17 +781,6 @@ class ModelRunner:
         return self.run_decode_greedy(seqs)
 
     def run(self, seqs, is_prefill):
-        if self.model_family == "mamba":
-            model_type = getattr(self.config, "model_type", "")
-            if model_type == "gla":
-                return self._run_gla_batch(seqs, is_prefill)
-            if model_type == "rwkv7":
-                return self._run_rwkv7_batch(seqs, is_prefill)
-            if model_type == "kimi_linear":
-                return self._run_kimi_linear_batch(seqs, is_prefill)
-            if model_type == "qwen3_next":
-                return self._run_qwen3_next_batch(seqs, is_prefill)
-            return self._run_mamba_batch(seqs, is_prefill)
         input_ids, positions = (
             self.prepare_prefill(seqs) if is_prefill
             else self.prepare_decode(seqs)
@@ -1254,17 +873,6 @@ class LlamaEngine:
         self.model_name = model_name
         self.seed = seed
         self._set_seeds(seed)
-        model_type = getattr(AutoConfig.from_pretrained(model_name, trust_remote_code=True), "model_type", "")
-        self.model_family = (
-            "mamba" if model_type in {"mamba", "mamba2", "gla", "rwkv7", "kimi_linear", "qwen3_next"}
-            else "attention"
-        )
-        self.model_type = model_type
-        if self.model_family == "mamba":
-            if tensor_parallel_size != 1 and model_type not in {"kimi_linear", "qwen3_next"}:
-                raise ValueError("Recurrent-family currently supports tensor_parallel_size=1 only")
-            if not enforce_eager:
-                enforce_eager = True
 
         # Unique shared memory name to avoid collisions
         shm_name = f"sllama_{uuid.uuid4().hex[:8]}"
@@ -1289,10 +897,7 @@ class LlamaEngine:
             model_name, 0, tensor_parallel_size, dtype,
             enforce_eager, self.events, shm_name,
         )
-        self.block_manager = (
-            BlockManager(self.model_runner.num_blocks)
-            if self.model_family == "attention" else None
-        )
+        self.block_manager = BlockManager(self.model_runner.num_blocks)
 
         self.tokenizer = AutoTokenizer.from_pretrained(model_name, trust_remote_code=True)
         if self.tokenizer.pad_token_id is None:
@@ -1552,77 +1157,6 @@ class LlamaEngine:
                 seq_logits[id(seq)] = []
 
         all_seqs = list(waiting)
-
-        if self.model_family == "mamba":
-            while waiting or running:
-                prefill_seqs = []
-                while (
-                    waiting
-                    and len(prefill_seqs) < MAX_NUM_SEQS
-                    and self.model_runner.can_allocate_mamba_state()
-                ):
-                    seq = waiting.popleft()
-                    self.model_runner.allocate_mamba_state(seq)
-                    seq.status = SeqStatus.RUNNING
-                    running.append(seq)
-                    prefill_seqs.append(seq)
-
-                if prefill_seqs:
-                    logits = self.model_runner.call("run", prefill_seqs, True)
-                    if logits is not None:
-                        if collect_logits:
-                            for i, seq in enumerate(prefill_seqs):
-                                seq_logits[id(seq)].append(logits[i:i+1].cpu())
-                        token_ids = self._sample(logits, sp_list[0])
-                        finished_set = set()
-                        for seq, tid in zip(prefill_seqs, token_ids):
-                            seq.append_token(tid)
-                            done = len(seq.generated_ids) >= seq.max_tokens
-                            if not seq.ignore_eos:
-                                done = done or tid == eos
-                            if done:
-                                seq.status = SeqStatus.FINISHED
-                                finished_set.add(id(seq))
-                                self.model_runner.deallocate_mamba_state(seq)
-                        if finished_set:
-                            running = deque(s for s in running if id(s) not in finished_set)
-
-                if not running:
-                    continue
-
-                decode_seqs = list(running)
-                result = self.model_runner.call("run", decode_seqs, False)
-                if result is not None:
-                    if collect_logits:
-                        for i, seq in enumerate(decode_seqs):
-                            seq_logits[id(seq)].append(result[i:i+1].cpu())
-                    token_ids = self._sample(result, sp_list[0])
-                    finished_set = set()
-                    for seq, tid in zip(decode_seqs, token_ids):
-                        seq.append_token(tid)
-                        done = len(seq.generated_ids) >= seq.max_tokens
-                        if not seq.ignore_eos:
-                            done = done or tid == eos
-                        if done:
-                            seq.status = SeqStatus.FINISHED
-                            finished_set.add(id(seq))
-                            self.model_runner.deallocate_mamba_state(seq)
-                    if finished_set:
-                        running = deque(s for s in running if id(s) not in finished_set)
-
-            return [
-                GenerationOutput(
-                    prompt=(prompts[i] if isinstance(prompts[i], str) else ""),
-                    generated_text=self.tokenizer.decode(
-                        all_seqs[i].generated_ids, skip_special_tokens=True,
-                    ),
-                    token_ids=all_seqs[i].generated_ids,
-                    logits_history=(
-                        seq_logits.get(id(all_seqs[i])) if collect_logits else None
-                    ),
-                )
-                for i in range(len(prompts))
-            ]
 
         use_greedy = (sp_list[0].temperature == 0.0
                       and not collect_logits)
