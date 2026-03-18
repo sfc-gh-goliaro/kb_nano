@@ -71,6 +71,23 @@ def _per_token_group_quant_fp8(x: torch.Tensor,
     )
 
 
+class _Fp8PrefillBufs:
+    """Shared prefill buffers for FP8 activation quantization.
+
+    Since decoder layers execute sequentially, a single set of buffers
+    (sized for max_num_batched_tokens) can be reused across all Fp8Linear
+    instances, eliminating per-layer dynamic allocation during prefill.
+    One instance per unique (K, N) weight shape.
+    """
+    __slots__ = ("a", "s", "o")
+
+    def __init__(self, max_tokens: int, K: int, N: int, device: torch.device):
+        num_groups = math.ceil(K / 128)
+        self.a = torch.empty(max_tokens, K, dtype=torch.float8_e4m3fn, device=device)
+        self.s = torch.empty(max_tokens, num_groups, dtype=torch.float32, device=device)
+        self.o = torch.empty(max_tokens, N, dtype=torch.bfloat16, device=device)
+
+
 class Fp8Linear(nn.Module):
     """Block-scaled FP8 linear using deep_gemm.fp8_gemm_nt.
 
@@ -87,6 +104,7 @@ class Fp8Linear(nn.Module):
         self._a_buf: torch.Tensor | None = None
         self._s_buf: torch.Tensor | None = None
         self._o_buf: torch.Tensor | None = None
+        self._pf: _Fp8PrefillBufs | None = None
 
     def _ensure_buffers(self, max_tokens: int, K: int, N: int, device: torch.device):
         """Pre-allocate activation FP8 buffers for CUDA graph capture."""
@@ -108,6 +126,11 @@ class Fp8Linear(nn.Module):
             q_input = self._a_buf[:M]
             input_scale = self._s_buf[:M]
             output = self._o_buf[:M]
+        elif self._pf is not None and M <= self._pf.a.shape[0]:
+            _per_token_group_quant_fp8(input_2d, self._pf.a[:M], self._pf.s[:M])
+            q_input = self._pf.a[:M]
+            input_scale = self._pf.s[:M]
+            output = self._pf.o[:M]
         else:
             num_groups = math.ceil(K / self.BLOCK_SIZE)
             q_input = torch.empty(M, K, dtype=torch.float8_e4m3fn, device=input_2d.device)
