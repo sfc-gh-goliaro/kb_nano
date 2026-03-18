@@ -18,6 +18,7 @@ from huggingface_hub import snapshot_download
 from safetensors import safe_open
 from transformers import AutoConfig
 
+from ..tasks.baseline.L1.fp8_linear import Fp8Linear, postprocess_fp8_weights
 from ..tasks.baseline.L4.llama import LlamaConfig, LlamaForCausalLM
 from ..tasks.baseline.L4.mixtral import MixtralConfig, MixtralForCausalLM
 from ..tasks.baseline.L4.qwen2_vl import Qwen2VLConfig, Qwen2VLForConditionalGeneration
@@ -119,9 +120,12 @@ def _load_vision_qkv(model, param_prefix: str, loaded_weight: torch.Tensor,
     return 1
 
 
+_WEIGHT_SCALE_INV_RE = re.compile(r"(.+)\.weight_scale_inv$")
+
+
 def load_weights(model, model_path: str, model_type: str = "llama") -> None:
     """Load weights with support for packed modules, MoE experts, vision
-    encoder QKV, and TP sharding.
+    encoder QKV, FP8 weight_scale_inv, and TP sharding.
     """
     packed = getattr(model, "packed_modules_mapping", {})
     safetensor_files = sorted(glob(os.path.join(model_path, "*.safetensors")))
@@ -197,6 +201,39 @@ def load_weights(model, model_path: str, model_type: str = "llama") -> None:
                         )
                         continue
 
+                # Handle FP8 weight_scale_inv tensors
+                m_scale = _WEIGHT_SCALE_INV_RE.match(mapped_name)
+                if m_scale:
+                    layer_prefix = m_scale.group(1)
+                    matched_scale = False
+                    for orig_key, (packed_name, shard_id) in packed.items():
+                        if orig_key in layer_prefix:
+                            scale_param_name = layer_prefix.replace(
+                                orig_key, packed_name) + ".weight_scale_inv"
+                            try:
+                                param = model.get_parameter(scale_param_name)
+                            except AttributeError:
+                                break
+                            scale_loader = getattr(param, "weight_loader", None)
+                            if scale_loader:
+                                scale_loader(param, f.get_tensor(weight_name), shard_id)
+                            else:
+                                default_weight_loader(param, f.get_tensor(weight_name))
+                            loaded += 1
+                            matched_scale = True
+                            break
+                    if matched_scale:
+                        continue
+                    scale_param_name = layer_prefix + ".weight_scale_inv"
+                    try:
+                        param = model.get_parameter(scale_param_name)
+                    except AttributeError:
+                        continue
+                    scale_loader = getattr(param, "weight_loader", default_weight_loader)
+                    scale_loader(param, f.get_tensor(weight_name))
+                    loaded += 1
+                    continue
+
                 # Handle MoE expert weights
                 m = _EXPERT_RE.match(mapped_name)
                 if m:
@@ -246,11 +283,43 @@ def load_weights(model, model_path: str, model_type: str = "llama") -> None:
     print(f"  Loaded {loaded} weight shards.")
 
 
+def _postprocess_fp8_weights(model: torch.nn.Module) -> None:
+    """Re-quantize FP8 weights to UE8M0 format and transform scale layout for DeepGEMM."""
+    print("  Post-processing FP8 weights for DeepGEMM...")
+    count = 0
+    for module in model.modules():
+        if isinstance(module.linear_op if hasattr(module, 'linear_op') else None, Fp8Linear):
+            w = module.weight
+            s = module.weight_scale_inv
+            w_new, s_new = postprocess_fp8_weights(w.data, s.data)
+            module.weight = torch.nn.Parameter(w_new, requires_grad=False)
+            module.weight_scale_inv = torch.nn.Parameter(s_new, requires_grad=False)
+            count += 1
+    print(f"  Post-processed {count} FP8 linear layers.")
+
+
 def _detect_model_type(model_name: str) -> str:
     """Detect model architecture from HuggingFace config."""
     hf_config = AutoConfig.from_pretrained(model_name)
     model_type = getattr(hf_config, "model_type", "llama")
     return model_type
+
+
+def _detect_quant_config(model_name: str) -> dict | None:
+    """Detect FP8 quantization config from HuggingFace config."""
+    hf_config = AutoConfig.from_pretrained(model_name)
+    qc = getattr(hf_config, "quantization_config", None)
+    if qc is None:
+        return None
+    if isinstance(qc, dict):
+        quant_method = qc.get("quant_method", "")
+    else:
+        quant_method = getattr(qc, "quant_method", "")
+    if quant_method != "fp8":
+        return None
+    if isinstance(qc, dict):
+        return qc
+    return qc.to_dict() if hasattr(qc, "to_dict") else {"quant_method": "fp8"}
 
 
 def load_model(
@@ -260,6 +329,11 @@ def load_model(
 ):
     model_path = download_model(model_name)
     model_type = _detect_model_type(model_name)
+    quant_config = _detect_quant_config(model_name)
+
+    if quant_config:
+        print(f"  Detected FP8 quantization: {quant_config.get('quant_method')}, "
+              f"block_size={quant_config.get('weight_block_size')}")
 
     if model_type == "mixtral":
         config = MixtralConfig.from_pretrained(model_name)
@@ -275,7 +349,7 @@ def load_model(
         config = Qwen3VLConfig.from_pretrained(model_name)
         config.dtype = dtype
         print("  Allocating Qwen3-VL model...")
-        model = Qwen3VLForConditionalGeneration(config)
+        model = Qwen3VLForConditionalGeneration(config, quant_config=quant_config)
     else:
         config = LlamaConfig.from_pretrained(model_name)
         config.dtype = dtype
@@ -283,6 +357,22 @@ def load_model(
         model = LlamaForCausalLM(config)
 
     load_weights(model, model_path, model_type)
-    model = model.to(device=device, dtype=dtype)
+
+    if quant_config:
+        for name, param in model.named_parameters():
+            if param.dtype == torch.float8_e4m3fn:
+                if not param.is_cuda:
+                    param.data = param.data.to(device=device)
+            elif "weight_scale_inv" in name:
+                param.data = param.data.to(device=device)
+            elif param.data.device != device or param.dtype != dtype:
+                param.data = param.data.to(device=device, dtype=dtype)
+        for name, buf in model.named_buffers():
+            if buf.device != device:
+                buf.data = buf.data.to(device=device)
+        _postprocess_fp8_weights(model)
+    else:
+        model = model.to(device=device, dtype=dtype)
+
     model.eval()
     return model, config
