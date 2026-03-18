@@ -47,7 +47,7 @@ class VocabParallelEmbedding(nn.Module):
             x = mask * (x - self.vocab_start)
         y = self.embedding_op(x, self.weight)
         if self.tp_size > 1:
-            y = mask.unsqueeze(-1) * y
+            y = mask.unsqueeze(1) * y
             y = self.allreduce(y)
         return y
 

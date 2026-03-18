@@ -18,19 +18,10 @@ from huggingface_hub import snapshot_download
 from safetensors import safe_open
 from transformers import AutoConfig
 
-from ..tasks.baseline.L4.bitnet import BitNetConfig, BitNetForCausalLM
-from ..tasks.baseline.L4.gla import GLAConfig, GLAForCausalLM
 from ..tasks.baseline.L4.gpt_oss import GptOssConfig, GptOssForCausalLM
-from ..tasks.baseline.L4.kimi_linear import KimiLinearConfig, KimiLinearForCausalLM
-from ..tasks.baseline.L4.retnet import RetNetConfig, RetNetForCausalLM
-from ..tasks.baseline.L4.rwkv7 import RWKV7Config, RWKV7ForCausalLM
 from ..tasks.baseline.L4.llama import LlamaConfig, LlamaForCausalLM
-from ..tasks.baseline.L4.llama4 import Llama4Config, Llama4ForCausalLM
-from ..tasks.baseline.L4.mamba import MambaConfig, MambaForCausalLM
-from ..tasks.baseline.L4.mamba2 import Mamba2Config, Mamba2ForCausalLM
 from ..tasks.baseline.L4.mixtral import MixtralConfig, MixtralForCausalLM
 from ..tasks.baseline.L4.qwen2_vl import Qwen2VLConfig, Qwen2VLForConditionalGeneration
-from ..tasks.baseline.L4.qwen3_next import Qwen3NextConfig, Qwen3NextForCausalLM
 from ..tasks.baseline.L4.qwen3_vl import Qwen3VLConfig, Qwen3VLForConditionalGeneration
 
 
@@ -46,11 +37,6 @@ def download_model(model_name: str) -> str:
 
 _EXPERT_RE = re.compile(
     r"(.+\.block_sparse_moe)\.experts\.(\d+)\.(w[123])\.weight"
-)
-
-# Qwen3-Next MoE expert pattern: mlp.experts.{j}.{gate_proj|up_proj|down_proj}.weight
-_QWEN_EXPERT_RE = re.compile(
-    r"(.+\.mlp)\.experts\.(\d+)\.(gate_proj|up_proj|down_proj)\.weight"
 )
 
 
@@ -94,22 +80,6 @@ _VISION_BLOCK_NORM_RE = re.compile(r"(visual\.blocks\.\d+\.norm[12])\.(weight|bi
 _VISION_MERGER_NORM_RE = re.compile(r"(visual\.(?:merger|deepstack_merger_list\.\d+)\.norm)\.(weight|bias)")
 
 
-# Llama4 fused expert weight patterns
-_LLAMA4_FUSED_EXPERT_RE = re.compile(
-    r"(.+\.feed_forward)\.experts\.(gate_up_proj|down_proj)"
-)
-
-
-def _permute_qk_for_rotary(weight: torch.Tensor, n_heads: int) -> torch.Tensor:
-    """Permute Q/K weights from interleaved to contiguous layout for rotary."""
-    f_out, f_in = weight.shape
-    return (
-        weight.view(n_heads, f_out // n_heads // 2, 2, f_in)
-        .transpose(1, 2)
-        .reshape(f_out, f_in)
-    )
-
-
 def _remap_qwen2_vl_name(name: str) -> str:
     """Remap Qwen2-VL checkpoint weight names to our model parameter names."""
     for prefix, replacement in _QWEN2_VL_PREFIX_MAP.items():
@@ -150,9 +120,6 @@ def _load_vision_qkv(model, param_prefix: str, loaded_weight: torch.Tensor,
     return 1
 
 
-# MXFP4 dequantization lookup table: FP4 E2M1 (4-bit) -> float32
-# Index layout: [sign(1), exponent(2), mantissa(1)] = SEEM
-# Exponent bias = 1; subnormals when exponent == 0
 _FP4_E2M1_LUT = torch.tensor([
     0.0, 0.5, 1.0, 1.5, 2.0, 3.0, 4.0, 6.0,
     -0.0, -0.5, -1.0, -1.5, -2.0, -3.0, -4.0, -6.0,
@@ -169,29 +136,22 @@ def _dequant_mxfp4(blocks: torch.Tensor, scales: torch.Tensor,
     Returns:
         [..., num_blocks * 32] dequantized tensor
     """
-    # Unpack: each byte -> 2 FP4 values (lower nibble first)
-    low = (blocks & 0x0F).long()     # lower nibble = first element
-    high = ((blocks >> 4) & 0x0F).long()  # upper nibble = second element
-    # Interleave: [lo_0, hi_0, lo_1, hi_1, ...] -> 32 values per block
-    unpacked = torch.stack([low, high], dim=-1)  # [..., 16, 2]
-    unpacked = unpacked.reshape(*blocks.shape[:-1], 32)  # [..., 32]
+    low = (blocks & 0x0F).long()
+    high = ((blocks >> 4) & 0x0F).long()
+    unpacked = torch.stack([low, high], dim=-1)
+    unpacked = unpacked.reshape(*blocks.shape[:-1], 32)
 
-    # FP4 to float via lookup
-    values = _FP4_E2M1_LUT[unpacked]  # [..., 32] float32
+    values = _FP4_E2M1_LUT[unpacked]
 
-    # E8M0 scale: 2^(byte - 127)
-    scale_float = torch.pow(2.0, scales.float() - 127.0)  # [..., num_blocks]
+    scale_float = torch.pow(2.0, scales.float() - 127.0)
 
-    # Apply scale per block
-    values = values * scale_float.unsqueeze(-1)  # [..., num_blocks, 32]
+    values = values * scale_float.unsqueeze(-1)
 
-    # Reshape to flat input dimension
     batch_shape = values.shape[:-2]
-    values = values.reshape(*batch_shape, -1)  # [..., num_blocks * 32]
+    values = values.reshape(*batch_shape, -1)
     return values.to(dtype)
 
 
-# GPT-OSS checkpoint weight name pattern for MXFP4 expert weights
 _GPT_OSS_EXPERT_RE = re.compile(
     r"(model\.layers\.\d+\.mlp\.experts)\.(gate_up_proj|down_proj)_(blocks|scales|bias)"
 )
@@ -206,10 +166,8 @@ def _load_gpt_oss_weights(model, model_path: str) -> None:
 
     print(f"  Loading GPT-OSS weights from {len(safetensor_files)} safetensors file(s)...")
 
-    # First pass: collect MXFP4 blocks and scales
-    # Key: (layer_prefix, proj_name) -> {"blocks": tensor, "scales": tensor}
     mxfp4_data: dict[tuple[str, str], dict[str, torch.Tensor]] = {}
-    other_weights: list[tuple[str, str, str]] = []  # (file, weight_name, mapped_name)
+    other_weights: list[tuple[str, str, str]] = []
 
     for sf_file in safetensor_files:
         with safe_open(sf_file, "pt", "cpu") as f:
@@ -226,12 +184,9 @@ def _load_gpt_oss_weights(model, model_path: str) -> None:
 
     loaded = 0
 
-    # Load dequantized MXFP4 expert weights
     for (prefix, proj), data in mxfp4_data.items():
         if "blocks" in data and "scales" in data:
-            # Dequantize
             dequantized = _dequant_mxfp4(data["blocks"], data["scales"])
-            # Map to parameter name
             if proj == "gate_up_proj":
                 param_name = f"{prefix.replace('mlp.experts', 'mlp')}.w13"
                 try:
@@ -261,14 +216,12 @@ def _load_gpt_oss_weights(model, model_path: str) -> None:
             param.weight_loader(param, data["bias"])
             loaded += 1
 
-    # Load non-MXFP4 weights
     for sf_file, weight_name, mapped_name in other_weights:
         with safe_open(sf_file, "pt", "cpu") as f:
             if weight_name not in f.keys():
                 continue
             tensor = f.get_tensor(weight_name)
 
-            # Handle packed QKV (q_proj -> qkv_proj, etc.)
             matched = False
             for orig_key, (packed_name, shard_id) in packed.items():
                 if orig_key in mapped_name:
@@ -287,7 +240,6 @@ def _load_gpt_oss_weights(model, model_path: str) -> None:
             if "rotary_emb" in mapped_name:
                 continue
 
-            # Handle sinks: model.layers.{i}.self_attn.sinks
             try:
                 param = model.get_parameter(mapped_name)
             except AttributeError:
@@ -313,10 +265,6 @@ def load_weights(model, model_path: str, model_type: str = "llama") -> None:
     is_qwen2_vl = model_type == "qwen2_vl"
     is_qwen3_vl = model_type == "qwen3_vl"
     is_qwen_vl = is_qwen2_vl or is_qwen3_vl
-    is_mamba2 = model_type == "mamba2"
-    is_llama4 = model_type == "llama4"
-    if is_llama4:
-        llama4_config = model.config
 
     print(f"  Loading weights from {len(safetensor_files)} safetensors file(s)...")
     loaded = 0
@@ -330,64 +278,6 @@ def load_weights(model, model_path: str, model_type: str = "llama") -> None:
                     mapped_name = _remap_qwen3_vl_name(weight_name)
                 else:
                     mapped_name = weight_name
-
-                if is_mamba2:
-                    if mapped_name.startswith("model."):
-                        mapped_name = mapped_name[len("model."):]
-                    if mapped_name.startswith("backbone.embedding."):
-                        mapped_name = mapped_name.replace(
-                            "backbone.embedding.",
-                            "backbone.embeddings.",
-                            1,
-                        )
-
-                # Llama4: strip language_model. prefix, skip vision weights
-                if is_llama4:
-                    if not mapped_name.startswith("language_model."):
-                        continue  # skip vision weights
-                    mapped_name = mapped_name[len("language_model."):]
-
-                    # Handle fused expert weights
-                    m_fused = _LLAMA4_FUSED_EXPERT_RE.match(mapped_name)
-                    if m_fused:
-                        prefix_part, proj = m_fused.groups()
-                        tensor = f.get_tensor(weight_name)
-                        if proj == "gate_up_proj":
-                            param_name = f"{prefix_part}.w13"
-                            try:
-                                param = model.get_parameter(param_name)
-                            except AttributeError:
-                                continue
-                            # [E, hidden, 2*inter] → transpose → [E, 2*inter, hidden]
-                            weight = tensor.transpose(-1, -2)
-                            E = weight.shape[0]
-                            full_inter = weight.shape[1] // 2
-                            tp = param.shape[1] // 2
-                            rank = 0
-                            if full_inter != tp:
-                                from .tp import _tp_rank
-                                rank = _tp_rank()
-                            gate = weight[:, :full_inter, :]
-                            up = weight[:, full_inter:, :]
-                            param.data[:, :tp, :].copy_(gate[:, rank * tp:(rank + 1) * tp, :])
-                            param.data[:, tp:, :].copy_(up[:, rank * tp:(rank + 1) * tp, :])
-                        else:  # down_proj
-                            param_name = f"{prefix_part}.w2"
-                            try:
-                                param = model.get_parameter(param_name)
-                            except AttributeError:
-                                continue
-                            # [E, inter, hidden] → transpose → [E, hidden, inter]
-                            weight = tensor.transpose(-1, -2)
-                            full_inter = weight.shape[2]
-                            tp_inter = param.shape[2]
-                            rank = 0
-                            if full_inter != tp_inter:
-                                from .tp import _tp_rank
-                                rank = _tp_rank()
-                            param.data.copy_(weight[:, :, rank * tp_inter:(rank + 1) * tp_inter])
-                        loaded += 1
-                        continue
 
                 # Handle Qwen2-VL merger: ln_q -> norm, mlp.0 -> fc1, mlp.2 -> fc2
                 if is_qwen2_vl:
@@ -441,11 +331,7 @@ def load_weights(model, model_path: str, model_type: str = "llama") -> None:
                         )
                         continue
 
-                # Skip multi-token prediction (MTP) weights
-                if mapped_name.startswith("mtp.") or ".mtp." in mapped_name:
-                    continue
-
-                # Handle MoE expert weights (Kimi-Linear: block_sparse_moe)
+                # Handle MoE expert weights
                 m = _EXPERT_RE.match(mapped_name)
                 if m:
                     moe_prefix, expert_id_str, w_name = m.groups()
@@ -466,35 +352,9 @@ def load_weights(model, model_path: str, model_type: str = "llama") -> None:
                     loaded += 1
                     continue
 
-                # Handle MoE expert weights (Qwen3-Next: mlp.experts)
-                m = _QWEN_EXPERT_RE.match(mapped_name)
-                if m:
-                    moe_prefix, expert_id_str, proj_name = m.groups()
-                    expert_id = int(expert_id_str)
-                    if proj_name in ("gate_proj", "up_proj"):
-                        param_name = f"{moe_prefix}.w13"
-                        param = model.get_parameter(param_name)
-                        param.weight_loader(
-                            param, f.get_tensor(weight_name),
-                            expert_id, is_gate=(proj_name == "gate_proj"),
-                        )
-                    else:
-                        param_name = f"{moe_prefix}.w2"
-                        param = model.get_parameter(param_name)
-                        param.weight_loader(
-                            param, f.get_tensor(weight_name), expert_id,
-                        )
-                    loaded += 1
-                    continue
-
                 # Handle packed modules (qkv_proj, gate_up_proj)
                 matched = False
                 for orig_key, (packed_name, shard_id) in packed.items():
-                    # Llama4: skip packed mapping for expert weight names
-                    # (e.g. shared_expert.gate_proj should match, but
-                    #  experts.gate_up_proj should not)
-                    if is_llama4 and "experts." in mapped_name:
-                        continue
                     if orig_key in mapped_name:
                         param_name = mapped_name.replace(orig_key, packed_name)
                         try:
@@ -502,18 +362,7 @@ def load_weights(model, model_path: str, model_type: str = "llama") -> None:
                         except AttributeError:
                             break
                         weight_loader = getattr(param, "weight_loader")
-                        # Llama4: use permuted Q/K weights for rotary
-                        if is_llama4 and orig_key in ("q_proj", "k_proj"):
-                            tensor = f.get_tensor(weight_name)
-                            n_heads = (
-                                llama4_config.num_key_value_heads
-                                if orig_key == "k_proj"
-                                else llama4_config.num_attention_heads
-                            )
-                            tensor = _permute_qk_for_rotary(tensor, n_heads)
-                            weight_loader(param, tensor, shard_id)
-                        else:
-                            weight_loader(param, f.get_tensor(weight_name), shard_id)
+                        weight_loader(param, f.get_tensor(weight_name), shard_id)
                         loaded += 1
                         matched = True
                         break
@@ -533,7 +382,7 @@ def load_weights(model, model_path: str, model_type: str = "llama") -> None:
 
 def _detect_model_type(model_name: str) -> str:
     """Detect model architecture from HuggingFace config."""
-    hf_config = AutoConfig.from_pretrained(model_name, trust_remote_code=True)
+    hf_config = AutoConfig.from_pretrained(model_name)
     model_type = getattr(hf_config, "model_type", "llama")
     return model_type
 
@@ -546,67 +395,17 @@ def load_model(
     model_path = download_model(model_name)
     model_type = _detect_model_type(model_name)
 
-    if model_type == "llama4":
-        config = Llama4Config.from_pretrained(model_name)
-        config.dtype = dtype
-        print(f"  Allocating Llama4 model ({config.num_local_experts} experts, "
-              f"top-{config.num_experts_per_tok})...")
-        model = Llama4ForCausalLM(config)
-    elif model_type == "mixtral":
-        config = MixtralConfig.from_pretrained(model_name)
-        config.dtype = dtype
-        print(f"  Allocating Mixtral model ({config.num_local_experts} experts)...")
-        model = MixtralForCausalLM(config)
-    elif model_type == "mamba":
-        config = MambaConfig.from_pretrained(model_path)
-        config.dtype = dtype
-        print("  Allocating Mamba model...")
-        model = MambaForCausalLM(config)
-    elif model_type == "mamba2":
-        config = Mamba2Config.from_pretrained(model_path)
-        config.dtype = dtype
-        print("  Allocating Mamba2 model...")
-        model = Mamba2ForCausalLM(config)
-    elif model_type == "gla":
-        config = GLAConfig.from_pretrained(model_path)
-        config.dtype = dtype
-        print("  Allocating GLA model...")
-        model = GLAForCausalLM(config)
-    elif model_type == "retnet":
-        config = RetNetConfig.from_pretrained(model_path)
-        config.dtype = dtype
-        print("  Allocating RetNet model...")
-        model = RetNetForCausalLM(config)
-    elif model_type == "rwkv7":
-        config = RWKV7Config.from_pretrained(model_path)
-        config.dtype = dtype
-        print("  Allocating RWKV7 model...")
-        model = RWKV7ForCausalLM(config)
-    elif model_type == "bitnet":
-        config = BitNetConfig.from_pretrained(model_path)
-        config.dtype = dtype
-        print("  Allocating BitNet model...")
-        model = BitNetForCausalLM(config)
-    elif model_type == "gpt_oss":
+    if model_type == "gpt_oss":
         config = GptOssConfig.from_pretrained(model_name)
         config.dtype = dtype
         print(f"  Allocating GPT-OSS model ({config.num_local_experts} experts, "
               f"top-{config.num_experts_per_tok})...")
         model = GptOssForCausalLM(config)
-    elif model_type == "kimi_linear":
-        config = KimiLinearConfig.from_pretrained(model_name)
+    elif model_type == "mixtral":
+        config = MixtralConfig.from_pretrained(model_name)
         config.dtype = dtype
-        print(f"  Allocating Kimi-Linear model ({config.num_experts} experts, "
-              f"{len(config.kda_layers)} KDA + {len(config.full_attn_layers)} MLA layers)...")
-        model = KimiLinearForCausalLM(config)
-    elif model_type == "qwen3_next":
-        config = Qwen3NextConfig.from_pretrained(model_name)
-        config.dtype = dtype
-        n_linear = sum(1 for lt in config.layer_types if lt == "linear_attention")
-        n_full = sum(1 for lt in config.layer_types if lt == "full_attention")
-        print(f"  Allocating Qwen3-Next model ({config.num_experts} experts, "
-              f"{n_linear} GDN + {n_full} full attention layers)...")
-        model = Qwen3NextForCausalLM(config)
+        print(f"  Allocating Mixtral model ({config.num_local_experts} experts)...")
+        model = MixtralForCausalLM(config)
     elif model_type == "qwen2_vl":
         config = Qwen2VLConfig.from_pretrained(model_name)
         config.dtype = dtype
