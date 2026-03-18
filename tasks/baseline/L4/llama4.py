@@ -94,11 +94,6 @@ class Llama4Model(nn.Module):
     def __init__(self, config: Llama4Config):
         super().__init__()
         self.embed_tokens = VocabParallelEmbedding(config.vocab_size, config.hidden_size)
-        self.layers = nn.ModuleList([
-            Llama4DecoderLayer(config, layer_idx=i)
-            for i in range(config.num_hidden_layers)
-        ])
-        self.norm = RMSNorm(config.hidden_size, eps=config.rms_norm_eps)
         self.rotary_emb = RotaryEmbedding(
             config.head_dim,
             config.max_position_embeddings,
@@ -108,14 +103,17 @@ class Llama4Model(nn.Module):
             rope_high_freq_factor=config.rope_high_freq_factor,
             rope_original_max_position_embeddings=config.rope_original_max_position_embeddings,
         )
+        self.layers = nn.ModuleList([
+            Llama4DecoderLayer(config, layer_idx=i, rotary_emb=self.rotary_emb)
+            for i in range(config.num_hidden_layers)
+        ])
+        self.norm = RMSNorm(config.hidden_size, eps=config.rms_norm_eps)
 
     def forward(self, input_ids, positions):
         hidden_states = self.embed_tokens(input_ids)
         residual = None
         for layer in self.layers:
-            hidden_states, residual = layer(
-                positions, hidden_states, residual, self.rotary_emb,
-            )
+            hidden_states, residual = layer(positions, hidden_states, residual)
         hidden_states, _ = self.norm(hidden_states, residual)
         return hidden_states
 
