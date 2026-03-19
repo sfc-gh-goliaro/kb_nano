@@ -88,10 +88,10 @@ class EvalReport:
         print(f"  Models         : {self.total_models}")
         tp_set = sorted(set(m.tp for c in self.categories for m in c.models))
         print(f"  TP degrees     : {tp_set}")
-        print(f"  Throughput     : prefill-heavy (1024/512), balanced (512/512),")
-        print(f"                   decode-heavy (512/1024) — 1000 reqs each")
-        print(f"  Latency        : single-request (bs=1, 128/128),")
-        print(f"                   fixed-batch-32 (bs=32, 128/128)")
+        print(f"  Throughput     : longbench-summ (500 reqs), sharegpt-short (3000 reqs),")
+        print(f"                   ds1000-code (1000 reqs)")
+        print(f"  Latency        : single-short (bs=1, sharegpt),")
+        print(f"                   single-long-context (bs=1, longbench)")
         print(f"{'=' * 70}")
 
         for cat in self.categories:

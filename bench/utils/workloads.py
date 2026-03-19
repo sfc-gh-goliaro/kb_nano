@@ -3,12 +3,15 @@
 These workloads are constants that ensure reproducible, comparable results
 across runs and users. They are not configurable by design.
 
-LLM workloads (text-only, random token IDs):
-  Throughput: 3 scenarios (prefill-heavy, balanced, decode-heavy), 1000 reqs each.
-  Latency: 2 scenarios (single-request, fixed-batch-32).
+LLM workloads (real datasets):
+  Throughput: 3 scenarios using LongBench (500 reqs, prefill-heavy),
+    ShareGPT (3000 reqs, decode-heavy at high concurrency), and
+    DS-1000 (1000 reqs, decode-sustained code generation).
+  Latency: 2 scenarios (single-short from ShareGPT, single-long-context
+    from LongBench), both batch_size=1.
 
 VLM workloads (multi-modal):
-  Throughput: 3 scenarios (text-only, image, video), 1000 reqs each.
+  Throughput: 3 scenarios (text-only mixed from LLM datasets, image, video).
   Latency: 2 scenarios (single-image, single-video), batch_size=1.
 """
 
@@ -20,30 +23,40 @@ from dataclasses import dataclass
 @dataclass(frozen=True)
 class ThroughputWorkload:
     name: str
-    input_len: int
-    output_len: int
+    dataset: str  # "longbench", "sharegpt", "ds1000"
+    output_len: int | None  # None = dynamic (from dataset)
     num_requests: int = 1000
 
 
 @dataclass(frozen=True)
 class LatencyWorkload:
     name: str
+    dataset: str  # "sharegpt", "longbench"
     batch_size: int
-    input_len: int
     output_len: int
     num_warmup: int = 3
     num_iters: int = 5
 
 
 THROUGHPUT_WORKLOADS: list[ThroughputWorkload] = [
-    ThroughputWorkload(name="prefill-heavy", input_len=1024, output_len=512),
-    ThroughputWorkload(name="balanced",      input_len=512,  output_len=512),
-    ThroughputWorkload(name="decode-heavy",  input_len=512,  output_len=1024),
+    ThroughputWorkload(
+        name="longbench-summ", dataset="longbench",
+        output_len=512, num_requests=500),
+    ThroughputWorkload(
+        name="sharegpt-short", dataset="sharegpt",
+        output_len=None, num_requests=3000),
+    ThroughputWorkload(
+        name="ds1000-code", dataset="ds1000",
+        output_len=8192, num_requests=1000),
 ]
 
 LATENCY_WORKLOADS: list[LatencyWorkload] = [
-    LatencyWorkload(name="single-request",  batch_size=1,  input_len=128, output_len=128),
-    LatencyWorkload(name="fixed-batch-32",  batch_size=32, input_len=128, output_len=128),
+    LatencyWorkload(
+        name="single-short", dataset="sharegpt",
+        batch_size=1, output_len=128),
+    LatencyWorkload(
+        name="single-long-context", dataset="longbench",
+        batch_size=1, output_len=128),
 ]
 
 ALL_WORKLOADS = {
@@ -60,20 +73,20 @@ ALL_WORKLOADS = {
 class VLMThroughputWorkload:
     name: str
     modality: str  # "text", "image", "video"
-    input_len: int | None  # fixed input token length (text only)
-    output_len: int
+    output_len: int | None  # None = dynamic (from dataset)
     dataset_name: str | None = None  # HF dataset (image/video only)
     num_requests: int = 1000
 
 
 VLM_THROUGHPUT_WORKLOADS: list[VLMThroughputWorkload] = [
     VLMThroughputWorkload(
-        "text-only", "text", input_len=512, output_len=1024),
+        "text-only", "text", output_len=None,
+        dataset_name="mixed"),
     VLMThroughputWorkload(
-        "image", "image", input_len=None, output_len=512,
+        "image", "image", output_len=512,
         dataset_name="lmarena-ai/VisionArena-Chat"),
     VLMThroughputWorkload(
-        "video", "video", input_len=None, output_len=512,
+        "video", "video", output_len=512,
         dataset_name="yale-nlp/MMVU"),
 ]
 
@@ -102,13 +115,3 @@ ALL_VLM_WORKLOADS = {
     "throughput": VLM_THROUGHPUT_WORKLOADS,
     "latency": VLM_LATENCY_WORKLOADS,
 }
-
-
-def get_max_seq_len() -> int:
-    """Return the maximum sequence length across all standardized workloads."""
-    max_len = 0
-    for w in THROUGHPUT_WORKLOADS:
-        max_len = max(max_len, w.input_len + w.output_len)
-    for w in LATENCY_WORKLOADS:
-        max_len = max(max_len, w.input_len + w.output_len)
-    return max_len

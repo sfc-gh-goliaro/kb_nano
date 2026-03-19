@@ -2,12 +2,15 @@
 """
 Throughput and alignment benchmark: kb-nano baseline vs vLLM.
 
-For LLM models: runs three text-only scenarios (prefill-heavy, balanced,
-decode-heavy) with random token IDs.
+For LLM models: runs three text-only scenarios using real datasets:
+  - LongBench (prefill-heavy, 500 reqs)
+  - ShareGPT (short QA, 3000 reqs)
+  - DS-1000 (long-output code gen, 1000 reqs)
 
 For VLM models (Qwen2-VL, Qwen3-VL): runs three throughput scenarios
-(text-only, image, video) and two latency scenarios (single-image,
-single-video) using real multimodal datasets (VisionArena, MMVU).
+(text-only mixed from LLM datasets, image, video) and two latency
+scenarios (single-image, single-video) using real multimodal datasets
+(VisionArena, MMVU).
 
 Each engine (vLLM, kb-nano) is loaded once in a single long-lived subprocess
 that processes all scenarios sequentially, avoiding repeated model loading.
@@ -30,7 +33,6 @@ import os
 import random
 import sys
 from pathlib import Path
-from random import randint
 
 import subprocess
 
@@ -61,18 +63,21 @@ from kb_nano.bench.utils.worker import run_worker
 
 
 SCENARIOS = [
-    {"name": "prefill-heavy", "input_len": 1024, "output_len": 512},
-    {"name": "balanced",      "input_len": 512,  "output_len": 512},
-    {"name": "decode-heavy",  "input_len": 512,  "output_len": 1024},
+    {"name": "longbench-summ", "dataset": "longbench", "output_len": 512,
+     "num_requests": 500},
+    {"name": "sharegpt-short", "dataset": "sharegpt", "output_len": None,
+     "num_requests": 3000},
+    {"name": "ds1000-code",   "dataset": "ds1000",   "output_len": 8192,
+     "num_requests": 1000},
 ]
 
 LATENCY_SCENARIOS = [
-    {"name": "single-request",  "input_len": 128, "output_len": 128, "batch_size": 1},
-    {"name": "fixed-batch-32",  "input_len": 128, "output_len": 128, "batch_size": 32},
+    {"name": "single-short",       "dataset": "sharegpt",  "output_len": 128, "batch_size": 1},
+    {"name": "single-long-context", "dataset": "longbench", "output_len": 128, "batch_size": 1},
 ]
 
 VLM_SCENARIOS = [
-    {"name": "text-only",  "modality": "text",  "input_len": 512, "output_len": 1024},
+    {"name": "text-only",  "modality": "text",  "dataset": "mixed", "output_len": None},
     {"name": "image",      "modality": "image", "output_len": 512,
      "dataset": "lmarena-ai/VisionArena-Chat", "dataset_split": "train"},
     {"name": "video",      "modality": "video", "output_len": 512,
@@ -90,6 +95,143 @@ VLM_LATENCY_SCENARIOS = [
 def _is_vlm_model(model_name: str) -> bool:
     lower = model_name.lower()
     return "qwen" in lower and "vl" in lower
+
+
+# ---------------------------------------------------------------------------
+# Dataset loading helpers
+# ---------------------------------------------------------------------------
+
+def _load_longbench(tokenizer, num_requests: int, seed: int,
+                    min_prompt_tokens: int = 12000) -> dict:
+    """Load LongBench gov_report + multi_news, filter for long inputs."""
+    from datasets import load_dataset
+
+    items = []
+    for subset in ("gov_report", "multi_news"):
+        ds = load_dataset("THUDM/LongBench", subset, split="test",
+                          trust_remote_code=True)
+        for row in ds:
+            text = row.get("context", "") or row.get("input", "")
+            if not text:
+                continue
+            items.append(text)
+
+    rng = random.Random(seed)
+    rng.shuffle(items)
+
+    prompts = []
+    prompt_lens = []
+    for text in items:
+        if len(prompts) >= num_requests:
+            break
+        ids = tokenizer.encode(text)
+        if len(ids) >= min_prompt_tokens:
+            prompts.append(text)
+            prompt_lens.append(len(ids))
+
+    if len(prompts) < num_requests:
+        print(f"  WARNING: LongBench only yielded {len(prompts)} prompts "
+              f"with >= {min_prompt_tokens} tokens (requested {num_requests})")
+
+    return {"prompts": prompts, "prompt_lens": prompt_lens}
+
+
+def _load_sharegpt(tokenizer, num_requests: int, seed: int) -> dict:
+    """Load ShareGPT single-turn conversations."""
+    from datasets import load_dataset
+
+    ds = load_dataset(
+        "anon8231489123/ShareGPT_Vicuna_unfiltered",
+        split="train",
+        trust_remote_code=True,
+    )
+
+    rng = random.Random(seed)
+    indices = list(range(len(ds)))
+    rng.shuffle(indices)
+
+    prompts = []
+    prompt_lens = []
+    output_lens = []
+    for idx in indices:
+        if len(prompts) >= num_requests:
+            break
+        row = ds[idx]
+        convs = row.get("conversations", [])
+        if len(convs) < 2:
+            continue
+        prompt = convs[0].get("value", "")
+        completion = convs[1].get("value", "")
+        if not prompt or not completion:
+            continue
+        # Filter to reasonable lengths
+        prompt_ids = tokenizer.encode(prompt)
+        completion_ids = tokenizer.encode(completion)
+        if len(prompt_ids) < 4 or len(prompt_ids) > 2048:
+            continue
+        if len(completion_ids) < 4:
+            continue
+        prompts.append(prompt)
+        prompt_lens.append(len(prompt_ids))
+        output_lens.append(len(completion_ids))
+
+    return {"prompts": prompts, "prompt_lens": prompt_lens,
+            "output_lens": output_lens}
+
+
+def _load_ds1000(tokenizer, num_requests: int, seed: int) -> dict:
+    """Load DS-1000 code generation prompts."""
+    from datasets import load_dataset
+
+    ds = load_dataset("xlangai/DS-1000", split="test",
+                      trust_remote_code=True)
+
+    rng = random.Random(seed)
+    indices = list(range(len(ds)))
+    rng.shuffle(indices)
+
+    prompts = []
+    prompt_lens = []
+    for idx in indices:
+        if len(prompts) >= num_requests:
+            break
+        row = ds[idx]
+        prompt = row.get("prompt", "")
+        if not prompt:
+            continue
+        prompt_ids = tokenizer.encode(prompt)
+        if len(prompt_ids) < 4:
+            continue
+        prompts.append(prompt)
+        prompt_lens.append(len(prompt_ids))
+
+    return {"prompts": prompts, "prompt_lens": prompt_lens}
+
+
+def _load_text_datasets(model: str, seed: int) -> dict:
+    """Load all text datasets and return structured data.
+
+    Returns dict with keys: "longbench", "sharegpt", "ds1000", each containing
+    {"prompts": list[str], "prompt_lens": list[int], "output_lens": list[int] (sharegpt only)}.
+    """
+    from transformers import AutoTokenizer
+    print("  Loading tokenizer and text datasets...")
+    tokenizer = AutoTokenizer.from_pretrained(model, trust_remote_code=True)
+
+    longbench = _load_longbench(tokenizer, num_requests=500, seed=seed)
+    print(f"    LongBench: {len(longbench['prompts'])} prompts loaded")
+
+    sharegpt = _load_sharegpt(tokenizer, num_requests=3000, seed=seed)
+    print(f"    ShareGPT:  {len(sharegpt['prompts'])} prompts loaded")
+
+    ds1000 = _load_ds1000(tokenizer, num_requests=1000, seed=seed)
+    print(f"    DS-1000:   {len(ds1000['prompts'])} prompts loaded")
+
+    return {
+        "longbench": longbench,
+        "sharegpt": sharegpt,
+        "ds1000": ds1000,
+    }
 
 
 # ---------------------------------------------------------------------------
@@ -123,7 +265,7 @@ def main():
     scenarios = cfg["scenarios"]
     all_results = []
     for scenario in scenarios:
-        prompt_token_ids = scenario["prompt_token_ids"]
+        prompts = scenario["prompts"]
         output_lens = scenario["output_lens"]
         temperature = cfg.get("temperature", 0.0)
 
@@ -132,7 +274,7 @@ def main():
             for ol in output_lens
         ]
 
-        vllm_prompts = [dict(prompt_token_ids=p) for p in prompt_token_ids]
+        vllm_prompts = [dict(prompt=p) for p in prompts]
         start = time.perf_counter()
         outputs = llm.generate(vllm_prompts, sp_list)
         elapsed = time.perf_counter() - start
@@ -163,7 +305,7 @@ def main():
 
     latency_results = []
     for ls in cfg.get("latency_scenarios", []):
-        prompts = [dict(prompt_token_ids=p) for p in ls["prompt_token_ids"]]
+        prompts = [dict(prompt=p) for p in ls["prompts"]]
         sp = SamplingParams(temperature=0.0,
                             ignore_eos=True, max_tokens=ls["output_len"])
         num_warmup = ls.get("num_warmup", 3)
@@ -178,7 +320,6 @@ def main():
         latency_results.append({
             "name": ls["name"],
             "batch_size": ls["batch_size"],
-            "input_len": ls["input_len"],
             "output_len": ls["output_len"],
             "num_iters": num_iters,
             "latencies": latencies,
@@ -227,7 +368,7 @@ def main():
     scenarios = cfg["scenarios"]
     all_results = []
     for scenario in scenarios:
-        prompts = scenario["prompt_token_ids"]
+        prompts = scenario["prompts"]
         output_lens = scenario["output_lens"]
         temperature = cfg.get("temperature", 0.0)
         top_p = cfg.get("top_p", 1.0)
@@ -249,7 +390,10 @@ def main():
         torch.cuda.synchronize()
         elapsed = time.perf_counter() - start
 
-        total_input_tokens = sum(len(p) for p in prompts)
+        total_input_tokens = sum(
+            len(engine.tokenizer.encode(p)) if isinstance(p, str) else len(p)
+            for p in prompts
+        )
         total_output_tokens = sum(len(o.token_ids) for o in outputs)
 
         result = {
@@ -269,7 +413,7 @@ def main():
 
     latency_results = []
     for ls in cfg.get("latency_scenarios", []):
-        prompts = ls["prompt_token_ids"]
+        prompts = ls["prompts"]
         sp = SamplingParams(temperature=0.0,
                             ignore_eos=True, max_tokens=ls["output_len"])
         num_warmup = ls.get("num_warmup", 3)
@@ -290,7 +434,6 @@ def main():
         latency_results.append({
             "name": ls["name"],
             "batch_size": ls["batch_size"],
-            "input_len": ls["input_len"],
             "output_len": ls["output_len"],
             "num_iters": num_iters,
             "latencies": latencies,
@@ -529,14 +672,14 @@ def main():
         modality = scenario.get("modality", "text")
 
         if modality == "text":
-            prompt_token_ids = scenario["prompt_token_ids"]
+            prompts = scenario["prompts"]
             output_lens = scenario["output_lens"]
             sp_list = [
                 SamplingParams(temperature=temperature,
                                ignore_eos=True, max_tokens=ol)
                 for ol in output_lens
             ]
-            vllm_prompts = [dict(prompt_token_ids=p) for p in prompt_token_ids]
+            vllm_prompts = [dict(prompt=p) for p in prompts]
             start = time.perf_counter()
             outputs = llm.generate(vllm_prompts, sp_list)
             elapsed = time.perf_counter() - start
@@ -599,7 +742,7 @@ def main():
         modality = ls.get("modality", "text")
 
         if modality == "text":
-            prompts = [dict(prompt_token_ids=p) for p in ls["prompt_token_ids"]]
+            prompts = [dict(prompt=p) for p in ls["prompts"]]
             sp = SamplingParams(temperature=0.0,
                                 ignore_eos=True, max_tokens=ls["output_len"])
             run_fn = lambda: llm.generate(prompts, sp, use_tqdm=False)
@@ -694,7 +837,7 @@ def main():
         modality = scenario.get("modality", "text")
 
         if modality == "text":
-            prompts = scenario["prompt_token_ids"]
+            prompts = scenario["prompts"]
             output_lens = scenario["output_lens"]
             sp_list = [
                 SamplingParams(temperature=temperature, top_p=top_p,
@@ -707,7 +850,10 @@ def main():
             outputs = engine.generate(prompts, sp_list, use_tqdm=True)
             torch.cuda.synchronize()
             elapsed = time.perf_counter() - start
-            total_input_tokens = sum(len(p) for p in prompts)
+            total_input_tokens = sum(
+                len(engine.tokenizer.encode(p)) if isinstance(p, str) else len(p)
+                for p in prompts
+            )
         else:
             mm_data = _preload_mm_data(
                 scenario["dataset"], scenario["dataset_split"],
@@ -773,7 +919,7 @@ def main():
         modality = ls.get("modality", "text")
 
         if modality == "text":
-            prompts = ls["prompt_token_ids"]
+            prompts = ls["prompts"]
             sp = SamplingParams(temperature=0.0, ignore_eos=True,
                                 max_tokens=ls["output_len"])
             def run_fn():
@@ -889,7 +1035,6 @@ def main():
         "--model", type=str, default="meta-llama/Llama-3.1-8B-Instruct",
     )
     parser.add_argument("--tp", type=int, default=1)
-    parser.add_argument("--num-seqs", type=int, default=1000)
     parser.add_argument("--seed", type=int, default=42)
     parser.add_argument(
         "--temperature", type=float, default=0.0,
@@ -936,6 +1081,19 @@ def main():
             if s.get("modality", "text") == args.modality
         ]
 
+    # Load real text datasets (shared across all text scenarios)
+    has_text_throughput = not args.skip_throughput and any(
+        s.get("modality", "text") == "text" if is_vlm else True
+        for s in throughput_scenarios
+    )
+    has_text_latency = not args.skip_latency and any(
+        s.get("modality", "text") == "text" if is_vlm else True
+        for s in latency_scenarios
+    )
+    text_data = None
+    if has_text_throughput or has_text_latency:
+        text_data = _load_text_datasets(args.model, args.seed)
+
     # Pre-generate all scenario data
     scenario_data = []
     global_max_seq_len = 0
@@ -943,26 +1101,66 @@ def main():
         for i, scenario in enumerate(throughput_scenarios):
             modality = scenario.get("modality", "text") if is_vlm else "text"
             if modality == "text":
-                rng_seed = args.seed + i
-                random.seed(rng_seed)
-                np.random.seed(rng_seed)
-                input_len = scenario["input_len"]
-                output_len = scenario["output_len"]
-                prompt_token_ids = [
-                    [randint(0, 10000) for _ in range(input_len)]
-                    for _ in range(args.num_seqs)
-                ]
-                output_lens = [output_len] * args.num_seqs
-                max_seq_len = input_len + output_len
+                ds_key = scenario.get("dataset", "mixed")
+                num_reqs = scenario.get("num_requests", 1000)
+
+                if ds_key == "mixed":
+                    # VLM text-only: proportional mix from all three datasets
+                    all_prompts = []
+                    all_prompt_lens = []
+                    all_output_lens = []
+                    for src_key, src_scenario in zip(
+                        ["longbench", "sharegpt", "ds1000"], SCENARIOS
+                    ):
+                        src = text_data[src_key]
+                        src_output_len = src_scenario["output_len"]
+                        src_num = min(
+                            src_scenario.get("num_requests", 1000),
+                            len(src["prompts"]),
+                        )
+                        # Proportionally scale to num_reqs
+                        n = min(
+                            int(src_num * num_reqs / 4500),
+                            len(src["prompts"]),
+                        )
+                        all_prompts.extend(src["prompts"][:n])
+                        all_prompt_lens.extend(src["prompt_lens"][:n])
+                        if "output_lens" in src and src_output_len is None:
+                            all_output_lens.extend(src["output_lens"][:n])
+                        else:
+                            ol = src_output_len if src_output_len is not None else 512
+                            all_output_lens.extend([ol] * n)
+
+                    prompts = all_prompts
+                    prompt_lens = all_prompt_lens
+                    output_lens = all_output_lens
+                else:
+                    src = text_data[ds_key]
+                    n = min(num_reqs, len(src["prompts"]))
+                    prompts = src["prompts"][:n]
+                    prompt_lens = src["prompt_lens"][:n]
+
+                    output_len = scenario["output_len"]
+                    if output_len is not None:
+                        output_lens = [output_len] * n
+                    else:
+                        # Dynamic from dataset (ShareGPT)
+                        output_lens = src["output_lens"][:n]
+
+                max_prompt_len = max(prompt_lens) if prompt_lens else 0
+                max_output_len = max(output_lens) if output_lens else 0
+                max_seq_len = max_prompt_len + max_output_len
                 if max_seq_len > global_max_seq_len:
                     global_max_seq_len = max_seq_len
+
                 scenario_data.append({
                     "name": scenario["name"],
                     "modality": "text",
-                    "input_len": input_len,
-                    "output_len": output_len,
-                    "prompt_token_ids": prompt_token_ids,
+                    "prompts": prompts,
                     "output_lens": output_lens,
+                    "num_requests": len(prompts),
+                    "avg_prompt_len": sum(prompt_lens) / len(prompt_lens) if prompt_lens else 0,
+                    "max_prompt_len": max_prompt_len,
                 })
             else:
                 # Image/video: dataset is loaded inside the subprocess worker.
@@ -976,7 +1174,7 @@ def main():
                     "output_len": scenario["output_len"],
                     "dataset": scenario["dataset"],
                     "dataset_split": scenario["dataset_split"],
-                    "num_seqs": args.num_seqs,
+                    "num_seqs": scenario.get("num_requests", 1000),
                 })
 
     # Pre-generate latency scenario data
@@ -985,24 +1183,24 @@ def main():
         for j, ls in enumerate(latency_scenarios):
             modality = ls.get("modality", "text") if is_vlm else "text"
             if modality == "text":
-                rng_seed = args.seed + 100 + j
-                random.seed(rng_seed)
-                np.random.seed(rng_seed)
+                ds_key = ls["dataset"]
+                src = text_data[ds_key]
                 bs = ls["batch_size"]
-                prompt_token_ids = [
-                    [randint(0, 10000) for _ in range(ls["input_len"])]
-                    for _ in range(bs)
-                ]
-                seq_len = ls["input_len"] + ls["output_len"]
+                # Pick prompt(s) from the end of the dataset to avoid overlap
+                # with throughput data
+                prompts = src["prompts"][-bs:]
+                prompt_lens = src["prompt_lens"][-bs:]
+
+                max_prompt_len = max(prompt_lens) if prompt_lens else 0
+                seq_len = max_prompt_len + ls["output_len"]
                 if seq_len > global_max_seq_len:
                     global_max_seq_len = seq_len
                 latency_data.append({
                     "name": ls["name"],
                     "modality": "text",
-                    "input_len": ls["input_len"],
                     "output_len": ls["output_len"],
                     "batch_size": bs,
-                    "prompt_token_ids": prompt_token_ids,
+                    "prompts": prompts,
                     "num_warmup": 3,
                     "num_iters": args.latency_iters,
                 })
@@ -1029,7 +1227,6 @@ def main():
     if is_vlm and args.modality != "all":
         print(f"  Modality       : {args.modality}")
     print(f"  TP             : {args.tp}")
-    print(f"  Seqs/scenario  : {args.num_seqs}")
     print(f"  Temperature    : {args.temperature}")
     print(f"  Enforce eager  : {args.enforce_eager}")
     print(f"  Seed           : {args.seed}")
@@ -1103,16 +1300,20 @@ def main():
             kb_data = kb_results[i]
             kb_tps = kb_data["total_output_tokens"] / kb_data["elapsed"]
 
+            sd = scenario_data[i] if i < len(scenario_data) else {}
+            num_reqs = sd.get("num_requests", 1000)
+            avg_prompt_len = sd.get("avg_prompt_len", 0)
+
             result = {
                 "scenario": scenario["name"],
-                "num_seqs": args.num_seqs,
+                "num_requests": num_reqs,
                 "kb_nano_elapsed": kb_data["elapsed"],
                 "kb_nano_output_tokens": kb_data["total_output_tokens"],
                 "kb_nano_tok_per_s": kb_tps,
+                "avg_prompt_len": int(avg_prompt_len),
             }
-            if "input_len" in scenario:
-                result["input_len"] = scenario["input_len"]
-            result["output_len"] = scenario["output_len"]
+            if "output_len" in scenario and scenario["output_len"] is not None:
+                result["output_len"] = scenario["output_len"]
 
             if vllm_results is not None:
                 v_data = vllm_results[i]
@@ -1144,23 +1345,16 @@ def main():
 
             all_results.append(result)
 
-        print(f"\n\n{'=' * 90}")
+        print(f"\n\n{'=' * 100}")
         print("  THROUGHPUT SUMMARY")
-        print(f"{'=' * 90}")
-        if is_vlm:
-            header = (
-                f"  {'SCENARIO':<16} {'OUT':>5} "
-                f"{'KB-NANO tok/s':>15} {'vLLM tok/s':>12} {'SPEEDUP':>8} "
-                f"{'AVG MATCH TOKS':>15}"
-            )
-        else:
-            header = (
-                f"  {'SCENARIO':<16} {'IN':>5} {'OUT':>5} "
-                f"{'KB-NANO tok/s':>15} {'vLLM tok/s':>12} {'SPEEDUP':>8} "
-                f"{'AVG MATCH TOKS':>15}"
-            )
+        print(f"{'=' * 100}")
+        header = (
+            f"  {'SCENARIO':<20} {'REQS':>5} {'AVG IN':>7} "
+            f"{'KB-NANO tok/s':>15} {'vLLM tok/s':>12} {'SPEEDUP':>8} "
+            f"{'AVG MATCH TOKS':>15}"
+        )
         print(header)
-        print(f"  {'-' * 84}")
+        print(f"  {'-' * 94}")
 
         for r in all_results:
             kb_tps_str = f"{r['kb_nano_tok_per_s']:,.0f}"
@@ -1177,20 +1371,14 @@ def main():
             else:
                 match_str = "N/A"
 
-            if is_vlm:
-                print(
-                    f"  {r['scenario']:<16} {r['output_len']:>5} "
-                    f"{kb_tps_str:>15} {v_tps_str:>12} {speedup_str:>8} "
-                    f"{match_str:>15}"
-                )
-            else:
-                print(
-                    f"  {r['scenario']:<16} {r['input_len']:>5} {r['output_len']:>5} "
-                    f"{kb_tps_str:>15} {v_tps_str:>12} {speedup_str:>8} "
-                    f"{match_str:>15}"
-                )
+            print(
+                f"  {r['scenario']:<20} {r['num_requests']:>5} "
+                f"{r['avg_prompt_len']:>7} "
+                f"{kb_tps_str:>15} {v_tps_str:>12} {speedup_str:>8} "
+                f"{match_str:>15}"
+            )
 
-        print(f"{'=' * 90}")
+        print(f"{'=' * 100}")
 
     # -- Latency summary table --
     latency_combined = []
@@ -1224,8 +1412,6 @@ def main():
                 "kb_nano_ms_per_tok": kb_ms_per_tok,
                 "kb_nano_latencies": kb_lat["latencies"],
             }
-            if "input_len" in kb_lat:
-                lat_result["input_len"] = kb_lat["input_len"]
 
             v_med_str = "N/A"
             speedup_str = "N/A"
@@ -1267,7 +1453,6 @@ def main():
             "tp": args.tp,
             "seed": args.seed,
             "temperature": args.temperature,
-            "num_seqs": args.num_seqs,
             "enforce_eager": args.enforce_eager,
         }
         if all_results:

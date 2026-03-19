@@ -477,7 +477,6 @@ def test_section_4():
     from kb_nano.bench.utils.workloads import (
         LATENCY_WORKLOADS,
         THROUGHPUT_WORKLOADS,
-        get_max_seq_len,
     )
 
     # 4a. Throughput workload constants
@@ -485,23 +484,26 @@ def test_section_4():
         check(len(THROUGHPUT_WORKLOADS) == 3, "4a. exactly 3 throughput workloads")
         names = [w.name for w in THROUGHPUT_WORKLOADS]
         check(
-            names == ["prefill-heavy", "balanced", "decode-heavy"],
+            names == ["longbench-summ", "sharegpt-short", "ds1000-code"],
             f"4a. correct names: {names}",
         )
-        ph = THROUGHPUT_WORKLOADS[0]
+        lb = THROUGHPUT_WORKLOADS[0]
         check(
-            ph.input_len == 1024 and ph.output_len == 512,
-            "4a. prefill-heavy: 1024/512",
+            lb.dataset == "longbench" and lb.output_len == 512
+            and lb.num_requests == 500,
+            "4a. longbench-summ: longbench dataset, 512 output, 500 reqs",
         )
-        bal = THROUGHPUT_WORKLOADS[1]
+        sg = THROUGHPUT_WORKLOADS[1]
         check(
-            bal.input_len == 512 and bal.output_len == 512,
-            "4a. balanced: 512/512",
+            sg.dataset == "sharegpt" and sg.output_len is None
+            and sg.num_requests == 3000,
+            "4a. sharegpt-short: sharegpt dataset, dynamic output, 3000 reqs",
         )
-        dh = THROUGHPUT_WORKLOADS[2]
+        ds = THROUGHPUT_WORKLOADS[2]
         check(
-            dh.input_len == 512 and dh.output_len == 1024,
-            "4a. decode-heavy: 512/1024",
+            ds.dataset == "ds1000" and ds.output_len == 8192
+            and ds.num_requests == 1000,
+            "4a. ds1000-code: ds1000 dataset, 8192 output, 1000 reqs",
         )
 
     # 4b. Latency workload constants
@@ -509,21 +511,21 @@ def test_section_4():
         check(len(LATENCY_WORKLOADS) == 2, "4b. exactly 2 latency workloads")
         sr = LATENCY_WORKLOADS[0]
         check(
-            sr.name == "single-request" and sr.batch_size == 1
-            and sr.input_len == 128 and sr.output_len == 128,
-            "4b. single-request: bs=1, 128/128",
+            sr.name == "single-short" and sr.batch_size == 1
+            and sr.dataset == "sharegpt" and sr.output_len == 128,
+            "4b. single-short: bs=1, sharegpt, 128 output",
         )
-        fb = LATENCY_WORKLOADS[1]
+        lc = LATENCY_WORKLOADS[1]
         check(
-            fb.name == "fixed-batch-32" and fb.batch_size == 32
-            and fb.input_len == 128 and fb.output_len == 128,
-            "4b. fixed-batch-32: bs=32, 128/128",
+            lc.name == "single-long-context" and lc.batch_size == 1
+            and lc.dataset == "longbench" and lc.output_len == 128,
+            "4b. single-long-context: bs=1, longbench, 128 output",
         )
 
     # 4c. Immutability (frozen dataclasses)
     with _Timeout(30):
         try:
-            THROUGHPUT_WORKLOADS[0].input_len = 999
+            THROUGHPUT_WORKLOADS[0].dataset = "foo"
             check(False, "4c. throughput workloads should be immutable")
         except AttributeError:
             check(True, "4c. throughput workloads are frozen (immutable)")
@@ -532,14 +534,6 @@ def test_section_4():
             check(False, "4c. latency workloads should be immutable")
         except AttributeError:
             check(True, "4c. latency workloads are frozen (immutable)")
-
-    # 4d. get_max_seq_len
-    with _Timeout(30):
-        max_len = get_max_seq_len()
-        check(
-            max_len == 1536,
-            f"4d. max_seq_len = {max_len} (expected 1536 = 512+1024)",
-        )
 
 
 # ===========================================================================

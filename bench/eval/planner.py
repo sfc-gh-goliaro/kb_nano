@@ -1,8 +1,8 @@
 """Eval planner: static job generation from (model, tp) pairs.
 
 Given an EvalConfig, produces an EvalPlan — an ordered list of E2E job
-pairs (baseline + candidate). Each job runs all 5 standardized workloads
-in a single engine load.
+pairs (baseline + candidate). Each job runs all standardized workloads
+in a single engine load using real datasets (LongBench, ShareGPT, DS-1000).
 
 Jobs are ordered by TP degree (ascending) for optimal GPU scheduling:
 TP=1 jobs can run 8 in parallel on an 8-GPU box, TP=4 jobs run 2 in
@@ -13,12 +13,10 @@ from __future__ import annotations
 
 import random
 from dataclasses import dataclass, field
-from random import randint
 
 from kb_nano.bench.utils.workloads import (
     LATENCY_WORKLOADS,
     THROUGHPUT_WORKLOADS,
-    get_max_seq_len,
 )
 
 from .config import EvalConfig, MODEL_KEY_TO_DEFAULT_HF
@@ -89,46 +87,80 @@ class EvalPlanner:
 
     def _generate_workload_data(
         self,
+        model: str,
         seed: int,
-        num_prompts: int,
-    ) -> tuple[list[dict], list[dict]]:
-        """Pre-generate all scenario data (matching bench_vllm.py methodology)."""
+    ) -> tuple[list[dict], list[dict], int]:
+        """Load real datasets and generate workload data.
+
+        Returns (throughput_data, latency_data, max_seq_len).
+        """
+        from transformers import AutoTokenizer
+        tokenizer = AutoTokenizer.from_pretrained(model, trust_remote_code=True)
+
+        # Import dataset loaders from bench_vllm
+        import sys
+        from pathlib import Path
+        tests_dir = Path(__file__).resolve().parent.parent.parent / "tests"
+        sys.path.insert(0, str(tests_dir))
+        from bench_vllm import _load_longbench, _load_sharegpt, _load_ds1000
+
+        datasets = {
+            "longbench": _load_longbench(tokenizer, num_requests=500, seed=seed),
+            "sharegpt": _load_sharegpt(tokenizer, num_requests=3000, seed=seed),
+            "ds1000": _load_ds1000(tokenizer, num_requests=1000, seed=seed),
+        }
+
+        max_seq_len = 0
+
         throughput_data = []
-        for i, w in enumerate(THROUGHPUT_WORKLOADS):
-            rng_seed = seed + i
-            random.seed(rng_seed)
-            prompt_token_ids = [
-                [randint(0, 10000) for _ in range(w.input_len)]
-                for _ in range(num_prompts)
-            ]
-            output_lens = [w.output_len] * num_prompts
+        for w in THROUGHPUT_WORKLOADS:
+            src = datasets[w.dataset]
+            n = min(w.num_requests, len(src["prompts"]))
+            prompts = src["prompts"][:n]
+            prompt_lens = src["prompt_lens"][:n]
+
+            if w.output_len is not None:
+                output_lens = [w.output_len] * n
+            else:
+                output_lens = src["output_lens"][:n]
+
+            max_prompt_len = max(prompt_lens) if prompt_lens else 0
+            max_output_len = max(output_lens) if output_lens else 0
+            seq_len = max_prompt_len + max_output_len
+            if seq_len > max_seq_len:
+                max_seq_len = seq_len
+
             throughput_data.append({
                 "name": w.name,
-                "input_len": w.input_len,
-                "output_len": w.output_len,
-                "prompt_token_ids": prompt_token_ids,
+                "prompts": prompts,
                 "output_lens": output_lens,
+                "num_requests": n,
+                "avg_prompt_len": sum(prompt_lens) / len(prompt_lens) if prompt_lens else 0,
+                "max_prompt_len": max_prompt_len,
             })
 
         latency_data = []
-        for j, w in enumerate(LATENCY_WORKLOADS):
-            rng_seed = seed + 100 + j
-            random.seed(rng_seed)
-            prompt_token_ids = [
-                [randint(0, 10000) for _ in range(w.input_len)]
-                for _ in range(w.batch_size)
-            ]
+        for w in LATENCY_WORKLOADS:
+            src = datasets[w.dataset]
+            # Pick from end to avoid overlap with throughput
+            prompts = src["prompts"][-w.batch_size:]
+            prompt_lens = src["prompt_lens"][-w.batch_size:]
+
+            max_prompt_len = max(prompt_lens) if prompt_lens else 0
+            seq_len = max_prompt_len + w.output_len
+            if seq_len > max_seq_len:
+                max_seq_len = seq_len
+
             latency_data.append({
                 "name": w.name,
-                "input_len": w.input_len,
                 "output_len": w.output_len,
                 "batch_size": w.batch_size,
-                "prompt_token_ids": prompt_token_ids,
+                "prompts": prompts,
                 "num_warmup": w.num_warmup,
                 "num_iters": w.num_iters,
             })
 
-        return throughput_data, latency_data
+        return throughput_data, latency_data, max_seq_len
 
     def plan(self) -> EvalPlan:
         """Generate the eval plan: ordered list of (model, tp) job pairs."""
@@ -142,9 +174,11 @@ class EvalPlanner:
                 if self.config.get_model_category(m) in self.config.categories
             ]
 
-        max_seq_len = get_max_seq_len()
-        throughput_data, latency_data = self._generate_workload_data(
-            self.config.seed, self.config.num_prompts,
+        # Use the first model to load datasets (tokenizer needed for length
+        # estimation). All models use the same real-text prompts.
+        first_model = models[0] if models else "meta-llama/Llama-3.1-8B-Instruct"
+        throughput_data, latency_data, max_seq_len = self._generate_workload_data(
+            first_model, self.config.seed,
         )
 
         jobs: list[EvalJob] = []
