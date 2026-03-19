@@ -10,7 +10,7 @@ MODEL_KEY_TO_DEFAULT_HF: dict[str, str] = {
     "llama4": "meta-llama/Llama-4-Scout-17B-16E-Instruct",
     "mixtral": "mistralai/Mixtral-8x7B-Instruct-v0.1",
     "qwen2_vl": "Qwen/Qwen2-VL-7B-Instruct",
-    "qwen3_vl": "Qwen/Qwen3-VL-8B-Instruct",
+    "qwen3_vl": "Qwen/Qwen3-VL-8B-Instruct-FP8",
 }
 
 MODEL_CATEGORY: dict[str, str] = {
@@ -19,7 +19,7 @@ MODEL_CATEGORY: dict[str, str] = {
     "meta-llama/Llama-4-Scout-17B-16E-Instruct": "llm",
     "mistralai/Mixtral-8x7B-Instruct-v0.1": "llm",
     "Qwen/Qwen2-VL-7B-Instruct": "vlm",
-    "Qwen/Qwen3-VL-8B-Instruct": "vlm",
+    "Qwen/Qwen3-VL-8B-Instruct-FP8": "vlm",
 }
 
 

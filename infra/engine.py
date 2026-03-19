@@ -276,6 +276,7 @@ class ModelRunner:
         self._share_trtllm_workspace()
         self._share_activation_buffers()
         self.warmup_model()
+        self._warmup_deepgemm()
         self.allocate_kv_cache()
         if not self.enforce_eager:
             self.capture_cudagraph()
@@ -403,6 +404,74 @@ class ModelRunner:
         self.run(seqs, True)
 
         torch.cuda.empty_cache()
+
+    def _warmup_deepgemm(self):
+        """Pre-JIT DeepGEMM FP8 kernels for all weight shapes at decode and
+        prefill batch sizes, pre-allocate decode buffers per instance and
+        shared prefill buffers per unique (K, N) shape."""
+        from ..tasks.baseline.L1.fp8_linear import Fp8Linear, _Fp8PrefillBufs
+        import deep_gemm
+
+        fp8_modules = []
+        for module in self.model.modules():
+            linear_op = getattr(module, 'linear_op', None)
+            if isinstance(linear_op, Fp8Linear):
+                fp8_modules.append((module, linear_op))
+
+        if not fp8_modules:
+            return
+
+        max_decode = self.max_num_seqs
+        max_prefill = self.max_num_batched_tokens
+        device = next(self.model.parameters()).device
+
+        decode_bs = [1, 2, 4, 8] + list(range(16, max_decode + 1, 16))
+        prefill_bs = [s for s in [128, 256, 512, 1024, 2048, 4096, 8192, 16384]
+                      if s <= max_prefill and s > max_decode]
+
+        prefill_bufs: dict[tuple[int, int], _Fp8PrefillBufs] = {}
+
+        seen_shapes = set()
+        for module, linear_op in fp8_modules:
+            w = module.weight
+            ws = module.weight_scale_inv
+            N, K = w.shape
+
+            linear_op._ensure_buffers(max_decode, K, N, device)
+
+            key = (N, K)
+            if key not in prefill_bufs:
+                prefill_bufs[key] = _Fp8PrefillBufs(max_prefill, K, N, device)
+            linear_op._pf = prefill_bufs[key]
+
+            if key in seen_shapes:
+                continue
+            seen_shapes.add(key)
+
+            a_fp8 = linear_op._a_buf
+            a_scale = linear_op._s_buf
+            out = linear_op._o_buf
+            for num_tokens in decode_bs:
+                if num_tokens > max_decode:
+                    break
+                deep_gemm.fp8_gemm_nt(
+                    (a_fp8[:num_tokens], a_scale[:num_tokens]),
+                    (w, ws),
+                    out[:num_tokens],
+                )
+
+            pf = prefill_bufs[key]
+            for num_tokens in prefill_bs:
+                deep_gemm.fp8_gemm_nt(
+                    (pf.a[:num_tokens], pf.s[:num_tokens]),
+                    (w, ws),
+                    pf.o[:num_tokens],
+                )
+
+        torch.cuda.synchronize()
+        torch.cuda.empty_cache()
+        if self.rank == 0:
+            print(f"  DeepGEMM warmup: {len(seen_shapes)} unique FP8 weight shapes")
 
     def _warmup_vision_encoder(self):
         """Run vision encoder with worst-case dummy inputs to capture peak

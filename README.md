@@ -355,6 +355,27 @@ Latency (batch size 1, 128 output tokens, 5 iterations):
 | Qwen3-VL-8B  | 1 | single-image | 0.559s | 0.578s | 0.97x |
 | Qwen3-VL-8B  | 1 | single-video | 0.613s | 0.593s | **1.03x** |
 
+### Qwen3-VL FP8 (W8A8 block-quantized)
+
+FP8 support uses `Qwen/Qwen3-VL-8B-Instruct-FP8` with block-scaled FP8 GEMM via DeepGEMM. Vision encoder and lm_head remain in BF16; only LLM decoder layers use FP8.
+
+Throughput (1000 sequences per scenario, `temperature=0`, `max_model_len=16896`):
+
+| Model | TP | Scenario | Output | vLLM (tok/s) | Ours (tok/s) | Ratio | Avg Match Tokens |
+|-------|---:|----------|-------:|-------------:|-------------:|------:|-----------------:|
+| Qwen3-VL-8B-FP8 | 1 | text-only | 1024 | 22,921 | 19,951 | **0.87x** | 765.3/1024 |
+| Qwen3-VL-8B-FP8 | 1 | image     |  512 | 15,963 | 13,308 | **0.83x** |   73.2/512 |
+| Qwen3-VL-8B-FP8 | 1 | video     |  512 |  4,148 |  8,842 | **2.13x** | 102.1/512 |
+
+Latency (batch size 1, 128 output tokens, 5 iterations):
+
+| Model | TP | Scenario | vLLM median | Ours median | Ratio |
+|-------|---:|----------|------------:|------------:|------:|
+| Qwen3-VL-8B-FP8 | 1 | single-image | 0.516s | 0.528s | **0.98x** |
+| Qwen3-VL-8B-FP8 | 1 | single-video | 0.557s | 0.541s | **1.03x** |
+
+FP8 activation quantization uses a custom Triton kernel for single-launch per-token-group UE8M0 quantization. Pre-allocated shared prefill buffers eliminate dynamic allocation during FP8 prefill, and DeepGEMM is JIT-warmed for both decode and prefill batch sizes. The remaining throughput gap vs vLLM is primarily from vLLM's `torch.compile` + Inductor fusion passes (RMSNorm+quant, SiLU+quant).
+
 ### Key optimizations
 
 - **Fused RMSNorm**: Uses `sgl_kernel`'s fused residual-add + RMSNorm CUDA kernel, eliminating multiple kernel launches per norm call
@@ -366,3 +387,4 @@ Latency (batch size 1, 128 output tokens, 5 iterations):
 - **SHM spin-wait signaling**: Workers spin on a shared-memory sequence counter instead of `multiprocessing.Event`, reducing per-step signaling latency from ~0.48ms to ~0.004ms
 - **LM head in CUDA graph**: The LM head projection and local argmax are captured inside the CUDA graph alongside the transformer body
 - **Greedy fast path**: For greedy decoding with TP, uses local argmax + small all-gather instead of gathering full logits across ranks
+- **Triton FP8 activation quantization**: Single-kernel per-token-group UE8M0 quantization for FP8 inference, with pre-allocated decode buffers for CUDA graph capture and shared prefill buffers to eliminate dynamic allocation

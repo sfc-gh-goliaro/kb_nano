@@ -36,7 +36,8 @@ class LlamaAttention(nn.Module):
                  use_weightless_qk_norm: bool = False,   # Llama 4
                  attn_temperature_tuning: bool = False,  # Llama 4
                  floor_scale: float = 8192.0,            # Llama 4
-                 attn_scale: float = 0.1):               # Llama 4
+                 attn_scale: float = 0.1,                # Llama 4
+                 quant_config: dict | None = None):
         super().__init__()
         tp = _tp_size()
         self.num_heads = num_attention_heads // tp
@@ -52,9 +53,11 @@ class LlamaAttention(nn.Module):
             hidden_size, head_dim,
             num_attention_heads, num_key_value_heads,
             bias=bias,
+            quant_config=quant_config,
         )
         self.o_proj = RowParallelLinear(
             num_attention_heads * head_dim, hidden_size,
+            quant_config=quant_config,
         )
 
         self.q_norm = RMSNorm(head_dim, eps=rms_norm_eps) if qk_norm else None  # Qwen3
