@@ -94,20 +94,16 @@ class EvalPlanner:
 
         Returns (throughput_data, latency_data, max_seq_len).
         """
+        from kb_nano.bench.utils.datasets import (
+            load_longbench, load_sharegpt, load_ds1000,
+        )
         from transformers import AutoTokenizer
         tokenizer = AutoTokenizer.from_pretrained(model, trust_remote_code=True)
 
-        # Import dataset loaders from bench_vllm
-        import sys
-        from pathlib import Path
-        tests_dir = Path(__file__).resolve().parent.parent.parent / "tests"
-        sys.path.insert(0, str(tests_dir))
-        from bench_vllm import _load_longbench, _load_sharegpt, _load_ds1000
-
         datasets = {
-            "longbench": _load_longbench(tokenizer, num_requests=500, seed=seed),
-            "sharegpt": _load_sharegpt(tokenizer, num_requests=3000, seed=seed),
-            "ds1000": _load_ds1000(tokenizer, num_requests=1000, seed=seed),
+            "longbench": load_longbench(tokenizer, num_requests=500, seed=seed),
+            "sharegpt": load_sharegpt(tokenizer, num_requests=3000, seed=seed),
+            "ds1000": load_ds1000(tokenizer, num_requests=1000, seed=seed),
         }
 
         max_seq_len = 0
