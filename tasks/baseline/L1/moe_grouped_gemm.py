@@ -170,6 +170,11 @@ def _get_default_config(M: int, N: int = 0) -> dict:
 
 
 class MoeGroupedGemm(nn.Module):
+    @staticmethod
+    def get_config(M: int, N: int = 0) -> dict:
+        """Select best kernel config based on batch size M and output dim N."""
+        return _get_default_config(M, N)
+
     def forward(
         self,
         A: torch.Tensor,
@@ -181,8 +186,11 @@ class MoeGroupedGemm(nn.Module):
         num_tokens_post_padded: torch.Tensor,
         mul_routed_weight: bool,
         top_k: int,
-        config: dict,
+        config: dict | None = None,
     ):
+        if config is None:
+            config = _get_default_config(A.size(0), B.size(1))
+
         naive = sorted_token_ids is None
         if naive:
             EM = expert_ids.numel() * config["BLOCK_SIZE_M"]

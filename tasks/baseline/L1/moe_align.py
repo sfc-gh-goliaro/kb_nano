@@ -1,7 +1,8 @@
 """MoE token-to-expert alignment with block padding.
 
 Uses sgl_kernel.moe_align_block_size for high-performance, CUDA-graph-compatible
-token-to-expert alignment.
+token-to-expert alignment. Supports a naive fast path that skips the full sort
+when the number of tokens is very small relative to the number of experts.
 """
 
 from __future__ import annotations
@@ -25,6 +26,7 @@ class MoeAlign(nn.Module):
         self._expert_ids = None
         self._num_tokens_post_padded = None
         self._cumsum_buffer = None
+        self._naive_num_tokens_post_padded = None
 
     def _ensure_buffers(self, max_padded, max_blocks, num_experts, device):
         if (self._sorted_token_ids is None
@@ -48,12 +50,33 @@ class MoeAlign(nn.Module):
                 num_experts + 2, dtype=torch.int32, device=device,
             )
 
+    def _naive_forward(
+        self,
+        topk_ids: torch.Tensor,
+        block_size: int,
+    ) -> tuple[torch.Tensor | None, torch.Tensor, torch.Tensor]:
+        """Fast path: skip full alignment when tokens * top_k is very small."""
+        numel = topk_ids.numel()
+        max_num_tokens_padded = numel * block_size
+        expert_ids = topk_ids.view(-1).to(torch.int32)
+        if (self._naive_num_tokens_post_padded is None
+                or self._naive_num_tokens_post_padded.device != topk_ids.device):
+            self._naive_num_tokens_post_padded = torch.empty(
+                1, dtype=torch.int32, device=topk_ids.device,
+            )
+        self._naive_num_tokens_post_padded.fill_(max_num_tokens_padded)
+        return None, expert_ids, self._naive_num_tokens_post_padded
+
     def forward(
         self,
         topk_ids: torch.Tensor,
         block_size: int,
         num_experts: int,
-    ) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
+        naive: bool = False,
+    ) -> tuple[torch.Tensor | None, torch.Tensor, torch.Tensor]:
+        if naive:
+            return self._naive_forward(topk_ids, block_size)
+
         numel = topk_ids.numel()
         if numel < num_experts + 1:
             max_padded = numel * block_size

@@ -1,6 +1,6 @@
 """Encoder-only attention for Qwen vision transformer blocks.
 
-Non-causal, no KV cache. Uses flash_attn_varlen_func with cu_seqlens
+Non-causal, no KV cache. Uses FlashAttnPrefill L1 op with cu_seqlens
 for variable-length sequence support within the vision encoder.
 """
 
@@ -8,10 +8,10 @@ from __future__ import annotations
 
 import torch
 import torch.nn as nn
-from flash_attn import flash_attn_varlen_func
 from flash_attn.ops.triton.rotary import apply_rotary
 
 from ....infra.tp import _tp_size, _tp_rank
+from ..L1.flash_attn_prefill import FlashAttnPrefill
 from .parallel_linear import QKVParallelLinear, RowParallelLinear
 
 
@@ -36,6 +36,7 @@ class VisionAttention(nn.Module):
             embed_dim, self.head_dim, num_heads, num_heads, bias=True,
         )
         self.proj = RowParallelLinear(projection_size, embed_dim, bias=True)
+        self.attn = FlashAttnPrefill(self.num_heads, self.num_heads, self.head_dim)
 
     def forward(
         self, x: torch.Tensor,
@@ -71,12 +72,10 @@ class VisionAttention(nn.Module):
         if max_seqlen is None:
             max_seqlen = (cu_seqlens[1:] - cu_seqlens[:-1]).max().item()
 
-        out = flash_attn_varlen_func(
+        out = self.attn(
             q, k, v,
-            cu_seqlens_q=cu_seqlens,
-            cu_seqlens_k=cu_seqlens,
-            max_seqlen_q=max_seqlen,
-            max_seqlen_k=max_seqlen,
+            cu_seqlens, cu_seqlens,
+            max_seqlen, max_seqlen,
             softmax_scale=self.head_dim ** -0.5,
             causal=False,
         )

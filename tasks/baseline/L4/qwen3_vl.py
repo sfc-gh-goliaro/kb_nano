@@ -14,13 +14,14 @@ from dataclasses import dataclass, field
 import numpy as np
 import torch
 import torch.nn as nn
-import torch.nn.functional as F
 from transformers import AutoConfig
 
+from ..L1.gelu import GELU
 from ..L1.mrope import MRotaryEmbedding
-from ..L1.rms_norm import RMSNorm
-from ..L1.vision_rotary_emb import VisionRotaryEmbedding
 from ..L1.mrope_input_positions import MRopeInputPositions
+from ..L1.rms_norm import RMSNorm
+from ..L1.silu import SiLU
+from ..L1.vision_rotary_emb import VisionRotaryEmbedding
 from ..L2.parallel_embedding import ParallelLMHead, VocabParallelEmbedding
 from ..L2.vision_patch_embed import VisionPatchEmbed
 from ..L2.vision_patch_merger import VisionPatchMerger
@@ -108,9 +109,9 @@ class Qwen3VLConfig:
 # ---- Vision Encoder Components ----
 
 _ACTIVATION_MAP = {
-    "silu": F.silu,
-    "gelu": F.gelu,
-    "gelu_pytorch_tanh": lambda x: F.gelu(x, approximate="tanh"),
+    "silu": SiLU(),
+    "gelu": GELU(),
+    "gelu_pytorch_tanh": GELU(approximate="tanh"),
 }
 
 
@@ -137,7 +138,7 @@ class Qwen3VisionTransformer(nn.Module):
         head_dim = vision_config.hidden_size // vision_config.num_heads
         self.rotary_emb = VisionRotaryEmbedding(head_dim // 2)
 
-        act_fn = _ACTIVATION_MAP.get(vision_config.hidden_act, F.silu)
+        act_fn = _ACTIVATION_MAP.get(vision_config.hidden_act, SiLU())
 
         self.blocks = nn.ModuleList([
             VisionBlock(

@@ -17,6 +17,8 @@ import torch.nn as nn
 
 from ....infra.tp import _tp_rank, _tp_size
 from ..L1.allreduce import AllReduce
+from ..L1.linear import Linear
+from ..L1.sigmoid_topk import SigmoidTopK
 from ..L2.llama_mlp import LlamaMLP
 from ..L2.fused_experts import FusedExperts
 
@@ -46,8 +48,10 @@ class Llama4MoE(nn.Module):
         self.intermediate_per_tp = config.intermediate_size // tp
 
         # Router: replicated across TP ranks
-        self.router = nn.Linear(config.hidden_size, config.num_local_experts, bias=False)
-        self.router.weight.weight_loader = lambda p, w: p.data.copy_(w)
+        self.router_weight = nn.Parameter(
+            torch.empty(config.num_local_experts, config.hidden_size),
+        )
+        self.router_weight.weight_loader = lambda p, w: p.data.copy_(w)
 
         # Shared expert: standard SwiGLU MLP (skip its internal all-reduce;
         # we do a single all-reduce on shared + routed together)
@@ -67,10 +71,10 @@ class Llama4MoE(nn.Module):
         ))
         self.w2.weight_loader = self._w2_weight_loader
 
+        self.linear_op = Linear()
+        self.sigmoid_topk = SigmoidTopK()
         self.fused_experts = FusedExperts()
         self.allreduce = AllReduce()
-        self._topk_weights = None
-        self._topk_ids = None
 
     def _w13_weight_loader(self, param, loaded_weight, expert_id: int = 0,
                            is_gate: bool = True):
@@ -82,12 +86,10 @@ class Llama4MoE(nn.Module):
         param.data[expert_id, offset:offset + N, :].copy_(shard)
 
     def _w13_fused_weight_loader(self, param, loaded_weight):
-        """Load all experts' fused gate_up_proj: [E, in, 2*out] → transpose → w13."""
+        """Load all experts' fused gate_up_proj: [E, in, 2*out] -> transpose -> w13."""
         tp, rank = _tp_size(), _tp_rank()
-        # loaded_weight: [E, hidden, 2*intermediate]
         weight = loaded_weight.transpose(-1, -2)  # [E, 2*intermediate, hidden]
         N = self.intermediate_per_tp
-        # Shard gate and up separately
         gate = weight[:, :weight.shape[1] // 2, :]  # [E, intermediate, hidden]
         up = weight[:, weight.shape[1] // 2:, :]    # [E, intermediate, hidden]
         param.data[:, :N, :].copy_(gate[:, rank * N:(rank + 1) * N, :])
@@ -100,17 +102,11 @@ class Llama4MoE(nn.Module):
         param.data[expert_id].copy_(loaded_weight.narrow(1, rank * N, N))
 
     def _w2_fused_weight_loader(self, param, loaded_weight):
-        """Load all experts' fused down_proj: [E, out, in] → transpose → w2."""
+        """Load all experts' fused down_proj: [E, out, in] -> transpose -> w2."""
         tp, rank = _tp_size(), _tp_rank()
-        # loaded_weight: [E, intermediate, hidden]
         weight = loaded_weight.transpose(-1, -2)  # [E, hidden, intermediate]
         N = self.intermediate_per_tp
         param.data.copy_(weight[:, :, rank * N:(rank + 1) * N])
-
-    def _ensure_routing_buffers(self, M, device):
-        if self._topk_weights is None or self._topk_weights.size(0) < M:
-            self._topk_weights = torch.empty(M, self.top_k, device=device, dtype=torch.float32)
-            self._topk_ids = torch.empty(M, self.top_k, device=device, dtype=torch.int32)
 
     def forward(self, hidden_states: torch.Tensor) -> torch.Tensor:
         orig_shape = hidden_states.shape
@@ -121,13 +117,8 @@ class Llama4MoE(nn.Module):
         shared_out = self.shared_expert(hidden_states)
 
         # Sigmoid top-k routing
-        router_logits = self.router(hidden_states)  # [M, E]
-        self._ensure_routing_buffers(M, hidden_states.device)
-        topk_weights = self._topk_weights[:M]
-        topk_ids = self._topk_ids[:M]
-        scores, indices = torch.topk(router_logits, self.top_k, dim=-1)
-        topk_weights.copy_(torch.sigmoid(scores.float()))
-        topk_ids.copy_(indices.to(torch.int32))
+        router_logits = self.linear_op(hidden_states, self.router_weight)
+        topk_weights, topk_ids = self.sigmoid_topk(router_logits, self.top_k)
         # Apply routing weight on input (matches vLLM's apply_router_weight_on_input=True).
         # SiLU is nonlinear so w*expert(x) != expert(w*x); Llama4 uses the latter.
         weighted_input = hidden_states * topk_weights.to(hidden_states.dtype)
