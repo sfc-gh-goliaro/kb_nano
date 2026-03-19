@@ -35,6 +35,7 @@ class Llama4DecoderLayer(nn.Module):
         no_rope_layers = getattr(config, "no_rope_layers", None) or []
         nope = no_rope_layers[layer_idx] == 0 if layer_idx < len(no_rope_layers) else False
 
+        chunk_size = getattr(config, "attention_chunk_size", None)
         self.self_attn = LlamaAttention(
             config.hidden_size, config.num_attention_heads,
             config.num_key_value_heads, config.head_dim,
@@ -45,6 +46,7 @@ class Llama4DecoderLayer(nn.Module):
             floor_scale=getattr(config, "floor_scale", 8192.0),
             attn_scale=getattr(config, "attn_scale", 0.1),
             rms_norm_eps=config.rms_norm_eps,
+            attention_chunk_size=chunk_size if not nope else None,
         )
 
         step = getattr(config, "interleave_moe_layer_step", 1)

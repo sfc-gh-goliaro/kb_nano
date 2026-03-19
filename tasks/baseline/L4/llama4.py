@@ -43,6 +43,7 @@ class Llama4Config:
     interleave_moe_layer_step: int = 1
     intermediate_size_mlp: int = 16384
     no_rope_layers: list = field(default_factory=list)
+    attention_chunk_size: int | None = None
     use_qk_norm: bool = True
     attn_temperature_tuning: bool = True
     attn_scale: float = 0.1
@@ -82,6 +83,7 @@ class Llama4Config:
             interleave_moe_layer_step=getattr(text, "interleave_moe_layer_step", 1),
             intermediate_size_mlp=getattr(text, "intermediate_size_mlp", 16384),
             no_rope_layers=no_rope_layers if isinstance(no_rope_layers, list) else list(no_rope_layers),
+            attention_chunk_size=getattr(text, "attention_chunk_size", None),
             use_qk_norm=getattr(text, "use_qk_norm", True),
             attn_temperature_tuning=getattr(text, "attn_temperature_tuning", True),
             attn_scale=getattr(text, "attn_scale", 0.1),

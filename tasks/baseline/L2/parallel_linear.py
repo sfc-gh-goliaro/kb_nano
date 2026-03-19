@@ -1,4 +1,10 @@
-"""TP-aware linear layers (L2 operators)."""
+"""TP-aware linear layers (L2 operators).
+
+TODO: Consider demoting to L1 -- these are TP-aware wrappers around L1
+primitives (Linear, Fp8Linear, AllReduce) and are used by other L2 ops,
+creating same-level dependencies. Moving them to L1 would make each L2
+operator independently benchmarkable.
+"""
 
 from __future__ import annotations
 

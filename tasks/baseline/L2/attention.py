@@ -37,7 +37,8 @@ class LlamaAttention(nn.Module):
                  attn_temperature_tuning: bool = False,  # Llama 4
                  floor_scale: float = 8192.0,            # Llama 4
                  attn_scale: float = 0.1,                # Llama 4
-                 quant_config: dict | None = None):
+                 quant_config: dict | None = None,
+                 attention_chunk_size: int | None = None):
         super().__init__()
         tp = _tp_size()
         self.num_heads = num_attention_heads // tp
@@ -70,6 +71,7 @@ class LlamaAttention(nn.Module):
         self.attn = Attention(
             self.num_heads, head_dim, head_dim ** -0.5,
             num_kv_heads=self.num_kv_heads,
+            attention_chunk_size=attention_chunk_size,
         )
 
     def _get_attn_scale(self, positions):  # Llama 4 NoPE only
