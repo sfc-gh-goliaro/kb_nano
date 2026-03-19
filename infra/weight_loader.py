@@ -1,5 +1,6 @@
 """
-Weight loader for Llama 3.1, Mixtral, Qwen2-VL, and Qwen3-VL with tensor parallelism.
+Weight loader for Llama 3.1, Llama 4, Mixtral, Qwen2-VL, and Qwen3-VL
+with tensor parallelism.
 
 Loads weights from HuggingFace safetensors and distributes them
 across TP shards using the weight_loader callbacks on each parameter.
@@ -7,19 +8,19 @@ across TP shards using the weight_loader callbacks on each parameter.
 
 from __future__ import annotations
 
-import gc
 import os
 import re
 from glob import glob
-from pathlib import Path
 
 import torch
 from huggingface_hub import snapshot_download
 from safetensors import safe_open
 from transformers import AutoConfig
 
+from .tp import _tp_size
 from ..tasks.baseline.L1.fp8_linear import Fp8Linear, postprocess_fp8_weights
 from ..tasks.baseline.L4.llama import LlamaConfig, LlamaForCausalLM
+from ..tasks.baseline.L4.llama4 import Llama4Config, Llama4ForCausalLM
 from ..tasks.baseline.L4.mixtral import MixtralConfig, MixtralForCausalLM
 from ..tasks.baseline.L4.qwen2_vl import Qwen2VLConfig, Qwen2VLForConditionalGeneration
 from ..tasks.baseline.L4.qwen3_vl import Qwen3VLConfig, Qwen3VLForConditionalGeneration
@@ -80,6 +81,22 @@ _VISION_BLOCK_NORM_RE = re.compile(r"(visual\.blocks\.\d+\.norm[12])\.(weight|bi
 _VISION_MERGER_NORM_RE = re.compile(r"(visual\.(?:merger|deepstack_merger_list\.\d+)\.norm)\.(weight|bias)")
 
 
+# Llama4 fused expert weight patterns
+_LLAMA4_FUSED_EXPERT_RE = re.compile(
+    r"(.+\.feed_forward)\.experts\.(gate_up_proj|down_proj)"
+)
+
+
+def _permute_qk_for_rotary(weight: torch.Tensor, n_heads: int) -> torch.Tensor:
+    """Permute Q/K weights from interleaved to contiguous layout for rotary."""
+    f_out, f_in = weight.shape
+    return (
+        weight.view(n_heads, f_out // n_heads // 2, 2, f_in)
+        .transpose(1, 2)
+        .reshape(f_out, f_in)
+    )
+
+
 def _remap_qwen2_vl_name(name: str) -> str:
     """Remap Qwen2-VL checkpoint weight names to our model parameter names."""
     for prefix, replacement in _QWEN2_VL_PREFIX_MAP.items():
@@ -135,6 +152,9 @@ def load_weights(model, model_path: str, model_type: str = "llama") -> None:
     is_qwen2_vl = model_type == "qwen2_vl"
     is_qwen3_vl = model_type == "qwen3_vl"
     is_qwen_vl = is_qwen2_vl or is_qwen3_vl
+    is_llama4 = model_type == "llama4"
+    if is_llama4:
+        llama4_config = model.config
 
     print(f"  Loading weights from {len(safetensor_files)} safetensors file(s)...")
     loaded = 0
@@ -148,6 +168,54 @@ def load_weights(model, model_path: str, model_type: str = "llama") -> None:
                     mapped_name = _remap_qwen3_vl_name(weight_name)
                 else:
                     mapped_name = weight_name
+
+                # Llama4: strip language_model. prefix, skip vision weights
+                if is_llama4:
+                    if not mapped_name.startswith("language_model."):
+                        continue  # skip vision weights
+                    mapped_name = mapped_name[len("language_model."):]
+
+                    # Handle fused expert weights
+                    m_fused = _LLAMA4_FUSED_EXPERT_RE.match(mapped_name)
+                    if m_fused:
+                        prefix_part, proj = m_fused.groups()
+                        tensor = f.get_tensor(weight_name)
+                        if proj == "gate_up_proj":
+                            param_name = f"{prefix_part}.w13"
+                            try:
+                                param = model.get_parameter(param_name)
+                            except AttributeError:
+                                continue
+                            # [E, hidden, 2*inter] → transpose → [E, 2*inter, hidden]
+                            weight = tensor.transpose(-1, -2)
+                            E = weight.shape[0]
+                            full_inter = weight.shape[1] // 2
+                            tp = param.shape[1] // 2
+                            rank = 0
+                            if full_inter != tp:
+                                from .tp import _tp_rank
+                                rank = _tp_rank()
+                            gate = weight[:, :full_inter, :]
+                            up = weight[:, full_inter:, :]
+                            param.data[:, :tp, :].copy_(gate[:, rank * tp:(rank + 1) * tp, :])
+                            param.data[:, tp:, :].copy_(up[:, rank * tp:(rank + 1) * tp, :])
+                        else:  # down_proj
+                            param_name = f"{prefix_part}.w2"
+                            try:
+                                param = model.get_parameter(param_name)
+                            except AttributeError:
+                                continue
+                            # [E, inter, hidden] → transpose → [E, hidden, inter]
+                            weight = tensor.transpose(-1, -2)
+                            full_inter = weight.shape[2]
+                            tp_inter = param.shape[2]
+                            rank = 0
+                            if full_inter != tp_inter:
+                                from .tp import _tp_rank
+                                rank = _tp_rank()
+                            param.data.copy_(weight[:, :, rank * tp_inter:(rank + 1) * tp_inter])
+                        loaded += 1
+                        continue
 
                 # Handle Qwen2-VL merger: ln_q -> norm, mlp.0 -> fc1, mlp.2 -> fc2
                 if is_qwen2_vl:
@@ -258,6 +326,11 @@ def load_weights(model, model_path: str, model_type: str = "llama") -> None:
                 # Handle packed modules (qkv_proj, gate_up_proj)
                 matched = False
                 for orig_key, (packed_name, shard_id) in packed.items():
+                    # Llama4: skip packed mapping for expert weight names
+                    # (e.g. shared_expert.gate_proj should match, but
+                    #  experts.gate_up_proj should not)
+                    if is_llama4 and "experts." in mapped_name:
+                        continue
                     if orig_key in mapped_name:
                         param_name = mapped_name.replace(orig_key, packed_name)
                         try:
@@ -265,7 +338,18 @@ def load_weights(model, model_path: str, model_type: str = "llama") -> None:
                         except AttributeError:
                             break
                         weight_loader = getattr(param, "weight_loader")
-                        weight_loader(param, f.get_tensor(weight_name), shard_id)
+                        # Llama4: use permuted Q/K weights for rotary
+                        if is_llama4 and orig_key in ("q_proj", "k_proj"):
+                            tensor = f.get_tensor(weight_name)
+                            n_heads = (
+                                llama4_config.num_key_value_heads
+                                if orig_key == "k_proj"
+                                else llama4_config.num_attention_heads
+                            )
+                            tensor = _permute_qk_for_rotary(tensor, n_heads)
+                            weight_loader(param, tensor, shard_id)
+                        else:
+                            weight_loader(param, f.get_tensor(weight_name), shard_id)
                         loaded += 1
                         matched = True
                         break
@@ -300,7 +384,7 @@ def _postprocess_fp8_weights(model: torch.nn.Module) -> None:
 
 def _detect_model_type(model_name: str) -> str:
     """Detect model architecture from HuggingFace config."""
-    hf_config = AutoConfig.from_pretrained(model_name)
+    hf_config = AutoConfig.from_pretrained(model_name, trust_remote_code=True)
     model_type = getattr(hf_config, "model_type", "llama")
     return model_type
 
@@ -335,7 +419,13 @@ def load_model(
         print(f"  Detected FP8 quantization: {quant_config.get('quant_method')}, "
               f"block_size={quant_config.get('weight_block_size')}")
 
-    if model_type == "mixtral":
+    if model_type == "llama4":
+        config = Llama4Config.from_pretrained(model_name)
+        config.dtype = dtype
+        print(f"  Allocating Llama4 model ({config.num_local_experts} experts, "
+              f"top-{config.num_experts_per_tok})...")
+        model = Llama4ForCausalLM(config)
+    elif model_type == "mixtral":
         config = MixtralConfig.from_pretrained(model_name)
         config.dtype = dtype
         print(f"  Allocating Mixtral model ({config.num_local_experts} experts)...")
@@ -355,6 +445,18 @@ def load_model(
         config.dtype = dtype
         print("  Allocating Llama model...")
         model = LlamaForCausalLM(config)
+
+    tp = _tp_size()
+    if hasattr(config, "num_attention_heads") and config.num_attention_heads % tp != 0:
+        raise ValueError(
+            f"TP degree {tp} is incompatible with {config.num_attention_heads} Q heads "
+            f"(num_attention_heads must be divisible by tensor_parallel_size)"
+        )
+    if hasattr(config, "num_key_value_heads") and config.num_key_value_heads % tp != 0:
+        raise ValueError(
+            f"TP degree {tp} is incompatible with {config.num_key_value_heads} KV heads "
+            f"(num_key_value_heads must be divisible by tensor_parallel_size)"
+        )
 
     load_weights(model, model_path, model_type)
 

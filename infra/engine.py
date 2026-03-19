@@ -271,6 +271,7 @@ class ModelRunner:
         self.model, self.config = load_model(
             model_name, torch.device(f"cuda:{rank}"), dtype,
         )
+        self.is_moe = hasattr(self.config, "num_local_experts")
         self.is_qwen_vl = hasattr(self.config, "mrope_section")
         self._share_trtllm_workspace()
         self._share_activation_buffers()
