@@ -79,7 +79,7 @@ git clone git@github.com:sfc-gh-goliaro/kb-nano.git
 cd kb-nano
 
 # Install
-pip install .
+pip install . --no-build-isolation
 
 # Now all commands work from any directory:
 kb_nano kernels --list

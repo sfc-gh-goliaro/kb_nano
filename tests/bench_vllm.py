@@ -112,6 +112,7 @@ def main():
         gpu_memory_utilization=cfg.get("gpu_memory_utilization", 0.9),
         max_model_len=cfg["max_model_len"],
         enable_prefix_caching=False,
+        load_format="fastsafetensors",
     )
 
     # Warmup
@@ -514,6 +515,7 @@ def main():
         gpu_memory_utilization=cfg.get("gpu_memory_utilization", 0.9),
         max_model_len=cfg["max_model_len"],
         enable_prefix_caching=False,
+        load_format="fastsafetensors",
     )
 
     llm.generate(

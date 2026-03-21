@@ -18,6 +18,8 @@ dependencies = [
     "sgl-kernel",
     "decord",
     "mlflow>=2.10",
+    "fastsafetensors",
+    "deep-gemm @ git+https://github.com/deepseek-ai/DeepGEMM.git@v2.1.1.post3",
 ]
 
 [project.optional-dependencies]
