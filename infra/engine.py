@@ -35,6 +35,7 @@ from .context import (
 )
 from ..tasks.baseline.L1.allreduce import set_custom_ar
 from .weight_loader import load_model
+from .tp import init_parallel_groups
 
 MAX_MODEL_LEN = 131072
 NCCL_PORT = int(os.environ.get("KB_NANO_NCCL_PORT", "29501"))
@@ -68,6 +69,17 @@ ATTN_BACKEND_CONFIG = get_attn_backend_config()
 USE_TRTLLM = ATTN_BACKEND_CONFIG.use_trtllm
 BLOCK_SIZE = ATTN_BACKEND_CONFIG.block_size
 USE_FLASHINFER = USE_TRTLLM  # back-compat alias
+
+
+def _reconfigure_attn_backend(cfg: AttnBackendConfig) -> None:
+    """Update module-level globals after detecting model-specific backend."""
+    global ATTN_BACKEND_CONFIG, USE_TRTLLM, BLOCK_SIZE, USE_FLASHINFER
+    from .context import set_attn_backend_config
+    set_attn_backend_config(cfg)
+    ATTN_BACKEND_CONFIG = cfg
+    USE_TRTLLM = cfg.use_trtllm
+    BLOCK_SIZE = cfg.block_size
+    USE_FLASHINFER = USE_TRTLLM
 
 
 # ---------------------------------------------------------------------------
@@ -234,7 +246,9 @@ class ModelRunner:
                  gpu_memory_utilization: float = 0.9,
                  max_model_len: int = MAX_MODEL_LEN,
                  max_num_seqs: int | None = None,
-                 max_num_batched_tokens: int | None = None):
+                 max_num_batched_tokens: int | None = None,
+                 data_parallel_size: int = 1,
+                 enable_expert_parallel: bool = False):
         self.model_name = model_name
         self.rank = rank
         self.world_size = world_size
@@ -245,21 +259,40 @@ class ModelRunner:
         self.max_model_len = ((max_model_len + BLOCK_SIZE - 1) // BLOCK_SIZE + 2) * BLOCK_SIZE
         self.max_num_seqs = max_num_seqs if max_num_seqs is not None else _DEFAULT_MAX_NUM_SEQS
         self.max_num_batched_tokens = max_num_batched_tokens if max_num_batched_tokens is not None else _DEFAULT_MAX_NUM_BATCHED_TOKENS
+        self.data_parallel_size = data_parallel_size
+        self.enable_expert_parallel = enable_expert_parallel
+
+        tp_size = world_size // data_parallel_size
 
         torch.cuda.set_device(rank)
-        dist.init_process_group(
-            "nccl", f"tcp://localhost:{NCCL_PORT}",
-            world_size=world_size, rank=rank,
-            device_id=torch.device(f"cuda:{rank}"),
-        )
+        self._dist_pre_initialized = dist.is_initialized()
+        if not self._dist_pre_initialized:
+            dist.init_process_group(
+                "nccl", f"tcp://localhost:{NCCL_PORT}",
+                world_size=world_size, rank=rank,
+                device_id=torch.device(f"cuda:{rank}"),
+            )
+            init_parallel_groups(
+                tp_size=tp_size,
+                dp_size=data_parallel_size,
+                enable_expert_parallel=enable_expert_parallel,
+            )
 
         self.custom_ar = None
-        if world_size > 1:
-            self.cpu_group = dist.new_group(backend="gloo")
+        if tp_size > 1:
+            from .tp import get_tp_group
+            tp_group = get_tp_group()
+            self.cpu_group = dist.new_group(
+                ranks=list(range(
+                    (rank // tp_size) * tp_size,
+                    (rank // tp_size) * tp_size + tp_size,
+                )),
+                backend="gloo",
+            )
             if not os.environ.get("KB_NANO_DISABLE_CUSTOM_AR", "0") == "1":
                 from ..tasks.baseline.L1.allreduce import CustomAllreduce
                 self.custom_ar = CustomAllreduce(
-                    self.cpu_group, rank, max_size=8 * 1024 * 1024
+                    self.cpu_group, rank % tp_size, max_size=8 * 1024 * 1024
                 )
                 set_custom_ar(self.custom_ar)
 
@@ -268,15 +301,48 @@ class ModelRunner:
         torch.set_default_dtype(dtype)
         torch.set_default_device("cuda")
 
+        from .weight_loader import _detect_model_type
+        _early_model_type = _detect_model_type(model_name)
+        _early_is_v32 = _early_model_type == "deepseek_v32"
+        if _early_is_v32:
+            cc = torch.cuda.get_device_capability()
+            if cc[0] >= 9:
+                _reconfigure_attn_backend(AttnBackendConfig.flashmla_sparse())
+                self.block_size = BLOCK_SIZE
+                self.max_model_len = ((max_model_len + BLOCK_SIZE - 1) // BLOCK_SIZE + 2) * BLOCK_SIZE
+                if self.rank == 0:
+                    print(f"  DeepSeek V3.2: FlashMLA sparse backend (block_size={BLOCK_SIZE})")
+
         self.model, self.config = load_model(
             model_name, torch.device(f"cuda:{rank}"), dtype,
         )
-        self.is_moe = hasattr(self.config, "num_local_experts")
+        self.is_moe = hasattr(self.config, "num_local_experts") or hasattr(self.config, "n_routed_experts")
+        self.is_deepseek = hasattr(self.config, "qk_nope_head_dim")
+        self.is_deepseek_v32 = (self.is_deepseek
+                                and hasattr(self.config, "index_topk")
+                                and self.config.index_topk is not None)
         self.is_qwen_vl = hasattr(self.config, "mrope_section")
+        torch.cuda.synchronize()
+        if self.rank == 0:
+            _GiB = 1 << 30
+            mem = torch.cuda.memory_allocated() / _GiB
+            peak = torch.cuda.max_memory_allocated() / _GiB
+            print(f"  After model load: allocated={mem:.1f}G peak={peak:.1f}G")
         self._share_trtllm_workspace()
         self._share_activation_buffers()
-        self.warmup_model()
+        if self.rank == 0:
+            _GiB = 1 << 30
+            print(f"  After sharing bufs: allocated={torch.cuda.memory_allocated()/_GiB:.1f}G")
         self._warmup_deepgemm()
+        torch.cuda.synchronize()
+        if self.rank == 0:
+            _GiB = 1 << 30
+            print(f"  After DG warmup: allocated={torch.cuda.memory_allocated()/_GiB:.1f}G")
+        self.warmup_model()
+        if self.rank == 0:
+            _GiB = 1 << 30
+            print(f"  After model warmup: allocated={torch.cuda.memory_allocated()/_GiB:.1f}G")
+        self._presize_moe_buffers()
         self.allocate_kv_cache()
         if not self.enforce_eager:
             self.capture_cudagraph()
@@ -284,9 +350,10 @@ class ModelRunner:
         torch.set_default_device("cpu")
         torch.set_default_dtype(default_dtype)
 
-        # TP shared memory setup
-        if world_size > 1:
-            if rank == 0:
+        # TP shared memory setup (only needed when tp_size > 1)
+        if tp_size > 1:
+            tp_rank = rank % tp_size
+            if tp_rank == 0:
                 self.shm = SharedMemory(name=shm_name, create=True, size=2**20)
                 self.shm.buf[self._SHM_FLAG_OFFSET] = 0
                 self.shm.buf[self._SHM_SEQ_OFFSET:self._SHM_SEQ_OFFSET+4] = (0).to_bytes(4, "little")
@@ -301,15 +368,18 @@ class ModelRunner:
             self.custom_ar.close()
             self.custom_ar = None
             set_custom_ar(None)
-        if self.world_size > 1:
+        tp_size = self.world_size // self.data_parallel_size
+        if tp_size > 1:
             self.shm.close()
             dist.barrier()
-            if self.rank == 0:
+            tp_rank = self.rank % tp_size
+            if tp_rank == 0:
                 self.shm.unlink()
         if hasattr(self, "graphs"):
             del self.graphs, self.graph_pool
         torch.cuda.synchronize()
-        dist.destroy_process_group()
+        if not self._dist_pre_initialized:
+            dist.destroy_process_group()
 
     # SHM layout for spin-wait signaling:
     # byte[-1] (_SHM_FLAG_OFFSET): 0=generic, 1=decode_greedy, 2=exit marker
@@ -375,21 +445,36 @@ class ModelRunner:
         torch.cuda.empty_cache()
 
     def _share_activation_buffers(self):
-        """Share a single SiluAndMul activation buffer across all layers.
+        """Share activation buffers across all layers that execute sequentially.
 
-        Layers execute sequentially so the buffer is safe to reuse.
-        Must be called before warmup so only one buffer grows to max size
-        instead of one per layer (saves ~14 GiB for 32-layer models).
+        Covers SiluAndMul, FusedExperts intermediate caches, and FP8 quantization
+        buffers. Must be called before warmup so only one buffer grows to max size
+        instead of one per layer.
         """
         from ..tasks.baseline.L1.silu_and_mul import SiluAndMul
         silu_modules = [
             m for m in self.model.modules() if isinstance(m, SiluAndMul)
         ]
-        if len(silu_modules) <= 1:
-            return
-        shared = silu_modules[0]._act_buf
-        for m in silu_modules[1:]:
-            m.set_shared_buffer(shared)
+        if len(silu_modules) > 1:
+            shared = silu_modules[0]._act_buf
+            for m in silu_modules[1:]:
+                m.set_shared_buffer(shared)
+
+        from ..tasks.baseline.L2.fused_experts import FusedExperts
+        fused_experts = [
+            m for m in self.model.modules() if isinstance(m, FusedExperts)
+        ]
+        if len(fused_experts) > 1:
+            shared_bufs = fused_experts[0]._shared_bufs
+            for m in fused_experts[1:]:
+                m.set_shared_bufs(shared_bufs)
+
+        from ..tasks.baseline.L1.moe_sum import MoeSum
+        moe_sums = [m for m in self.model.modules() if isinstance(m, MoeSum)]
+        if len(moe_sums) > 1:
+            shared_buf = moe_sums[0]._buf
+            for m in moe_sums[1:]:
+                m.set_shared_buf(shared_buf)
 
     def warmup_model(self):
         torch.cuda.empty_cache()
@@ -400,10 +485,84 @@ class ModelRunner:
 
         warmup_len = min(self.max_model_len, self.max_num_batched_tokens)
         num_seqs = min(self.max_num_batched_tokens // warmup_len, self.max_num_seqs)
+
+        from .tp import _ep_size, get_ep_group
+        ep = _ep_size()
+        if ep > 1:
+            warmup_len = min(warmup_len, max(16, self.max_num_batched_tokens // (ep * ep)))
+            num_seqs = 1
+            ep_group = get_ep_group()
+            if ep_group is not None:
+                dist.barrier(ep_group)
+
+        if self.rank == 0:
+            print(f"  Warmup: {num_seqs} seq(s) of length {warmup_len}, ep={ep}")
         seqs = [Sequence([0] * warmup_len) for _ in range(num_seqs)]
         self.run(seqs, True)
 
         torch.cuda.empty_cache()
+
+    def _presize_moe_buffers(self):
+        """Pre-allocate MoE intermediate and FP8 buffers to their maximum
+        inference-time size.
+
+        With EP, the warmup runs with a reduced token count, leaving MoE
+        buffers undersized.  During real inference, EP dispatch gathers tokens
+        from all ranks (M * ep_size), causing buffers to grow dramatically.
+        If KV cache is allocated based on post-warmup memory, there won't be
+        room for the larger buffers.  This mirrors vLLM's profile_run which
+        runs at max_num_batched_tokens to size everything before KV allocation.
+        """
+        from ..tasks.baseline.L2.fused_experts import FusedExperts
+        from .tp import _ep_size
+
+        fused = [m for m in self.model.modules() if isinstance(m, FusedExperts)]
+        if not fused:
+            return
+
+        ep = _ep_size()
+        if ep > 1:
+            M = 256 * ep
+        else:
+            M = self.max_num_batched_tokens
+        device = next(self.model.parameters()).device
+
+        cfg = self.config
+        K = cfg.hidden_size
+        N2 = 2 * getattr(cfg, 'moe_intermediate_size', getattr(cfg, 'intermediate_size', K))
+        top_k = getattr(cfg, 'num_experts_per_tok', 8)
+
+        bufs = fused[0]._shared_bufs
+        dtype = next(self.model.parameters()).dtype
+
+        bufs.get_cache("cache1", (M * top_k, N2), device, dtype)
+        bufs.get_cache("cache3", (M * top_k, K), device, dtype)
+
+        is_fp8 = any(
+            hasattr(m, 'w13') and m.w13 is not None and m.w13.dtype == torch.float8_e4m3fn
+            for m in self.model.modules()
+            if hasattr(m, 'w13')
+        )
+        if is_fp8:
+            fused[0]._ensure_fp8_bufs(M, K, N2, top_k, device)
+
+        from ..tasks.baseline.L1.silu_and_mul import SiluAndMul
+        silu_modules = [m for m in self.model.modules() if isinstance(m, SiluAndMul)]
+        if silu_modules:
+            half = N2 // 2
+            silu_modules[0]._act_buf.get(M * top_k, half, device, dtype)
+
+        from ..tasks.baseline.L1.moe_sum import MoeSum
+        moe_sums = [m for m in self.model.modules() if isinstance(m, MoeSum)]
+        if moe_sums:
+            moe_sums[0]._buf.get(M, K, device, dtype)
+
+        torch.cuda.synchronize()
+        if self.rank == 0:
+            _GiB = 1 << 30
+            mem = torch.cuda.memory_allocated() / _GiB
+            print(f"  After MoE buffer pre-sizing (M={M}, top_k={top_k}, ep={ep}): "
+                  f"allocated={mem:.1f}G")
 
     def _warmup_deepgemm(self):
         """Pre-JIT DeepGEMM FP8 kernels for all weight shapes at decode and
@@ -411,6 +570,9 @@ class ModelRunner:
         shared prefill buffers per unique (K, N) shape."""
         from ..tasks.baseline.L1.fp8_linear import Fp8Linear, _Fp8PrefillBufs
         import deep_gemm
+        torch.cuda.synchronize()
+        if self.rank == 0:
+            print("  Starting DeepGEMM warmup...")
 
         fp8_modules = []
         for module in self.model.modules():
@@ -438,10 +600,17 @@ class ModelRunner:
             N, K = w.shape
 
             linear_op._ensure_buffers(max_decode, K, N, device)
+            linear_op._a_buf.zero_()
+            linear_op._s_buf.fill_(1.0)
+            linear_op._o_buf.zero_()
 
             key = (N, K)
             if key not in prefill_bufs:
-                prefill_bufs[key] = _Fp8PrefillBufs(max_prefill, K, N, device)
+                pf_buf = _Fp8PrefillBufs(max_prefill, K, N, device)
+                pf_buf.a.zero_()
+                pf_buf.s.fill_(1.0)
+                pf_buf.o.zero_()
+                prefill_bufs[key] = pf_buf
             linear_op._pf = prefill_bufs[key]
 
             if key in seen_shapes:
@@ -573,40 +742,117 @@ class ModelRunner:
     def allocate_kv_cache(self):
         if not hasattr(self, '_attn_layers') or not self._attn_layers:
             self._attn_layers = []
+            self._indexer_layers = []
+            from ..tasks.baseline.L2.deepseek_indexer import DeepSeekIndexer
             for module in self.model.modules():
-                if hasattr(module, "k_cache") and hasattr(module, "v_cache"):
+                if isinstance(module, DeepSeekIndexer):
+                    self._indexer_layers.append(module)
+                elif hasattr(module, "k_cache") and hasattr(module, "v_cache"):
                     self._attn_layers.append(module)
 
+        torch.cuda.empty_cache()
+        torch.cuda.reset_peak_memory_stats()
         free, total = torch.cuda.mem_get_info()
         used = total - free
         peak = torch.cuda.memory_stats()["allocated_bytes.all.peak"]
         current = torch.cuda.memory_stats()["allocated_bytes.all.current"]
-        num_kv_heads = self.config.num_key_value_heads // self.world_size
-        head_dim = self.config.head_dim
-        num_layers = self.config.num_hidden_layers
-        elem_size = torch.finfo(torch.get_default_dtype()).bits // 8
-        block_bytes = 2 * num_layers * BLOCK_SIZE * num_kv_heads * head_dim * elem_size
-        num_blocks = int(total * self.gpu_memory_utilization - used - peak + current) // block_bytes
-        if self.is_qwen_vl:
-            num_blocks = int(num_blocks * 0.95)
-        assert num_blocks > 0, f"Not enough GPU memory for KV cache on rank {self.rank}"
-        self.num_blocks = num_blocks
-        if self.rank == 0:
-            print(f"  KV cache: {num_blocks} blocks x {BLOCK_SIZE} = {num_blocks * BLOCK_SIZE} token slots")
 
-        if ATTN_BACKEND_CONFIG.kv_layout == "HND":
-            self.kv_cache = torch.empty(
-                2, num_layers, num_blocks, num_kv_heads, BLOCK_SIZE, head_dim,
+        from .tp import _tp_size
+        tp = _tp_size()
+
+        num_layers = self.config.num_hidden_layers
+
+        if self.is_deepseek_v32 and ATTN_BACKEND_CONFIG.use_flashmla_sparse:
+            mla_bytes_per_tok = 656
+            indexer_head_dim = getattr(self.config, 'index_head_dim', 128)
+            indexer_bytes_per_tok = indexer_head_dim + 4
+
+            block_bytes = num_layers * BLOCK_SIZE * (mla_bytes_per_tok + indexer_bytes_per_tok)
+
+            non_torch = used - current
+            utilization = min(self.gpu_memory_utilization, 0.90)
+            available = total * utilization - non_torch - current
+
+            if self.rank == 0:
+                _GiB = 1 << 30
+                print(f"  Memory: total={total/_GiB:.1f}G free={free/_GiB:.1f}G "
+                      f"used={used/_GiB:.1f}G peak={peak/_GiB:.1f}G "
+                      f"current={current/_GiB:.1f}G non_torch={non_torch/_GiB:.1f}G "
+                      f"avail={available/_GiB:.1f}G block_bytes={block_bytes}")
+
+            num_blocks = int(available) // block_bytes
+            assert num_blocks > 0, f"Not enough GPU memory for KV cache on rank {self.rank}"
+            self.num_blocks = num_blocks
+
+            if self.rank == 0:
+                print(f"  KV cache: {num_blocks} blocks x {BLOCK_SIZE} = "
+                      f"{num_blocks * BLOCK_SIZE} token slots (FP8 MLA + indexer)")
+
+            mla_cache = torch.zeros(
+                num_layers, num_blocks, BLOCK_SIZE, mla_bytes_per_tok,
+                dtype=torch.uint8, device="cuda",
             )
+            indexer_cache = torch.zeros(
+                num_layers, num_blocks, BLOCK_SIZE, indexer_bytes_per_tok,
+                dtype=torch.uint8, device="cuda",
+            )
+
+            layer_id = 0
+            for module in self._attn_layers:
+                module.k_cache = mla_cache[layer_id]
+                module.v_cache = mla_cache[layer_id]
+                layer_id += 1
+
+            idx_layer_id = 0
+            for module in self._indexer_layers:
+                module.k_cache = indexer_cache[idx_layer_id]
+                idx_layer_id += 1
+
+            self.kv_cache = mla_cache
+            self._indexer_cache = indexer_cache
+
         else:
-            self.kv_cache = torch.empty(
-                2, num_layers, num_blocks, BLOCK_SIZE, num_kv_heads, head_dim,
-            )
-        layer_id = 0
-        for module in self._attn_layers:
-            module.k_cache = self.kv_cache[0, layer_id]
-            module.v_cache = self.kv_cache[1, layer_id]
-            layer_id += 1
+            if self.is_deepseek:
+                num_kv_heads = 1
+                head_dim = self.config.kv_lora_rank + self.config.qk_rope_head_dim
+            else:
+                num_kv_heads = self.config.num_key_value_heads // tp
+                head_dim = self.config.head_dim
+
+            elem_size = torch.finfo(torch.get_default_dtype()).bits // 8
+            block_bytes = 2 * num_layers * BLOCK_SIZE * num_kv_heads * head_dim * elem_size
+            non_torch = used - current
+            utilization = self.gpu_memory_utilization
+            if self.is_deepseek:
+                utilization = min(utilization, 0.88)
+            available = total * utilization - non_torch - current
+            if self.rank == 0:
+                _GiB = 1 << 30
+                print(f"  Memory: total={total/_GiB:.1f}G free={free/_GiB:.1f}G "
+                      f"used={used/_GiB:.1f}G peak={peak/_GiB:.1f}G "
+                      f"current={current/_GiB:.1f}G non_torch={non_torch/_GiB:.1f}G "
+                      f"avail={available/_GiB:.1f}G block_bytes={block_bytes}")
+            num_blocks = int(available) // block_bytes
+            if self.is_qwen_vl:
+                num_blocks = int(num_blocks * 0.95)
+            assert num_blocks > 0, f"Not enough GPU memory for KV cache on rank {self.rank}"
+            self.num_blocks = num_blocks
+            if self.rank == 0:
+                print(f"  KV cache: {num_blocks} blocks x {BLOCK_SIZE} = {num_blocks * BLOCK_SIZE} token slots")
+
+            if ATTN_BACKEND_CONFIG.kv_layout == "HND":
+                self.kv_cache = torch.empty(
+                    2, num_layers, num_blocks, num_kv_heads, BLOCK_SIZE, head_dim,
+                )
+            else:
+                self.kv_cache = torch.empty(
+                    2, num_layers, num_blocks, BLOCK_SIZE, num_kv_heads, head_dim,
+                )
+            layer_id = 0
+            for module in self._attn_layers:
+                module.k_cache = self.kv_cache[0, layer_id]
+                module.v_cache = self.kv_cache[1, layer_id]
+                layer_id += 1
 
         if self.rank == 0:
             cfg = ATTN_BACKEND_CONFIG
@@ -1316,12 +1562,20 @@ class LlamaEngine:
         max_model_len: int = MAX_MODEL_LEN,
         max_num_seqs: int | None = None,
         max_num_batched_tokens: int | None = None,
+        data_parallel_size: int = 1,
+        enable_expert_parallel: bool = False,
     ):
         self.model_name = model_name
         self.seed = seed
         self.max_num_seqs = max_num_seqs if max_num_seqs is not None else _DEFAULT_MAX_NUM_SEQS
         self.max_num_batched_tokens = max_num_batched_tokens if max_num_batched_tokens is not None else _DEFAULT_MAX_NUM_BATCHED_TOKENS
+        if enable_expert_parallel:
+            enforce_eager = True
+        self.data_parallel_size = data_parallel_size
+        self.enable_expert_parallel = enable_expert_parallel
         self._set_seeds(seed)
+
+        world_size = tensor_parallel_size * data_parallel_size
 
         # Unique shared memory name to avoid collisions
         shm_name = f"sllama_{uuid.uuid4().hex[:8]}"
@@ -1331,17 +1585,19 @@ class LlamaEngine:
             max_model_len=max_model_len,
             max_num_seqs=self.max_num_seqs,
             max_num_batched_tokens=self.max_num_batched_tokens,
+            data_parallel_size=data_parallel_size,
+            enable_expert_parallel=enable_expert_parallel,
         )
 
         # Launch non-rank-0 workers
         self.workers = []
         self.events = []
         ctx = mp.get_context("spawn")
-        for i in range(1, tensor_parallel_size):
+        for i in range(1, world_size):
             event = ctx.Event()
             p = ctx.Process(
                 target=ModelRunner,
-                args=(model_name, i, tensor_parallel_size, dtype,
+                args=(model_name, i, world_size, dtype,
                       enforce_eager, event, shm_name),
                 kwargs=mr_kwargs,
             )
@@ -1351,7 +1607,7 @@ class LlamaEngine:
 
         # Rank 0 model runner (events is a list for rank 0)
         self.model_runner = ModelRunner(
-            model_name, 0, tensor_parallel_size, dtype,
+            model_name, 0, world_size, dtype,
             enforce_eager, self.events, shm_name,
             **mr_kwargs,
         )

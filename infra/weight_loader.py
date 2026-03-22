@@ -1,13 +1,14 @@
 """
-Weight loader for Llama 3.1, Llama 4, Mixtral, Qwen2-VL, and Qwen3-VL
-with tensor parallelism.
+Weight loader for Llama 3.1, Llama 4, Mixtral, DeepSeek V3, Qwen2-VL, and Qwen3-VL
+with tensor parallelism and expert parallelism.
 
 Loads weights from HuggingFace safetensors and distributes them
-across TP shards using the weight_loader callbacks on each parameter.
+across TP/EP shards using the weight_loader callbacks on each parameter.
 """
 
 from __future__ import annotations
 
+import gc
 import os
 import re
 from glob import glob
@@ -22,6 +23,7 @@ from ..tasks.baseline.L1.fp8_linear import Fp8Linear, postprocess_fp8_weights
 from ..tasks.baseline.L4.llama import LlamaConfig, LlamaForCausalLM
 from ..tasks.baseline.L4.llama4 import Llama4Config, Llama4ForCausalLM
 from ..tasks.baseline.L4.mixtral import MixtralConfig, MixtralForCausalLM
+from ..tasks.baseline.L4.deepseek_v3 import DeepSeekV3Config, DeepSeekV3ForCausalLM
 from ..tasks.baseline.L4.qwen2_vl import Qwen2VLConfig, Qwen2VLForConditionalGeneration
 from ..tasks.baseline.L4.qwen3_vl import Qwen3VLConfig, Qwen3VLForConditionalGeneration
 
@@ -38,6 +40,16 @@ def download_model(model_name: str) -> str:
 
 _EXPERT_RE = re.compile(
     r"(.+\.block_sparse_moe)\.experts\.(\d+)\.(w[123])\.weight"
+)
+
+# DeepSeek MoE expert pattern: model.layers.X.mlp.experts.Y.{gate,up,down}_proj.weight
+_DS_EXPERT_RE = re.compile(
+    r"(.+\.mlp)\.experts\.(\d+)\.(gate_proj|up_proj|down_proj)\.weight"
+)
+
+# DeepSeek expert scale pattern: model.layers.X.mlp.experts.Y.{gate,up,down}_proj.weight_scale_inv
+_DS_EXPERT_SCALE_RE = re.compile(
+    r"(.+\.mlp)\.experts\.(\d+)\.(gate_proj|up_proj|down_proj)\.weight_scale_inv"
 )
 
 
@@ -153,6 +165,7 @@ def load_weights(model, model_path: str, model_type: str = "llama") -> None:
     is_qwen3_vl = model_type == "qwen3_vl"
     is_qwen_vl = is_qwen2_vl or is_qwen3_vl
     is_llama4 = model_type == "llama4"
+    is_deepseek = model_type in ("deepseek_v3", "deepseek_v32")
     if is_llama4:
         llama4_config = model.config
 
@@ -269,6 +282,36 @@ def load_weights(model, model_path: str, model_type: str = "llama") -> None:
                         )
                         continue
 
+                # Handle DeepSeek expert FP8 weight_scale_inv tensors
+                if is_deepseek:
+                    m_ds_scale = _DS_EXPERT_SCALE_RE.match(mapped_name)
+                    if m_ds_scale:
+                        moe_prefix, expert_id_str, proj = m_ds_scale.groups()
+                        expert_id = int(expert_id_str)
+                        tensor = f.get_tensor(weight_name)
+                        if proj in ("gate_proj", "up_proj"):
+                            param_name = f"{moe_prefix}.w13_weight_scale_inv"
+                            try:
+                                param = model.get_parameter(param_name)
+                            except AttributeError:
+                                pass
+                            else:
+                                param.weight_loader(
+                                    param, tensor, expert_id,
+                                    is_w1=(proj == "gate_proj"),
+                                )
+                                loaded += 1
+                        else:  # down_proj
+                            param_name = f"{moe_prefix}.w2_weight_scale_inv"
+                            try:
+                                param = model.get_parameter(param_name)
+                            except AttributeError:
+                                pass
+                            else:
+                                param.weight_loader(param, tensor, expert_id)
+                                loaded += 1
+                        continue
+
                 # Handle FP8 weight_scale_inv tensors
                 m_scale = _WEIGHT_SCALE_INV_RE.match(mapped_name)
                 if m_scale:
@@ -302,7 +345,52 @@ def load_weights(model, model_path: str, model_type: str = "llama") -> None:
                     loaded += 1
                     continue
 
-                # Handle MoE expert weights
+                # Handle DeepSeek MoE expert weights
+                if is_deepseek:
+                    m_ds = _DS_EXPERT_RE.match(mapped_name)
+                    if m_ds:
+                        moe_prefix, expert_id_str, proj = m_ds.groups()
+                        expert_id = int(expert_id_str)
+                        tensor = f.get_tensor(weight_name)
+                        if proj in ("gate_proj", "up_proj"):
+                            param_name = f"{moe_prefix}.w13"
+                            try:
+                                param = model.get_parameter(param_name)
+                            except AttributeError:
+                                continue
+                            param.weight_loader(
+                                param, tensor, expert_id,
+                                is_w1=(proj == "gate_proj"),
+                            )
+                        else:  # down_proj
+                            param_name = f"{moe_prefix}.w2"
+                            try:
+                                param = model.get_parameter(param_name)
+                            except AttributeError:
+                                continue
+                            param.weight_loader(param, tensor, expert_id)
+                        loaded += 1
+                        continue
+
+                # Handle DeepSeek shared expert packed modules
+                if is_deepseek and "shared_experts." in mapped_name:
+                    matched_shared = False
+                    for orig_key, (packed_name, shard_id) in packed.items():
+                        if orig_key in mapped_name:
+                            param_name = mapped_name.replace(orig_key, packed_name)
+                            try:
+                                param = model.get_parameter(param_name)
+                            except AttributeError:
+                                break
+                            weight_loader = getattr(param, "weight_loader")
+                            weight_loader(param, f.get_tensor(weight_name), shard_id)
+                            loaded += 1
+                            matched_shared = True
+                            break
+                    if matched_shared:
+                        continue
+
+                # Handle MoE expert weights (Mixtral)
                 m = _EXPERT_RE.match(mapped_name)
                 if m:
                     moe_prefix, expert_id_str, w_name = m.groups()
@@ -367,6 +455,20 @@ def load_weights(model, model_path: str, model_type: str = "llama") -> None:
     print(f"  Loaded {loaded} weight shards.")
 
 
+def _extract_mla_absorption_weights(model: torch.nn.Module) -> None:
+    """Extract W_UK/W_UV from MLA's kv_b_proj BEFORE FP8 postprocessing.
+
+    After postprocessing, the FP8 weights use UE8M0 scales with a
+    transformed layout that makes direct dequantization incorrect.
+    Extraction must happen while weights are still in standard FP8
+    with standard block scales.
+    """
+    from ..tasks.baseline.L2.deepseek_mla import DeepSeekMLA
+    for m in model.modules():
+        if isinstance(m, DeepSeekMLA):
+            m._extract_absorption_weights()
+
+
 def _postprocess_fp8_weights(model: torch.nn.Module) -> None:
     """Re-quantize FP8 weights to UE8M0 format and transform scale layout for DeepGEMM."""
     print("  Post-processing FP8 weights for DeepGEMM...")
@@ -384,15 +486,31 @@ def _postprocess_fp8_weights(model: torch.nn.Module) -> None:
 
 def _detect_model_type(model_name: str) -> str:
     """Detect model architecture from HuggingFace config."""
-    hf_config = AutoConfig.from_pretrained(model_name, trust_remote_code=True)
-    model_type = getattr(hf_config, "model_type", "llama")
+    import json
+    from huggingface_hub import hf_hub_download
+    try:
+        cfg_path = hf_hub_download(model_name, "config.json")
+        with open(cfg_path) as f:
+            cfg = json.load(f)
+        model_type = cfg.get("model_type", "llama")
+    except Exception:
+        hf_config = AutoConfig.from_pretrained(model_name, trust_remote_code=True)
+        model_type = getattr(hf_config, "model_type", "llama")
     return model_type
 
 
 def _detect_quant_config(model_name: str) -> dict | None:
     """Detect FP8 quantization config from HuggingFace config."""
-    hf_config = AutoConfig.from_pretrained(model_name)
-    qc = getattr(hf_config, "quantization_config", None)
+    import json
+    from huggingface_hub import hf_hub_download
+    try:
+        cfg_path = hf_hub_download(model_name, "config.json")
+        with open(cfg_path) as f:
+            cfg = json.load(f)
+        qc = cfg.get("quantization_config", None)
+    except Exception:
+        hf_config = AutoConfig.from_pretrained(model_name, trust_remote_code=True)
+        qc = getattr(hf_config, "quantization_config", None)
     if qc is None:
         return None
     if isinstance(qc, dict):
@@ -419,7 +537,15 @@ def load_model(
         print(f"  Detected FP8 quantization: {quant_config.get('quant_method')}, "
               f"block_size={quant_config.get('weight_block_size')}")
 
-    if model_type == "llama4":
+    if model_type in ("deepseek_v3", "deepseek_v32"):
+        config = DeepSeekV3Config.from_pretrained(model_name)
+        config.dtype = dtype
+        from .tp import _ep_size
+        ep = _ep_size()
+        print(f"  Allocating DeepSeek V3 model ({config.n_routed_experts} experts, "
+              f"top-{config.num_experts_per_tok}, EP={ep})...")
+        model = DeepSeekV3ForCausalLM(config, quant_config=quant_config)
+    elif model_type == "llama4":
         config = Llama4Config.from_pretrained(model_name)
         config.dtype = dtype
         print(f"  Allocating Llama4 model ({config.num_local_experts} experts, "
@@ -472,7 +598,12 @@ def load_model(
         for name, buf in model.named_buffers():
             if buf.device != device:
                 buf.data = buf.data.to(device=device)
+        _extract_mla_absorption_weights(model)
+        torch.cuda.synchronize()
         _postprocess_fp8_weights(model)
+        torch.cuda.synchronize()
+        gc.collect()
+        torch.cuda.empty_cache()
     else:
         model = model.to(device=device, dtype=dtype)
 

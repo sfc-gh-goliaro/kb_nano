@@ -1,9 +1,17 @@
-"""Fused MoE experts: two grouped GEMMs with SiLU-mul in between."""
+"""Fused MoE experts: two grouped GEMMs with SiLU-mul in between.
+
+Supports FP8 w8a8 with block-scale quantization matching vLLM's Triton path:
+  - Expert weights stored as float8_e4m3fn with per-block float32 scales
+  - Activations quantized to FP8 per-token-group before each GEMM
+  - Block scales applied inside the Triton kernel (no BF16 expansion)
+"""
 
 from __future__ import annotations
 
 import torch
 import torch.nn as nn
+import triton
+import triton.language as tl
 
 from ..L1.moe_align import MoeAlign
 from ..L1.moe_grouped_gemm import MoeGroupedGemm
@@ -11,6 +19,80 @@ from ..L1.moe_sum import MoeSum
 from ..L1.silu_and_mul import SiluAndMul
 
 SPARSITY_FACTOR = 4
+
+_FP8_BLOCK = 128
+_FP8_INFO = torch.finfo(torch.float8_e4m3fn)
+
+
+@triton.jit
+def _moe_act_quant_kernel(
+    x_ptr, out_ptr, scale_ptr,
+    stride_x_row, stride_out_row, stride_s_row,
+    num_cols,
+    fp8_max: tl.constexpr,
+    GROUP_SIZE: tl.constexpr,
+):
+    """Single-kernel per-token-group FP8 quantization for MoE activations."""
+    pid = tl.program_id(0)
+    groups_per_row = num_cols // GROUP_SIZE
+    row = pid // groups_per_row
+    group = pid % groups_per_row
+
+    x_base = x_ptr + row * stride_x_row + group * GROUP_SIZE
+    cols = tl.arange(0, GROUP_SIZE)
+    x = tl.load(x_base + cols).to(tl.float32)
+
+    absmax = tl.max(tl.abs(x))
+    absmax = tl.maximum(absmax, 1e-10)
+    scale = absmax / fp8_max
+
+    x_scaled = x / scale
+    x_fp8 = tl.clamp(x_scaled, -fp8_max, fp8_max).to(out_ptr.dtype.element_ty)
+
+    out_base = out_ptr + row * stride_out_row + group * GROUP_SIZE
+    tl.store(out_base + cols, x_fp8)
+
+    scale_base = scale_ptr + row * stride_s_row + group
+    tl.store(scale_base, scale)
+
+
+class _MoESharedBufs:
+    """Shared mutable container for MoE intermediate and FP8 buffers.
+
+    All FusedExperts instances in a model share one _MoESharedBufs so that
+    only a single set of buffers is allocated. Layers execute sequentially.
+    """
+    __slots__ = ("cache1", "cache3", "a1_q", "a1_s", "a2_q", "a2_s")
+
+    def __init__(self):
+        self.cache1: torch.Tensor | None = None
+        self.cache3: torch.Tensor | None = None
+        self.a1_q: torch.Tensor | None = None
+        self.a1_s: torch.Tensor | None = None
+        self.a2_q: torch.Tensor | None = None
+        self.a2_s: torch.Tensor | None = None
+
+    def get_cache(self, which: str, size: tuple, device, dtype) -> torch.Tensor:
+        cache = getattr(self, which)
+        if cache is None or cache.size(0) < size[0] or cache.size(1) < size[1]:
+            cache = torch.empty(size, device=device, dtype=dtype)
+            setattr(self, which, cache)
+        return cache[:size[0], :size[1]]
+
+
+def _quant_fp8_inplace(
+    x: torch.Tensor, out_q: torch.Tensor, out_s: torch.Tensor,
+) -> None:
+    """Quantize activations to FP8 using pre-allocated buffers (zero temp memory)."""
+    M, K = x.shape
+    groups_per_row = K // _FP8_BLOCK
+    _moe_act_quant_kernel[(M * groups_per_row,)](
+        x, out_q, out_s,
+        x.stride(0), out_q.stride(0), out_s.stride(0),
+        K,
+        fp8_max=_FP8_INFO.max,
+        GROUP_SIZE=_FP8_BLOCK,
+    )
 
 
 class FusedExperts(nn.Module):
@@ -23,6 +105,8 @@ class FusedExperts(nn.Module):
         topk_weights: [M, top_k]
         topk_ids:     [M, top_k]
         num_experts: E
+        w13_scale: [E, ceil(2*intermediate/128), ceil(K/128)] or None
+        w2_scale:  [E, ceil(K/128), ceil(intermediate/128)] or None
 
     Returns:
         output: [M, K]
@@ -34,15 +118,23 @@ class FusedExperts(nn.Module):
         self.moe_grouped_gemm = MoeGroupedGemm()
         self.act_fn = SiluAndMul()
         self.moe_sum = MoeSum()
-        self._cache1 = None
-        self._cache3 = None
+        self._shared_bufs = _MoESharedBufs()
 
-    def _get_cache(self, name, size, device, dtype):
-        cache = getattr(self, name)
-        if cache is None or cache.size(0) < size[0] or cache.size(1) < size[1]:
-            cache = torch.empty(size, device=device, dtype=dtype)
-            setattr(self, name, cache)
-        return cache[:size[0], :size[1]]
+    def set_shared_bufs(self, bufs: _MoESharedBufs):
+        self._shared_bufs = bufs
+
+    def _ensure_fp8_bufs(self, M: int, K: int, N: int, top_k: int, device: torch.device):
+        """Ensure FP8 buffers are large enough. K = hidden_size, N = 2*intermediate."""
+        bufs = self._shared_bufs
+        n_groups_k = K // _FP8_BLOCK
+        if bufs.a1_q is None or bufs.a1_q.size(0) < M:
+            bufs.a1_q = torch.empty(M, K, dtype=torch.float8_e4m3fn, device=device)
+            bufs.a1_s = torch.empty(M, n_groups_k, dtype=torch.float32, device=device)
+        a2_rows = M * top_k
+        n_groups_n2 = (N // 2) // _FP8_BLOCK
+        if bufs.a2_q is None or bufs.a2_q.size(0) < a2_rows:
+            bufs.a2_q = torch.empty(a2_rows, N // 2, dtype=torch.float8_e4m3fn, device=device)
+            bufs.a2_s = torch.empty(a2_rows, n_groups_n2, dtype=torch.float32, device=device)
 
     def forward(
         self,
@@ -52,11 +144,17 @@ class FusedExperts(nn.Module):
         topk_weights: torch.Tensor,
         topk_ids: torch.Tensor,
         num_experts: int,
+        w13_scale: torch.Tensor | None = None,
+        w2_scale: torch.Tensor | None = None,
     ) -> torch.Tensor:
         M, K = hidden_states.size()
         E, N2, _ = w13.size()
         N = N2 // 2
         top_k = topk_ids.size(1)
+
+        is_fp8 = w13.dtype == torch.float8_e4m3fn
+        out_dtype = hidden_states.dtype
+        block_shape = [_FP8_BLOCK, _FP8_BLOCK] if is_fp8 else None
 
         config = self.moe_grouped_gemm.get_config(M, N2)
 
@@ -66,30 +164,49 @@ class FusedExperts(nn.Module):
             topk_ids, config["BLOCK_SIZE_M"], num_experts, naive=use_naive,
         )
 
-        intermediate1 = self._get_cache(
-            "_cache1", (M * top_k, N2),
-            hidden_states.device, hidden_states.dtype,
+        sbufs = self._shared_bufs
+        intermediate1 = sbufs.get_cache(
+            "cache1", (M * top_k, N2),
+            hidden_states.device, out_dtype,
         )
 
+        if is_fp8:
+            self._ensure_fp8_bufs(M, K, N2, top_k, hidden_states.device)
+            a1_q = sbufs.a1_q[:M]
+            a1_s = sbufs.a1_s[:M]
+            _quant_fp8_inplace(hidden_states, a1_q, a1_s)
+        else:
+            a1_q, a1_s = hidden_states, None
+
         self.moe_grouped_gemm(
-            hidden_states, w13, intermediate1,
+            a1_q, w13, intermediate1,
             topk_weights, sorted_token_ids, expert_ids,
             num_tokens_post_padded,
             mul_routed_weight=False, top_k=top_k, config=config,
+            A_scale=a1_s, B_scale=w13_scale, block_shape=block_shape,
         )
 
         intermediate2 = self.act_fn(intermediate1)
 
-        intermediate3 = self._get_cache(
-            "_cache3", (M * top_k, K),
-            hidden_states.device, hidden_states.dtype,
+        intermediate3 = sbufs.get_cache(
+            "cache3", (M * top_k, K),
+            hidden_states.device, out_dtype,
         )
 
+        Mt = M * top_k
+        if is_fp8:
+            a2_q = sbufs.a2_q[:Mt]
+            a2_s = sbufs.a2_s[:Mt]
+            _quant_fp8_inplace(intermediate2, a2_q, a2_s)
+        else:
+            a2_q, a2_s = intermediate2, None
+
         self.moe_grouped_gemm(
-            intermediate2, w2, intermediate3,
+            a2_q, w2, intermediate3,
             topk_weights, sorted_token_ids, expert_ids,
             num_tokens_post_padded,
             mul_routed_weight=True, top_k=1, config=config,
+            A_scale=a2_s, B_scale=w2_scale, block_shape=block_shape,
         )
 
         return self.moe_sum(intermediate3, top_k)

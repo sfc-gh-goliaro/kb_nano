@@ -1,4 +1,4 @@
-"""Triton fused MoE grouped GEMM kernel."""
+"""Triton fused MoE grouped GEMM kernel with FP8 w8a8 block-scale support."""
 
 from __future__ import annotations
 
@@ -11,6 +11,7 @@ import triton.language as tl
 @triton.jit
 def _fused_moe_kernel(
     a_ptr, b_ptr, c_ptr,
+    a_scale_ptr, b_scale_ptr,
     topk_weights_ptr,
     sorted_token_ids_ptr,
     expert_ids_ptr,
@@ -20,6 +21,10 @@ def _fused_moe_kernel(
     stride_am, stride_ak,
     stride_be, stride_bk, stride_bn,
     stride_cm, stride_cn,
+    stride_asm, stride_ask,
+    stride_bse, stride_bsk, stride_bsn,
+    group_n: tl.constexpr,
+    group_k: tl.constexpr,
     MUL_ROUTED_WEIGHT: tl.constexpr,
     top_k: tl.constexpr,
     BLOCK_SIZE_M: tl.constexpr,
@@ -27,6 +32,7 @@ def _fused_moe_kernel(
     BLOCK_SIZE_K: tl.constexpr,
     GROUP_SIZE_M: tl.constexpr,
     compute_type: tl.constexpr,
+    use_fp8_w8a8: tl.constexpr,
     NAIVE_BLOCK_ASSIGNMENT: tl.constexpr = False,
 ):
     pid = tl.program_id(axis=0)
@@ -60,14 +66,46 @@ def _fused_moe_kernel(
     a_ptrs = a_ptr + (offs_token[:, None] // top_k * stride_am + offs_k[None, :] * stride_ak)
     b_ptrs = b_ptr + (off_expert * stride_be + offs_k[:, None] * stride_bk + offs_bn[None, :] * stride_bn)
 
+    if use_fp8_w8a8 and group_k > 0 and group_n > 0:
+        a_scale_ptrs = a_scale_ptr + (offs_token // top_k) * stride_asm
+        if BLOCK_SIZE_N > group_n:
+            offs_bsn = offs_bn // group_n
+        else:
+            offs_bsn = pid_n * BLOCK_SIZE_N // group_n
+        b_scale_ptrs = (
+            b_scale_ptr + off_expert * stride_bse + offs_bsn * stride_bsn
+        )
+
     accumulator = tl.zeros((BLOCK_SIZE_M, BLOCK_SIZE_N), dtype=tl.float32)
     for k_start in range(0, K, BLOCK_SIZE_K):
         k_mask = (k_start + offs_k) < K
         a = tl.load(a_ptrs, mask=token_mask[:, None] & k_mask[None, :], other=0.0)
         b = tl.load(b_ptrs, mask=k_mask[:, None], other=0.0)
-        accumulator = tl.dot(a.to(compute_type), b.to(compute_type), accumulator)
+
+        if use_fp8_w8a8:
+            if group_k > 0 and group_n > 0:
+                offs_ks = k_start // group_k
+                a_scale = tl.load(
+                    a_scale_ptrs + offs_ks * stride_ask,
+                    mask=token_mask, other=0.0,
+                )
+                b_scale = tl.load(b_scale_ptrs + offs_ks * stride_bsk)
+                if BLOCK_SIZE_N > group_n:
+                    accumulator += tl.dot(a, b) * a_scale[:, None] * b_scale[None, :]
+                else:
+                    accumulator += tl.dot(a, b) * (a_scale[:, None] * b_scale)
+            else:
+                accumulator = tl.dot(a, b, acc=accumulator)
+        else:
+            accumulator = tl.dot(a.to(compute_type), b.to(compute_type), accumulator)
+
         a_ptrs += BLOCK_SIZE_K * stride_ak
         b_ptrs += BLOCK_SIZE_K * stride_bk
+
+    if use_fp8_w8a8 and not (group_k > 0 and group_n > 0):
+        a_scale = tl.load(a_scale_ptr)
+        b_scale = tl.load(b_scale_ptr + off_expert)
+        accumulator *= a_scale * b_scale
 
     if MUL_ROUTED_WEIGHT:
         moe_weight = tl.load(topk_weights_ptr + offs_token, mask=token_mask, other=0.0)
@@ -187,10 +225,14 @@ class MoeGroupedGemm(nn.Module):
         mul_routed_weight: bool,
         top_k: int,
         config: dict | None = None,
+        A_scale: torch.Tensor | None = None,
+        B_scale: torch.Tensor | None = None,
+        block_shape: list[int] | None = None,
     ):
         if config is None:
             config = _get_default_config(A.size(0), B.size(1))
 
+        use_fp8 = A.dtype == torch.float8_e4m3fn
         naive = sorted_token_ids is None
         if naive:
             EM = expert_ids.numel() * config["BLOCK_SIZE_M"]
@@ -203,7 +245,9 @@ class MoeGroupedGemm(nn.Module):
             triton.cdiv(EM, config["BLOCK_SIZE_M"]) * triton.cdiv(B.size(1), config["BLOCK_SIZE_N"]),
         )
 
-        if A.dtype == torch.bfloat16:
+        if use_fp8:
+            compute_type = tl.bfloat16
+        elif A.dtype == torch.bfloat16:
             compute_type = tl.bfloat16
         elif A.dtype == torch.float16:
             compute_type = tl.float16
@@ -218,8 +262,13 @@ class MoeGroupedGemm(nn.Module):
 
         sorted_ids_ptr = sorted_token_ids if sorted_token_ids is not None else A
 
+        group_n = 0 if block_shape is None else block_shape[0]
+        group_k = 0 if block_shape is None else block_shape[1]
+
         _fused_moe_kernel[grid](
             A, B, C,
+            A_scale if A_scale is not None else A,
+            B_scale if B_scale is not None else B,
             topk_weights,
             sorted_ids_ptr,
             expert_ids,
@@ -229,9 +278,17 @@ class MoeGroupedGemm(nn.Module):
             A.stride(0), A.stride(1),
             B.stride(0), B.stride(2), B.stride(1),
             C.stride(0), C.stride(1),
+            A_scale.stride(0) if A_scale is not None and A_scale.ndim == 2 else 0,
+            A_scale.stride(1) if A_scale is not None and A_scale.ndim == 2 else 0,
+            B_scale.stride(0) if B_scale is not None and B_scale.ndim >= 2 else 0,
+            B_scale.stride(2) if B_scale is not None and B_scale.ndim == 3 else 0,
+            B_scale.stride(1) if B_scale is not None and B_scale.ndim >= 2 else 0,
+            group_n=group_n,
+            group_k=group_k,
             MUL_ROUTED_WEIGHT=mul_routed_weight,
             top_k=top_k,
             compute_type=compute_type,
+            use_fp8_w8a8=use_fp8,
             BLOCK_SIZE_M=config["BLOCK_SIZE_M"],
             BLOCK_SIZE_N=config["BLOCK_SIZE_N"],
             BLOCK_SIZE_K=config["BLOCK_SIZE_K"],

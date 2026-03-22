@@ -33,9 +33,18 @@ class AttnBackendConfig:
                 pass
         return cls()
 
+    @classmethod
+    def flashmla_sparse(cls) -> "AttnBackendConfig":
+        """FlashMLA sparse backend for DeepSeek V3.2 on SM90+."""
+        return cls(backend="flashmla_sparse", block_size=64, kv_layout="NHD")
+
     @property
     def use_trtllm(self) -> bool:
         return self.backend == "trtllm"
+
+    @property
+    def use_flashmla_sparse(self) -> bool:
+        return self.backend == "flashmla_sparse"
 
 
 _ATTN_BACKEND_CONFIG: AttnBackendConfig | None = None

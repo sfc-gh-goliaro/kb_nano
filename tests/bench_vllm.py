@@ -92,18 +92,26 @@ def _is_vlm_model(model_name: str) -> bool:
     return "qwen" in lower and "vl" in lower
 
 
+def _is_deepseek_model(model_name: str) -> bool:
+    lower = model_name.lower()
+    return "deepseek" in lower
+
+
+
+
 # ---------------------------------------------------------------------------
 # Multi-scenario vLLM subprocess worker (LLM, text-only)
 # ---------------------------------------------------------------------------
 VLLM_WORKER = r'''
 import json, os, sys, time
 os.environ.setdefault("VLLM_WORKER_MULTIPROC_METHOD", "spawn")
+os.environ.setdefault("VLLM_DEEP_GEMM_WARMUP", "skip")
 
-def main():
+
+def _run_single_process(cfg):
+    """Run vLLM in single-process mode (no DP)."""
     from vllm import LLM, SamplingParams
 
-    with open(sys.argv[1]) as f:
-        cfg = json.load(f)
     llm = LLM(
         model=cfg["model"],
         seed=cfg["seed"],
@@ -115,7 +123,6 @@ def main():
         load_format="fastsafetensors",
     )
 
-    # Warmup
     llm.generate(
         [dict(prompt_token_ids=[0] * 16)],
         SamplingParams(temperature=0.0, max_tokens=16),
@@ -186,9 +193,240 @@ def main():
         })
 
     del llm
+    return {"throughput": all_results, "latency": latency_results}
 
-    with open(cfg["output_file"], "w") as f:
+
+def _dp_rank_main(dp_rank, dp_size, dp_master_port, nccl_port, cfg, result_file):
+    """Run one DP rank's share of the workload using vLLM SPMD DP mode."""
+    os.environ["VLLM_DP_RANK"] = str(dp_rank)
+    os.environ["VLLM_DP_RANK_LOCAL"] = str(dp_rank)
+    os.environ["VLLM_DP_SIZE"] = str(dp_size)
+    os.environ["VLLM_DP_MASTER_IP"] = "127.0.0.1"
+    os.environ["VLLM_DP_MASTER_PORT"] = str(dp_master_port)
+
+    from vllm import LLM, SamplingParams
+
+    tp = cfg["tp"]
+    ep = cfg.get("enable_expert_parallel", False)
+
+    llm_kwargs = dict(
+        model=cfg["model"],
+        seed=cfg["seed"],
+        enforce_eager=cfg.get("enforce_eager", False),
+        tensor_parallel_size=tp,
+        gpu_memory_utilization=cfg.get("gpu_memory_utilization", 0.9),
+        max_model_len=cfg["max_model_len"],
+        enable_prefix_caching=False,
+        load_format="fastsafetensors",
+    )
+    if ep:
+        llm_kwargs["enable_expert_parallel"] = True
+    llm = LLM(**llm_kwargs)
+
+    llm.generate(
+        [dict(prompt_token_ids=[0] * 16)],
+        SamplingParams(temperature=0.0, max_tokens=16),
+    )
+
+    scenarios = cfg["scenarios"]
+    all_results = []
+    for scenario in scenarios:
+        all_prompts = scenario["prompt_token_ids"]
+        all_output_lens = scenario["output_lens"]
+        n = len(all_prompts)
+        chunk = n // dp_size
+        remainder = n % dp_size
+        start_idx = dp_rank * chunk + min(dp_rank, remainder)
+        end_idx = start_idx + chunk + (1 if dp_rank < remainder else 0)
+        my_prompts = all_prompts[start_idx:end_idx]
+        my_output_lens = all_output_lens[start_idx:end_idx]
+
+        temperature = cfg.get("temperature", 0.0)
+        sp_list = [
+            SamplingParams(temperature=temperature, ignore_eos=True, max_tokens=ol)
+            for ol in my_output_lens
+        ]
+        vllm_prompts = [dict(prompt_token_ids=p) for p in my_prompts]
+
+        import torch.distributed as tdist
+        if tdist.is_initialized():
+            tdist.barrier()
+        start = time.perf_counter()
+        outputs = llm.generate(vllm_prompts, sp_list)
+        elapsed = time.perf_counter() - start
+
+        total_prompt_tokens = sum(
+            len(o.prompt_token_ids) if o.prompt_token_ids else 0
+            for o in outputs
+        )
+        total_output_tokens = sum(
+            sum(len(c.token_ids) for c in o.outputs if c)
+            for o in outputs
+        )
+        result = {
+            "name": scenario["name"],
+            "elapsed": elapsed,
+            "total_prompt_tokens": total_prompt_tokens,
+            "total_output_tokens": total_output_tokens,
+            "start_idx": start_idx,
+            "end_idx": end_idx,
+            "outputs": [
+                {"text": o.outputs[0].text, "token_ids": list(o.outputs[0].token_ids)}
+                for o in outputs
+            ],
+        }
+        all_results.append(result)
+
+    latency_results = []
+    for ls in cfg.get("latency_scenarios", []):
+        prompts = [dict(prompt_token_ids=p) for p in ls["prompt_token_ids"]]
+        sp = SamplingParams(temperature=0.0,
+                            ignore_eos=True, max_tokens=ls["output_len"])
+        num_warmup = ls.get("num_warmup", 3)
+        num_iters = ls.get("num_iters", 5)
+        for _ in range(num_warmup):
+            llm.generate(prompts, sp, use_tqdm=False)
+        latencies = []
+        for _ in range(num_iters):
+            t0 = time.perf_counter()
+            llm.generate(prompts, sp, use_tqdm=False)
+            latencies.append(time.perf_counter() - t0)
+        latency_results.append({
+            "name": ls["name"],
+            "batch_size": ls["batch_size"],
+            "input_len": ls["input_len"],
+            "output_len": ls["output_len"],
+            "num_iters": num_iters,
+            "latencies": latencies,
+        })
+
+    with open(result_file, "w") as f:
         json.dump({"throughput": all_results, "latency": latency_results}, f)
+    os._exit(0)
+
+
+def _merge_dp_results(rank_results, dp_size):
+    """Merge per-rank DP results into a single result matching non-DP format."""
+    num_scenarios = len(rank_results[0]["throughput"])
+    merged_throughput = []
+    for si in range(num_scenarios):
+        per_rank = [rank_results[r]["throughput"][si] for r in range(dp_size)]
+        max_elapsed = max(r["elapsed"] for r in per_rank)
+        total_prompt_tokens = sum(r["total_prompt_tokens"] for r in per_rank)
+        total_output_tokens = sum(r["total_output_tokens"] for r in per_rank)
+
+        all_outputs = []
+        indexed = []
+        for r in per_rank:
+            start = r["start_idx"]
+            for j, out in enumerate(r["outputs"]):
+                indexed.append((start + j, out))
+        indexed.sort(key=lambda x: x[0])
+        all_outputs = [item[1] for item in indexed]
+
+        merged_throughput.append({
+            "name": per_rank[0]["name"],
+            "elapsed": max_elapsed,
+            "total_prompt_tokens": total_prompt_tokens,
+            "total_output_tokens": total_output_tokens,
+            "outputs": all_outputs,
+        })
+
+    merged_latency = []
+    if rank_results[0]["latency"]:
+        for li in range(len(rank_results[0]["latency"])):
+            r0 = rank_results[0]["latency"][li]
+            all_latencies = []
+            for r in range(dp_size):
+                all_latencies.extend(rank_results[r]["latency"][li]["latencies"])
+            merged_latency.append({
+                "name": r0["name"],
+                "batch_size": r0["batch_size"],
+                "input_len": r0["input_len"],
+                "output_len": r0["output_len"],
+                "num_iters": r0["num_iters"],
+                "latencies": all_latencies,
+            })
+
+    return {"throughput": merged_throughput, "latency": merged_latency}
+
+
+def _cleanup_vllm_gpu_resources():
+    """Force cleanup of GPU resources left by vLLM DP processes."""
+    import subprocess, signal
+    try:
+        out = subprocess.check_output(
+            ["nvidia-smi", "--query-compute-apps=pid", "--format=csv,noheader"],
+            text=True,
+        ).strip()
+        if out:
+            for pid_str in out.splitlines():
+                pid_str = pid_str.strip()
+                if pid_str:
+                    try:
+                        os.kill(int(pid_str), signal.SIGKILL)
+                    except (ProcessLookupError, ValueError):
+                        pass
+            import time as _t
+            _t.sleep(10)
+    except Exception:
+        pass
+
+
+def main():
+    with open(sys.argv[1]) as f:
+        cfg = json.load(f)
+
+    dp = cfg.get("dp", 1)
+    if dp <= 1:
+        result = _run_single_process(cfg)
+        with open(cfg["output_file"], "w") as f:
+            json.dump(result, f)
+        return
+
+    import tempfile
+    from multiprocessing import Process
+
+    from vllm.utils.network_utils import get_open_port
+    dp_master_port = get_open_port()
+
+    result_files = []
+    procs = []
+    for rank in range(dp):
+        rf = tempfile.NamedTemporaryFile(
+            mode="w", suffix=f"_dp{rank}.json", delete=False, dir="/tmp")
+        rf.close()
+        result_files.append(rf.name)
+        p = Process(target=_dp_rank_main,
+                    args=(rank, dp, dp_master_port, 0, cfg, rf.name))
+        p.start()
+        procs.append(p)
+
+    for p in procs:
+        p.join(timeout=600)
+
+    rank_results = []
+    all_files_ready = True
+    for rf in result_files:
+        if os.path.exists(rf) and os.path.getsize(rf) > 0:
+            with open(rf) as f:
+                rank_results.append(json.load(f))
+            os.unlink(rf)
+        else:
+            all_files_ready = False
+
+    for p in procs:
+        if p.is_alive():
+            p.kill()
+            p.join(timeout=10)
+
+    if not all_files_ready or len(rank_results) != dp:
+        print("ERROR: One or more DP ranks failed to produce results")
+        sys.exit(1)
+
+    merged = _merge_dp_results(rank_results, dp)
+    with open(cfg["output_file"], "w") as f:
+        json.dump(merged, f)
 
 if __name__ == "__main__":
     main()
@@ -200,9 +438,9 @@ if __name__ == "__main__":
 KB_NANO_WORKER = r'''
 import json, sys, time
 
-def main():
-    with open(sys.argv[1]) as f:
-        cfg = json.load(f)
+
+def _run_single_process(cfg):
+    """Run kb-nano in single-process mode (no DP)."""
     sys.path.insert(0, cfg["project_root"])
     pkg = cfg["package_name"]
 
@@ -221,7 +459,6 @@ def main():
         engine_kwargs["max_model_len"] = cfg["max_model_len"]
     engine = LlamaEngine(**engine_kwargs)
 
-    # Warmup
     engine.generate(["warmup"], SamplingParams(temperature=0.0, max_tokens=16))
 
     import torch
@@ -235,10 +472,8 @@ def main():
 
         sp_list = [
             SamplingParams(
-                temperature=temperature,
-                top_p=top_p,
-                max_tokens=ol,
-                ignore_eos=True,
+                temperature=temperature, top_p=top_p,
+                max_tokens=ol, ignore_eos=True,
             )
             for ol in output_lens
         ]
@@ -259,10 +494,7 @@ def main():
             "total_input_tokens": total_input_tokens,
             "total_output_tokens": total_output_tokens,
             "outputs": [
-                {
-                    "generated_text": o.generated_text,
-                    "token_ids": o.token_ids,
-                }
+                {"generated_text": o.generated_text, "token_ids": o.token_ids}
                 for o in outputs
             ],
         }
@@ -301,6 +533,248 @@ def main():
         json.dump({"throughput": all_results, "latency": latency_results}, f)
 
     del engine
+
+
+def _dp_rank_main(dp_rank, dp_size, nccl_port, cfg, result_file):
+    """Run one DP rank of kb-nano with EP for MoE models."""
+    import os
+    os.environ["CUDA_VISIBLE_DEVICES"] = str(dp_rank)
+
+    sys.path.insert(0, cfg["project_root"])
+    pkg = cfg["package_name"]
+
+    import torch
+    import torch.distributed as tdist
+    torch.cuda.set_device(0)
+
+    tdist.init_process_group(
+        "nccl", f"tcp://localhost:{nccl_port}",
+        world_size=dp_size, rank=dp_rank,
+        device_id=torch.device("cuda:0"),
+    )
+
+    tp_mod = __import__(f"{pkg}.infra.tp", fromlist=["init_parallel_groups"])
+    tp_mod.init_parallel_groups(
+        tp_size=1,
+        dp_size=dp_size,
+        enable_expert_parallel=cfg.get("enable_expert_parallel", False),
+    )
+
+    mod = __import__(f"{pkg}.infra.engine", fromlist=["LlamaEngine", "SamplingParams"])
+    LlamaEngine, SamplingParams = mod.LlamaEngine, mod.SamplingParams
+
+    engine_kwargs = dict(
+        model_name=cfg["model"],
+        seed=cfg["seed"] + dp_rank,
+        enforce_eager=cfg.get("enforce_eager", False),
+        tensor_parallel_size=1,
+        enable_expert_parallel=cfg.get("enable_expert_parallel", False),
+    )
+    if "gpu_memory_utilization" in cfg:
+        engine_kwargs["gpu_memory_utilization"] = cfg["gpu_memory_utilization"]
+    if "max_model_len" in cfg:
+        engine_kwargs["max_model_len"] = cfg["max_model_len"]
+    engine = LlamaEngine(**engine_kwargs)
+
+    tdist.barrier()
+    engine.generate(["warmup"], SamplingParams(temperature=0.0, max_tokens=16))
+
+    scenarios = cfg["scenarios"]
+    ep_active = cfg.get("enable_expert_parallel", False)
+
+    all_results = []
+    for scenario in scenarios:
+        all_prompts = scenario["prompt_token_ids"]
+        all_output_lens = scenario["output_lens"]
+        n = len(all_prompts)
+        chunk = n // dp_size
+        remainder = n % dp_size
+        start_idx = dp_rank * chunk + min(dp_rank, remainder)
+        end_idx = start_idx + chunk + (1 if dp_rank < remainder else 0)
+        my_prompts = all_prompts[start_idx:end_idx]
+        my_output_lens = all_output_lens[start_idx:end_idx]
+        real_count = len(my_prompts)
+
+        if ep_active and n % dp_size != 0:
+            seqs_per_rank = (n + dp_size - 1) // dp_size
+            while len(my_prompts) < seqs_per_rank:
+                my_prompts.append(my_prompts[-1])
+                my_output_lens.append(my_output_lens[-1])
+
+        temperature = cfg.get("temperature", 0.0)
+        top_p = cfg.get("top_p", 1.0)
+        sp_list = [
+            SamplingParams(
+                temperature=temperature, top_p=top_p,
+                max_tokens=ol, ignore_eos=True,
+            )
+            for ol in my_output_lens
+        ]
+
+        engine.block_manager.reset()
+        torch.cuda.synchronize()
+        tdist.barrier()
+        start = time.perf_counter()
+        outputs = engine.generate(my_prompts, sp_list,
+                                  use_tqdm=(dp_rank == 0))
+        torch.cuda.synchronize()
+        tdist.barrier()
+        elapsed = time.perf_counter() - start
+
+        outputs = outputs[:real_count]
+        my_prompts = my_prompts[:real_count]
+
+        total_input_tokens = sum(len(p) for p in my_prompts)
+        total_output_tokens = sum(len(o.token_ids) for o in outputs)
+
+        result = {
+            "name": scenario["name"],
+            "elapsed": elapsed,
+            "total_input_tokens": total_input_tokens,
+            "total_output_tokens": total_output_tokens,
+            "start_idx": start_idx,
+            "end_idx": end_idx,
+            "outputs": [
+                {"generated_text": o.generated_text, "token_ids": o.token_ids}
+                for o in outputs
+            ],
+        }
+        all_results.append(result)
+
+    latency_results = []
+    for ls in cfg.get("latency_scenarios", []):
+        prompts = ls["prompt_token_ids"]
+        sp = SamplingParams(temperature=0.0,
+                            ignore_eos=True, max_tokens=ls["output_len"])
+        num_warmup = ls.get("num_warmup", 3)
+        num_iters = ls.get("num_iters", 5)
+        for _ in range(num_warmup):
+            engine.block_manager.reset()
+            torch.cuda.synchronize()
+            engine.generate(prompts, sp)
+            torch.cuda.synchronize()
+        latencies = []
+        for _ in range(num_iters):
+            engine.block_manager.reset()
+            torch.cuda.synchronize()
+            tdist.barrier()
+            t0 = time.perf_counter()
+            engine.generate(prompts, sp)
+            torch.cuda.synchronize()
+            tdist.barrier()
+            latencies.append(time.perf_counter() - t0)
+        latency_results.append({
+            "name": ls["name"],
+            "batch_size": ls["batch_size"],
+            "input_len": ls["input_len"],
+            "output_len": ls["output_len"],
+            "num_iters": num_iters,
+            "latencies": latencies,
+        })
+
+    del engine
+    tdist.barrier()
+    tdist.destroy_process_group()
+
+    with open(result_file, "w") as f:
+        json.dump({"throughput": all_results, "latency": latency_results}, f)
+
+
+def _merge_dp_results(rank_results, dp_size):
+    """Merge per-rank DP results into a single result matching non-DP format."""
+    num_scenarios = len(rank_results[0]["throughput"])
+    merged_throughput = []
+    for si in range(num_scenarios):
+        per_rank = [rank_results[r]["throughput"][si] for r in range(dp_size)]
+        max_elapsed = max(r["elapsed"] for r in per_rank)
+        total_input_tokens = sum(r["total_input_tokens"] for r in per_rank)
+        total_output_tokens = sum(r["total_output_tokens"] for r in per_rank)
+
+        indexed = []
+        for r in per_rank:
+            start = r["start_idx"]
+            for j, out in enumerate(r["outputs"]):
+                indexed.append((start + j, out))
+        indexed.sort(key=lambda x: x[0])
+        all_outputs = [item[1] for item in indexed]
+
+        merged_throughput.append({
+            "name": per_rank[0]["name"],
+            "elapsed": max_elapsed,
+            "total_input_tokens": total_input_tokens,
+            "total_output_tokens": total_output_tokens,
+            "outputs": all_outputs,
+        })
+
+    merged_latency = []
+    if rank_results[0]["latency"]:
+        for li in range(len(rank_results[0]["latency"])):
+            r0 = rank_results[0]["latency"][li]
+            all_latencies = []
+            for r in range(dp_size):
+                all_latencies.extend(rank_results[r]["latency"][li]["latencies"])
+            merged_latency.append({
+                "name": r0["name"],
+                "batch_size": r0["batch_size"],
+                "input_len": r0["input_len"],
+                "output_len": r0["output_len"],
+                "num_iters": r0["num_iters"],
+                "latencies": all_latencies,
+            })
+
+    return {"throughput": merged_throughput, "latency": merged_latency}
+
+
+def main():
+    with open(sys.argv[1]) as f:
+        cfg = json.load(f)
+
+    dp = cfg.get("dp", 1)
+    if dp <= 1:
+        _run_single_process(cfg)
+        return
+
+    import os, tempfile
+    from multiprocessing import Process
+
+    nccl_port = int(os.environ.get("KB_NANO_NCCL_PORT", "29501"))
+    for port_try in range(nccl_port, nccl_port + 100):
+        import socket
+        with socket.socket(socket.AF_INET, socket.SOCK_STREAM) as s:
+            if s.connect_ex(("localhost", port_try)) != 0:
+                nccl_port = port_try
+                break
+
+    result_files = []
+    procs = []
+    for rank in range(dp):
+        rf = tempfile.NamedTemporaryFile(
+            mode="w", suffix=f"_dp{rank}.json", delete=False, dir="/tmp")
+        rf.close()
+        result_files.append(rf.name)
+        p = Process(target=_dp_rank_main,
+                    args=(rank, dp, nccl_port, cfg, rf.name))
+        p.start()
+        procs.append(p)
+
+    for p in procs:
+        p.join(timeout=7200)
+
+    failed = any(p.exitcode != 0 for p in procs)
+    if failed:
+        print("ERROR: One or more DP ranks failed")
+        import sys as _sys
+        _sys.exit(1)
+
+    rank_results = []
+    for rf in result_files:
+        with open(rf) as f:
+            rank_results.append(json.load(f))
+        os.unlink(rf)
+
+    merged = _merge_dp_results(rank_results, dp)
+    with open(cfg["output_file"], "w") as f:
+        json.dump(merged, f)
 
 if __name__ == "__main__":
     main()
@@ -891,6 +1365,10 @@ def main():
         "--model", type=str, default="meta-llama/Llama-3.1-8B-Instruct",
     )
     parser.add_argument("--tp", type=int, default=1)
+    parser.add_argument("--dp", type=int, default=1,
+                        help="Data parallel degree (default: 1)")
+    parser.add_argument("--enable-expert-parallel", action="store_true",
+                        help="Enable expert parallelism for MoE models")
     parser.add_argument("--num-seqs", type=int, default=1000)
     parser.add_argument("--seed", type=int, default=42)
     parser.add_argument(
@@ -919,14 +1397,24 @@ def main():
 
     gpu = _detect_gpu_name()
     is_vlm = _is_vlm_model(args.model)
+    is_deepseek = _is_deepseek_model(args.model)
 
     if args.output_dir is None:
         short = args.model.split("/")[-1]
         repo_root = Path(__file__).resolve().parent.parent
-        args.output_dir = str(repo_root / "tests" / "results" / gpu / f"{short}_tp{args.tp}")
+        dp_tag = f"_dp{args.dp}" if args.dp > 1 else ""
+        ep_tag = "_ep" if args.enable_expert_parallel else ""
+        args.output_dir = str(
+            repo_root / "tests" / "results" / gpu
+            / f"{short}_tp{args.tp}{dp_tag}{ep_tag}"
+        )
 
-    throughput_scenarios = VLM_SCENARIOS if is_vlm else SCENARIOS
-    latency_scenarios = VLM_LATENCY_SCENARIOS if is_vlm else LATENCY_SCENARIOS
+    if is_vlm:
+        throughput_scenarios = VLM_SCENARIOS
+        latency_scenarios = VLM_LATENCY_SCENARIOS
+    else:
+        throughput_scenarios = SCENARIOS
+        latency_scenarios = LATENCY_SCENARIOS
 
     if is_vlm and args.modality != "all":
         throughput_scenarios = [
@@ -1027,10 +1515,15 @@ def main():
     print("  kb-nano Baseline vs vLLM -- Multi-Scenario Benchmark")
     print("=" * 70)
     print(f"  Model          : {args.model}")
-    print(f"  Model type     : {'VLM' if is_vlm else 'LLM'}")
+    model_type_str = "VLM" if is_vlm else ("DeepSeek MoE" if is_deepseek else "LLM")
+    print(f"  Model type     : {model_type_str}")
     if is_vlm and args.modality != "all":
         print(f"  Modality       : {args.modality}")
     print(f"  TP             : {args.tp}")
+    if args.dp > 1:
+        print(f"  DP             : {args.dp}")
+    if args.enable_expert_parallel:
+        print(f"  EP             : enabled")
     print(f"  Seqs/scenario  : {args.num_seqs}")
     print(f"  Temperature    : {args.temperature}")
     print(f"  Enforce eager  : {args.enforce_eager}")
@@ -1053,9 +1546,12 @@ def main():
     vllm_raw = None
     if not args.skip_vllm:
         short_name = args.model.split("/")[-1]
+        vllm_tp = 1 if (args.dp > 1 and args.enable_expert_parallel) else args.tp
         vllm_config = {
             "model": args.model,
-            "tp": args.tp,
+            "tp": vllm_tp,
+            "dp": args.dp,
+            "enable_expert_parallel": args.enable_expert_parallel,
             "seed": args.seed,
             "temperature": args.temperature,
             "enforce_eager": args.enforce_eager,
@@ -1063,10 +1559,56 @@ def main():
             "scenarios": scenario_data,
             "latency_scenarios": latency_data,
         }
+        dp_ep_str = ""
+        if args.dp > 1:
+            dp_ep_str += f", DP={args.dp}"
+        if args.enable_expert_parallel:
+            dp_ep_str += ", EP"
         vllm_raw = run_worker(
             vllm_worker, vllm_config,
-            f"vLLM [{short_name}] all scenarios (TP={args.tp})",
+            f"vLLM [{short_name}] all scenarios (TP={vllm_tp}{dp_ep_str})",
+            timeout=7200,
         )
+
+    # Ensure all GPU resources from vLLM are fully released before kb-nano
+    if not args.skip_vllm and args.dp > 1:
+        import time as _time, subprocess as _sp, signal as _sig
+        print("  Cleaning up vLLM GPU resources...")
+
+        my_pid = os.getpid()
+        for attempt in range(6):
+            _time.sleep(5)
+            try:
+                out = _sp.check_output(
+                    ["nvidia-smi", "--query-compute-apps=pid",
+                     "--format=csv,noheader"],
+                    text=True,
+                ).strip()
+            except Exception:
+                out = ""
+            if not out:
+                break
+            pids = set()
+            for pid_str in out.splitlines():
+                pid_str = pid_str.strip()
+                if pid_str:
+                    try:
+                        pid = int(pid_str)
+                        if pid != my_pid:
+                            pids.add(pid)
+                    except ValueError:
+                        pass
+            if not pids:
+                break
+            for pid in pids:
+                try:
+                    os.kill(pid, _sig.SIGKILL)
+                except (ProcessLookupError, PermissionError):
+                    pass
+            print(f"    Killed {len(pids)} leftover GPU processes (attempt {attempt+1})")
+
+        _time.sleep(5)
+        print("  GPU cleanup done.")
 
     # -- Run kb-nano (one subprocess, all scenarios) --
     kb_root = str(_PROJECT_ROOT)
@@ -1074,6 +1616,8 @@ def main():
     kb_config = {
         "model": args.model,
         "tp": args.tp,
+        "dp": args.dp,
+        "enable_expert_parallel": args.enable_expert_parallel,
         "seed": args.seed,
         "temperature": args.temperature,
         "enforce_eager": args.enforce_eager,
@@ -1084,9 +1628,15 @@ def main():
         "latency_scenarios": latency_data,
     }
     short_name = args.model.split("/")[-1]
+    dp_ep_str = ""
+    if args.dp > 1:
+        dp_ep_str += f", DP={args.dp}"
+    if args.enable_expert_parallel:
+        dp_ep_str += ", EP"
     kb_raw = run_worker(
         kb_worker, kb_config,
-        f"kb-nano [{short_name}] all scenarios (TP={args.tp})",
+        f"kb-nano [{short_name}] all scenarios (TP={args.tp}{dp_ep_str})",
+        timeout=7200,
     )
     if kb_raw is None:
         print("  ERROR: kb-nano subprocess failed.")

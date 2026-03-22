@@ -17,25 +17,26 @@ import triton.language as tl
 def _store_kvcache_kernel(
     key_ptr, key_stride, value_ptr, value_stride,
     k_cache_ptr, v_cache_ptr, slot_mapping_ptr,
+    real_D,
     D: tl.constexpr,
 ):
     idx = tl.program_id(0)
     slot = tl.load(slot_mapping_ptr + idx)
     if slot == -1:
         return
-    key_offsets = idx * key_stride + tl.arange(0, D)
-    value_offsets = idx * value_stride + tl.arange(0, D)
-    key = tl.load(key_ptr + key_offsets)
-    value = tl.load(value_ptr + value_offsets)
-    cache_offsets = slot * D + tl.arange(0, D)
-    tl.store(k_cache_ptr + cache_offsets, key)
-    tl.store(v_cache_ptr + cache_offsets, value)
+    offs = tl.arange(0, D)
+    mask = offs < real_D
+    key = tl.load(key_ptr + idx * key_stride + offs, mask=mask)
+    value = tl.load(value_ptr + idx * value_stride + offs, mask=mask)
+    tl.store(k_cache_ptr + slot * real_D + offs, key, mask=mask)
+    tl.store(v_cache_ptr + slot * real_D + offs, value, mask=mask)
 
 
 @triton.jit
 def _store_kvcache_hnd_kernel(
     key_ptr, key_stride_n, value_ptr, value_stride_n,
     k_cache_ptr, v_cache_ptr, slot_mapping_ptr,
+    real_head_dim,
     PAGE_SIZE: tl.constexpr,
     NUM_KV_HEADS: tl.constexpr,
     HEAD_DIM: tl.constexpr,
@@ -48,16 +49,25 @@ def _store_kvcache_hnd_kernel(
         return
     block_idx = slot // PAGE_SIZE
     slot_in_block = slot % PAGE_SIZE
-    src_k_offset = idx * key_stride_n + head * HEAD_DIM + tl.arange(0, HEAD_DIM)
-    src_v_offset = idx * value_stride_n + head * HEAD_DIM + tl.arange(0, HEAD_DIM)
-    dst_offset = (block_idx * NUM_KV_HEADS * PAGE_SIZE * HEAD_DIM
-                  + head * PAGE_SIZE * HEAD_DIM
-                  + slot_in_block * HEAD_DIM
-                  + tl.arange(0, HEAD_DIM))
-    k = tl.load(key_ptr + src_k_offset)
-    v = tl.load(value_ptr + src_v_offset)
-    tl.store(k_cache_ptr + dst_offset, k)
-    tl.store(v_cache_ptr + dst_offset, v)
+    offs = tl.arange(0, HEAD_DIM)
+    mask = offs < real_head_dim
+    src_k_offset = idx * key_stride_n + head * real_head_dim + offs
+    src_v_offset = idx * value_stride_n + head * real_head_dim + offs
+    dst_offset = (block_idx * NUM_KV_HEADS * PAGE_SIZE * real_head_dim
+                  + head * PAGE_SIZE * real_head_dim
+                  + slot_in_block * real_head_dim
+                  + offs)
+    k = tl.load(key_ptr + src_k_offset, mask=mask)
+    v = tl.load(value_ptr + src_v_offset, mask=mask)
+    tl.store(k_cache_ptr + dst_offset, k, mask=mask)
+    tl.store(v_cache_ptr + dst_offset, v, mask=mask)
+
+
+def _next_power_of_2(n: int) -> int:
+    p = 1
+    while p < n:
+        p <<= 1
+    return p
 
 
 class StoreKVCache(nn.Module):
@@ -65,9 +75,10 @@ class StoreKVCache(nn.Module):
     def forward(self, key, value, k_cache, v_cache, slot_mapping):
         N, num_heads, head_dim = key.shape
         D = num_heads * head_dim
+        D_padded = _next_power_of_2(D)
         _store_kvcache_kernel[(N,)](
             key, key.stride(0), value, value.stride(0),
-            k_cache, v_cache, slot_mapping, D,
+            k_cache, v_cache, slot_mapping, D, D_padded,
         )
 
 
@@ -79,10 +90,11 @@ class StoreKVCacheHND(nn.Module):
 
     def forward(self, key, value, k_cache, v_cache, slot_mapping):
         N, num_kv_heads, head_dim = key.shape
+        head_dim_padded = _next_power_of_2(head_dim)
         _store_kvcache_hnd_kernel[(N, num_kv_heads)](
             key, key.stride(0), value, value.stride(0),
-            k_cache, v_cache, slot_mapping,
+            k_cache, v_cache, slot_mapping, head_dim,
             PAGE_SIZE=self.page_size,
             NUM_KV_HEADS=num_kv_heads,
-            HEAD_DIM=head_dim,
+            HEAD_DIM=head_dim_padded,
         )

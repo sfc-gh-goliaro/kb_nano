@@ -144,6 +144,34 @@ class Fp8Linear(nn.Module):
         return output.view(*input_bf16.shape[:-1], N)
 
 
+def _align(x: int, a: int) -> int:
+    return (x + a - 1) // a * a
+
+
+def _per_block_cast_to_fp8(x: torch.Tensor, block_size: int = 128,
+                           ) -> tuple[torch.Tensor, torch.Tensor]:
+    """Pure PyTorch per-block FP8 quantization with UE8M0 scales.
+
+    Matches vLLM's approach to avoid using DeepGEMM's C++ per_block_cast_to_fp8.
+    """
+    fp8_dtype = torch.float8_e4m3fn
+    fp8_max = torch.finfo(fp8_dtype).max
+    assert x.dim() == 2
+    m, n = x.shape
+    pm, pn = _align(m, block_size), _align(n, block_size)
+    x_padded = torch.zeros(pm, pn, dtype=x.dtype, device=x.device)
+    x_padded[:m, :n] = x
+    x_view = x_padded.view(pm // block_size, block_size,
+                           pn // block_size, block_size)
+    x_amax = x_view.abs().float().amax(dim=(1, 3), keepdim=True).clamp(1e-4)
+    sf = x_amax / fp8_max
+    # UE8M0: ceil to nearest power of 2
+    sf = torch.exp2(torch.ceil(torch.log2(sf)))
+    x_scaled = (x_view * (1.0 / sf)).to(fp8_dtype)
+    return (x_scaled.view_as(x_padded)[:m, :n].contiguous(),
+            sf.view(pm // block_size, pn // block_size))
+
+
 def postprocess_fp8_weights(weight_fp8: torch.Tensor,
                             scale_inv: torch.Tensor) -> tuple[torch.Tensor, torch.Tensor]:
     """Re-quantize FP8 weights to UE8M0 scale format and transform scale layout
@@ -173,7 +201,7 @@ def postprocess_fp8_weights(weight_fp8: torch.Tensor,
     if need_n_pad or need_k_pad:
         w_bf16_flat = w_bf16_flat[:N, :K].contiguous()
 
-    w_fp8_new, scale_ue8m0 = deep_gemm.per_block_cast_to_fp8(w_bf16_flat, use_ue8m0=True)
+    w_fp8_new, scale_ue8m0 = _per_block_cast_to_fp8(w_bf16_flat, block_size)
 
     recipe = (1, block_size, block_size)
     scale_transformed = deep_gemm.transform_sf_into_required_layout(

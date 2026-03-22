@@ -2,6 +2,9 @@
 
 Includes the CustomAllreduce class (ported from vLLM, simplified) which
 uses JIT-compiled CUDA kernels for intra-node P2P cross-device reduction.
+
+Also includes EPDispatch and EPCombine for expert-parallel MoE token
+routing via all_gather (dispatch) and reduce_scatter (combine).
 """
 
 from __future__ import annotations
@@ -43,6 +46,110 @@ class AllReduce(nn.Module):
                 return out
         dist.all_reduce(tensor)
         return tensor
+
+
+# ---------------------------------------------------------------------------
+# Expert-parallel dispatch/combine via all_gather and reduce_scatter
+# ---------------------------------------------------------------------------
+class EPDispatch(nn.Module):
+    """Gather hidden states and router logits from all EP ranks.
+
+    Handles variable batch sizes across ranks by exchanging sizes first,
+    then padding to the max size for all_gather, and unpadding afterward.
+    """
+
+    def __init__(self):
+        super().__init__()
+        self._sizes_buf: torch.Tensor | None = None
+
+    def forward(
+        self,
+        hidden_states: torch.Tensor,
+        router_logits: torch.Tensor,
+        ep_group: ProcessGroup,
+    ) -> tuple[torch.Tensor, torch.Tensor]:
+        ep_size = dist.get_world_size(group=ep_group)
+        if ep_size <= 1:
+            return hidden_states, router_logits
+
+        local_n = hidden_states.size(0)
+        device = hidden_states.device
+
+        local_size_t = torch.tensor([local_n], dtype=torch.int64, device=device)
+        if self._sizes_buf is None or self._sizes_buf.device != device:
+            self._sizes_buf = torch.zeros(ep_size, dtype=torch.int64, device=device)
+        sizes_list = [torch.zeros(1, dtype=torch.int64, device=device) for _ in range(ep_size)]
+        dist.all_gather(sizes_list, local_size_t, group=ep_group)
+        sizes = torch.cat(sizes_list)
+
+        max_n = int(sizes.max().item())
+        per_rank_sizes = sizes.tolist()
+
+        if local_n < max_n:
+            pad_h = hidden_states.new_zeros(max_n - local_n, hidden_states.size(1))
+            hidden_padded = torch.cat([hidden_states, pad_h], dim=0)
+            pad_r = router_logits.new_zeros(max_n - local_n, router_logits.size(1))
+            logits_padded = torch.cat([router_logits, pad_r], dim=0)
+        else:
+            hidden_padded = hidden_states
+            logits_padded = router_logits
+
+        gathered_h = [torch.empty_like(hidden_padded) for _ in range(ep_size)]
+        dist.all_gather(gathered_h, hidden_padded, group=ep_group)
+
+        gathered_r = [torch.empty_like(logits_padded) for _ in range(ep_size)]
+        dist.all_gather(gathered_r, logits_padded, group=ep_group)
+
+        trimmed_h = [gathered_h[i][:int(per_rank_sizes[i])] for i in range(ep_size)]
+        trimmed_r = [gathered_r[i][:int(per_rank_sizes[i])] for i in range(ep_size)]
+
+        self._per_rank_sizes = [int(s) for s in per_rank_sizes]
+
+        return torch.cat(trimmed_h, dim=0), torch.cat(trimmed_r, dim=0)
+
+
+class EPCombine(nn.Module):
+    """Reduce MoE output back to each EP rank's local tokens.
+
+    Handles variable batch sizes by padding to uniform size per rank,
+    using reduce_scatter, then trimming.
+    """
+
+    def forward(
+        self,
+        hidden_states: torch.Tensor,
+        ep_group: ProcessGroup,
+        per_rank_sizes: list[int] | None = None,
+    ) -> torch.Tensor:
+        ep_size = dist.get_world_size(group=ep_group)
+        if ep_size <= 1:
+            return hidden_states
+
+        rank = dist.get_rank(group=ep_group)
+
+        if per_rank_sizes is not None and not all(s == per_rank_sizes[0] for s in per_rank_sizes):
+            local_n = per_rank_sizes[rank]
+            max_n = max(per_rank_sizes)
+            D = hidden_states.size(1)
+
+            chunks = torch.split(hidden_states, per_rank_sizes, dim=0)
+            padded = hidden_states.new_zeros(ep_size * max_n, D)
+            for i, c in enumerate(chunks):
+                padded[i * max_n : i * max_n + c.size(0)] = c
+
+            output = torch.empty(max_n, D, dtype=hidden_states.dtype,
+                                 device=hidden_states.device)
+            dist.reduce_scatter_tensor(output, padded.contiguous(), group=ep_group)
+            return output[:local_n]
+        else:
+            total = hidden_states.size(0)
+            local_size = total // ep_size
+            output = torch.empty(
+                local_size, hidden_states.size(1),
+                dtype=hidden_states.dtype, device=hidden_states.device,
+            )
+            dist.reduce_scatter_tensor(output, hidden_states, group=ep_group)
+            return output
 
 
 # ---------------------------------------------------------------------------

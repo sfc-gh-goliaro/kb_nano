@@ -50,20 +50,38 @@ def run_worker(script: str, config: dict, label: str, timeout: int = 3600) -> di
         print(f"  {label}")
         print(f"{'─' * 70}")
 
-        result = subprocess.run(
+        import signal
+        proc = subprocess.Popen(
             [sys.executable, script_path, config_path],
-            timeout=timeout,
+            start_new_session=True,
         )
-        if result.returncode != 0:
-            print(f"  ERROR: {label} failed with exit code {result.returncode}")
+        try:
+            proc.wait(timeout=timeout)
+        except subprocess.TimeoutExpired:
+            print(f"  ERROR: {label} timed out after {timeout}s")
+            os.killpg(os.getpgid(proc.pid), signal.SIGKILL)
+            proc.wait(timeout=10)
+            return None
+
+        if proc.returncode != 0:
+            if os.path.exists(output_path) and os.path.getsize(output_path) > 0:
+                print(f"  WARNING: {label} exited with code {proc.returncode}"
+                      f" but output file exists, attempting to use it")
+                with open(output_path) as f:
+                    return json.loads(f.read())
+            print(f"  ERROR: {label} failed with exit code {proc.returncode}")
             return None
 
         with open(output_path) as f:
             return json.loads(f.read())
-    except subprocess.TimeoutExpired:
-        print(f"  ERROR: {label} timed out after {timeout}s")
+    except Exception as e:
+        print(f"  ERROR: {label} failed with exception: {e}")
         return None
     finally:
+        try:
+            os.killpg(os.getpgid(proc.pid), signal.SIGKILL)
+        except (ProcessLookupError, OSError, NameError):
+            pass
         os.unlink(script_path)
         os.unlink(config_path)
         if os.path.exists(output_path):
