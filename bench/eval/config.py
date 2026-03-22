@@ -11,6 +11,7 @@ MODEL_KEY_TO_DEFAULT_HF: dict[str, str] = {
     "mixtral": "mistralai/Mixtral-8x7B-Instruct-v0.1",
     "qwen2_vl": "Qwen/Qwen2-VL-7B-Instruct",
     "qwen3_vl": "Qwen/Qwen3-VL-8B-Instruct-FP8",
+    "flux": "black-forest-labs/FLUX.1-dev",
 }
 
 MODEL_CATEGORY: dict[str, str] = {
@@ -20,6 +21,7 @@ MODEL_CATEGORY: dict[str, str] = {
     "mistralai/Mixtral-8x7B-Instruct-v0.1": "llm",
     "Qwen/Qwen2-VL-7B-Instruct": "vlm",
     "Qwen/Qwen3-VL-8B-Instruct-FP8": "vlm",
+    "black-forest-labs/FLUX.1-dev": "diffusion",
 }
 
 

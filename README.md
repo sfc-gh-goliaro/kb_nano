@@ -1,18 +1,20 @@
 # kb-nano
 
-A standalone, high-performance LLM inference engine supporting **Llama 3.1** and **Mixtral-8x7B** with tensor parallelism. No vLLM dependency at runtime — just PyTorch, Triton, and Flash Attention.
+A standalone, high-performance inference engine supporting **LLMs** (Llama 3.1, Mixtral-8x7B, Qwen2-VL, Qwen3-VL) and **diffusion models** (FLUX.1-dev) with tensor parallelism. No vLLM dependency at runtime — just PyTorch, Triton, and Flash Attention.
 
 ## Features
 
 - **Llama 3.1** (8B, 70B) with frequency-scaled RoPE
 - **Mixtral-8x7B** with fused Triton MoE grouped-GEMM kernels
+- **FLUX.1-dev** diffusion transformer (text-to-image) with Flash Attention and torch.compile
 - **Tensor parallelism** (TP) with custom IPC-based all-reduce for multi-GPU inference
-- **Paged KV cache** with Triton store kernels
-- **CUDA graph capture** for decode steps
-- **Flash Attention** for both prefill and paged decode
-- Greedy and top-p sampling
+- **Paged KV cache** with Triton store kernels (LLM models)
+- **CUDA graph capture** for decode steps (LLM models)
+- **Flash Attention** for both prefill/paged decode (LLMs) and non-causal bidirectional attention (diffusion)
+- Greedy and top-p sampling (LLMs); flow-match Euler discrete scheduling (diffusion)
 - **Layered operator architecture** (L1 single-kernel ops through L4 full models) with clean separation of concerns
 - **Benchmarking suite** for evaluating custom CUDA/Triton/PyTorch kernels at 4 abstraction levels
+- **vllm-omni comparison benchmark** for diffusion models
 
 ## Project Structure
 
@@ -23,6 +25,8 @@ A standalone, high-performance LLM inference engine supporting **Llama 3.1** and
 │   │   │   ├── rms_norm.py     # Fused RMSNorm
 │   │   │   ├── silu_and_mul.py # SiLU activation with gate
 │   │   │   ├── rotary_emb.py   # RoPE (standard + Llama 3.1 frequency scaling)
+│   │   │   ├── diffusion_rope.py   # Interleaved RoPE for diffusion models
+│   │   │   ├── diffusion_sdpa.py   # Non-causal SDPA for diffusion models
 │   │   │   ├── store_kvcache.py# Triton KV cache store kernel
 │   │   │   ├── flash_attn_prefill.py
 │   │   │   ├── flash_attn_decode.py
@@ -36,6 +40,8 @@ A standalone, high-performance LLM inference engine supporting **Llama 3.1** and
 │   │   │       └── custom_allreduce_kernels.cu
 │   │   ├── L2/                 # Multi-op blocks
 │   │   │   ├── attention.py    # LlamaAttention (GQA + QKV proj + RoPE + output proj)
+│   │   │   ├── flux_attention.py   # FluxAttention (joint/cross attention for DiT)
+│   │   │   ├── flux_feedforward.py # FLUX FFN (GELU + TP-sharded linears)
 │   │   │   ├── llama_mlp.py    # Llama SwiGLU MLP
 │   │   │   ├── mixtral_moe.py  # Mixtral MoE routing + experts
 │   │   │   ├── fused_experts.py# Fused expert execution
@@ -43,10 +49,12 @@ A standalone, high-performance LLM inference engine supporting **Llama 3.1** and
 │   │   │   └── parallel_embedding.py
 │   │   ├── L3/                 # Decoder layers
 │   │   │   ├── llama_decoder.py
-│   │   │   └── mixtral_decoder.py
+│   │   │   ├── mixtral_decoder.py
+│   │   │   └── flux_transformer_block.py  # FLUX dual/single-stream DiT blocks
 │   │   └── L4/                 # Full models
 │   │       ├── llama.py        # LlamaForCausalLM
-│   │       └── mixtral.py      # MixtralForCausalLM
+│   │       ├── mixtral.py      # MixtralForCausalLM
+│   │       └── flux.py         # FluxPipeline (text-to-image diffusion)
 │   └── candidate/              # Generated replacement kernels (gitignored)
 │       ├── README.md           # Instructions
 │       └── L1/, L2/, ...       # Organized by level, named after the operator
@@ -66,6 +74,7 @@ A standalone, high-performance LLM inference engine supporting **Llama 3.1** and
 └── tests/                      # Test suite
     ├── test_bench.py           # Bench module tests (discovery, replacement, kernel and E2E integration)
     ├── bench_vllm.py           # Multi-scenario throughput + latency + alignment benchmark vs vLLM
+    ├── bench_vllm_omni.py     # FLUX diffusion benchmark: kb-nano vs vllm-omni
     ├── utils/                  # Post-processing and visualization
     │   └── parse_vllm_bench_results.py  # Generate tables and plots from bench_vllm.py results
     └── debug/                  # Profiling and debugging scripts
@@ -91,7 +100,7 @@ python -m kb_nano kernels --list
 python -m kb_nano eval --help
 ```
 
-### Benchmarking vs vLLM
+### Benchmarking vs vLLM (LLMs)
 
 ```bash
 # Throughput + latency + alignment benchmark vs vLLM
@@ -107,6 +116,27 @@ python tests/test_bench.py
 # Bench module unit tests only (no GPU required)
 python tests/test_bench.py --unit-only
 ```
+
+### Benchmarking vs vllm-omni (Diffusion)
+
+```bash
+# FLUX.1-dev: throughput + latency benchmark vs vllm-omni
+python tests/bench_vllm_omni.py --model black-forest-labs/FLUX.1-dev
+
+# kb-nano only (skip vllm-omni comparison)
+python tests/bench_vllm_omni.py --skip-vllm-omni
+
+# Correctness / determinism check only
+python tests/bench_vllm_omni.py --correctness-only
+
+# With custom vllm-omni path
+python tests/bench_vllm_omni.py --vllm-omni-path /path/to/vllm-omni
+```
+
+The diffusion benchmark measures:
+- **Throughput**: images/sec at 1024x1024 and 512x512 with 28 and 50 denoising steps
+- **Latency**: per-image latency with P50/P90/P99 percentile stats
+- **Correctness**: deterministic generation via seeded `torch.Generator`, latent MSE comparison
 
 ## Benchmarking
 

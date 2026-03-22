@@ -218,6 +218,119 @@ class LLMEngine:
             self._engine = None
 
 
+class DiffusionBenchEngine:
+    """BenchEngine wrapper for diffusion models (FLUX, etc.).
+
+    Measures throughput by images/sec and latency by per-image timing.
+    """
+
+    def __init__(
+        self,
+        model_name: str,
+        tp: int = 1,
+        seed: int = 42,
+        enforce_eager: bool = False,
+        **kwargs,
+    ):
+        self.model_name = model_name
+        self.seed = seed
+        self.enforce_eager = enforce_eager
+        self._engine = None
+
+    def _get_engine(self):
+        if self._engine is None:
+            from kb_nano.infra.diffusion_engine import DiffusionEngine
+            self._engine = DiffusionEngine(
+                model_name=self.model_name,
+                seed=self.seed,
+                enforce_eager=self.enforce_eager,
+            )
+        return self._engine
+
+    def warmup(self) -> None:
+        engine = self._get_engine()
+        engine.warmup()
+
+    def run_throughput(
+        self,
+        requests: list[SampleRequest],
+        temperature: float = 1.0,
+        top_p: float = 1.0,
+        seed: int = 42,
+    ) -> ThroughputResult:
+        import time
+        import torch
+        from kb_nano.tasks.baseline.L4.flux import DiffusionSamplingParams
+
+        engine = self._get_engine()
+        prompts = [r.prompt for r in requests]
+
+        params = DiffusionSamplingParams(seed=seed)
+
+        torch.cuda.synchronize()
+        start = time.perf_counter()
+        output = engine.generate(prompts, params)
+        torch.cuda.synchronize()
+        elapsed = time.perf_counter() - start
+
+        num_images = len(prompts)
+        return ThroughputResult(
+            elapsed_time=elapsed,
+            total_input_tokens=0,
+            total_output_tokens=0,
+            requests_per_second=num_images / elapsed,
+            tokens_per_second=0.0,
+            output_tokens_per_second=0.0,
+        )
+
+    def run_latency(
+        self,
+        input_len: int,
+        output_len: int,
+        batch_size: int,
+        num_warmup: int = 3,
+        num_iters: int = 10,
+        temperature: float = 1.0,
+        seed: int = 42,
+    ) -> LatencyResult:
+        import time
+        import numpy as np
+        import torch
+        from kb_nano.tasks.baseline.L4.flux import DiffusionSamplingParams
+
+        engine = self._get_engine()
+        prompts = [f"A beautiful landscape photo, style {i}" for i in range(batch_size)]
+        params = DiffusionSamplingParams(seed=seed, output_type="latent")
+
+        for _ in range(num_warmup):
+            torch.cuda.synchronize()
+            engine.generate(prompts, params)
+            torch.cuda.synchronize()
+
+        latencies = []
+        for _ in range(num_iters):
+            torch.cuda.synchronize()
+            t0 = time.perf_counter()
+            engine.generate(prompts, params)
+            torch.cuda.synchronize()
+            latencies.append(time.perf_counter() - t0)
+
+        lat_arr = np.array(latencies)
+        percentages = [10, 25, 50, 75, 90, 99]
+        pcts = np.percentile(lat_arr, percentages)
+
+        return LatencyResult(
+            avg_latency=float(np.mean(lat_arr)),
+            latencies=latencies,
+            percentiles={str(p): float(v) for p, v in zip(percentages, pcts)},
+        )
+
+    def cleanup(self) -> None:
+        if self._engine is not None:
+            self._engine._cleanup()
+            self._engine = None
+
+
 class EngineRegistry:
     """Maps model names to engine classes for automatic dispatch."""
 
@@ -231,6 +344,7 @@ class EngineRegistry:
         "mamba": LLMEngine,
         "gemma": LLMEngine,
         "phi": LLMEngine,
+        "flux": DiffusionBenchEngine,
     }
 
     @classmethod

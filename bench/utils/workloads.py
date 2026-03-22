@@ -104,8 +104,61 @@ ALL_VLM_WORKLOADS = {
 }
 
 
+# ---------------------------------------------------------------------------
+# Diffusion workloads (image generation)
+# ---------------------------------------------------------------------------
+
+@dataclass(frozen=True)
+class DiffusionThroughputWorkload:
+    name: str
+    height: int
+    width: int
+    num_inference_steps: int
+    batch_size: int
+    guidance_scale: float = 3.5
+    num_requests: int = 1  # Each "request" generates batch_size images
+
+DIFFUSION_THROUGHPUT_WORKLOADS: list[DiffusionThroughputWorkload] = [
+    DiffusionThroughputWorkload(
+        "1024x1024-28steps", height=1024, width=1024,
+        num_inference_steps=28, batch_size=4),
+    DiffusionThroughputWorkload(
+        "512x512-28steps", height=512, width=512,
+        num_inference_steps=28, batch_size=8),
+    DiffusionThroughputWorkload(
+        "1024x1024-50steps", height=1024, width=1024,
+        num_inference_steps=50, batch_size=4),
+]
+
+
+@dataclass(frozen=True)
+class DiffusionLatencyWorkload:
+    name: str
+    height: int
+    width: int
+    num_inference_steps: int
+    batch_size: int = 1
+    guidance_scale: float = 3.5
+    num_warmup: int = 2
+    num_iters: int = 5
+
+DIFFUSION_LATENCY_WORKLOADS: list[DiffusionLatencyWorkload] = [
+    DiffusionLatencyWorkload(
+        "single-1024x1024", height=1024, width=1024,
+        num_inference_steps=28),
+    DiffusionLatencyWorkload(
+        "single-512x512", height=512, width=512,
+        num_inference_steps=28),
+]
+
+ALL_DIFFUSION_WORKLOADS = {
+    "throughput": DIFFUSION_THROUGHPUT_WORKLOADS,
+    "latency": DIFFUSION_LATENCY_WORKLOADS,
+}
+
+
 def get_max_seq_len() -> int:
-    """Return the maximum sequence length across all standardized workloads."""
+    """Return the maximum sequence length across all standardized LLM workloads."""
     max_len = 0
     for w in THROUGHPUT_WORKLOADS:
         max_len = max(max_len, w.input_len + w.output_len)

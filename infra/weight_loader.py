@@ -24,6 +24,7 @@ from ..tasks.baseline.L4.llama4 import Llama4Config, Llama4ForCausalLM
 from ..tasks.baseline.L4.mixtral import MixtralConfig, MixtralForCausalLM
 from ..tasks.baseline.L4.qwen2_vl import Qwen2VLConfig, Qwen2VLForConditionalGeneration
 from ..tasks.baseline.L4.qwen3_vl import Qwen3VLConfig, Qwen3VLForConditionalGeneration
+from ..tasks.baseline.L4.flux import FluxConfig, FluxPipeline
 
 
 def default_weight_loader(param: torch.nn.Parameter, loaded_weight: torch.Tensor):
@@ -382,8 +383,24 @@ def _postprocess_fp8_weights(model: torch.nn.Module) -> None:
     print(f"  Post-processed {count} FP8 linear layers.")
 
 
+def _is_diffusion_model(model_name: str) -> bool:
+    """Check if the model is a diffusion model (e.g., FLUX) by looking for model_index.json."""
+    import json as _json
+    model_path = model_name if os.path.isdir(model_name) else download_model(model_name)
+    index_path = os.path.join(model_path, "model_index.json")
+    if os.path.exists(index_path):
+        with open(index_path) as f:
+            data = _json.load(f)
+        class_name = data.get("_class_name", "")
+        if "Flux" in class_name or "Diffusion" in class_name:
+            return True
+    return False
+
+
 def _detect_model_type(model_name: str) -> str:
     """Detect model architecture from HuggingFace config."""
+    if _is_diffusion_model(model_name):
+        return "flux"
     hf_config = AutoConfig.from_pretrained(model_name, trust_remote_code=True)
     model_type = getattr(hf_config, "model_type", "llama")
     return model_type
@@ -419,7 +436,13 @@ def load_model(
         print(f"  Detected FP8 quantization: {quant_config.get('quant_method')}, "
               f"block_size={quant_config.get('weight_block_size')}")
 
-    if model_type == "llama4":
+    if model_type == "flux":
+        raise ValueError(
+            "FLUX diffusion models should be loaded via "
+            "kb_nano.infra.diffusion_engine.DiffusionEngine, "
+            "not the LLM load_model() path."
+        )
+    elif model_type == "llama4":
         config = Llama4Config.from_pretrained(model_name)
         config.dtype = dtype
         print(f"  Allocating Llama4 model ({config.num_local_experts} experts, "
