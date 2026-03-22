@@ -249,10 +249,14 @@ class DeepSeekMoE(nn.Module):
         D = self.hidden_size
         R = router_logits.size(1)
 
-        max_n_t = torch.tensor([local_n], dtype=torch.int64,
-                               device=hidden_states.device)
-        dist.all_reduce(max_n_t, op=dist.ReduceOp.MAX, group=ep_group)
-        max_n = int(max_n_t.item())
+        global _ep_cached_max_n
+        if _ep_cached_max_n is not None:
+            max_n = _ep_cached_max_n
+        else:
+            max_n_t = torch.tensor([local_n], dtype=torch.int64,
+                                   device=hidden_states.device)
+            dist.all_reduce(max_n_t, op=dist.ReduceOp.MAX, group=ep_group)
+            max_n = int(max_n_t.item())
 
         if max_n <= _MOE_DP_CHUNK_SIZE:
             return self._ep_forward_small(

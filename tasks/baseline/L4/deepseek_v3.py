@@ -184,8 +184,25 @@ class DeepSeekV3Model(nn.Module):
     def forward(self, input_ids, positions):
         hidden_states = self.embed_tokens(input_ids)
         residual = None
+
+        from ..L2.deepseek_moe import set_ep_max_n
+        from ....infra.tp import _ep_size, get_ep_group
+        ep = _ep_size()
+        if ep > 1:
+            import torch.distributed as dist
+            ep_group = get_ep_group()
+            local_n = input_ids.size(0)
+            max_n_t = torch.tensor([local_n], dtype=torch.int64,
+                                   device=input_ids.device)
+            dist.all_reduce(max_n_t, op=dist.ReduceOp.MAX, group=ep_group)
+            set_ep_max_n(int(max_n_t.item()))
+
         for layer in self.layers:
             hidden_states, residual = layer(positions, hidden_states, residual)
+
+        if ep > 1:
+            set_ep_max_n(None)
+
         hidden_states, _ = self.norm(hidden_states, residual)
         return hidden_states
 
