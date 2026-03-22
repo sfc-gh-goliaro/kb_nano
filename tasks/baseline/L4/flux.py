@@ -556,7 +556,7 @@ class FluxPipeline(nn.Module):
         self.scheduler.set_begin_index(0)
         for t in timesteps:
             timestep = t.expand(latents.shape[0]).to(
-                device=latents.device, dtype=latents.dtype,
+                dtype=latents.dtype,
             )
             noise_pred = self.transformer(
                 hidden_states=latents,
@@ -614,7 +614,7 @@ class FluxPipeline(nn.Module):
 
         if self.transformer.guidance_embeds:
             guidance = torch.full(
-                [1], params.guidance_scale, dtype=torch.float32,
+                [1], params.guidance_scale, dtype=prompt_embeds.dtype, device=device,
             ).expand(latents.shape[0])
         else:
             guidance = None
