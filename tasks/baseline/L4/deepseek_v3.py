@@ -165,6 +165,7 @@ class DeepSeekV3Model(nn.Module):
                 beta_slow=config.rope_beta_slow,
                 mscale=config.rope_mscale,
                 mscale_all_dim=config.rope_mscale_all_dim,
+                is_neox=True,
             )
 
         self.topk_indices_buffer = topk_indices_buffer
