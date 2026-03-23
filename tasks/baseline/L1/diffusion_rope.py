@@ -33,9 +33,16 @@ def _apply_rotary_emb_torch(
 ) -> torch.Tensor:
     """Pure-PyTorch fallback.  x: (B, S, H, D), cos/sin: (S, D/2)."""
     ro_dim = cos.shape[-1] * 2
-    pattern = "... d -> ... 1 (2 d)" if not interleaved else "... d -> ... 1 (d 2)"
-    cos = cos.unsqueeze(-2).repeat_interleave(2, dim=-1) if not interleaved else cos.unsqueeze(-2).repeat_interleave(2, dim=-1)
-    sin = sin.unsqueeze(-2).repeat_interleave(2, dim=-1) if not interleaved else sin.unsqueeze(-2).repeat_interleave(2, dim=-1)
+    cos = cos.unsqueeze(-2)
+    sin = sin.unsqueeze(-2)
+    if interleaved:
+        cos = cos.repeat_interleave(2, dim=-1)
+        sin = sin.repeat_interleave(2, dim=-1)
+    else:
+        repeat_dims = [1] * cos.dim()
+        repeat_dims[-1] = 2
+        cos = cos.repeat(*repeat_dims)
+        sin = sin.repeat(*repeat_dims)
     return torch.cat(
         [
             x[..., :ro_dim] * cos + _rotate_half(x[..., :ro_dim], interleaved) * sin,

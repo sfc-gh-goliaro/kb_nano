@@ -8,8 +8,9 @@ Runs standardized diffusion workloads and compares:
   - Latency: per-image latency with percentile stats
   - Correctness: latent-space MSE between outputs of both engines
 
-Prompts are drawn from the nateraw/parti-prompts dataset, sampling one
-prompt per Challenge category for diversity.
+Prompts are drawn from the full nateraw/parti-prompts (P2) dataset (~1632
+prompts), shuffled deterministically. Multiple batches per scenario provide
+sustained throughput measurement analogous to the 1000-request LLM workloads.
 
 Each engine runs in a subprocess to avoid import contamination.
 
@@ -64,28 +65,18 @@ def _detect_gpu_name() -> str:
 # ---------------------------------------------------------------------------
 
 def _load_parti_prompts(seed: int = 42) -> list[str]:
-    """Load prompts from nateraw/parti-prompts, one per Challenge category.
+    """Load all prompts from nateraw/parti-prompts (P2), deterministically shuffled.
 
-    Returns a deterministic list of prompts (one per challenge), sorted by
-    challenge name so the order is reproducible.
+    Returns ~1632 prompts covering diverse challenge categories.
+    The full set enables realistic throughput benchmarking analogous to
+    the 1000-request LLM workloads.
     """
     from datasets import load_dataset
 
     ds = load_dataset("nateraw/parti-prompts", split="train")
+    prompts = [row["Prompt"] for row in ds]
     rng = random.Random(seed)
-
-    # Group prompts by Challenge
-    by_challenge: dict[str, list[str]] = {}
-    for row in ds:
-        ch = row["Challenge"]
-        by_challenge.setdefault(ch, []).append(row["Prompt"])
-
-    # Pick one prompt per challenge, deterministically
-    prompts = []
-    for challenge in sorted(by_challenge.keys()):
-        candidates = by_challenge[challenge]
-        prompts.append(rng.choice(candidates))
-
+    rng.shuffle(prompts)
     return prompts
 
 
@@ -106,6 +97,7 @@ def _get_bench_prompts(seed: int = 42) -> list[str]:
 # ---------------------------------------------------------------------------
 VLLM_OMNI_WORKER = r'''
 import json, os, sys, time, torch
+from tqdm import tqdm
 
 def main():
     with open(sys.argv[1]) as f:
@@ -124,7 +116,6 @@ def main():
     )
     engine = OmniDiffusion(od_config)
 
-    # Warmup
     warmup_params = OmniDiffusionSamplingParams(
         height=256, width=256, num_inference_steps=2,
     )
@@ -133,7 +124,9 @@ def main():
 
     all_results = []
     for scenario in cfg["scenarios"]:
-        prompts = scenario["prompts"]
+        batches = scenario.get("batches", [scenario.get("prompts", [])])
+        if not isinstance(batches[0], list):
+            batches = [batches]
         params = OmniDiffusionSamplingParams(
             height=scenario["height"],
             width=scenario["width"],
@@ -142,29 +135,29 @@ def main():
         )
         params.seed = cfg["seed"]
 
-        torch.cuda.synchronize()
-        start = time.perf_counter()
-        outputs = engine.generate(prompts, params)
-        torch.cuda.synchronize()
-        elapsed = time.perf_counter() - start
+        total_elapsed = 0.0
+        total_images = 0
+        desc = f"vllm-omni {scenario['name']}"
+        pbar = tqdm(batches, desc=desc, unit="batch", file=sys.stderr)
+        for batch_prompts in pbar:
+            torch.cuda.synchronize()
+            start = time.perf_counter()
+            outputs = engine.generate(batch_prompts, params)
+            torch.cuda.synchronize()
+            batch_elapsed = time.perf_counter() - start
+            total_elapsed += batch_elapsed
+            total_images += len(batch_prompts)
+            pbar.set_postfix(
+                imgs=total_images,
+                ips=f"{total_images / total_elapsed:.2f}",
+            )
 
-        result = {
+        all_results.append({
             "name": scenario["name"],
-            "elapsed": elapsed,
-            "num_images": len(prompts),
-            "images_per_second": len(prompts) / elapsed,
-        }
-
-        if cfg.get("save_latents", False) and outputs:
-            latent_list = []
-            for out in outputs:
-                if hasattr(out, "outputs") and out.outputs:
-                    for o in out.outputs:
-                        if hasattr(o, "data") and o.data is not None:
-                            latent_list.append(o.data.cpu().tolist())
-            result["latents"] = latent_list
-
-        all_results.append(result)
+            "elapsed": total_elapsed,
+            "num_images": total_images,
+            "images_per_second": total_images / total_elapsed,
+        })
 
     latency_results = []
     for ls in cfg.get("latency_scenarios", []):
@@ -180,13 +173,13 @@ def main():
         num_warmup = ls.get("num_warmup", 2)
         num_iters = ls.get("num_iters", 5)
 
-        for _ in range(num_warmup):
+        for i in tqdm(range(num_warmup), desc=f"vllm-omni latency warmup {ls['name']}", file=sys.stderr):
             torch.cuda.synchronize()
             engine.generate(prompts, params)
             torch.cuda.synchronize()
 
         latencies = []
-        for _ in range(num_iters):
+        for i in tqdm(range(num_iters), desc=f"vllm-omni latency {ls['name']}", file=sys.stderr):
             torch.cuda.synchronize()
             t0 = time.perf_counter()
             engine.generate(prompts, params)
@@ -218,6 +211,7 @@ if __name__ == "__main__":
 # ---------------------------------------------------------------------------
 KB_NANO_DIFFUSION_WORKER = r'''
 import json, sys, time, torch
+from tqdm import tqdm
 
 def main():
     with open(sys.argv[1]) as f:
@@ -242,7 +236,6 @@ def main():
         enforce_eager=cfg.get("enforce_eager", False),
     )
 
-    # Warmup at each unique resolution to trigger torch.compile
     seen = set()
     for s in cfg["scenarios"] + cfg.get("latency_scenarios", []):
         key = (s["height"], s["width"])
@@ -258,7 +251,9 @@ def main():
 
     all_results = []
     for scenario in cfg["scenarios"]:
-        prompts = scenario["prompts"]
+        batches = scenario.get("batches", [scenario.get("prompts", [])])
+        if not isinstance(batches[0], list):
+            batches = [batches]
         params = DiffusionSamplingParams(
             height=scenario["height"],
             width=scenario["width"],
@@ -268,23 +263,29 @@ def main():
             output_type=scenario.get("output_type", "pil"),
         )
 
-        torch.cuda.synchronize()
-        start = time.perf_counter()
-        output = engine.generate(prompts, params)
-        torch.cuda.synchronize()
-        elapsed = time.perf_counter() - start
+        total_elapsed = 0.0
+        total_images = 0
+        desc = f"kb-nano {scenario['name']}"
+        pbar = tqdm(batches, desc=desc, unit="batch", file=sys.stderr)
+        for batch_prompts in pbar:
+            torch.cuda.synchronize()
+            start = time.perf_counter()
+            output = engine.generate(batch_prompts, params)
+            torch.cuda.synchronize()
+            batch_elapsed = time.perf_counter() - start
+            total_elapsed += batch_elapsed
+            total_images += len(batch_prompts)
+            pbar.set_postfix(
+                imgs=total_images,
+                ips=f"{total_images / total_elapsed:.2f}",
+            )
 
-        result = {
+        all_results.append({
             "name": scenario["name"],
-            "elapsed": elapsed,
-            "num_images": len(prompts),
-            "images_per_second": len(prompts) / elapsed,
-        }
-
-        if cfg.get("save_latents", False) and output.latents is not None:
-            result["latents"] = output.latents.cpu().tolist()
-
-        all_results.append(result)
+            "elapsed": total_elapsed,
+            "num_images": total_images,
+            "images_per_second": total_images / total_elapsed,
+        })
 
     latency_results = []
     for ls in cfg.get("latency_scenarios", []):
@@ -301,13 +302,13 @@ def main():
         num_warmup = ls.get("num_warmup", 2)
         num_iters = ls.get("num_iters", 5)
 
-        for _ in range(num_warmup):
+        for i in tqdm(range(num_warmup), desc=f"kb-nano latency warmup {ls['name']}", file=sys.stderr):
             torch.cuda.synchronize()
             engine.generate(prompts, params)
             torch.cuda.synchronize()
 
         latencies = []
-        for _ in range(num_iters):
+        for i in tqdm(range(num_iters), desc=f"kb-nano latency {ls['name']}", file=sys.stderr):
             torch.cuda.synchronize()
             t0 = time.perf_counter()
             engine.generate(prompts, params)
@@ -379,10 +380,22 @@ def main():
 
     result = {}
     if output.latents is not None:
-        result["latents"] = output.latents.cpu().float().tolist()
-        result["latent_shape"] = list(output.latents.shape)
-        result["latent_mean"] = float(output.latents.float().mean())
-        result["latent_std"] = float(output.latents.float().std())
+        lat = output.latents
+        result["packed_latent_shape"] = list(lat.shape)
+        result["latent_mean"] = float(lat.float().mean())
+        result["latent_std"] = float(lat.float().std())
+
+        pipeline = engine._get_pipeline()
+        height = cfg.get("height", 512)
+        width = cfg.get("width", 512)
+        from kb_nano.tasks.baseline.L4.flux import FluxPipeline
+        with torch.inference_mode():
+            unpacked = FluxPipeline._unpack_latents(
+                lat, height, width, pipeline.vae_scale_factor)
+            unpacked = (unpacked / pipeline.vae.config.scaling_factor) + pipeline.vae.config.shift_factor
+            decoded = pipeline.vae.decode(unpacked, return_dict=False)[0]
+        result["latents"] = decoded.cpu().float().tolist()
+        result["latent_shape"] = list(decoded.shape)
 
     engine._cleanup()
 
@@ -410,6 +423,7 @@ def main():
         model=cfg["model"],
         dtype=torch.bfloat16,
         enforce_eager=True,
+        output_type="latent",
     )
     engine = OmniDiffusion(od_config)
 
@@ -434,19 +448,19 @@ def main():
 
     result = {}
     if outputs:
-        latent_list = []
+        import numpy as np
+        latent_tensors = []
         for out in outputs:
-            if hasattr(out, "outputs") and out.outputs:
-                for o in out.outputs:
-                    if hasattr(o, "data") and o.data is not None:
-                        latent_list.append(o.data.cpu().float().tolist())
-        if latent_list:
-            import numpy as np
-            arr = np.array(latent_list)
-            result["latents"] = arr.tolist()
-            result["latent_shape"] = list(arr.shape)
-            result["latent_mean"] = float(arr.mean())
-            result["latent_std"] = float(arr.std())
+            if hasattr(out, "images") and out.images:
+                for img in out.images:
+                    if isinstance(img, torch.Tensor):
+                        latent_tensors.append(img.cpu().float())
+        if latent_tensors:
+            combined = torch.cat(latent_tensors, dim=0) if len(latent_tensors) > 1 else latent_tensors[0]
+            result["latents"] = combined.numpy().tolist()
+            result["latent_shape"] = list(combined.shape)
+            result["latent_mean"] = float(combined.mean())
+            result["latent_std"] = float(combined.std())
 
     del engine
     torch.cuda.empty_cache()
@@ -465,16 +479,19 @@ def _build_throughput_scenarios(
     scenarios = []
     for w in DIFFUSION_THROUGHPUT_WORKLOADS:
         bs = batch_size_override or w.batch_size
-        p = prompts[:bs]
-        if len(p) < bs:
-            p = (p * ((bs // len(p)) + 1))[:bs]
+        num_requests = w.num_requests
+        total_needed = bs * num_requests
+        pool = (prompts * ((total_needed // len(prompts)) + 1))[:total_needed]
+        batches = [pool[i * bs : (i + 1) * bs] for i in range(num_requests)]
         scenarios.append({
             "name": w.name,
             "height": w.height,
             "width": w.width,
             "num_inference_steps": w.num_inference_steps,
             "guidance_scale": w.guidance_scale,
-            "prompts": p,
+            "batches": batches,
+            "batch_size": bs,
+            "num_requests": num_requests,
         })
     return scenarios
 
@@ -496,17 +513,17 @@ def _build_latency_scenarios(prompts: list[str]) -> list[dict]:
 
 
 def _print_throughput_comparison(kb_results: list[dict], vllm_results: list[dict] | None):
-    print("\n" + "=" * 80)
+    print("\n" + "=" * 90)
     print("  THROUGHPUT COMPARISON (images/sec)")
-    print("=" * 80)
-    header = f"  {'Scenario':<25} {'kb-nano':>12}"
+    print("=" * 90)
+    header = f"  {'Scenario':<25} {'Images':>7} {'kb-nano':>12}"
     if vllm_results:
         header += f" {'vllm-omni':>12} {'Speedup':>10}"
     print(header)
-    print("  " + "-" * 60)
+    print("  " + "-" * 70)
 
     for kb in kb_results:
-        line = f"  {kb['name']:<25} {kb['images_per_second']:>12.2f}"
+        line = f"  {kb['name']:<25} {kb['num_images']:>7} {kb['images_per_second']:>12.2f}"
         if vllm_results:
             vllm = next((v for v in vllm_results if v["name"] == kb["name"]), None)
             if vllm:
@@ -603,7 +620,7 @@ def _print_correctness_results(
         else:
             print("\n  Could not compare cross-engine latents (empty data)")
 
-    print(f"\n  Prompts used ({len(prompts)} from parti-prompts, one per Challenge):")
+    print(f"\n  Prompts used ({len(prompts)} from parti-prompts P2):")
     for i, p in enumerate(prompts):
         print(f"    [{i+1}] {p[:80]}{'...' if len(p) > 80 else ''}")
     print()
@@ -624,7 +641,17 @@ def main():
                         help="Path to vllm-omni repo root")
     parser.add_argument("--output", type=str, default=None,
                         help="Output JSON file for results")
+    parser.add_argument("--log-dir", type=str, default=None,
+                        help="Directory for worker log files (use tail -f to monitor)")
     args = parser.parse_args()
+
+    if args.log_dir:
+        os.makedirs(args.log_dir, exist_ok=True)
+        main_log = os.path.join(args.log_dir, "bench_main.log")
+        log_fh = open(main_log, "w")
+        sys.stdout = log_fh
+        sys.stderr = log_fh
+        print(f"Main log: {main_log}", file=sys.__stderr__, flush=True)
 
     gpu_name = _detect_gpu_name()
     print(f"\nBenchmark: FLUX.1-dev on {gpu_name}")
@@ -634,7 +661,7 @@ def main():
 
     # Load prompts from parti-prompts dataset
     bench_prompts = _get_bench_prompts(args.seed)
-    print(f"Loaded {len(bench_prompts)} prompts from parti-prompts (one per Challenge)")
+    print(f"Loaded {len(bench_prompts)} prompts from parti-prompts (P2)")
 
     vllm_omni_path = args.vllm_omni_path
     if vllm_omni_path is None:
@@ -670,11 +697,11 @@ def main():
         # Run kb-nano (twice for determinism check)
         kb_result = run_worker(
             KB_NANO_CORRECTNESS_WORKER, correctness_config,
-            "kb-nano correctness", timeout=600,
+            "kb-nano correctness", timeout=600, log_dir=args.log_dir,
         )
         kb_result2 = run_worker(
             KB_NANO_CORRECTNESS_WORKER, correctness_config,
-            "kb-nano correctness (run 2)", timeout=600,
+            "kb-nano correctness (run 2)", timeout=600, log_dir=args.log_dir,
         )
 
         # Run vllm-omni for cross-engine comparison
@@ -686,7 +713,7 @@ def main():
             }
             vllm_result = run_worker(
                 VLLM_OMNI_CORRECTNESS_WORKER, vllm_correctness_config,
-                "vllm-omni correctness", timeout=600,
+                "vllm-omni correctness", timeout=600, log_dir=args.log_dir,
             )
 
         _print_correctness_results(
@@ -706,7 +733,7 @@ def main():
     }
     kb_data = run_worker(
         KB_NANO_DIFFUSION_WORKER, kb_config,
-        "kb-nano diffusion benchmark", timeout=3600,
+        "kb-nano diffusion benchmark", timeout=36000, log_dir=args.log_dir,
     )
 
     # --- vllm-omni benchmark ---
@@ -720,7 +747,7 @@ def main():
         }
         vllm_data = run_worker(
             VLLM_OMNI_WORKER, vllm_config,
-            "vllm-omni diffusion benchmark", timeout=3600,
+            "vllm-omni diffusion benchmark", timeout=36000, log_dir=args.log_dir,
         )
     elif not args.skip_vllm_omni:
         print("\n  WARNING: vllm-omni not found, skipping comparison.")
@@ -743,7 +770,7 @@ def main():
             "gpu": gpu_name,
             "seed": args.seed,
             "prompts_source": "nateraw/parti-prompts",
-            "prompts": bench_prompts,
+            "num_prompts": len(bench_prompts),
             "kb_nano": kb_data,
         }
         if vllm_data:

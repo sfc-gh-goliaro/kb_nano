@@ -406,6 +406,29 @@ Latency (batch size 1, 128 output tokens, 5 iterations):
 
 FP8 activation quantization uses a custom Triton kernel for single-launch per-token-group UE8M0 quantization. Pre-allocated shared prefill buffers eliminate dynamic allocation during FP8 prefill, and DeepGEMM is JIT-warmed for both decode and prefill batch sizes. The remaining throughput gap vs vLLM is primarily from vLLM's `torch.compile` + Inductor fusion passes (RMSNorm+quant, SiLU+quant).
 
+### FLUX.1-dev (Diffusion)
+
+Run `tests/bench_vllm_omni.py` to reproduce. Prompts drawn from the full nateraw/parti-prompts (P2) dataset (1632 prompts), shuffled deterministically. Reference engine: vllm-omni.
+
+**Hardware: NVIDIA B200**
+
+Throughput (images/sec):
+
+| Scenario | Batch | Images | vllm-omni | Ours | Ratio |
+|----------|------:|-------:|----------:|-----:|------:|
+| 1024x1024, 28 steps | 4 | 40 | 0.296 | 0.310 | **1.05x** |
+| 512x512, 28 steps   | 8 | 80 | 1.210 | 1.332 | **1.10x** |
+| 1024x1024, 50 steps | 4 | 20 | 0.180 | 0.198 | **1.10x** |
+
+Latency (single image, 28 steps, median of 5 runs):
+
+| Resolution | vllm-omni | Ours | Ratio |
+|------------|----------:|-----:|------:|
+| 1024x1024  | 3.244s | 2.821s | **1.15x** |
+| 512x512    | 1.073s | 0.826s | **1.30x** |
+
+Correctness: cosine similarity 0.992 (latent-space comparison after VAE decode).
+
 ### Key optimizations
 
 - **Fused RMSNorm**: Uses `sgl_kernel`'s fused residual-add + RMSNorm CUDA kernel, eliminating multiple kernel launches per norm call

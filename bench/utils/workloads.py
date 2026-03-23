@@ -121,13 +121,13 @@ class DiffusionThroughputWorkload:
 DIFFUSION_THROUGHPUT_WORKLOADS: list[DiffusionThroughputWorkload] = [
     DiffusionThroughputWorkload(
         "1024x1024-28steps", height=1024, width=1024,
-        num_inference_steps=28, batch_size=4),
+        num_inference_steps=28, batch_size=4, num_requests=10),
     DiffusionThroughputWorkload(
         "512x512-28steps", height=512, width=512,
-        num_inference_steps=28, batch_size=8),
+        num_inference_steps=28, batch_size=8, num_requests=10),
     DiffusionThroughputWorkload(
         "1024x1024-50steps", height=1024, width=1024,
-        num_inference_steps=50, batch_size=4),
+        num_inference_steps=50, batch_size=4, num_requests=5),
 ]
 
 
