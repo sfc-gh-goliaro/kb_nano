@@ -252,7 +252,7 @@ class ModelRunner:
         self.model_name = model_name
         self.rank = rank
         self.world_size = world_size
-        self.enforce_eager = enforce_eager
+        self.enforce_eager = enforce_eager or enable_expert_parallel
         self.event = event
         self.block_size = BLOCK_SIZE
         self.gpu_memory_utilization = gpu_memory_utilization
@@ -506,12 +506,9 @@ class ModelRunner:
         """Pre-allocate MoE intermediate and FP8 buffers to their maximum
         inference-time size.
 
-        With EP, the warmup runs with a reduced token count, leaving MoE
-        buffers undersized.  During real inference, EP dispatch gathers tokens
-        from all ranks (M * ep_size), causing buffers to grow dramatically.
-        If KV cache is allocated based on post-warmup memory, there won't be
-        room for the larger buffers.  This mirrors vLLM's profile_run which
-        runs at max_num_batched_tokens to size everything before KV allocation.
+        With FlashInfer, intermediate buffers are managed internally so we
+        only pre-allocate EP gather/scatter buffers. With the Triton fallback,
+        we pre-allocate shared intermediate buffers for the grouped GEMMs.
         """
         from ..tasks.baseline.L2.fused_experts import FusedExperts, use_flashinfer_cutlass
         from .tp import _ep_size
@@ -521,14 +518,16 @@ class ModelRunner:
             return
 
         ep = _ep_size()
+        use_fi = use_flashinfer_cutlass()
         device = next(self.model.parameters()).device
+        dtype = next(self.model.parameters()).dtype
+
         cfg = self.config
         K = cfg.hidden_size
         N2 = 2 * getattr(cfg, 'moe_intermediate_size', getattr(cfg, 'intermediate_size', K))
         top_k = getattr(cfg, 'num_experts_per_tok', 8)
-        dtype = next(self.model.parameters()).dtype
 
-        if not use_flashinfer_cutlass():
+        if not use_fi:
             if ep > 1:
                 M = 256 * ep
             else:
@@ -557,7 +556,7 @@ class ModelRunner:
             if moe_sums:
                 moe_sums[0]._buf.get(M, K, device, dtype)
 
-        if ep > 1:
+        if ep > 1 and self.enable_expert_parallel:
             self._presize_ep_buffers(ep, K, top_k, device, dtype)
 
         torch.cuda.synchronize()
@@ -565,7 +564,7 @@ class ModelRunner:
             _GiB = 1 << 30
             mem = torch.cuda.memory_allocated() / _GiB
             print(f"  After MoE buffer pre-sizing (top_k={top_k}, ep={ep}, "
-                  f"flashinfer={use_flashinfer_cutlass()}): allocated={mem:.1f}G")
+                  f"flashinfer={use_fi}): allocated={mem:.1f}G")
 
     def _presize_ep_buffers(self, ep_size, D, top_k, device, dtype):
         """Pre-allocate shared EP gather/scatter buffers for the decode path.
@@ -1136,9 +1135,6 @@ class ModelRunner:
     def run_model(self, input_ids, positions, is_prefill, inputs_embeds=None,
                   deepstack_embeds=None):
         if is_prefill or self.enforce_eager or input_ids.size(0) > self.graph_bs_list[-1]:
-            if self.enable_expert_parallel:
-                from ..tasks.baseline.L2.deepseek_moe import set_ep_max_n
-                set_ep_max_n(None)
             if inputs_embeds is not None:
                 return self.model.compute_logits(
                     self.model(input_ids, positions, inputs_embeds=inputs_embeds,
@@ -1148,9 +1144,6 @@ class ModelRunner:
         bs = input_ids.size(0)
         ctx = get_context()
         graph_bs = self._graph_bs_for_n[bs]
-        if self.enable_expert_parallel:
-            from ..tasks.baseline.L2.deepseek_moe import set_ep_max_n
-            set_ep_max_n(graph_bs)
         gv = self.graph_vars
         gv["input_ids"][:bs] = input_ids
         gv["positions"][:bs] = positions
@@ -1192,10 +1185,6 @@ class ModelRunner:
         gv = self.graph_vars
         graph_bs = self._graph_bs_for_n[n]
         prev_n = getattr(self, '_prev_decode_n', -1)
-
-        if self.enable_expert_parallel:
-            from ..tasks.baseline.L2.deepseek_moe import set_ep_max_n
-            set_ep_max_n(graph_bs)
 
         gv["input_ids"][:n].copy_(torch.from_numpy(ids_np), non_blocking=True)
         gv["positions"][:n].copy_(torch.from_numpy(pos_np), non_blocking=True)
@@ -1557,10 +1546,6 @@ class ModelRunner:
         lm_max_vals = torch.zeros(max_bs)
         lm_max_idxs = torch.zeros(max_bs, dtype=torch.int64)
 
-        use_ep = self.enable_expert_parallel
-        if use_ep:
-            from ..tasks.baseline.L2.deepseek_moe import set_ep_max_n
-
         ar_ctx = self.custom_ar.capture() if self.custom_ar is not None else nullcontext()
         with ar_ctx:
             for bs in reversed(self.graph_bs_list):
@@ -1570,8 +1555,6 @@ class ModelRunner:
                     context_lens=context_lens[:bs], block_tables=block_tables[:bs],
                     max_context_len=self.max_model_len,
                 )
-                if use_ep:
-                    set_ep_max_n(bs)
                 outputs[:bs] = self.model(input_ids[:bs], positions[:bs])
                 lm_logits[:bs] = lm_head.linear_op(outputs[:bs], lm_head.weight).float()
                 lm_max_vals[:bs], lm_max_idxs[:bs] = lm_logits[:bs].max(dim=-1)
@@ -1586,9 +1569,6 @@ class ModelRunner:
                 self.graphs[bs] = graph
                 torch.cuda.synchronize()
                 reset_context()
-
-        if use_ep:
-            set_ep_max_n(None)
 
         self.graph_vars = dict(
             input_ids=input_ids, positions=positions,

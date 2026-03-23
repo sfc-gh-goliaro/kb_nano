@@ -237,6 +237,8 @@ class DeepSeekMoE(nn.Module):
             shared_input.record_stream(self._shared_stream)
             main_stream = torch.cuda.current_stream()
             self._shared_stream.wait_stream(main_stream)
+            with torch.cuda.stream(self._shared_stream):
+                shared_out = self.shared_experts(shared_input)
         elif self.shared_experts is not None:
             shared_out = self.shared_experts(hidden_states)
 
@@ -255,8 +257,6 @@ class DeepSeekMoE(nn.Module):
             )
 
         if use_overlap:
-            with torch.cuda.stream(self._shared_stream):
-                shared_out = self.shared_experts(shared_input)
             main_stream.wait_stream(self._shared_stream)
 
         if self.shared_experts is not None:

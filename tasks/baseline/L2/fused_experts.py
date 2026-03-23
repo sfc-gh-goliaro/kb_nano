@@ -7,6 +7,8 @@ Supports FP8 w8a8 with block-scale quantization via two backends:
 
 from __future__ import annotations
 
+import os
+
 import torch
 import torch.nn as nn
 import triton
@@ -35,7 +37,10 @@ def _check_flashinfer_cutlass() -> bool:
 def use_flashinfer_cutlass() -> bool:
     global _USE_FLASHINFER_CUTLASS
     if _USE_FLASHINFER_CUTLASS is None:
-        _USE_FLASHINFER_CUTLASS = _check_flashinfer_cutlass()
+        if os.environ.get("KB_NANO_DISABLE_FLASHINFER", "0") == "1":
+            _USE_FLASHINFER_CUTLASS = False
+        else:
+            _USE_FLASHINFER_CUTLASS = _check_flashinfer_cutlass()
     return _USE_FLASHINFER_CUTLASS
 
 
