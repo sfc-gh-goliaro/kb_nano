@@ -221,20 +221,22 @@ class DeepSeekIndexer(nn.Module):
 
         if ctx.is_prefill or (ctx.is_mixed and ctx.num_prefill_tokens > 0):
             np_ = ctx.num_prefill_tokens if ctx.is_mixed else N
-            self._prefill_indexing(q_fp8[:np_], weights[:np_], topk_indices_buffer, ctx)
+            self._prefill_indexing(q_fp8[:np_], q_scale[:np_], weights[:np_],
+                                   topk_indices_buffer, ctx)
 
         if not ctx.is_prefill or (ctx.is_mixed and ctx.num_decode_tokens > 0):
             nd_start = ctx.num_prefill_tokens if ctx.is_mixed else 0
             nd_end = N
             if nd_end > nd_start:
                 self._decode_indexing(
-                    q_fp8[nd_start:nd_end], weights[nd_start:nd_end],
+                    q_fp8[nd_start:nd_end], q_scale[nd_start:nd_end],
+                    weights[nd_start:nd_end],
                     topk_indices_buffer, nd_start, ctx,
                 )
 
         return topk_indices_buffer
 
-    def _prefill_indexing(self, q_fp8, weights, topk_indices_buffer, ctx):
+    def _prefill_indexing(self, q_fp8, q_scale, weights, topk_indices_buffer, ctx):
         """Prefill: gather all K from cache, compute logits, top-k."""
         if ctx.is_mixed:
             cu_q = ctx.prefill_cu_seqlens_q
@@ -255,7 +257,9 @@ class DeepSeekIndexer(nn.Module):
                 continue
 
             q_s = q_fp8[q_start:q_end]
-            q_flat = q_s.reshape(-1, self.head_dim).to(torch.bfloat16)
+            qs_s = q_scale[q_start:q_end]
+            q_bf16 = q_s.to(torch.float32) * qs_s
+            q_flat = q_bf16.reshape(-1, self.head_dim).to(torch.bfloat16)
             w_s = weights[q_start:q_end]
 
             k_latent = self._gather_k_bf16(ctx, s, kv_len)
@@ -280,8 +284,9 @@ class DeepSeekIndexer(nn.Module):
                 _, indices = torch.topk(logits_combined, k, dim=1)
                 topk_indices_buffer[q_start:q_end, :k] = indices.to(torch.int32)
 
-    def _decode_indexing(self, q_fp8, weights, topk_indices_buffer, offset, ctx):
-        """Decode: paged MQA logits via simple matmul fallback."""
+    def _decode_indexing(self, q_fp8, q_scale, weights, topk_indices_buffer,
+                         offset, ctx):
+        """Decode: paged MQA logits via padded batched matmul."""
         if ctx.is_mixed:
             context_lens = ctx.decode_context_lens
             block_tables = ctx.decode_block_tables
@@ -290,26 +295,47 @@ class DeepSeekIndexer(nn.Module):
             block_tables = ctx.block_tables
 
         batch = q_fp8.shape[0]
+        if batch == 0:
+            return
 
-        for b in range(batch):
-            seq_len = int(context_lens[b].item())
-            if seq_len == 0:
-                continue
+        q_bf16 = (q_fp8.to(torch.float32) * q_scale).to(torch.bfloat16)
+        q_2d = q_bf16.reshape(batch, self.n_head * self.head_dim)
 
-            q_b = q_fp8[b].reshape(self.n_head, self.head_dim).to(torch.bfloat16)
-            w_b = weights[b]
+        max_seq_len = int(context_lens.max().item())
+        if max_seq_len == 0:
+            return
 
-            num_pages = (seq_len + self._block_size - 1) // self._block_size
-            bt = block_tables[b, :num_pages]
-            k_gathered = self._gather_k_bf16_paged(bt, seq_len)
-            k_gathered = k_gathered.reshape(seq_len, self.head_dim)
-            logits = torch.matmul(q_b, k_gathered.t())
-            logits = logits + w_b.unsqueeze(-1)
-            logits_combined = logits.sum(dim=0)
+        max_pages = (max_seq_len + self._block_size - 1) // self._block_size
+        bt_all = block_tables[:batch, :max_pages]
 
-            k = min(self.topk_tokens, seq_len)
-            _, indices = torch.topk(logits_combined[:seq_len], k)
-            topk_indices_buffer[offset + b, :k] = indices.to(torch.int32)
+        hd = self.head_dim
+        bs = self._block_size
+        bpt = self._bytes_per_token
+        cache = self.k_cache
+
+        all_page_ids = bt_all.reshape(-1).long()
+        raw = cache[all_page_ids]
+        raw = raw.reshape(batch, max_pages * bs, bpt)
+
+        fp8_vals = raw[:, :, :hd].contiguous().view(torch.float8_e4m3fn).to(torch.float32)
+        scales = raw[:, :, hd:hd + 4].contiguous().view(torch.float32)
+        k_all = (fp8_vals * scales).to(torch.bfloat16)
+
+        max_kv = max_pages * bs
+        q_heads = q_2d.reshape(batch, self.n_head, hd)
+        logits = torch.einsum('bnh,bkh->bnk', q_heads, k_all[:, :max_kv, :])
+
+        logits = logits + weights.unsqueeze(-1)
+
+        logits_combined = logits.sum(dim=1)
+
+        pos_range = torch.arange(max_kv, device=logits_combined.device)
+        mask = pos_range.unsqueeze(0) >= context_lens[:batch].unsqueeze(1)
+        logits_combined = logits_combined.masked_fill(mask, float('-inf'))
+
+        k = min(self.topk_tokens, max_kv)
+        _, indices = torch.topk(logits_combined, k, dim=1)
+        topk_indices_buffer[offset:offset + batch, :k] = indices.to(torch.int32)
 
     def _gather_k_bf16(self, ctx, seq_idx, kv_len):
         """Gather K from indexer cache pages, dequantize to BF16."""

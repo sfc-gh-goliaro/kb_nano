@@ -323,9 +323,9 @@ class DeepSeekMLA(nn.Module):
         flash_mla_sparse_fwd expects:
             q: [s_q, h_q, d_qk] bf16
             kv: [s_kv, h_kv=1, d_qk] bf16
-            indices: [s_q, h_kv=1, topk] int32
+            indices: [s_q, h_kv=1, topk] int32 — global indices into kv
         """
-        topk_indices = self._topk_indices_buffer[:N]
+        topk_indices = self._topk_indices_buffer[:N].clone()
 
         kv_bf16 = torch.cat([kv_c_normed, k_pe], dim=-1)
 
@@ -336,9 +336,11 @@ class DeepSeekMLA(nn.Module):
             cu_q = cu_seqlens_q.cpu().tolist()
             num_seqs = len(cu_q) - 1
             all_kv = []
+            kv_offset = 0
 
             for s in range(num_seqs):
-                q_len = cu_q[s + 1] - cu_q[s]
+                q_start, q_end = cu_q[s], cu_q[s + 1]
+                q_len = q_end - q_start
                 kv_len = cu_k[s + 1] - cu_k[s]
                 cached_len = kv_len - q_len
 
@@ -351,22 +353,41 @@ class DeepSeekMLA(nn.Module):
 
                 all_kv.append(kv_bf16[cu_q[s] - cu_q[0]:cu_q[s + 1] - cu_q[0]])
 
+                valid_mask = topk_indices[q_start:q_end] >= 0
+                topk_indices[q_start:q_end] = torch.where(
+                    valid_mask,
+                    topk_indices[q_start:q_end] + kv_offset,
+                    topk_indices[q_start:q_end],
+                )
+                kv_offset += kv_len
+
             kv_flat = torch.cat(all_kv, dim=0)
         else:
+            cu_q = (ctx.prefill_cu_seqlens_q if ctx.prefill_cu_seqlens_q is not None else ctx.cu_seqlens_q)
+            if cu_q is not None:
+                cu_q_list = cu_q.cpu().tolist()
+                num_seqs = len(cu_q_list) - 1
+                kv_offset = 0
+                for s in range(num_seqs):
+                    q_start, q_end = cu_q_list[s], cu_q_list[s + 1]
+                    q_len = q_end - q_start
+                    valid_mask = topk_indices[q_start:q_end] >= 0
+                    topk_indices[q_start:q_end] = torch.where(
+                        valid_mask,
+                        topk_indices[q_start:q_end] + kv_offset,
+                        topk_indices[q_start:q_end],
+                    )
+                    kv_offset += q_len
             kv_flat = kv_bf16
 
-        # kv: [s_kv, h_kv=1, d_qk=576]
         kv_3d = kv_flat.unsqueeze(1)
-        # q: [s_q, h_q, d_qk=576] - already in correct shape
         q_mqa = q_absorbed
-        # indices: [s_q, h_kv=1, topk]
         topk_3d = topk_indices.unsqueeze(1).to(torch.int32)
 
         out, max_logits, lse = flash_mla_sparse_fwd(
             q_mqa, kv_3d, topk_3d, self.scaling,
         )
 
-        # out: [s_q, h_q, d_v=512]
         out = out[:, :self.num_local_heads, :self.kv_lora_rank]
 
         o = torch.einsum('bhc,hcd->bhd', out, self._w_uv)
