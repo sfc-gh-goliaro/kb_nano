@@ -568,37 +568,39 @@ class ModelRunner:
                   f"flashinfer={use_flashinfer_cutlass()}): allocated={mem:.1f}G")
 
     def _presize_ep_buffers(self, ep_size, D, top_k, device, dtype):
-        """Pre-allocate EP gather/scatter buffers for the small (decode) path.
+        """Pre-allocate shared EP gather/scatter buffers for the decode path.
 
-        This ensures no dynamic allocation occurs during CUDA graph capture
-        or replay. Buffers are sized for max_num_seqs per EP rank.
+        All MoE layers share one set of buffers (they execute sequentially).
+        Sized for max_num_seqs per EP rank.
         """
         from ..tasks.baseline.L2.deepseek_moe import DeepSeekMoE
         max_n = self.max_num_seqs
         total_gathered = ep_size * max_n
 
+        buf_h = torch.empty(total_gathered, D, dtype=dtype, device=device)
+        buf_w = torch.empty(total_gathered, top_k, dtype=dtype, device=device)
+        buf_i = torch.empty(total_gathered, top_k, dtype=torch.int64, device=device)
+        chunk_h = torch.empty(max_n, D, dtype=dtype, device=device)
+        chunk_w = torch.empty(max_n, top_k, dtype=dtype, device=device)
+        chunk_i = torch.empty(max_n, top_k, dtype=torch.int64, device=device)
+        rs_out = torch.empty(max_n, D, dtype=dtype, device=device)
+        gather_h = [buf_h[i * max_n:(i + 1) * max_n] for i in range(ep_size)]
+        gather_w = [buf_w[i * max_n:(i + 1) * max_n] for i in range(ep_size)]
+        gather_i = [buf_i[i * max_n:(i + 1) * max_n] for i in range(ep_size)]
+
         for m in self.model.modules():
             if not isinstance(m, DeepSeekMoE):
                 continue
-            m._ep_buf_h = torch.empty(total_gathered, D, dtype=dtype, device=device)
-            m._ep_buf_w = torch.empty(total_gathered, top_k, dtype=dtype, device=device)
-            m._ep_buf_i = torch.empty(total_gathered, top_k, dtype=torch.int64, device=device)
-            m._ep_chunk_h = torch.empty(max_n, D, dtype=dtype, device=device)
-            m._ep_chunk_w = torch.empty(max_n, top_k, dtype=dtype, device=device)
-            m._ep_chunk_i = torch.empty(max_n, top_k, dtype=torch.int64, device=device)
-            m._ep_rs_out = torch.empty(max_n, D, dtype=dtype, device=device)
-            m._ep_gather_h = [
-                m._ep_buf_h[i * max_n:(i + 1) * max_n]
-                for i in range(ep_size)
-            ]
-            m._ep_gather_w = [
-                m._ep_buf_w[i * max_n:(i + 1) * max_n]
-                for i in range(ep_size)
-            ]
-            m._ep_gather_i = [
-                m._ep_buf_i[i * max_n:(i + 1) * max_n]
-                for i in range(ep_size)
-            ]
+            m._ep_buf_h = buf_h
+            m._ep_buf_w = buf_w
+            m._ep_buf_i = buf_i
+            m._ep_chunk_h = chunk_h
+            m._ep_chunk_w = chunk_w
+            m._ep_chunk_i = chunk_i
+            m._ep_rs_out = rs_out
+            m._ep_gather_h = gather_h
+            m._ep_gather_w = gather_w
+            m._ep_gather_i = gather_i
             m._ep_bufs_initialized = True
 
     def _warmup_deepgemm(self):

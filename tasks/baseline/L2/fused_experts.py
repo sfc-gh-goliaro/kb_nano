@@ -184,7 +184,7 @@ class FusedExperts(nn.Module):
         cutlass_fused_moe(
             input=hidden_states,
             token_selected_experts=topk_ids.to(torch.int),
-            token_final_scales=topk_weights,
+            token_final_scales=topk_weights.float(),
             fc1_expert_weights=w13,
             fc2_expert_weights=w2,
             output_dtype=hidden_states.dtype,
