@@ -1,9 +1,8 @@
 """Fused MoE experts: two grouped GEMMs with SiLU-mul in between.
 
-Supports FP8 w8a8 with block-scale quantization matching vLLM's Triton path:
-  - Expert weights stored as float8_e4m3fn with per-block float32 scales
-  - Activations quantized to FP8 per-token-group before each GEMM
-  - Block scales applied inside the Triton kernel (no BF16 expansion)
+Supports FP8 w8a8 with block-scale quantization via two backends:
+  1. FlashInfer CUTLASS (preferred on Hopper+): fused routing + GEMM + activation
+  2. Triton fallback: manual align/quant/GEMM with per-block FP8 scales
 """
 
 from __future__ import annotations
@@ -22,6 +21,22 @@ SPARSITY_FACTOR = 4
 
 _FP8_BLOCK = 128
 _FP8_INFO = torch.finfo(torch.float8_e4m3fn)
+
+_USE_FLASHINFER_CUTLASS: bool | None = None
+
+def _check_flashinfer_cutlass() -> bool:
+    try:
+        from flashinfer.fused_moe import cutlass_fused_moe  # noqa: F401
+        from flashinfer.fused_moe.core import ActivationType  # noqa: F401
+        return True
+    except (ImportError, ModuleNotFoundError):
+        return False
+
+def use_flashinfer_cutlass() -> bool:
+    global _USE_FLASHINFER_CUTLASS
+    if _USE_FLASHINFER_CUTLASS is None:
+        _USE_FLASHINFER_CUTLASS = _check_flashinfer_cutlass()
+    return _USE_FLASHINFER_CUTLASS
 
 
 @triton.jit
@@ -96,17 +111,19 @@ def _quant_fp8_inplace(
 
 
 class FusedExperts(nn.Module):
-    """Fused MoE experts: two grouped GEMMs with SiLU-mul in between.
+    """Fused MoE experts with FlashInfer CUTLASS (preferred) or Triton fallback.
 
     Args (to forward):
         hidden_states: [M, K]
-        w13: [E, 2*intermediate, K] -- gate (w1) and up (w3) stacked on dim 1
+        w13: [E, 2*intermediate, K] -- W31 order for FlashInfer, W13 for Triton
         w2:  [E, K, intermediate]
         topk_weights: [M, top_k]
         topk_ids:     [M, top_k]
-        num_experts: E
+        num_experts: E (global number of experts for Triton; local for FlashInfer)
         w13_scale: [E, ceil(2*intermediate/128), ceil(K/128)] or None
         w2_scale:  [E, ceil(K/128), ceil(intermediate/128)] or None
+        ep_size: expert parallel world size (default 1)
+        ep_rank: expert parallel rank (default 0)
 
     Returns:
         output: [M, K]
@@ -119,6 +136,7 @@ class FusedExperts(nn.Module):
         self.act_fn = SiluAndMul()
         self.moe_sum = MoeSum()
         self._shared_bufs = _MoESharedBufs()
+        self._use_flashinfer = use_flashinfer_cutlass()
 
     def set_shared_bufs(self, bufs: _MoESharedBufs):
         self._shared_bufs = bufs
@@ -136,6 +154,49 @@ class FusedExperts(nn.Module):
             bufs.a2_q = torch.empty(a2_rows, N // 2, dtype=torch.float8_e4m3fn, device=device)
             bufs.a2_s = torch.empty(a2_rows, n_groups_n2, dtype=torch.float32, device=device)
 
+    def _forward_flashinfer(
+        self,
+        hidden_states: torch.Tensor,
+        w13: torch.Tensor,
+        w2: torch.Tensor,
+        topk_weights: torch.Tensor,
+        topk_ids: torch.Tensor,
+        num_experts: int,
+        w13_scale: torch.Tensor | None,
+        w2_scale: torch.Tensor | None,
+        ep_size: int,
+        ep_rank: int,
+    ) -> torch.Tensor:
+        from flashinfer.fused_moe import cutlass_fused_moe
+        from flashinfer.fused_moe.core import ActivationType
+
+        M, K = hidden_states.size()
+        is_fp8 = w13.dtype == torch.float8_e4m3fn
+
+        if is_fp8 and w13_scale is not None:
+            quant_scales = [w13_scale, w2_scale]
+        else:
+            quant_scales = None
+
+        output = torch.empty(M, K, dtype=hidden_states.dtype,
+                             device=hidden_states.device)
+
+        cutlass_fused_moe(
+            input=hidden_states,
+            token_selected_experts=topk_ids.to(torch.int),
+            token_final_scales=topk_weights,
+            fc1_expert_weights=w13,
+            fc2_expert_weights=w2,
+            output_dtype=hidden_states.dtype,
+            quant_scales=quant_scales,
+            ep_size=ep_size,
+            ep_rank=ep_rank,
+            output=output,
+            activation_type=ActivationType.Swiglu,
+            use_deepseek_fp8_block_scale=(is_fp8 and w13_scale is not None),
+        )
+        return output
+
     def forward(
         self,
         hidden_states: torch.Tensor,
@@ -146,7 +207,15 @@ class FusedExperts(nn.Module):
         num_experts: int,
         w13_scale: torch.Tensor | None = None,
         w2_scale: torch.Tensor | None = None,
+        ep_size: int = 1,
+        ep_rank: int = 0,
     ) -> torch.Tensor:
+        if self._use_flashinfer:
+            return self._forward_flashinfer(
+                hidden_states, w13, w2, topk_weights, topk_ids,
+                num_experts, w13_scale, w2_scale, ep_size, ep_rank,
+            )
+
         M, K = hidden_states.size()
         E, N2, _ = w13.size()
         N = N2 // 2

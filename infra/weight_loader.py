@@ -469,6 +469,38 @@ def _extract_mla_absorption_weights(model: torch.nn.Module) -> None:
             m._extract_absorption_weights()
 
 
+def _swap_w13_to_w31(w13: torch.Tensor) -> torch.Tensor:
+    """Swap W13 (gate||up) to W31 (up||gate) layout required by FlashInfer CUTLASS.
+
+    Input shape: [E, 2*intermediate, hidden] with gate in first half, up in second.
+    Output shape: same, but up in first half, gate in second.
+    """
+    return (
+        w13.reshape(w13.shape[0], 2, w13.shape[1] // 2, w13.shape[2])
+        .flip(dims=[1])
+        .reshape(w13.shape)
+    )
+
+
+def _swap_moe_weights_for_flashinfer(model: torch.nn.Module) -> None:
+    """Swap MoE expert W13 weights and scales from W13 to W31 layout for FlashInfer."""
+    from ..tasks.baseline.L2.fused_experts import use_flashinfer_cutlass
+    if not use_flashinfer_cutlass():
+        return
+
+    from ..tasks.baseline.L2.deepseek_moe import DeepSeekMoE
+    count = 0
+    for module in model.modules():
+        if isinstance(module, DeepSeekMoE):
+            module.w13.data = _swap_w13_to_w31(module.w13.data)
+            if module.w13_weight_scale_inv is not None:
+                module.w13_weight_scale_inv.data = _swap_w13_to_w31(
+                    module.w13_weight_scale_inv.data)
+            count += 1
+    if count > 0:
+        print(f"  Swapped W13->W31 layout for FlashInfer in {count} MoE layers.")
+
+
 def _postprocess_fp8_weights(model: torch.nn.Module) -> None:
     """Re-quantize FP8 weights to UE8M0 format and transform scale layout for DeepGEMM."""
     print("  Post-processing FP8 weights for DeepGEMM...")
@@ -601,6 +633,7 @@ def load_model(
         _extract_mla_absorption_weights(model)
         torch.cuda.synchronize()
         _postprocess_fp8_weights(model)
+        _swap_moe_weights_for_flashinfer(model)
         torch.cuda.synchronize()
         gc.collect()
         torch.cuda.empty_cache()

@@ -22,7 +22,7 @@ from ....infra.tp import _tp_rank, _tp_size, _ep_size, _ep_rank, get_ep_group
 from ..L1.allreduce import AllReduce
 from ..L1.sigmoid_topk import GroupedSigmoidTopK
 from ..L2.llama_mlp import LlamaMLP
-from ..L2.fused_experts import FusedExperts
+from ..L2.fused_experts import FusedExperts, use_flashinfer_cutlass
 
 _MOE_DP_CHUNK_SIZE = 256
 
@@ -143,6 +143,13 @@ class DeepSeekMoE(nn.Module):
         self.grouped_topk = GroupedSigmoidTopK()
         self.fused_experts = FusedExperts()
         self.allreduce = AllReduce()
+        self._use_flashinfer = use_flashinfer_cutlass()
+
+        self._shared_stream = (
+            torch.cuda.Stream() if self.shared_experts is not None
+            and not os.environ.get("KB_NANO_DISABLE_SHARED_EXPERTS_STREAM", "0") == "1"
+            else None
+        )
 
     def _w13_weight_loader(self, param, loaded_weight, expert_id: int, is_w1: bool):
         local_id = expert_id - self.expert_start
@@ -175,16 +182,18 @@ class DeepSeekMoE(nn.Module):
     def _run_routed_experts(
         self,
         hidden_states: torch.Tensor,
-        router_logits: torch.Tensor,
+        topk_weights: torch.Tensor,
+        topk_ids: torch.Tensor,
     ) -> torch.Tensor:
-        topk_weights, topk_ids = self.grouped_topk(
-            router_logits, self.top_k,
-            n_group=self.n_group,
-            topk_group=self.topk_group,
-            e_score_correction_bias=self.e_score_correction_bias,
-            routed_scaling_factor=self.routed_scaling_factor,
-            renormalize=self.norm_topk_prob,
-        )
+        if self._use_flashinfer:
+            return self.fused_experts(
+                hidden_states, self.w13, self.w2,
+                topk_weights, topk_ids, self.n_local_experts,
+                w13_scale=self.w13_weight_scale_inv,
+                w2_scale=self.w2_weight_scale_inv,
+                ep_size=self.ep_size,
+                ep_rank=self.ep_rank,
+            )
 
         if self.ep_size > 1:
             local_mask = (topk_ids >= self.expert_start) & (topk_ids < self.expert_end)
@@ -202,27 +211,55 @@ class DeepSeekMoE(nn.Module):
             w2_scale=self.w2_weight_scale_inv,
         )
 
+    def _compute_routing(self, router_logits: torch.Tensor):
+        return self.grouped_topk(
+            router_logits, self.top_k,
+            n_group=self.n_group,
+            topk_group=self.topk_group,
+            e_score_correction_bias=self.e_score_correction_bias,
+            routed_scaling_factor=self.routed_scaling_factor,
+            renormalize=self.norm_topk_prob,
+        )
+
     def forward(self, hidden_states: torch.Tensor) -> torch.Tensor:
         orig_shape = hidden_states.shape
         hidden_states = hidden_states.view(-1, self.hidden_size)
+        num_tokens = hidden_states.size(0)
 
-        shared_out = None
-        if self.shared_experts is not None:
+        use_overlap = (
+            self._shared_stream is not None
+            and self.shared_experts is not None
+            and num_tokens <= 256
+        )
+
+        if use_overlap:
+            shared_input = hidden_states.clone()
+            shared_input.record_stream(self._shared_stream)
+            main_stream = torch.cuda.current_stream()
+            self._shared_stream.wait_stream(main_stream)
+        elif self.shared_experts is not None:
             shared_out = self.shared_experts(hidden_states)
 
         router_logits = self.gate(hidden_states)
+        topk_weights, topk_ids = self._compute_routing(router_logits)
 
         ep_group = get_ep_group()
         use_ep = self.ep_size > 1 and ep_group is not None
 
         if not use_ep:
-            routed_out = self._run_routed_experts(hidden_states, router_logits)
+            routed_out = self._run_routed_experts(
+                hidden_states, topk_weights, topk_ids)
         else:
             routed_out = self._chunked_ep_forward(
-                hidden_states, router_logits, ep_group,
+                hidden_states, topk_weights, topk_ids, ep_group,
             )
 
-        if shared_out is not None:
+        if use_overlap:
+            with torch.cuda.stream(self._shared_stream):
+                shared_out = self.shared_experts(shared_input)
+            main_stream.wait_stream(self._shared_stream)
+
+        if self.shared_experts is not None:
             out = routed_out + shared_out
         else:
             out = routed_out
@@ -232,22 +269,22 @@ class DeepSeekMoE(nn.Module):
     def _chunked_ep_forward(
         self,
         hidden_states: torch.Tensor,
-        router_logits: torch.Tensor,
+        topk_weights: torch.Tensor,
+        topk_ids: torch.Tensor,
         ep_group,
     ) -> torch.Tensor:
         """Process MoE with EP, chunking only for large batches.
 
-        For small batches (decode), directly all_gather with actual size.
-        For large batches (prefill), chunk into _MOE_DP_CHUNK_SIZE pieces.
-        All ranks synchronize on max_n via all_reduce(MAX) to ensure
-        matching collective counts.
+        Routing is computed locally before gather. We gather hidden_states
+        and post-routing topk_weights/topk_ids (much smaller than full
+        router_logits).
         """
         import torch.distributed as dist
 
         local_n = hidden_states.size(0)
         ep_size = self.ep_size
         D = self.hidden_size
-        R = router_logits.size(1)
+        top_k = topk_ids.size(1)
 
         global _ep_cached_max_n
         if _ep_cached_max_n is not None:
@@ -260,52 +297,94 @@ class DeepSeekMoE(nn.Module):
 
         if max_n <= _MOE_DP_CHUNK_SIZE:
             return self._ep_forward_small(
-                hidden_states, router_logits, ep_group, local_n, max_n)
+                hidden_states, topk_weights, topk_ids,
+                ep_group, local_n, max_n)
         else:
             return self._ep_forward_chunked(
-                hidden_states, router_logits, ep_group, local_n, max_n)
+                hidden_states, topk_weights, topk_ids,
+                ep_group, local_n, max_n)
 
     def _ep_forward_small(
         self,
         hidden_states: torch.Tensor,
-        router_logits: torch.Tensor,
+        topk_weights: torch.Tensor,
+        topk_ids: torch.Tensor,
         ep_group,
         local_n: int,
         max_n: int,
     ) -> torch.Tensor:
-        """EP dispatch/combine for small batches (no chunking)."""
+        """EP dispatch/combine for small batches (no chunking).
+
+        Uses pre-allocated buffers when available (CUDA graph path).
+        """
         import torch.distributed as dist
         ep_size = self.ep_size
         D = self.hidden_size
-        R = router_logits.size(1)
+        top_k = topk_ids.size(1)
+        total = ep_size * max_n
 
-        if local_n < max_n:
-            h_pad = hidden_states.new_zeros(max_n - local_n, D)
-            h_in = torch.cat([hidden_states, h_pad], dim=0)
-            r_pad = router_logits.new_zeros(max_n - local_n, R)
-            r_in = torch.cat([router_logits, r_pad], dim=0)
+        have_bufs = getattr(self, '_ep_bufs_initialized', False)
+
+        if have_bufs:
+            h_in = self._ep_chunk_h[:max_n]
+            w_in = self._ep_chunk_w[:max_n]
+            i_in = self._ep_chunk_i[:max_n]
+            h_in[:local_n].copy_(hidden_states[:local_n])
+            w_in[:local_n].copy_(topk_weights[:local_n])
+            i_in[:local_n].copy_(topk_ids[:local_n])
+            if local_n < max_n:
+                h_in[local_n:max_n].zero_()
+                w_in[local_n:max_n].zero_()
+                i_in[local_n:max_n].zero_()
+
+            gather_h = [t[:max_n] for t in self._ep_gather_h]
+            gather_w = [t[:max_n] for t in self._ep_gather_w]
+            gather_i = [t[:max_n] for t in self._ep_gather_i]
         else:
-            h_in = hidden_states.contiguous()
-            r_in = router_logits.contiguous()
+            if local_n < max_n:
+                pad = max_n - local_n
+                h_in = torch.cat([hidden_states,
+                                  hidden_states.new_zeros(pad, D)], dim=0)
+                w_in = torch.cat([topk_weights,
+                                  topk_weights.new_zeros(pad, top_k)], dim=0)
+                i_in = torch.cat([topk_ids,
+                                  topk_ids.new_zeros(pad, top_k)], dim=0)
+            else:
+                h_in = hidden_states.contiguous()
+                w_in = topk_weights.contiguous()
+                i_in = topk_ids.contiguous()
 
-        gathered_h = [torch.empty_like(h_in) for _ in range(ep_size)]
-        dist.all_gather(gathered_h, h_in, group=ep_group)
-        gathered_r = [torch.empty_like(r_in) for _ in range(ep_size)]
-        dist.all_gather(gathered_r, r_in, group=ep_group)
+            gather_h = [torch.empty_like(h_in) for _ in range(ep_size)]
+            gather_w = [torch.empty_like(w_in) for _ in range(ep_size)]
+            gather_i = [torch.empty_like(i_in) for _ in range(ep_size)]
 
-        all_h = torch.cat(gathered_h, dim=0)
-        all_r = torch.cat(gathered_r, dim=0)
+        dist.all_gather(gather_h, h_in, group=ep_group)
+        dist.all_gather(gather_w, w_in, group=ep_group)
+        dist.all_gather(gather_i, i_in, group=ep_group)
 
-        out = self._run_routed_experts(all_h, all_r)
+        if have_bufs:
+            all_h = self._ep_buf_h[:total]
+            all_w = self._ep_buf_w[:total]
+            all_i = self._ep_buf_i[:total]
+        else:
+            all_h = torch.cat(gather_h, dim=0)
+            all_w = torch.cat(gather_w, dim=0)
+            all_i = torch.cat(gather_i, dim=0)
 
-        rs_out = torch.empty(max_n, D, dtype=out.dtype, device=out.device)
+        out = self._run_routed_experts(all_h, all_w, all_i)
+
+        if have_bufs:
+            rs_out = self._ep_rs_out[:max_n]
+        else:
+            rs_out = torch.empty(max_n, D, dtype=out.dtype, device=out.device)
         dist.reduce_scatter_tensor(rs_out, out, group=ep_group)
         return rs_out[:local_n]
 
     def _ep_forward_chunked(
         self,
         hidden_states: torch.Tensor,
-        router_logits: torch.Tensor,
+        topk_weights: torch.Tensor,
+        topk_ids: torch.Tensor,
         ep_group,
         local_n: int,
         max_n: int,
@@ -316,7 +395,7 @@ class DeepSeekMoE(nn.Module):
         chunk_size = _MOE_DP_CHUNK_SIZE
         ep_size = self.ep_size
         D = self.hidden_size
-        R = router_logits.size(1)
+        top_k = topk_ids.size(1)
         total_gathered = ep_size * chunk_size
         num_chunks = (max_n + chunk_size - 1) // chunk_size
 
@@ -327,18 +406,25 @@ class DeepSeekMoE(nn.Module):
         if need_init:
             dev = hidden_states.device
             dt_h = hidden_states.dtype
-            dt_r = router_logits.dtype
+            dt_w = topk_weights.dtype
+            dt_i = topk_ids.dtype
             self._ep_buf_h = torch.empty(total_gathered, D, dtype=dt_h, device=dev)
-            self._ep_buf_r = torch.empty(total_gathered, R, dtype=dt_r, device=dev)
+            self._ep_buf_w = torch.empty(total_gathered, top_k, dtype=dt_w, device=dev)
+            self._ep_buf_i = torch.empty(total_gathered, top_k, dtype=dt_i, device=dev)
             self._ep_chunk_h = torch.empty(chunk_size, D, dtype=dt_h, device=dev)
-            self._ep_chunk_r = torch.empty(chunk_size, R, dtype=dt_r, device=dev)
+            self._ep_chunk_w = torch.empty(chunk_size, top_k, dtype=dt_w, device=dev)
+            self._ep_chunk_i = torch.empty(chunk_size, top_k, dtype=dt_i, device=dev)
             self._ep_rs_out = torch.empty(chunk_size, D, dtype=dt_h, device=dev)
             self._ep_gather_h = [
                 self._ep_buf_h[i * chunk_size:(i + 1) * chunk_size]
                 for i in range(ep_size)
             ]
-            self._ep_gather_r = [
-                self._ep_buf_r[i * chunk_size:(i + 1) * chunk_size]
+            self._ep_gather_w = [
+                self._ep_buf_w[i * chunk_size:(i + 1) * chunk_size]
+                for i in range(ep_size)
+            ]
+            self._ep_gather_i = [
+                self._ep_buf_i[i * chunk_size:(i + 1) * chunk_size]
                 for i in range(ep_size)
             ]
             self._ep_bufs_initialized = True
@@ -351,17 +437,22 @@ class DeepSeekMoE(nn.Module):
             actual = max(c_end - c_start, 0)
 
             h_chunk = self._ep_chunk_h
-            r_chunk = self._ep_chunk_r
+            w_chunk = self._ep_chunk_w
+            i_chunk = self._ep_chunk_i
             h_chunk.zero_()
-            r_chunk.zero_()
+            w_chunk.zero_()
+            i_chunk.zero_()
             if actual > 0:
                 h_chunk[:actual].copy_(hidden_states[c_start:c_end])
-                r_chunk[:actual].copy_(router_logits[c_start:c_end])
+                w_chunk[:actual].copy_(topk_weights[c_start:c_end])
+                i_chunk[:actual].copy_(topk_ids[c_start:c_end])
 
             dist.all_gather(self._ep_gather_h, h_chunk, group=ep_group)
-            dist.all_gather(self._ep_gather_r, r_chunk, group=ep_group)
+            dist.all_gather(self._ep_gather_w, w_chunk, group=ep_group)
+            dist.all_gather(self._ep_gather_i, i_chunk, group=ep_group)
 
-            chunk_out = self._run_routed_experts(self._ep_buf_h, self._ep_buf_r)
+            chunk_out = self._run_routed_experts(
+                self._ep_buf_h, self._ep_buf_w, self._ep_buf_i)
 
             dist.reduce_scatter_tensor(self._ep_rs_out, chunk_out, group=ep_group)
 

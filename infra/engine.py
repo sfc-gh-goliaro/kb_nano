@@ -513,7 +513,7 @@ class ModelRunner:
         room for the larger buffers.  This mirrors vLLM's profile_run which
         runs at max_num_batched_tokens to size everything before KV allocation.
         """
-        from ..tasks.baseline.L2.fused_experts import FusedExperts
+        from ..tasks.baseline.L2.fused_experts import FusedExperts, use_flashinfer_cutlass
         from .tp import _ep_size
 
         fused = [m for m in self.model.modules() if isinstance(m, FusedExperts)]
@@ -521,48 +521,85 @@ class ModelRunner:
             return
 
         ep = _ep_size()
-        if ep > 1:
-            M = 256 * ep
-        else:
-            M = self.max_num_batched_tokens
         device = next(self.model.parameters()).device
-
         cfg = self.config
         K = cfg.hidden_size
         N2 = 2 * getattr(cfg, 'moe_intermediate_size', getattr(cfg, 'intermediate_size', K))
         top_k = getattr(cfg, 'num_experts_per_tok', 8)
-
-        bufs = fused[0]._shared_bufs
         dtype = next(self.model.parameters()).dtype
 
-        bufs.get_cache("cache1", (M * top_k, N2), device, dtype)
-        bufs.get_cache("cache3", (M * top_k, K), device, dtype)
+        if not use_flashinfer_cutlass():
+            if ep > 1:
+                M = 256 * ep
+            else:
+                M = self.max_num_batched_tokens
 
-        is_fp8 = any(
-            hasattr(m, 'w13') and m.w13 is not None and m.w13.dtype == torch.float8_e4m3fn
-            for m in self.model.modules()
-            if hasattr(m, 'w13')
-        )
-        if is_fp8:
-            fused[0]._ensure_fp8_bufs(M, K, N2, top_k, device)
+            bufs = fused[0]._shared_bufs
+            bufs.get_cache("cache1", (M * top_k, N2), device, dtype)
+            bufs.get_cache("cache3", (M * top_k, K), device, dtype)
 
-        from ..tasks.baseline.L1.silu_and_mul import SiluAndMul
-        silu_modules = [m for m in self.model.modules() if isinstance(m, SiluAndMul)]
-        if silu_modules:
-            half = N2 // 2
-            silu_modules[0]._act_buf.get(M * top_k, half, device, dtype)
+            is_fp8 = any(
+                hasattr(m, 'w13') and m.w13 is not None and m.w13.dtype == torch.float8_e4m3fn
+                for m in self.model.modules()
+                if hasattr(m, 'w13')
+            )
+            if is_fp8:
+                fused[0]._ensure_fp8_bufs(M, K, N2, top_k, device)
 
-        from ..tasks.baseline.L1.moe_sum import MoeSum
-        moe_sums = [m for m in self.model.modules() if isinstance(m, MoeSum)]
-        if moe_sums:
-            moe_sums[0]._buf.get(M, K, device, dtype)
+            from ..tasks.baseline.L1.silu_and_mul import SiluAndMul
+            silu_modules = [m for m in self.model.modules() if isinstance(m, SiluAndMul)]
+            if silu_modules:
+                half = N2 // 2
+                silu_modules[0]._act_buf.get(M * top_k, half, device, dtype)
+
+            from ..tasks.baseline.L1.moe_sum import MoeSum
+            moe_sums = [m for m in self.model.modules() if isinstance(m, MoeSum)]
+            if moe_sums:
+                moe_sums[0]._buf.get(M, K, device, dtype)
+
+        if ep > 1:
+            self._presize_ep_buffers(ep, K, top_k, device, dtype)
 
         torch.cuda.synchronize()
         if self.rank == 0:
             _GiB = 1 << 30
             mem = torch.cuda.memory_allocated() / _GiB
-            print(f"  After MoE buffer pre-sizing (M={M}, top_k={top_k}, ep={ep}): "
-                  f"allocated={mem:.1f}G")
+            print(f"  After MoE buffer pre-sizing (top_k={top_k}, ep={ep}, "
+                  f"flashinfer={use_flashinfer_cutlass()}): allocated={mem:.1f}G")
+
+    def _presize_ep_buffers(self, ep_size, D, top_k, device, dtype):
+        """Pre-allocate EP gather/scatter buffers for the small (decode) path.
+
+        This ensures no dynamic allocation occurs during CUDA graph capture
+        or replay. Buffers are sized for max_num_seqs per EP rank.
+        """
+        from ..tasks.baseline.L2.deepseek_moe import DeepSeekMoE
+        max_n = self.max_num_seqs
+        total_gathered = ep_size * max_n
+
+        for m in self.model.modules():
+            if not isinstance(m, DeepSeekMoE):
+                continue
+            m._ep_buf_h = torch.empty(total_gathered, D, dtype=dtype, device=device)
+            m._ep_buf_w = torch.empty(total_gathered, top_k, dtype=dtype, device=device)
+            m._ep_buf_i = torch.empty(total_gathered, top_k, dtype=torch.int64, device=device)
+            m._ep_chunk_h = torch.empty(max_n, D, dtype=dtype, device=device)
+            m._ep_chunk_w = torch.empty(max_n, top_k, dtype=dtype, device=device)
+            m._ep_chunk_i = torch.empty(max_n, top_k, dtype=torch.int64, device=device)
+            m._ep_rs_out = torch.empty(max_n, D, dtype=dtype, device=device)
+            m._ep_gather_h = [
+                m._ep_buf_h[i * max_n:(i + 1) * max_n]
+                for i in range(ep_size)
+            ]
+            m._ep_gather_w = [
+                m._ep_buf_w[i * max_n:(i + 1) * max_n]
+                for i in range(ep_size)
+            ]
+            m._ep_gather_i = [
+                m._ep_buf_i[i * max_n:(i + 1) * max_n]
+                for i in range(ep_size)
+            ]
+            m._ep_bufs_initialized = True
 
     def _warmup_deepgemm(self):
         """Pre-JIT DeepGEMM FP8 kernels for all weight shapes at decode and
@@ -1097,6 +1134,9 @@ class ModelRunner:
     def run_model(self, input_ids, positions, is_prefill, inputs_embeds=None,
                   deepstack_embeds=None):
         if is_prefill or self.enforce_eager or input_ids.size(0) > self.graph_bs_list[-1]:
+            if self.enable_expert_parallel:
+                from ..tasks.baseline.L2.deepseek_moe import set_ep_max_n
+                set_ep_max_n(None)
             if inputs_embeds is not None:
                 return self.model.compute_logits(
                     self.model(input_ids, positions, inputs_embeds=inputs_embeds,
@@ -1106,6 +1146,9 @@ class ModelRunner:
         bs = input_ids.size(0)
         ctx = get_context()
         graph_bs = self._graph_bs_for_n[bs]
+        if self.enable_expert_parallel:
+            from ..tasks.baseline.L2.deepseek_moe import set_ep_max_n
+            set_ep_max_n(graph_bs)
         gv = self.graph_vars
         gv["input_ids"][:bs] = input_ids
         gv["positions"][:bs] = positions
@@ -1147,6 +1190,10 @@ class ModelRunner:
         gv = self.graph_vars
         graph_bs = self._graph_bs_for_n[n]
         prev_n = getattr(self, '_prev_decode_n', -1)
+
+        if self.enable_expert_parallel:
+            from ..tasks.baseline.L2.deepseek_moe import set_ep_max_n
+            set_ep_max_n(graph_bs)
 
         gv["input_ids"][:n].copy_(torch.from_numpy(ids_np), non_blocking=True)
         gv["positions"][:n].copy_(torch.from_numpy(pos_np), non_blocking=True)
@@ -1508,6 +1555,10 @@ class ModelRunner:
         lm_max_vals = torch.zeros(max_bs)
         lm_max_idxs = torch.zeros(max_bs, dtype=torch.int64)
 
+        use_ep = self.enable_expert_parallel
+        if use_ep:
+            from ..tasks.baseline.L2.deepseek_moe import set_ep_max_n
+
         ar_ctx = self.custom_ar.capture() if self.custom_ar is not None else nullcontext()
         with ar_ctx:
             for bs in reversed(self.graph_bs_list):
@@ -1517,6 +1568,8 @@ class ModelRunner:
                     context_lens=context_lens[:bs], block_tables=block_tables[:bs],
                     max_context_len=self.max_model_len,
                 )
+                if use_ep:
+                    set_ep_max_n(bs)
                 outputs[:bs] = self.model(input_ids[:bs], positions[:bs])
                 lm_logits[:bs] = lm_head.linear_op(outputs[:bs], lm_head.weight).float()
                 lm_max_vals[:bs], lm_max_idxs[:bs] = lm_logits[:bs].max(dim=-1)
@@ -1531,6 +1584,9 @@ class ModelRunner:
                 self.graphs[bs] = graph
                 torch.cuda.synchronize()
                 reset_context()
+
+        if use_ep:
+            set_ep_max_n(None)
 
         self.graph_vars = dict(
             input_ids=input_ids, positions=positions,
@@ -1569,8 +1625,6 @@ class LlamaEngine:
         self.seed = seed
         self.max_num_seqs = max_num_seqs if max_num_seqs is not None else _DEFAULT_MAX_NUM_SEQS
         self.max_num_batched_tokens = max_num_batched_tokens if max_num_batched_tokens is not None else _DEFAULT_MAX_NUM_BATCHED_TOKENS
-        if enable_expert_parallel:
-            enforce_eager = True
         self.data_parallel_size = data_parallel_size
         self.enable_expert_parallel = enable_expert_parallel
         self._set_seeds(seed)
