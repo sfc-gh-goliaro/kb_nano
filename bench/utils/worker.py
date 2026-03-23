@@ -15,13 +15,7 @@ import sys
 import tempfile
 
 
-def run_worker(
-    script: str,
-    config: dict,
-    label: str,
-    timeout: int = 3600,
-    log_dir: str | None = None,
-) -> dict | None:
+def run_worker(script: str, config: dict, label: str, timeout: int = 3600) -> dict | None:
     """Run a worker script in a subprocess and return parsed JSON output.
 
     Args:
@@ -30,8 +24,6 @@ def run_worker(
                 An ``output_file`` key is added automatically.
         label: Human-readable label printed before/after execution.
         timeout: Maximum wall-clock seconds before the subprocess is killed.
-        log_dir: If set, redirect both stdout and stderr to a log file in
-                 this directory.  Monitor progress with ``tail -f``.
 
     Returns:
         Parsed JSON dict written by the worker to ``output_file``, or None on
@@ -53,40 +45,22 @@ def run_worker(
         json.dump(config, f)
         config_path = f.name
 
-    safe_label = label.replace(" ", "_").replace("/", "-")
-    log_path = None
-    if log_dir:
-        os.makedirs(log_dir, exist_ok=True)
-        log_path = os.path.join(log_dir, f"{safe_label}.log")
-
     try:
         print(f"\n{'─' * 70}")
         print(f"  {label}")
-        if log_path:
-            print(f"  stdout log: {log_path}")
         print(f"{'─' * 70}", flush=True)
 
-        log_fh = open(log_path, "w") if log_path else None
-        try:
-            proc = subprocess.Popen(
-                [sys.executable, "-u", script_path, config_path],
-                stdout=log_fh if log_fh else None,
-                stderr=log_fh if log_fh else None,
-            )
-            proc.wait(timeout=timeout)
-        finally:
-            if log_fh:
-                log_fh.close()
-
-        if proc.returncode != 0:
-            print(f"  ERROR: {label} failed with exit code {proc.returncode}")
+        result = subprocess.run(
+            [sys.executable, "-u", script_path, config_path],
+            timeout=timeout,
+        )
+        if result.returncode != 0:
+            print(f"  ERROR: {label} failed with exit code {result.returncode}")
             return None
 
         with open(output_path) as f:
             return json.loads(f.read())
     except subprocess.TimeoutExpired:
-        proc.kill()
-        proc.wait()
         print(f"  ERROR: {label} timed out after {timeout}s")
         return None
     finally:

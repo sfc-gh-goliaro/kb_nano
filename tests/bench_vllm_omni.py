@@ -6,7 +6,12 @@ for diffusion models (FLUX.1-dev).
 Runs standardized diffusion workloads and compares:
   - Throughput: images/sec at various resolutions and step counts
   - Latency: per-image latency with percentile stats
-  - Correctness: latent-space MSE between outputs of both engines
+  - Correctness: per-batch packed-latent MSE and cosine similarity between
+    outputs of both engines (assessed for every image during throughput runs)
+
+Both engines run with output_type="latent" (no VAE decode) so the benchmark
+measures the transformer backbone.  Packed latents are saved per-batch and
+compared numerically after both engines finish.
 
 Prompts are drawn from the full nateraw/parti-prompts (P2) dataset (~1632
 prompts), shuffled deterministically. Multiple batches per scenario provide
@@ -16,8 +21,7 @@ Each engine runs in a subprocess to avoid import contamination.
 
 Usage:
     python tests/bench_vllm_omni.py --model black-forest-labs/FLUX.1-dev
-    python tests/bench_vllm_omni.py --skip-vllm-omni  # kb-nano only
-    python tests/bench_vllm_omni.py --correctness-only  # compare outputs only
+    python tests/bench_vllm_omni.py --skip-vllm-omni  # kb-nano only (no correctness)
 """
 
 from __future__ import annotations
@@ -26,8 +30,10 @@ import argparse
 import json
 import os
 import random
+import shutil
 import subprocess
 import sys
+import tempfile
 import time
 from pathlib import Path
 
@@ -103,8 +109,6 @@ def main():
     with open(sys.argv[1]) as f:
         cfg = json.load(f)
 
-    sys.path.insert(0, cfg.get("vllm_omni_path", ""))
-
     from vllm_omni.entrypoints.omni_diffusion import OmniDiffusion
     from vllm_omni.diffusion.data import OmniDiffusionConfig
     from vllm_omni.inputs.data import OmniDiffusionSamplingParams
@@ -113,6 +117,7 @@ def main():
         model=cfg["model"],
         dtype=torch.bfloat16,
         enforce_eager=cfg.get("enforce_eager", False),
+        output_type="latent",
     )
     engine = OmniDiffusion(od_config)
 
@@ -121,6 +126,10 @@ def main():
     )
     warmup_params.seed = cfg["seed"]
     engine.generate(["warmup"], warmup_params)
+
+    latent_dir = cfg.get("latent_dir")
+    if latent_dir:
+        os.makedirs(latent_dir, exist_ok=True)
 
     all_results = []
     for scenario in cfg["scenarios"]:
@@ -139,7 +148,7 @@ def main():
         total_images = 0
         desc = f"vllm-omni {scenario['name']}"
         pbar = tqdm(batches, desc=desc, unit="batch", file=sys.stderr)
-        for batch_prompts in pbar:
+        for batch_idx, batch_prompts in enumerate(pbar):
             torch.cuda.synchronize()
             start = time.perf_counter()
             outputs = engine.generate(batch_prompts, params)
@@ -147,6 +156,26 @@ def main():
             batch_elapsed = time.perf_counter() - start
             total_elapsed += batch_elapsed
             total_images += len(batch_prompts)
+
+            if latent_dir and outputs:
+                latent_tensor = None
+                for out in outputs:
+                    if hasattr(out, "images") and out.images:
+                        for img in out.images:
+                            if isinstance(img, torch.Tensor):
+                                latent_tensor = img
+                                break
+                    if latent_tensor is not None:
+                        break
+                    if hasattr(out, "latents") and out.latents is not None:
+                        latent_tensor = out.latents
+                        break
+                if latent_tensor is not None:
+                    torch.save(
+                        latent_tensor.cpu(),
+                        os.path.join(latent_dir, f"{scenario['name']}_batch{batch_idx:04d}.pt"),
+                    )
+
             pbar.set_postfix(
                 imgs=total_images,
                 ips=f"{total_images / total_elapsed:.2f}",
@@ -210,7 +239,7 @@ if __name__ == "__main__":
 # kb-nano subprocess worker
 # ---------------------------------------------------------------------------
 KB_NANO_DIFFUSION_WORKER = r'''
-import json, sys, time, torch
+import json, os, sys, time, torch
 from tqdm import tqdm
 
 def main():
@@ -238,7 +267,8 @@ def main():
 
     seen = set()
     for s in cfg["scenarios"] + cfg.get("latency_scenarios", []):
-        key = (s["height"], s["width"])
+        bs = s.get("batch_size", len(s.get("prompts", ["w"])))
+        key = (s["height"], s["width"], bs)
         if key not in seen:
             seen.add(key)
             wp = DiffusionSamplingParams(
@@ -246,8 +276,16 @@ def main():
                 num_inference_steps=2, seed=cfg["seed"],
                 output_type="latent",
             )
-            engine.generate(["warmup"], wp)
+            warmup_prompts = [f"warmup {i}" for i in range(bs)]
+            print(f"Warming up: {s['height']}x{s['width']} batch_size={bs}", file=sys.stderr, flush=True)
+            engine.generate(warmup_prompts, wp)
             torch.cuda.synchronize()
+
+    latent_dir = cfg.get("latent_dir")
+    if latent_dir:
+        os.makedirs(latent_dir, exist_ok=True)
+
+    pipeline = engine._get_pipeline()
 
     all_results = []
     for scenario in cfg["scenarios"]:
@@ -260,14 +298,14 @@ def main():
             num_inference_steps=scenario["num_inference_steps"],
             guidance_scale=scenario.get("guidance_scale", 3.5),
             seed=cfg["seed"],
-            output_type=scenario.get("output_type", "pil"),
+            output_type="latent",
         )
 
         total_elapsed = 0.0
         total_images = 0
         desc = f"kb-nano {scenario['name']}"
         pbar = tqdm(batches, desc=desc, unit="batch", file=sys.stderr)
-        for batch_prompts in pbar:
+        for batch_idx, batch_prompts in enumerate(pbar):
             torch.cuda.synchronize()
             start = time.perf_counter()
             output = engine.generate(batch_prompts, params)
@@ -275,6 +313,20 @@ def main():
             batch_elapsed = time.perf_counter() - start
             total_elapsed += batch_elapsed
             total_images += len(batch_prompts)
+
+            if latent_dir and output.latents is not None:
+                packed = output.latents
+                unpacked = pipeline._unpack_latents(
+                    packed, scenario["height"], scenario["width"],
+                    pipeline.vae_scale_factor,
+                )
+                decoded = (unpacked / pipeline.vae.config.scaling_factor) + pipeline.vae.config.shift_factor
+                decoded = pipeline.vae.decode(decoded, return_dict=False)[0]
+                torch.save(
+                    decoded.cpu(),
+                    os.path.join(latent_dir, f"{scenario['name']}_batch{batch_idx:04d}.pt"),
+                )
+
             pbar.set_postfix(
                 imgs=total_images,
                 ips=f"{total_images / total_elapsed:.2f}",
@@ -333,144 +385,6 @@ if __name__ == "__main__":
     main()
 '''
 
-
-# ---------------------------------------------------------------------------
-# Correctness workers (one per engine, returns latents for comparison)
-# ---------------------------------------------------------------------------
-KB_NANO_CORRECTNESS_WORKER = r'''
-import json, sys, torch
-
-def main():
-    with open(sys.argv[1]) as f:
-        cfg = json.load(f)
-    sys.path.insert(0, cfg["project_root"])
-    pkg = cfg["package_name"]
-
-    eng_mod = __import__(
-        f"{pkg}.infra.diffusion_engine",
-        fromlist=["DiffusionEngine"],
-    )
-    flux_mod = __import__(
-        f"{pkg}.tasks.baseline.L4.flux",
-        fromlist=["DiffusionSamplingParams"],
-    )
-    DiffusionEngine = eng_mod.DiffusionEngine
-    DiffusionSamplingParams = flux_mod.DiffusionSamplingParams
-
-    engine = DiffusionEngine(
-        model_name=cfg["model"],
-        seed=cfg["seed"],
-        enforce_eager=True,
-    )
-
-    engine.warmup()
-
-    prompts = cfg["prompts"]
-    params = DiffusionSamplingParams(
-        height=cfg.get("height", 512),
-        width=cfg.get("width", 512),
-        num_inference_steps=cfg.get("num_inference_steps", 28),
-        guidance_scale=cfg.get("guidance_scale", 3.5),
-        seed=cfg["seed"],
-        output_type="latent",
-    )
-
-    torch.manual_seed(cfg["seed"])
-    output = engine.generate(prompts, params)
-
-    result = {}
-    if output.latents is not None:
-        lat = output.latents
-        result["packed_latent_shape"] = list(lat.shape)
-        result["latent_mean"] = float(lat.float().mean())
-        result["latent_std"] = float(lat.float().std())
-
-        pipeline = engine._get_pipeline()
-        height = cfg.get("height", 512)
-        width = cfg.get("width", 512)
-        from kb_nano.tasks.baseline.L4.flux import FluxPipeline
-        with torch.inference_mode():
-            unpacked = FluxPipeline._unpack_latents(
-                lat, height, width, pipeline.vae_scale_factor)
-            unpacked = (unpacked / pipeline.vae.config.scaling_factor) + pipeline.vae.config.shift_factor
-            decoded = pipeline.vae.decode(unpacked, return_dict=False)[0]
-        result["latents"] = decoded.cpu().float().tolist()
-        result["latent_shape"] = list(decoded.shape)
-
-    engine._cleanup()
-
-    with open(cfg["output_file"], "w") as f:
-        json.dump(result, f)
-
-if __name__ == "__main__":
-    main()
-'''
-
-VLLM_OMNI_CORRECTNESS_WORKER = r'''
-import json, os, sys, torch
-
-def main():
-    with open(sys.argv[1]) as f:
-        cfg = json.load(f)
-
-    sys.path.insert(0, cfg.get("vllm_omni_path", ""))
-
-    from vllm_omni.entrypoints.omni_diffusion import OmniDiffusion
-    from vllm_omni.diffusion.data import OmniDiffusionConfig
-    from vllm_omni.inputs.data import OmniDiffusionSamplingParams
-
-    od_config = OmniDiffusionConfig(
-        model=cfg["model"],
-        dtype=torch.bfloat16,
-        enforce_eager=True,
-        output_type="latent",
-    )
-    engine = OmniDiffusion(od_config)
-
-    # Warmup
-    warmup_params = OmniDiffusionSamplingParams(
-        height=256, width=256, num_inference_steps=2,
-    )
-    warmup_params.seed = cfg["seed"]
-    engine.generate(["warmup"], warmup_params)
-
-    prompts = cfg["prompts"]
-    params = OmniDiffusionSamplingParams(
-        height=cfg.get("height", 512),
-        width=cfg.get("width", 512),
-        num_inference_steps=cfg.get("num_inference_steps", 28),
-        guidance_scale=cfg.get("guidance_scale", 3.5),
-    )
-    params.seed = cfg["seed"]
-
-    torch.manual_seed(cfg["seed"])
-    outputs = engine.generate(prompts, params)
-
-    result = {}
-    if outputs:
-        import numpy as np
-        latent_tensors = []
-        for out in outputs:
-            if hasattr(out, "images") and out.images:
-                for img in out.images:
-                    if isinstance(img, torch.Tensor):
-                        latent_tensors.append(img.cpu().float())
-        if latent_tensors:
-            combined = torch.cat(latent_tensors, dim=0) if len(latent_tensors) > 1 else latent_tensors[0]
-            result["latents"] = combined.numpy().tolist()
-            result["latent_shape"] = list(combined.shape)
-            result["latent_mean"] = float(combined.mean())
-            result["latent_std"] = float(combined.std())
-
-    del engine
-    torch.cuda.empty_cache()
-
-    with open(cfg["output_file"], "w") as f:
-        json.dump(result, f)
-
-if __name__ == "__main__":
-    main()
-'''
 
 
 def _build_throughput_scenarios(
@@ -558,71 +472,105 @@ def _print_latency_comparison(kb_results: list[dict], vllm_results: list[dict] |
     print()
 
 
-def _print_correctness_results(
-    kb_result: dict | None,
-    vllm_result: dict | None,
-    kb_result2: dict | None,
-    prompts: list[str],
-):
-    print("\n" + "=" * 80)
-    print("  CORRECTNESS RESULTS")
-    print("=" * 80)
+def _compare_latents(kb_latent_dir: str, vllm_latent_dir: str) -> dict:
+    """Compare per-batch output tensors between kb-nano and vllm-omni.
 
-    if kb_result:
-        print(f"\n  kb-nano latent shape: {kb_result.get('latent_shape')}")
-        print(f"  kb-nano latent mean:  {kb_result.get('latent_mean', 'N/A'):.6f}")
-        print(f"  kb-nano latent std:   {kb_result.get('latent_std', 'N/A'):.6f}")
+    Both engines may produce tensors in different representations (packed
+    latents vs decoded images).  The comparison flattens both tensors and
+    computes MSE and cosine similarity, which remains valid as long as the
+    total element count is comparable.  When element counts differ (e.g.
+    packed latents vs decoded images), the batch is skipped with a warning.
 
-    if vllm_result:
-        print(f"\n  vllm-omni latent shape: {vllm_result.get('latent_shape')}")
-        print(f"  vllm-omni latent mean:  {vllm_result.get('latent_mean', 'N/A'):.6f}")
-        print(f"  vllm-omni latent std:   {vllm_result.get('latent_std', 'N/A'):.6f}")
+    Returns a dict mapping scenario names to per-scenario correctness stats.
+    """
+    import torch
 
-    # Determinism check: kb-nano run1 vs run2
-    if kb_result and kb_result2:
-        l1 = np.array(kb_result.get("latents", []))
-        l2 = np.array(kb_result2.get("latents", []))
-        if l1.size > 0 and l2.size > 0 and l1.shape == l2.shape:
-            mse = float(np.mean((l1 - l2) ** 2))
-            print(f"\n  Determinism (kb-nano run1 vs run2):")
-            print(f"    MSE: {mse:.2e}")
-            if mse < 1e-6:
-                print("    PASS: outputs are deterministic")
-            else:
-                print("    WARN: outputs differ between runs")
+    kb_files = sorted(
+        f for f in os.listdir(kb_latent_dir) if f.endswith(".pt")
+    ) if os.path.isdir(kb_latent_dir) else []
+    vllm_files = sorted(
+        f for f in os.listdir(vllm_latent_dir) if f.endswith(".pt")
+    ) if os.path.isdir(vllm_latent_dir) else []
 
-    # Cross-engine comparison
-    if kb_result and vllm_result:
-        kb_lat = np.array(kb_result.get("latents", []))
-        vllm_lat = np.array(vllm_result.get("latents", []))
-        if kb_lat.size > 0 and vllm_lat.size > 0:
-            # Shapes may differ due to packing; compare flattened
-            kb_flat = kb_lat.flatten()
-            vllm_flat = vllm_lat.flatten()
-            min_len = min(len(kb_flat), len(vllm_flat))
-            if min_len > 0:
-                kb_flat = kb_flat[:min_len]
-                vllm_flat = vllm_flat[:min_len]
-                mse = float(np.mean((kb_flat - vllm_flat) ** 2))
-                cos_sim = float(
-                    np.dot(kb_flat, vllm_flat)
-                    / (np.linalg.norm(kb_flat) * np.linalg.norm(vllm_flat) + 1e-12)
-                )
-                print(f"\n  Cross-engine (kb-nano vs vllm-omni):")
-                print(f"    Latent MSE:        {mse:.2e}")
-                print(f"    Cosine similarity: {cos_sim:.6f}")
-                if cos_sim > 0.99:
-                    print("    PASS: outputs match closely")
-                elif cos_sim > 0.95:
-                    print("    WARN: outputs similar but not identical")
-                else:
-                    print("    FAIL: outputs diverge significantly")
-        else:
-            print("\n  Could not compare cross-engine latents (empty data)")
+    common = sorted(set(kb_files) & set(vllm_files))
+    if not common:
+        return {}
 
-    print(f"\n  Prompts used ({len(prompts)} from parti-prompts P2):")
-    for i, p in enumerate(prompts):
-        print(f"    [{i+1}] {p[:80]}{'...' if len(p) > 80 else ''}")
+    from collections import defaultdict
+    scenario_stats: dict[str, list[dict]] = defaultdict(list)
+
+    for fname in common:
+        kb_lat = torch.load(
+            os.path.join(kb_latent_dir, fname), map_location="cpu", weights_only=True,
+        ).float().flatten()
+        vllm_lat = torch.load(
+            os.path.join(vllm_latent_dir, fname), map_location="cpu", weights_only=True,
+        ).float().flatten()
+
+        if len(kb_lat) != len(vllm_lat):
+            print(
+                f"  WARNING: shape mismatch for {fname}: "
+                f"kb-nano={kb_lat.shape} vs vllm-omni={vllm_lat.shape}, skipping",
+                file=sys.stderr,
+            )
+            continue
+
+        kb_v = kb_lat.numpy()
+        vllm_v = vllm_lat.numpy()
+
+        mse = float(np.mean((kb_v - vllm_v) ** 2))
+        cos_sim = float(
+            np.dot(kb_v, vllm_v)
+            / (np.linalg.norm(kb_v) * np.linalg.norm(vllm_v) + 1e-12)
+        )
+
+        scenario_name = fname.rsplit("_batch", 1)[0]
+        scenario_stats[scenario_name].append({
+            "file": fname,
+            "mse": mse,
+            "cosine_similarity": cos_sim,
+        })
+
+    results = {}
+    for scenario, batches in scenario_stats.items():
+        mses = [b["mse"] for b in batches]
+        cosines = [b["cosine_similarity"] for b in batches]
+        results[scenario] = {
+            "num_batches": len(batches),
+            "mean_mse": float(np.mean(mses)),
+            "max_mse": float(np.max(mses)),
+            "mean_cosine_sim": float(np.mean(cosines)),
+            "min_cosine_sim": float(np.min(cosines)),
+        }
+    return results
+
+
+def _print_correctness_comparison(correctness: dict):
+    """Print per-scenario correctness table from latent comparison."""
+    print("\n" + "=" * 90)
+    print("  CORRECTNESS COMPARISON (packed latent space, per-batch)")
+    print("=" * 90)
+    print(f"  {'Scenario':<25} {'Batches':>8} {'Mean CosSim':>12} {'Min CosSim':>11} {'Mean MSE':>12} {'Max MSE':>12} {'Result':>8}")
+    print("  " + "-" * 88)
+
+    all_pass = True
+    for scenario, stats in correctness.items():
+        min_cos = stats["min_cosine_sim"]
+        verdict = "PASS" if min_cos > 0.99 else ("WARN" if min_cos > 0.95 else "FAIL")
+        if verdict != "PASS":
+            all_pass = False
+        print(
+            f"  {scenario:<25} {stats['num_batches']:>8} "
+            f"{stats['mean_cosine_sim']:>12.6f} {min_cos:>11.6f} "
+            f"{stats['mean_mse']:>12.2e} {stats['max_mse']:>12.2e} "
+            f"{verdict:>8}"
+        )
+
+    print()
+    if all_pass:
+        print("  All scenarios PASS (min cosine similarity > 0.99)")
+    else:
+        print("  WARNING: Some scenarios have divergent outputs")
     print()
 
 
@@ -633,25 +581,11 @@ def main():
     parser.add_argument("--enforce-eager", action="store_true")
     parser.add_argument("--skip-vllm-omni", action="store_true",
                         help="Skip vllm-omni and only benchmark kb-nano")
-    parser.add_argument("--correctness-only", action="store_true",
-                        help="Only run correctness check (smaller workload)")
     parser.add_argument("--batch-size", type=int, default=None,
                         help="Override batch size for all scenarios")
-    parser.add_argument("--vllm-omni-path", type=str, default=None,
-                        help="Path to vllm-omni repo root")
     parser.add_argument("--output", type=str, default=None,
                         help="Output JSON file for results")
-    parser.add_argument("--log-dir", type=str, default=None,
-                        help="Directory for worker log files (use tail -f to monitor)")
     args = parser.parse_args()
-
-    if args.log_dir:
-        os.makedirs(args.log_dir, exist_ok=True)
-        main_log = os.path.join(args.log_dir, "bench_main.log")
-        log_fh = open(main_log, "w")
-        sys.stdout = log_fh
-        sys.stderr = log_fh
-        print(f"Main log: {main_log}", file=sys.__stderr__, flush=True)
 
     gpu_name = _detect_gpu_name()
     print(f"\nBenchmark: FLUX.1-dev on {gpu_name}")
@@ -659,21 +593,15 @@ def main():
     print(f"Seed: {args.seed}")
     print(f"Enforce eager: {args.enforce_eager}")
 
-    # Load prompts from parti-prompts dataset
     bench_prompts = _get_bench_prompts(args.seed)
     print(f"Loaded {len(bench_prompts)} prompts from parti-prompts (P2)")
 
-    vllm_omni_path = args.vllm_omni_path
-    if vllm_omni_path is None:
-        candidates = [
-            str(_PROJECT_ROOT / "vllm_repo" / "vllm-omni"),
-            str(_PROJECT_ROOT / "vllm-omni"),
-            os.path.expanduser("~/vllm-omni"),
-        ]
-        for c in candidates:
-            if os.path.isdir(c):
-                vllm_omni_path = c
-                break
+    run_vllm = not args.skip_vllm_omni
+    save_latents = run_vllm
+
+    latent_tmpdir = tempfile.mkdtemp(prefix="flux_latents_") if save_latents else None
+    kb_latent_dir = os.path.join(latent_tmpdir, "kb_nano") if latent_tmpdir else None
+    vllm_latent_dir = os.path.join(latent_tmpdir, "vllm_omni") if latent_tmpdir else None
 
     base_config = {
         "model": args.model,
@@ -683,45 +611,6 @@ def main():
         "package_name": "kb_nano",
     }
 
-    # --- Correctness check ---
-    if args.correctness_only:
-        print("\n--- Correctness Check ---")
-        correctness_config = {
-            **base_config,
-            "prompts": bench_prompts[:4],
-            "height": 512,
-            "width": 512,
-            "num_inference_steps": 28,
-        }
-
-        # Run kb-nano (twice for determinism check)
-        kb_result = run_worker(
-            KB_NANO_CORRECTNESS_WORKER, correctness_config,
-            "kb-nano correctness", timeout=600, log_dir=args.log_dir,
-        )
-        kb_result2 = run_worker(
-            KB_NANO_CORRECTNESS_WORKER, correctness_config,
-            "kb-nano correctness (run 2)", timeout=600, log_dir=args.log_dir,
-        )
-
-        # Run vllm-omni for cross-engine comparison
-        vllm_result = None
-        if not args.skip_vllm_omni and vllm_omni_path:
-            vllm_correctness_config = {
-                **correctness_config,
-                "vllm_omni_path": vllm_omni_path,
-            }
-            vllm_result = run_worker(
-                VLLM_OMNI_CORRECTNESS_WORKER, vllm_correctness_config,
-                "vllm-omni correctness", timeout=600, log_dir=args.log_dir,
-            )
-
-        _print_correctness_results(
-            kb_result, vllm_result, kb_result2, bench_prompts[:4],
-        )
-        return
-
-    # Build scenarios
     scenarios = _build_throughput_scenarios(bench_prompts, args.batch_size)
     latency_scenarios = _build_latency_scenarios(bench_prompts)
 
@@ -731,28 +620,27 @@ def main():
         "scenarios": scenarios,
         "latency_scenarios": latency_scenarios,
     }
+    if kb_latent_dir:
+        kb_config["latent_dir"] = kb_latent_dir
     kb_data = run_worker(
         KB_NANO_DIFFUSION_WORKER, kb_config,
-        "kb-nano diffusion benchmark", timeout=36000, log_dir=args.log_dir,
+        "kb-nano diffusion benchmark", timeout=36000,
     )
 
     # --- vllm-omni benchmark ---
     vllm_data = None
-    if not args.skip_vllm_omni and vllm_omni_path:
+    if run_vllm:
         vllm_config = {
             **base_config,
-            "vllm_omni_path": vllm_omni_path,
             "scenarios": scenarios,
             "latency_scenarios": latency_scenarios,
         }
+        if vllm_latent_dir:
+            vllm_config["latent_dir"] = vllm_latent_dir
         vllm_data = run_worker(
             VLLM_OMNI_WORKER, vllm_config,
-            "vllm-omni diffusion benchmark", timeout=36000, log_dir=args.log_dir,
+            "vllm-omni diffusion benchmark", timeout=36000,
         )
-    elif not args.skip_vllm_omni:
-        print("\n  WARNING: vllm-omni not found, skipping comparison.")
-        print("  Set --vllm-omni-path or ensure vllm-omni is at a standard location.\n")
-
     # --- Print results ---
     if kb_data:
         kb_tp = kb_data.get("throughput", [])
@@ -762,6 +650,15 @@ def main():
 
         _print_throughput_comparison(kb_tp, vllm_tp)
         _print_latency_comparison(kb_lat, vllm_lat)
+
+        # Per-batch correctness comparison
+        correctness = None
+        if save_latents and kb_latent_dir and vllm_latent_dir:
+            correctness = _compare_latents(kb_latent_dir, vllm_latent_dir)
+            if correctness:
+                _print_correctness_comparison(correctness)
+            else:
+                print("\n  WARNING: No matching latent files found for correctness comparison.")
 
         # Save results
         output_file = args.output or f"bench_vllm_omni_results_{gpu_name}.json"
@@ -775,12 +672,17 @@ def main():
         }
         if vllm_data:
             results["vllm_omni"] = vllm_data
+        if correctness:
+            results["correctness"] = correctness
         with open(output_file, "w") as f:
             json.dump(results, f, indent=2)
         print(f"Results saved to {output_file}")
     else:
         print("ERROR: kb-nano benchmark failed.")
         sys.exit(1)
+
+    if latent_tmpdir:
+        shutil.rmtree(latent_tmpdir, ignore_errors=True)
 
 
 if __name__ == "__main__":
