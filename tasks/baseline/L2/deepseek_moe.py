@@ -226,10 +226,12 @@ class DeepSeekMoE(nn.Module):
         hidden_states = hidden_states.view(-1, self.hidden_size)
         num_tokens = hidden_states.size(0)
 
+        capturing = torch.cuda.is_current_stream_capturing()
         use_overlap = (
             self._shared_stream is not None
             and self.shared_experts is not None
             and num_tokens <= 256
+            and not capturing
         )
 
         if use_overlap:
@@ -315,7 +317,7 @@ class DeepSeekMoE(nn.Module):
     ) -> torch.Tensor:
         """EP dispatch/combine for small batches (no chunking).
 
-        Uses pre-allocated buffers when available (CUDA graph path).
+        Uses pre-allocated buffers when available.
         """
         import torch.distributed as dist
         ep_size = self.ep_size

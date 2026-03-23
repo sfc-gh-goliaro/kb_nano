@@ -301,7 +301,10 @@ class DeepSeekIndexer(nn.Module):
         q_bf16 = (q_fp8.to(torch.float32) * q_scale).to(torch.bfloat16)
         q_2d = q_bf16.reshape(batch, self.n_head * self.head_dim)
 
-        max_seq_len = int(context_lens.max().item())
+        if ctx.is_mixed:
+            max_seq_len = ctx.decode_max_context_len
+        else:
+            max_seq_len = ctx.max_context_len
         if max_seq_len == 0:
             return
 

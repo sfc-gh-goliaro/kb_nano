@@ -1135,6 +1135,9 @@ class ModelRunner:
     def run_model(self, input_ids, positions, is_prefill, inputs_embeds=None,
                   deepstack_embeds=None):
         if is_prefill or self.enforce_eager or input_ids.size(0) > self.graph_bs_list[-1]:
+            if self.enable_expert_parallel:
+                from ..tasks.baseline.L2.deepseek_moe import set_ep_max_n
+                set_ep_max_n(None)
             if inputs_embeds is not None:
                 return self.model.compute_logits(
                     self.model(input_ids, positions, inputs_embeds=inputs_embeds,
@@ -1144,6 +1147,9 @@ class ModelRunner:
         bs = input_ids.size(0)
         ctx = get_context()
         graph_bs = self._graph_bs_for_n[bs]
+        if self.enable_expert_parallel:
+            from ..tasks.baseline.L2.deepseek_moe import set_ep_max_n
+            set_ep_max_n(graph_bs)
         gv = self.graph_vars
         gv["input_ids"][:bs] = input_ids
         gv["positions"][:bs] = positions
@@ -1185,6 +1191,10 @@ class ModelRunner:
         gv = self.graph_vars
         graph_bs = self._graph_bs_for_n[n]
         prev_n = getattr(self, '_prev_decode_n', -1)
+
+        if self.enable_expert_parallel:
+            from ..tasks.baseline.L2.deepseek_moe import set_ep_max_n
+            set_ep_max_n(graph_bs)
 
         gv["input_ids"][:n].copy_(torch.from_numpy(ids_np), non_blocking=True)
         gv["positions"][:n].copy_(torch.from_numpy(pos_np), non_blocking=True)
@@ -1546,6 +1556,10 @@ class ModelRunner:
         lm_max_vals = torch.zeros(max_bs)
         lm_max_idxs = torch.zeros(max_bs, dtype=torch.int64)
 
+        use_ep = self.enable_expert_parallel
+        if use_ep:
+            from ..tasks.baseline.L2.deepseek_moe import set_ep_max_n
+
         ar_ctx = self.custom_ar.capture() if self.custom_ar is not None else nullcontext()
         with ar_ctx:
             for bs in reversed(self.graph_bs_list):
@@ -1555,6 +1569,8 @@ class ModelRunner:
                     context_lens=context_lens[:bs], block_tables=block_tables[:bs],
                     max_context_len=self.max_model_len,
                 )
+                if use_ep:
+                    set_ep_max_n(bs)
                 outputs[:bs] = self.model(input_ids[:bs], positions[:bs])
                 lm_logits[:bs] = lm_head.linear_op(outputs[:bs], lm_head.weight).float()
                 lm_max_vals[:bs], lm_max_idxs[:bs] = lm_logits[:bs].max(dim=-1)
@@ -1569,6 +1585,9 @@ class ModelRunner:
                 self.graphs[bs] = graph
                 torch.cuda.synchronize()
                 reset_context()
+
+        if use_ep:
+            set_ep_max_n(None)
 
         self.graph_vars = dict(
             input_ids=input_ids, positions=positions,
