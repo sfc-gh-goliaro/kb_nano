@@ -126,17 +126,17 @@ python tests/bench_vllm_omni.py --model black-forest-labs/FLUX.1-dev
 # kb-nano only (skip vllm-omni comparison)
 python tests/bench_vllm_omni.py --skip-vllm-omni
 
-# Correctness / determinism check only
-python tests/bench_vllm_omni.py --correctness-only
+# Override batch size for all scenarios
+python tests/bench_vllm_omni.py --batch-size 2
 
-# With custom vllm-omni path
-python tests/bench_vllm_omni.py --vllm-omni-path /path/to/vllm-omni
+# Save results to a specific file
+python tests/bench_vllm_omni.py --output my_results.json
 ```
 
 The diffusion benchmark measures:
 - **Throughput**: images/sec at 1024x1024 and 512x512 with 28 and 50 denoising steps
-- **Latency**: per-image latency with P50/P90/P99 percentile stats
-- **Correctness**: deterministic generation via seeded `torch.Generator`, latent MSE comparison
+- **Latency**: per-image latency with P50 percentile stats
+- **Correctness**: per-batch packed-latent MSE and cosine similarity between engine outputs (assessed during throughput runs)
 
 ## Benchmarking
 
