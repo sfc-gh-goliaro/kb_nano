@@ -28,8 +28,8 @@ def _yarn_find_correction_range(
     beta_fast: int, beta_slow: int, dim: int, base: float,
     max_position_embeddings: int,
 ) -> tuple[int, int]:
-    low = _yarn_find_correction_dim(beta_slow, dim, base, max_position_embeddings)
-    high = _yarn_find_correction_dim(beta_fast, dim, base, max_position_embeddings)
+    low = _yarn_find_correction_dim(beta_fast, dim, base, max_position_embeddings)
+    high = _yarn_find_correction_dim(beta_slow, dim, base, max_position_embeddings)
     low = max(math.floor(low), 0)
     high = min(math.ceil(high), dim - 1)
     return low, high
