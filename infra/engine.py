@@ -602,15 +602,44 @@ class ModelRunner:
             m._ep_gather_i = gather_i
             m._ep_bufs_initialized = True
 
+    @staticmethod
+    def _optimal_warmup_m_values(max_tokens: int, n: int, device: torch.device) -> list[int]:
+        """Generate M values that cover all DeepGEMM kernel configurations.
+
+        Mirrors vLLM's "relax" heuristic: instead of iterating every batch size,
+        pick the M values at block-size boundaries and SM-wave transitions that
+        trigger different JIT kernel instantiations.
+        """
+        block_ms = [64, 128, 256]
+        block_ns = list(range(16, min(257, n + 1), 16))
+        num_sms = torch.cuda.get_device_properties(device).multi_processor_count
+
+        m_values = set()
+        m_values.update([1, 2, 4] + list(range(8, 65, 8)))
+
+        for block_m in block_ms:
+            for block_n in block_ns:
+                if block_n > n:
+                    continue
+                for wave in range(1, 11):
+                    target_blocks = wave * num_sms
+                    m = target_blocks * block_m // -((-n) // block_n)
+                    if 1 <= m <= max_tokens:
+                        m_values.add(m)
+            for multiple in range(1, max_tokens // block_m + 1):
+                m = multiple * block_m
+                if m <= max_tokens:
+                    m_values.add(m)
+
+        return sorted(m_values)
+
     def _warmup_deepgemm(self):
-        """Pre-JIT DeepGEMM FP8 kernels for all weight shapes at decode and
-        prefill batch sizes, pre-allocate decode buffers per instance and
+        """Pre-JIT DeepGEMM FP8 kernels for all weight shapes using vLLM's
+        'relax' heuristic, pre-allocate decode buffers per instance and
         shared prefill buffers per unique (K, N) shape."""
         from ..tasks.baseline.L1.fp8_linear import Fp8Linear, _Fp8PrefillBufs
         import deep_gemm
         torch.cuda.synchronize()
-        if self.rank == 0:
-            print("  Starting DeepGEMM warmup...")
 
         fp8_modules = []
         for module in self.model.modules():
@@ -625,12 +654,9 @@ class ModelRunner:
         max_prefill = self.max_num_batched_tokens
         device = next(self.model.parameters()).device
 
-        decode_bs = [1, 2, 4, 8] + list(range(16, max_decode + 1, 16))
-        prefill_bs = [s for s in [128, 256, 512, 1024, 2048, 4096, 8192, 16384]
-                      if s <= max_prefill and s > max_decode]
-
         prefill_bufs: dict[tuple[int, int], _Fp8PrefillBufs] = {}
 
+        warmup_plan: list[tuple] = []
         seen_shapes = set()
         for module, linear_op in fp8_modules:
             w = module.weight
@@ -655,30 +681,47 @@ class ModelRunner:
                 continue
             seen_shapes.add(key)
 
-            a_fp8 = linear_op._a_buf
-            a_scale = linear_op._s_buf
-            out = linear_op._o_buf
-            for num_tokens in decode_bs:
-                if num_tokens > max_decode:
-                    break
-                deep_gemm.fp8_gemm_nt(
-                    (a_fp8[:num_tokens], a_scale[:num_tokens]),
-                    (w, ws),
-                    out[:num_tokens],
-                )
+            m_values = self._optimal_warmup_m_values(max_prefill, N, device)
+            warmup_plan.append((linear_op, w, ws, prefill_bufs[key], m_values, max_decode))
 
-            pf = prefill_bufs[key]
-            for num_tokens in prefill_bs:
-                deep_gemm.fp8_gemm_nt(
-                    (pf.a[:num_tokens], pf.s[:num_tokens]),
-                    (w, ws),
-                    pf.o[:num_tokens],
-                )
+        skip_jit = os.environ.get("KB_NANO_SKIP_DG_WARMUP") == "1"
+        if skip_jit:
+            if self.rank == 0:
+                print("  DeepGEMM warmup: JIT skipped (KB_NANO_SKIP_DG_WARMUP=1), "
+                      f"buffers allocated for {len(seen_shapes)} shapes")
+        else:
+            total_iters = sum(len(p[4]) for p in warmup_plan)
+            if self.rank == 0:
+                from tqdm import tqdm as _tqdm
+                pbar = _tqdm(total=total_iters, desc="DeepGEMM warmup")
+            else:
+                pbar = None
+
+            for linear_op, w, ws, pf, m_values, max_dc in warmup_plan:
+                a_fp8 = linear_op._a_buf
+                a_scale = linear_op._s_buf
+                out = linear_op._o_buf
+                for num_tokens in m_values:
+                    if num_tokens <= max_dc:
+                        deep_gemm.fp8_gemm_nt(
+                            (a_fp8[:num_tokens], a_scale[:num_tokens]),
+                            (w, ws),
+                            out[:num_tokens],
+                        )
+                    else:
+                        deep_gemm.fp8_gemm_nt(
+                            (pf.a[:num_tokens], pf.s[:num_tokens]),
+                            (w, ws),
+                            pf.o[:num_tokens],
+                        )
+                    if pbar is not None:
+                        pbar.update(1)
+
+            if pbar is not None:
+                pbar.close()
 
         torch.cuda.synchronize()
         torch.cuda.empty_cache()
-        if self.rank == 0:
-            print(f"  DeepGEMM warmup: {len(seen_shapes)} unique FP8 weight shapes")
 
     def _warmup_vision_encoder(self):
         """Run vision encoder with worst-case dummy inputs to capture peak
@@ -844,6 +887,7 @@ class ModelRunner:
             idx_layer_id = 0
             for module in self._indexer_layers:
                 module.k_cache = indexer_cache[idx_layer_id]
+                module.max_model_len = self.max_model_len
                 idx_layer_id += 1
 
             self.kv_cache = mla_cache

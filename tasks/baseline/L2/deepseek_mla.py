@@ -7,8 +7,22 @@ Prefill uses flash_mla_sparse_fwd (BF16 sparse prefill kernel).
 
 from __future__ import annotations
 
+import os as _os
 import torch
 import torch.nn as nn
+
+_KB_DUMP_HIDDEN = _os.environ.get("KB_NANO_DUMP_HIDDEN") == "1"
+_KB_DUMP_DIR = "/tmp/kb_hidden"
+_KB_DUMP_ARMED_FLAG = "/tmp/kb_hidden_armed"
+
+def _kb_dump_active_mla() -> bool:
+    return _KB_DUMP_HIDDEN and _os.path.exists(_KB_DUMP_ARMED_FLAG)
+
+def _dump_tensor_mla(name: str, t: torch.Tensor) -> None:
+    if not _kb_dump_active_mla():
+        return
+    _os.makedirs(_KB_DUMP_DIR, exist_ok=True)
+    torch.save(t.detach().float().cpu(), f"{_KB_DUMP_DIR}/{name}.pt")
 
 from ....infra.tp import _tp_size
 from ....infra.context import get_context, get_attn_backend_config
@@ -91,6 +105,7 @@ class DeepSeekMLA(nn.Module):
         self.kv_lora_rank = kv_lora_rank
         self.rotary_emb = rotary_emb
 
+        self.layer_idx = -1
         self.scaling = (self.qk_head_dim ** -0.5) * attn_scaling
         self.kv_cache_head_dim = kv_lora_rank + qk_rope_head_dim
 
@@ -145,6 +160,19 @@ class DeepSeekMLA(nn.Module):
         cc = torch.cuda.get_device_capability()
         self._prefill_head_padding = 128 if cc[0] >= 10 else 64
 
+        self._kv_flat_buf = None
+        self._kv_flat_buf_size = 0
+
+    def _get_kv_flat_buf(self, size: int, kv_dim: int, device) -> torch.Tensor:
+        """Return a reusable bfloat16 buffer of at least [size, kv_dim]."""
+        if self._kv_flat_buf is None or self._kv_flat_buf_size < size:
+            self._kv_flat_buf_size = max(size, self._kv_flat_buf_size * 2, 256)
+            self._kv_flat_buf = torch.empty(
+                self._kv_flat_buf_size, kv_dim,
+                dtype=torch.bfloat16, device=device,
+            )
+        return self._kv_flat_buf[:size]
+
     def set_topk_indices_buffer(self, buf):
         self._topk_indices_buffer = buf
 
@@ -183,6 +211,8 @@ class DeepSeekMLA(nn.Module):
     def forward(self, positions, hidden_states):
         N = hidden_states.shape[0]
         ctx = get_context()
+        _li = self.layer_idx
+        _dump = _kb_dump_active_mla() and _li == 0
 
         if self.q_a_proj is not None:
             q_c = self.q_a_proj(hidden_states)
@@ -196,17 +226,31 @@ class DeepSeekMLA(nn.Module):
             [self.qk_nope_head_dim, self.qk_rope_head_dim], dim=-1,
         )
 
+        if _dump:
+            _dump_tensor_mla(f"layer{_li}_q_nope_pre_rope", q_nope)
+            _dump_tensor_mla(f"layer{_li}_q_pe_pre_rope", q_pe)
+
         latent_cache = self.kv_a_proj_with_mqa(hidden_states)
         kv_a, k_pe = latent_cache.split(
             [self.kv_lora_rank, self.qk_rope_head_dim], dim=-1,
         )
         kv_c_normed = self.kv_a_layernorm(kv_a)
 
+        if _dump:
+            _dump_tensor_mla(f"layer{_li}_kv_c_normed", kv_c_normed)
+            _dump_tensor_mla(f"layer{_li}_k_pe_pre_rope", k_pe)
+
         q_pe_flat = q_pe.reshape(N, self.num_local_heads * self.qk_rope_head_dim)
         k_pe_flat = k_pe
         q_pe_flat, k_pe_flat = self.rotary_emb(positions, q_pe_flat, k_pe_flat)
         q_pe = q_pe_flat.view(N, self.num_local_heads, self.qk_rope_head_dim)
         k_pe = k_pe_flat.view(N, self.qk_rope_head_dim)
+
+        if _dump:
+            _dump_tensor_mla(f"layer{_li}_q_pe_post_rope", q_pe)
+            _dump_tensor_mla(f"layer{_li}_k_pe_post_rope", k_pe)
+            _dump_tensor_mla(f"layer{_li}_rope_cos_sin_cache", self.rotary_emb.cos_sin_cache)
+            _dump_tensor_mla(f"layer{_li}_rope_positions", positions)
 
         q[..., self.qk_nope_head_dim:] = q_pe
 
@@ -220,7 +264,15 @@ class DeepSeekMLA(nn.Module):
 
         self._extract_absorption_weights()
         ql_nope = torch.einsum('bhd,hdc->bhc', q_nope, self._w_uk)
-        q_absorbed = torch.cat([ql_nope, q_pe], dim=-1)
+        q_absorbed = torch.empty(
+            N, self.num_local_heads, self.kv_lora_rank + self.qk_rope_head_dim,
+            dtype=ql_nope.dtype, device=ql_nope.device,
+        )
+        q_absorbed[..., :self.kv_lora_rank] = ql_nope
+        q_absorbed[..., self.kv_lora_rank:] = q_pe
+
+        if _dump:
+            _dump_tensor_mla(f"layer{_li}_q_absorbed", q_absorbed)
 
         if ctx.is_mixed:
             attn_output = self._forward_mixed(q_absorbed, kv_c_normed, k_pe,
@@ -230,6 +282,9 @@ class DeepSeekMLA(nn.Module):
                                                 kv_cache, ctx, N)
         else:
             attn_output = self._forward_decode(q_absorbed, kv_cache, ctx, N)
+
+        if _dump:
+            _dump_tensor_mla(f"layer{_li}_attn_output_pre_oproj", attn_output)
 
         return self.o_proj(attn_output)
 
@@ -304,13 +359,14 @@ class DeepSeekMLA(nn.Module):
         o = torch.einsum('bhc,hcd->bhd', o_latent, self._w_uv)
         return o.reshape(N, self.num_local_heads * self.v_head_dim)
 
-    def _dequant_cache_to_bf16(self, kv_cache, page_ids, total_tokens):
-        """Gather FP8 cache pages and dequantize to BF16 [total_tokens, 576]."""
+    def _dequant_cache_to_bf16_into(self, kv_cache, page_ids, total_tokens,
+                                     dst: torch.Tensor, dst_offset: int):
+        """Gather FP8 cache pages, dequantize, and write into dst[dst_offset:]."""
         block_size = self._block_size
         num_pages = page_ids.shape[0]
 
-        raw = kv_cache[page_ids.long()]  # (num_pages, block_size, 656)
-        flat = raw.reshape(num_pages * block_size, 656)[:total_tokens]
+        raw = kv_cache[page_ids.long()]
+        flat = raw.reshape(num_pages * block_size, BYTES_PER_TOKEN)[:total_tokens]
 
         nope_fp8 = flat[:, :512].contiguous().view(torch.float8_e4m3fn)
         scales = flat[:, 512:528].contiguous().view(torch.float32).reshape(total_tokens, 4)
@@ -319,7 +375,9 @@ class DeepSeekMLA(nn.Module):
         nope_f32 = nope_fp8.to(torch.float32).view(total_tokens, 4, 128)
         nope_dequant = (nope_f32 * scales.unsqueeze(-1)).view(total_tokens, 512).to(torch.bfloat16)
 
-        return torch.cat([nope_dequant, rope_bf16], dim=-1)
+        out = dst[dst_offset:dst_offset + total_tokens]
+        out[:, :512] = nope_dequant
+        out[:, 512:] = rope_bf16
 
     def _forward_prefill(self, q_absorbed, kv_c_normed, k_pe, kv_cache, ctx, N):
         """Prefill using FlashMLA sparse prefill kernel (BF16).
@@ -330,8 +388,7 @@ class DeepSeekMLA(nn.Module):
             indices: [s_q, h_kv=1, topk] int32 — global indices into kv
         """
         topk_indices = self._topk_indices_buffer[:N].clone()
-
-        kv_bf16 = torch.cat([kv_c_normed, k_pe], dim=-1)
+        kv_dim = self.kv_lora_rank + self.qk_rope_head_dim
 
         cu_seqlens_k = ctx.prefill_cu_seqlens_k if ctx.prefill_cu_seqlens_k is not None else ctx.cu_seqlens_k
         cu_seqlens_q = ctx.prefill_cu_seqlens_q if ctx.prefill_cu_seqlens_q is not None else ctx.cu_seqlens_q
@@ -339,7 +396,9 @@ class DeepSeekMLA(nn.Module):
             cu_k = cu_seqlens_k.cpu().tolist()
             cu_q = cu_seqlens_q.cpu().tolist()
             num_seqs = len(cu_q) - 1
-            all_kv = []
+            total_kv = cu_k[-1] - cu_k[0]
+
+            kv_flat = self._get_kv_flat_buf(total_kv, kv_dim, q_absorbed.device)
             kv_offset = 0
 
             for s in range(num_seqs):
@@ -352,21 +411,27 @@ class DeepSeekMLA(nn.Module):
                 if cached_len > 0 and bt is not None:
                     num_pages = (cached_len + self._block_size - 1) // self._block_size
                     page_ids = bt[s, :num_pages]
-                    cached_kv = self._dequant_cache_to_bf16(kv_cache, page_ids, cached_len)
-                    all_kv.append(cached_kv)
+                    self._dequant_cache_to_bf16_into(
+                        kv_cache, page_ids, cached_len, kv_flat, kv_offset,
+                    )
+                    kv_offset += cached_len
 
-                all_kv.append(kv_bf16[cu_q[s] - cu_q[0]:cu_q[s + 1] - cu_q[0]])
+                q_off = cu_q[s] - cu_q[0]
+                kv_flat[kv_offset:kv_offset + q_len, :self.kv_lora_rank] = kv_c_normed[q_off:q_off + q_len]
+                kv_flat[kv_offset:kv_offset + q_len, self.kv_lora_rank:] = k_pe[q_off:q_off + q_len]
+                kv_offset += q_len
 
                 valid_mask = topk_indices[q_start:q_end] >= 0
                 topk_indices[q_start:q_end] = torch.where(
                     valid_mask,
-                    topk_indices[q_start:q_end] + kv_offset,
+                    topk_indices[q_start:q_end] + (kv_offset - kv_len),
                     topk_indices[q_start:q_end],
                 )
-                kv_offset += kv_len
-
-            kv_flat = torch.cat(all_kv, dim=0)
         else:
+            kv_flat = self._get_kv_flat_buf(N, kv_dim, q_absorbed.device)
+            kv_flat[:, :self.kv_lora_rank] = kv_c_normed
+            kv_flat[:, self.kv_lora_rank:] = k_pe
+
             cu_q = (ctx.prefill_cu_seqlens_q if ctx.prefill_cu_seqlens_q is not None else ctx.cu_seqlens_q)
             if cu_q is not None:
                 cu_q_list = cu_q.cpu().tolist()
@@ -382,7 +447,6 @@ class DeepSeekMLA(nn.Module):
                         topk_indices[q_start:q_end],
                     )
                     kv_offset += q_len
-            kv_flat = kv_bf16
 
         kv_3d = kv_flat.unsqueeze(1)
         q_mqa = q_absorbed

@@ -14,9 +14,13 @@ import torch.nn as nn
 import triton
 import triton.language as tl
 
+import deep_gemm
+
 from ....infra.context import get_context, get_attn_backend_config
 from ..L1.fp8_linear import Fp8Linear
 from .parallel_linear import ColumnParallelLinear
+
+_NUM_SMS = 132
 
 
 class _IndexerLinear(nn.Module):
@@ -129,6 +133,96 @@ def _indexer_k_quant_and_cache_kernel(
     tl.store(scale_byte_ptr, scale_inv_ue8m0)
 
 
+@triton.jit
+def _gather_indexer_k_fp8_kernel(
+    cache_ptr,              # flat [num_blocks * block_size * BYTES_PER_TOKEN] uint8
+    dst_k_ptr,              # [total_tokens, head_dim] fp8 (as uint8)
+    dst_scale_ptr,          # [total_tokens] float32
+    token_to_seq_ptr,       # [total_tokens] int32 — maps token to sequence id
+    block_table_ptr,        # [batch, max_blocks_per_seq] int32
+    cu_seq_lens_ptr,        # [batch+1] int32
+    block_table_stride,     # stride(0) of block_table
+    HEAD_DIM: tl.constexpr,
+    BLOCK_SIZE: tl.constexpr,
+    BYTES_PER_TOKEN: tl.constexpr,
+):
+    """Gather FP8 K + scale from paged indexer cache into dense buffers."""
+    tid = tl.program_id(0)
+
+    seq_id = tl.load(token_to_seq_ptr + tid)
+    seq_start = tl.load(cu_seq_lens_ptr + seq_id)
+
+    local_pos = tid - seq_start
+    page_idx = local_pos // BLOCK_SIZE
+    offset_in_page = local_pos % BLOCK_SIZE
+
+    block_id = tl.load(block_table_ptr + seq_id * block_table_stride + page_idx)
+    slot = block_id * BLOCK_SIZE + offset_in_page
+
+    src_base = slot * BYTES_PER_TOKEN
+    offs = tl.arange(0, HEAD_DIM)
+    fp8_bytes = tl.load(cache_ptr + src_base + offs)
+    tl.store(dst_k_ptr + tid * HEAD_DIM + offs, fp8_bytes)
+
+    scale_ptr = (cache_ptr + src_base + HEAD_DIM).to(tl.pointer_type(tl.float32))
+    scale_val = tl.load(scale_ptr)
+    tl.store(dst_scale_ptr + tid, scale_val)
+
+
+def _build_token_to_seq(cu_seq_lens: torch.Tensor, total_tokens: int) -> torch.Tensor:
+    """Build a flat mapping from token index -> sequence index."""
+    batch_size = cu_seq_lens.shape[0] - 1
+    token_to_seq = torch.empty(total_tokens, dtype=torch.int32, device=cu_seq_lens.device)
+    for s in range(batch_size):
+        start = cu_seq_lens[s].item()
+        end = cu_seq_lens[s + 1].item()
+        token_to_seq[start:end] = s
+    return token_to_seq
+
+
+def _gather_indexer_k_fp8(
+    cache: torch.Tensor,
+    block_table: torch.Tensor,
+    cu_seq_lens: torch.Tensor,
+    total_tokens: int,
+    head_dim: int,
+    block_size: int,
+    dst_k: torch.Tensor | None = None,
+    dst_scale: torch.Tensor | None = None,
+) -> tuple[torch.Tensor, torch.Tensor]:
+    """Gather FP8 K and scales from paged cache into dense contiguous buffers.
+
+    Args:
+        cache: [num_blocks, block_size, head_dim+4] uint8
+        block_table: [batch, max_blocks] int32
+        cu_seq_lens: [batch+1] int32 — cumulative sequence lengths
+        total_tokens: total number of tokens across all sequences
+    Returns:
+        (k_fp8 [total_tokens, head_dim] fp8, k_scale [total_tokens] float32)
+    """
+    if dst_k is None:
+        dst_k = torch.empty(total_tokens, head_dim, dtype=torch.uint8, device=cache.device)
+    if dst_scale is None:
+        dst_scale = torch.empty(total_tokens, dtype=torch.float32, device=cache.device)
+    bytes_per_token = head_dim + 4
+
+    token_to_seq = _build_token_to_seq(cu_seq_lens, total_tokens)
+
+    _gather_indexer_k_fp8_kernel[(total_tokens,)](
+        cache.view(-1),
+        dst_k,
+        dst_scale,
+        token_to_seq,
+        block_table,
+        cu_seq_lens,
+        block_table.stride(0),
+        HEAD_DIM=head_dim,
+        BLOCK_SIZE=block_size,
+        BYTES_PER_TOKEN=bytes_per_token,
+    )
+    return dst_k.view(torch.float8_e4m3fn), dst_scale
+
+
 class DeepSeekIndexer(nn.Module):
     """DSA Indexer: computes top-k KV indices per query token per layer."""
 
@@ -143,6 +237,7 @@ class DeepSeekIndexer(nn.Module):
         rms_norm_eps: float,
         rotary_emb: nn.Module,
         quant_config: dict | None = None,
+        max_model_len: int = 4096,
     ):
         super().__init__()
         self.n_head = index_n_heads
@@ -152,6 +247,7 @@ class DeepSeekIndexer(nn.Module):
         self.quant_block_size = 128
         self.softmax_scale = index_head_dim ** -0.5
         self.rotary_emb = rotary_emb
+        self.max_model_len = max_model_len
 
         self.wq_b = _IndexerLinear(q_lora_rank, index_n_heads * index_head_dim,
                                    quant_config=quant_config)
@@ -165,6 +261,23 @@ class DeepSeekIndexer(nn.Module):
         self._block_size = get_attn_backend_config().block_size
 
         self._bytes_per_token = index_head_dim + 4
+
+        self._k_fp8_buf = None
+        self._k_scale_buf = None
+        self._k_buf_size = 0
+
+    def _get_gather_bufs(self, size: int, device):
+        """Return reusable (k_fp8, k_scale) buffers of at least [size, head_dim]."""
+        if self._k_fp8_buf is None or self._k_buf_size < size:
+            self._k_buf_size = max(size, self._k_buf_size * 2, 256)
+            self._k_fp8_buf = torch.empty(
+                self._k_buf_size, self.head_dim,
+                dtype=torch.uint8, device=device,
+            )
+            self._k_scale_buf = torch.empty(
+                self._k_buf_size, dtype=torch.float32, device=device,
+            )
+        return self._k_fp8_buf[:size], self._k_scale_buf[:size]
 
     def forward(self, hidden_states, q_c, positions, topk_indices_buffer):
         """
@@ -237,56 +350,100 @@ class DeepSeekIndexer(nn.Module):
         return topk_indices_buffer
 
     def _prefill_indexing(self, q_fp8, q_scale, weights, topk_indices_buffer, ctx):
-        """Prefill: gather all K from cache, compute logits, top-k."""
+        """Prefill: fused FP8 MQA logits via DeepGEMM with causal masking."""
+        if not self.k_cache.numel():
+            return
+
         if ctx.is_mixed:
             cu_q = ctx.prefill_cu_seqlens_q
             cu_k = ctx.prefill_cu_seqlens_k
+            block_tables = ctx.prefill_block_tables
         else:
             cu_q = ctx.cu_seqlens_q
             cu_k = ctx.cu_seqlens_k
+            block_tables = ctx.block_tables
 
         cu_q_list = cu_q.cpu().tolist()
         cu_k_list = cu_k.cpu().tolist()
         num_seqs = len(cu_q_list) - 1
         N = q_fp8.shape[0]
+        total_kv = cu_k_list[-1] - cu_k_list[0]
+        device = q_fp8.device
 
+        if total_kv == 0:
+            return
+
+        # Gather all K from paged cache into dense FP8 + scale buffers
+        if block_tables is not None and block_tables.numel() > 0 and self.k_cache.numel():
+            dst_k, dst_scale = self._get_gather_bufs(total_kv, device)
+            cu_k_gather = torch.tensor(cu_k_list, dtype=torch.int32, device=device)
+            k_fp8_dense, k_scale_dense = _gather_indexer_k_fp8(
+                self.k_cache,
+                block_tables[:num_seqs],
+                cu_k_gather,
+                total_kv,
+                self.head_dim,
+                self._block_size,
+                dst_k=dst_k.view(torch.uint8),
+                dst_scale=dst_scale,
+            )
+        else:
+            k_fp8_dense = torch.empty(0, self.head_dim, dtype=torch.float8_e4m3fn, device=device)
+            k_scale_dense = torch.empty(0, dtype=torch.float32, device=device)
+
+        # Build per-query-token causal mask as cu_seqlen_ks / cu_seqlen_ke
+        cu_seqlen_ks = torch.empty(N, dtype=torch.int32, device=device)
+        cu_seqlen_ke = torch.empty(N, dtype=torch.int32, device=device)
+
+        kv_base = 0
+        for s in range(num_seqs):
+            q_start, q_end = cu_q_list[s], cu_q_list[s + 1]
+            q_len = q_end - q_start
+            kv_len = cu_k_list[s + 1] - cu_k_list[s]
+            cached_len = kv_len - q_len
+
+            starts = torch.full((q_len,), kv_base, dtype=torch.int32, device=device)
+            ends = torch.arange(1, q_len + 1, dtype=torch.int32, device=device) + kv_base + cached_len
+            ends = ends.clamp(max=kv_base + kv_len)
+
+            cu_seqlen_ks[q_start:q_end] = starts
+            cu_seqlen_ke[q_start:q_end] = ends
+            kv_base += kv_len
+
+        # weights already has q_scale * softmax_scale * n_head^-0.5
+        w = weights.to(torch.float32)
+
+        logits = deep_gemm.fp8_mqa_logits(
+            q_fp8,
+            (k_fp8_dense, k_scale_dense),
+            w,
+            cu_seqlen_ks,
+            cu_seqlen_ke,
+            clean_logits=False,
+        )
+
+        # Top-k per sequence with causal masking
+        kv_base = 0
         for s in range(num_seqs):
             q_start, q_end = cu_q_list[s], cu_q_list[s + 1]
             kv_len = cu_k_list[s + 1] - cu_k_list[s]
             if kv_len == 0:
                 continue
 
-            q_s = q_fp8[q_start:q_end]
-            qs_s = q_scale[q_start:q_end]
-            q_bf16 = q_s.to(torch.float32) * qs_s
-            q_flat = q_bf16.reshape(-1, self.head_dim).to(torch.bfloat16)
-            w_s = weights[q_start:q_end]
-
-            k_latent = self._gather_k_bf16(ctx, s, kv_len)
-            k_latent = k_latent.reshape(kv_len, self.head_dim)
-            logits = torch.matmul(q_flat, k_latent.t())
-            logits = logits.view(q_end - q_start, self.n_head, kv_len)
-            logits = logits + w_s.unsqueeze(-1)
-
-            logits_combined = logits.sum(dim=1)
-
-            q_len = q_end - q_start
-            cached_len = kv_len - q_len
-
-            causal_mask = torch.arange(kv_len, device=logits_combined.device).unsqueeze(0)
-            valid_lens = torch.arange(1, q_len + 1, device=logits_combined.device) + cached_len
-            valid_lens = valid_lens.clamp(max=kv_len)
-            mask = causal_mask >= valid_lens.unsqueeze(1)
-            logits_combined = logits_combined.masked_fill(mask, float('-inf'))
-
             k = min(self.topk_tokens, kv_len)
             if k > 0:
-                _, indices = torch.topk(logits_combined, k, dim=1)
+                # Slice the logits for this sequence's KV range
+                seq_logits = logits[q_start:q_end, kv_base:kv_base + kv_len]
+                _, indices = torch.topk(seq_logits, k, dim=1)
                 topk_indices_buffer[q_start:q_end, :k] = indices.to(torch.int32)
+            kv_base += kv_len
 
     def _decode_indexing(self, q_fp8, q_scale, weights, topk_indices_buffer,
                          offset, ctx):
-        """Decode: paged MQA logits via padded batched matmul."""
+        """Decode: fused FP8 paged MQA logits via DeepGEMM."""
+        if not self.k_cache.numel():
+            return
+
         if ctx.is_mixed:
             context_lens = ctx.decode_context_lens
             block_tables = ctx.decode_block_tables
@@ -298,46 +455,34 @@ class DeepSeekIndexer(nn.Module):
         if batch == 0:
             return
 
-        q_bf16 = (q_fp8.to(torch.float32) * q_scale).to(torch.bfloat16)
-        q_2d = q_bf16.reshape(batch, self.n_head * self.head_dim)
+        # q_fp8: [B, n_head, head_dim] -> [B, 1, n_head, head_dim] (next_n=1)
+        q_4d = q_fp8.unsqueeze(1)
 
-        if ctx.is_mixed:
-            max_seq_len = ctx.decode_max_context_len
-        else:
-            max_seq_len = ctx.max_context_len
-        if max_seq_len == 0:
-            return
+        # kv_cache: [num_blocks, block_size, D+4] -> [num_blocks, block_size, 1, D+4]
+        kv_cache_4d = self.k_cache.unsqueeze(2)
 
-        max_pages = (max_seq_len + self._block_size - 1) // self._block_size
-        bt_all = block_tables[:batch, :max_pages]
+        # weights already has q_scale * softmax_scale * n_head^-0.5 applied
+        w = weights.to(torch.float32)
 
-        hd = self.head_dim
-        bs = self._block_size
-        bpt = self._bytes_per_token
-        cache = self.k_cache
+        ctx_lens = context_lens[:batch].to(torch.int32)
 
-        all_page_ids = bt_all.reshape(-1).long()
-        raw = cache[all_page_ids]
-        raw = raw.reshape(batch, max_pages * bs, bpt)
+        sched_meta = deep_gemm.get_paged_mqa_logits_metadata(
+            ctx_lens, self._block_size, _NUM_SMS,
+        )
 
-        fp8_vals = raw[:, :, :hd].contiguous().view(torch.float8_e4m3fn).to(torch.float32)
-        scales = raw[:, :, hd:hd + 4].contiguous().view(torch.float32)
-        k_all = (fp8_vals * scales).to(torch.bfloat16)
+        logits = deep_gemm.fp8_paged_mqa_logits(
+            q_4d,
+            kv_cache_4d,
+            w,
+            ctx_lens,
+            block_tables[:batch].to(torch.int32),
+            sched_meta,
+            self.max_model_len,
+            clean_logits=True,
+        )
 
-        max_kv = max_pages * bs
-        q_heads = q_2d.reshape(batch, self.n_head, hd)
-        logits = torch.einsum('bnh,bkh->bnk', q_heads, k_all[:, :max_kv, :])
-
-        logits = logits + weights.unsqueeze(-1)
-
-        logits_combined = logits.sum(dim=1)
-
-        pos_range = torch.arange(max_kv, device=logits_combined.device)
-        mask = pos_range.unsqueeze(0) >= context_lens[:batch].unsqueeze(1)
-        logits_combined = logits_combined.masked_fill(mask, float('-inf'))
-
-        k = min(self.topk_tokens, max_kv)
-        _, indices = torch.topk(logits_combined, k, dim=1)
+        k = min(self.topk_tokens, logits.shape[1])
+        _, indices = torch.topk(logits, k, dim=1)
         topk_indices_buffer[offset:offset + batch, :k] = indices.to(torch.int32)
 
     def _gather_k_bf16(self, ctx, seq_idx, kv_len):
