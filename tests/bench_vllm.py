@@ -112,7 +112,11 @@ def _run_single_process(cfg):
     """Run vLLM in single-process mode (no DP)."""
     from vllm import LLM, SamplingParams
 
-    llm = LLM(
+    num_layers = cfg.get("num_layers")
+    load_fmt = "fastsafetensors"
+    if num_layers is not None:
+        load_fmt = "auto"
+    llm_kwargs = dict(
         model=cfg["model"],
         seed=cfg["seed"],
         enforce_eager=cfg.get("enforce_eager", False),
@@ -120,8 +124,11 @@ def _run_single_process(cfg):
         gpu_memory_utilization=cfg.get("gpu_memory_utilization", 0.9),
         max_model_len=cfg["max_model_len"],
         enable_prefix_caching=False,
-        load_format="fastsafetensors",
+        load_format=load_fmt,
     )
+    if num_layers is not None:
+        llm_kwargs["hf_overrides"] = {"num_hidden_layers": num_layers}
+    llm = LLM(**llm_kwargs)
 
     llm.generate(
         [dict(prompt_token_ids=[0] * 16)],
@@ -209,6 +216,10 @@ def _dp_rank_main(dp_rank, dp_size, dp_master_port, nccl_port, cfg, result_file)
     tp = cfg["tp"]
     ep = cfg.get("enable_expert_parallel", False)
 
+    num_layers = cfg.get("num_layers")
+    load_fmt = "fastsafetensors"
+    if num_layers is not None:
+        load_fmt = "auto"
     llm_kwargs = dict(
         model=cfg["model"],
         seed=cfg["seed"],
@@ -217,10 +228,12 @@ def _dp_rank_main(dp_rank, dp_size, dp_master_port, nccl_port, cfg, result_file)
         gpu_memory_utilization=cfg.get("gpu_memory_utilization", 0.9),
         max_model_len=cfg["max_model_len"],
         enable_prefix_caching=False,
-        load_format="fastsafetensors",
+        load_format=load_fmt,
     )
     if ep:
         llm_kwargs["enable_expert_parallel"] = True
+    if num_layers is not None:
+        llm_kwargs["hf_overrides"] = {"num_hidden_layers": num_layers}
     llm = LLM(**llm_kwargs)
 
     llm.generate(
@@ -441,6 +454,9 @@ import json, sys, time
 
 def _run_single_process(cfg):
     """Run kb-nano in single-process mode (no DP)."""
+    import os
+    if cfg.get("num_layers") is not None:
+        os.environ["KB_NANO_NUM_LAYERS"] = str(cfg["num_layers"])
     sys.path.insert(0, cfg["project_root"])
     pkg = cfg["package_name"]
 
@@ -539,6 +555,8 @@ def _dp_rank_main(dp_rank, dp_size, nccl_port, cfg, result_file):
     """Run one DP rank of kb-nano with EP for MoE models."""
     import os
     os.environ["CUDA_VISIBLE_DEVICES"] = str(dp_rank)
+    if cfg.get("num_layers") is not None:
+        os.environ["KB_NANO_NUM_LAYERS"] = str(cfg["num_layers"])
 
     sys.path.insert(0, cfg["project_root"])
     pkg = cfg["package_name"]
@@ -1393,6 +1411,10 @@ def main():
         choices=["all", "text", "image", "video"],
         help="Run only scenarios matching this modality (VLM models only, default: all)",
     )
+    parser.add_argument(
+        "--num-layers", type=int, default=None,
+        help="Override the number of transformer layers (for fast profiling runs)",
+    )
     args = parser.parse_args()
 
     gpu = _detect_gpu_name()
@@ -1527,6 +1549,8 @@ def main():
     print(f"  Seqs/scenario  : {args.num_seqs}")
     print(f"  Temperature    : {args.temperature}")
     print(f"  Enforce eager  : {args.enforce_eager}")
+    if args.num_layers is not None:
+        print(f"  Num layers     : {args.num_layers} (overridden)")
     print(f"  Seed           : {args.seed}")
     print(f"  Max seq len    : {global_max_seq_len}")
     print(f"  Output dir     : {args.output_dir}")
@@ -1559,6 +1583,8 @@ def main():
             "scenarios": scenario_data,
             "latency_scenarios": latency_data,
         }
+        if args.num_layers is not None:
+            vllm_config["num_layers"] = args.num_layers
         dp_ep_str = ""
         if args.dp > 1:
             dp_ep_str += f", DP={args.dp}"
@@ -1627,6 +1653,8 @@ def main():
         "scenarios": scenario_data,
         "latency_scenarios": latency_data,
     }
+    if args.num_layers is not None:
+        kb_config["num_layers"] = args.num_layers
     short_name = args.model.split("/")[-1]
     dp_ep_str = ""
     if args.dp > 1:

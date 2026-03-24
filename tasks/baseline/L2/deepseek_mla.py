@@ -270,6 +270,9 @@ class DeepSeekMLA(nn.Module):
             topk_indices, block_tables, self._block_size,
         )
 
+        physical_indices = physical_indices.clone()
+        physical_indices[physical_indices < 0] = 0
+
         # q: (batch=N, seq_q=1, num_heads_q, head_dim=576)
         q_4d = q_absorbed.unsqueeze(1)
         # indices: (batch=N, seq_q=1, topk)
@@ -278,7 +281,8 @@ class DeepSeekMLA(nn.Module):
         # k_cache: (num_blocks, block_size, num_heads_k=1, 656)
         kv_cache_view = kv_cache.unsqueeze(2)
 
-        sched_key = (N, 1, self.num_local_heads, topk_indices.shape[1])
+        topk_dim = physical_indices.shape[1]
+        sched_key = (N, 1, self.num_local_heads, topk_dim)
         if sched_key not in self._sched_meta_cache:
             self._sched_meta_cache[sched_key], _ = get_mla_metadata()
 

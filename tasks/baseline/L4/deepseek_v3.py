@@ -124,6 +124,11 @@ class DeepSeekV3Config:
         else:
             cfg.attn_scaling = 1.0
 
+        import os
+        layer_override = os.environ.get("KB_NANO_NUM_LAYERS")
+        if layer_override is not None:
+            cfg.num_hidden_layers = int(layer_override)
+
         return cfg
 
 

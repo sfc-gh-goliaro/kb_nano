@@ -152,6 +152,9 @@ def _load_vision_qkv(model, param_prefix: str, loaded_weight: torch.Tensor,
 _WEIGHT_SCALE_INV_RE = re.compile(r"(.+)\.weight_scale_inv$")
 
 
+_LAYER_IDX_RE = re.compile(r"layers\.(\d+)\.")
+
+
 def load_weights(model, model_path: str, model_type: str = "llama") -> None:
     """Load weights with support for packed modules, MoE experts, vision
     encoder QKV, FP8 weight_scale_inv, and TP sharding.
@@ -168,6 +171,26 @@ def load_weights(model, model_path: str, model_type: str = "llama") -> None:
     is_deepseek = model_type in ("deepseek_v3", "deepseek_v32")
     if is_llama4:
         llama4_config = model.config
+
+    num_layers = getattr(model.config if hasattr(model, 'config') else None,
+                         'num_hidden_layers', None)
+    if num_layers is not None:
+        import json as _json
+        idx_path = os.path.join(model_path, "model.safetensors.index.json")
+        if os.path.exists(idx_path):
+            with open(idx_path) as _f:
+                weight_map = _json.load(_f).get("weight_map", {})
+            needed_files = set()
+            for wname, fname in weight_map.items():
+                m = _LAYER_IDX_RE.search(wname)
+                if m is None or int(m.group(1)) < num_layers:
+                    needed_files.add(fname)
+            needed_abs = {os.path.join(model_path, f) for f in needed_files}
+            before = len(safetensor_files)
+            safetensor_files = [f for f in safetensor_files if f in needed_abs]
+            if len(safetensor_files) < before:
+                print(f"  Layer filter: loading {len(safetensor_files)}/{before} "
+                      f"safetensor files (num_layers={num_layers})")
 
     print(f"  Loading weights from {len(safetensor_files)} safetensors file(s)...")
     loaded = 0
