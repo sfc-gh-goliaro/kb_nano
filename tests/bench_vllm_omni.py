@@ -30,10 +30,8 @@ import argparse
 import json
 import os
 import random
-import shutil
 import subprocess
 import sys
-import tempfile
 import time
 from pathlib import Path
 
@@ -502,10 +500,10 @@ def _compare_latents(kb_latent_dir: str, vllm_latent_dir: str) -> dict:
     for fname in common:
         kb_lat = torch.load(
             os.path.join(kb_latent_dir, fname), map_location="cpu", weights_only=True,
-        ).float().flatten()
+        ).detach().float().flatten()
         vllm_lat = torch.load(
             os.path.join(vllm_latent_dir, fname), map_location="cpu", weights_only=True,
-        ).float().flatten()
+        ).detach().float().flatten()
 
         if len(kb_lat) != len(vllm_lat):
             print(
@@ -583,15 +581,25 @@ def main():
                         help="Skip vllm-omni and only benchmark kb-nano")
     parser.add_argument("--batch-size", type=int, default=None,
                         help="Override batch size for all scenarios")
-    parser.add_argument("--output", type=str, default=None,
-                        help="Output JSON file for results")
+    parser.add_argument(
+        "--output-dir", type=str, default=None,
+        help="Directory to save per-scenario outputs and results JSON "
+             "(default: tests/results/<gpu>/<model>)",
+    )
     args = parser.parse_args()
 
     gpu_name = _detect_gpu_name()
+
+    if args.output_dir is None:
+        short = args.model.split("/")[-1]
+        repo_root = Path(__file__).resolve().parent.parent
+        args.output_dir = str(repo_root / "tests" / "results" / gpu_name / short)
+
     print(f"\nBenchmark: FLUX.1-dev on {gpu_name}")
     print(f"Model: {args.model}")
     print(f"Seed: {args.seed}")
     print(f"Enforce eager: {args.enforce_eager}")
+    print(f"Output dir: {args.output_dir}")
 
     bench_prompts = _get_bench_prompts(args.seed)
     print(f"Loaded {len(bench_prompts)} prompts from parti-prompts (P2)")
@@ -599,9 +607,13 @@ def main():
     run_vllm = not args.skip_vllm_omni
     save_latents = run_vllm
 
-    latent_tmpdir = tempfile.mkdtemp(prefix="flux_latents_") if save_latents else None
-    kb_latent_dir = os.path.join(latent_tmpdir, "kb_nano") if latent_tmpdir else None
-    vllm_latent_dir = os.path.join(latent_tmpdir, "vllm_omni") if latent_tmpdir else None
+    os.makedirs(args.output_dir, exist_ok=True)
+    if save_latents:
+        kb_latent_dir = os.path.join(args.output_dir, "latents", "kb_nano")
+        vllm_latent_dir = os.path.join(args.output_dir, "latents", "vllm_omni")
+    else:
+        kb_latent_dir = None
+        vllm_latent_dir = None
 
     base_config = {
         "model": args.model,
@@ -661,7 +673,7 @@ def main():
                 print("\n  WARNING: No matching latent files found for correctness comparison.")
 
         # Save results
-        output_file = args.output or f"bench_vllm_omni_results_{gpu_name}.json"
+        results_path = os.path.join(args.output_dir, "results.json")
         results = {
             "model": args.model,
             "gpu": gpu_name,
@@ -674,15 +686,12 @@ def main():
             results["vllm_omni"] = vllm_data
         if correctness:
             results["correctness"] = correctness
-        with open(output_file, "w") as f:
+        with open(results_path, "w") as f:
             json.dump(results, f, indent=2)
-        print(f"Results saved to {output_file}")
+        print(f"\n  Results saved to: {results_path}")
     else:
         print("ERROR: kb-nano benchmark failed.")
         sys.exit(1)
-
-    if latent_tmpdir:
-        shutil.rmtree(latent_tmpdir, ignore_errors=True)
 
 
 if __name__ == "__main__":

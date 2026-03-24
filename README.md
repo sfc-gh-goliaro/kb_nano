@@ -120,7 +120,7 @@ python tests/test_bench.py --unit-only
 ### Benchmarking vs vllm-omni (Diffusion)
 
 ```bash
-# FLUX.1-dev: throughput + latency benchmark vs vllm-omni
+# FLUX.1-dev: throughput + latency + correctness benchmark vs vllm-omni
 python tests/bench_vllm_omni.py --model black-forest-labs/FLUX.1-dev
 
 # kb-nano only (skip vllm-omni comparison)
@@ -129,8 +129,8 @@ python tests/bench_vllm_omni.py --skip-vllm-omni
 # Override batch size for all scenarios
 python tests/bench_vllm_omni.py --batch-size 2
 
-# Save results to a specific file
-python tests/bench_vllm_omni.py --output my_results.json
+# Save results to a specific directory
+python tests/bench_vllm_omni.py --output-dir tests/results/B200/FLUX.1-dev
 ```
 
 The diffusion benchmark measures:
@@ -408,7 +408,7 @@ FP8 activation quantization uses a custom Triton kernel for single-launch per-to
 
 ### FLUX.1-dev (Diffusion)
 
-Run `tests/bench_vllm_omni.py` to reproduce. Prompts drawn from the full nateraw/parti-prompts (P2) dataset (1632 prompts), shuffled deterministically. Reference engine: vllm-omni.
+Run `tests/bench_vllm_omni.py` to reproduce. Prompts drawn from the full nateraw/parti-prompts (P2) dataset (1632 prompts), shuffled deterministically. Both engines run in eager mode (`--enforce-eager`). Reference engine: vllm-omni 0.16.0.
 
 **Hardware: NVIDIA B200**
 
@@ -416,18 +416,18 @@ Throughput (images/sec):
 
 | Scenario | Batch | Images | vllm-omni | Ours | Ratio |
 |----------|------:|-------:|----------:|-----:|------:|
-| 1024x1024, 28 steps | 4 | 40 | 0.296 | 0.310 | **1.05x** |
-| 512x512, 28 steps   | 8 | 80 | 1.210 | 1.332 | **1.10x** |
-| 1024x1024, 50 steps | 4 | 20 | 0.180 | 0.198 | **1.10x** |
+| 1024x1024, 28 steps | 4 | 40 | 0.29 | 0.33 | **1.15x** |
+| 512x512, 28 steps   | 8 | 80 | 1.08 | 1.05 | 0.98x |
+| 1024x1024, 50 steps | 4 | 20 | 0.16 | 0.18 | **1.13x** |
 
 Latency (single image, 28 steps, median of 5 runs):
 
 | Resolution | vllm-omni | Ours | Ratio |
 |------------|----------:|-----:|------:|
-| 1024x1024  | 3.244s | 2.821s | **1.15x** |
-| 512x512    | 1.073s | 0.826s | **1.30x** |
+| 1024x1024  | 3.586s | 3.033s | **1.18x** |
+| 512x512    | 1.304s | 1.240s | **1.05x** |
 
-Correctness: cosine similarity 0.992 (latent-space comparison after VAE decode).
+Correctness: cosine similarity 0.998 (packed-latent comparison, single prompt); mean 0.97–0.98 across batches (VAE-decoded, multi-prompt). Numerical divergence grows with denoising steps due to accumulated floating-point differences — consistent with both engines using the same SDPA backend.
 
 ### Key optimizations
 

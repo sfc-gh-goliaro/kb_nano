@@ -5,10 +5,6 @@ FluxTransformerBlock: Dual-stream block with AdaLayerNormZero conditioning.
 
 FluxSingleTransformerBlock: Single-stream block with AdaLayerNormZeroSingle.
   Concatenates text and image, applies self-attention and MLP in parallel.
-
-Mirrors vllm-omni's ``FluxTransformerBlock`` and
-``FluxSingleTransformerBlock`` in
-``vllm_omni/diffusion/models/flux/flux_transformer.py``.
 """
 
 from __future__ import annotations
@@ -19,8 +15,11 @@ import torch
 import torch.nn as nn
 from diffusers.models.normalization import AdaLayerNormZero, AdaLayerNormZeroSingle
 
+from ..L1.gelu import GELU
+from ..L1.layer_norm import LayerNorm
 from ..L2.flux_attention import FluxAttention
 from ..L2.flux_feedforward import FeedForward
+from ..L2.parallel_linear import ColumnParallelLinear, RowParallelLinear
 
 
 class FluxTransformerBlock(nn.Module):
@@ -49,10 +48,10 @@ class FluxTransformerBlock(nn.Module):
             eps=eps,
         )
 
-        self.norm2 = nn.LayerNorm(dim, elementwise_affine=False, eps=1e-6)
+        self.norm2 = LayerNorm(dim, elementwise_affine=False, eps=1e-6)
         self.ff = FeedForward(dim=dim, dim_out=dim)
 
-        self.norm2_context = nn.LayerNorm(dim, elementwise_affine=False, eps=1e-6)
+        self.norm2_context = LayerNorm(dim, elementwise_affine=False, eps=1e-6)
         self.ff_context = FeedForward(dim=dim, dim_out=dim)
 
     def forward(
@@ -127,9 +126,9 @@ class FluxSingleTransformerBlock(nn.Module):
         self.mlp_hidden_dim = int(dim * mlp_ratio)
 
         self.norm = AdaLayerNormZeroSingle(dim)
-        self.proj_mlp = nn.Linear(dim, self.mlp_hidden_dim)
-        self.act_mlp = nn.GELU(approximate="tanh")
-        self.proj_out = nn.Linear(dim + self.mlp_hidden_dim, dim)
+        self.proj_mlp = ColumnParallelLinear(dim, self.mlp_hidden_dim, bias=True)
+        self.act_mlp = GELU(approximate="tanh")
+        self.proj_out = RowParallelLinear(dim + self.mlp_hidden_dim, dim, bias=True)
 
         self.attn = FluxAttention(
             query_dim=dim,

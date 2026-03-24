@@ -1,17 +1,14 @@
 """FLUX feed-forward network (L2 composite).
 
 Two-layer MLP: ColumnParallelLinear + GELU(tanh) -> RowParallelLinear.
-
-Mirrors vllm-omni's ``FeedForward`` in
-``vllm_omni/diffusion/models/flux/flux_transformer.py``.
 """
 
 from __future__ import annotations
 
 import torch
 import torch.nn as nn
-import torch.nn.functional as F
 
+from ..L1.gelu import GELU
 from .parallel_linear import ColumnParallelLinear, RowParallelLinear
 
 
@@ -19,11 +16,11 @@ class ColumnParallelApproxGELU(nn.Module):
     def __init__(self, dim_in: int, dim_out: int, *, approximate: str, bias: bool = True):
         super().__init__()
         self.proj = ColumnParallelLinear(dim_in, dim_out, bias=bias)
-        self.approximate = approximate
+        self.gelu = GELU(approximate=approximate)
 
     def forward(self, x: torch.Tensor) -> torch.Tensor:
         x = self.proj(x)
-        return F.gelu(x, approximate=self.approximate)
+        return self.gelu(x)
 
 
 class FeedForward(nn.Module):

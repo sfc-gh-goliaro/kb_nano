@@ -1,22 +1,19 @@
 """FLUX.1-dev diffusion pipeline (L4 pipeline).
 
 Contains:
-- FluxPosEmbed: 2D rotary position embedding generator.
 - FluxTransformer2DModel: the DiT backbone (dual + single stream blocks).
 - FluxPipeline: full text-to-image pipeline (encode, diffuse, decode).
 
-Mirrors vllm-omni's ``FluxPipeline`` and ``FluxTransformer2DModel``.
-This is L4 wiring/configuration; computation lives in L1-L3 tasks.
+L4 wiring/configuration; computation lives in L1-L3 tasks.
 """
 
 from __future__ import annotations
 
-import inspect
 import json
 import logging
 import os
 from collections.abc import Iterable
-from dataclasses import dataclass, field
+from dataclasses import dataclass
 from typing import Any
 
 import numpy as np
@@ -26,7 +23,6 @@ from diffusers.models.autoencoders.autoencoder_kl import AutoencoderKL
 from diffusers.models.embeddings import (
     CombinedTimestepGuidanceTextProjEmbeddings,
     CombinedTimestepTextProjEmbeddings,
-    get_1d_rotary_pos_embed,
 )
 from diffusers.models.normalization import AdaLayerNormContinuous
 from diffusers.schedulers.scheduling_flow_match_euler_discrete import (
@@ -36,6 +32,7 @@ from diffusers.utils.torch_utils import randn_tensor
 from torch import nn
 from transformers import CLIPTextModel, CLIPTokenizer, T5EncoderModel, T5TokenizerFast
 
+from ..L1.flux_pos_embed import FluxPosEmbed
 from ..L3.flux_transformer_block import FluxTransformerBlock, FluxSingleTransformerBlock
 
 logger = logging.getLogger(__name__)
@@ -105,36 +102,6 @@ class DiffusionOutput:
     """Output of the diffusion pipeline."""
     images: list[Any] | None = None
     latents: torch.Tensor | None = None
-
-
-# ---------------------------------------------------------------------------
-# Position embeddings
-# ---------------------------------------------------------------------------
-
-class FluxPosEmbed(nn.Module):
-    """2D rotary position embeddings for FLUX (concatenated per-axis 1D embeddings)."""
-
-    def __init__(self, theta: int, axes_dim: list[int] | tuple[int, ...]):
-        super().__init__()
-        self.theta = theta
-        self.axes_dim = list(axes_dim)
-
-    def forward(self, ids: torch.Tensor) -> tuple[torch.Tensor, torch.Tensor]:
-        n_axes = ids.shape[-1]
-        cos_out = []
-        sin_out = []
-        pos = ids.float()
-        freqs_dtype = torch.float64
-        for i in range(n_axes):
-            freqs_cis = get_1d_rotary_pos_embed(
-                self.axes_dim[i], pos[:, i],
-                theta=self.theta, use_real=False, freqs_dtype=freqs_dtype,
-            )
-            cos_out.append(freqs_cis.real)
-            sin_out.append(freqs_cis.imag)
-        freqs_cos = torch.cat(cos_out, dim=-1).to(ids.device)
-        freqs_sin = torch.cat(sin_out, dim=-1).to(ids.device)
-        return freqs_cos, freqs_sin
 
 
 # ---------------------------------------------------------------------------

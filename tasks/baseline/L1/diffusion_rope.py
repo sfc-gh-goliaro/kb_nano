@@ -4,13 +4,9 @@ Unlike the LLM RoPE (which uses sgl_kernel with a precomputed cos/sin cache
 indexed by integer positions), diffusion models receive pre-computed (cos, sin)
 tensors of shape [seq_len, rotary_dim/2] and apply them to Q/K of shape
 [batch, seq_len, num_heads, head_dim].
-
-Mirrors vllm-omni's ``vllm_omni.diffusion.layers.rope.RotaryEmbedding``.
 """
 
 from __future__ import annotations
-
-from importlib.util import find_spec
 
 import torch
 import torch.nn as nn
@@ -25,13 +21,13 @@ def _rotate_half(x: torch.Tensor, interleaved: bool = False) -> torch.Tensor:
         return torch.stack((-x2, x1), dim=-1).reshape_as(x)
 
 
-def _apply_rotary_emb_torch(
+def _apply_rotary_emb(
     x: torch.Tensor,
     cos: torch.Tensor,
     sin: torch.Tensor,
     interleaved: bool = False,
 ) -> torch.Tensor:
-    """Pure-PyTorch fallback.  x: (B, S, H, D), cos/sin: (S, D/2)."""
+    """Apply rotary embeddings.  x: (B, S, H, D), cos/sin: (S, D/2)."""
     ro_dim = cos.shape[-1] * 2
     cos = cos.unsqueeze(-2)
     sin = sin.unsqueeze(-2)
@@ -66,13 +62,6 @@ class DiffusionRoPE(nn.Module):
         super().__init__()
         self.is_neox_style = is_neox_style
         self.interleaved = not is_neox_style
-        self._use_flash_rotary = False
-        if find_spec("vllm") is not None:
-            try:
-                from vllm.vllm_flash_attn.layers.rotary import apply_rotary_emb  # noqa: F401
-                self._use_flash_rotary = True
-            except Exception:
-                pass
 
     def forward(
         self,
@@ -84,8 +73,4 @@ class DiffusionRoPE(nn.Module):
             cos = cos[0]
             sin = sin[0]
 
-        if self._use_flash_rotary:
-            from vllm.vllm_flash_attn.layers.rotary import apply_rotary_emb
-            return apply_rotary_emb(x, cos, sin, interleaved=self.interleaved)
-
-        return _apply_rotary_emb_torch(x, cos, sin, interleaved=self.interleaved)
+        return _apply_rotary_emb(x, cos, sin, interleaved=self.interleaved)
