@@ -12,7 +12,7 @@ import torch
 import torch.nn as nn
 
 from ..L1.conv3d import Conv3d
-from ..L1.linear import Linear
+from ..L1.linear import Matmul
 
 
 class VisionPatchEmbed(nn.Module):
@@ -23,7 +23,7 @@ class VisionPatchEmbed(nn.Module):
         self.input_size = in_channels * temporal_patch_size * patch_size * patch_size
         kernel = (temporal_patch_size, patch_size, patch_size)
         self.proj = Conv3d(in_channels, embed_dim, kernel, bias=bias)
-        self.linear = Linear()
+        self.linear = Matmul()
 
     def forward(self, x: torch.Tensor) -> torch.Tensor:
         x = x.view(x.shape[0], self.input_size)

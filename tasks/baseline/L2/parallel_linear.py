@@ -14,7 +14,7 @@ import torch
 import torch.nn as nn
 
 from ....infra.tp import _tp_size, _tp_rank
-from ..L1.linear import Linear
+from ..L1.linear import Matmul
 from ..L1.fp8_linear import Fp8Linear
 from ..L1.allreduce import AllReduce
 
@@ -53,7 +53,7 @@ class ColumnParallelLinear(nn.Module):
         else:
             self.weight = nn.Parameter(torch.empty(self.output_size_per_partition, input_size))
             self.weight.weight_loader = self._weight_loader
-            self.linear_op = Linear()
+            self.linear_op = Matmul()
 
         self.bias = nn.Parameter(torch.empty(self.output_size_per_partition)) if bias else None
         if self.bias is not None:
@@ -104,7 +104,7 @@ class MergedColumnParallelLinear(nn.Module):
         else:
             self.weight = nn.Parameter(torch.empty(total // tp, input_size))
             self.weight.weight_loader = self._weight_loader
-            self.linear_op = Linear()
+            self.linear_op = Matmul()
 
         self.bias = None
 
@@ -160,7 +160,7 @@ class QKVParallelLinear(nn.Module):
         else:
             self.weight = nn.Parameter(torch.empty(output_size, hidden_size))
             self.weight.weight_loader = self._weight_loader
-            self.linear_op = Linear()
+            self.linear_op = Matmul()
 
         self.bias = None
         if bias:
@@ -234,7 +234,7 @@ class RowParallelLinear(nn.Module):
         else:
             self.weight = nn.Parameter(torch.empty(output_size, self.input_size_per_partition))
             self.weight.weight_loader = self._weight_loader
-            self.linear_op = Linear()
+            self.linear_op = Matmul()
 
         self.bias = nn.Parameter(torch.empty(output_size)) if bias else None
         if self.bias is not None:

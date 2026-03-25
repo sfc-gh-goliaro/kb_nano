@@ -7,7 +7,7 @@ import torch.nn as nn
 
 from ....infra.tp import _tp_rank, _tp_size
 from ..L1.allreduce import AllReduce
-from ..L1.linear import Linear
+from ..L1.linear import Matmul
 from ..L1.topk_softmax import TopKSoftmax
 from ..L2.fused_experts import FusedExperts
 
@@ -44,7 +44,7 @@ class MixtralMoE(nn.Module):
         ))
         self.w2.weight_loader = self._w2_weight_loader
 
-        self.linear_op = Linear()
+        self.linear_op = Matmul()
         self.topk_softmax = TopKSoftmax()
         self.fused_experts = FusedExperts()
         self.allreduce = AllReduce()

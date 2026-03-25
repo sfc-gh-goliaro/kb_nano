@@ -17,7 +17,7 @@ import torch.nn as nn
 
 from ....infra.tp import _tp_rank, _tp_size
 from ..L1.allreduce import AllReduce
-from ..L1.linear import Linear
+from ..L1.linear import Matmul
 from ..L1.sigmoid_topk import SigmoidTopK
 from ..L2.llama_mlp import LlamaMLP
 from ..L2.fused_experts import FusedExperts
@@ -71,7 +71,7 @@ class Llama4MoE(nn.Module):
         ))
         self.w2.weight_loader = self._w2_weight_loader
 
-        self.linear_op = Linear()
+        self.linear_op = Matmul()
         self.sigmoid_topk = SigmoidTopK()
         self.fused_experts = FusedExperts()
         self.allreduce = AllReduce()
