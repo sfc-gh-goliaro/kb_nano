@@ -26,7 +26,7 @@ A standalone, high-performance inference engine supporting **LLMs** (Llama 3.1, 
 │   │   │   ├── silu_and_mul.py # SiLU activation with gate
 │   │   │   ├── rotary_emb.py   # RoPE (standard + Llama 3.1 frequency scaling)
 │   │   │   ├── diffusion_rope.py   # Interleaved RoPE for diffusion models
-│   │   │   ├── diffusion_sdpa.py   # Non-causal SDPA for diffusion models
+│   │   │   ├── dense_attention.py   # Dense attention (non-paged, no KV cache; FA3>FA2>SDPA)
 │   │   │   ├── store_kvcache.py# Triton KV cache store kernel
 │   │   │   ├── flash_attn_prefill.py
 │   │   │   ├── flash_attn_decode.py
@@ -408,26 +408,34 @@ FP8 activation quantization uses a custom Triton kernel for single-launch per-to
 
 ### FLUX.1-dev (Diffusion)
 
-Run `tests/bench_vllm_omni.py` to reproduce. Prompts drawn from the full nateraw/parti-prompts (P2) dataset (1632 prompts), shuffled deterministically. Both engines run in eager mode (`--enforce-eager`). Reference engine: vllm-omni 0.16.0.
+Run `tests/bench_vllm_omni.py` to reproduce. Prompts drawn from the full nateraw/parti-prompts (P2) dataset (1632 prompts), shuffled deterministically. Reference engine: vllm-omni 0.16.0.
 
 **Hardware: NVIDIA B200**
 
-Throughput (images/sec):
+Throughput (images/sec, with `torch.compile`):
 
 | Scenario | Batch | Images | vllm-omni | Ours | Ratio |
 |----------|------:|-------:|----------:|-----:|------:|
-| 1024x1024, 28 steps | 4 | 40 | 0.29 | 0.33 | **1.15x** |
-| 512x512, 28 steps   | 8 | 80 | 1.08 | 1.05 | 0.98x |
-| 1024x1024, 50 steps | 4 | 20 | 0.16 | 0.18 | **1.13x** |
+| 1024x1024, 28 steps | 4 | 40 | 0.32 | 0.45 | **1.43x** |
+| 512x512, 28 steps   | 8 | 80 | 1.22 | 1.48 | **1.22x** |
+| 1024x1024, 50 steps | 4 | 20 | 0.18 | 0.25 | **1.40x** |
 
-Latency (single image, 28 steps, median of 5 runs):
+Latency (single image, 28 steps, median of 5 runs, with `torch.compile`):
 
 | Resolution | vllm-omni | Ours | Ratio |
 |------------|----------:|-----:|------:|
-| 1024x1024  | 3.586s | 3.033s | **1.18x** |
-| 512x512    | 1.304s | 1.240s | **1.05x** |
+| 1024x1024  | 3.225s | 2.208s | **1.46x** |
+| 512x512    | 1.056s | 0.757s | **1.39x** |
 
-Correctness: cosine similarity 0.998 (packed-latent comparison, single prompt); mean 0.97–0.98 across batches (VAE-decoded, multi-prompt). Numerical divergence grows with denoising steps due to accumulated floating-point differences — consistent with both engines using the same SDPA backend.
+Correctness (eager mode, VAE-decoded images, per-batch cosine similarity):
+
+| Scenario | Mean CosSim | Min CosSim |
+|----------|------------:|-----------:|
+| 1024x1024, 28 steps | 0.973 | 0.947 |
+| 512x512, 28 steps   | 0.983 | 0.974 |
+| 1024x1024, 50 steps | 0.969 | 0.939 |
+
+Correctness is measured in eager mode to isolate numerical differences in the model from `torch.compile` graph-level optimizations (which change floating-point evaluation order). On B200, both engines use PyTorch SDPA (which dispatches to cuDNN flash attention); on Ampere/Hopper GPUs, kb-nano uses `flash_attn_func` directly.
 
 ### Key optimizations
 

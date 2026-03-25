@@ -16,6 +16,7 @@ dependencies = [
     "tqdm",
     "vllm==0.16.0",
     "sgl-kernel",
+    "flash-attn",
     "decord",
     "mlflow>=2.10",
 ]

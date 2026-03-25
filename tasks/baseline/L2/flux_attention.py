@@ -15,7 +15,7 @@ import torch.nn as nn
 from ....infra.tp import _tp_size
 from ..L1.rms_norm import RMSNorm
 from ..L1.diffusion_rope import DiffusionRoPE
-from ..L1.diffusion_sdpa import DiffusionSDPA
+from ..L1.dense_attention import DenseAttention
 from .parallel_linear import (
     ColumnParallelLinear,
     QKVParallelLinear,
@@ -94,7 +94,7 @@ class FluxAttention(nn.Module):
             )
 
         self.rope = DiffusionRoPE(is_neox_style=False)
-        self.attn = DiffusionSDPA()
+        self.attn = DenseAttention()
 
     def forward(
         self,
