@@ -180,24 +180,19 @@ class DeepSeekMLA(nn.Module):
         self.indexer = indexer
 
     def _extract_absorption_weights(self):
-        """Extract W_UK and W_UV from kv_b_proj for decode-path absorption."""
+        """Extract W_UK and W_UV from kv_b_proj for decode-path absorption.
+
+        Uses an identity-matrix forward pass through the FP8 linear layer to
+        dequantize weights, matching vLLM's approach. Must be called AFTER FP8
+        postprocessing (UE8M0 requant + scale layout transform).
+        """
         if self._w_uk is not None:
             return
-        import math
-        _B = 128
         w_raw = self.kv_b_proj.weight.data
-        if w_raw.dtype == torch.float8_e4m3fn:
-            scale = self.kv_b_proj.weight_scale_inv.data
-            N, K = w_raw.shape
-            sN, sK = math.ceil(N / _B), math.ceil(K / _B)
-            pN, pK = sN * _B, sK * _B
-            w_f = w_raw.to(torch.float32)
-            if pN != N or pK != K:
-                w_f = torch.nn.functional.pad(w_f, (0, pK - K, 0, pN - N))
-            w_f = w_f.view(sN, _B, sK, _B) * scale[:sN, None, :sK, None]
-            w_dequant = w_f.reshape(pN, pK)[:N, :K].to(torch.bfloat16)
-        else:
-            w_dequant = w_raw.to(torch.bfloat16)
+        K = w_raw.shape[1]  # input_size = kv_lora_rank
+        eye = torch.eye(K, dtype=torch.bfloat16, device=w_raw.device)
+        with torch.no_grad():
+            w_dequant = self.kv_b_proj(eye).T  # [out_features, K]
 
         w = w_dequant.view(self.num_local_heads,
                            self.qk_nope_head_dim + self.v_head_dim,

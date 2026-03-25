@@ -8,6 +8,7 @@ Uses DeepGEMM's fp8_mqa_logits / fp8_paged_mqa_logits for scoring.
 from __future__ import annotations
 
 import math
+import os
 
 import torch
 import torch.nn as nn
@@ -21,6 +22,22 @@ from ..L1.fp8_linear import Fp8Linear
 from .parallel_linear import ColumnParallelLinear
 
 _NUM_SMS = 132
+
+_topk_ops = None
+
+
+def _get_topk_ops():
+    global _topk_ops
+    if _topk_ops is None:
+        from torch.utils.cpp_extension import load
+        src = os.path.join(os.path.dirname(__file__), "csrc", "top_k_per_row.cu")
+        _topk_ops = load(
+            name="top_k_per_row_ops",
+            sources=[src],
+            extra_cuda_cflags=["-O3", "--expt-relaxed-constexpr"],
+            verbose=False,
+        )
+    return _topk_ops
 
 
 class _IndexerLinear(nn.Module):
@@ -422,21 +439,17 @@ class DeepSeekIndexer(nn.Module):
             clean_logits=False,
         )
 
-        # Top-k per sequence with causal masking
-        kv_base = 0
-        for s in range(num_seqs):
-            q_start, q_end = cu_q_list[s], cu_q_list[s + 1]
-            kv_len = cu_k_list[s + 1] - cu_k_list[s]
-            if kv_len == 0:
-                continue
-
-            k = min(self.topk_tokens, kv_len)
-            if k > 0:
-                # Slice the logits for this sequence's KV range
-                seq_logits = logits[q_start:q_end, kv_base:kv_base + kv_len]
-                _, indices = torch.topk(seq_logits, k, dim=1)
-                topk_indices_buffer[q_start:q_end, :k] = indices.to(torch.int32)
-            kv_base += kv_len
+        ops = _get_topk_ops()
+        ops.top_k_per_row_prefill(
+            logits,
+            cu_seqlen_ks,
+            cu_seqlen_ke,
+            topk_indices_buffer[:N],
+            N,
+            logits.stride(0),
+            logits.stride(1),
+            self.topk_tokens,
+        )
 
     def _decode_indexing(self, q_fp8, q_scale, weights, topk_indices_buffer,
                          offset, ctx):
@@ -478,12 +491,20 @@ class DeepSeekIndexer(nn.Module):
             block_tables[:batch].to(torch.int32),
             sched_meta,
             self.max_model_len,
-            clean_logits=True,
+            clean_logits=False,
         )
 
-        k = min(self.topk_tokens, logits.shape[1])
-        _, indices = torch.topk(logits, k, dim=1)
-        topk_indices_buffer[offset:offset + batch, :k] = indices.to(torch.int32)
+        ops = _get_topk_ops()
+        ops.top_k_per_row_decode(
+            logits,
+            1,
+            ctx_lens,
+            topk_indices_buffer[offset:offset + batch],
+            batch,
+            logits.stride(0),
+            logits.stride(1),
+            self.topk_tokens,
+        )
 
     def _gather_k_bf16(self, ctx, seq_idx, kv_len):
         """Gather K from indexer cache pages, dequantize to BF16."""

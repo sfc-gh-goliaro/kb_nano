@@ -753,7 +753,8 @@ def main():
         return
 
     import os, tempfile
-    from multiprocessing import Process
+    import multiprocessing as mp
+    ctx = mp.get_context("spawn")
 
     nccl_port = int(os.environ.get("KB_NANO_NCCL_PORT", "29501"))
     for port_try in range(nccl_port, nccl_port + 100):
@@ -770,8 +771,8 @@ def main():
             mode="w", suffix=f"_dp{rank}.json", delete=False, dir="/tmp")
         rf.close()
         result_files.append(rf.name)
-        p = Process(target=_dp_rank_main,
-                    args=(rank, dp, nccl_port, cfg, rf.name))
+        p = ctx.Process(target=_dp_rank_main,
+                        args=(rank, dp, nccl_port, cfg, rf.name))
         p.start()
         procs.append(p)
 

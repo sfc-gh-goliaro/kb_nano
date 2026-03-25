@@ -479,12 +479,11 @@ def load_weights(model, model_path: str, model_type: str = "llama") -> None:
 
 
 def _extract_mla_absorption_weights(model: torch.nn.Module) -> None:
-    """Extract W_UK/W_UV from MLA's kv_b_proj BEFORE FP8 postprocessing.
+    """Extract W_UK/W_UV from MLA's kv_b_proj AFTER FP8 postprocessing.
 
-    After postprocessing, the FP8 weights use UE8M0 scales with a
-    transformed layout that makes direct dequantization incorrect.
-    Extraction must happen while weights are still in standard FP8
-    with standard block scales.
+    Uses an identity-matrix forward pass through the postprocessed FP8
+    linear layer (UE8M0 scales + transformed layout) to dequantize,
+    matching vLLM's approach for numerical alignment.
     """
     from ..tasks.baseline.L2.deepseek_mla import DeepSeekMLA
     for m in model.modules():
@@ -653,9 +652,9 @@ def load_model(
         for name, buf in model.named_buffers():
             if buf.device != device:
                 buf.data = buf.data.to(device=device)
-        _extract_mla_absorption_weights(model)
-        torch.cuda.synchronize()
         _postprocess_fp8_weights(model)
+        torch.cuda.synchronize()
+        _extract_mla_absorption_weights(model)
         _swap_moe_weights_for_flashinfer(model)
         torch.cuda.synchronize()
         gc.collect()

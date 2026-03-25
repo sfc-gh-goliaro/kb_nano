@@ -185,16 +185,6 @@ class DeepSeekMoE(nn.Module):
         topk_weights: torch.Tensor,
         topk_ids: torch.Tensor,
     ) -> torch.Tensor:
-        if self._use_flashinfer:
-            return self.fused_experts(
-                hidden_states, self.w13, self.w2,
-                topk_weights, topk_ids, self.n_local_experts,
-                w13_scale=self.w13_weight_scale_inv,
-                w2_scale=self.w2_weight_scale_inv,
-                ep_size=self.ep_size,
-                ep_rank=self.ep_rank,
-            )
-
         if self.ep_size > 1:
             local_mask = (topk_ids >= self.expert_start) & (topk_ids < self.expert_end)
             topk_ids = torch.where(
@@ -360,9 +350,12 @@ class DeepSeekMoE(nn.Module):
             gather_w = [torch.empty_like(w_in) for _ in range(ep_size)]
             gather_i = [torch.empty_like(i_in) for _ in range(ep_size)]
 
-        dist.all_gather(gather_h, h_in, group=ep_group)
-        dist.all_gather(gather_w, w_in, group=ep_group)
-        dist.all_gather(gather_i, i_in, group=ep_group)
+        with dist.distributed_c10d._coalescing_manager(
+            group=ep_group, device=h_in.device
+        ):
+            dist.all_gather(gather_h, h_in, group=ep_group)
+            dist.all_gather(gather_w, w_in, group=ep_group)
+            dist.all_gather(gather_i, i_in, group=ep_group)
 
         if have_bufs:
             all_h = self._ep_buf_h[:total]
@@ -449,9 +442,12 @@ class DeepSeekMoE(nn.Module):
                 w_chunk[:actual].copy_(topk_weights[c_start:c_end])
                 i_chunk[:actual].copy_(topk_ids[c_start:c_end])
 
-            dist.all_gather(self._ep_gather_h, h_chunk, group=ep_group)
-            dist.all_gather(self._ep_gather_w, w_chunk, group=ep_group)
-            dist.all_gather(self._ep_gather_i, i_chunk, group=ep_group)
+            with dist.distributed_c10d._coalescing_manager(
+                group=ep_group, device=h_chunk.device
+            ):
+                dist.all_gather(self._ep_gather_h, h_chunk, group=ep_group)
+                dist.all_gather(self._ep_gather_w, w_chunk, group=ep_group)
+                dist.all_gather(self._ep_gather_i, i_chunk, group=ep_group)
 
             chunk_out = self._run_routed_experts(
                 self._ep_buf_h, self._ep_buf_w, self._ep_buf_i)
