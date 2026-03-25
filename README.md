@@ -416,7 +416,7 @@ Throughput (images/sec, with `torch.compile`):
 
 | Scenario | Batch | Images | vllm-omni | Ours | Ratio |
 |----------|------:|-------:|----------:|-----:|------:|
-| 1024x1024, 28 steps | 4 | 40 | 0.32 | 0.45 | **1.43x** |
+| 1024x1024, 28 steps | 4 | 40 | 0.32 | 0.45 | **1.44x** |
 | 512x512, 28 steps   | 8 | 80 | 1.22 | 1.48 | **1.22x** |
 | 1024x1024, 50 steps | 4 | 20 | 0.18 | 0.25 | **1.40x** |
 
@@ -424,10 +424,10 @@ Latency (single image, 28 steps, median of 5 runs, with `torch.compile`):
 
 | Resolution | vllm-omni | Ours | Ratio |
 |------------|----------:|-----:|------:|
-| 1024x1024  | 3.225s | 2.208s | **1.46x** |
-| 512x512    | 1.056s | 0.757s | **1.39x** |
+| 1024x1024  | 3.223s | 2.209s | **1.46x** |
+| 512x512    | 1.028s | 0.758s | **1.36x** |
 
-Correctness (eager mode, VAE-decoded images, per-batch cosine similarity):
+Correctness (eager mode, packed latent space, per-batch cosine similarity):
 
 | Scenario | Mean CosSim | Min CosSim |
 |----------|------------:|-----------:|
