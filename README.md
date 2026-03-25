@@ -1,12 +1,13 @@
 # kb-nano
 
-A standalone, high-performance inference engine supporting **LLMs** (Llama 3.1, Mixtral-8x7B, Qwen2-VL, Qwen3-VL) and **diffusion models** (FLUX.1-dev) with tensor parallelism. No vLLM dependency at runtime — just PyTorch, Triton, and Flash Attention.
+A standalone, high-performance inference engine supporting **LLMs** (Llama 3.1, Mixtral-8x7B, Qwen2-VL, Qwen3-VL) and **diffusion models** (FLUX.1-dev, SDXL) with tensor parallelism. No vLLM dependency at runtime — just PyTorch, Triton, and Flash Attention.
 
 ## Features
 
 - **Llama 3.1** (8B, 70B) with frequency-scaled RoPE
 - **Mixtral-8x7B** with fused Triton MoE grouped-GEMM kernels
 - **FLUX.1-dev** diffusion transformer (text-to-image) with Flash Attention and torch.compile
+- **SDXL** (Stable Diffusion XL) UNet-based text-to-image with dual CLIP text encoders
 - **Tensor parallelism** (TP) with custom IPC-based all-reduce for multi-GPU inference
 - **Paged KV cache** with Triton store kernels (LLM models)
 - **CUDA graph capture** for decode steps (LLM models)
@@ -14,7 +15,8 @@ A standalone, high-performance inference engine supporting **LLMs** (Llama 3.1, 
 - Greedy and top-p sampling (LLMs); flow-match Euler discrete scheduling (diffusion)
 - **Layered operator architecture** (L1 single-kernel ops through L4 full models) with clean separation of concerns
 - **Benchmarking suite** for evaluating custom CUDA/Triton/PyTorch kernels at 4 abstraction levels
-- **vllm-omni comparison benchmark** for diffusion models
+- **vllm-omni comparison benchmark** for FLUX diffusion
+- **diffusers comparison benchmark** for SDXL diffusion
 
 ## Project Structure
 
@@ -27,6 +29,8 @@ A standalone, high-performance inference engine supporting **LLMs** (Llama 3.1, 
 │   │   │   ├── rotary_emb.py   # RoPE (standard + Llama 3.1 frequency scaling)
 │   │   │   ├── diffusion_rope.py   # Interleaved RoPE for diffusion models
 │   │   │   ├── dense_attention.py   # Dense attention (non-paged, no KV cache; FA3>FA2>SDPA)
+│   │   │   ├── conv2d.py       # Conv2d op (wraps F.conv2d)
+│   │   │   ├── group_norm.py   # GroupNorm op (wraps F.group_norm)
 │   │   │   ├── store_kvcache.py# Triton KV cache store kernel
 │   │   │   ├── flash_attn_prefill.py
 │   │   │   ├── flash_attn_decode.py
@@ -46,15 +50,25 @@ A standalone, high-performance inference engine supporting **LLMs** (Llama 3.1, 
 │   │   │   ├── mixtral_moe.py  # Mixtral MoE routing + experts
 │   │   │   ├── fused_experts.py# Fused expert execution
 │   │   │   ├── parallel_linear.py  # TP-aware linear layers
-│   │   │   └── parallel_embedding.py
+│   │   │   ├── parallel_embedding.py
+│   │   │   ├── sdxl_attention.py   # SDXL multi-head attention (self/cross)
+│   │   │   ├── sdxl_resnet.py      # ResnetBlock2D for UNet
+│   │   │   ├── sdxl_feedforward.py # GEGLU FeedForward
+│   │   │   ├── sdxl_time_embedding.py # SDXL text_time conditioning
+│   │   │   ├── sdxl_downsample.py  # Stride-2 Conv2d downsampling
+│   │   │   └── sdxl_upsample.py    # Nearest-neighbor + Conv2d upsampling
 │   │   ├── L3/                 # Decoder layers
 │   │   │   ├── llama_decoder.py
 │   │   │   ├── mixtral_decoder.py
-│   │   │   └── flux_transformer_block.py  # FLUX dual/single-stream DiT blocks
+│   │   │   ├── flux_transformer_block.py  # FLUX dual/single-stream DiT blocks
+│   │   │   ├── sdxl_transformer_block.py # BasicTransformerBlock (self-attn, cross-attn, GEGLU FFN)
+│   │   │   ├── sdxl_spatial_transformer.py # Transformer2DModel (spatial flatten + N transformer blocks)
+│   │   │   └── sdxl_unet_block.py  # UNet down/mid/up blocks with cross-attention
 │   │   └── L4/                 # Full models
 │   │       ├── llama.py        # LlamaForCausalLM
 │   │       ├── mixtral.py      # MixtralForCausalLM
-│   │       └── flux.py         # FluxPipeline (text-to-image diffusion)
+│   │       ├── flux.py         # FluxPipeline (text-to-image diffusion)
+│   │       └── sdxl.py         # SDXLPipeline (UNet text-to-image diffusion)
 │   └── candidate/              # Generated replacement kernels (gitignored)
 │       ├── README.md           # Instructions
 │       └── L1/, L2/, ...       # Organized by level, named after the operator
@@ -75,6 +89,7 @@ A standalone, high-performance inference engine supporting **LLMs** (Llama 3.1, 
     ├── test_bench.py           # Bench module tests (discovery, replacement, kernel and E2E integration)
     ├── bench_vllm.py           # Multi-scenario throughput + latency + alignment benchmark vs vLLM
     ├── bench_vllm_omni.py     # FLUX diffusion benchmark: kb-nano vs vllm-omni
+    ├── bench_diffusers.py     # SDXL diffusion benchmark: kb-nano vs diffusers + torch.compile
     ├── utils/                  # Post-processing and visualization
     │   └── parse_vllm_bench_results.py  # Generate tables and plots from bench_vllm.py results
     └── debug/                  # Profiling and debugging scripts
@@ -131,6 +146,22 @@ python tests/bench_vllm_omni.py --batch-size 2
 
 # Save results to a specific directory
 python tests/bench_vllm_omni.py --output-dir tests/results/B200/FLUX.1-dev
+```
+
+### Benchmarking vs diffusers (SDXL Diffusion)
+
+```bash
+# SDXL: throughput + latency + correctness benchmark vs diffusers + torch.compile
+python tests/bench_diffusers.py --model stabilityai/stable-diffusion-xl-base-1.0
+
+# Eager mode (for correctness measurement without compile divergence)
+python tests/bench_diffusers.py --enforce-eager
+
+# kb-nano only (skip diffusers comparison)
+python tests/bench_diffusers.py --skip-diffusers
+
+# Save results to a specific directory
+python tests/bench_diffusers.py --output-dir tests/results/B200/stable-diffusion-xl-base-1.0
 ```
 
 The diffusion benchmark measures:
@@ -436,6 +467,37 @@ Correctness (eager mode, packed latent space, per-batch cosine similarity):
 | 1024x1024, 50 steps | 0.969 | 0.939 |
 
 Correctness is measured in eager mode to isolate numerical differences in the model from `torch.compile` graph-level optimizations (which change floating-point evaluation order). On B200, both engines use PyTorch SDPA (which dispatches to cuDNN flash attention); on Ampere/Hopper GPUs, kb-nano uses `flash_attn_func` directly.
+
+### SDXL (Diffusion)
+
+Run `tests/bench_diffusers.py` to reproduce. Prompts drawn from the full nateraw/parti-prompts (P2) dataset (1632 prompts), shuffled deterministically. Reference engine: diffusers 0.31 with `torch.compile(mode="max-autotune")`, eager mode for correctness.
+
+**Hardware: NVIDIA B200**
+
+Throughput (images/sec, eager mode):
+
+| Scenario | Batch | Images | diffusers | Ours | Ratio |
+|----------|------:|-------:|----------:|-----:|------:|
+| 1024x1024, 50 steps | 1 | 5 | 0.51 | 0.57 | **1.12x** |
+| 512x512, 50 steps   | 4 | 20 | 2.03 | 2.62 | **1.29x** |
+| 1024x1024, 28 steps | 1 | 5 | 0.92 | 1.01 | **1.10x** |
+
+Latency (single image, 50 steps, median of 5 runs, eager mode):
+
+| Resolution | diffusers | Ours | Ratio |
+|------------|----------:|-----:|------:|
+| 1024x1024  | 1.914s | 1.753s | **1.09x** |
+| 512x512    | 1.906s | 1.370s | **1.39x** |
+
+Correctness (eager mode, latent space, per-batch cosine similarity):
+
+| Scenario | Mean CosSim | Min CosSim |
+|----------|------------:|-----------:|
+| 1024x1024, 50 steps | 0.990 | 0.967 |
+| 1024x1024, 28 steps | 0.987 | 0.977 |
+| 512x512, 50 steps   | 0.969 | 0.952 |
+
+Correctness is measured in eager mode with bf16 precision. Both engines use identical model weights (diffusers checkpoint) and the same EulerDiscreteScheduler. The remaining cosine divergence is expected from bf16 accumulation differences across 28-50 denoising steps with CFG guidance_scale=5.0.
 
 ### Key optimizations
 
