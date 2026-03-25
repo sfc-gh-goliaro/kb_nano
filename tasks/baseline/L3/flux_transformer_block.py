@@ -13,7 +13,7 @@ from typing import Any
 
 import torch
 import torch.nn as nn
-from diffusers.models.normalization import AdaLayerNormZero, AdaLayerNormZeroSingle
+from ..L2.ada_layer_norm import AdaLayerNormZero, AdaLayerNormZeroSingle
 
 from ..L1.gelu import GELU
 from ..L1.layer_norm import LayerNorm

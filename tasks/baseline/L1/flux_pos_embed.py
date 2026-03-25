@@ -7,7 +7,21 @@ from __future__ import annotations
 
 import torch
 import torch.nn as nn
-from diffusers.models.embeddings import get_1d_rotary_pos_embed
+
+
+def _get_1d_rotary_pos_embed(
+    dim: int,
+    pos: torch.Tensor,
+    theta: float = 10000.0,
+    freqs_dtype: torch.dtype = torch.float32,
+) -> torch.Tensor:
+    """Compute 1D rotary frequency tensor as complex exponentials.
+
+    Returns complex64 tensor of shape [S, dim/2].
+    """
+    freqs = 1.0 / (theta ** (torch.arange(0, dim, 2, dtype=freqs_dtype, device=pos.device) / dim))
+    freqs = torch.outer(pos, freqs)
+    return torch.polar(torch.ones_like(freqs), freqs)
 
 
 class FluxPosEmbed(nn.Module):
@@ -23,11 +37,10 @@ class FluxPosEmbed(nn.Module):
         cos_out = []
         sin_out = []
         pos = ids.float()
-        freqs_dtype = torch.float64
         for i in range(n_axes):
-            freqs_cis = get_1d_rotary_pos_embed(
+            freqs_cis = _get_1d_rotary_pos_embed(
                 self.axes_dim[i], pos[:, i],
-                theta=self.theta, use_real=False, freqs_dtype=freqs_dtype,
+                theta=self.theta, freqs_dtype=torch.float64,
             )
             cos_out.append(freqs_cis.real)
             sin_out.append(freqs_cis.imag)

@@ -18,17 +18,17 @@ from typing import Any
 
 import numpy as np
 import torch
-from diffusers.image_processor import VaeImageProcessor
 from diffusers.models.autoencoders.autoencoder_kl import AutoencoderKL
-from diffusers.models.embeddings import (
+
+from ..L2.ada_layer_norm_continuous import AdaLayerNormContinuous
+from ..L2.timestep_embedding import (
     CombinedTimestepGuidanceTextProjEmbeddings,
     CombinedTimestepTextProjEmbeddings,
 )
-from diffusers.models.normalization import AdaLayerNormContinuous
+from .vae_image_processor import VaeImageProcessor
 from diffusers.schedulers.scheduling_flow_match_euler_discrete import (
     FlowMatchEulerDiscreteScheduler,
 )
-from diffusers.utils.torch_utils import randn_tensor
 from torch import nn
 from transformers import CLIPTextModel, CLIPTokenizer, T5EncoderModel, T5TokenizerFast
 
@@ -479,7 +479,7 @@ class FluxPipeline(nn.Module):
         h = 2 * (int(height) // (self.vae_scale_factor * 2))
         w = 2 * (int(width) // (self.vae_scale_factor * 2))
         shape = (batch_size, num_channels_latents, h, w)
-        latents = randn_tensor(shape, generator=generator, device=device, dtype=dtype)
+        latents = torch.randn(shape, generator=generator, device=device, dtype=dtype)
         latents = self._pack_latents(latents, batch_size, num_channels_latents, h, w)
         latent_image_ids = self._prepare_latent_image_ids(
             batch_size, h // 2, w // 2, device, dtype,
