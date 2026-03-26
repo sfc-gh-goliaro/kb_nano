@@ -21,7 +21,7 @@ from ....infra.context import get_context, get_attn_backend_config
 from ..L1.fp8_linear import Fp8Linear
 from .parallel_linear import ColumnParallelLinear
 
-_NUM_SMS = 132
+_NUM_SMS = None
 
 _topk_ops = None
 
@@ -187,14 +187,13 @@ def _gather_indexer_k_fp8_kernel(
 
 
 def _build_token_to_seq(cu_seq_lens: torch.Tensor, total_tokens: int) -> torch.Tensor:
-    """Build a flat mapping from token index -> sequence index."""
+    """Build a flat mapping from token index -> sequence index (vectorized)."""
     batch_size = cu_seq_lens.shape[0] - 1
-    token_to_seq = torch.empty(total_tokens, dtype=torch.int32, device=cu_seq_lens.device)
-    for s in range(batch_size):
-        start = cu_seq_lens[s].item()
-        end = cu_seq_lens[s + 1].item()
-        token_to_seq[start:end] = s
-    return token_to_seq
+    seq_lens = cu_seq_lens[1:] - cu_seq_lens[:-1]
+    return torch.repeat_interleave(
+        torch.arange(batch_size, device=cu_seq_lens.device, dtype=torch.int32),
+        seq_lens.int(),
+    )
 
 
 def _gather_indexer_k_fp8(
@@ -238,6 +237,41 @@ def _gather_indexer_k_fp8(
         BYTES_PER_TOKEN=bytes_per_token,
     )
     return dst_k.view(torch.float8_e4m3fn), dst_scale
+
+
+def _kv_spans_from_batches(
+    cu_q_list: list[int], cu_k_list: list[int], N: int, device,
+) -> tuple[torch.Tensor, torch.Tensor]:
+    """Build per-query-token causal KV spans (vectorized, no Python loop).
+
+    Following vLLM's kv_spans_from_batches pattern: uses cumsum +
+    repeat_interleave to avoid per-sequence Python loops and GPU-CPU sync.
+    """
+    num_seqs = len(cu_q_list) - 1
+    q_lens_t = torch.tensor(
+        [cu_q_list[s + 1] - cu_q_list[s] for s in range(num_seqs)],
+        dtype=torch.int32, device=device)
+    kv_lens_t = torch.tensor(
+        [cu_k_list[s + 1] - cu_k_list[s] for s in range(num_seqs)],
+        dtype=torch.int32, device=device)
+    cached_lens = kv_lens_t - q_lens_t
+
+    kv_bases = torch.zeros(num_seqs, dtype=torch.int32, device=device)
+    kv_bases[1:] = torch.cumsum(kv_lens_t[:-1], dim=0)
+
+    kv_base_per_tok = torch.repeat_interleave(kv_bases, q_lens_t)
+    cached_per_tok = torch.repeat_interleave(cached_lens, q_lens_t)
+    kv_len_per_tok = torch.repeat_interleave(kv_lens_t, q_lens_t)
+
+    q_starts = torch.repeat_interleave(
+        torch.tensor(cu_q_list[:-1], dtype=torch.int32, device=device), q_lens_t)
+    local_pos = torch.arange(N, dtype=torch.int32, device=device) - q_starts
+
+    cu_seqlen_ks = kv_base_per_tok
+    cu_seqlen_ke = (local_pos + 1 + kv_base_per_tok + cached_per_tok).clamp(
+        max=(kv_base_per_tok + kv_len_per_tok))
+
+    return cu_seqlen_ks, cu_seqlen_ke
 
 
 class DeepSeekIndexer(nn.Module):
@@ -380,8 +414,12 @@ class DeepSeekIndexer(nn.Module):
             cu_k = ctx.cu_seqlens_k
             block_tables = ctx.block_tables
 
-        cu_q_list = cu_q.cpu().tolist()
-        cu_k_list = cu_k.cpu().tolist()
+        cu_q_list = (ctx.prefill_cu_seqlens_q_cpu if ctx.is_mixed and ctx.prefill_cu_seqlens_q_cpu is not None
+                     else ctx.cu_seqlens_q_cpu if not ctx.is_mixed and ctx.cu_seqlens_q_cpu is not None
+                     else cu_q.cpu().tolist())
+        cu_k_list = (ctx.prefill_cu_seqlens_k_cpu if ctx.is_mixed and ctx.prefill_cu_seqlens_k_cpu is not None
+                     else ctx.cu_seqlens_k_cpu if not ctx.is_mixed and ctx.cu_seqlens_k_cpu is not None
+                     else cu_k.cpu().tolist())
         num_seqs = len(cu_q_list) - 1
         N = q_fp8.shape[0]
         total_kv = cu_k_list[-1] - cu_k_list[0]
@@ -408,48 +446,60 @@ class DeepSeekIndexer(nn.Module):
             k_fp8_dense = torch.empty(0, self.head_dim, dtype=torch.float8_e4m3fn, device=device)
             k_scale_dense = torch.empty(0, dtype=torch.float32, device=device)
 
-        # Build per-query-token causal mask as cu_seqlen_ks / cu_seqlen_ke
-        cu_seqlen_ks = torch.empty(N, dtype=torch.int32, device=device)
-        cu_seqlen_ke = torch.empty(N, dtype=torch.int32, device=device)
+        cu_seqlen_ks, cu_seqlen_ke = _kv_spans_from_batches(
+            cu_q_list, cu_k_list, N, device)
 
-        kv_base = 0
-        for s in range(num_seqs):
-            q_start, q_end = cu_q_list[s], cu_q_list[s + 1]
-            q_len = q_end - q_start
-            kv_len = cu_k_list[s + 1] - cu_k_list[s]
-            cached_len = kv_len - q_len
-
-            starts = torch.full((q_len,), kv_base, dtype=torch.int32, device=device)
-            ends = torch.arange(1, q_len + 1, dtype=torch.int32, device=device) + kv_base + cached_len
-            ends = ends.clamp(max=kv_base + kv_len)
-
-            cu_seqlen_ks[q_start:q_end] = starts
-            cu_seqlen_ke[q_start:q_end] = ends
-            kv_base += kv_len
-
-        # weights already has q_scale * softmax_scale * n_head^-0.5
         w = weights.to(torch.float32)
 
-        logits = deep_gemm.fp8_mqa_logits(
-            q_fp8,
-            (k_fp8_dense, k_scale_dense),
-            w,
-            cu_seqlen_ks,
-            cu_seqlen_ke,
-            clean_logits=False,
-        )
+        max_prefill_buf = int(os.environ.get(
+            "KB_NANO_INDEXER_MAX_PREFILL_TOKENS", "8192"))
+        if N <= max_prefill_buf or total_kv <= max_prefill_buf:
+            logits = deep_gemm.fp8_mqa_logits(
+                q_fp8,
+                (k_fp8_dense, k_scale_dense),
+                w,
+                cu_seqlen_ks,
+                cu_seqlen_ke,
+                clean_logits=False,
+            )
+            ops = _get_topk_ops()
+            ops.top_k_per_row_prefill(
+                logits,
+                cu_seqlen_ks,
+                cu_seqlen_ke,
+                topk_indices_buffer[:N],
+                N,
+                logits.stride(0),
+                logits.stride(1),
+                self.topk_tokens,
+            )
+        else:
+            ops = _get_topk_ops()
+            chunk_start = 0
+            while chunk_start < N:
+                chunk_end = min(chunk_start + max_prefill_buf, N)
+                chunk_n = chunk_end - chunk_start
 
-        ops = _get_topk_ops()
-        ops.top_k_per_row_prefill(
-            logits,
-            cu_seqlen_ks,
-            cu_seqlen_ke,
-            topk_indices_buffer[:N],
-            N,
-            logits.stride(0),
-            logits.stride(1),
-            self.topk_tokens,
-        )
+                chunk_logits = deep_gemm.fp8_mqa_logits(
+                    q_fp8[chunk_start:chunk_end],
+                    (k_fp8_dense, k_scale_dense),
+                    w[chunk_start:chunk_end],
+                    cu_seqlen_ks[chunk_start:chunk_end],
+                    cu_seqlen_ke[chunk_start:chunk_end],
+                    clean_logits=False,
+                )
+                ops.top_k_per_row_prefill(
+                    chunk_logits,
+                    cu_seqlen_ks[chunk_start:chunk_end],
+                    cu_seqlen_ke[chunk_start:chunk_end],
+                    topk_indices_buffer[chunk_start:chunk_end],
+                    chunk_n,
+                    chunk_logits.stride(0),
+                    chunk_logits.stride(1),
+                    self.topk_tokens,
+                )
+                del chunk_logits
+                chunk_start = chunk_end
 
     def _decode_indexing(self, q_fp8, q_scale, weights, topk_indices_buffer,
                          offset, ctx):
@@ -479,9 +529,16 @@ class DeepSeekIndexer(nn.Module):
 
         ctx_lens = context_lens[:batch].to(torch.int32)
 
-        sched_meta = deep_gemm.get_paged_mqa_logits_metadata(
-            ctx_lens, self._block_size, _NUM_SMS,
-        )
+        if ctx.decode_paged_mqa_sched_meta is not None:
+            sched_meta = ctx.decode_paged_mqa_sched_meta
+        else:
+            global _NUM_SMS
+            if _NUM_SMS is None:
+                _NUM_SMS = torch.cuda.get_device_properties(0).multi_processor_count
+            sched_meta = deep_gemm.get_paged_mqa_logits_metadata(
+                ctx_lens, self._block_size, _NUM_SMS,
+            )
+            ctx.decode_paged_mqa_sched_meta = sched_meta
 
         logits = deep_gemm.fp8_paged_mqa_logits(
             q_4d,

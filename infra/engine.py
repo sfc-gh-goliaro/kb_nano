@@ -480,6 +480,8 @@ class ModelRunner:
         torch.cuda.empty_cache()
         torch.cuda.reset_peak_memory_stats()
 
+        self._precompile_indexer_ops()
+
         if self.is_qwen_vl:
             self._warmup_vision_encoder()
 
@@ -606,9 +608,11 @@ class ModelRunner:
     def _optimal_warmup_m_values(max_tokens: int, n: int, device: torch.device) -> list[int]:
         """Generate M values that cover all DeepGEMM kernel configurations.
 
-        Mirrors vLLM's "relax" heuristic: instead of iterating every batch size,
-        pick the M values at block-size boundaries and SM-wave transitions that
-        trigger different JIT kernel instantiations.
+        Uses vLLM's "relax" heuristic but caps M at max_tokens to avoid
+        spending GPU time executing large GEMMs that don't trigger new JIT
+        compilations.  DeepGEMM's JIT key is (block_m, block_n, N, K) — the
+        compiled kernel is identical for M=256 and M=16384 when both select
+        block_m=256, so we only need small representative M values.
         """
         block_ms = [64, 128, 256]
         block_ns = list(range(16, min(257, n + 1), 16))
@@ -633,12 +637,36 @@ class ModelRunner:
 
         return sorted(m_values)
 
+    def _precompile_indexer_ops(self):
+        """Pre-compile top_k_per_row CUDA extension so JIT cost is paid once."""
+        try:
+            from ..tasks.baseline.L2.deepseek_indexer import _get_topk_ops
+            _get_topk_ops()
+            if self.rank == 0:
+                print("  Pre-compiled top_k_per_row CUDA extension.")
+        except Exception:
+            pass
+
     def _warmup_deepgemm(self):
-        """Pre-JIT DeepGEMM FP8 kernels for all weight shapes using vLLM's
-        'relax' heuristic, pre-allocate decode buffers per instance and
-        shared prefill buffers per unique (K, N) shape."""
+        """Pre-JIT DeepGEMM FP8 kernels for all weight shapes, pre-allocate
+        decode buffers per instance and shared prefill buffers per unique
+        (K, N) shape.
+
+        JIT compilation is driven by (block_m, block_n, N, K) — not by M
+        directly — so we cap the warmup M range at max_num_seqs instead of
+        max_num_batched_tokens.  This avoids spending minutes executing huge
+        GEMMs that compile no new kernels.  Compiled cubins are persisted
+        under DG_JIT_CACHE_DIR (default ~/.deep_gemm/cache) so subsequent
+        launches are near-instant.
+        """
         from ..tasks.baseline.L1.fp8_linear import Fp8Linear, _Fp8PrefillBufs
         import deep_gemm
+
+        if not os.environ.get("DG_JIT_CACHE_DIR"):
+            cache_dir = os.path.join(os.path.expanduser("~"), ".deep_gemm", "cache")
+            os.makedirs(cache_dir, exist_ok=True)
+            os.environ["DG_JIT_CACHE_DIR"] = cache_dir
+
         torch.cuda.synchronize()
 
         fp8_modules = []
@@ -681,7 +709,7 @@ class ModelRunner:
                 continue
             seen_shapes.add(key)
 
-            m_values = self._optimal_warmup_m_values(max_prefill, N, device)
+            m_values = self._optimal_warmup_m_values(max_decode, N, device)
             warmup_plan.append((linear_op, w, ws, prefill_bufs[key], m_values, max_decode))
 
         skip_jit = os.environ.get("KB_NANO_SKIP_DG_WARMUP") == "1"
@@ -1001,6 +1029,8 @@ class ModelRunner:
             max_sq, max_sk,
             torch.tensor(slot_mapping, dtype=torch.int32, pin_memory=True).cuda(non_blocking=True),
             block_tables=block_tables,
+            cu_seqlens_q_cpu=list(cu_seqlens_q),
+            cu_seqlens_k_cpu=list(cu_seqlens_k),
         )
 
         input_ids_t = torch.tensor(input_ids, dtype=torch.int64, pin_memory=True).cuda(non_blocking=True)
@@ -1166,6 +1196,8 @@ class ModelRunner:
             decode_block_tables=torch.from_numpy(dc_bt).pin_memory().cuda(non_blocking=True) if nd > 0 else None,
             decode_max_context_len=dc_max_cl,
             logit_indices=torch.tensor(logit_idx, dtype=torch.int64, pin_memory=True).cuda(non_blocking=True),
+            prefill_cu_seqlens_q_cpu=list(pf_cu_q),
+            prefill_cu_seqlens_k_cpu=list(pf_cu_k),
         )
 
         input_ids_t = torch.tensor(input_ids, dtype=torch.int64, pin_memory=True).cuda(non_blocking=True)

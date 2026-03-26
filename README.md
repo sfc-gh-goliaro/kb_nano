@@ -376,6 +376,29 @@ Latency (batch size 1, 128 output tokens, 5 iterations):
 
 FP8 activation quantization uses a custom Triton kernel for single-launch per-token-group UE8M0 quantization. Pre-allocated shared prefill buffers eliminate dynamic allocation during FP8 prefill, and DeepGEMM is JIT-warmed for both decode and prefill batch sizes. The remaining throughput gap vs vLLM is primarily from vLLM's `torch.compile` + Inductor fusion passes (RMSNorm+quant, SiLU+quant).
 
+### DeepSeek V3.2 (Sparse MoE + MLA + DSA)
+
+DeepSeek V3.2 uses Multi-head Latent Attention (MLA) with FP8 KV cache, 256 routed experts (top-8), and a Deep Sparse Attention (DSA) indexer for selective KV retrieval during prefill. The full model is 61 layers with ~685B parameters, loaded from FP8 safetensors.
+
+Throughput (16 sequences per scenario, `temperature=0`, 8x H200, TP=1, DP=8, EP=8, `enforce_eager=True`):
+
+| Model | DP | EP | Scenario | Input/Output | Ours (tok/s) |
+|-------|---:|---:|----------|:------------:|-------------:|
+| DeepSeek-V3.2 | 8 | 8 | prefill-heavy | 1024/512  | 68 |
+| DeepSeek-V3.2 | 8 | 8 | balanced      |  512/512  | 69 |
+| DeepSeek-V3.2 | 8 | 8 | decode-heavy  |  512/1024 | 69 |
+
+DeepSeek V3.2 optimizations implemented:
+- **FP8 MLA KV cache** with fused Triton store/gather kernels (656 bytes/token: 512 FP8 latent + 16 scale + 128 RoPE)
+- **Fused RoPE + FP8 quantization + cache write** in a single Triton kernel launch
+- **Fused Q+KV A-projection** via `MergedReplicatedLinear` (merges `q_a_proj` and `kv_a_proj_with_mqa`)
+- **Batched FP8 cache dequantization** for sparse prefill (replaces per-sequence Python loop)
+- **Triton logical-to-physical index kernel** for block table lookups
+- **GPU-resident metadata** eliminates CPU sync barriers in MLA and indexer (pre-computed cu_seqlens lists, vectorized `_build_token_to_seq`, cached `get_mla_metadata`)
+- **Shared expert overlap** with routed expert computation
+- **Prefill chunking** in the DSA indexer to prevent OOM on long sequences
+- **Pre-compiled top_k_per_row** CUDA extension at engine init
+
 ### Key optimizations
 
 - **Fused RMSNorm**: Uses `sgl_kernel`'s fused residual-add + RMSNorm CUDA kernel, eliminating multiple kernel launches per norm call

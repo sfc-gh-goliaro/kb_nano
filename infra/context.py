@@ -96,6 +96,15 @@ class Context:
     # Flat indices into concatenated input for extracting one logit per seq
     logit_indices: torch.Tensor | None = None
 
+    # Pre-computed CPU lists to avoid per-layer GPU-CPU sync (Items #9, #11)
+    cu_seqlens_q_cpu: list[int] | None = None
+    cu_seqlens_k_cpu: list[int] | None = None
+    prefill_cu_seqlens_q_cpu: list[int] | None = None
+    prefill_cu_seqlens_k_cpu: list[int] | None = None
+
+    # Pre-computed decode scheduler metadata (Item #12)
+    decode_paged_mqa_sched_meta: object | None = None
+
 
 _CONTEXT = Context()
 
@@ -107,11 +116,14 @@ def get_context() -> Context:
 def set_context(is_prefill, cu_seqlens_q=None, cu_seqlens_k=None,
                 max_seqlen_q=0, max_seqlen_k=0, slot_mapping=None,
                 context_lens=None, block_tables=None,
-                max_context_len=0):
+                max_context_len=0,
+                cu_seqlens_q_cpu=None, cu_seqlens_k_cpu=None):
     global _CONTEXT
     _CONTEXT = Context(is_prefill, cu_seqlens_q, cu_seqlens_k,
                        max_seqlen_q, max_seqlen_k, slot_mapping,
-                       context_lens, block_tables, max_context_len)
+                       context_lens, block_tables, max_context_len,
+                       cu_seqlens_q_cpu=cu_seqlens_q_cpu,
+                       cu_seqlens_k_cpu=cu_seqlens_k_cpu)
 
 
 def set_mixed_context(
@@ -122,6 +134,7 @@ def set_mixed_context(
     prefill_block_tables,
     decode_context_lens, decode_block_tables, decode_max_context_len,
     logit_indices,
+    prefill_cu_seqlens_q_cpu=None, prefill_cu_seqlens_k_cpu=None,
 ):
     global _CONTEXT
     _CONTEXT = Context(
@@ -139,6 +152,8 @@ def set_mixed_context(
         decode_block_tables=decode_block_tables,
         decode_max_context_len=decode_max_context_len,
         logit_indices=logit_indices,
+        prefill_cu_seqlens_q_cpu=prefill_cu_seqlens_q_cpu,
+        prefill_cu_seqlens_k_cpu=prefill_cu_seqlens_k_cpu,
     )
 
 
