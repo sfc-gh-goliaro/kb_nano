@@ -1,6 +1,6 @@
 """
-Weight loader for Llama 3.1, Llama 4, Mixtral, Qwen2-VL, and Qwen3-VL
-with tensor parallelism.
+Weight loader for Llama 3.1, Llama 4, Mixtral, DeepSeek V3.2, Qwen2-VL,
+and Qwen3-VL with tensor parallelism.
 
 Loads weights from HuggingFace safetensors and distributes them
 across TP shards using the weight_loader callbacks on each parameter.
@@ -24,6 +24,7 @@ from ..tasks.baseline.L4.llama4 import Llama4Config, Llama4ForCausalLM
 from ..tasks.baseline.L4.mixtral import MixtralConfig, MixtralForCausalLM
 from ..tasks.baseline.L4.qwen2_vl import Qwen2VLConfig, Qwen2VLForConditionalGeneration
 from ..tasks.baseline.L4.qwen3_vl import Qwen3VLConfig, Qwen3VLForConditionalGeneration
+from ..tasks.baseline.L4.deepseek import DeepSeekV3Config, DeepSeekV3ForCausalLM
 
 
 def default_weight_loader(param: torch.nn.Parameter, loaded_weight: torch.Tensor):
@@ -38,6 +39,14 @@ def download_model(model_name: str) -> str:
 
 _EXPERT_RE = re.compile(
     r"(.+\.block_sparse_moe)\.experts\.(\d+)\.(w[123])\.weight"
+)
+
+_DEEPSEEK_EXPERT_RE = re.compile(
+    r"(.+\.mlp)\.experts\.(\d+)\.(gate_proj|up_proj|down_proj)\.(weight|weight_scale_inv)"
+)
+
+_DEEPSEEK_SHARED_EXPERT_RE = re.compile(
+    r"(.+\.mlp)\.shared_experts\.(gate_proj|up_proj|down_proj)\.(weight|weight_scale_inv)"
 )
 
 
@@ -302,7 +311,7 @@ def load_weights(model, model_path: str, model_type: str = "llama") -> None:
                     loaded += 1
                     continue
 
-                # Handle MoE expert weights
+                # Handle MoE expert weights (Mixtral-style: w1/w2/w3)
                 m = _EXPERT_RE.match(mapped_name)
                 if m:
                     moe_prefix, expert_id_str, w_name = m.groups()
@@ -320,6 +329,36 @@ def load_weights(model, model_path: str, model_type: str = "llama") -> None:
                         param.weight_loader(
                             param, f.get_tensor(weight_name), expert_id,
                         )
+                    loaded += 1
+                    continue
+
+                # Handle DeepSeek MoE expert weights (gate_proj/up_proj/down_proj)
+                m_ds = _DEEPSEEK_EXPERT_RE.match(mapped_name)
+                if m_ds:
+                    moe_prefix, expert_id_str, proj_name, attr = m_ds.groups()
+                    expert_id = int(expert_id_str)
+                    tensor = f.get_tensor(weight_name)
+                    if proj_name in ("gate_proj", "up_proj"):
+                        is_w1 = (proj_name == "gate_proj")
+                        if attr == "weight":
+                            param_name = f"{moe_prefix}.w13"
+                        else:
+                            param_name = f"{moe_prefix}.w13_weight_scale_inv"
+                        try:
+                            param = model.get_parameter(param_name)
+                        except AttributeError:
+                            continue
+                        param.weight_loader(param, tensor, expert_id, is_w1=is_w1)
+                    else:  # down_proj
+                        if attr == "weight":
+                            param_name = f"{moe_prefix}.w2"
+                        else:
+                            param_name = f"{moe_prefix}.w2_weight_scale_inv"
+                        try:
+                            param = model.get_parameter(param_name)
+                        except AttributeError:
+                            continue
+                        param.weight_loader(param, tensor, expert_id)
                     loaded += 1
                     continue
 
@@ -379,7 +418,20 @@ def _postprocess_fp8_weights(model: torch.nn.Module) -> None:
             module.weight = torch.nn.Parameter(w_new, requires_grad=False)
             module.weight_scale_inv = torch.nn.Parameter(s_new, requires_grad=False)
             count += 1
-    print(f"  Post-processed {count} FP8 linear layers.")
+    moe_count = 0
+    for module in model.modules():
+        from ..tasks.baseline.L2.deepseek_moe import DeepSeekMoE
+        if isinstance(module, DeepSeekMoE) and module.use_fp8:
+            for name in ("w13", "w2"):
+                w = getattr(module, name)
+                s = getattr(module, f"{name}_weight_scale_inv")
+                E = w.shape[0]
+                for e in range(E):
+                    w_e, s_e = postprocess_fp8_weights(w.data[e], s.data[e])
+                    w.data[e] = w_e
+                    s.data[e] = s_e
+                moe_count += E
+    print(f"  Post-processed {count} FP8 linear layers, {moe_count} MoE expert weight slices.")
 
 
 def _detect_model_type(model_name: str) -> str:
@@ -440,6 +492,12 @@ def load_model(
         config.dtype = dtype
         print("  Allocating Qwen3-VL model...")
         model = Qwen3VLForConditionalGeneration(config, quant_config=quant_config)
+    elif model_type == "deepseek_v3":
+        config = DeepSeekV3Config.from_pretrained(model_name)
+        config.dtype = dtype
+        print(f"  Allocating DeepSeek V3.2 model ({config.n_routed_experts} experts, "
+              f"top-{config.num_experts_per_tok}, DSA topk={config.index_topk})...")
+        model = DeepSeekV3ForCausalLM(config, quant_config=quant_config)
     else:
         config = LlamaConfig.from_pretrained(model_name)
         config.dtype = dtype
@@ -452,7 +510,9 @@ def load_model(
             f"TP degree {tp} is incompatible with {config.num_attention_heads} Q heads "
             f"(num_attention_heads must be divisible by tensor_parallel_size)"
         )
-    if hasattr(config, "num_key_value_heads") and config.num_key_value_heads % tp != 0:
+    if (model_type != "deepseek_v3"
+            and hasattr(config, "num_key_value_heads")
+            and config.num_key_value_heads % tp != 0):
         raise ValueError(
             f"TP degree {tp} is incompatible with {config.num_key_value_heads} KV heads "
             f"(num_key_value_heads must be divisible by tensor_parallel_size)"

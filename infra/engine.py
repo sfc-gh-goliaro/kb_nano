@@ -273,6 +273,7 @@ class ModelRunner:
         )
         self.is_moe = hasattr(self.config, "num_local_experts")
         self.is_qwen_vl = hasattr(self.config, "mrope_section")
+        self.is_deepseek_mla = hasattr(self.config, "kv_lora_rank")
         self._share_trtllm_workspace()
         self._share_activation_buffers()
         self.warmup_model()
@@ -577,6 +578,10 @@ class ModelRunner:
                 if hasattr(module, "k_cache") and hasattr(module, "v_cache"):
                     self._attn_layers.append(module)
 
+        if self.is_deepseek_mla:
+            self._allocate_mla_kv_cache()
+            return
+
         free, total = torch.cuda.mem_get_info()
         used = total - free
         peak = torch.cuda.memory_stats()["allocated_bytes.all.peak"]
@@ -618,6 +623,68 @@ class ModelRunner:
             import gc
             gc.collect()
             torch.cuda.empty_cache()
+
+    def _allocate_mla_kv_cache(self):
+        """Allocate FP8 MLA KV cache (uint8, 656 bytes/token) and indexer K cache (132 bytes/token)."""
+        from ..tasks.baseline.L2.mla_attention_impl import MLAAttention
+        from ..tasks.baseline.L2.sparse_attn_indexer import SparseAttnIndexer
+
+        _MLA_BLOCK_SIZE = 64  # FlashMLA uses block_size=64
+        _MLA_CACHE_BYTES = 656
+        _INDEXER_CACHE_BYTES = 132
+
+        mla_layers = []
+        indexer_layers = []
+        for module in self.model.modules():
+            if isinstance(module, MLAAttention):
+                mla_layers.append(module)
+            elif isinstance(module, SparseAttnIndexer):
+                indexer_layers.append(module)
+
+        num_layers = len(mla_layers)
+        num_indexer_layers = len(indexer_layers)
+
+        free, total = torch.cuda.mem_get_info()
+        used = total - free
+        peak = torch.cuda.memory_stats()["allocated_bytes.all.peak"]
+        current = torch.cuda.memory_stats()["allocated_bytes.all.current"]
+
+        kv_bytes_per_block = num_layers * _MLA_BLOCK_SIZE * _MLA_CACHE_BYTES
+        idx_bytes_per_block = num_indexer_layers * _MLA_BLOCK_SIZE * _INDEXER_CACHE_BYTES
+        total_bytes_per_block = kv_bytes_per_block + idx_bytes_per_block
+
+        num_blocks = int(total * self.gpu_memory_utilization - used - peak + current) // total_bytes_per_block
+        assert num_blocks > 0, f"Not enough GPU memory for MLA KV cache on rank {self.rank}"
+        self.num_blocks = num_blocks
+        self.block_size = _MLA_BLOCK_SIZE
+
+        if self.rank == 0:
+            print(f"  MLA KV cache: {num_blocks} blocks x {_MLA_BLOCK_SIZE} = "
+                  f"{num_blocks * _MLA_BLOCK_SIZE} token slots ({num_layers} layers, "
+                  f"{_MLA_CACHE_BYTES} bytes/token)")
+
+        device = f"cuda:{self.rank}"
+        for i, layer in enumerate(mla_layers):
+            cache = torch.zeros(
+                num_blocks, _MLA_BLOCK_SIZE, _MLA_CACHE_BYTES,
+                dtype=torch.uint8, device=device,
+            )
+            layer.k_cache = cache
+            layer.v_cache = cache
+
+        if num_indexer_layers > 0:
+            if self.rank == 0:
+                print(f"  Indexer K cache: {num_blocks} blocks x {_MLA_BLOCK_SIZE} = "
+                      f"{num_blocks * _MLA_BLOCK_SIZE} token slots ({num_indexer_layers} layers, "
+                      f"{_INDEXER_CACHE_BYTES} bytes/token)")
+            for i, layer in enumerate(indexer_layers):
+                layer.indexer_k_cache = torch.zeros(
+                    num_blocks, _MLA_BLOCK_SIZE, _INDEXER_CACHE_BYTES,
+                    dtype=torch.uint8, device=device,
+                )
+
+        if self.rank == 0:
+            print(f"  MLA attention backend: FlashMLA (block_size={_MLA_BLOCK_SIZE}, FP8 KV cache)")
 
     def prepare_prefill(self, seqs):
         input_ids, positions = [], []
