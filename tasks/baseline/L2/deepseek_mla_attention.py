@@ -110,7 +110,9 @@ class DeepSeekMLAAttention(nn.Module):
             indexer_interleave = getattr(config, "indexer_rope_interleave", False)
             self.indexer_rope_emb = YarnRotaryEmbedding(
                 head_dim=self.qk_rope_head_dim,
-                max_position_embeddings=config.max_position_embeddings,
+                max_position_embeddings=_irp.get(
+                    'original_max_position_embeddings',
+                    config.max_position_embeddings),
                 rope_theta=_irp.get("rope_theta", getattr(config, "rope_theta", 10000.0)),
                 scaling_factor=_irp.get("factor", 1.0),
                 attn_factor=_irp.get("attn_factor", 1.0),

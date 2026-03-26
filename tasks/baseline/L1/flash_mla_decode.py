@@ -43,5 +43,27 @@ class FlashMLADecode(nn.Module):
 
 
 class FlashMLAGetMetadata(nn.Module):
-    def forward(self, cache_seqlens: torch.Tensor, num_heads_per_head_k: int) -> tuple[torch.Tensor, torch.Tensor]:
-        return get_mla_metadata(cache_seqlens, num_heads_per_head_k)
+    def forward(
+        self,
+        cache_seqlens: torch.Tensor,
+        num_q_tokens_per_head_k: int,
+        num_heads_k: int = 1,
+        topk: int | None = None,
+        num_heads_q: int | None = None,
+        is_fp8_kvcache: bool = False,
+    ) -> tuple[torch.Tensor, torch.Tensor]:
+        kwargs: dict = {}
+        if topk is not None:
+            kwargs["topk"] = topk
+        if num_heads_q is not None:
+            kwargs["num_heads_q"] = num_heads_q
+            kwargs["num_heads_k"] = num_heads_k
+        if is_fp8_kvcache:
+            kwargs["is_fp8_kvcache"] = is_fp8_kvcache
+        if kwargs:
+            return get_mla_metadata(
+                cache_seqlens=cache_seqlens,
+                num_q_tokens_per_head_k=num_q_tokens_per_head_k,
+                **kwargs,
+            )
+        return get_mla_metadata(cache_seqlens, num_q_tokens_per_head_k, num_heads_k)

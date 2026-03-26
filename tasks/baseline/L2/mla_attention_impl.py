@@ -140,7 +140,9 @@ class MLAAttention(nn.Module):
         cache_seqlens = ctx.context_lens
         block_table = ctx.block_tables
 
-        tile_sched_meta, _ = self.get_metadata(cache_seqlens, self.num_heads)
+        tile_sched_meta, _ = self.get_metadata(
+            cache_seqlens, self.num_heads, num_heads_k=1,
+            is_fp8_kvcache=True)
 
         o, _ = self.decode_op(
             q, kv_cache.view(torch.uint8).unsqueeze(-2),
@@ -198,7 +200,10 @@ class MLAAttention(nn.Module):
         topk_tensor = torch.full((1,), topk, dtype=torch.int32, device=q.device)
         dummy_bt = torch.empty((1, 1), dtype=torch.int32, device=q.device)
 
-        tile_sched_meta, _ = self.get_metadata(topk_tensor, N * padded_heads)
+        tile_sched_meta, _ = self.get_metadata(
+            topk_tensor, N * padded_heads,
+            topk=topk, num_heads_q=padded_heads,
+            num_heads_k=1, is_fp8_kvcache=True)
 
         o, _ = self.decode_op(
             q_4d, kv_cache.view(torch.uint8).unsqueeze(-2),
@@ -243,7 +248,10 @@ class MLAAttention(nn.Module):
             topk_tensor = torch.full((1,), topk, dtype=torch.int32, device=q.device)
             dummy_bt = torch.empty((1, 1), dtype=torch.int32, device=q.device)
 
-            tile_sched_meta, _ = self.get_metadata(topk_tensor, nd * padded_heads)
+            tile_sched_meta, _ = self.get_metadata(
+                topk_tensor, nd * padded_heads,
+                topk=topk, num_heads_q=padded_heads,
+                num_heads_k=1, is_fp8_kvcache=True)
 
             o_dc, _ = self.decode_op(
                 q_4d, kv_cache.view(torch.uint8).unsqueeze(-2),
@@ -403,7 +411,9 @@ class MLAAttention(nn.Module):
             q_dc = q[np_:]
             cache_seqlens = ctx.decode_context_lens
             block_table = ctx.decode_block_tables
-            tile_sched_meta, _ = self.get_metadata(cache_seqlens, self.num_heads)
+            tile_sched_meta, _ = self.get_metadata(
+                cache_seqlens, self.num_heads, num_heads_k=1,
+                is_fp8_kvcache=True)
 
             o, _ = self.decode_op(
                 q_dc, kv_cache.view(torch.uint8).unsqueeze(-2),

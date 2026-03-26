@@ -8,6 +8,7 @@ Uses YARN-scaled RoPE, FP8 quantization, and tensor parallelism.
 from __future__ import annotations
 
 from dataclasses import dataclass, field
+from typing import Optional
 
 import torch
 import torch.nn as nn
@@ -48,10 +49,10 @@ class DeepSeekV3Config:
     first_k_dense_replace: int = 1
     moe_layer_freq: int = 1
 
-    # DSA params (V3.2)
-    index_topk: int = 8192
-    index_n_heads: int = 64
-    index_head_dim: int = 128
+    # DSA params (V3.2 only — None when not a V3.2 model)
+    index_topk: Optional[int] = None
+    index_n_heads: Optional[int] = None
+    index_head_dim: Optional[int] = None
 
     # YARN RoPE params
     rope_parameters: dict = field(default_factory=lambda: {
@@ -107,9 +108,9 @@ class DeepSeekV3Config:
             routed_scaling_factor=getattr(hf, 'routed_scaling_factor', 2.5),
             first_k_dense_replace=getattr(hf, 'first_k_dense_replace', 1),
             moe_layer_freq=getattr(hf, 'moe_layer_freq', 1),
-            index_topk=getattr(hf, 'index_topk', 8192),
-            index_n_heads=getattr(hf, 'index_n_heads', 64),
-            index_head_dim=getattr(hf, 'index_head_dim', 128),
+            index_topk=getattr(hf, 'index_topk', None),
+            index_n_heads=getattr(hf, 'index_n_heads', None),
+            index_head_dim=getattr(hf, 'index_head_dim', None),
             rope_parameters=rope_params,
         )
 
