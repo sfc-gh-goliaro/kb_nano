@@ -21,6 +21,47 @@ from ..L1.fp8_mqa_logits import Fp8MQALogits, Fp8PagedMQALogitsMetadata
 from ..L1.top_k_per_row import TopKPerRow
 
 
+def _kv_spans_from_batches(
+    cu_seqlens_q: torch.Tensor,
+    seq_lens_k: torch.Tensor,
+    device: torch.device,
+) -> tuple[torch.Tensor, torch.Tensor]:
+    """Per-token KV span boundaries for causal prefill indexer logits.
+
+    Args:
+        cu_seqlens_q: [B+1] cumulative query token counts.
+        seq_lens_k:   [B] full KV sequence length per batch.
+
+    Returns:
+        (cu_seqlen_ks, cu_seqlen_ke): both [N] int32, per-query-token
+        start (inclusive) and end (exclusive) into concatenated KV.
+    """
+    q = cu_seqlens_q.long()
+    L = seq_lens_k.long()
+    B = L.numel()
+    counts = q[1:] - q[:-1]
+    N = int(q[-1].item())
+    if N == 0:
+        empty = torch.empty(0, dtype=torch.int32, device=device)
+        return empty, empty
+
+    kv_starts = torch.cumsum(L, dim=0) - L
+    batch_id = torch.repeat_interleave(torch.arange(B, device=device), counts)
+    start_tensor = kv_starts[batch_id]
+
+    L_expand = torch.repeat_interleave(L, counts)
+    m_expand = torch.repeat_interleave(counts, counts)
+    pos_within = (
+        torch.arange(N, dtype=torch.long, device=device)
+        - torch.repeat_interleave(q[:-1], counts)
+        + 1
+    )
+    local_pos = L_expand - m_expand + pos_within
+    end_location = start_tensor + local_pos
+
+    return start_tensor.int(), end_location.int()
+
+
 class ReplicatedLinear(nn.Module):
     """Linear layer replicated across all TP ranks (no sharding)."""
 
@@ -187,16 +228,21 @@ class SparseAttnIndexer(nn.Module):
             k_fp8, k_scale_flat = self.k_cache_gather(
                 self.indexer_k_cache, bt, cu_k)
 
+            num_seqs = cu_k.shape[0] - 1
+            seq_lens_k = cu_k[1:] - cu_k[:-1]
+            cu_seqlen_ks, cu_seqlen_ke = _kv_spans_from_batches(
+                cu_q, seq_lens_k, hidden_states.device)
+
             logits = self.fp8_mqa_logits.forward_prefill(
                 q_fp8_pf.view(-1, self.n_head, self.head_dim),
                 (k_fp8, k_scale_flat),
                 weights_pf,
-                cu_q[:-1].int(),
-                cu_k[1:].int(),
+                cu_seqlen_ks,
+                cu_seqlen_ke,
             )
 
             topk_indices[:np_] = self.topk_per_row.forward_prefill(
-                logits, cu_q[:-1].int(), cu_k[1:].int(),
+                logits, cu_seqlen_ks, cu_seqlen_ke,
                 self.topk_tokens,
             )
 
@@ -242,9 +288,10 @@ class SparseAttnIndexer(nn.Module):
             block_size,
             num_sms,
         )
+        q_fp8_4d = q_fp8.unsqueeze(1)  # [M, 1, n_head, head_dim]
         logits = self.fp8_mqa_logits.forward_decode(
-            q_fp8,
-            self.indexer_k_cache,
+            q_fp8_4d,
+            self.indexer_k_cache.unsqueeze(-2),
             weights,
             ctx.decode_context_lens,
             ctx.decode_block_tables,
