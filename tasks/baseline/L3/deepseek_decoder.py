@@ -19,7 +19,8 @@ class DeepSeekDecoderLayer(nn.Module):
     def __init__(self, config, layer_idx: int,
                  rotary_emb: nn.Module,
                  quant_config: dict | None = None,
-                 is_v32: bool = False):
+                 is_v32: bool = False,
+                 topk_indices_buffer: torch.Tensor | None = None):
         super().__init__()
         self.layer_idx = layer_idx
         self.routed_scaling_factor = getattr(config, 'routed_scaling_factor', 1.0)
@@ -28,6 +29,7 @@ class DeepSeekDecoderLayer(nn.Module):
             config, rotary_emb=rotary_emb,
             quant_config=quant_config,
             is_v32=is_v32,
+            topk_indices_buffer=topk_indices_buffer,
         )
 
         moe_layer_freq = getattr(config, 'moe_layer_freq', 1)

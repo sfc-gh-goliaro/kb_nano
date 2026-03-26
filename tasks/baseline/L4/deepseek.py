@@ -135,12 +135,23 @@ class DeepSeekV3Model(nn.Module):
 
         is_v32 = hasattr(config, 'index_topk') and config.index_topk is not None
 
+        # Pre-allocate topk_indices_buffer for DSA indexer (shared across layers)
+        if is_v32:
+            max_batched = getattr(config, 'max_num_batched_tokens', 16384)
+            self.topk_indices_buffer = torch.empty(
+                max_batched, config.index_topk,
+                dtype=torch.int32,
+            )
+        else:
+            self.topk_indices_buffer = None
+
         self.layers = nn.ModuleList([
             DeepSeekDecoderLayer(
                 config, layer_idx=i,
                 rotary_emb=self.rotary_emb,
                 quant_config=quant_config,
                 is_v32=is_v32,
+                topk_indices_buffer=self.topk_indices_buffer,
             )
             for i in range(config.num_hidden_layers)
         ])

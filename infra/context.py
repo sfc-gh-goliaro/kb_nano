@@ -54,6 +54,24 @@ def set_attn_backend_config(config: AttnBackendConfig) -> None:
 
 
 @dataclass
+class ChunkedContextMetadata:
+    """Metadata for chunked prefill context processing (MLA).
+
+    When a prefill request has prior computed tokens in the KV cache,
+    those tokens must be gathered and attended to in chunks to bound
+    workspace memory.  Matches vllm's MLACommonPrefillMetadata.ChunkedContextMetadata.
+    """
+    cu_seq_lens: torch.Tensor
+    starts: torch.Tensor
+    seq_tot: list[int]
+    max_seq_lens: list[int]
+    seq_lens: torch.Tensor
+    workspace: torch.Tensor
+    token_to_seq: torch.Tensor
+    chunk_total_token: list[int]
+
+
+@dataclass
 class Context:
     is_prefill: bool = False
     cu_seqlens_q: torch.Tensor | None = None
@@ -87,6 +105,12 @@ class Context:
     # Flat indices into concatenated input for extracting one logit per seq
     logit_indices: torch.Tensor | None = None
 
+    # MLA chunked prefill context (for requests with prior computed tokens)
+    chunked_context: ChunkedContextMetadata | None = None
+
+    # Per-token request ID mapping (for sparse indexer index conversion)
+    req_id_per_token: torch.Tensor | None = None
+
 
 _CONTEXT = Context()
 
@@ -98,11 +122,14 @@ def get_context() -> Context:
 def set_context(is_prefill, cu_seqlens_q=None, cu_seqlens_k=None,
                 max_seqlen_q=0, max_seqlen_k=0, slot_mapping=None,
                 context_lens=None, block_tables=None,
-                max_context_len=0):
+                max_context_len=0, chunked_context=None,
+                req_id_per_token=None):
     global _CONTEXT
     _CONTEXT = Context(is_prefill, cu_seqlens_q, cu_seqlens_k,
                        max_seqlen_q, max_seqlen_k, slot_mapping,
-                       context_lens, block_tables, max_context_len)
+                       context_lens, block_tables, max_context_len,
+                       chunked_context=chunked_context,
+                       req_id_per_token=req_id_per_token)
 
 
 def set_mixed_context(
@@ -113,6 +140,8 @@ def set_mixed_context(
     prefill_block_tables,
     decode_context_lens, decode_block_tables, decode_max_context_len,
     logit_indices,
+    chunked_context=None,
+    req_id_per_token=None,
 ):
     global _CONTEXT
     _CONTEXT = Context(
@@ -130,6 +159,8 @@ def set_mixed_context(
         decode_block_tables=decode_block_tables,
         decode_max_context_len=decode_max_context_len,
         logit_indices=logit_indices,
+        chunked_context=chunked_context,
+        req_id_per_token=req_id_per_token,
     )
 
 

@@ -118,7 +118,8 @@ class SparseAttnIndexer(nn.Module):
 
     def __init__(self, hidden_size: int, q_lora_rank: int,
                  n_head: int, head_dim: int, rope_dim: int,
-                 topk_tokens: int, quant_config: dict | None = None):
+                 topk_tokens: int, quant_config: dict | None = None,
+                 topk_indices_buffer: torch.Tensor | None = None):
         super().__init__()
         self.n_head = n_head
         self.head_dim = head_dim
@@ -141,10 +142,12 @@ class SparseAttnIndexer(nn.Module):
         self.topk_per_row = TopKPerRow()
 
         # Indexer K cache: [num_blocks, block_size, 132] uint8
-        # Will be allocated by engine and set externally
         self.indexer_k_cache = torch.tensor([])
 
         self._quant_block_size = 128
+
+        # Shared buffer to avoid per-step allocation (matches vllm)
+        self.topk_indices_buffer = topk_indices_buffer
 
     def forward(self, hidden_states: torch.Tensor, q_latent: torch.Tensor,
                 positions: torch.Tensor, rope_emb: nn.Module) -> torch.Tensor:
@@ -201,9 +204,17 @@ class SparseAttnIndexer(nn.Module):
         )
         weights = weights.squeeze(-1)
 
-        # Compute logits and top-k
-        topk_indices = torch.full((M, self.topk_tokens), -1, dtype=torch.int32,
-                                  device=hidden_states.device)
+        # Use pre-allocated buffer if available, otherwise allocate
+        if self.topk_indices_buffer is not None and M <= self.topk_indices_buffer.shape[0]:
+            buf = self.topk_indices_buffer
+            if buf.device != hidden_states.device:
+                buf = buf.to(hidden_states.device)
+                self.topk_indices_buffer = buf
+            topk_indices = buf[:M, :self.topk_tokens]
+            topk_indices.fill_(-1)
+        else:
+            topk_indices = torch.full((M, self.topk_tokens), -1, dtype=torch.int32,
+                                      device=hidden_states.device)
 
         if ctx.is_prefill or (ctx.is_mixed and ctx.num_prefill_tokens > 0):
             # Prefill path: gather K from cache, compute logits, top-k

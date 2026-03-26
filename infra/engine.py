@@ -686,6 +686,89 @@ class ModelRunner:
         if self.rank == 0:
             print(f"  MLA attention backend: FlashMLA (block_size={_MLA_BLOCK_SIZE}, FP8 KV cache)")
 
+        # Pre-allocate chunked prefill workspace for MLA context gathering.
+        # Matches vllm's MLACommonMetadataBuilder workspace sizing.
+        workspace_tokens = min(
+            max(8 * self.max_model_len,
+                4 * self.max_num_seqs * _MLA_BLOCK_SIZE),
+            64 * 1024,
+        )
+        workspace_tokens = max(workspace_tokens,
+                               self.max_num_seqs * _MLA_BLOCK_SIZE)
+        self._mla_chunked_prefill_workspace = torch.empty(
+            workspace_tokens, _MLA_CACHE_BYTES - 80,  # 576 = kv_lora_rank + qk_rope_head_dim
+            dtype=torch.bfloat16, device=device,
+        )
+        self._mla_workspace_size = workspace_tokens
+
+    def _build_chunked_context(self, prefill_seqs, prefill_chunk_sizes,
+                               block_tables, device):
+        """Build ChunkedContextMetadata for MLA prefill with prior context.
+
+        When a prefill request has already-computed tokens (chunked prefill),
+        those tokens live in the KV cache and must be gathered and attended to
+        in workspace-sized chunks. This matches vllm's
+        MLACommonMetadataBuilder.build() chunked context logic.
+        """
+        from .context import ChunkedContextMetadata
+
+        num_prefills = len(prefill_seqs)
+        context_lens = []
+        for seq, chunk_size in zip(prefill_seqs, prefill_chunk_sizes):
+            context_lens.append(seq.num_computed_tokens)
+        context_lens_cpu = torch.tensor(context_lens, dtype=torch.int32)
+        max_context_len = int(context_lens_cpu.max().item())
+
+        if max_context_len == 0:
+            return None
+
+        num_prefills_with_context = int((context_lens_cpu > 0).sum().item())
+        if num_prefills_with_context == 0:
+            return None
+
+        max_context_chunk = self._mla_workspace_size // num_prefills_with_context
+        block_size = self.block_size
+        max_context_chunk = (max_context_chunk // block_size) * block_size
+        if max_context_chunk == 0:
+            max_context_chunk = block_size
+        num_chunks = (max_context_len + max_context_chunk - 1) // max_context_chunk
+
+        chunk_starts = (
+            torch.arange(num_chunks, dtype=torch.int32)
+            .unsqueeze(1).expand(-1, num_prefills)
+            * max_context_chunk
+        )
+        chunk_ends = torch.min(
+            context_lens_cpu.unsqueeze(0), chunk_starts + max_context_chunk
+        )
+        chunk_seq_lens = (chunk_ends - chunk_starts).clamp(min=0)
+
+        cu_seq_lens_cpu = torch.zeros(
+            num_chunks, num_prefills + 1, dtype=torch.int32)
+        torch.cumsum(chunk_seq_lens, dim=1, out=cu_seq_lens_cpu[:, 1:],
+                     dtype=torch.int32)
+        chunk_total_token = cu_seq_lens_cpu[:, -1]
+
+        max_token_num = int(chunk_total_token.max().item())
+        token_to_seq_cpu = torch.zeros(
+            num_chunks, max_token_num, dtype=torch.int32)
+        range_idx = torch.arange(num_prefills, dtype=torch.int32)
+        for i in range(num_chunks):
+            chunk_t2s = torch.repeat_interleave(range_idx, chunk_seq_lens[i])
+            clen = chunk_t2s.shape[0]
+            token_to_seq_cpu[i, :clen] = chunk_t2s
+
+        return ChunkedContextMetadata(
+            cu_seq_lens=cu_seq_lens_cpu.to(device, non_blocking=True),
+            starts=chunk_starts.to(device, non_blocking=True),
+            seq_tot=chunk_seq_lens.sum(dim=1).tolist(),
+            max_seq_lens=chunk_seq_lens.max(dim=1).values.tolist(),
+            seq_lens=chunk_seq_lens,
+            workspace=self._mla_chunked_prefill_workspace,
+            token_to_seq=token_to_seq_cpu.to(device, non_blocking=True),
+            chunk_total_token=chunk_total_token.tolist(),
+        )
+
     def prepare_prefill(self, seqs):
         input_ids, positions = [], []
         cu_seqlens_q, cu_seqlens_k = [0], [0]
@@ -891,6 +974,13 @@ class ModelRunner:
         for j in range(nd):
             logit_idx.append(num_prefill_tokens + j)
 
+        chunked_context = None
+        if self.is_deepseek_mla and num_prefill_seqs > 0:
+            chunked_context = self._build_chunked_context(
+                prefill_seqs, prefill_chunk_sizes, prefill_block_tables,
+                device=torch.device(f"cuda:{self.rank}"),
+            )
+
         set_mixed_context(
             slot_mapping=torch.tensor(slot_mapping, dtype=torch.int32, pin_memory=True).cuda(non_blocking=True),
             num_prefill_tokens=num_prefill_tokens,
@@ -905,6 +995,7 @@ class ModelRunner:
             decode_block_tables=torch.from_numpy(dc_bt).pin_memory().cuda(non_blocking=True) if nd > 0 else None,
             decode_max_context_len=dc_max_cl,
             logit_indices=torch.tensor(logit_idx, dtype=torch.int64, pin_memory=True).cuda(non_blocking=True),
+            chunked_context=chunked_context,
         )
 
         input_ids_t = torch.tensor(input_ids, dtype=torch.int64, pin_memory=True).cuda(non_blocking=True)

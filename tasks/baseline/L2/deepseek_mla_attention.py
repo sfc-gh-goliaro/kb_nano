@@ -29,7 +29,8 @@ class DeepSeekMLAAttention(nn.Module):
 
     def __init__(self, config, rotary_emb: nn.Module,
                  quant_config: dict | None = None,
-                 is_v32: bool = False):
+                 is_v32: bool = False,
+                 topk_indices_buffer: torch.Tensor | None = None):
         super().__init__()
         tp = _tp_size()
         self.hidden_size = config.hidden_size
@@ -106,6 +107,7 @@ class DeepSeekMLAAttention(nn.Module):
                 rope_dim=self.qk_rope_head_dim,
                 topk_tokens=config.index_topk,
                 quant_config=quant_config,
+                topk_indices_buffer=topk_indices_buffer,
             )
             indexer_interleave = getattr(config, "indexer_rope_interleave", False)
             self.indexer_rope_emb = YarnRotaryEmbedding(
@@ -127,12 +129,16 @@ class DeepSeekMLAAttention(nn.Module):
             self.indexer_rope_emb = None
 
     def compute_absorbed_weights(self):
-        """Compute W_UV from kv_b_proj for absorbed MLA decode.
+        """Compute W_UV and W_UK_T from kv_b_proj for absorbed MLA decode.
 
         Must be called after weight loading but BEFORE FP8 postprocessing
         (transform_sf_into_required_layout). For FP8 weights, we dequantize
         using the original block scales to recover accurate BF16 values,
         matching vLLM's get_and_maybe_dequant_weights.
+
+        Produces:
+        - W_UV: [N, L, V] for v_up_proj (matches vllm)
+        - W_UK_T: [N, P, L] for decode query absorption (matches vllm)
         """
         weight = self.kv_b_proj.weight.data
         if hasattr(self.kv_b_proj, 'use_fp8') and self.kv_b_proj.use_fp8:
@@ -140,14 +146,18 @@ class DeepSeekMLAAttention(nn.Module):
             weight = self._dequant_fp8_block(weight, scale)
         else:
             weight = weight.to(torch.bfloat16)
-        weight = weight.T
+        weight = weight.T  # [L, N*(P+V)]
         L = self.kv_lora_rank
         N = self.num_local_heads
         P = self.qk_nope_head_dim
         V = self.v_head_dim
         weight = weight.view(L, N, P + V)
-        W_UV = weight[:, :, P:]
+        W_UK = weight[:, :, :P]  # [L, N, P]
+        W_UV = weight[:, :, P:]  # [L, N, V]
+        # W_UV: (L, N, V) -> (N, L, V) — matches vllm
         self.attn.W_UV = W_UV.permute(1, 0, 2).contiguous()
+        # W_UK_T: (L, N, P) -> (N, P, L) — matches vllm
+        self.attn.W_UK_T = W_UK.permute(1, 2, 0).contiguous()
 
     @staticmethod
     def _dequant_fp8_block(w_fp8: torch.Tensor, scale_inv: torch.Tensor,
