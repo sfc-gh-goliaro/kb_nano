@@ -110,22 +110,37 @@ def main():
         for i, layer in enumerate(model.model.layers):
             hidden, residual = layer(positions, hidden, residual)
             h_norm = hidden.float().norm().item()
-            r_norm = residual.float().norm().item() if residual is not None else 0
             r_has_inf = residual.isinf().any().item() if residual is not None else False
-            r_has_nan = residual.isnan().any().item() if residual is not None else False
-            if rank == 0:
-                flag = ""
-                if r_has_inf:
-                    flag = " <<< INF!"
-                if r_has_nan:
-                    flag = " <<< NAN!"
-                if h_norm == 0:
-                    flag = " <<< ZERO!"
-                h_max = hidden.abs().max().item()
+            if rank == 0 and (i < 5 or i % 10 == 0 or i >= 58 or r_has_inf or h_norm == 0):
                 r_max = residual.abs().max().item() if residual is not None else 0
-                print(f"  layer {i:2d}: h_norm={h_norm:.4f} h_max={h_max:.2f}  "
-                      f"r_norm={r_norm:.4f} r_max={r_max:.2f}{flag}")
-            if r_has_inf or r_has_nan:
+                flag = " <<< INF!" if r_has_inf else (" <<< ZERO!" if h_norm == 0 else "")
+                print(f"  layer {i:2d}: h_norm={h_norm:.4f} h_max={hidden.abs().max():.2f}  "
+                      f"r_max={r_max:.2f}{flag}")
+            if r_has_inf:
+                # Investigate: run MoE manually at the exploding layer
+                if rank == 0:
+                    # Check: is the routed expert output the culprit?
+                    # Re-run the layer manually to isolate the MoE
+                    h_pre = hidden.clone()  # hidden is the MoE output
+                    print(f"  >>> Investigating layer {i} MoE...")
+                    # Get MoE input: we need the post_attention_layernorm output
+                    # The layer already ran, so h_pre IS the MoE output
+                    print(f"  >>> MoE output h_norm={h_norm:.4f}")
+
+                    # Check: does the shared expert on its own produce inf?
+                    # Need the MoE input — get it from post_attention_layernorm
+                    # Actually we can just check the SiluMulQuantFp8 scale
+                    moe = layer.mlp
+                    if hasattr(moe, 'silu_mul_quant_fp8'):
+                        print(f"  >>> MoE w13 scale range: [{moe.w13_weight_scale_inv.min():.6f}, {moe.w13_weight_scale_inv.max():.6f}]")
+                        print(f"  >>> MoE w2 scale range: [{moe.w2_weight_scale_inv.min():.6f}, {moe.w2_weight_scale_inv.max():.6f}]")
+                        # Check w13 for NaN/Inf
+                        print(f"  >>> w13 has inf: {moe.w13.float().isinf().any().item()}")
+                        print(f"  >>> w13 has nan: {moe.w13.float().isnan().any().item()}")
+                        print(f"  >>> w13_scale has inf: {moe.w13_weight_scale_inv.isinf().any().item()}")
+                        print(f"  >>> w13_scale has nan: {moe.w13_weight_scale_inv.isnan().any().item()}")
+                        print(f"  >>> w2 has inf: {moe.w2.float().isinf().any().item()}")
+                        print(f"  >>> w2_scale has inf: {moe.w2_weight_scale_inv.isinf().any().item()}")
                 break
 
         # Final norm

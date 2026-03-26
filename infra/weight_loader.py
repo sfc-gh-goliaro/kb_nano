@@ -48,7 +48,7 @@ _EXPERT_RE = re.compile(
 )
 
 _DEEPSEEK_EXPERT_RE = re.compile(
-    r"(.+\.mlp)\.experts\.(\d+)\.(gate_proj|up_proj|down_proj)\.(weight|weight_scale_inv)"
+    r"(.+\.mlp)\.experts\.(\d+)\.(gate_proj|up_proj|down_proj)\.(weight_scale_inv|weight)$"
 )
 
 _DEEPSEEK_SHARED_EXPERT_RE = re.compile(
@@ -337,6 +337,37 @@ def load_weights(model, model_path: str, model_type: str = "llama") -> None:
                 loaded += _load_vision_qkv(model, prefix, tensor, wb)
                 continue
 
+        # DeepSeek MoE expert weights/scales — must be checked BEFORE
+        # _WEIGHT_SCALE_INV_RE to avoid the generic scale handler consuming
+        # expert weight_scale_inv names and silently skipping them.
+        m_ds = _DEEPSEEK_EXPERT_RE.match(mapped_name)
+        if m_ds:
+            moe_prefix, expert_id_str, proj_name, attr = m_ds.groups()
+            expert_id = int(expert_id_str)
+            if proj_name in ("gate_proj", "up_proj"):
+                is_w1 = (proj_name == "gate_proj")
+                if attr == "weight":
+                    param_name = f"{moe_prefix}.w13"
+                else:
+                    param_name = f"{moe_prefix}.w13_weight_scale_inv"
+                try:
+                    param = model.get_parameter(param_name)
+                except AttributeError:
+                    continue
+                param.weight_loader(param, tensor, expert_id, is_w1=is_w1)
+            else:
+                if attr == "weight":
+                    param_name = f"{moe_prefix}.w2"
+                else:
+                    param_name = f"{moe_prefix}.w2_weight_scale_inv"
+                try:
+                    param = model.get_parameter(param_name)
+                except AttributeError:
+                    continue
+                param.weight_loader(param, tensor, expert_id)
+            loaded += 1
+            continue
+
         m_scale = _WEIGHT_SCALE_INV_RE.match(mapped_name)
         if m_scale:
             layer_prefix = m_scale.group(1)
@@ -382,34 +413,6 @@ def load_weights(model, model_path: str, model_type: str = "llama") -> None:
             else:
                 param_name = f"{moe_prefix}.w2"
                 param = model.get_parameter(param_name)
-                param.weight_loader(param, tensor, expert_id)
-            loaded += 1
-            continue
-
-        m_ds = _DEEPSEEK_EXPERT_RE.match(mapped_name)
-        if m_ds:
-            moe_prefix, expert_id_str, proj_name, attr = m_ds.groups()
-            expert_id = int(expert_id_str)
-            if proj_name in ("gate_proj", "up_proj"):
-                is_w1 = (proj_name == "gate_proj")
-                if attr == "weight":
-                    param_name = f"{moe_prefix}.w13"
-                else:
-                    param_name = f"{moe_prefix}.w13_weight_scale_inv"
-                try:
-                    param = model.get_parameter(param_name)
-                except AttributeError:
-                    continue
-                param.weight_loader(param, tensor, expert_id, is_w1=is_w1)
-            else:
-                if attr == "weight":
-                    param_name = f"{moe_prefix}.w2"
-                else:
-                    param_name = f"{moe_prefix}.w2_weight_scale_inv"
-                try:
-                    param = model.get_parameter(param_name)
-                except AttributeError:
-                    continue
                 param.weight_loader(param, tensor, expert_id)
             loaded += 1
             continue
