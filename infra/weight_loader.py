@@ -160,25 +160,20 @@ def _weights_iterator(safetensor_files, use_fastsafetensors=True):
 
     Uses fastsafetensors (GPU Direct Storage) when available for fast
     GPU-direct loading. Falls back to safetensors CPU loading otherwise.
-    Matches vllm's fastsafetensors_weights_iterator / safetensors_weights_iterator.
+
+    Note: unlike vllm (which loads weights once on rank 0 and distributes),
+    kb_nano has each TP rank independently load ALL weights and apply its
+    own shard via weight_loader callbacks. So we use SingleGroup to ensure
+    each rank loads all files itself via GDS, without cross-rank distribution.
     """
     if use_fastsafetensors and _HAS_FASTSAFETENSORS:
-        import torch.distributed as dist
-        if dist.is_initialized():
-            pg = dist.group.WORLD
-        else:
-            pg = SingleGroup()
-        device = torch.device(f"cuda:{pg.rank()}")
-        batch_size = pg.size()
-        file_batches = [
-            safetensor_files[i:i + batch_size]
-            for i in range(0, len(safetensor_files), batch_size)
-        ]
+        from .tp import _tp_rank
+        device = torch.device(f"cuda:{_tp_rank()}")
+        pg = SingleGroup()
         nogds = False
-        for f_list in file_batches:
+        for sf_file in safetensor_files:
             loader = SafeTensorsFileLoader(pg, device, nogds=nogds)
-            rank_file_map = {i: [f] for i, f in enumerate(f_list)}
-            loader.add_filenames(rank_file_map)
+            loader.add_filenames({0: [sf_file]})
             try:
                 try:
                     fb = loader.copy_files_to_device()
@@ -188,7 +183,7 @@ def _weights_iterator(safetensor_files, use_fastsafetensors=True):
                     loader.close()
                     nogds = True
                     loader = SafeTensorsFileLoader(pg, device, nogds=nogds)
-                    loader.add_filenames(rank_file_map)
+                    loader.add_filenames({0: [sf_file]})
                     fb = loader.copy_files_to_device()
                 try:
                     for k in list(fb.key_to_rank_lidx.keys()):
