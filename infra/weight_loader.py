@@ -481,8 +481,12 @@ def _postprocess_fp8_weights(model: torch.nn.Module) -> None:
             for name in ("w13", "w2"):
                 w = getattr(module, name)
                 s = getattr(module, f"{name}_weight_scale_inv")
-                postprocess_fp8_weights_batched(w.data, s.data)
-                moe_count += w.shape[0]
+                E = w.shape[0]
+                for e in range(E):
+                    w_e, s_e = postprocess_fp8_weights(w.data[e], s.data[e])
+                    w.data[e].copy_(w_e)
+                    s.data[e].copy_(s_e)
+                moe_count += E
             done = (j + 1) * 2
             if j % max(1, len(moe_modules) // 5) == 0 or j == len(moe_modules) - 1:
                 print(f"    MoE postprocess {done}/{total_ops} "
