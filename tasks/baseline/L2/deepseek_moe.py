@@ -1,6 +1,6 @@
 """DeepSeek MoE with shared expert, grouped routing, and FP8 expert execution.
 
-Uses GroupedTopK for routing, FusedExperts (BF16) or Fp8MoeGroupedGemm (FP8)
+Uses GroupedTopK for routing, FusedExperts (BF16) or fused DeepGEMM FP8 path
 for expert execution, and a shared expert (LlamaMLP) running on a separate stream.
 
 Matches vllm's DeepseekV2MoE: routed_scaling_factor is applied post-experts
@@ -20,7 +20,9 @@ from ..L1.allreduce import AllReduce
 from ..L1.linear import Linear
 from ..L1.silu_and_mul import SiluAndMul
 from ..L1.grouped_topk import GroupedTopK
-from ..L1.moe_align import MoeAlign
+from ..L1.moe_permute import MoePermute
+from ..L1.moe_unpermute_reduce import MoeUnpermuteReduce
+from ..L1.silu_mul_quant_fp8 import SiluMulQuantFp8
 from .fused_experts import FusedExperts
 from .parallel_linear import MergedColumnParallelLinear, RowParallelLinear
 
@@ -138,10 +140,15 @@ class DeepSeekMoE(nn.Module):
         self.grouped_topk = GroupedTopK()
         self.fused_experts = FusedExperts()
         if self.use_fp8:
-            self.moe_align = MoeAlign()
+            self.moe_permute = MoePermute()
+            self.moe_unpermute_reduce = MoeUnpermuteReduce()
+            self.silu_mul_quant_fp8 = SiluMulQuantFp8()
         self.silu_and_mul = SiluAndMul()
         self.allreduce = AllReduce()
         self._shared_stream: torch.cuda.Stream | None = None
+        self._ws13: torch.Tensor | None = None
+        self._ws2: torch.Tensor | None = None
+        self._out_buf: torch.Tensor | None = None
 
     def _w13_weight_loader(self, param, loaded_weight, expert_id: int, is_w1: bool):
         tp, rank = _tp_size(), _tp_rank()
@@ -210,6 +217,15 @@ class DeepSeekMoE(nn.Module):
 
         return out.view(orig_shape)
 
+    def _get_workspace(self, name: str, min_bytes: int,
+                        device: torch.device) -> torch.Tensor:
+        """Get or grow a workspace buffer (uint8) for reuse across calls."""
+        buf = getattr(self, name)
+        if buf is None or buf.numel() < min_bytes or buf.device != device:
+            buf = torch.empty(min_bytes, dtype=torch.uint8, device=device)
+            setattr(self, name, buf)
+        return buf
+
     def _forward_fp8_experts(
         self,
         hidden_states: torch.Tensor,
@@ -224,96 +240,52 @@ class DeepSeekMoE(nn.Module):
         N_gate_up = 2 * self.intermediate_per_tp
         N_inter = self.intermediate_per_tp
         top_k = self.top_k
+        device = hidden_states.device
 
-        block_size_m = 128
-        sorted_token_ids, expert_ids, num_tokens_post_padded = self.moe_align(
-            topk_ids, block_size_m, self.num_experts,
-        )
-
-        ntp = int(num_tokens_post_padded.item()
-                  if num_tokens_post_padded.numel() == 1
-                  else int(num_tokens_post_padded))
         align = int(deep_gemm.get_mk_alignment_for_contiguous_layout())
-        m_sum = ((ntp + align - 1) // align) * align
-
-        stp = sorted_token_ids[:ntp].long()
-        num_valid = M * top_k
-        valid = stp < num_valid
-        input_rows = (stp // top_k).clamp(max=M - 1)
+        m_sum_upper = (M * top_k) + self.num_experts * (align - 1)
+        m_sum = ((m_sum_upper + align - 1) // align) * align
 
         # FP8 quant hidden_states
         num_groups_k = K // _FP8_BLOCK
-        a1_fp8 = torch.empty(M, K, dtype=torch.float8_e4m3fn,
-                             device=hidden_states.device)
+        ws13 = self._get_workspace(
+            "_ws13", m_sum * max(K, N_gate_up) * 2, device)
+        a1_fp8 = ws13[:M * K].view(torch.float8_e4m3fn).view(M, K)
         a1_scale = torch.empty(M, num_groups_k, dtype=torch.float32,
-                               device=hidden_states.device)
+                               device=device)
         _per_token_group_quant_fp8(hidden_states, a1_fp8, a1_scale)
 
-        # Permute for GEMM1
-        a1_perm = a1_fp8[input_rows]
-        s1_perm = a1_scale[input_rows]
-        blk = (torch.arange(ntp, device=hidden_states.device, dtype=torch.int64)
-               // block_size_m).clamp(max=expert_ids.shape[0] - 1)
-        eid_row = expert_ids[blk].to(torch.int32)
-        eid_row = torch.where(valid, eid_row, torch.full_like(eid_row, -1))
+        # Fused permute into expert-contiguous layout
+        a1_perm, s1_perm, expert_ids, inv_perm = self.moe_permute(
+            a1_fp8, a1_scale, topk_ids, self.num_experts, m_sum,
+        )
 
-        def _pad_to(t, target, fill=0):
-            if t.shape[0] >= target:
-                return t[:target]
-            pad = target - t.shape[0]
-            return torch.cat([t, t.new_full((pad, *t.shape[1:]), fill)], dim=0)
-
-        a1_perm = _pad_to(a1_perm, m_sum)
-        s1_perm = _pad_to(s1_perm, m_sum)
-        eid_row_padded = _pad_to(eid_row, m_sum, fill=-1)
-
-        # GEMM1: gate_up
-        out1 = torch.empty(m_sum, N_gate_up, dtype=torch.bfloat16,
-                           device=hidden_states.device)
+        # GEMM1: gate_up — reuse ws2 for output
+        ws2 = self._get_workspace(
+            "_ws2", m_sum * max(N_gate_up, K) * 2, device)
+        out1 = ws2[:m_sum * N_gate_up * 2].view(torch.bfloat16).view(
+            m_sum, N_gate_up)
         deep_gemm.m_grouped_fp8_gemm_nt_contiguous(
             (a1_perm, s1_perm), (self.w13, self.w13_weight_scale_inv),
-            out1, eid_row_padded,
+            out1, expert_ids,
         )
 
-        # Scatter GEMM1 output to [M*top_k, 2*N]
-        gate_up = torch.zeros(M * top_k, N_gate_up, dtype=hidden_states.dtype,
-                              device=hidden_states.device)
-        out1_valid = out1[:ntp]
-        tok_slots = stp.clamp(max=gate_up.shape[0] - 1)
-        gate_up[tok_slots[valid]] = out1_valid[valid].to(gate_up.dtype)
+        # Fused SiLU+Mul+FP8Quant — single kernel, output stays in permuted order
+        a2_fp8, a2_scale = self.silu_mul_quant_fp8(out1)
 
-        # SiLU + Mul
-        intermediate = self.silu_and_mul(gate_up)
-
-        # FP8 quant intermediate for GEMM2 — gather in sorted order
-        inter_perm = intermediate[tok_slots]
-        inter_perm[~valid] = 0
-        num_groups_n = N_inter // _FP8_BLOCK
-        a2_fp8 = torch.empty(ntp, N_inter, dtype=torch.float8_e4m3fn,
-                             device=hidden_states.device)
-        a2_scale = torch.empty(ntp, num_groups_n, dtype=torch.float32,
-                               device=hidden_states.device)
-        _per_token_group_quant_fp8(inter_perm[:ntp].contiguous(), a2_fp8, a2_scale)
-
-        a2_perm = _pad_to(a2_fp8, m_sum)
-        s2_perm = _pad_to(a2_scale, m_sum)
-
-        # GEMM2: down
-        out2 = torch.empty(m_sum, K, dtype=torch.bfloat16,
-                           device=hidden_states.device)
+        # GEMM2: down — reuse ws2 for output
+        out2 = ws2[:m_sum * K * 2].view(torch.bfloat16).view(m_sum, K)
         deep_gemm.m_grouped_fp8_gemm_nt_contiguous(
-            (a2_perm, s2_perm), (self.w2, self.w2_weight_scale_inv),
-            out2, eid_row_padded,
+            (a2_fp8, a2_scale), (self.w2, self.w2_weight_scale_inv),
+            out2, expert_ids,
         )
 
-        # Scatter GEMM2 output with routed weights to [M*top_k, K]
-        down_out = torch.zeros(M * top_k, K, dtype=hidden_states.dtype,
-                               device=hidden_states.device)
-        out2_valid = out2[:ntp]
-        w = topk_weights.view(-1)[tok_slots].unsqueeze(1)
-        weighted = (out2_valid * w).to(down_out.dtype)
-        weighted[~valid] = 0
-        down_out[tok_slots[valid]] = weighted[valid]
-
-        # Sum over top_k
-        return down_out.view(M, top_k, K).sum(dim=1)
+        # Fused unpermute + weighted reduce
+        if self._out_buf is None or self._out_buf.shape[0] < M:
+            self._out_buf = torch.empty(M, K, dtype=hidden_states.dtype,
+                                        device=device)
+        output = self._out_buf[:M]
+        self.moe_unpermute_reduce(
+            out2, topk_ids, topk_weights, inv_perm, output,
+        )
+        return output

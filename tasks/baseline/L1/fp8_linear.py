@@ -46,15 +46,38 @@ def _fp8_group_quant_kernel(
     tl.store(scale_base, scale)
 
 
+_HAS_VLLM_CUDA_QUANT: bool | None = None
+
+
+def _check_vllm_cuda_quant() -> bool:
+    global _HAS_VLLM_CUDA_QUANT
+    if _HAS_VLLM_CUDA_QUANT is None:
+        try:
+            import vllm._C  # noqa: F401
+            _HAS_VLLM_CUDA_QUANT = hasattr(torch.ops, "_C") and hasattr(
+                torch.ops._C, "per_token_group_fp8_quant"
+            )
+        except (ImportError, AttributeError):
+            _HAS_VLLM_CUDA_QUANT = False
+    return _HAS_VLLM_CUDA_QUANT
+
+
 def _per_token_group_quant_fp8(x: torch.Tensor,
                                out_fp8: torch.Tensor,
                                out_scale: torch.Tensor) -> None:
     """In-place per-token-group FP8 quantization with UE8M0 (power-of-two) scales.
 
-    Single Triton kernel launch, writes to pre-allocated buffers for
-    CUDA-graph compatibility.
+    Prefers vLLM's CUDA C++ kernel when available for lower launch overhead;
+    falls back to Triton.
     """
     M, K = x.shape
+    if _check_vllm_cuda_quant() and x.is_cuda and x.is_contiguous():
+        torch.ops._C.per_token_group_fp8_quant(
+            x, out_fp8, out_scale, int(_GROUP_SIZE),
+            1e-12, _FP8_INFO.min, _FP8_INFO.max, True,
+        )
+        return
+
     groups_per_row = K // _GROUP_SIZE
     _fp8_group_quant_kernel[(M * groups_per_row,)](
         x, out_fp8, out_scale,
