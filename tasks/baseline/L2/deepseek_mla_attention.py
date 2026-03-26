@@ -57,12 +57,11 @@ class DeepSeekMLAAttention(nn.Module):
         self.rotary_emb = rotary_emb
         self.is_v32 = is_v32
 
-        # Fused Q + KV_a projection (replicated, no TP)
-        # disable_tp is handled by using the full sizes
         self.fused_qkv_a_proj = MergedColumnParallelLinear(
             self.hidden_size,
             [self.q_lora_rank, self.kv_lora_rank + self.qk_rope_head_dim],
             quant_config=quant_config,
+            disable_tp=True,
         )
 
         self.q_a_layernorm = RMSNorm(self.q_lora_rank, eps=config.rms_norm_eps)
@@ -108,6 +107,7 @@ class DeepSeekMLAAttention(nn.Module):
                 topk_tokens=config.index_topk,
                 quant_config=quant_config,
             )
+            indexer_interleave = getattr(config, "indexer_rope_interleave", False)
             self.indexer_rope_emb = YarnRotaryEmbedding(
                 head_dim=self.qk_rope_head_dim,
                 max_position_embeddings=config.max_position_embeddings,
@@ -118,10 +118,29 @@ class DeepSeekMLAAttention(nn.Module):
                 beta_slow=_irp.get("beta_slow", 1),
                 mscale=_irp.get("mscale", 1.0),
                 mscale_all_dim=_irp.get("mscale_all_dim", 0.0),
+                is_neox_style=not indexer_interleave,
             )
         else:
             self.indexer = None
             self.indexer_rope_emb = None
+
+    def compute_absorbed_weights(self):
+        """Compute W_UV from kv_b_proj for absorbed MLA decode.
+
+        Must be called after weight loading. Extracts the V-projection
+        portion of kv_b_proj and stores it as W_UV on the attention core.
+        """
+        weight = self.kv_b_proj.weight.data
+        if hasattr(self.kv_b_proj, 'use_fp8') and self.kv_b_proj.use_fp8:
+            weight = weight.float()
+        weight = weight.T
+        L = self.kv_lora_rank
+        N = self.num_local_heads
+        P = self.qk_nope_head_dim
+        V = self.v_head_dim
+        weight = weight.view(L, N, P + V)
+        W_UV = weight[:, :, P:]
+        self.attn.W_UV = W_UV.permute(1, 0, 2).contiguous()
 
     def forward(self, positions: torch.Tensor, hidden_states: torch.Tensor) -> torch.Tensor:
         N = hidden_states.shape[0]

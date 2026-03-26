@@ -6,6 +6,7 @@ Layers 1+: DeepSeekMLAAttention + DeepSeekMoE
 
 from __future__ import annotations
 
+import torch
 import torch.nn as nn
 
 from ..L1.rms_norm import RMSNorm
@@ -44,7 +45,8 @@ class DeepSeekDecoderLayer(nn.Module):
 
     def forward(self, positions, hidden_states, residual):
         if residual is None:
-            hidden_states, residual = self.input_layernorm(hidden_states), hidden_states
+            residual = hidden_states.clone()
+            hidden_states = self.input_layernorm(hidden_states)
         else:
             hidden_states, residual = self.input_layernorm(hidden_states, residual)
 

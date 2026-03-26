@@ -16,7 +16,6 @@ class GroupedTopK(nn.Module):
         num_expert_group: int,
         topk_group: int,
         topk: int,
-        routed_scaling_factor: float = 1.0,
     ) -> tuple[torch.Tensor, torch.Tensor]:
         topk_weights, topk_ids = _sgl_fused_gate(
             router_logits,
@@ -25,5 +24,4 @@ class GroupedTopK(nn.Module):
             topk_group,
             topk,
         )
-        topk_weights = topk_weights * routed_scaling_factor
         return topk_weights, topk_ids

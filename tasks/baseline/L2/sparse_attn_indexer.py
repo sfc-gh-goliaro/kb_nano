@@ -154,10 +154,11 @@ class SparseAttnIndexer(nn.Module):
         if ctx.slot_mapping is not None and self.indexer_k_cache.numel():
             self.k_cache_store(k, self.indexer_k_cache, ctx.slot_mapping)
 
-        # Compute weights (combine head weights with per-head activation scales)
         weights = self.weights_proj(hidden_states)  # [M, n_head]
-        weights = (weights.unsqueeze(-1) * q_scale).mean(dim=-1)
-        weights = weights * self.softmax_scale * (self.n_head ** -0.5)
+        weights = (
+            weights.unsqueeze(-1) * q_scale * self.softmax_scale * self.n_head ** -0.5
+        )
+        weights = weights.squeeze(-1)
 
         # Compute logits and top-k
         topk_indices = torch.full((M, self.topk_tokens), -1, dtype=torch.int32,

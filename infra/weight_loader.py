@@ -178,6 +178,13 @@ def load_weights(model, model_path: str, model_type: str = "llama") -> None:
                 else:
                     mapped_name = weight_name
 
+                # DeepSeek: shared_experts -> shared_expert, gate.weight -> gate_weight
+                if model_type == "deepseek_v3":
+                    mapped_name = mapped_name.replace(
+                        ".shared_experts.", ".shared_expert.")
+                    mapped_name = mapped_name.replace(
+                        ".mlp.gate.weight", ".mlp.gate_weight")
+
                 # Llama4: strip language_model. prefix, skip vision weights
                 if is_llama4:
                     if not mapped_name.startswith("language_model."):
@@ -536,5 +543,19 @@ def load_model(
     else:
         model = model.to(device=device, dtype=dtype)
 
+    if model_type == "deepseek_v3":
+        _compute_mla_absorbed_weights(model)
+
     model.eval()
     return model, config
+
+
+def _compute_mla_absorbed_weights(model: torch.nn.Module) -> None:
+    """Compute absorbed W_UV weights for MLA decode after loading."""
+    from ..tasks.baseline.L2.deepseek_mla_attention import DeepSeekMLAAttention
+    count = 0
+    for module in model.modules():
+        if isinstance(module, DeepSeekMLAAttention):
+            module.compute_absorbed_weights()
+            count += 1
+    print(f"  Computed absorbed MLA weights for {count} attention layers.")

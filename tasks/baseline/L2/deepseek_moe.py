@@ -2,6 +2,10 @@
 
 Uses GroupedTopK for routing, FusedExperts (BF16) or Fp8MoeGroupedGemm (FP8)
 for expert execution, and a shared expert (LlamaMLP) running on a separate stream.
+
+Matches vllm's DeepseekV2MoE: routed_scaling_factor is applied post-experts
+(not folded into routing weights), and shared expert uses
+moe_intermediate_size * n_shared_experts as its intermediate dimension.
 """
 
 from __future__ import annotations
@@ -14,9 +18,10 @@ import torch.nn as nn
 from ....infra.tp import _tp_rank, _tp_size
 from ..L1.allreduce import AllReduce
 from ..L1.linear import Linear
+from ..L1.silu_and_mul import SiluAndMul
 from ..L1.grouped_topk import GroupedTopK
 from .fused_experts import FusedExperts
-from .llama_mlp import LlamaMLP
+from .parallel_linear import MergedColumnParallelLinear, RowParallelLinear
 
 _FP8_BLOCK = 128
 
@@ -25,14 +30,38 @@ def _scale_shape(out_dim: int, in_dim: int) -> tuple[int, int]:
     return (math.ceil(out_dim / _FP8_BLOCK), math.ceil(in_dim / _FP8_BLOCK))
 
 
+class DeepSeekSharedExpertMLP(nn.Module):
+    """Shared expert MLP with reduce_results=False for external all-reduce."""
+
+    def __init__(self, hidden_size: int, intermediate_size: int,
+                 quant_config: dict | None = None):
+        super().__init__()
+        self.gate_up_proj = MergedColumnParallelLinear(
+            hidden_size, [intermediate_size] * 2,
+            quant_config=quant_config,
+        )
+        self.down_proj = RowParallelLinear(
+            intermediate_size, hidden_size,
+            quant_config=quant_config,
+            reduce_results=False,
+        )
+        self.act_fn = SiluAndMul()
+
+    def forward(self, x):
+        x = self.gate_up_proj(x)
+        x = self.act_fn(x)
+        return self.down_proj(x)
+
+
 class DeepSeekMoE(nn.Module):
     """DeepSeek Mixture-of-Experts with shared expert and grouped routing.
 
     Architecture:
     - Router: replicated gate + e_score_correction_bias
-    - Shared expert: LlamaMLP (reused, FP8 via quant_config)
+    - Shared expert: DeepSeekSharedExpertMLP (reduce_results=False)
     - Routed experts: FP8 weights (w13, w2) + per-block scales
     - Routing: GroupedTopK via sgl_kernel.moe.moe_fused_gate
+    - routed_scaling_factor applied post-experts (not in routing weights)
     """
 
     def __init__(self, config, quant_config: dict | None = None):
@@ -51,26 +80,26 @@ class DeepSeekMoE(nn.Module):
         self.n_group = n_group
         self.topk_group = topk_group
 
-        # Router gate (replicated, no TP, no FP8)
         self.gate_weight = nn.Parameter(
             torch.empty(config.n_routed_experts, config.hidden_size),
         )
         self.gate_weight.weight_loader = lambda p, w: p.data.copy_(w)
 
-        # Correction bias for noaux_tc routing
         self.e_score_correction_bias = nn.Parameter(
             torch.zeros(config.n_routed_experts, dtype=torch.float32),
         )
         self.e_score_correction_bias.weight_loader = lambda p, w: p.data.copy_(w)
 
-        # Shared expert
         n_shared = getattr(config, 'n_shared_experts', 1)
         if n_shared is not None and n_shared > 0:
-            self.shared_expert = LlamaMLP(config, quant_config=quant_config)
+            shared_intermediate = config.moe_intermediate_size * n_shared
+            self.shared_expert = DeepSeekSharedExpertMLP(
+                config.hidden_size, shared_intermediate,
+                quant_config=quant_config,
+            )
         else:
             self.shared_expert = None
 
-        # Expert weights
         if self.use_fp8:
             self.w13 = nn.Parameter(torch.empty(
                 config.n_routed_experts, 2 * self.intermediate_per_tp, config.hidden_size,
@@ -98,7 +127,6 @@ class DeepSeekMoE(nn.Module):
                 config.n_routed_experts, config.hidden_size, self.intermediate_per_tp,
             ))
 
-        # Weight loaders
         self.w13.weight_loader = self._w13_weight_loader
         self.w2.weight_loader = self._w2_weight_loader
         if self.use_fp8:
@@ -141,23 +169,28 @@ class DeepSeekMoE(nn.Module):
         orig_shape = hidden_states.shape
         hidden_states = hidden_states.view(-1, self.hidden_size)
 
-        # Router
         router_logits = self.linear_op(hidden_states, self.gate_weight)
         topk_weights, topk_ids = self.grouped_topk(
             router_logits, self.e_score_correction_bias,
             self.n_group, self.topk_group, self.top_k,
-            routed_scaling_factor=self.routed_scaling_factor,
         )
         topk_weights = topk_weights.to(hidden_states.dtype)
 
-        # Routed experts (BF16 path for now, FP8 TODO)
-        out = self.fused_experts(
-            hidden_states, self.w13 if not self.use_fp8 else self.w13.float().to(hidden_states.dtype),
-            self.w2 if not self.use_fp8 else self.w2.float().to(hidden_states.dtype),
-            topk_weights, topk_ids, self.num_experts,
-        )
+        if self.use_fp8:
+            out = self.fused_experts(
+                hidden_states,
+                self.w13.float().to(hidden_states.dtype),
+                self.w2.float().to(hidden_states.dtype),
+                topk_weights, topk_ids, self.num_experts,
+            )
+        else:
+            out = self.fused_experts(
+                hidden_states, self.w13, self.w2,
+                topk_weights, topk_ids, self.num_experts,
+            )
 
-        # Shared expert
+        out = out * self.routed_scaling_factor
+
         if self.shared_expert is not None:
             shared_out = self.shared_expert(hidden_states)
             out = out + shared_out

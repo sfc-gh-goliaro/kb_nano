@@ -54,9 +54,11 @@ class YarnRotaryEmbedding(nn.Module):
         beta_slow: int = 1,
         mscale: float = 1,
         mscale_all_dim: float = 0,
+        is_neox_style: bool = False,
     ):
         super().__init__()
         self.head_dim = head_dim
+        self.is_neox_style = is_neox_style
         rotary_dim = head_dim
         base = rope_theta
 
@@ -86,5 +88,5 @@ class YarnRotaryEmbedding(nn.Module):
         if cache.dtype != torch.float32:
             cache = cache.float()
             self.cos_sin_cache = cache
-        _sgl_rope(positions, query, key, self.head_dim, cache, is_neox=False)
+        _sgl_rope(positions, query, key, self.head_dim, cache, is_neox=self.is_neox_style)
         return query, key
