@@ -409,9 +409,16 @@ class ModelRunner:
     def _warmup_deepgemm(self):
         """Pre-JIT DeepGEMM FP8 kernels for all weight shapes at decode and
         prefill batch sizes, pre-allocate decode buffers per instance and
-        shared prefill buffers per unique (K, N) shape."""
+        shared prefill buffers per unique (K, N) shape.
+
+        Respects VLLM_DEEP_GEMM_WARMUP env var: "skip" disables JIT warmup
+        (buffers are still allocated), "relax"/"full" run warmup normally.
+        """
+        import os
         from ..tasks.baseline.L1.fp8_linear import Fp8Linear, _Fp8PrefillBufs
         import deep_gemm
+
+        skip_jit = os.environ.get("VLLM_DEEP_GEMM_WARMUP", "").lower() == "skip"
 
         fp8_modules = []
         for module in self.model.modules():
@@ -445,7 +452,8 @@ class ModelRunner:
                 prefill_bufs[key] = _Fp8PrefillBufs(max_prefill, K, N, device)
             linear_op._pf = prefill_bufs[key]
 
-            if key in seen_shapes:
+            if skip_jit or key in seen_shapes:
+                seen_shapes.add(key)
                 continue
             seen_shapes.add(key)
 
@@ -472,7 +480,11 @@ class ModelRunner:
         torch.cuda.synchronize()
         torch.cuda.empty_cache()
         if self.rank == 0:
-            print(f"  DeepGEMM warmup: {len(seen_shapes)} unique FP8 weight shapes")
+            if skip_jit:
+                print(f"  DeepGEMM warmup: skipped JIT (VLLM_DEEP_GEMM_WARMUP=skip), "
+                      f"{len(seen_shapes)} shapes buffered")
+            else:
+                print(f"  DeepGEMM warmup: {len(seen_shapes)} unique FP8 weight shapes")
 
     def _warmup_vision_encoder(self):
         """Run vision encoder with worst-case dummy inputs to capture peak

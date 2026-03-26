@@ -98,6 +98,7 @@ def _is_vlm_model(model_name: str) -> bool:
 VLLM_WORKER = r'''
 import json, os, sys, time
 os.environ.setdefault("VLLM_WORKER_MULTIPROC_METHOD", "spawn")
+os.environ.setdefault("VLLM_DEEP_GEMM_WARMUP", "skip")
 
 def main():
     from vllm import LLM, SamplingParams
@@ -197,7 +198,8 @@ if __name__ == "__main__":
 # Multi-scenario kb-nano subprocess worker
 # ---------------------------------------------------------------------------
 KB_NANO_WORKER = r'''
-import json, sys, time
+import json, os, sys, time
+os.environ.setdefault("VLLM_DEEP_GEMM_WARMUP", "skip")
 
 def main():
     with open(sys.argv[1]) as f:
@@ -494,6 +496,7 @@ def _filter_and_prepare(mm_data, processor, max_input_tokens):
 VLLM_VLM_WORKER = _MM_PRELOAD_FN + r'''
 import json, os, sys, time
 os.environ.setdefault("VLLM_WORKER_MULTIPROC_METHOD", "spawn")
+os.environ.setdefault("VLLM_DEEP_GEMM_WARMUP", "skip")
 
 
 def main():
@@ -654,7 +657,8 @@ if __name__ == "__main__":
 # Multi-scenario kb-nano subprocess worker (VLM, multi-modal)
 # ---------------------------------------------------------------------------
 KB_NANO_VLM_WORKER = _MM_PRELOAD_FN + r'''
-import json, sys, time
+import json, os, sys, time
+os.environ.setdefault("VLLM_DEEP_GEMM_WARMUP", "skip")
 
 
 def main():
