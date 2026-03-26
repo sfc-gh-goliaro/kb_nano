@@ -170,7 +170,12 @@ class Fp8Linear(nn.Module):
 def postprocess_fp8_weights(weight_fp8: torch.Tensor,
                             scale_inv: torch.Tensor) -> tuple[torch.Tensor, torch.Tensor]:
     """Re-quantize FP8 weights to UE8M0 scale format and transform scale layout
-    for DeepGEMM compatibility. Must be called once after weight loading."""
+    for DeepGEMM compatibility. Must be called once after weight loading.
+
+    Matches vLLM's requant_weight_ue8m0_inplace + deepgemm_post_process_fp8_weight_block:
+    dequantize in float32 for precision, re-quantize with UE8M0 power-of-two scales,
+    then transform scale layout.
+    """
     N, K = weight_fp8.shape
     block_size = Fp8Linear.BLOCK_SIZE
 
@@ -178,25 +183,12 @@ def postprocess_fp8_weights(weight_fp8: torch.Tensor,
     scale_cols = math.ceil(K / block_size)
     scale = scale_inv[:scale_rows, :scale_cols]
 
-    w_padded = weight_fp8
-    need_n_pad = (block_size - N % block_size) % block_size
-    need_k_pad = (block_size - K % block_size) % block_size
-    if need_n_pad or need_k_pad:
-        w_padded = torch.nn.functional.pad(weight_fp8.view(torch.int8),
-                                           (0, need_k_pad, 0, need_n_pad)).view(torch.float8_e4m3fn)
+    s_float = scale.to(torch.float32)
+    s_exp = torch.repeat_interleave(s_float, block_size, dim=0)[:N]
+    s_exp = torch.repeat_interleave(s_exp, block_size, dim=1)[:, :K]
+    w_dq = weight_fp8.to(torch.float32) * s_exp
 
-    w_view = w_padded.view(math.ceil(N / block_size + need_n_pad / block_size), block_size,
-                           math.ceil(K / block_size + need_k_pad / block_size), block_size) \
-                      if need_n_pad or need_k_pad else \
-                      w_padded.view(scale_rows, block_size, scale_cols, block_size)
-
-    w_bf16 = w_view.to(torch.bfloat16) * scale[:, None, :, None]
-
-    w_bf16_flat = w_bf16.reshape(-1, w_bf16.shape[2] * block_size)
-    if need_n_pad or need_k_pad:
-        w_bf16_flat = w_bf16_flat[:N, :K].contiguous()
-
-    w_fp8_new, scale_ue8m0 = deep_gemm.per_block_cast_to_fp8(w_bf16_flat, use_ue8m0=True)
+    w_fp8_new, scale_ue8m0 = deep_gemm.per_block_cast_to_fp8(w_dq, use_ue8m0=True)
 
     recipe = (1, block_size, block_size)
     scale_transformed = deep_gemm.transform_sf_into_required_layout(
@@ -209,3 +201,40 @@ def postprocess_fp8_weights(weight_fp8: torch.Tensor,
     ).squeeze(0)
 
     return w_fp8_new, scale_transformed
+
+
+def postprocess_fp8_weights_batched(weight_fp8: torch.Tensor,
+                                    scale_inv: torch.Tensor) -> None:
+    """Re-quantize 3D MoE weights [E, N, K] to UE8M0 scales in-place,
+    then transform scale layout for DeepGEMM. Matches vLLM's
+    requant_weight_ue8m0_inplace + deepgemm_post_process_fp8_weight_block."""
+    assert weight_fp8.ndim == 3
+    E, N, K = weight_fp8.shape
+    block_size = Fp8Linear.BLOCK_SIZE
+
+    scale_rows = math.ceil(N / block_size)
+    scale_cols = math.ceil(K / block_size)
+
+    for idx in range(E):
+        w_q = weight_fp8[idx]
+        s_old = scale_inv[idx, :scale_rows, :scale_cols]
+
+        s_float = s_old.to(torch.float32)
+        s_exp = torch.repeat_interleave(s_float, block_size, dim=0)[:N]
+        s_exp = torch.repeat_interleave(s_exp, block_size, dim=1)[:, :K]
+        w_dq = w_q.to(torch.float32) * s_exp
+
+        w_requant, s_requant = deep_gemm.per_block_cast_to_fp8(w_dq, use_ue8m0=True)
+        w_q.copy_(w_requant)
+        s_old.copy_(s_requant)
+
+    recipe = (1, block_size, block_size)
+    scale_transformed = deep_gemm.transform_sf_into_required_layout(
+        sf=scale_inv[:, :scale_rows, :scale_cols],
+        mn=N,
+        k=K,
+        recipe=recipe,
+        num_groups=E,
+        is_sfa=False,
+    )
+    scale_inv[:, :scale_rows, :scale_cols].copy_(scale_transformed)

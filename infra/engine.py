@@ -268,20 +268,49 @@ class ModelRunner:
         torch.set_default_dtype(dtype)
         torch.set_default_device("cuda")
 
+        import time as _time
+        _t0 = _time.perf_counter()
+        if rank == 0:
+            print(f"  [1/6] Loading model weights...", flush=True)
         self.model, self.config = load_model(
             model_name, torch.device(f"cuda:{rank}"), dtype,
         )
         self.is_moe = hasattr(self.config, "num_local_experts")
         self.is_qwen_vl = hasattr(self.config, "mrope_section")
         self.is_deepseek_mla = hasattr(self.config, "kv_lora_rank")
+        if rank == 0:
+            print(f"  [1/6] Model loaded in {_time.perf_counter()-_t0:.1f}s", flush=True)
         self._share_trtllm_workspace()
         self._share_activation_buffers()
+        self._share_moe_workspaces()
+        if rank == 0:
+            print(f"  [2/6] Warmup forward pass...", flush=True)
+        _t1 = _time.perf_counter()
         self.warmup_model()
+        if rank == 0:
+            print(f"  [2/6] Warmup done in {_time.perf_counter()-_t1:.1f}s", flush=True)
+            print(f"  [3/6] DeepGEMM warmup...", flush=True)
+        _t2 = _time.perf_counter()
         self._warmup_deepgemm()
+        if rank == 0:
+            print(f"  [3/6] DeepGEMM done in {_time.perf_counter()-_t2:.1f}s", flush=True)
+            print(f"  [4/6] Allocating KV cache...", flush=True)
+        _t3 = _time.perf_counter()
         self.allocate_kv_cache()
+        if rank == 0:
+            print(f"  [4/6] KV cache done in {_time.perf_counter()-_t3:.1f}s", flush=True)
         if not self.enforce_eager:
+            if rank == 0:
+                print(f"  [5/6] Capturing CUDA graphs...", flush=True)
+            _t4 = _time.perf_counter()
             self.capture_cudagraph()
+            if rank == 0:
+                print(f"  [5/6] CUDA graphs done in {_time.perf_counter()-_t4:.1f}s", flush=True)
+        if rank == 0:
+            print(f"  [6/6] Init greedy buffers...", flush=True)
         self._init_greedy_buffers()
+        if rank == 0:
+            print(f"  Engine ready in {_time.perf_counter()-_t0:.1f}s total", flush=True)
         torch.set_default_device("cpu")
         torch.set_default_dtype(default_dtype)
 
@@ -391,6 +420,51 @@ class ModelRunner:
         shared = silu_modules[0]._act_buf
         for m in silu_modules[1:]:
             m.set_shared_buffer(shared)
+
+    def _share_moe_workspaces(self):
+        """Pre-allocate and share MoE FP8 expert workspace buffers across layers.
+
+        Each DeepSeekMoE layer has _ws13, _ws2, _out_buf workspace tensors
+        that grow on first use. Since decoder layers execute sequentially,
+        only one set is ever active. Without sharing, each of the ~58 MoE
+        layers allocates its own ~5 GB workspace during warmup, totaling
+        ~285 GB — far exceeding GPU memory. Matches vllm's global
+        WorkspaceManager approach.
+
+        We pre-allocate at the max size (max_num_batched_tokens * top_k,
+        padded for DeepGEMM alignment) and assign the same buffers to all
+        modules so _get_workspace sees them as already big enough.
+        """
+        from ..tasks.baseline.L2.deepseek_moe import DeepSeekMoE
+        moe_modules = [
+            m for m in self.model.modules()
+            if isinstance(m, DeepSeekMoE) and m.use_fp8
+        ]
+        if not moe_modules:
+            return
+
+        ref = moe_modules[0]
+        device = next(self.model.parameters()).device
+        M = self.max_num_batched_tokens
+        K = ref.hidden_size
+        N_gate_up = 2 * ref.intermediate_per_tp
+        top_k = ref.top_k
+
+        import deep_gemm
+        align = int(deep_gemm.get_mk_alignment_for_contiguous_layout())
+        m_sum_upper = (M * top_k) + ref.num_experts * (align - 1)
+        m_sum = ((m_sum_upper + align - 1) // align) * align
+
+        ws13_bytes = m_sum * max(K, N_gate_up) * 2
+        ws2_bytes = m_sum * max(N_gate_up, K) * 2
+        shared_ws13 = torch.empty(ws13_bytes, dtype=torch.uint8, device=device)
+        shared_ws2 = torch.empty(ws2_bytes, dtype=torch.uint8, device=device)
+        shared_out = torch.empty(M, K, dtype=torch.bfloat16, device=device)
+
+        for m in moe_modules:
+            m._ws13 = shared_ws13
+            m._ws2 = shared_ws2
+            m._out_buf = shared_out
 
     def warmup_model(self):
         torch.cuda.empty_cache()
@@ -670,6 +744,17 @@ class ModelRunner:
         self.num_blocks = num_blocks
         self.block_size = _MLA_BLOCK_SIZE
 
+        # Update module-level BLOCK_SIZE so Sequence.num_blocks,
+        # blocks_needed_for, BlockManager, prepare_prefill/decode, etc.
+        # all use the MLA block size consistently.
+        global BLOCK_SIZE
+        BLOCK_SIZE = _MLA_BLOCK_SIZE
+        # Recompute max_model_len with the new block size
+        self.max_model_len = (
+            (self.max_model_len + _MLA_BLOCK_SIZE - 1)
+            // _MLA_BLOCK_SIZE * _MLA_BLOCK_SIZE
+        )
+
         if self.rank == 0:
             print(f"  MLA KV cache: {num_blocks} blocks x {_MLA_BLOCK_SIZE} = "
                   f"{num_blocks * _MLA_BLOCK_SIZE} token slots ({num_layers} layers, "
@@ -833,7 +918,7 @@ class ModelRunner:
             torch.tensor(cu_seqlens_q, dtype=torch.int32, pin_memory=True).cuda(non_blocking=True),
             torch.tensor(cu_seqlens_k, dtype=torch.int32, pin_memory=True).cuda(non_blocking=True),
             max_sq, max_sk,
-            torch.tensor(slot_mapping, dtype=torch.int32, pin_memory=True).cuda(non_blocking=True),
+            torch.tensor(slot_mapping, dtype=torch.int64, pin_memory=True).cuda(non_blocking=True),
             block_tables=block_tables,
         )
 
@@ -850,7 +935,7 @@ class ModelRunner:
         n = len(seqs)
         ids = np.empty(n, dtype=np.int64)
         pos = np.empty(n, dtype=np.int64)
-        sm = np.empty(n, dtype=np.int32)
+        sm = np.empty(n, dtype=np.int64)
         cl = np.empty(n, dtype=np.int32)
         use_mrope = self.is_qwen_vl
         if use_mrope:
@@ -994,7 +1079,7 @@ class ModelRunner:
             )
 
         set_mixed_context(
-            slot_mapping=torch.tensor(slot_mapping, dtype=torch.int32, pin_memory=True).cuda(non_blocking=True),
+            slot_mapping=torch.tensor(slot_mapping, dtype=torch.int64, pin_memory=True).cuda(non_blocking=True),
             num_prefill_tokens=num_prefill_tokens,
             num_decode_tokens=nd,
             num_prefill_seqs=num_prefill_seqs,
@@ -1168,13 +1253,13 @@ class ModelRunner:
         max_num_blocks = (self.max_model_len + BLOCK_SIZE - 1) // BLOCK_SIZE
         self._np_ids = np.empty(max_bs, dtype=np.int64)
         self._np_pos = np.empty(max_bs, dtype=np.int64)
-        self._np_sm = np.empty(max_bs, dtype=np.int32)
+        self._np_sm = np.empty(max_bs, dtype=np.int64)
         self._np_cl = np.empty(max_bs, dtype=np.int32)
         self._np_bt = np.full((max_bs, max_num_blocks), -1, dtype=np.int32)
 
         self._eager_input_ids = torch.zeros(max_bs, dtype=torch.int64, device=dev)
         self._eager_positions = torch.zeros(max_bs, dtype=torch.int64, device=dev)
-        self._eager_slot_mapping = torch.zeros(max_bs, dtype=torch.int32, device=dev)
+        self._eager_slot_mapping = torch.zeros(max_bs, dtype=torch.int64, device=dev)
         self._eager_context_lens = torch.zeros(max_bs, dtype=torch.int32, device=dev)
         self._eager_block_tables = torch.zeros(max_bs, max_num_blocks, dtype=torch.int32, device=dev)
 
@@ -1411,16 +1496,24 @@ class ModelRunner:
 
     @torch.inference_mode()
     def capture_cudagraph(self):
+        import gc
         from contextlib import nullcontext
         max_bs = self.max_num_seqs
         max_num_blocks = (self.max_model_len + BLOCK_SIZE - 1) // BLOCK_SIZE
         input_ids = torch.zeros(max_bs, dtype=torch.int64)
         positions = torch.zeros(max_bs, dtype=torch.int64)
-        slot_mapping = torch.full((max_bs,), -1, dtype=torch.int32)
+        slot_mapping = torch.full((max_bs,), -1, dtype=torch.int64)
         context_lens = torch.zeros(max_bs, dtype=torch.int32)
         block_tables = torch.zeros(max_bs, max_num_blocks, dtype=torch.int32)
 
-        self.graph_bs_list = [1, 2, 4, 8] + list(range(16, max_bs + 1, 16))
+        # Match vllm's capture size selection: [1,2,4] + step 8 to 256 +
+        # step 16 above, capped at min(max_num_seqs, 512).
+        max_capture = min(max_bs, 512)
+        self.graph_bs_list = [i for i in [1, 2, 4] if i <= max_capture]
+        if max_capture >= 8:
+            self.graph_bs_list += list(range(8, min(max_capture + 1, 256), 8))
+        if max_capture >= 256:
+            self.graph_bs_list += list(range(256, max_capture + 1, 16))
         self.graphs = {}
         self.graph_pool = None
 
@@ -1433,17 +1526,41 @@ class ModelRunner:
         lm_max_idxs = torch.zeros(max_bs, dtype=torch.int64)
 
         ar_ctx = self.custom_ar.capture() if self.custom_ar is not None else nullcontext()
+        _graph_list = list(reversed(self.graph_bs_list))
+
+        # Single warmup at the largest batch size to trigger all Triton/CUDA
+        # kernel JIT compilation. Subsequent captures reuse compiled kernels.
+        largest_bs = _graph_list[0]
+        set_context(
+            False, slot_mapping=slot_mapping[:largest_bs],
+            context_lens=context_lens[:largest_bs],
+            block_tables=block_tables[:largest_bs],
+            max_context_len=self.max_model_len,
+        )
+        outputs[:largest_bs] = self.model(input_ids[:largest_bs], positions[:largest_bs])
+        lm_logits[:largest_bs] = lm_head.linear_op(
+            outputs[:largest_bs], lm_head.weight).float()
+        lm_max_vals[:largest_bs], lm_max_idxs[:largest_bs] = \
+            lm_logits[:largest_bs].max(dim=-1)
+        reset_context()
+        torch.cuda.synchronize()
+
+        # Freeze GC during capture to avoid Python GC stalls (matches vllm).
+        gc.collect()
+        gc.freeze()
+
         with ar_ctx:
-            for bs in reversed(self.graph_bs_list):
+            for _gi, bs in enumerate(_graph_list):
+                if self.rank == 0 and (_gi % max(1, len(_graph_list) // 5) == 0
+                                       or _gi == len(_graph_list) - 1):
+                    print(f"    CUDA graph {_gi+1}/{len(_graph_list)} (bs={bs})",
+                          flush=True)
                 graph = torch.cuda.CUDAGraph()
                 set_context(
                     False, slot_mapping=slot_mapping[:bs],
                     context_lens=context_lens[:bs], block_tables=block_tables[:bs],
                     max_context_len=self.max_model_len,
                 )
-                outputs[:bs] = self.model(input_ids[:bs], positions[:bs])
-                lm_logits[:bs] = lm_head.linear_op(outputs[:bs], lm_head.weight).float()
-                lm_max_vals[:bs], lm_max_idxs[:bs] = lm_logits[:bs].max(dim=-1)
 
                 with torch.cuda.graph(graph, self.graph_pool):
                     outputs[:bs] = self.model(input_ids[:bs], positions[:bs])
@@ -1456,6 +1573,9 @@ class ModelRunner:
                 torch.cuda.synchronize()
                 reset_context()
 
+        gc.unfreeze()
+        gc.collect()
+
         self.graph_vars = dict(
             input_ids=input_ids, positions=positions,
             slot_mapping=slot_mapping, context_lens=context_lens,
@@ -1467,7 +1587,12 @@ class ModelRunner:
         # Pre-compute lookup table: _graph_bs_for_n[n] = smallest graph_bs >= n
         self._graph_bs_for_n = [0] * (max_bs + 1)
         for n in range(max_bs + 1):
-            self._graph_bs_for_n[n] = next(x for x in self.graph_bs_list if x >= n)
+            for x in self.graph_bs_list:
+                if x >= n:
+                    self._graph_bs_for_n[n] = x
+                    break
+            else:
+                self._graph_bs_for_n[n] = max_bs
 
 
 # ---------------------------------------------------------------------------

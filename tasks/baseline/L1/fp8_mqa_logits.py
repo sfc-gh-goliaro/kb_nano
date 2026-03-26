@@ -44,7 +44,7 @@ class Fp8MQALogits(nn.Module):
         context_lens: torch.Tensor,
         block_tables: torch.Tensor,
         schedule_metadata: torch.Tensor,
-        max_model_len: int,
+        max_context_len: int,
     ) -> torch.Tensor:
         return deep_gemm.fp8_paged_mqa_logits(
             q_fp8,
@@ -53,7 +53,7 @@ class Fp8MQALogits(nn.Module):
             context_lens,
             block_tables,
             schedule_metadata,
-            max_model_len=max_model_len,
+            max_context_len,
             clean_logits=False,
         )
 

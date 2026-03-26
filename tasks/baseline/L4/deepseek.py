@@ -70,7 +70,17 @@ class DeepSeekV3Config:
 
     @classmethod
     def from_pretrained(cls, model_name: str) -> "DeepSeekV3Config":
-        hf = AutoConfig.from_pretrained(model_name, trust_remote_code=True)
+        try:
+            hf = AutoConfig.from_pretrained(model_name, trust_remote_code=True)
+        except ValueError:
+            from transformers import DeepseekV3Config as _HFDSConfig
+            from huggingface_hub import hf_hub_download
+            import json
+            path = hf_hub_download(model_name, "config.json")
+            with open(path) as f:
+                cfg = json.load(f)
+            cfg["model_type"] = "deepseek_v3"
+            hf = _HFDSConfig(**cfg)
         rope = getattr(hf, 'rope_scaling', {}) or {}
         rope_params = {
             'rope_type': rope.get('type', rope.get('rope_type', 'deepseek_yarn')),

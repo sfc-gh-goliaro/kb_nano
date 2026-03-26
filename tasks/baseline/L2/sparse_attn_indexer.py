@@ -311,7 +311,7 @@ class SparseAttnIndexer(nn.Module):
             ctx.decode_context_lens,
             ctx.decode_block_tables,
             schedule,
-            max_model_len=max_ctx,
+            max_context_len=max_ctx,
         )
         return self.topk_per_row.forward_decode(
             logits, ctx.decode_context_lens, next_n=next_n, topk=self.topk_tokens,

@@ -200,6 +200,7 @@ if __name__ == "__main__":
 KB_NANO_WORKER = r'''
 import json, os, sys, time
 os.environ.setdefault("VLLM_DEEP_GEMM_WARMUP", "skip")
+os.environ.setdefault("KB_NANO_DISABLE_CUSTOM_AR", "1")
 
 def main():
     with open(sys.argv[1]) as f:
@@ -659,6 +660,7 @@ if __name__ == "__main__":
 KB_NANO_VLM_WORKER = _MM_PRELOAD_FN + r'''
 import json, os, sys, time
 os.environ.setdefault("VLLM_DEEP_GEMM_WARMUP", "skip")
+os.environ.setdefault("KB_NANO_DISABLE_CUSTOM_AR", "1")
 
 
 def main():
@@ -1068,6 +1070,7 @@ def main():
         vllm_raw = run_worker(
             vllm_worker, vllm_config,
             f"vLLM [{short_name}] all scenarios (TP={args.tp})",
+            timeout=10800,
         )
 
     # -- Run kb-nano (one subprocess, all scenarios) --
@@ -1089,6 +1092,7 @@ def main():
     kb_raw = run_worker(
         kb_worker, kb_config,
         f"kb-nano [{short_name}] all scenarios (TP={args.tp})",
+        timeout=10800,
     )
     if kb_raw is None:
         print("  ERROR: kb-nano subprocess failed.")

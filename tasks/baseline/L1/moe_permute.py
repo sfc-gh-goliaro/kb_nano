@@ -96,15 +96,50 @@ def _scatter_kernel(
                          row_s, mask=mask_s)
 
 
+@triton.jit
+def _count_expert_num_tokens_kernel(
+    topk_ids_ptr,
+    expert_num_tokens_ptr,
+    num_experts,
+    topk_numel,
+    BLOCK_SIZE: tl.constexpr,
+):
+    """Triton kernel: count tokens per expert. CUDA-graph compatible.
+    Matches vllm's _count_expert_num_tokens."""
+    curr_expert = tl.program_id(0)
+    offsets = tl.arange(0, BLOCK_SIZE)
+    topk_ids_ptrs = topk_ids_ptr + offsets
+    acc = tl.zeros((BLOCK_SIZE,), dtype=tl.int32)
+    for _x in range(tl.cdiv(topk_numel, BLOCK_SIZE)):
+        mask = offsets < (topk_numel - _x * BLOCK_SIZE)
+        expert_ids = tl.load(topk_ids_ptrs, mask=mask, other=-1)
+        has_curr_expert = tl.where(expert_ids == curr_expert, 1, 0)
+        acc = acc + has_curr_expert
+        topk_ids_ptrs += BLOCK_SIZE
+    if curr_expert < num_experts:
+        tl.store(expert_num_tokens_ptr + curr_expert, tl.sum(acc))
+
+
 def _count_expert_tokens(topk_ids: torch.Tensor,
                          num_experts: int) -> torch.Tensor:
-    """Count tokens per expert from topk_ids [M, top_k]."""
-    flat = topk_ids.view(-1)
-    valid = flat[flat >= 0]
-    counts = torch.zeros(num_experts, dtype=torch.int32, device=topk_ids.device)
-    if valid.numel() > 0:
-        counts.scatter_add_(0, valid.long(), torch.ones_like(valid, dtype=torch.int32))
-    return counts
+    """Count tokens per expert from topk_ids [M, top_k].
+    Uses a Triton kernel for CUDA-graph compatibility
+    (no boolean indexing or dynamic shapes).
+    Matches vllm's count_expert_num_tokens.
+    """
+    expert_num_tokens = torch.empty(
+        num_experts, device=topk_ids.device, dtype=torch.int32,
+    )
+    BLOCK_SIZE = min(topk_ids.numel(), 1024)
+    BLOCK_SIZE = triton.next_power_of_2(BLOCK_SIZE)
+    _count_expert_num_tokens_kernel[(num_experts,)](
+        topk_ids,
+        expert_num_tokens,
+        num_experts,
+        topk_ids.numel(),
+        BLOCK_SIZE=BLOCK_SIZE,
+    )
+    return expert_num_tokens
 
 
 class MoePermute(nn.Module):

@@ -114,7 +114,7 @@ class MLAAttention(nn.Module):
         if kv_cache.numel() and ctx.slot_mapping is not None:
             self.store_kvcache(kv_c_normed, k_pe, kv_cache, ctx.slot_mapping)
 
-        if self.is_sparse and topk_indices is not None:
+        if self.is_sparse and topk_indices is not None and kv_cache.ndim >= 2:
             o = self._forward_sparse(q, kv_c_normed, k_pe, kv_b_proj, kv_cache, ctx, topk_indices)
         elif ctx.is_mixed:
             o = self._forward_mixed(q, kv_c_normed, k_pe, kv_b_proj, kv_cache, ctx)
@@ -404,7 +404,13 @@ class MLAAttention(nn.Module):
         return q_padded, actual_heads
 
     def _forward_sparse_decode(self, q, kv_cache, ctx, topk_indices):
-        """Sparse FP8 decode: per-request batching with padded heads."""
+        """Sparse FP8 decode: absorb q into latent space, then FlashMLA sparse.
+
+        The sparse decode kernel requires head_size_k == 576 (kv_lora_rank +
+        qk_rope_head_dim). We absorb q_nope via W_UK_T: (N,H,P)@(H,P,L) →
+        (N,H,L), then concatenate with q_pe to get (N,H,576).
+        Matches vllm's MLACommonImpl decode query absorption.
+        """
         N = q.shape[0]
         block_size = int(kv_cache.shape[1])
         num_decodes = ctx.block_tables.shape[0]
@@ -416,8 +422,20 @@ class MLAAttention(nn.Module):
         topk_indices = self.convert_indices(
             topk_indices, ctx.block_tables, block_size, req_ids=req_ids)
 
+        # Absorb q_nope into latent space via W_UK_T
+        q_nope = q[..., :self.qk_nope_head_dim]   # [N, H, P]
+        q_pe = q[..., self.qk_nope_head_dim:]      # [N, H, rope]
+
+        # (H, N, P) @ (H, P, L) -> (H, N, L) -> (N, H, L)
+        q_absorbed = torch.bmm(
+            q_nope.transpose(0, 1), self.W_UK_T
+        ).transpose(0, 1)
+
+        # Concat absorbed nope + rope -> [N, H, L+rope=576]
+        q_latent = torch.cat([q_absorbed, q_pe], dim=-1)
+
         decode_query_len = N // num_decodes if num_decodes > 0 else N
-        q_4d = q.view(num_decodes, decode_query_len, self.num_heads, q.shape[-1])
+        q_4d = q_latent.view(num_decodes, decode_query_len, self.num_heads, q_latent.shape[-1])
         topk_4d = topk_indices.view(num_decodes, decode_query_len, -1)
 
         q_4d, actual_heads = self._pad_q_for_fp8(q_4d)
@@ -455,6 +473,10 @@ class MLAAttention(nn.Module):
         """Separate prefill (BF16 workspace) and decode (FP8 kernel)."""
         N = q.shape[0]
         block_size = int(kv_cache.shape[1])
+
+        if ctx.block_tables is None:
+            return self._forward_pure(q, kv_c_normed, k_pe, kv_b_proj,
+                                      kv_cache, ctx)
 
         num_seqs_total = ctx.block_tables.shape[0]
         num_decode_seqs = getattr(ctx, 'num_decode_seqs', num_seqs_total if num_decode_tokens > 0 else 0)

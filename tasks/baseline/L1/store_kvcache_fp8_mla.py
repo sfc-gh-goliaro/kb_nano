@@ -34,7 +34,7 @@ class StoreKVCacheFP8MLA(nn.Module):
         kv_c_normed: ``[N, 512]`` BF16 — compressed KV after layernorm.
         k_pe: ``[N, 1, 64]`` or ``[N, 64]`` BF16 — RoPE key component.
         kv_cache: ``[num_blocks, block_size, 656]`` uint8.
-        slot_mapping: ``[N]`` int32 — linear slot index per token (``-1`` skips).
+        slot_mapping: ``[N]`` int64 — linear slot index per token (``-1`` skips).
     """
 
     def __init__(self):
