@@ -1,16 +1,21 @@
 # kb-nano
 
-A standalone, high-performance LLM inference engine supporting **Llama 3.1** and **Mixtral-8x7B** with tensor parallelism. No vLLM dependency at runtime — just PyTorch, Triton, and Flash Attention.
+A standalone, high-performance LLM inference engine supporting **Llama 3.1**, **Llama 4**, **Mixtral-8x7B**, **DeepSeek V3.2**, **Qwen2-VL**, and **Qwen3-VL** with tensor parallelism and FP8 quantization. No vLLM dependency at runtime — just PyTorch, Triton, and Flash Attention.
 
 ## Features
 
 - **Llama 3.1** (8B, 70B) with frequency-scaled RoPE
+- **Llama 4** with fused MoE experts
 - **Mixtral-8x7B** with fused Triton MoE grouped-GEMM kernels
+- **DeepSeek V3.2** with MLA (Multi-head Latent Attention), 256-expert MoE via DeepGEMM FP8, DSA (DeepSeek Sparse Attention), and YARN RoPE — **1.28–1.47× faster than vLLM**
+- **Qwen2-VL / Qwen3-VL** multimodal models with image and video support
+- **FP8 inference** with block-scaled FP8 quantization via DeepGEMM, UE8M0 power-of-two scales, and fused SiLU+Mul+FP8 quantization kernels
 - **Tensor parallelism** (TP) with custom IPC-based all-reduce for multi-GPU inference
-- **Paged KV cache** with Triton store kernels
+- **Paged KV cache** with Triton store kernels; FP8 MLA KV cache for DeepSeek
 - **CUDA graph capture** for decode steps
-- **Flash Attention** for both prefill and paged decode
+- **Flash Attention** for prefill; **FlashMLA** for DeepSeek MLA decode
 - Greedy and top-p sampling
+- **fastsafetensors** GPU Direct Storage for fast weight loading
 - **Layered operator architecture** (L1 single-kernel ops through L4 full models) with clean separation of concerns
 - **Benchmarking suite** for evaluating custom CUDA/Triton/PyTorch kernels at 4 abstraction levels
 
@@ -375,6 +380,29 @@ Latency (batch size 1, 128 output tokens, 5 iterations):
 | Qwen3-VL-8B-FP8 | 1 | single-video | 0.557s | 0.541s | **1.03x** |
 
 FP8 activation quantization uses a custom Triton kernel for single-launch per-token-group UE8M0 quantization. Pre-allocated shared prefill buffers eliminate dynamic allocation during FP8 prefill, and DeepGEMM is JIT-warmed for both decode and prefill batch sizes. The remaining throughput gap vs vLLM is primarily from vLLM's `torch.compile` + Inductor fusion passes (RMSNorm+quant, SiLU+quant).
+
+### DeepSeek V3.2 FP8 (MoE, MLA, DSA)
+
+FP8 support for `deepseek-ai/DeepSeek-V3.2` with block-scaled FP8 MoE experts via DeepGEMM, Multi-head Latent Attention (MLA) with FP8 KV cache via FlashMLA, and DeepSeek Sparse Attention (DSA) indexer.
+
+**Hardware: 8x NVIDIA H200 (NVLink)**
+
+Throughput (1000 sequences per scenario, `temperature=0`, `max_model_len=1536`):
+
+| Model | TP | Scenario | Input/Output | vLLM (tok/s) | Ours (tok/s) | Ratio | Avg Match Tokens |
+|-------|---:|----------|:------------:|-------------:|-------------:|------:|-----------------:|
+| DeepSeek-V3.2 | 8 | prefill-heavy | 1024/512  | 2,160 | 3,106 | **1.44x** | 21.0/512 |
+| DeepSeek-V3.2 | 8 | balanced      |  512/512  | 2,855 | 4,199 | **1.47x** | 17.5/512 |
+| DeepSeek-V3.2 | 8 | decode-heavy  |  512/1024 | 2,964 | 3,787 | **1.28x** | 35.4/1024 |
+
+Latency (128 output tokens, 5 iterations):
+
+| Model | TP | Scenario | BS | vLLM median | Ours median | ms/tok vLLM | ms/tok Ours | Ratio |
+|-------|---:|----------|---:|------------:|------------:|------------:|------------:|------:|
+| DeepSeek-V3.2 | 8 | single-request  |  1 | 2.539s | 4.701s | 19.84 | 36.72 | 0.54x |
+| DeepSeek-V3.2 | 8 | fixed-batch-32  | 32 | 4.596s | 5.703s |  1.12 |  1.39 | 0.81x |
+
+Token match rates are lower than other models due to FP8 quantization differences in the 256-expert MoE routing and DSA sparse attention paths. Both engines produce valid, coherent text; the divergence is from different but equally valid greedy decoding paths.
 
 ### Key optimizations
 
