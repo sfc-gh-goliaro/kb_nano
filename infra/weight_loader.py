@@ -539,11 +539,13 @@ def load_model(
         for name, buf in model.named_buffers():
             if buf.device != device:
                 buf.data = buf.data.to(device=device)
+        if model_type == "deepseek_v3":
+            _compute_mla_absorbed_weights(model)
         _postprocess_fp8_weights(model)
     else:
         model = model.to(device=device, dtype=dtype)
 
-    if model_type == "deepseek_v3":
+    if model_type == "deepseek_v3" and quant_config is None:
         _compute_mla_absorbed_weights(model)
 
     model.eval()

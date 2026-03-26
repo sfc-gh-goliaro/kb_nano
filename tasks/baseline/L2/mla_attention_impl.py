@@ -23,6 +23,7 @@ from ..L1.flash_mla_sparse_prefill import FlashMLASparsePrefill
 from ..L1.convert_indices import ConvertIndicesToGlobal
 
 _MLA_HEAD_DIM_V = 512
+_MLA_WORKSPACE_HEAD_SIZE = 576  # 512 NoPE + 64 RoPE = 576 BF16 dims
 MIN_HEADS_FOR_BF16_PREFILL = 32
 
 
@@ -184,24 +185,33 @@ class MLAAttention(nn.Module):
         return q_padded, actual_heads
 
     def _forward_sparse_decode(self, q, kv_cache, ctx, topk_indices):
-        """Sparse FP8 decode: pad heads, use dummy block_table/cache_seqlens."""
+        """Sparse FP8 decode: per-request batching with padded heads."""
         N = q.shape[0]
+        block_size = int(kv_cache.shape[1])
+        num_decodes = ctx.block_tables.shape[0]
+
+        req_ids = getattr(ctx, 'req_id_per_token', None)
+        if req_ids is None:
+            req_ids = torch.arange(N, dtype=torch.int32, device=q.device)
 
         topk_indices = self.convert_indices(
-            topk_indices, ctx.block_tables, block_size=int(kv_cache.shape[1]))
+            topk_indices, ctx.block_tables, block_size, req_ids=req_ids)
 
-        q_4d = q.unsqueeze(0)
-        topk_4d = topk_indices.unsqueeze(0)
+        decode_query_len = N // num_decodes if num_decodes > 0 else N
+        q_4d = q.view(num_decodes, decode_query_len, self.num_heads, q.shape[-1])
+        topk_4d = topk_indices.view(num_decodes, decode_query_len, -1)
 
         q_4d, actual_heads = self._pad_q_for_fp8(q_4d)
         padded_heads = q_4d.shape[-2]
 
         topk = topk_indices.shape[-1]
-        topk_tensor = torch.full((1,), topk, dtype=torch.int32, device=q.device)
-        dummy_bt = torch.empty((1, 1), dtype=torch.int32, device=q.device)
+        topk_tensor = torch.full(
+            (num_decodes,), topk, dtype=torch.int32, device=q.device)
+        dummy_bt = torch.empty(
+            (num_decodes, 1), dtype=torch.int32, device=q.device)
 
         tile_sched_meta, _ = self.get_metadata(
-            topk_tensor, N * padded_heads,
+            topk_tensor, decode_query_len * padded_heads,
             topk=topk, num_heads_q=padded_heads,
             num_heads_k=1, is_fp8_kvcache=True)
 
@@ -215,7 +225,7 @@ class MLAAttention(nn.Module):
             indices=topk_4d,
         )
 
-        o = o.squeeze(0)
+        o = o.view(-1, padded_heads, o.shape[-1])
         if actual_heads < padded_heads:
             o = o[:, :actual_heads, :]
         return self._v_up_proj(o)
@@ -225,157 +235,134 @@ class MLAAttention(nn.Module):
                                  num_prefill_tokens, num_decode_tokens):
         """Separate prefill (BF16 workspace) and decode (FP8 kernel)."""
         N = q.shape[0]
-        out = torch.empty(N, self.num_heads * self.v_head_dim,
+        block_size = int(kv_cache.shape[1])
+
+        num_seqs_total = ctx.block_tables.shape[0]
+        num_decode_seqs = getattr(ctx, 'num_decode_seqs', num_seqs_total if num_decode_tokens > 0 else 0)
+        num_prefill_seqs = num_seqs_total - num_decode_seqs
+
+        req_ids = getattr(ctx, 'req_id_per_token', None)
+        if req_ids is None:
+            req_ids = torch.arange(N, dtype=torch.int32, device=q.device)
+
+        prefill_request_ids = None
+        prefill_workspace_starts = None
+        has_prefill = num_prefill_tokens > 0
+
+        if has_prefill:
+            if ctx.is_mixed:
+                pf_bt = ctx.prefill_block_tables if hasattr(ctx, 'prefill_block_tables') else ctx.block_tables[num_decode_seqs:]
+                pf_seq_lens = ctx.prefill_seq_lens if hasattr(ctx, 'prefill_seq_lens') else (ctx.cu_seqlens_k[1:] - ctx.cu_seqlens_k[:-1])
+            else:
+                pf_bt = ctx.block_tables
+                pf_cu = ctx.cu_seqlens_k
+                pf_seq_lens = pf_cu[1:] - pf_cu[:-1]
+
+            prefill_request_ids = torch.full((N,), -1, dtype=torch.int32, device=q.device)
+            prefill_workspace_starts = torch.zeros(num_prefill_seqs, dtype=torch.int32, device=q.device)
+
+            if num_prefill_seqs > 1:
+                prefill_workspace_starts[1:] = torch.cumsum(pf_seq_lens[:-1], dim=0).int()
+
+            if ctx.is_mixed:
+                pf_cu_q = ctx.prefill_cu_seqlens_q if hasattr(ctx, 'prefill_cu_seqlens_q') else ctx.cu_seqlens_q
+                for req_idx in range(num_prefill_seqs):
+                    global_idx = num_decode_seqs + req_idx
+                    qs = int(pf_cu_q[req_idx].item()) if hasattr(ctx, 'prefill_cu_seqlens_q') else int(ctx.cu_seqlens_q[global_idx].item())
+                    qe = int(pf_cu_q[req_idx + 1].item()) if hasattr(ctx, 'prefill_cu_seqlens_q') else int(ctx.cu_seqlens_q[global_idx + 1].item())
+                    prefill_request_ids[qs:qe] = req_idx
+            else:
+                cu_q = ctx.cu_seqlens_q
+                for req_idx in range(num_prefill_seqs):
+                    qs = int(cu_q[req_idx].item())
+                    qe = int(cu_q[req_idx + 1].item())
+                    prefill_request_ids[qs:qe] = req_idx
+
+        topk_global = self.convert_indices(
+            topk_indices, ctx.block_tables, block_size,
+            req_ids=req_ids,
+            prefill_request_ids=prefill_request_ids,
+            prefill_workspace_starts=prefill_workspace_starts,
+        )
+
+        out = torch.empty(N, self.num_heads, self.kv_lora_rank,
                           dtype=q.dtype, device=q.device)
 
         if num_decode_tokens > 0:
             nd = num_decode_tokens
-            q_dc = q[:nd] if ctx.is_mixed else q
-            topk_dc = topk_indices[:nd] if ctx.is_mixed else topk_indices
+            q_dc = q[:nd]
+            topk_dc = topk_global[:nd]
+            num_decodes = num_decode_seqs
 
-            dc_ctx_lens = ctx.decode_context_lens if ctx.is_mixed else ctx.context_lens
-            dc_bt = ctx.decode_block_tables if ctx.is_mixed else ctx.block_tables
+            q_dc_4d = q_dc.view(num_decodes, -1, self.num_heads, q.shape[-1])
+            topk_dc_4d = topk_dc.view(num_decodes, -1, topk_dc.shape[-1])
+            q_dc_4d, actual_heads = self._pad_q_for_fp8(q_dc_4d)
+            padded_heads = q_dc_4d.shape[-2]
+            decode_query_len = q_dc_4d.shape[1]
 
-            topk_dc_global = self.convert_indices(
-                topk_dc, dc_bt, block_size=int(kv_cache.shape[1]))
-
-            q_4d = q_dc.unsqueeze(0)
-            topk_4d = topk_dc_global.unsqueeze(0)
-            q_4d, actual_heads = self._pad_q_for_fp8(q_4d)
-            padded_heads = q_4d.shape[-2]
-
-            topk = topk_dc_global.shape[-1]
-            topk_tensor = torch.full((1,), topk, dtype=torch.int32, device=q.device)
-            dummy_bt = torch.empty((1, 1), dtype=torch.int32, device=q.device)
+            topk = topk_dc.shape[-1]
+            topk_tensor = torch.full(
+                (num_decodes,), topk, dtype=torch.int32, device=q.device)
+            dummy_bt = torch.empty(
+                (num_decodes, 1), dtype=torch.int32, device=q.device)
 
             tile_sched_meta, _ = self.get_metadata(
-                topk_tensor, nd * padded_heads,
+                topk_tensor, decode_query_len * padded_heads,
                 topk=topk, num_heads_q=padded_heads,
                 num_heads_k=1, is_fp8_kvcache=True)
 
             o_dc, _ = self.decode_op(
-                q_4d, kv_cache.view(torch.uint8).unsqueeze(-2),
+                q_dc_4d, kv_cache.view(torch.uint8).unsqueeze(-2),
                 dummy_bt, topk_tensor,
                 head_dim_v=_MLA_HEAD_DIM_V,
                 tile_scheduler_metadata=tile_sched_meta,
                 softmax_scale=self.scale,
                 is_fp8_kvcache=True,
-                indices=topk_4d,
+                indices=topk_dc_4d,
             )
-            o_dc = o_dc.squeeze(0)
+            o_dc = o_dc.view(-1, padded_heads, o_dc.shape[-1])
             if actual_heads < padded_heads:
                 o_dc = o_dc[:, :actual_heads, :]
-            v_proj_out = self._v_up_proj(o_dc)
-            if ctx.is_mixed:
-                out[:nd] = v_proj_out
-            else:
-                out[:] = v_proj_out
+            out[:nd] = o_dc
 
         if num_prefill_tokens > 0:
             np_ = num_prefill_tokens
-            if ctx.is_mixed:
-                q_pf = q[num_decode_tokens:]
-                topk_pf = topk_indices[num_decode_tokens:]
-                pf_bt = ctx.prefill_block_tables if hasattr(ctx, 'prefill_block_tables') else ctx.block_tables
-                pf_cu = ctx.prefill_cu_seqlens_k if hasattr(ctx, 'prefill_cu_seqlens_k') else ctx.cu_seqlens_k
-            else:
-                q_pf = q
-                topk_pf = topk_indices
-                pf_bt = ctx.block_tables
-                pf_cu = ctx.cu_seqlens_k
+            q_pf = q[num_decode_tokens:] if ctx.is_mixed else q
+            topk_pf = topk_global[num_decode_tokens:] if ctx.is_mixed else topk_global
 
-            head_size = kv_cache.shape[-1]
-            num_seqs = pf_cu.shape[0] - 1
-            total_seq_len = int(pf_cu[-1].item())
-
-            workspace = torch.empty(total_seq_len, head_size,
+            total_seq_len = int(pf_seq_lens.sum().item())
+            workspace = torch.empty(total_seq_len, _MLA_WORKSPACE_HEAD_SIZE,
                                     dtype=torch.bfloat16, device=q.device)
-            self._gather_and_upconvert(kv_cache, workspace, pf_bt, pf_cu, num_seqs)
+            self.gather_kvcache(
+                kv_cache, pf_bt, pf_seq_lens,
+                prefill_workspace_starts, num_prefill_seqs, workspace,
+            )
 
-            workspace_kv = workspace.view(-1, 1, head_size)
-
-            workspace_starts = torch.zeros(num_seqs, dtype=torch.int32, device=q.device)
-            seq_lens_cpu = pf_cu.cpu()
-            for i in range(1, num_seqs):
-                workspace_starts[i] = int(seq_lens_cpu[i].item())
-
-            topk_pf_ws = self._convert_prefill_indices_to_workspace(
-                topk_pf, workspace_starts, pf_cu)
+            workspace_kv = workspace.view(-1, 1, _MLA_WORKSPACE_HEAD_SIZE)
 
             prefill_padding = 64
+            actual_h = q_pf.shape[1]
             q_pf_3d = q_pf
-            actual_h = q_pf_3d.shape[1]
             if actual_h % prefill_padding != 0:
                 pad_h = prefill_padding
                 q_padded = q_pf_3d.new_empty(q_pf_3d.shape[0], pad_h, q_pf_3d.shape[2])
                 q_padded[:, :actual_h, :] = q_pf_3d
                 q_pf_3d = q_padded
 
-            topk_pf_ws_3d = topk_pf_ws.view(np_, 1, -1)
+            topk_pf_3d = topk_pf.view(np_, 1, -1)
             pf_out = self.sparse_prefill_op(
-                q_pf_3d, workspace_kv, topk_pf_ws_3d, self.scale)
+                q_pf_3d, workspace_kv, topk_pf_3d, self.scale)
 
             if isinstance(pf_out, tuple):
                 pf_out = pf_out[0]
             pf_out = pf_out[:, :actual_h, :]
 
-            pf_v_out = self._v_up_proj(pf_out)
             if ctx.is_mixed:
-                out[num_decode_tokens:] = pf_v_out
+                out[num_decode_tokens:] = pf_out
             else:
-                out[:] = pf_v_out
+                out[:] = pf_out
 
-        return out
-
-    def _gather_and_upconvert(self, kv_cache, workspace, block_table, cu_seq_lens, num_seqs):
-        """Gather FP8 KV cache and upconvert to BF16 workspace."""
-        block_size = kv_cache.shape[1]
-        head_size = kv_cache.shape[2]
-        cache_flat = kv_cache.view(-1, head_size)
-
-        from ..L1.store_kvcache_fp8_mla import (
-            _KV_C_FP8_BYTES, _KV_C_SCALE_BYTES, _K_PE_BYTES,
-            _KV_C_DIM, _K_PE_DIM, _GROUP_SIZE, _NUM_GROUPS,
-        )
-
-        out_idx = 0
-        for seq_i in range(num_seqs):
-            seq_start = int(cu_seq_lens[seq_i].item())
-            seq_end = int(cu_seq_lens[seq_i + 1].item())
-            seq_len = seq_end - seq_start
-            for t in range(seq_len):
-                block_idx = t // block_size
-                slot_in_block = t % block_size
-                physical_block = int(block_table[seq_i, block_idx].item())
-                slot = physical_block * block_size + slot_in_block
-                raw = cache_flat[slot]
-
-                for g in range(_NUM_GROUPS):
-                    fp8_offset = g * _GROUP_SIZE
-                    fp8_bytes = raw[fp8_offset:fp8_offset + _GROUP_SIZE]
-                    fp8_vals = fp8_bytes.view(torch.float8_e4m3fn).float()
-                    scale_offset = _KV_C_FP8_BYTES + g * 4
-                    scale = raw[scale_offset:scale_offset + 4].view(torch.float32)
-                    workspace[out_idx, fp8_offset:fp8_offset + _GROUP_SIZE] = (
-                        fp8_vals * scale).to(torch.bfloat16).view(torch.uint8)
-
-                pe_offset = _KV_C_FP8_BYTES + _KV_C_SCALE_BYTES
-                workspace[out_idx, pe_offset:pe_offset + _K_PE_BYTES] = raw[pe_offset:pe_offset + _K_PE_BYTES]
-                out_idx += 1
-
-    def _convert_prefill_indices_to_workspace(self, topk_indices, workspace_starts, cu_seq_lens):
-        """Convert per-request logical indices to workspace offsets for prefill."""
-        M = topk_indices.shape[0]
-        out = topk_indices.clone()
-        num_seqs = cu_seq_lens.shape[0] - 1
-        for seq_i in range(num_seqs):
-            seq_start = int(cu_seq_lens[seq_i].item())
-            seq_end = int(cu_seq_lens[seq_i + 1].item())
-            ws_start = int(workspace_starts[seq_i].item())
-            for row in range(seq_start, min(seq_end, M)):
-                valid = out[row] >= 0
-                out[row] = torch.where(valid, out[row] + ws_start, out[row])
-        return out
+        return self._v_up_proj(out.view(N, self.num_heads, self.kv_lora_rank))
 
     def _forward_mixed(self, q, kv_c_normed, k_pe, kv_b_proj, kv_cache, ctx):
         """Mixed batch for dense (non-sparse) attention."""

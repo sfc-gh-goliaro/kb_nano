@@ -225,7 +225,7 @@ class SparseAttnIndexer(nn.Module):
             if cu_q is None or cu_k is None or bt is None:
                 return topk_indices
 
-            k_fp8, k_scale_flat = self.k_cache_gather(
+            k_fp8, k_scale_bytes = self.k_cache_gather(
                 self.indexer_k_cache, bt, cu_k)
 
             num_seqs = cu_k.shape[0] - 1
@@ -235,7 +235,7 @@ class SparseAttnIndexer(nn.Module):
 
             logits = self.fp8_mqa_logits.forward_prefill(
                 q_fp8_pf.view(-1, self.n_head, self.head_dim),
-                (k_fp8, k_scale_flat),
+                (k_fp8, k_scale_bytes.view(torch.float32).flatten()),
                 weights_pf,
                 cu_seqlen_ks,
                 cu_seqlen_ke,
@@ -283,21 +283,25 @@ class SparseAttnIndexer(nn.Module):
         else:
             num_sms = 1
 
+        B = ctx.decode_context_lens.shape[0]
+        next_n = M // B if B > 0 else 1
+
         schedule = self.paged_mqa_metadata(
             ctx.decode_context_lens,
             block_size,
             num_sms,
         )
-        q_fp8_4d = q_fp8.unsqueeze(1)  # [M, 1, n_head, head_dim]
+        q_fp8_4d = q_fp8.view(B, next_n, self.n_head, self.head_dim)
+        kv_cache_4d = self.indexer_k_cache.unsqueeze(-2)
         logits = self.fp8_mqa_logits.forward_decode(
             q_fp8_4d,
-            self.indexer_k_cache.unsqueeze(-2),
-            weights,
+            kv_cache_4d,
+            weights[:B * next_n],
             ctx.decode_context_lens,
             ctx.decode_block_tables,
             schedule,
             max_model_len=max_ctx,
         )
         return self.topk_per_row.forward_decode(
-            logits, ctx.decode_context_lens, next_n=1, topk=self.topk_tokens,
+            logits, ctx.decode_context_lens, next_n=next_n, topk=self.topk_tokens,
         )

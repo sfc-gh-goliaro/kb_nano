@@ -1,5 +1,8 @@
 """Indexer K cache store and gather for DSA (132 bytes/token).
 
+Uses vLLM's CUDA kernels for high-performance FP8 quantization and cache
+operations, matching the exact semantics of the vLLM sparse attention indexer.
+
 Cache format per token (132 bytes):
 
   * ``[0:128]`` — K as ``float8_e4m3fn``.
@@ -13,19 +16,19 @@ from __future__ import annotations
 import torch
 import torch.nn as nn
 
+import vllm._C  # noqa: F401  — registers torch.ops._C_cache_ops
+
 _HEAD_DIM = 128
 _SCALE_BYTES = 4
 _BYTES_PER_TOKEN = _HEAD_DIM + _SCALE_BYTES
-_FP8_MAX = torch.finfo(torch.float8_e4m3fn).max
-
-
-def _ue8m0_scale(absmax: torch.Tensor) -> torch.Tensor:
-    absmax = absmax.clamp(min=1e-12)
-    return torch.exp2(torch.ceil(torch.log2(absmax / _FP8_MAX)))
+_QUANT_BLOCK_SIZE = 128
 
 
 class IndexerKCacheStore(nn.Module):
-    """Quantize K to FP8 and store in indexer paged cache.
+    """Quantize K to FP8 and store in indexer paged cache via CUDA kernel.
+
+    Wraps ``torch.ops._C_cache_ops.indexer_k_quant_and_cache`` which fuses
+    FP8 quantization (UE8M0 scale) with paged cache insertion.
 
     Args:
         k: ``[N, head_dim]`` BF16 — indexer key vectors.
@@ -39,34 +42,20 @@ class IndexerKCacheStore(nn.Module):
         kv_cache: torch.Tensor,
         slot_mapping: torch.Tensor,
     ) -> None:
-        N, D = k.shape
-        if D != _HEAD_DIM:
-            raise ValueError(f"head_dim must be {_HEAD_DIM}, got {D}")
-
-        cache_flat = kv_cache.view(-1, _BYTES_PER_TOKEN)
-
-        for i in range(N):
-            s = int(slot_mapping[i].item())
-            if s < 0:
-                continue
-
-            vals = k[i].float()
-            absmax = vals.abs().max()
-            scale = _ue8m0_scale(absmax)
-
-            fp8_vals = (vals / scale).clamp(-_FP8_MAX, _FP8_MAX).to(torch.float8_e4m3fn)
-            cache_flat[s, :_HEAD_DIM] = fp8_vals.view(torch.uint8)
-
-            scale_b = scale.reshape(1).to(dtype=torch.float32).view(torch.uint8)
-            cache_flat[s, _HEAD_DIM:_HEAD_DIM + _SCALE_BYTES] = scale_b
+        torch.ops._C_cache_ops.indexer_k_quant_and_cache(
+            k, kv_cache, slot_mapping, _QUANT_BLOCK_SIZE, "ue8m0",
+        )
 
 
 class IndexerKCacheGather(nn.Module):
-    """Gather K from indexer paged cache in FP8 form.
+    """Gather K from indexer paged cache in FP8 form via CUDA kernel.
+
+    Wraps ``torch.ops._C_cache_ops.cp_gather_indexer_k_quant_cache`` which
+    gathers FP8 keys and their float32 scales from a paged cache.
 
     Returns:
         ``k_fp8``: ``[total_tokens, head_dim]`` float8_e4m3fn.
-        ``k_scale``: ``[total_tokens]`` float32.
+        ``k_scale``: ``[total_tokens, 4]`` uint8 (float32 scale viewed as bytes).
     """
 
     def forward(
@@ -75,34 +64,18 @@ class IndexerKCacheGather(nn.Module):
         block_table: torch.Tensor,
         cu_seq_lens: torch.Tensor,
     ) -> tuple[torch.Tensor, torch.Tensor]:
-        device = kv_cache.device
-        block_size = kv_cache.shape[1]
         total_tokens = int(cu_seq_lens[-1].item())
-
-        cache_flat = kv_cache.view(-1, _BYTES_PER_TOKEN)
+        device = kv_cache.device
 
         k_fp8 = torch.empty(
             total_tokens, _HEAD_DIM, dtype=torch.float8_e4m3fn, device=device,
         )
-        k_scale = torch.empty(total_tokens, dtype=torch.float32, device=device)
+        k_scale = torch.empty(
+            total_tokens, _SCALE_BYTES, dtype=torch.uint8, device=device,
+        )
 
-        num_seqs = cu_seq_lens.shape[0] - 1
-        out_idx = 0
-        for seq_i in range(num_seqs):
-            seq_start = int(cu_seq_lens[seq_i].item())
-            seq_end = int(cu_seq_lens[seq_i + 1].item())
-            seq_len = seq_end - seq_start
-
-            for t in range(seq_len):
-                block_idx = t // block_size
-                slot_in_block = t % block_size
-                physical_block = int(block_table[seq_i, block_idx].item())
-                slot = physical_block * block_size + slot_in_block
-
-                k_fp8[out_idx] = cache_flat[slot, :_HEAD_DIM].view(torch.float8_e4m3fn)
-                k_scale[out_idx] = cache_flat[
-                    slot, _HEAD_DIM:_HEAD_DIM + _SCALE_BYTES
-                ].view(torch.float32).item()
-                out_idx += 1
+        torch.ops._C_cache_ops.cp_gather_indexer_k_quant_cache(
+            kv_cache, k_fp8, k_scale, block_table, cu_seq_lens,
+        )
 
         return k_fp8, k_scale

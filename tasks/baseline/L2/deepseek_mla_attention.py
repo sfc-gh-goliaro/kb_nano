@@ -129,12 +129,17 @@ class DeepSeekMLAAttention(nn.Module):
     def compute_absorbed_weights(self):
         """Compute W_UV from kv_b_proj for absorbed MLA decode.
 
-        Must be called after weight loading. Extracts the V-projection
-        portion of kv_b_proj and stores it as W_UV on the attention core.
+        Must be called after weight loading but BEFORE FP8 postprocessing
+        (transform_sf_into_required_layout). For FP8 weights, we dequantize
+        using the original block scales to recover accurate BF16 values,
+        matching vLLM's get_and_maybe_dequant_weights.
         """
         weight = self.kv_b_proj.weight.data
         if hasattr(self.kv_b_proj, 'use_fp8') and self.kv_b_proj.use_fp8:
-            weight = weight.float()
+            scale = self.kv_b_proj.weight_scale_inv.data
+            weight = self._dequant_fp8_block(weight, scale)
+        else:
+            weight = weight.to(torch.bfloat16)
         weight = weight.T
         L = self.kv_lora_rank
         N = self.num_local_heads
@@ -143,6 +148,19 @@ class DeepSeekMLAAttention(nn.Module):
         weight = weight.view(L, N, P + V)
         W_UV = weight[:, :, P:]
         self.attn.W_UV = W_UV.permute(1, 0, 2).contiguous()
+
+    @staticmethod
+    def _dequant_fp8_block(w_fp8: torch.Tensor, scale_inv: torch.Tensor,
+                           block_size: int = 128) -> torch.Tensor:
+        """Dequantize block-scaled FP8 weight [N, K] to BF16 using per-block scales."""
+        import math
+        N, K = w_fp8.shape
+        sn = math.ceil(N / block_size)
+        sk = math.ceil(K / block_size)
+        scale = scale_inv[:sn, :sk]
+        scale_expanded = scale.repeat_interleave(block_size, dim=0)[:N] \
+                              .repeat_interleave(block_size, dim=1)[:, :K]
+        return (w_fp8.float() * scale_expanded).to(torch.bfloat16)
 
     def forward(self, positions: torch.Tensor, hidden_states: torch.Tensor) -> torch.Tensor:
         N = hidden_states.shape[0]
