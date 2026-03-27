@@ -273,6 +273,9 @@ class ModelRunner:
         )
         self.is_moe = hasattr(self.config, "num_local_experts")
         self.is_qwen_vl = hasattr(self.config, "mrope_section")
+        self.is_whisper = getattr(self.config, "is_encoder_decoder", False)
+        if self.is_whisper:
+            self.enforce_eager = True
         self._share_trtllm_workspace()
         self._share_activation_buffers()
         self.warmup_model()
@@ -398,10 +401,13 @@ class ModelRunner:
         if self.is_qwen_vl:
             self._warmup_vision_encoder()
 
-        warmup_len = min(self.max_model_len, self.max_num_batched_tokens)
-        num_seqs = min(self.max_num_batched_tokens // warmup_len, self.max_num_seqs)
-        seqs = [Sequence([0] * warmup_len) for _ in range(num_seqs)]
-        self.run(seqs, True)
+        if self.is_whisper:
+            self._warmup_whisper()
+        else:
+            warmup_len = min(self.max_model_len, self.max_num_batched_tokens)
+            num_seqs = min(self.max_num_batched_tokens // warmup_len, self.max_num_seqs)
+            seqs = [Sequence([0] * warmup_len) for _ in range(num_seqs)]
+            self.run(seqs, True)
 
         torch.cuda.empty_cache()
 
@@ -472,6 +478,33 @@ class ModelRunner:
         torch.cuda.empty_cache()
         if self.rank == 0:
             print(f"  DeepGEMM warmup: {len(seen_shapes)} unique FP8 weight shapes")
+
+    def _warmup_whisper(self):
+        """Warmup Whisper encoder + decoder with dummy audio input."""
+        config = self.config
+        num_mel_bins = config.num_mel_bins
+        max_source_positions = config.max_source_positions
+        max_target_positions = config.max_target_positions
+
+        # Warmup encoder with max-length mel spectrogram
+        T_mel = max_source_positions * 2  # conv2 stride=2 halves it
+        dummy_features = torch.randn(
+            1, num_mel_bins, T_mel,
+            device=f"cuda:{self.rank}", dtype=torch.get_default_dtype(),
+        )
+        with torch.inference_mode():
+            enc_out = self.model.encode(dummy_features)
+
+        # Warmup decoder with max sequence length
+        warmup_len = min(max_target_positions, self.max_num_batched_tokens)
+        num_seqs = min(self.max_num_batched_tokens // warmup_len, self.max_num_seqs)
+        seqs = [Sequence([0] * warmup_len) for _ in range(num_seqs)]
+        self.run(seqs, True)
+
+        self.model.clear_cross_attention_cache()
+        if self.rank == 0:
+            print(f"  Whisper warmup: encoder T_mel={T_mel}, "
+                  f"decoder warmup_len={warmup_len}")
 
     def _warmup_vision_encoder(self):
         """Run vision encoder with worst-case dummy inputs to capture peak
@@ -1364,12 +1397,17 @@ class LlamaEngine:
             self.tokenizer.pad_token_id = self.tokenizer.eos_token_id
 
         self.is_qwen_vl = self.model_runner.is_qwen_vl
+        self.is_whisper = self.model_runner.is_whisper
         self.processor = None
         if self.is_qwen_vl:
             from transformers import AutoProcessor
             self.processor = AutoProcessor.from_pretrained(model_name)
 
         self.encoder_cache: dict[int, tuple] = {}
+
+        if self.is_whisper:
+            from transformers import WhisperProcessor
+            self.whisper_processor = WhisperProcessor.from_pretrained(model_name)
 
         atexit.register(self._cleanup)
 
@@ -2288,3 +2326,98 @@ class LlamaEngine:
                     bm.deallocate(seq)
             else:
                 running.append(seq)
+
+    # ------------------------------------------------------------------
+    # Whisper: audio-to-text generation
+    # ------------------------------------------------------------------
+    @torch.inference_mode()
+    def generate_whisper(
+        self,
+        audio_features_list: list[torch.Tensor],
+        decoder_prompt_ids: list[list[int]],
+        sampling_params: SamplingParams | list[SamplingParams],
+        use_tqdm: bool = False,
+    ) -> list[GenerationOutput]:
+        """Generate text from pre-processed audio features.
+
+        Args:
+            audio_features_list: list of [num_mel_bins, T] tensors (log-mel)
+            decoder_prompt_ids: list of decoder prompt token IDs per audio
+            sampling_params: sampling parameters
+            use_tqdm: show progress bar
+        """
+        if isinstance(sampling_params, list):
+            sp_list = sampling_params
+        else:
+            sp_list = [sampling_params] * len(audio_features_list)
+
+        eos = self.tokenizer.eos_token_id
+        model = self.model_runner.model
+
+        all_outputs = []
+        for i, (features, prompt_ids) in enumerate(
+            zip(audio_features_list, decoder_prompt_ids)
+        ):
+            sp = sp_list[i]
+
+            # Run encoder
+            features_gpu = features.unsqueeze(0).to(
+                device=f"cuda:{self.model_runner.rank}",
+                dtype=torch.get_default_dtype(),
+            )
+            enc_out = model.encode(features_gpu)
+
+            # Pre-compute and cache encoder K/V for cross-attention
+            for layer in model.decoder.layers:
+                layer.encoder_attn.cache_encoder_kv(enc_out)
+            # Clear _encoder_output so decoder forward doesn't re-project K/V
+            model._encoder_output = None
+
+            # Create decoder sequence
+            seq = Sequence(prompt_ids, max_tokens=sp.max_tokens,
+                           ignore_eos=sp.ignore_eos)
+            self.block_manager.reset()
+
+            # Prefill decoder prompt
+            num_blocks_needed = seq.num_blocks
+            self.block_manager.allocate_n(seq, num_blocks_needed)
+
+            input_ids_t, positions_t = self.model_runner.prepare_prefill([seq])
+            logits = self.model_runner.run_model(input_ids_t, positions_t, True)
+            reset_context()
+
+            if logits is not None:
+                token_ids = self._sample(logits, sp)
+                tid = token_ids[0]
+                seq.append_token(tid)
+                seq.num_computed_tokens = seq.num_prompt_tokens
+                seq.status = SeqStatus.RUNNING
+
+            # Decode loop
+            while len(seq.generated_ids) < sp.max_tokens:
+                if not sp.ignore_eos and seq.last_token == eos:
+                    break
+
+                self.block_manager.may_append(seq)
+                input_ids_t, positions_t = self.model_runner.prepare_decode([seq])
+                logits = self.model_runner.run_model(input_ids_t, positions_t, False)
+                reset_context()
+
+                if logits is not None:
+                    token_ids = self._sample(logits, sp)
+                    seq.append_token(token_ids[0])
+
+            model.clear_cross_attention_cache()
+            self.block_manager.deallocate(seq)
+
+            all_outputs.append(
+                GenerationOutput(
+                    prompt="",
+                    generated_text=self.tokenizer.decode(
+                        seq.generated_ids, skip_special_tokens=True,
+                    ),
+                    token_ids=seq.generated_ids,
+                )
+            )
+
+        return all_outputs

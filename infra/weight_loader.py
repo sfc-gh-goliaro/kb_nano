@@ -1,6 +1,6 @@
 """
-Weight loader for Llama 3.1, Llama 4, Mixtral, Qwen2-VL, and Qwen3-VL
-with tensor parallelism.
+Weight loader for Llama 3.1, Llama 4, Mixtral, Qwen2-VL, Qwen3-VL,
+and Whisper with tensor parallelism.
 
 Loads weights from HuggingFace safetensors and distributes them
 across TP shards using the weight_loader callbacks on each parameter.
@@ -24,6 +24,7 @@ from ..tasks.baseline.L4.llama4 import Llama4Config, Llama4ForCausalLM
 from ..tasks.baseline.L4.mixtral import MixtralConfig, MixtralForCausalLM
 from ..tasks.baseline.L4.qwen2_vl import Qwen2VLConfig, Qwen2VLForConditionalGeneration
 from ..tasks.baseline.L4.qwen3_vl import Qwen3VLConfig, Qwen3VLForConditionalGeneration
+from ..tasks.baseline.L4.whisper import WhisperConfig, WhisperForConditionalGeneration
 
 
 def default_weight_loader(param: torch.nn.Parameter, loaded_weight: torch.Tensor):
@@ -139,6 +140,24 @@ def _load_vision_qkv(model, param_prefix: str, loaded_weight: torch.Tensor,
 
 _WEIGHT_SCALE_INV_RE = re.compile(r"(.+)\.weight_scale_inv$")
 
+# Whisper: remap checkpoint names
+# Strip "model." prefix, fc1/fc2 -> mlp.fc1/mlp.fc2,
+# conv -> conv.conv (L1 wrapper), layernorm -> layernorm.norm (L1 wrapper)
+_WHISPER_FC_RE = re.compile(
+    r"((?:encoder|decoder)\.layers\.\d+)\.fc([12])\.(weight|bias)"
+)
+_WHISPER_CONV_RE = re.compile(r"(encoder\.conv[12])\.(weight|bias)")
+_WHISPER_LAYER_NORM_RE = re.compile(
+    r"((?:encoder|decoder)(?:\.layers\.\d+)?\.(?:self_attn_layer_norm|"
+    r"encoder_attn_layer_norm|final_layer_norm|layer_norm))\.(weight|bias)"
+)
+_WHISPER_EMBED_POSITIONS_RE = re.compile(
+    r"(encoder)\.embed_positions\.weight"
+)
+_WHISPER_OUT_PROJ_RE = re.compile(
+    r"((?:encoder|decoder)\.layers\.\d+\.(?:self_attn|encoder_attn))\.out_proj\.(weight|bias)"
+)
+
 
 def load_weights(model, model_path: str, model_type: str = "llama") -> None:
     """Load weights with support for packed modules, MoE experts, vision
@@ -149,6 +168,7 @@ def load_weights(model, model_path: str, model_type: str = "llama") -> None:
     if not safetensor_files:
         raise FileNotFoundError(f"No .safetensors files found in {model_path}")
 
+    is_whisper = model_type == "whisper"
     is_qwen2_vl = model_type == "qwen2_vl"
     is_qwen3_vl = model_type == "qwen3_vl"
     is_qwen_vl = is_qwen2_vl or is_qwen3_vl
@@ -168,6 +188,58 @@ def load_weights(model, model_path: str, model_type: str = "llama") -> None:
                     mapped_name = _remap_qwen3_vl_name(weight_name)
                 else:
                     mapped_name = weight_name
+
+                # Whisper: remap checkpoint names
+                if is_whisper:
+                    # Strip "model." prefix
+                    if mapped_name.startswith("model."):
+                        mapped_name = mapped_name[len("model."):]
+                    # proj_out -> lm_head (tied weights, skip)
+                    if mapped_name.startswith("proj_out."):
+                        continue
+
+                    # fc1/fc2 -> mlp.fc1/mlp.fc2
+                    m_fc = _WHISPER_FC_RE.match(mapped_name)
+                    if m_fc:
+                        prefix, fc_num, wb = m_fc.groups()
+                        mapped_name = f"{prefix}.mlp.fc{fc_num}.{wb}"
+
+                    # conv1/conv2 -> conv1.conv/conv2.conv (L1 wrapper)
+                    m_conv = _WHISPER_CONV_RE.match(mapped_name)
+                    if m_conv:
+                        prefix, wb = m_conv.groups()
+                        mapped_name = f"{prefix}.conv.{wb}"
+
+                    # LayerNorm -> *.norm.* (L1 wrapper)
+                    m_ln = _WHISPER_LAYER_NORM_RE.match(mapped_name)
+                    if m_ln:
+                        prefix, wb = m_ln.groups()
+                        mapped_name = f"{prefix}.norm.{wb}"
+
+                    # encoder.embed_positions is a buffer, loaded separately
+                    if _WHISPER_EMBED_POSITIONS_RE.match(mapped_name):
+                        continue
+
+                    # Create fake zero bias for k_proj (HF checkpoint has
+                    # no k_proj bias, but our QKVParallelLinear expects one
+                    # for the packed QKV)
+                    if mapped_name.endswith(".k_proj.weight"):
+                        tensor = f.get_tensor(weight_name)
+                        fake_bias_name = mapped_name.replace(".weight", ".bias")
+                        fake_bias = torch.zeros(tensor.size(0))
+                        # Load the fake bias through packed mapping
+                        for orig_key, (packed_name, shard_id) in packed.items():
+                            if orig_key in fake_bias_name:
+                                param_name = fake_bias_name.replace(
+                                    orig_key, packed_name)
+                                try:
+                                    param = model.get_parameter(param_name)
+                                    weight_loader_fn = getattr(
+                                        param, "weight_loader")
+                                    weight_loader_fn(param, fake_bias, shard_id)
+                                except AttributeError:
+                                    pass
+                                break
 
                 # Llama4: strip language_model. prefix, skip vision weights
                 if is_llama4:
@@ -364,6 +436,14 @@ def load_weights(model, model_path: str, model_type: str = "llama") -> None:
                 weight_loader = getattr(param, "weight_loader", default_weight_loader)
                 weight_loader(param, f.get_tensor(weight_name))
                 loaded += 1
+
+                # Whisper: duplicate decoder embed_tokens -> lm_head (tied weights)
+                if is_whisper and mapped_name == "decoder.embed_tokens.weight":
+                    lm_param = model.get_parameter("lm_head.weight")
+                    lm_loader = getattr(lm_param, "weight_loader", default_weight_loader)
+                    lm_loader(lm_param, f.get_tensor(weight_name))
+                    loaded += 1
+
     print(f"  Loaded {loaded} weight shards.")
 
 
@@ -419,7 +499,13 @@ def load_model(
         print(f"  Detected FP8 quantization: {quant_config.get('quant_method')}, "
               f"block_size={quant_config.get('weight_block_size')}")
 
-    if model_type == "llama4":
+    if model_type == "whisper":
+        config = WhisperConfig.from_pretrained(model_name)
+        config.dtype = dtype
+        print(f"  Allocating Whisper model (enc={config.encoder_layers}L, "
+              f"dec={config.decoder_layers}L, d={config.d_model})...")
+        model = WhisperForConditionalGeneration(config)
+    elif model_type == "llama4":
         config = Llama4Config.from_pretrained(model_name)
         config.dtype = dtype
         print(f"  Allocating Llama4 model ({config.num_local_experts} experts, "
