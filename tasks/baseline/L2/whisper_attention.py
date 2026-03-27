@@ -3,8 +3,10 @@ and decoder cross-attention.
 
 Encoder self-attention has no KV cache and no causal mask (full bidirectional).
 Decoder self-attention uses the standard paged KV cache with causal masking.
-Cross-attention computes encoder K/V once during prefill and caches them for
-subsequent decode steps.
+Cross-attention projects encoder K/V once during prefill, writes them to
+paged KV cache blocks, and reads from cache on subsequent decode steps.
+This matches vLLM's approach: cross-attention K/V live in the same paged
+KV system as self-attention, with dedicated blocks per request.
 """
 
 from __future__ import annotations
@@ -13,9 +15,11 @@ import torch
 import torch.nn as nn
 
 from ....infra.tp import _tp_size
+from ....infra.context import get_context, get_attn_backend_config
 from .parallel_linear import ColumnParallelLinear, QKVParallelLinear, RowParallelLinear
 from .attention_impl import Attention
 from ..L1.flash_attn_prefill import FlashAttnPrefill
+from ..L1.store_kvcache import StoreKVCache, StoreKVCacheHND
 
 
 class WhisperEncoderSelfAttention(nn.Module):
@@ -122,13 +126,15 @@ class WhisperDecoderSelfAttention(nn.Module):
 
 
 class WhisperCrossAttention(nn.Module):
-    """Decoder cross-attention: queries from decoder, keys/values from encoder.
+    """Decoder cross-attention with paged KV cache.
 
-    Encoder K/V are projected and cached during the first decode step.
-    On subsequent steps, encoder_hidden_states is None and the cached
-    K/V are reused.
+    Matches vLLM's approach: encoder K/V are projected once during prefill
+    and written to paged KV cache via slot_mapping. On subsequent decode
+    steps, the attention reads from the paged cache.
 
-    Interface matches vLLM's WhisperCrossAttention.forward() signature.
+    The engine discovers cross-attention layers via duck-typing on
+    ``k_cache`` / ``v_cache`` attributes, same as self-attention layers.
+    Cross-attention layers are distinguished by ``is_cross_attn = True``.
     """
 
     def __init__(self, embed_dim: int, num_heads: int):
@@ -146,83 +152,85 @@ class WhisperCrossAttention(nn.Module):
         self.v_proj = ColumnParallelLinear(embed_dim, embed_dim, bias=True)
         self.out_proj = RowParallelLinear(embed_dim, embed_dim, bias=True)
 
+        self.is_cross_attn = True
+        self.k_cache = self.v_cache = torch.tensor([])
+
+        attn_cfg = get_attn_backend_config()
+        self._block_size = attn_cfg.block_size
+
+        self.store_kvcache = (
+            StoreKVCacheHND(page_size=attn_cfg.block_size)
+            if attn_cfg.use_trtllm
+            else StoreKVCache()
+        )
         self.prefill_op = FlashAttnPrefill(
             self.num_heads, self.num_heads, self.head_dim,
         )
-
-        self._cached_k: torch.Tensor | None = None
-        self._cached_v: torch.Tensor | None = None
-
-    def clear_cache(self):
-        self._cached_k = None
-        self._cached_v = None
-
-    def cache_encoder_kv(self, encoder_hidden_states: torch.Tensor):
-        """Pre-compute and cache encoder K/V projections.
-
-        Args:
-            encoder_hidden_states: [B, T_enc, D]
-        """
-        B, T_enc, D = encoder_hidden_states.shape
-        enc_flat = encoder_hidden_states.reshape(B * T_enc, D)
-        k = self.k_proj(enc_flat)
-        v = self.v_proj(enc_flat)
-        self._cached_k = k.view(B, T_enc, self.num_heads, self.head_dim)
-        self._cached_v = v.view(B, T_enc, self.num_heads, self.head_dim)
-        self._cached_T_enc = T_enc
+        from ..L1.flash_attn_decode import FlashAttnDecode
+        self.decode_op = FlashAttnDecode(
+            self.num_heads, self.num_heads, self.head_dim,
+        )
 
     def forward(
         self,
         hidden_states: torch.Tensor,
         encoder_hidden_states: torch.Tensor | None,
-        num_decoder_seqs: int | None = None,
     ) -> torch.Tensor:
         """
         Args:
             hidden_states: [N_dec, D] decoder token states (flat)
-            encoder_hidden_states: [B, T_enc, D] encoder outputs or None
-            num_decoder_seqs: number of decoder sequences in the batch
+            encoder_hidden_states: [N_enc, D] concatenated encoder outputs
+                for NEW requests this step, or None if all requests are
+                in decode phase (K/V already in paged cache).
         """
-        if encoder_hidden_states is not None:
-            self.cache_encoder_kv(encoder_hidden_states)
+        ctx = get_context()
 
         q = self.q_proj(hidden_states)
         N_dec = q.shape[0]
-
-        assert self._cached_k is not None, "Cross-attention cache not initialized"
-        cached_k = self._cached_k
-        cached_v = self._cached_v
-        B = cached_k.shape[0]
-        T_enc = self._cached_T_enc
-
-        if num_decoder_seqs is not None:
-            B_dec = num_decoder_seqs
-        else:
-            B_dec = B
-
         q = q.view(N_dec, self.num_heads, self.head_dim)
-        k_flat = cached_k.reshape(B * T_enc, self.num_heads, self.head_dim)
-        v_flat = cached_v.reshape(B * T_enc, self.num_heads, self.head_dim)
 
-        tokens_per_dec = N_dec // B_dec
-        cu_seqlens_q = torch.arange(
-            0, (B_dec + 1) * tokens_per_dec, tokens_per_dec,
-            dtype=torch.int32, device=q.device,
-        )
-        cu_seqlens_k = torch.arange(
-            0, (B_dec + 1) * T_enc, T_enc,
-            dtype=torch.int32, device=q.device,
-        )
+        k_cache, v_cache = self.k_cache, self.v_cache
+
+        if encoder_hidden_states is not None:
+            k = self.k_proj(encoder_hidden_states)
+            v = self.v_proj(encoder_hidden_states)
+            N_enc = encoder_hidden_states.shape[0]
+            k = k.view(N_enc, self.num_heads, self.head_dim)
+            v = v.view(N_enc, self.num_heads, self.head_dim)
+
+            if k_cache.numel() and v_cache.numel() and ctx.cross_slot_mapping is not None:
+                self.store_kvcache(k, v, k_cache, v_cache, ctx.cross_slot_mapping)
+
+        if ctx.is_prefill or ctx.is_mixed:
+            return self._forward_prefill(q, k_cache, v_cache, ctx)
+        else:
+            return self._forward_decode(q, k_cache, v_cache, ctx)
+
+    def _forward_prefill(self, q, k_cache, v_cache, ctx):
+        """Prefill: Q attends to encoder K/V in paged cache (non-causal)."""
+        cu_q = ctx.cross_cu_seqlens_q
+        cu_k = ctx.cross_cu_seqlens_k
+        bt = ctx.cross_block_tables
 
         out = self.prefill_op(
-            q, k_flat, v_flat,
-            cu_seqlens_q=cu_seqlens_q,
-            cu_seqlens_k=cu_seqlens_k,
-            max_seqlen_q=tokens_per_dec,
-            max_seqlen_k=T_enc,
+            q, k_cache, v_cache,
+            cu_seqlens_q=cu_q, cu_seqlens_k=cu_k,
+            max_seqlen_q=ctx.cross_max_seqlen_q,
+            max_seqlen_k=ctx.cross_max_seqlen_k,
             softmax_scale=self.scale,
             causal=False,
+            block_table=bt,
         )
+        return self.out_proj(out.view(q.shape[0], -1))
 
-        out = out.view(N_dec, self.num_heads * self.head_dim)
-        return self.out_proj(out)
+    def _forward_decode(self, q, k_cache, v_cache, ctx):
+        """Decode: each decoder token attends to full encoder KV in cache."""
+        out = self.decode_op(
+            q, k_cache, v_cache,
+            cache_seqlens=ctx.cross_context_lens,
+            block_table=ctx.cross_block_tables,
+            softmax_scale=self.scale,
+            causal=False,
+            max_seq_len=ctx.cross_max_context_len,
+        )
+        return self.out_proj(out.view(q.shape[0], -1))

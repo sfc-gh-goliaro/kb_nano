@@ -1091,8 +1091,9 @@ def main():
         engine.block_manager.reset()
         torch.cuda.synchronize()
         start = time.perf_counter()
-        outputs = engine.generate_whisper(
-            audio_features_list, decoder_prompts, sp, use_tqdm=True,
+        outputs = engine.generate(
+            decoder_prompts, sp,
+            audio_features=audio_features_list, use_tqdm=True,
         )
         torch.cuda.synchronize()
         elapsed = time.perf_counter() - start
@@ -1133,14 +1134,18 @@ def main():
         for _ in range(num_warmup):
             engine.block_manager.reset()
             torch.cuda.synchronize()
-            engine.generate_whisper(audio_feats, [decoder_prompt], sp)
+            engine.generate(
+                [decoder_prompt], sp, audio_features=audio_feats,
+            )
             torch.cuda.synchronize()
         latencies = []
         for _ in range(num_iters):
             engine.block_manager.reset()
             torch.cuda.synchronize()
             t0 = time.perf_counter()
-            engine.generate_whisper(audio_feats, [decoder_prompt], sp)
+            engine.generate(
+                [decoder_prompt], sp, audio_features=audio_feats,
+            )
             torch.cuda.synchronize()
             latencies.append(time.perf_counter() - t0)
         audio_dur = len(audio) / sr

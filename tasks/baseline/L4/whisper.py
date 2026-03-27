@@ -165,25 +165,21 @@ class WhisperDecoder(nn.Module):
         self,
         input_ids: torch.Tensor,
         positions: torch.Tensor,
-        encoder_hidden_states: torch.Tensor | None,
-        num_decoder_seqs: int | None = None,
+        encoder_hidden_states: torch.Tensor | None = None,
     ) -> torch.Tensor:
         """
         Args:
             input_ids: [N] flat token IDs
             positions: [N] position indices
-            encoder_hidden_states: [B, T_enc, D] or None
-            num_decoder_seqs: number of decoder sequences
+            encoder_hidden_states: [N_enc, D] flat encoder outputs for NEW
+                requests, or None when all are in decode phase.
         """
         inputs_embeds = self.embedding_op(input_ids, self.embed_tokens.weight)
         pos_embeds = self.embedding_op(positions, self.embed_positions.weight)
         hidden_states = inputs_embeds + pos_embeds
 
         for layer in self.layers:
-            hidden_states = layer(
-                hidden_states, encoder_hidden_states,
-                num_decoder_seqs=num_decoder_seqs,
-            )
+            hidden_states = layer(hidden_states, encoder_hidden_states)
 
         hidden_states = self.layer_norm(hidden_states)
         return hidden_states
@@ -202,44 +198,43 @@ class WhisperForConditionalGeneration(nn.Module):
         self.encoder = WhisperEncoder(config)
         self.decoder = WhisperDecoder(config)
         self.lm_head = ParallelLMHead(config.vocab_size, config.d_model)
-
-        self._encoder_output: torch.Tensor | None = None
         self._linear_op = Linear()
 
-    def encode(self, input_features: torch.Tensor) -> torch.Tensor:
-        """Run encoder and cache output for cross-attention."""
-        self._encoder_output = self.encoder(input_features)
-        return self._encoder_output
+    def get_multimodal_embeddings(
+        self, input_features: torch.Tensor,
+    ) -> list[torch.Tensor]:
+        """Run encoder on audio features, return per-request encoder outputs.
+
+        Args:
+            input_features: [B, num_mel_bins, T] batched log-mel spectrograms
+        Returns:
+            List of [T_enc, D] tensors, one per batch element.
+        """
+        encoder_out = self.encoder(input_features)
+        return list(encoder_out.unbind(0))
 
     def forward(
         self,
         input_ids: torch.Tensor,
         positions: torch.Tensor,
-        encoder_hidden_states: torch.Tensor | None = None,
+        encoder_outputs: list[torch.Tensor] | None = None,
     ) -> torch.Tensor:
         """Decoder forward pass.
 
         Args:
             input_ids: [N] flat token IDs
             positions: [N] position indices
-            encoder_hidden_states: [B, T_enc, D] or None (uses cached if None)
+            encoder_outputs: list of [T_enc_i, D] encoder hidden states
+                for NEW requests this step. Concatenated and passed to
+                cross-attention for KV projection and cache write.
+                Empty list or None means all requests are decoding
+                from cached KV.
         """
-        if encoder_hidden_states is None:
-            encoder_hidden_states = self._encoder_output
+        enc_states = None
+        if encoder_outputs:
+            enc_states = torch.cat(encoder_outputs, dim=0)
 
-        num_decoder_seqs = None
-        if encoder_hidden_states is not None:
-            num_decoder_seqs = encoder_hidden_states.shape[0]
-
-        return self.decoder(
-            input_ids, positions, encoder_hidden_states,
-            num_decoder_seqs=num_decoder_seqs,
-        )
-
-    def forward_with_lm_proj(self, input_ids, positions,
-                             encoder_hidden_states=None):
-        hidden_states = self.forward(input_ids, positions, encoder_hidden_states)
-        return self.lm_head.project(hidden_states)
+        return self.decoder(input_ids, positions, enc_states)
 
     def compute_logits(self, hidden_states):
         logits = self.lm_head(hidden_states)
@@ -256,9 +251,3 @@ class WhisperForConditionalGeneration(nn.Module):
     def greedy_sample_decode(self, partial_logits):
         result = self.lm_head.gather_greedy(partial_logits.float())
         return result
-
-    def clear_cross_attention_cache(self):
-        """Clear cached encoder K/V in all cross-attention layers."""
-        for layer in self.decoder.layers:
-            layer.encoder_attn.clear_cache()
-        self._encoder_output = None

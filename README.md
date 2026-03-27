@@ -7,7 +7,7 @@ A standalone, high-performance LLM inference engine supporting **Llama 3.1**, **
 - **Llama 3.1** (8B, 70B) with frequency-scaled RoPE
 - **Mixtral-8x7B** with fused Triton MoE grouped-GEMM kernels
 - **Qwen2-VL / Qwen3-VL** vision-language models with image and video support
-- **Whisper** (large-v3) encoder-decoder speech-to-text model
+- **Whisper** (large-v3) encoder-decoder speech-to-text with batched inference and paged cross-attention KV cache
 - **Tensor parallelism** (TP) with custom IPC-based all-reduce for multi-GPU inference
 - **Paged KV cache** with Triton store kernels
 - **CUDA graph capture** for decode steps

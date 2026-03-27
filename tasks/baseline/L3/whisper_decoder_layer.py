@@ -34,13 +34,12 @@ class WhisperDecoderLayer(nn.Module):
         self,
         hidden_states: torch.Tensor,
         encoder_hidden_states: torch.Tensor | None,
-        num_decoder_seqs: int | None = None,
     ) -> torch.Tensor:
         """
         Args:
             hidden_states: [N, D] flat token embeddings
-            encoder_hidden_states: [B, T_enc, D] or None
-            num_decoder_seqs: number of decoder sequences in batch
+            encoder_hidden_states: [N_enc, D] flat encoder outputs for NEW
+                requests, or None when all requests are in decode phase.
         """
         residual = hidden_states
         hidden_states = self.self_attn_layer_norm(hidden_states)
@@ -51,7 +50,6 @@ class WhisperDecoderLayer(nn.Module):
         hidden_states = self.encoder_attn_layer_norm(hidden_states)
         hidden_states = self.encoder_attn(
             hidden_states, encoder_hidden_states,
-            num_decoder_seqs=num_decoder_seqs,
         )
         hidden_states = residual + hidden_states
 
