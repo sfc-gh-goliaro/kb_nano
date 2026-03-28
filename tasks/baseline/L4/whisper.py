@@ -138,9 +138,7 @@ class WhisperEncoder(nn.Module):
         for layer in self.layers:
             hidden_states = layer(hidden_states)
 
-        B, T, D = hidden_states.shape
-        hidden_states = self.layer_norm(hidden_states.reshape(B * T, D))
-        hidden_states = hidden_states.view(B, T, D)
+        hidden_states = self.layer_norm(hidden_states)
         return hidden_states
 
 
@@ -190,6 +188,8 @@ class WhisperForConditionalGeneration(nn.Module):
         "self_attn.q_proj": ("self_attn.qkv_proj", "q"),
         "self_attn.k_proj": ("self_attn.qkv_proj", "k"),
         "self_attn.v_proj": ("self_attn.qkv_proj", "v"),
+        "encoder_attn.k_proj": ("encoder_attn.kv_proj", "k"),
+        "encoder_attn.v_proj": ("encoder_attn.kv_proj", "v"),
     }
 
     def __init__(self, config: WhisperConfig):

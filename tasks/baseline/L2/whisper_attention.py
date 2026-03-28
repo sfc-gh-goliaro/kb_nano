@@ -129,8 +129,9 @@ class WhisperCrossAttention(nn.Module):
     """Decoder cross-attention with paged KV cache.
 
     Matches vLLM's approach: encoder K/V are projected once during prefill
-    and written to paged KV cache via slot_mapping. On subsequent decode
-    steps, the attention reads from the paged cache.
+    via a fused kv_proj (QKVParallelLinear with total_num_heads=0), written
+    to paged KV cache via slot_mapping. On subsequent decode steps, the
+    attention reads from the paged cache.
 
     The engine discovers cross-attention layers via duck-typing on
     ``k_cache`` / ``v_cache`` attributes, same as self-attention layers.
@@ -148,8 +149,12 @@ class WhisperCrossAttention(nn.Module):
         self.scale = self.head_dim ** -0.5
 
         self.q_proj = ColumnParallelLinear(embed_dim, embed_dim, bias=True)
-        self.k_proj = ColumnParallelLinear(embed_dim, embed_dim, bias=False)
-        self.v_proj = ColumnParallelLinear(embed_dim, embed_dim, bias=True)
+        self.kv_proj = QKVParallelLinear(
+            embed_dim, self.head_dim,
+            total_num_heads=0,
+            total_num_kv_heads=num_heads,
+            bias=True,
+        )
         self.out_proj = RowParallelLinear(embed_dim, embed_dim, bias=True)
 
         self.is_cross_attn = True
@@ -192,8 +197,8 @@ class WhisperCrossAttention(nn.Module):
         k_cache, v_cache = self.k_cache, self.v_cache
 
         if encoder_hidden_states is not None:
-            k = self.k_proj(encoder_hidden_states)
-            v = self.v_proj(encoder_hidden_states)
+            kv = self.kv_proj(encoder_hidden_states)
+            k, v = kv.split([self.kv_size, self.kv_size], dim=-1)
             N_enc = encoder_hidden_states.shape[0]
             k = k.view(N_enc, self.num_heads, self.head_dim)
             v = v.view(N_enc, self.num_heads, self.head_dim)

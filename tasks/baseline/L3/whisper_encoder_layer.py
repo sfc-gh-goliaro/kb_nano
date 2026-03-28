@@ -15,6 +15,16 @@ from ..L2.whisper_attention import WhisperEncoderSelfAttention
 from ..L2.whisper_mlp import WhisperMLP
 
 
+def cast_overflow_tensors(
+    tensors: torch.Tensor,
+    offset: float = 1000,
+) -> torch.Tensor:
+    if tensors.isinf().any() or tensors.isnan().any():
+        clamp_value = torch.finfo(tensors.dtype).max - offset
+        tensors = torch.clamp(tensors, min=-clamp_value, max=clamp_value)
+    return tensors
+
+
 class WhisperEncoderLayer(nn.Module):
     def __init__(self, config):
         super().__init__()
@@ -33,16 +43,15 @@ class WhisperEncoderLayer(nn.Module):
             [B, T, D]
         """
         residual = hidden_states
-        B, T, D = hidden_states.shape
-        hidden_states = self.self_attn_layer_norm(hidden_states.reshape(B * T, D))
-        hidden_states = hidden_states.view(B, T, D)
+        hidden_states = self.self_attn_layer_norm(hidden_states)
         hidden_states = self.self_attn(hidden_states)
         hidden_states = residual + hidden_states
 
         residual = hidden_states
-        hidden_states = self.final_layer_norm(hidden_states.reshape(B * T, D))
+        hidden_states = self.final_layer_norm(hidden_states)
         hidden_states = self.mlp(hidden_states)
-        hidden_states = hidden_states.view(B, T, D)
         hidden_states = residual + hidden_states
+
+        hidden_states = cast_overflow_tensors(hidden_states)
 
         return hidden_states
