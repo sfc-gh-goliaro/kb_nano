@@ -19,6 +19,7 @@ from ....infra.context import get_context, get_attn_backend_config
 from .parallel_linear import ColumnParallelLinear, QKVParallelLinear, RowParallelLinear
 from .attention_impl import Attention
 from ..L1.flash_attn_prefill import FlashAttnPrefill
+from ..L1.flash_attn_decode import FlashAttnDecode
 from ..L1.store_kvcache import StoreKVCache, StoreKVCacheHND
 
 
@@ -171,7 +172,6 @@ class WhisperCrossAttention(nn.Module):
         self.prefill_op = FlashAttnPrefill(
             self.num_heads, self.num_heads, self.head_dim,
         )
-        from ..L1.flash_attn_decode import FlashAttnDecode
         self.decode_op = FlashAttnDecode(
             self.num_heads, self.num_heads, self.head_dim,
         )

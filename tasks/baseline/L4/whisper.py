@@ -15,7 +15,6 @@ from dataclasses import dataclass
 
 import torch
 import torch.nn as nn
-import torch.nn.functional as F
 from transformers import AutoConfig
 
 from ..L1.conv1d import Conv1d
@@ -24,18 +23,8 @@ from ..L1.layer_norm import LayerNorm
 from ..L1.embedding import Embedding
 from ..L1.linear import Linear
 from ..L2.parallel_embedding import ParallelLMHead
-from ..L2.parallel_linear import ColumnParallelLinear
 from ..L3.whisper_encoder_layer import WhisperEncoderLayer
 from ..L3.whisper_decoder_layer import WhisperDecoderLayer
-
-
-def _sinusoids(length: int, channels: int) -> torch.Tensor:
-    """Sinusoidal positional embeddings matching HF's whisper implementation."""
-    assert channels % 2 == 0
-    log_timescale_increment = math.log(10000) / (channels // 2 - 1)
-    inv_timescales = torch.exp(-log_timescale_increment * torch.arange(channels // 2))
-    scaled_time = torch.arange(length)[:, None] * inv_timescales[None, :]
-    return torch.cat([torch.sin(scaled_time), torch.cos(scaled_time)], dim=1)
 
 
 @dataclass
