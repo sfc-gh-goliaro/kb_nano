@@ -74,6 +74,11 @@ _QWEN2_MERGER_RE = re.compile(r"(visual\.merger)\.(ln_q|mlp\.0|mlp\.2)\.(weight|
 # Qwen3-VL learned pos embed: visual.pos_embed.weight -> visual.pos_embed_interp.pos_embed
 _VISION_POS_EMBED_RE = re.compile(r"visual\.pos_embed\.weight$")
 
+# L1 wrapper nesting: *.embed_tokens.weight / *.lm_head.weight -> *.embedding_op.emb.weight
+_EMBED_WEIGHT_RE = re.compile(
+    r"((?:model\.)?(?:embed_tokens|lm_head))\.weight$"
+)
+
 # L1 wrapper nesting: patch_embed.proj.X -> patch_embed.proj.conv.X
 _VISION_PATCH_EMBED_RE = re.compile(r"(visual\.patch_embed\.proj)\.(weight|bias)")
 # L1 wrapper nesting: *.norm1.X / *.norm2.X -> *.norm1.norm.X / *.norm2.norm.X (VisionBlock)
@@ -151,8 +156,8 @@ _WHISPER_LAYER_NORM_RE = re.compile(
     r"((?:encoder|decoder)(?:\.layers\.\d+)?\.(?:self_attn_layer_norm|"
     r"encoder_attn_layer_norm|final_layer_norm|layer_norm))\.(weight|bias)"
 )
-_WHISPER_EMBED_POSITIONS_RE = re.compile(
-    r"(encoder)\.embed_positions\.weight"
+_WHISPER_EMBED_RE = re.compile(
+    r"((?:encoder|decoder)\.embed_(?:positions|tokens))\.weight"
 )
 _WHISPER_OUT_PROJ_RE = re.compile(
     r"((?:encoder|decoder)\.layers\.\d+\.(?:self_attn|encoder_attn))\.out_proj\.(weight|bias)"
@@ -216,8 +221,11 @@ def load_weights(model, model_path: str, model_type: str = "llama") -> None:
                         prefix, wb = m_ln.groups()
                         mapped_name = f"{prefix}.norm.{wb}"
 
-                    # encoder.embed_positions is now an nn.Embedding;
-                    # checkpoint name uses 'weight' which matches directly.
+                    # Embedding L1 wrapper nesting: *.weight -> *.emb.weight
+                    m_emb = _WHISPER_EMBED_RE.match(mapped_name)
+                    if m_emb:
+                        prefix = m_emb.group(1)
+                        mapped_name = f"{prefix}.emb.weight"
 
                     # Create fake zero bias for k_proj (HF checkpoint has
                     # no k_proj bias, but our QKVParallelLinear expects one
@@ -313,7 +321,7 @@ def load_weights(model, model_path: str, model_type: str = "llama") -> None:
                 # Remap learned pos embed nesting (Qwen3-VL)
                 if is_qwen3_vl:
                     if _VISION_POS_EMBED_RE.match(mapped_name):
-                        mapped_name = "visual.pos_embed_interp.pos_embed"
+                        mapped_name = "visual.pos_embed_interp._embed.weight"
 
                 # Remap vision param names for L1 wrapper nesting
                 if is_qwen_vl:
@@ -428,6 +436,9 @@ def load_weights(model, model_path: str, model_type: str = "llama") -> None:
                     continue
                 if "rotary_emb" in mapped_name:
                     continue
+                m_emb_w = _EMBED_WEIGHT_RE.match(mapped_name)
+                if m_emb_w:
+                    mapped_name = f"{m_emb_w.group(1)}.embedding_op.emb.weight"
                 try:
                     param = model.get_parameter(mapped_name)
                 except AttributeError:
@@ -437,8 +448,8 @@ def load_weights(model, model_path: str, model_type: str = "llama") -> None:
                 loaded += 1
 
                 # Whisper: duplicate decoder embed_tokens -> lm_head (tied weights)
-                if is_whisper and mapped_name == "decoder.embed_tokens.weight":
-                    lm_param = model.get_parameter("lm_head.weight")
+                if is_whisper and mapped_name == "decoder.embed_tokens.emb.weight":
+                    lm_param = model.get_parameter("lm_head.embedding_op.emb.weight")
                     lm_loader = getattr(lm_param, "weight_loader", default_weight_loader)
                     lm_loader(lm_param, f.get_tensor(weight_name))
                     loaded += 1

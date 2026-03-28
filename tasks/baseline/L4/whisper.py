@@ -105,7 +105,7 @@ class WhisperEncoder(nn.Module):
         ])
         self.layer_norm = LayerNorm(embed_dim)
 
-        self.embed_positions = nn.Embedding(config.max_source_positions, embed_dim)
+        self.embed_positions = Embedding(config.max_source_positions, embed_dim)
 
     def forward(self, input_features: torch.Tensor) -> torch.Tensor:
         """
@@ -120,7 +120,7 @@ class WhisperEncoder(nn.Module):
         hidden_states = hidden_states.transpose(-1, -2)
 
         T_enc = hidden_states.shape[1]
-        hidden_states = hidden_states + self.embed_positions.weight[:T_enc].to(hidden_states.dtype)
+        hidden_states = hidden_states + self.embed_positions.emb.weight[:T_enc].to(hidden_states.dtype)
 
         for layer in self.layers:
             hidden_states = layer(hidden_states)
@@ -135,16 +135,15 @@ class WhisperDecoder(nn.Module):
         self.max_target_positions = config.max_target_positions
         self.d_model = config.d_model
 
-        self.embed_tokens = nn.Embedding(config.vocab_size, config.d_model,
-                                         padding_idx=config.pad_token_id)
-        self.embed_positions = nn.Embedding(config.max_target_positions, config.d_model)
+        self.embed_tokens = Embedding(config.vocab_size, config.d_model,
+                                       padding_idx=config.pad_token_id)
+        self.embed_positions = Embedding(config.max_target_positions, config.d_model)
 
         self.layers = nn.ModuleList([
             WhisperDecoderLayer(config)
             for _ in range(config.decoder_layers)
         ])
         self.layer_norm = LayerNorm(config.d_model)
-        self.embedding_op = Embedding()
 
     def forward(
         self,
@@ -159,8 +158,8 @@ class WhisperDecoder(nn.Module):
             encoder_hidden_states: [N_enc, D] flat encoder outputs for NEW
                 requests, or None when all are in decode phase.
         """
-        inputs_embeds = self.embedding_op(input_ids, self.embed_tokens.weight)
-        pos_embeds = self.embedding_op(positions, self.embed_positions.weight)
+        inputs_embeds = self.embed_tokens(input_ids)
+        pos_embeds = self.embed_positions(positions)
         hidden_states = inputs_embeds + pos_embeds
 
         for layer in self.layers:
