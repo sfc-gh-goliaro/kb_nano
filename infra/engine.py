@@ -122,6 +122,11 @@ class Sequence:
         self.video_grid_thw = None
         self.mrope_position_delta: int = 0
         self.mrope_positions = None  # (3, seq_len) tensor computed at prefill
+        # Encoder-decoder fields (Whisper)
+        self.encoder_features: torch.Tensor | None = None  # [num_mel_bins, T] log-mel
+        self.encoder_seq_len: int = 0  # num encoder tokens (after conv)
+        self.cross_block_table: list[int] = []  # paged KV blocks for cross-attn
+        self.encoder_computed: bool = False  # True after encoder has run
 
     def __len__(self):
         if self.token_ids is not None:
@@ -162,7 +167,9 @@ class Sequence:
         self.token_ids = list(self.prompt_ids)
         self.generated_ids.clear()
         self.block_table.clear()
+        self.cross_block_table.clear()
         self.num_computed_tokens = 0
+        self.encoder_computed = False
         self.status = SeqStatus.WAITING
 
     def append_token(self, token_id):
@@ -197,6 +204,8 @@ class BlockManager:
     def reset(self):
         """Return all blocks to the free pool."""
         self.free_block_ids = deque(range(self._num_blocks))
+        if hasattr(self, '_num_cross_blocks'):
+            self.cross_free_block_ids = deque(range(self._num_cross_blocks))
 
     def can_allocate(self, seq):
         return len(self.free_block_ids) >= seq.num_blocks
@@ -223,13 +232,19 @@ class BlockManager:
         self.free_block_ids.extend(seq.block_table)
         seq.block_table.clear()
 
+    def deallocate_cross(self, seq):
+        """Return cross-attention KV blocks to the cross-attn free pool."""
+        if hasattr(self, 'cross_free_block_ids') and seq.cross_block_table:
+            self.cross_free_block_ids.extend(seq.cross_block_table)
+            seq.cross_block_table.clear()
+
 
 # ---------------------------------------------------------------------------
 # ModelRunner — runs on EACH TP rank
 # ---------------------------------------------------------------------------
 class ModelRunner:
     def __init__(self, model_name: str, rank: int, world_size: int,
-                 dtype: torch.dtype, enforce_eager: bool,
+                 dtype: torch.dtype | None, enforce_eager: bool,
                  event, shm_name: str,
                  gpu_memory_utilization: float = 0.9,
                  max_model_len: int = MAX_MODEL_LEN,
@@ -263,6 +278,14 @@ class ModelRunner:
                 )
                 set_custom_ar(self.custom_ar)
 
+        if dtype is None:
+            from transformers import AutoConfig
+            _cfg = AutoConfig.from_pretrained(model_name)
+            cfg_dtype = getattr(_cfg, "torch_dtype", None)
+            if cfg_dtype is not None and isinstance(cfg_dtype, torch.dtype):
+                dtype = cfg_dtype
+            else:
+                dtype = torch.bfloat16
         self.dtype = dtype
         default_dtype = torch.get_default_dtype()
         torch.set_default_dtype(dtype)
@@ -273,6 +296,13 @@ class ModelRunner:
         )
         self.is_moe = hasattr(self.config, "num_local_experts")
         self.is_qwen_vl = hasattr(self.config, "mrope_section")
+        self.is_whisper = getattr(self.config, "is_encoder_decoder", False)
+        if self.is_whisper:
+            self.enforce_eager = True
+            self.max_model_len = min(
+                self.max_model_len,
+                getattr(self.config, "max_target_positions", self.max_model_len),
+            )
         self._share_trtllm_workspace()
         self._share_activation_buffers()
         self.warmup_model()
@@ -364,9 +394,13 @@ class ModelRunner:
         if not ATTN_BACKEND_CONFIG.use_trtllm:
             return
         self._attn_layers = []
+        self._cross_attn_layers = []
         for module in self.model.modules():
             if hasattr(module, "k_cache") and hasattr(module, "v_cache"):
-                self._attn_layers.append(module)
+                if getattr(module, "is_cross_attn", False):
+                    self._cross_attn_layers.append(module)
+                else:
+                    self._attn_layers.append(module)
         trtllm_workspace = torch.zeros(
             512 * 1024 * 1024, dtype=torch.uint8, device=f"cuda:{self.rank}"
         )
@@ -398,10 +432,13 @@ class ModelRunner:
         if self.is_qwen_vl:
             self._warmup_vision_encoder()
 
-        warmup_len = min(self.max_model_len, self.max_num_batched_tokens)
-        num_seqs = min(self.max_num_batched_tokens // warmup_len, self.max_num_seqs)
-        seqs = [Sequence([0] * warmup_len) for _ in range(num_seqs)]
-        self.run(seqs, True)
+        if self.is_whisper:
+            self._warmup_whisper()
+        else:
+            warmup_len = min(self.max_model_len, self.max_num_batched_tokens)
+            num_seqs = min(self.max_num_batched_tokens // warmup_len, self.max_num_seqs)
+            seqs = [Sequence([0] * warmup_len) for _ in range(num_seqs)]
+            self.run(seqs, True)
 
         torch.cuda.empty_cache()
 
@@ -472,6 +509,34 @@ class ModelRunner:
         torch.cuda.empty_cache()
         if self.rank == 0:
             print(f"  DeepGEMM warmup: {len(seen_shapes)} unique FP8 weight shapes")
+
+    def _warmup_whisper(self):
+        """Warmup Whisper encoder + decoder with dummy audio input.
+
+        Exercises the full forward path: encoder -> cross-attn KV write ->
+        decoder prefill with cross-attn read.
+        """
+        config = self.config
+        num_mel_bins = config.num_mel_bins
+        max_source_positions = config.max_source_positions
+        max_target_positions = config.max_target_positions
+
+        T_mel = max_source_positions * 2
+        dummy_features = torch.randn(
+            1, num_mel_bins, T_mel,
+            device=f"cuda:{self.rank}", dtype=torch.get_default_dtype(),
+        )
+        with torch.inference_mode():
+            encoder_outputs = self.model.get_multimodal_embeddings(dummy_features)
+
+        warmup_len = min(max_target_positions, self.max_num_batched_tokens)
+        num_seqs = min(self.max_num_batched_tokens // warmup_len, self.max_num_seqs)
+        seqs = [Sequence([0] * warmup_len) for _ in range(num_seqs)]
+        self.run(seqs, True)
+
+        if self.rank == 0:
+            print(f"  Whisper warmup: encoder T_mel={T_mel}, "
+                  f"decoder warmup_len={warmup_len}")
 
     def _warmup_vision_encoder(self):
         """Run vision encoder with worst-case dummy inputs to capture peak
@@ -573,9 +638,13 @@ class ModelRunner:
     def allocate_kv_cache(self):
         if not hasattr(self, '_attn_layers') or not self._attn_layers:
             self._attn_layers = []
+            self._cross_attn_layers = []
             for module in self.model.modules():
                 if hasattr(module, "k_cache") and hasattr(module, "v_cache"):
-                    self._attn_layers.append(module)
+                    if getattr(module, "is_cross_attn", False):
+                        self._cross_attn_layers.append(module)
+                    else:
+                        self._attn_layers.append(module)
 
         free, total = torch.cuda.mem_get_info()
         used = total - free
@@ -583,10 +652,56 @@ class ModelRunner:
         current = torch.cuda.memory_stats()["allocated_bytes.all.current"]
         num_kv_heads = self.config.num_key_value_heads // self.world_size
         head_dim = self.config.head_dim
-        num_layers = self.config.num_hidden_layers
+        num_self_attn_layers = len(self._attn_layers)
+        num_cross_attn_layers = len(self._cross_attn_layers)
         elem_size = torch.finfo(torch.get_default_dtype()).bits // 8
-        block_bytes = 2 * num_layers * BLOCK_SIZE * num_kv_heads * head_dim * elem_size
-        num_blocks = int(total * self.gpu_memory_utilization - used - peak + current) // block_bytes
+
+        available_bytes = int(total * self.gpu_memory_utilization - used - peak + current)
+
+        if num_cross_attn_layers > 0:
+            max_encoder_tokens = getattr(self.config, 'max_source_positions', 1500)
+            cross_blocks_per_seq = (max_encoder_tokens + BLOCK_SIZE - 1) // BLOCK_SIZE
+            cross_block_bytes = (
+                2 * num_cross_attn_layers * BLOCK_SIZE * num_kv_heads * head_dim * elem_size
+            )
+            cross_bytes_per_seq = cross_blocks_per_seq * cross_block_bytes
+            max_cross_seqs = min(
+                self.max_num_seqs,
+                max(1, int(available_bytes * 0.5) // cross_bytes_per_seq),
+            )
+            self.max_num_seqs = max_cross_seqs
+            num_cross_blocks = cross_blocks_per_seq * max_cross_seqs
+            cross_cache_bytes = num_cross_blocks * cross_block_bytes
+            available_bytes -= cross_cache_bytes
+
+            self.num_cross_blocks = num_cross_blocks
+            self.cross_blocks_per_seq = cross_blocks_per_seq
+            self.max_encoder_tokens = max_encoder_tokens
+
+            if ATTN_BACKEND_CONFIG.kv_layout == "HND":
+                self.cross_kv_cache = torch.empty(
+                    2, num_cross_attn_layers, num_cross_blocks,
+                    num_kv_heads, BLOCK_SIZE, head_dim,
+                )
+            else:
+                self.cross_kv_cache = torch.empty(
+                    2, num_cross_attn_layers, num_cross_blocks,
+                    BLOCK_SIZE, num_kv_heads, head_dim,
+                )
+            for i, module in enumerate(self._cross_attn_layers):
+                module.k_cache = self.cross_kv_cache[0, i]
+                module.v_cache = self.cross_kv_cache[1, i]
+
+            self._cross_free_block_ids_init = num_cross_blocks
+            if self.rank == 0:
+                print(f"  Cross-attn KV cache: {num_cross_blocks} blocks "
+                      f"({cross_blocks_per_seq} per seq x {max_cross_seqs} seqs, "
+                      f"capped from {_DEFAULT_MAX_NUM_SEQS})")
+
+        self_attn_block_bytes = (
+            2 * num_self_attn_layers * BLOCK_SIZE * num_kv_heads * head_dim * elem_size
+        )
+        num_blocks = available_bytes // self_attn_block_bytes
         if self.is_qwen_vl:
             num_blocks = int(num_blocks * 0.95)
         assert num_blocks > 0, f"Not enough GPU memory for KV cache on rank {self.rank}"
@@ -596,17 +711,15 @@ class ModelRunner:
 
         if ATTN_BACKEND_CONFIG.kv_layout == "HND":
             self.kv_cache = torch.empty(
-                2, num_layers, num_blocks, num_kv_heads, BLOCK_SIZE, head_dim,
+                2, num_self_attn_layers, num_blocks, num_kv_heads, BLOCK_SIZE, head_dim,
             )
         else:
             self.kv_cache = torch.empty(
-                2, num_layers, num_blocks, BLOCK_SIZE, num_kv_heads, head_dim,
+                2, num_self_attn_layers, num_blocks, BLOCK_SIZE, num_kv_heads, head_dim,
             )
-        layer_id = 0
-        for module in self._attn_layers:
-            module.k_cache = self.kv_cache[0, layer_id]
-            module.v_cache = self.kv_cache[1, layer_id]
-            layer_id += 1
+        for i, module in enumerate(self._attn_layers):
+            module.k_cache = self.kv_cache[0, i]
+            module.v_cache = self.kv_cache[1, i]
 
         if self.rank == 0:
             cfg = ATTN_BACKEND_CONFIG
@@ -721,6 +834,7 @@ class ModelRunner:
             block_tables=torch.from_numpy(bt).pin_memory().cuda(non_blocking=True),
             max_context_len=max_cl,
         )
+        self._apply_pending_cross_ctx()
         if use_mrope:
             positions_t = torch.from_numpy(mrope_pos).pin_memory().cuda(non_blocking=True)
         else:
@@ -849,12 +963,16 @@ class ModelRunner:
 
     @torch.inference_mode()
     def run_model(self, input_ids, positions, is_prefill, inputs_embeds=None,
-                  deepstack_embeds=None):
+                  deepstack_embeds=None, encoder_outputs=None):
         if is_prefill or self.enforce_eager or input_ids.size(0) > self.graph_bs_list[-1]:
             if inputs_embeds is not None:
                 return self.model.compute_logits(
                     self.model(input_ids, positions, inputs_embeds=inputs_embeds,
                                deepstack_embeds=deepstack_embeds)
+                )
+            if encoder_outputs is not None:
+                return self.model.compute_logits(
+                    self.model(input_ids, positions, encoder_outputs=encoder_outputs)
                 )
             return self.model.compute_logits(self.model(input_ids, positions))
         bs = input_ids.size(0)
@@ -963,9 +1081,10 @@ class ModelRunner:
             block_tables=block_tables,
             max_context_len=int(cl_np.max()),
         )
+        self._apply_pending_cross_ctx()
         hidden = self.model(input_ids, positions)
         lm_head = self.model.lm_head
-        logits = lm_head.linear_op(hidden, lm_head.weight).float()
+        logits = lm_head.linear_op(hidden, lm_head.embedding_op.emb.weight).float()
         max_vals, max_idxs = logits.max(dim=-1)
         reset_context()
 
@@ -1239,6 +1358,170 @@ class ModelRunner:
         reset_context()
         return result
 
+    # ------------------------------------------------------------------
+    # Whisper cross-attention context helpers
+    # ------------------------------------------------------------------
+
+    def _set_cross_attn_context_prefill(self, prefill_seqs, prefill_chunk_sizes,
+                                        encoder_seqs):
+        """Set cross-attention metadata on the global Context for prefill.
+
+        For sequences with new encoder outputs: builds slot_mapping for
+        writing encoder K/V to paged cache, and cu_seqlens for Q (decoder
+        tokens) x K (encoder tokens) non-causal attention.
+
+        For decode sequences in a mixed batch, cross-attn context is also
+        needed (handled by the mixed path caller).
+        """
+        ctx = get_context()
+        block_size = BLOCK_SIZE
+
+        # Cross-attn slot mapping: for NEW encoder outputs being written to cache
+        cross_slot_mapping = []
+        for seq in encoder_seqs:
+            enc_len = seq.encoder_seq_len
+            for p in range(enc_len):
+                block_idx = seq.cross_block_table[p // block_size]
+                cross_slot_mapping.append(block_idx * block_size + (p % block_size))
+
+        # Q = decoder tokens (for each prefill seq, chunk_size tokens)
+        # K = encoder tokens (encoder_seq_len per seq)
+        cross_cu_q, cross_cu_k = [0], [0]
+        cross_max_sq, cross_max_sk = 0, 0
+        cross_max_bt = 0
+        for seq, chunk in zip(prefill_seqs, prefill_chunk_sizes):
+            cross_cu_q.append(cross_cu_q[-1] + chunk)
+            enc_len = seq.encoder_seq_len
+            cross_cu_k.append(cross_cu_k[-1] + enc_len)
+            cross_max_sq = max(chunk, cross_max_sq)
+            cross_max_sk = max(enc_len, cross_max_sk)
+            blen = len(seq.cross_block_table)
+            if blen > cross_max_bt:
+                cross_max_bt = blen
+
+        cross_bt = None
+        if cross_max_bt > 0:
+            n = len(prefill_seqs)
+            bt_arr = np.full((n, cross_max_bt), -1, dtype=np.int32)
+            for i, seq in enumerate(prefill_seqs):
+                b = seq.cross_block_table
+                bt_arr[i, :len(b)] = b
+            cross_bt = torch.from_numpy(bt_arr).pin_memory().cuda(non_blocking=True)
+
+        ctx.cross_slot_mapping = (
+            torch.tensor(cross_slot_mapping, dtype=torch.int32, pin_memory=True).cuda(non_blocking=True)
+            if cross_slot_mapping else None
+        )
+        ctx.cross_cu_seqlens_q = torch.tensor(
+            cross_cu_q, dtype=torch.int32, pin_memory=True).cuda(non_blocking=True)
+        ctx.cross_cu_seqlens_k = torch.tensor(
+            cross_cu_k, dtype=torch.int32, pin_memory=True).cuda(non_blocking=True)
+        ctx.cross_max_seqlen_q = cross_max_sq
+        ctx.cross_max_seqlen_k = cross_max_sk
+        ctx.cross_block_tables = cross_bt
+
+    def _set_cross_attn_context_decode(self, decode_seqs):
+        """Set cross-attention metadata on the global Context for decode.
+
+        Each decode token attends to the full encoder output via paged cache.
+        Also stores the tensors as instance state so they can be applied to
+        any Context created later (e.g., by the greedy eager decode path).
+        """
+        n = len(decode_seqs)
+        cross_cl = np.empty(n, dtype=np.int32)
+        cross_max_bt = 0
+        for i, seq in enumerate(decode_seqs):
+            cross_cl[i] = seq.encoder_seq_len
+            blen = len(seq.cross_block_table)
+            if blen > cross_max_bt:
+                cross_max_bt = blen
+
+        cross_bt = np.full((n, cross_max_bt), -1, dtype=np.int32)
+        for i, seq in enumerate(decode_seqs):
+            b = seq.cross_block_table
+            cross_bt[i, :len(b)] = b
+
+        self._pending_cross_ctx = {
+            "cross_context_lens": torch.from_numpy(cross_cl).pin_memory().cuda(non_blocking=True),
+            "cross_block_tables": torch.from_numpy(cross_bt).pin_memory().cuda(non_blocking=True),
+            "cross_max_context_len": int(cross_cl.max()) if n > 0 else 0,
+        }
+        self._apply_pending_cross_ctx()
+
+    def _apply_pending_cross_ctx(self):
+        """Apply pending cross-attention context to the current global Context."""
+        pending = getattr(self, '_pending_cross_ctx', None)
+        if pending is None:
+            return
+        ctx = get_context()
+        ctx.cross_slot_mapping = None
+        ctx.cross_context_lens = pending["cross_context_lens"]
+        ctx.cross_block_tables = pending["cross_block_tables"]
+        ctx.cross_max_context_len = pending["cross_max_context_len"]
+
+    def _clear_pending_cross_ctx(self):
+        self._pending_cross_ctx = None
+
+    def _set_cross_attn_context_mixed(self, prefill_seqs, prefill_chunk_sizes,
+                                      decode_seqs, encoder_seqs):
+        """Set cross-attention metadata for mixed prefill+decode batch.
+
+        Prefill seqs: Q = chunked decoder tokens, K = encoder tokens (from paged cache).
+        Decode seqs: Q = 1 token each, K = encoder tokens (from paged cache).
+        Both use non-causal attention via the prefill kernel with block tables.
+        """
+        ctx = get_context()
+        block_size = BLOCK_SIZE
+
+        # Cross-attn slot mapping for NEW encoder outputs
+        cross_slot_mapping = []
+        for seq in encoder_seqs:
+            enc_len = seq.encoder_seq_len
+            for p in range(enc_len):
+                block_idx = seq.cross_block_table[p // block_size]
+                cross_slot_mapping.append(block_idx * block_size + (p % block_size))
+
+        # Build unified cu_seqlens: prefill seqs first, then decode seqs
+        all_seqs = list(prefill_seqs) + list(decode_seqs)
+        cross_cu_q, cross_cu_k = [0], [0]
+        cross_max_sq, cross_max_sk = 0, 0
+        cross_max_bt = 0
+
+        for idx, seq in enumerate(all_seqs):
+            if idx < len(prefill_seqs):
+                q_tokens = prefill_chunk_sizes[idx]
+            else:
+                q_tokens = 1
+            enc_len = seq.encoder_seq_len
+            cross_cu_q.append(cross_cu_q[-1] + q_tokens)
+            cross_cu_k.append(cross_cu_k[-1] + enc_len)
+            cross_max_sq = max(q_tokens, cross_max_sq)
+            cross_max_sk = max(enc_len, cross_max_sk)
+            blen = len(seq.cross_block_table)
+            if blen > cross_max_bt:
+                cross_max_bt = blen
+
+        cross_bt = None
+        if cross_max_bt > 0:
+            n = len(all_seqs)
+            bt_arr = np.full((n, cross_max_bt), -1, dtype=np.int32)
+            for i, seq in enumerate(all_seqs):
+                b = seq.cross_block_table
+                bt_arr[i, :len(b)] = b
+            cross_bt = torch.from_numpy(bt_arr).pin_memory().cuda(non_blocking=True)
+
+        ctx.cross_slot_mapping = (
+            torch.tensor(cross_slot_mapping, dtype=torch.int32, pin_memory=True).cuda(non_blocking=True)
+            if cross_slot_mapping else None
+        )
+        ctx.cross_cu_seqlens_q = torch.tensor(
+            cross_cu_q, dtype=torch.int32, pin_memory=True).cuda(non_blocking=True)
+        ctx.cross_cu_seqlens_k = torch.tensor(
+            cross_cu_k, dtype=torch.int32, pin_memory=True).cuda(non_blocking=True)
+        ctx.cross_max_seqlen_q = cross_max_sq
+        ctx.cross_max_seqlen_k = cross_max_sk
+        ctx.cross_block_tables = cross_bt
+
     @torch.inference_mode()
     def capture_cudagraph(self):
         from contextlib import nullcontext
@@ -1272,12 +1555,12 @@ class ModelRunner:
                     max_context_len=self.max_model_len,
                 )
                 outputs[:bs] = self.model(input_ids[:bs], positions[:bs])
-                lm_logits[:bs] = lm_head.linear_op(outputs[:bs], lm_head.weight).float()
+                lm_logits[:bs] = lm_head.linear_op(outputs[:bs], lm_head.embedding_op.emb.weight).float()
                 lm_max_vals[:bs], lm_max_idxs[:bs] = lm_logits[:bs].max(dim=-1)
 
                 with torch.cuda.graph(graph, self.graph_pool):
                     outputs[:bs] = self.model(input_ids[:bs], positions[:bs])
-                    lm_logits[:bs] = lm_head.linear_op(outputs[:bs], lm_head.weight).float()
+                    lm_logits[:bs] = lm_head.linear_op(outputs[:bs], lm_head.embedding_op.emb.weight).float()
                     lm_max_vals[:bs], lm_max_idxs[:bs] = lm_logits[:bs].max(dim=-1)
 
                 if self.graph_pool is None:
@@ -1308,7 +1591,7 @@ class LlamaEngine:
         self,
         model_name: str = "meta-llama/Llama-3.1-8B-Instruct",
         device: str = "cuda",
-        dtype: torch.dtype = torch.bfloat16,
+        dtype: torch.dtype | None = None,
         seed: int = 42,
         enforce_eager: bool = False,
         tensor_parallel_size: int = 1,
@@ -1356,6 +1639,13 @@ class LlamaEngine:
             **mr_kwargs,
         )
         self.block_manager = BlockManager(self.model_runner.num_blocks)
+        if hasattr(self.model_runner, '_cross_free_block_ids_init'):
+            n = self.model_runner._cross_free_block_ids_init
+            self.block_manager.cross_free_block_ids = deque(range(n))
+            self.block_manager._num_cross_blocks = n
+        if hasattr(self.model_runner, 'cross_blocks_per_seq'):
+            self.cross_blocks_per_seq = self.model_runner.cross_blocks_per_seq
+        self.max_num_seqs = self.model_runner.max_num_seqs
         print(f"  Scheduling: max_num_seqs={self.max_num_seqs}, "
               f"max_num_batched_tokens={self.max_num_batched_tokens}")
 
@@ -1364,12 +1654,17 @@ class LlamaEngine:
             self.tokenizer.pad_token_id = self.tokenizer.eos_token_id
 
         self.is_qwen_vl = self.model_runner.is_qwen_vl
+        self.is_whisper = self.model_runner.is_whisper
         self.processor = None
         if self.is_qwen_vl:
             from transformers import AutoProcessor
             self.processor = AutoProcessor.from_pretrained(model_name)
 
         self.encoder_cache: dict[int, tuple] = {}
+
+        if self.is_whisper:
+            from transformers import WhisperProcessor
+            self.whisper_processor = WhisperProcessor.from_pretrained(model_name)
 
         atexit.register(self._cleanup)
 
@@ -1602,13 +1897,20 @@ class LlamaEngine:
 
     @torch.inference_mode()
     def generate(self, prompts, sampling_params, collect_logits: bool = False,
-                 images=None, videos=None, use_tqdm: bool = False):
+                 images=None, videos=None, audio_features=None,
+                 use_tqdm: bool = False):
         """Generate completions for a batch of prompts.
 
         Uses unified chunked-prefill scheduling: every GPU step processes
         both decode tokens (for running seqs) and prefill chunks (for
         new/continuing seqs) in a single forward pass, matching vLLM's
         approach.
+
+        For Whisper (encoder-decoder), audio_features is a list of
+        [num_mel_bins, T] log-mel spectrogram tensors. The encoder runs
+        during the first prefill step and cross-attention KV is written
+        to paged cache. No chunked prefill for encoder-decoder (matching
+        vLLM).
         """
         if isinstance(sampling_params, list):
             sp_list = sampling_params
@@ -1631,16 +1933,37 @@ class LlamaEngine:
             images = [None] * len(prompts)
         if videos is None:
             videos = [None] * len(prompts)
+        if audio_features is None:
+            audio_features = [None] * len(prompts)
 
         _preprocess_t0 = time.perf_counter()
+
+        # Whisper: compute encoder output length from mel spectrogram length.
+        # Two conv layers with stride 2 => T_enc = T_mel // 4 (rounded down
+        # by convolutions, but padding ensures it's close to T_mel // 2 per layer).
+        # More precisely: after conv1 with kernel=3, stride=1, padding=1: T_out = T_mel
+        # after conv2 with kernel=3, stride=2, padding=1: T_out = (T_mel + 1) // 2
+        # Then the max is clamped to max_source_positions (1500).
+        def _whisper_encoder_tokens(mel_T):
+            return min((mel_T + 1) // 2, getattr(self.model_runner.config, 'max_source_positions', 1500))
 
         def _make_seq(i):
             prompt = prompts[i]
             sp = sp_list[i]
             img = images[i] if i < len(images) else None
             vid = videos[i] if i < len(videos) else None
+            aud = audio_features[i] if i < len(audio_features) else None
 
-            if self.is_qwen_vl and (img is not None or vid is not None):
+            if self.is_whisper and aud is not None:
+                ids = prompt if isinstance(prompt, list) else self.tokenizer.encode(prompt)
+                max_toks = min(sp.max_tokens,
+                               self.model_runner.max_model_len - len(ids))
+                seq = Sequence(ids, max_tokens=max_toks, ignore_eos=sp.ignore_eos)
+                seq.encoder_features = aud
+                mel_T = aud.shape[-1]
+                seq.encoder_seq_len = _whisper_encoder_tokens(mel_T)
+                return seq
+            elif self.is_qwen_vl and (img is not None or vid is not None):
                 (ids, pixel_values, image_grid_thw,
                  video_pv, video_grid_thw) = self._preprocess_multimodal(
                     prompt, images=img, videos=vid,
@@ -1744,6 +2067,7 @@ class LlamaEngine:
             nonlocal _pbar_pending, _pbar_pending_in, _pbar_pending_out
             seq.status = SeqStatus.FINISHED
             bm.deallocate(seq)
+            bm.deallocate_cross(seq)
             self.encoder_cache.pop(id(seq), None)
             if pbar is not None:
                 _pbar_pending += 1
@@ -1794,6 +2118,8 @@ class LlamaEngine:
 
                     mr = self.model_runner
                     n_dc = len(decode_seqs)
+                    if self.is_whisper:
+                        mr._set_cross_attn_context_decode(decode_seqs)
                     decode_data = mr._prepare_decode_arrays(decode_seqs)
                     if _PROFILE:
                         _fp_t1 = time.perf_counter()
@@ -1833,6 +2159,7 @@ class LlamaEngine:
                             _fp['post'] += _fp_t4 - _fp_t3
                             _fp['n'] += 1
 
+                        _whisper_fast = self.is_whisper
                         use_incr = True
                         while running and not waiting and not prefilling:
                             if any_finished:
@@ -1840,6 +2167,8 @@ class LlamaEngine:
                                 n_dc = len(decode_seqs)
                                 any_finished = False
                                 use_incr = False
+                                if _whisper_fast:
+                                    mr._set_cross_attn_context_decode(decode_seqs)
 
                             need_blocks = 0
                             for seq in decode_seqs:
@@ -1912,6 +2241,8 @@ class LlamaEngine:
                     for seq in decode_seqs:
                         if len(seq) % block_size == 1:
                             seq.block_table.append(bm.free_block_ids.popleft())
+                    if self.is_whisper:
+                        self.model_runner._set_cross_attn_context_decode(decode_seqs)
                     result = self.model_runner.call("run", decode_seqs, False)
                     if result is not None:
                         if collect_logits:
@@ -1948,6 +2279,7 @@ class LlamaEngine:
                 if needs_block:
                     if not bm.free_block_ids:
                         bm.deallocate(seq)
+                        bm.deallocate_cross(seq)
                         seq.preempt()
                         waiting.appendleft(seq)
                         continue
@@ -1997,7 +2329,19 @@ class LlamaEngine:
                     getattr(seq, 'pixel_values', None) is not None
                     or getattr(seq, 'video_pixel_values', None) is not None)
 
-                if has_mm:
+                is_whisper_seq = (seq.encoder_features is not None)
+
+                if is_whisper_seq:
+                    # No chunked prefill for encoder-decoder (matching vLLM).
+                    chunk = prompt_len
+                    if chunk > token_budget:
+                        break
+                    # Check cross-attn block availability
+                    cross_blocks_needed = getattr(self, 'cross_blocks_per_seq', 0)
+                    cross_free = len(getattr(bm, 'cross_free_block_ids', []))
+                    if cross_blocks_needed > 0 and cross_free < cross_blocks_needed:
+                        break
+                elif has_mm:
                     chunk = min(prompt_len, token_budget)
                     if chunk > encoder_budget:
                         break
@@ -2016,6 +2360,9 @@ class LlamaEngine:
                     break
                 waiting.popleft()
                 bm.allocate_n(seq, blocks_needed)
+                if is_whisper_seq and cross_blocks_needed > 0:
+                    for _ in range(cross_blocks_needed):
+                        seq.cross_block_table.append(bm.cross_free_block_ids.popleft())
                 seq.status = SeqStatus.PREFILLING
                 prefill_seqs.append(seq)
                 prefill_chunk_sizes.append(chunk)
@@ -2062,8 +2409,29 @@ class LlamaEngine:
                     _sp["mixed_text_pf_tokens"] += sum(prefill_chunk_sizes)
                     _sp["mixed_text_dc_tokens"] += n_dc
 
+            # ----- Whisper: run encoder for new prefill seqs -----
+            encoder_outputs = None
+            encoder_seqs = []
+            if self.is_whisper and n_pf > 0:
+                encoder_seqs = [s for s in prefill_seqs
+                                if s.encoder_features is not None and not s.encoder_computed]
+                if encoder_seqs:
+                    model = self.model_runner.model
+                    features_batch = torch.stack([
+                        s.encoder_features.to(
+                            device=f"cuda:{self.model_runner.rank}",
+                            dtype=self.model_runner.dtype,
+                        ) for s in encoder_seqs
+                    ], dim=0)
+                    encoder_outputs = model.get_multimodal_embeddings(features_batch)
+                    for seq, enc_out in zip(encoder_seqs, encoder_outputs):
+                        seq.encoder_computed = True
+                        seq.encoder_seq_len = enc_out.shape[0]
+
             if n_pf == 0 and use_greedy:
                 # Pure decode with CUDA graphs (fast path)
+                if self.is_whisper:
+                    self.model_runner._set_cross_attn_context_decode(decode_seqs)
                 gpu_result = self.model_runner.call_decode_greedy(decode_seqs)
                 if gpu_result is not None:
                     token_ids = gpu_result.tolist()
@@ -2084,6 +2452,8 @@ class LlamaEngine:
                     running.extend(decode_seqs)
             elif n_pf == 0:
                 # Pure decode, non-greedy
+                if self.is_whisper:
+                    self.model_runner._set_cross_attn_context_decode(decode_seqs)
                 result = self.model_runner.call("run", decode_seqs, False)
                 if result is not None:
                     if collect_logits:
@@ -2126,6 +2496,17 @@ class LlamaEngine:
                     if _step_profile_active:
                         torch.cuda.synchronize()
                         step_profile["mm_prefill_time"] += time.perf_counter() - _spt0
+                elif self.is_whisper and encoder_outputs:
+                    input_ids_t, positions_t = self.model_runner.prepare_mixed_batch(
+                        prefill_seqs, prefill_chunk_sizes, [],
+                    )
+                    self.model_runner._set_cross_attn_context_prefill(
+                        prefill_seqs, prefill_chunk_sizes, encoder_seqs)
+                    logits = self.model_runner.run_model(
+                        input_ids_t, positions_t, True,
+                        encoder_outputs=encoder_outputs,
+                    )
+                    reset_context()
                 else:
                     logits = self.model_runner.call(
                         "run_mixed", prefill_seqs, prefill_chunk_sizes, [],
@@ -2172,6 +2553,18 @@ class LlamaEngine:
                     if _step_profile_active:
                         torch.cuda.synchronize()
                         step_profile["mixed_mm_time"] += time.perf_counter() - _spt0
+                elif self.is_whisper:
+                    input_ids_t, positions_t = self.model_runner.prepare_mixed_batch(
+                        prefill_seqs, prefill_chunk_sizes, decode_seqs,
+                    )
+                    self.model_runner._set_cross_attn_context_mixed(
+                        prefill_seqs, prefill_chunk_sizes, decode_seqs,
+                        encoder_seqs)
+                    logits = self.model_runner.run_model(
+                        input_ids_t, positions_t, True,
+                        encoder_outputs=encoder_outputs if encoder_outputs else [],
+                    )
+                    reset_context()
                 else:
                     logits = self.model_runner.call(
                         "run_mixed", prefill_seqs, prefill_chunk_sizes, decode_seqs,
@@ -2288,3 +2681,4 @@ class LlamaEngine:
                     bm.deallocate(seq)
             else:
                 running.append(seq)
+

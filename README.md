@@ -1,11 +1,13 @@
 # kb-nano
 
-A standalone, high-performance LLM inference engine supporting **Llama 3.1** and **Mixtral-8x7B** with tensor parallelism. No vLLM dependency at runtime — just PyTorch, Triton, and Flash Attention.
+A standalone, high-performance LLM inference engine supporting **Llama 3.1**, **Mixtral-8x7B**, **Qwen2/3-VL**, and **Whisper** with tensor parallelism. No vLLM dependency at runtime — just PyTorch, Triton, and Flash Attention.
 
 ## Features
 
 - **Llama 3.1** (8B, 70B) with frequency-scaled RoPE
 - **Mixtral-8x7B** with fused Triton MoE grouped-GEMM kernels
+- **Qwen2-VL / Qwen3-VL** vision-language models with image and video support
+- **Whisper** (large-v3) encoder-decoder speech-to-text with batched inference and paged cross-attention KV cache
 - **Tensor parallelism** (TP) with custom IPC-based all-reduce for multi-GPU inference
 - **Paged KV cache** with Triton store kernels
 - **CUDA graph capture** for decode steps
@@ -29,6 +31,9 @@ A standalone, high-performance LLM inference engine supporting **Llama 3.1** and
 │   │   │   ├── allreduce.py    # AllReduce op + custom IPC all-reduce (NCCL fallback)
 │   │   │   ├── linear.py       # F.linear wrapper
 │   │   │   ├── embedding.py    # F.embedding wrapper
+│   │   │   ├── conv1d.py       # Conv1d wrapper (Whisper audio encoder)
+│   │   │   ├── gelu.py         # GELU activation (Whisper)
+│   │   │   ├── layer_norm.py   # LayerNorm wrapper (Whisper, vision)
 │   │   │   ├── moe_align.py    # MoE token-expert alignment
 │   │   │   ├── moe_sum.py      # Fused MoE sum kernel
 │   │   │   ├── moe_grouped_gemm.py # Triton fused MoE grouped GEMM
@@ -37,16 +42,21 @@ A standalone, high-performance LLM inference engine supporting **Llama 3.1** and
 │   │   ├── L2/                 # Multi-op blocks
 │   │   │   ├── attention.py    # LlamaAttention (GQA + QKV proj + RoPE + output proj)
 │   │   │   ├── llama_mlp.py    # Llama SwiGLU MLP
+│   │   │   ├── whisper_attention.py # Whisper encoder/decoder/cross-attention
+│   │   │   ├── whisper_mlp.py  # Whisper GELU MLP
 │   │   │   ├── mixtral_moe.py  # Mixtral MoE routing + experts
 │   │   │   ├── fused_experts.py# Fused expert execution
 │   │   │   ├── parallel_linear.py  # TP-aware linear layers
 │   │   │   └── parallel_embedding.py
-│   │   ├── L3/                 # Decoder layers
+│   │   ├── L3/                 # Decoder/encoder layers
 │   │   │   ├── llama_decoder.py
-│   │   │   └── mixtral_decoder.py
+│   │   │   ├── mixtral_decoder.py
+│   │   │   ├── whisper_encoder_layer.py
+│   │   │   └── whisper_decoder_layer.py
 │   │   └── L4/                 # Full models
 │   │       ├── llama.py        # LlamaForCausalLM
-│   │       └── mixtral.py      # MixtralForCausalLM
+│   │       ├── mixtral.py      # MixtralForCausalLM
+│   │       └── whisper.py      # WhisperForConditionalGeneration
 │   └── candidate/              # Generated replacement kernels (gitignored)
 │       ├── README.md           # Instructions
 │       └── L1/, L2/, ...       # Organized by level, named after the operator
@@ -100,6 +110,9 @@ python tests/bench_vllm.py --model meta-llama/Llama-3.1-8B-Instruct
 # With tensor parallelism
 python tests/bench_vllm.py \
     --model meta-llama/Llama-3.1-70B-Instruct --tp 4
+
+# Whisper speech-to-text
+python tests/bench_vllm.py --model openai/whisper-large-v3
 
 # Bench module tests (unit tests + GPU integration)
 python tests/test_bench.py
@@ -354,6 +367,21 @@ Latency (batch size 1, 128 output tokens, 5 iterations):
 | Qwen2-VL-7B  | 1 | single-video | 0.539s | 0.682s | 0.79x |
 | Qwen3-VL-8B  | 1 | single-image | 0.559s | 0.578s | 0.97x |
 | Qwen3-VL-8B  | 1 | single-video | 0.613s | 0.593s | **1.03x** |
+
+### Whisper (large-v3)
+
+Throughput (full LibriSpeech `test.clean` — 2,620 utterances, 324 minutes of audio, `temperature=0`, `enforce_eager=True`, 448 max output tokens):
+
+| Model | TP | Seqs | Audio | vLLM (tok/s) | Ours (tok/s) | Ratio | Avg Match Tokens |
+|-------|---:|-----:|------:|-------------:|-------------:|------:|-----------------:|
+| whisper-large-v3 | 1 | 2,620 | 324 min | 8,525 | 8,084 | 0.95x | 388.7/444 |
+
+Latency (448 output tokens, 5 iterations):
+
+| Model | TP | Scenario | Batch Size | vLLM median | Ours median | vLLM ms/tok | Ours ms/tok | Ratio |
+|-------|---:|----------|---:|------------:|------------:|------------:|------------:|------:|
+| whisper-large-v3 | 1 | single-utterance | 1 | 5.702s | 5.812s | 12.73 | 12.97 | 0.98x |
+| whisper-large-v3 | 1 | fixed-batch-32 | 32 | 6.214s | 5.978s | 0.43 | 0.42 | **1.04x** |
 
 ### Qwen3-VL FP8 (W8A8 block-quantized)
 

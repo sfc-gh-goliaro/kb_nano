@@ -87,6 +87,19 @@ class Context:
     # Flat indices into concatenated input for extracting one logit per seq
     logit_indices: torch.Tensor | None = None
 
+    # Cross-attention metadata (encoder-decoder models like Whisper)
+    # Slot mapping for writing encoder K/V to paged cache
+    cross_slot_mapping: torch.Tensor | None = None
+    # Prefill: cu_seqlens for decoder Q and encoder K
+    cross_cu_seqlens_q: torch.Tensor | None = None
+    cross_cu_seqlens_k: torch.Tensor | None = None
+    cross_max_seqlen_q: int = 0
+    cross_max_seqlen_k: int = 0
+    cross_block_tables: torch.Tensor | None = None
+    # Decode: context lens = encoder sequence lengths per request
+    cross_context_lens: torch.Tensor | None = None
+    cross_max_context_len: int = 0
+
 
 _CONTEXT = Context()
 
