@@ -1084,7 +1084,7 @@ class ModelRunner:
         self._apply_pending_cross_ctx()
         hidden = self.model(input_ids, positions)
         lm_head = self.model.lm_head
-        logits = lm_head.linear_op(hidden, lm_head.weight).float()
+        logits = lm_head.linear_op(hidden, lm_head.embedding_op.emb.weight).float()
         max_vals, max_idxs = logits.max(dim=-1)
         reset_context()
 
@@ -1555,12 +1555,12 @@ class ModelRunner:
                     max_context_len=self.max_model_len,
                 )
                 outputs[:bs] = self.model(input_ids[:bs], positions[:bs])
-                lm_logits[:bs] = lm_head.linear_op(outputs[:bs], lm_head.weight).float()
+                lm_logits[:bs] = lm_head.linear_op(outputs[:bs], lm_head.embedding_op.emb.weight).float()
                 lm_max_vals[:bs], lm_max_idxs[:bs] = lm_logits[:bs].max(dim=-1)
 
                 with torch.cuda.graph(graph, self.graph_pool):
                     outputs[:bs] = self.model(input_ids[:bs], positions[:bs])
-                    lm_logits[:bs] = lm_head.linear_op(outputs[:bs], lm_head.weight).float()
+                    lm_logits[:bs] = lm_head.linear_op(outputs[:bs], lm_head.embedding_op.emb.weight).float()
                     lm_max_vals[:bs], lm_max_idxs[:bs] = lm_logits[:bs].max(dim=-1)
 
                 if self.graph_pool is None:

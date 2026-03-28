@@ -39,7 +39,8 @@ class LlamaConfig:
     @classmethod
     def from_pretrained(cls, model_name: str) -> "LlamaConfig":
         hf = AutoConfig.from_pretrained(model_name)
-        rope = hf.rope_scaling or {}
+        rope = hf.rope_scaling or getattr(hf, "rope_parameters", None) or {}
+        rope_theta = getattr(hf, "rope_theta", None) or rope.get("rope_theta", 500000.0)
         return cls(
             hidden_size=hf.hidden_size,
             intermediate_size=hf.intermediate_size,
@@ -50,7 +51,7 @@ class LlamaConfig:
             vocab_size=hf.vocab_size,
             max_position_embeddings=hf.max_position_embeddings,
             rms_norm_eps=hf.rms_norm_eps,
-            rope_theta=hf.rope_theta,
+            rope_theta=rope_theta,
             rope_scaling_factor=rope.get("factor", 1.0),
             rope_low_freq_factor=rope.get("low_freq_factor", 1.0),
             rope_high_freq_factor=rope.get("high_freq_factor", 1.0),

@@ -43,6 +43,8 @@ class MixtralConfig:
         head_dim = getattr(hf, "head_dim", None)
         if head_dim is None:
             head_dim = hf.hidden_size // hf.num_attention_heads
+        rope = getattr(hf, "rope_parameters", None) or {}
+        rope_theta = getattr(hf, "rope_theta", None) or rope.get("rope_theta", 1000000.0)
         return cls(
             hidden_size=hf.hidden_size,
             intermediate_size=hf.intermediate_size,
@@ -53,7 +55,7 @@ class MixtralConfig:
             vocab_size=hf.vocab_size,
             max_position_embeddings=hf.max_position_embeddings,
             rms_norm_eps=hf.rms_norm_eps,
-            rope_theta=hf.rope_theta,
+            rope_theta=rope_theta,
             num_local_experts=hf.num_local_experts,
             num_experts_per_tok=hf.num_experts_per_tok,
         )
