@@ -206,7 +206,12 @@ class WhisperCrossAttention(nn.Module):
             if k_cache.numel() and v_cache.numel() and ctx.cross_slot_mapping is not None:
                 self.store_kvcache(k, v, k_cache, v_cache, ctx.cross_slot_mapping)
 
+        if not k_cache.numel():
+            return self.out_proj(torch.zeros_like(hidden_states))
+
         if ctx.is_prefill or ctx.is_mixed:
+            if ctx.cross_cu_seqlens_q is None:
+                return self.out_proj(torch.zeros_like(hidden_states))
             return self._forward_prefill(q, k_cache, v_cache, ctx)
         else:
             return self._forward_decode(q, k_cache, v_cache, ctx)

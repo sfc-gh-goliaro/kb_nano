@@ -244,7 +244,7 @@ class BlockManager:
 # ---------------------------------------------------------------------------
 class ModelRunner:
     def __init__(self, model_name: str, rank: int, world_size: int,
-                 dtype: torch.dtype, enforce_eager: bool,
+                 dtype: torch.dtype | None, enforce_eager: bool,
                  event, shm_name: str,
                  gpu_memory_utilization: float = 0.9,
                  max_model_len: int = MAX_MODEL_LEN,
@@ -278,6 +278,14 @@ class ModelRunner:
                 )
                 set_custom_ar(self.custom_ar)
 
+        if dtype is None:
+            from transformers import AutoConfig
+            _cfg = AutoConfig.from_pretrained(model_name)
+            cfg_dtype = getattr(_cfg, "torch_dtype", None)
+            if cfg_dtype is not None and isinstance(cfg_dtype, torch.dtype):
+                dtype = cfg_dtype
+            else:
+                dtype = torch.bfloat16
         self.dtype = dtype
         default_dtype = torch.get_default_dtype()
         torch.set_default_dtype(dtype)
@@ -291,6 +299,10 @@ class ModelRunner:
         self.is_whisper = getattr(self.config, "is_encoder_decoder", False)
         if self.is_whisper:
             self.enforce_eager = True
+            self.max_model_len = min(
+                self.max_model_len,
+                getattr(self.config, "max_target_positions", self.max_model_len),
+            )
         self._share_trtllm_workspace()
         self._share_activation_buffers()
         self.warmup_model()
@@ -647,16 +659,18 @@ class ModelRunner:
         available_bytes = int(total * self.gpu_memory_utilization - used - peak + current)
 
         if num_cross_attn_layers > 0:
-            # Whisper: allocate cross-attention KV cache from the budget first,
-            # then allocate self-attention KV cache from the remainder.
-            # Cross-attn blocks sized for max encoder output (1500 tokens).
             max_encoder_tokens = getattr(self.config, 'max_source_positions', 1500)
             cross_blocks_per_seq = (max_encoder_tokens + BLOCK_SIZE - 1) // BLOCK_SIZE
             cross_block_bytes = (
                 2 * num_cross_attn_layers * BLOCK_SIZE * num_kv_heads * head_dim * elem_size
             )
-            # Reserve enough cross-attn blocks for max_num_seqs concurrent reqs
-            num_cross_blocks = cross_blocks_per_seq * self.max_num_seqs
+            cross_bytes_per_seq = cross_blocks_per_seq * cross_block_bytes
+            max_cross_seqs = min(
+                self.max_num_seqs,
+                max(1, int(available_bytes * 0.5) // cross_bytes_per_seq),
+            )
+            self.max_num_seqs = max_cross_seqs
+            num_cross_blocks = cross_blocks_per_seq * max_cross_seqs
             cross_cache_bytes = num_cross_blocks * cross_block_bytes
             available_bytes -= cross_cache_bytes
 
@@ -678,11 +692,11 @@ class ModelRunner:
                 module.k_cache = self.cross_kv_cache[0, i]
                 module.v_cache = self.cross_kv_cache[1, i]
 
-            self.block_manager.cross_free_block_ids = deque(range(num_cross_blocks))
-            self.block_manager._num_cross_blocks = num_cross_blocks
+            self._cross_free_block_ids_init = num_cross_blocks
             if self.rank == 0:
                 print(f"  Cross-attn KV cache: {num_cross_blocks} blocks "
-                      f"({cross_blocks_per_seq} per seq x {self.max_num_seqs} seqs)")
+                      f"({cross_blocks_per_seq} per seq x {max_cross_seqs} seqs, "
+                      f"capped from {_DEFAULT_MAX_NUM_SEQS})")
 
         self_attn_block_bytes = (
             2 * num_self_attn_layers * BLOCK_SIZE * num_kv_heads * head_dim * elem_size
@@ -1577,7 +1591,7 @@ class LlamaEngine:
         self,
         model_name: str = "meta-llama/Llama-3.1-8B-Instruct",
         device: str = "cuda",
-        dtype: torch.dtype = torch.bfloat16,
+        dtype: torch.dtype | None = None,
         seed: int = 42,
         enforce_eager: bool = False,
         tensor_parallel_size: int = 1,
@@ -1625,6 +1639,13 @@ class LlamaEngine:
             **mr_kwargs,
         )
         self.block_manager = BlockManager(self.model_runner.num_blocks)
+        if hasattr(self.model_runner, '_cross_free_block_ids_init'):
+            n = self.model_runner._cross_free_block_ids_init
+            self.block_manager.cross_free_block_ids = deque(range(n))
+            self.block_manager._num_cross_blocks = n
+        if hasattr(self.model_runner, 'cross_blocks_per_seq'):
+            self.cross_blocks_per_seq = self.model_runner.cross_blocks_per_seq
+        self.max_num_seqs = self.model_runner.max_num_seqs
         print(f"  Scheduling: max_num_seqs={self.max_num_seqs}, "
               f"max_num_batched_tokens={self.max_num_batched_tokens}")
 
@@ -1935,7 +1956,9 @@ class LlamaEngine:
 
             if self.is_whisper and aud is not None:
                 ids = prompt if isinstance(prompt, list) else self.tokenizer.encode(prompt)
-                seq = Sequence(ids, max_tokens=sp.max_tokens, ignore_eos=sp.ignore_eos)
+                max_toks = min(sp.max_tokens,
+                               self.model_runner.max_model_len - len(ids))
+                seq = Sequence(ids, max_tokens=max_toks, ignore_eos=sp.ignore_eos)
                 seq.encoder_features = aud
                 mel_T = aud.shape[-1]
                 seq.encoder_seq_len = _whisper_encoder_tokens(mel_T)
@@ -2397,7 +2420,7 @@ class LlamaEngine:
                     features_batch = torch.stack([
                         s.encoder_features.to(
                             device=f"cuda:{self.model_runner.rank}",
-                            dtype=torch.get_default_dtype(),
+                            dtype=self.model_runner.dtype,
                         ) for s in encoder_seqs
                     ], dim=0)
                     encoder_outputs = model.get_multimodal_embeddings(features_batch)

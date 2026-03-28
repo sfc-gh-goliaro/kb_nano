@@ -216,9 +216,8 @@ def load_weights(model, model_path: str, model_type: str = "llama") -> None:
                         prefix, wb = m_ln.groups()
                         mapped_name = f"{prefix}.norm.{wb}"
 
-                    # encoder.embed_positions is a buffer, loaded separately
-                    if _WHISPER_EMBED_POSITIONS_RE.match(mapped_name):
-                        continue
+                    # encoder.embed_positions is now an nn.Embedding;
+                    # checkpoint name uses 'weight' which matches directly.
 
                     # Create fake zero bias for k_proj (HF checkpoint has
                     # no k_proj bias, but our QKVParallelLinear expects one

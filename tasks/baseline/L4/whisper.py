@@ -116,10 +116,7 @@ class WhisperEncoder(nn.Module):
         ])
         self.layer_norm = LayerNorm(embed_dim)
 
-        self.register_buffer(
-            "embed_positions",
-            _sinusoids(config.max_source_positions, embed_dim),
-        )
+        self.embed_positions = nn.Embedding(config.max_source_positions, embed_dim)
 
     def forward(self, input_features: torch.Tensor) -> torch.Tensor:
         """
@@ -128,12 +125,13 @@ class WhisperEncoder(nn.Module):
         Returns:
             [B, T_enc, D] encoder hidden states
         """
+        input_features = input_features.to(self.conv1.conv.weight.dtype)
         hidden_states = self.gelu(self.conv1(input_features))
         hidden_states = self.gelu(self.conv2(hidden_states))
         hidden_states = hidden_states.transpose(-1, -2)
 
         T_enc = hidden_states.shape[1]
-        hidden_states = hidden_states + self.embed_positions[:T_enc].to(hidden_states.dtype)
+        hidden_states = hidden_states + self.embed_positions.weight[:T_enc].to(hidden_states.dtype)
 
         for layer in self.layers:
             hidden_states = layer(hidden_states)
