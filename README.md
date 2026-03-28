@@ -368,6 +368,21 @@ Latency (batch size 1, 128 output tokens, 5 iterations):
 | Qwen3-VL-8B  | 1 | single-image | 0.559s | 0.578s | 0.97x |
 | Qwen3-VL-8B  | 1 | single-video | 0.613s | 0.593s | **1.03x** |
 
+### Whisper (large-v3)
+
+Throughput (full LibriSpeech `test.clean` — 2,620 utterances, 324 minutes of audio, `temperature=0`, `enforce_eager=True`, 448 max output tokens):
+
+| Model | TP | Seqs | Audio | vLLM (tok/s) | Ours (tok/s) | Ratio | Avg Match Tokens |
+|-------|---:|-----:|------:|-------------:|-------------:|------:|-----------------:|
+| whisper-large-v3 | 1 | 2,620 | 324 min | 8,525 | 8,084 | 0.95x | 388.7/444 |
+
+Latency (448 output tokens, 5 iterations):
+
+| Model | TP | Scenario | Batch Size | vLLM median | Ours median | vLLM ms/tok | Ours ms/tok | Ratio |
+|-------|---:|----------|---:|------------:|------------:|------------:|------------:|------:|
+| whisper-large-v3 | 1 | single-utterance | 1 | 5.702s | 5.812s | 12.73 | 12.97 | 0.98x |
+| whisper-large-v3 | 1 | fixed-batch-32 | 32 | 6.214s | 5.978s | 0.43 | 0.42 | **1.04x** |
+
 ### Qwen3-VL FP8 (W8A8 block-quantized)
 
 FP8 support uses `Qwen/Qwen3-VL-8B-Instruct-FP8` with block-scaled FP8 GEMM via DeepGEMM. Vision encoder and lm_head remain in BF16; only LLM decoder layers use FP8.

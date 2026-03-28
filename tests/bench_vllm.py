@@ -81,11 +81,14 @@ VLM_SCENARIOS = [
 
 WHISPER_SCENARIOS = [
     {"name": "librispeech", "output_len": 448,
-     "dataset": "openslr/librispeech_asr", "dataset_split": "test.clean"},
+     "dataset": "openslr/librispeech_asr", "dataset_split": "test.clean",
+     "use_full_dataset": True},
 ]
 
 WHISPER_LATENCY_SCENARIOS = [
     {"name": "single-utterance", "output_len": 448, "batch_size": 1,
+     "dataset": "openslr/librispeech_asr", "dataset_split": "test.clean"},
+    {"name": "fixed-batch-32", "output_len": 448, "batch_size": 32,
      "dataset": "openslr/librispeech_asr", "dataset_split": "test.clean"},
 ]
 
@@ -968,35 +971,38 @@ def main():
     latency_results = []
     for ls in cfg.get("latency_scenarios", []):
         output_len = ls["output_len"]
+        batch_size = ls.get("batch_size", 1)
         audio_samples = _load_librispeech(
-            ls["dataset"], ls["dataset_split"], 1, cfg["seed"] + 200,
+            ls["dataset"], ls["dataset_split"], batch_size, cfg["seed"] + 200,
         )
-        sample = audio_samples[0]
-        audio, sr = sample["audio"], sample["sampling_rate"]
-        prompt = ExplicitEncoderDecoderPrompt(
-            encoder_prompt=TextPrompt(
-                prompt="",
-                multi_modal_data={"audio": (audio, sr)},
-            ),
-            decoder_prompt=TextPrompt(
-                prompt="<|startoftranscript|><|en|><|transcribe|><|notimestamps|>",
-            ),
-        )
+        prompts = []
+        total_audio_s = 0.0
+        for sample in audio_samples:
+            audio, sr = sample["audio"], sample["sampling_rate"]
+            total_audio_s += len(audio) / sr
+            prompts.append(ExplicitEncoderDecoderPrompt(
+                encoder_prompt=TextPrompt(
+                    prompt="",
+                    multi_modal_data={"audio": (audio, sr)},
+                ),
+                decoder_prompt=TextPrompt(
+                    prompt="<|startoftranscript|><|en|><|transcribe|><|notimestamps|>",
+                ),
+            ))
         sp = SamplingParams(temperature=0.0, ignore_eos=True, max_tokens=output_len)
         num_warmup = ls.get("num_warmup", 3)
         num_iters = ls.get("num_iters", 5)
         for _ in range(num_warmup):
-            llm.generate([prompt], sp, use_tqdm=False)
+            llm.generate(prompts, sp, use_tqdm=False)
         latencies = []
         for _ in range(num_iters):
             t0 = time.perf_counter()
-            llm.generate([prompt], sp, use_tqdm=False)
+            llm.generate(prompts, sp, use_tqdm=False)
             latencies.append(time.perf_counter() - t0)
-        audio_dur = len(audio) / sr
         latency_results.append({
             "name": ls["name"],
-            "batch_size": ls["batch_size"],
-            "audio_duration_s": round(audio_dur, 2),
+            "batch_size": batch_size,
+            "audio_duration_s": round(total_audio_s, 2),
             "output_len": output_len,
             "num_iters": num_iters,
             "latencies": latencies,
@@ -1116,17 +1122,22 @@ def main():
     latency_results = []
     for ls in cfg.get("latency_scenarios", []):
         output_len = ls["output_len"]
+        batch_size = ls.get("batch_size", 1)
         audio_samples = _load_librispeech(
-            ls["dataset"], ls["dataset_split"], 1, cfg["seed"] + 200,
+            ls["dataset"], ls["dataset_split"], batch_size, cfg["seed"] + 200,
         )
-        sample = audio_samples[0]
-        audio, sr = sample["audio"], sample["sampling_rate"]
-        inputs = processor(audio, sampling_rate=sr, return_tensors="pt")
-        audio_feats = [inputs.input_features[0]]
+        audio_feats = []
+        total_audio_s = 0.0
+        for sample in audio_samples:
+            audio, sr = sample["audio"], sample["sampling_rate"]
+            total_audio_s += len(audio) / sr
+            inp = processor(audio, sampling_rate=sr, return_tensors="pt")
+            audio_feats.append(inp.input_features[0])
         decoder_prompt = processor.tokenizer.encode(
             "<|startoftranscript|><|en|><|transcribe|><|notimestamps|>",
             add_special_tokens=False,
         )
+        decoder_prompts = [decoder_prompt] * batch_size
 
         sp = SamplingParams(temperature=0.0, ignore_eos=True, max_tokens=output_len)
         num_warmup = ls.get("num_warmup", 3)
@@ -1135,7 +1146,7 @@ def main():
             engine.block_manager.reset()
             torch.cuda.synchronize()
             engine.generate(
-                [decoder_prompt], sp, audio_features=audio_feats,
+                decoder_prompts, sp, audio_features=audio_feats,
             )
             torch.cuda.synchronize()
         latencies = []
@@ -1144,15 +1155,14 @@ def main():
             torch.cuda.synchronize()
             t0 = time.perf_counter()
             engine.generate(
-                [decoder_prompt], sp, audio_features=audio_feats,
+                decoder_prompts, sp, audio_features=audio_feats,
             )
             torch.cuda.synchronize()
             latencies.append(time.perf_counter() - t0)
-        audio_dur = len(audio) / sr
         latency_results.append({
             "name": ls["name"],
-            "batch_size": ls["batch_size"],
-            "audio_duration_s": round(audio_dur, 2),
+            "batch_size": batch_size,
+            "audio_duration_s": round(total_audio_s, 2),
             "output_len": output_len,
             "num_iters": num_iters,
             "latencies": latencies,
@@ -1287,12 +1297,15 @@ def main():
                 max_seq_len = output_len + 10  # decoder prompt + output
                 if max_seq_len > global_max_seq_len:
                     global_max_seq_len = max_seq_len
+                num_seqs = args.num_seqs
+                if scenario.get("use_full_dataset"):
+                    num_seqs = 999_999  # load all available samples
                 scenario_data.append({
                     "name": scenario["name"],
                     "output_len": output_len,
                     "dataset": scenario["dataset"],
                     "dataset_split": scenario["dataset_split"],
-                    "num_seqs": args.num_seqs,
+                    "num_seqs": num_seqs,
                 })
                 continue
 
@@ -1400,7 +1413,9 @@ def main():
     if is_vlm and args.modality != "all":
         print(f"  Modality       : {args.modality}")
     print(f"  TP             : {args.tp}")
-    print(f"  Seqs/scenario  : {args.num_seqs}")
+    has_full = any(s.get("use_full_dataset") for s in throughput_scenarios) if is_whisper else False
+    seqs_label = "full dataset" if has_full else str(args.num_seqs)
+    print(f"  Seqs/scenario  : {seqs_label}")
     print(f"  Temperature    : {args.temperature}")
     print(f"  Enforce eager  : {args.enforce_eager}")
     print(f"  Seed           : {args.seed}")
@@ -1486,7 +1501,7 @@ def main():
 
             result = {
                 "scenario": scenario["name"],
-                "num_seqs": args.num_seqs,
+                "num_seqs": kb_data.get("num_seqs", args.num_seqs),
                 "kb_nano_elapsed": kb_data["elapsed"],
                 "kb_nano_output_tokens": kb_data["total_output_tokens"],
                 "kb_nano_tok_per_s": kb_tps,
