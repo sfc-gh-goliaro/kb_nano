@@ -1,16 +1,29 @@
 """Rotary position embeddings (RoPE), with optional Llama 3.1-style frequency scaling.
 
-Uses sgl_kernel.apply_rope_with_cos_sin_cache_inplace for high-performance in-place RoPE.
+Uses a custom CUDA kernel for high-performance in-place RoPE.
 """
 
 from __future__ import annotations
 
 import math
+import os
 
 import torch
 import torch.nn as nn
+from torch.utils.cpp_extension import load as _load_ext
 
-from sgl_kernel import apply_rope_with_cos_sin_cache_inplace as _sgl_rope
+_CSRC = os.path.join(os.path.dirname(os.path.abspath(__file__)), "csrc")
+_C = _load_ext(
+    name="kb_nano_L1_ops",
+    sources=[os.path.join(_CSRC, f) for f in [
+        "binding.cpp", "rmsnorm.cu", "activation.cu", "pos_enc.cu",
+        "moe_sum.cu", "moe_align.cu", "moe_topk_softmax.cu",
+    ]],
+    extra_cuda_cflags=["-O3", "--use_fast_math",
+                       "-DFLASHINFER_ENABLE_BF16", "-DFLASHINFER_ENABLE_F16"],
+    extra_cflags=["-O3"],
+    verbose=False,
+)
 
 
 def _compute_scaled_inv_freq(
@@ -78,8 +91,7 @@ class RotaryEmbedding(nn.Module):
 
     def forward(self, positions, query, key):
         cache = self.cos_sin_cache
-        if cache.dtype != torch.float32:
-            cache = cache.float()
-            self.cos_sin_cache = cache
-        _sgl_rope(positions, query, key, self.head_dim, cache)
+        if cache.dtype != query.dtype:
+            cache = cache.to(query.dtype)
+        _C.rotary_embedding(positions, query, key, self.head_dim, cache, True)
         return query, key

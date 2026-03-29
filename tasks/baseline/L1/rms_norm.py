@@ -1,13 +1,26 @@
-"""RMSNorm using sgl_kernel for high-performance fused normalization."""
+"""RMSNorm using custom CUDA kernels for high-performance fused normalization."""
 
 from __future__ import annotations
+
+import os
 
 import torch
 import torch.nn as nn
 import torch.nn.functional as F
+from torch.utils.cpp_extension import load as _load_ext
 
-from sgl_kernel import rmsnorm as _sgl_rmsnorm
-from sgl_kernel import fused_add_rmsnorm as _sgl_fused_add_rmsnorm
+_CSRC = os.path.join(os.path.dirname(os.path.abspath(__file__)), "csrc")
+_C = _load_ext(
+    name="kb_nano_L1_ops",
+    sources=[os.path.join(_CSRC, f) for f in [
+        "binding.cpp", "rmsnorm.cu", "activation.cu", "pos_enc.cu",
+        "moe_sum.cu", "moe_align.cu", "moe_topk_softmax.cu",
+    ]],
+    extra_cuda_cflags=["-O3", "--use_fast_math",
+                       "-DFLASHINFER_ENABLE_BF16", "-DFLASHINFER_ENABLE_F16"],
+    extra_cflags=["-O3"],
+    verbose=False,
+)
 
 
 class RMSNorm(nn.Module):
@@ -22,9 +35,11 @@ class RMSNorm(nn.Module):
     def forward(self, x, residual=None):
         if self.elementwise_affine:
             if residual is None:
-                return _sgl_rmsnorm(x, self.weight, self.eps)
+                out = torch.empty_like(x)
+                _C.rmsnorm(out, x, self.weight, self.eps)
+                return out
             else:
-                _sgl_fused_add_rmsnorm(x, residual, self.weight, self.eps)
+                _C.fused_add_rmsnorm(x, residual, self.weight, self.eps)
                 return x, residual
         else:
             if residual is None:

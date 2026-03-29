@@ -5,18 +5,32 @@ dimensions. Each dimension's positions index into a shared cos/sin cache,
 and the resulting embeddings are assembled by section into the rotary dim.
 
 Uses a Triton kernel for multimodal prefill (3D positions differ across dims)
-and sgl_kernel for decode / text-only (all 3 dims identical -> standard RoPE).
+and a custom CUDA kernel for decode / text-only (all 3 dims identical -> standard RoPE).
 """
 
 from __future__ import annotations
 
 import math
+import os
 
 import torch
 import torch.nn as nn
 import triton
 import triton.language as tl
-from sgl_kernel import apply_rope_with_cos_sin_cache_inplace as _sgl_rope
+from torch.utils.cpp_extension import load as _load_ext
+
+_CSRC = os.path.join(os.path.dirname(os.path.abspath(__file__)), "csrc")
+_C = _load_ext(
+    name="kb_nano_L1_ops",
+    sources=[os.path.join(_CSRC, f) for f in [
+        "binding.cpp", "rmsnorm.cu", "activation.cu", "pos_enc.cu",
+        "moe_sum.cu", "moe_align.cu", "moe_topk_softmax.cu",
+    ]],
+    extra_cuda_cflags=["-O3", "--use_fast_math",
+                       "-DFLASHINFER_ENABLE_BF16", "-DFLASHINFER_ENABLE_F16"],
+    extra_cflags=["-O3"],
+    verbose=False,
+)
 
 
 @triton.jit
@@ -130,19 +144,19 @@ class MRotaryEmbedding(nn.Module):
         self.register_buffer("cos_sin_cache", cache, persistent=False)
 
     def _apply_sgl_rope(self, positions_1d, query, key):
-        """Fast path using sgl_kernel for 1D positions (decode or text-only)."""
+        """Fast path using CUDA kernel for 1D positions (decode or text-only)."""
         cache = self.cos_sin_cache
-        if cache.dtype != torch.float32:
-            cache = cache.float()
-            self.cos_sin_cache = cache
+        if cache.dtype != query.dtype:
+            cache = cache.to(query.dtype)
         q_shape = query.shape
         k_shape = key.shape
-        _sgl_rope(
+        _C.rotary_embedding(
             positions_1d,
             query.view(q_shape[0], -1),
             key.view(k_shape[0], -1),
             self.head_dim,
             cache,
+            True,
         )
         return query, key
 

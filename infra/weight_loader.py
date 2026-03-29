@@ -18,7 +18,6 @@ from safetensors import safe_open
 from transformers import AutoConfig
 
 from .tp import _tp_size
-from ..tasks.baseline.L1.fp8_linear import Fp8Linear, postprocess_fp8_weights
 from ..tasks.baseline.L4.llama import LlamaConfig, LlamaForCausalLM
 from ..tasks.baseline.L4.llama4 import Llama4Config, Llama4ForCausalLM
 from ..tasks.baseline.L4.mixtral import MixtralConfig, MixtralForCausalLM
@@ -459,6 +458,8 @@ def load_weights(model, model_path: str, model_type: str = "llama") -> None:
 
 def _postprocess_fp8_weights(model: torch.nn.Module) -> None:
     """Re-quantize FP8 weights to UE8M0 format and transform scale layout for DeepGEMM."""
+    from ..tasks.baseline.L1.fp8_linear import Fp8Linear, postprocess_fp8_weights
+
     print("  Post-processing FP8 weights for DeepGEMM...")
     count = 0
     for module in model.modules():

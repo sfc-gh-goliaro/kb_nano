@@ -2,10 +2,24 @@
 
 from __future__ import annotations
 
+import os
+
 import torch
 import torch.nn as nn
+from torch.utils.cpp_extension import load as _load_ext
 
-from sgl_kernel import silu_and_mul as _sgl_silu_and_mul
+_CSRC = os.path.join(os.path.dirname(os.path.abspath(__file__)), "csrc")
+_C = _load_ext(
+    name="kb_nano_L1_ops",
+    sources=[os.path.join(_CSRC, f) for f in [
+        "binding.cpp", "rmsnorm.cu", "activation.cu", "pos_enc.cu",
+        "moe_sum.cu", "moe_align.cu", "moe_topk_softmax.cu",
+    ]],
+    extra_cuda_cflags=["-O3", "--use_fast_math",
+                       "-DFLASHINFER_ENABLE_BF16", "-DFLASHINFER_ENABLE_F16"],
+    extra_cflags=["-O3"],
+    verbose=False,
+)
 
 
 class _ActivationBuffer:
@@ -33,4 +47,5 @@ class SiluAndMul(nn.Module):
     def forward(self, x):
         half = x.size(-1) // 2
         out = self._act_buf.get(x.size(0), half, x.device, x.dtype)
-        return _sgl_silu_and_mul(x, out)
+        _C.silu_and_mul(out, x)
+        return out

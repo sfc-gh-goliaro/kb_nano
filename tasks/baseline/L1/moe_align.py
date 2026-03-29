@@ -1,17 +1,31 @@
 """MoE token-to-expert alignment with block padding.
 
-Uses sgl_kernel.moe_align_block_size for high-performance, CUDA-graph-compatible
+Uses a custom CUDA kernel for high-performance, CUDA-graph-compatible
 token-to-expert alignment. Supports a naive fast path that skips the full sort
 when the number of tokens is very small relative to the number of experts.
 """
 
 from __future__ import annotations
 
+import os
+
 import torch
 import torch.nn as nn
 import triton
+from torch.utils.cpp_extension import load as _load_ext
 
-from sgl_kernel import moe_align_block_size as _sgl_moe_align
+_CSRC = os.path.join(os.path.dirname(os.path.abspath(__file__)), "csrc")
+_C = _load_ext(
+    name="kb_nano_L1_ops",
+    sources=[os.path.join(_CSRC, f) for f in [
+        "binding.cpp", "rmsnorm.cu", "activation.cu", "pos_enc.cu",
+        "moe_sum.cu", "moe_align.cu", "moe_topk_softmax.cu",
+    ]],
+    extra_cuda_cflags=["-O3", "--use_fast_math",
+                       "-DFLASHINFER_ENABLE_BF16", "-DFLASHINFER_ENABLE_F16"],
+    extra_cflags=["-O3"],
+    verbose=False,
+)
 
 
 class MoeAlign(nn.Module):
@@ -89,7 +103,7 @@ class MoeAlign(nn.Module):
         sorted_token_ids = self._sorted_token_ids[:max_padded]
         expert_ids = self._expert_ids[:max_blocks]
 
-        _sgl_moe_align(
+        _C.moe_align_block_size(
             topk_ids.view(-1).contiguous(),
             num_experts + 1, block_size,
             sorted_token_ids, expert_ids,
