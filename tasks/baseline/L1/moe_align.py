@@ -1,6 +1,6 @@
 """MoE token-to-expert alignment with block padding.
 
-Uses sgl_kernel.moe_align_block_size for high-performance, CUDA-graph-compatible
+Uses a custom CUDA kernel for high-performance, CUDA-graph-compatible
 token-to-expert alignment. Supports a naive fast path that skips the full sort
 when the number of tokens is very small relative to the number of experts.
 """
@@ -11,7 +11,7 @@ import torch
 import torch.nn as nn
 import triton
 
-from sgl_kernel import moe_align_block_size as _sgl_moe_align
+from .csrc import _C
 
 
 class MoeAlign(nn.Module):
@@ -89,7 +89,7 @@ class MoeAlign(nn.Module):
         sorted_token_ids = self._sorted_token_ids[:max_padded]
         expert_ids = self._expert_ids[:max_blocks]
 
-        _sgl_moe_align(
+        _C.moe_align_block_size(
             topk_ids.view(-1).contiguous(),
             num_experts + 1, block_size,
             sorted_token_ids, expert_ids,

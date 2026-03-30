@@ -1,5 +1,5 @@
 [build-system]
-requires = ["setuptools>=64", "wheel"]
+requires = ["setuptools>=64", "wheel", "torch>=2.0"]
 build-backend = "setuptools.build_meta"
 
 [project]
@@ -15,9 +15,10 @@ dependencies = [
     "transformers",
     "tqdm",
     "vllm==0.18.0",
-    "sgl-kernel",
+    "deep-gemm @ git+https://github.com/deepseek-ai/DeepGEMM.git@v2.1.1.post3",
     "decord",
     "mlflow>=2.10",
+    "datasets",
 ]
 
 [project.optional-dependencies]

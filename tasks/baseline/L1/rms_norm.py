@@ -1,4 +1,4 @@
-"""RMSNorm using sgl_kernel for high-performance fused normalization."""
+"""RMSNorm using custom CUDA kernels for high-performance fused normalization."""
 
 from __future__ import annotations
 
@@ -6,8 +6,7 @@ import torch
 import torch.nn as nn
 import torch.nn.functional as F
 
-from sgl_kernel import rmsnorm as _sgl_rmsnorm
-from sgl_kernel import fused_add_rmsnorm as _sgl_fused_add_rmsnorm
+from .csrc import _C
 
 
 class RMSNorm(nn.Module):
@@ -22,9 +21,11 @@ class RMSNorm(nn.Module):
     def forward(self, x, residual=None):
         if self.elementwise_affine:
             if residual is None:
-                return _sgl_rmsnorm(x, self.weight, self.eps)
+                out = torch.empty_like(x)
+                _C.rmsnorm(out, x, self.weight, self.eps)
+                return out
             else:
-                _sgl_fused_add_rmsnorm(x, residual, self.weight, self.eps)
+                _C.fused_add_rmsnorm(x, residual, self.weight, self.eps)
                 return x, residual
         else:
             if residual is None:

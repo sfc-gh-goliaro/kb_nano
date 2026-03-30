@@ -446,8 +446,10 @@ class ModelRunner:
         """Pre-JIT DeepGEMM FP8 kernels for all weight shapes at decode and
         prefill batch sizes, pre-allocate decode buffers per instance and
         shared prefill buffers per unique (K, N) shape."""
-        from ..tasks.baseline.L1.fp8_linear import Fp8Linear, _Fp8PrefillBufs
-        import deep_gemm
+        try:
+            from ..tasks.baseline.L1.fp8_linear import Fp8Linear, _Fp8PrefillBufs
+        except ImportError:
+            return
 
         fp8_modules = []
         for module in self.model.modules():
@@ -457,6 +459,8 @@ class ModelRunner:
 
         if not fp8_modules:
             return
+
+        import deep_gemm
 
         max_decode = self.max_num_seqs
         max_prefill = self.max_num_batched_tokens

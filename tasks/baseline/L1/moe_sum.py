@@ -1,6 +1,6 @@
 """Fused MoE sum kernel: reduces top-k expert outputs into final output.
 
-Uses sgl_kernel.moe_sum for high-performance reduction.
+Uses a custom CUDA kernel for high-performance reduction.
 """
 
 from __future__ import annotations
@@ -8,7 +8,7 @@ from __future__ import annotations
 import torch
 import torch.nn as nn
 
-from sgl_kernel import moe_sum as _sgl_moe_sum
+from .csrc import _C
 
 
 class MoeSum(nn.Module):
@@ -40,6 +40,6 @@ class MoeSum(nn.Module):
             self._output = torch.empty(M, D, device=input.device, dtype=input.dtype)
         output = self._output[:M, :D]
 
-        _sgl_moe_sum(input.view(M, topk, D), output)
+        _C.moe_sum(input.view(M, topk, D), output)
 
         return output
