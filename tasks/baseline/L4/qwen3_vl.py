@@ -71,7 +71,8 @@ class Qwen3VLConfig:
         hf = AutoConfig.from_pretrained(model_name)
         vc = hf.vision_config
         text_config = hf.get_text_config()
-        rope = getattr(text_config, "rope_scaling", {}) or {}
+        rope = getattr(text_config, "rope_scaling", None) or getattr(text_config, "rope_parameters", None) or {}
+        rope_theta = getattr(text_config, "rope_theta", None) or rope.get("rope_theta", 5000000.0)
         return cls(
             hidden_size=text_config.hidden_size,
             intermediate_size=text_config.intermediate_size,
@@ -83,7 +84,7 @@ class Qwen3VLConfig:
             vocab_size=text_config.vocab_size,
             max_position_embeddings=text_config.max_position_embeddings,
             rms_norm_eps=text_config.rms_norm_eps,
-            rope_theta=text_config.rope_theta,
+            rope_theta=rope_theta,
             tie_word_embeddings=text_config.tie_word_embeddings,
             mrope_section=rope.get("mrope_section", [24, 20, 20]),
             mrope_interleaved=rope.get("mrope_interleaved", True),

@@ -1,5 +1,5 @@
 [build-system]
-requires = ["setuptools>=64", "wheel"]
+requires = ["setuptools>=64", "wheel", "torch>=2.0"]
 build-backend = "setuptools.build_meta"
 
 [project]
@@ -12,13 +12,14 @@ dependencies = [
     "torch>=2.0",
     "numpy",
     "pyyaml",
-    "transformers==4.57.6",
+    "transformers",
     "tqdm",
-    "vllm==0.16.0",
-    "sgl-kernel",
     "flash-attn",
+    "vllm==0.18.0",
+    "deep-gemm @ git+https://github.com/deepseek-ai/DeepGEMM.git@v2.1.1.post3",
     "decord",
     "mlflow>=2.10",
+    "datasets",
 ]
 
 [project.optional-dependencies]
@@ -26,6 +27,12 @@ tracking = ["mlflow>=2.10"]
 
 [project.scripts]
 kb_nano = "kb_nano.__main__:main"
+
+[tool.uv]
+find-links = [
+    "https://github.com/mjun0812/flash-attention-prebuild-wheels/releases/expanded_assets/v0.9.0",
+]
+no-build-isolation-package = ["flash-attn", "deep-gemm"]
 
 [tool.setuptools.package-dir]
 "kb_nano" = "."

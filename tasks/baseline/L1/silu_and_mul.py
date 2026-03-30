@@ -5,7 +5,7 @@ from __future__ import annotations
 import torch
 import torch.nn as nn
 
-from sgl_kernel import silu_and_mul as _sgl_silu_and_mul
+from .csrc import _C
 
 
 class _ActivationBuffer:
@@ -33,4 +33,5 @@ class SiluAndMul(nn.Module):
     def forward(self, x):
         half = x.size(-1) // 2
         out = self._act_buf.get(x.size(0), half, x.device, x.dtype)
-        return _sgl_silu_and_mul(x, out)
+        _C.silu_and_mul(out, x)
+        return out

@@ -18,6 +18,11 @@ from ..L1.linear import Matmul
 from ..L1.fp8_linear import Fp8Linear
 from ..L1.allreduce import AllReduce
 
+
+def _get_fp8_linear_cls():
+    from ..L1.fp8_linear import Fp8Linear
+    return Fp8Linear
+
 _FP8_BLOCK = 128
 
 
@@ -49,7 +54,7 @@ class ColumnParallelLinear(nn.Module):
             )
             self.weight.weight_loader = self._weight_loader
             self.weight_scale_inv.weight_loader = self._scale_loader
-            self.linear_op = Fp8Linear()
+            self.linear_op = _get_fp8_linear_cls()()
         else:
             self.weight = nn.Parameter(torch.empty(self.output_size_per_partition, input_size))
             self.weight.weight_loader = self._weight_loader
@@ -100,7 +105,7 @@ class MergedColumnParallelLinear(nn.Module):
             )
             self.weight.weight_loader = self._weight_loader
             self.weight_scale_inv.weight_loader = self._scale_loader
-            self.linear_op = Fp8Linear()
+            self.linear_op = _get_fp8_linear_cls()()
         else:
             self.weight = nn.Parameter(torch.empty(total // tp, input_size))
             self.weight.weight_loader = self._weight_loader
@@ -156,7 +161,7 @@ class QKVParallelLinear(nn.Module):
             )
             self.weight.weight_loader = self._weight_loader
             self.weight_scale_inv.weight_loader = self._scale_loader
-            self.linear_op = Fp8Linear()
+            self.linear_op = _get_fp8_linear_cls()()
         else:
             self.weight = nn.Parameter(torch.empty(output_size, hidden_size))
             self.weight.weight_loader = self._weight_loader
@@ -230,7 +235,7 @@ class RowParallelLinear(nn.Module):
             )
             self.weight.weight_loader = self._weight_loader
             self.weight_scale_inv.weight_loader = self._scale_loader
-            self.linear_op = Fp8Linear()
+            self.linear_op = _get_fp8_linear_cls()()
         else:
             self.weight = nn.Parameter(torch.empty(output_size, self.input_size_per_partition))
             self.weight.weight_loader = self._weight_loader

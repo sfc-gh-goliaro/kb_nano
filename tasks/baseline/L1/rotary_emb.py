@@ -1,6 +1,6 @@
 """Rotary position embeddings (RoPE), with optional Llama 3.1-style frequency scaling.
 
-Uses sgl_kernel.apply_rope_with_cos_sin_cache_inplace for high-performance in-place RoPE.
+Uses a custom CUDA kernel for high-performance in-place RoPE.
 """
 
 from __future__ import annotations
@@ -10,7 +10,7 @@ import math
 import torch
 import torch.nn as nn
 
-from sgl_kernel import apply_rope_with_cos_sin_cache_inplace as _sgl_rope
+from .csrc import _C
 
 
 def _compute_scaled_inv_freq(
@@ -78,8 +78,7 @@ class RotaryEmbedding(nn.Module):
 
     def forward(self, positions, query, key):
         cache = self.cos_sin_cache
-        if cache.dtype != torch.float32:
-            cache = cache.float()
-            self.cos_sin_cache = cache
-        _sgl_rope(positions, query, key, self.head_dim, cache)
+        if cache.dtype != query.dtype:
+            cache = cache.to(query.dtype)
+        _C.rotary_embedding(positions, query, key, self.head_dim, cache, True)
         return query, key

@@ -5,7 +5,7 @@ dimensions. Each dimension's positions index into a shared cos/sin cache,
 and the resulting embeddings are assembled by section into the rotary dim.
 
 Uses a Triton kernel for multimodal prefill (3D positions differ across dims)
-and sgl_kernel for decode / text-only (all 3 dims identical -> standard RoPE).
+and a custom CUDA kernel for decode / text-only (all 3 dims identical -> standard RoPE).
 """
 
 from __future__ import annotations
@@ -16,7 +16,8 @@ import torch
 import torch.nn as nn
 import triton
 import triton.language as tl
-from sgl_kernel import apply_rope_with_cos_sin_cache_inplace as _sgl_rope
+
+from .csrc import _C
 
 
 @triton.jit
@@ -130,19 +131,19 @@ class MRotaryEmbedding(nn.Module):
         self.register_buffer("cos_sin_cache", cache, persistent=False)
 
     def _apply_sgl_rope(self, positions_1d, query, key):
-        """Fast path using sgl_kernel for 1D positions (decode or text-only)."""
+        """Fast path using CUDA kernel for 1D positions (decode or text-only)."""
         cache = self.cos_sin_cache
-        if cache.dtype != torch.float32:
-            cache = cache.float()
-            self.cos_sin_cache = cache
+        if cache.dtype != query.dtype:
+            cache = cache.to(query.dtype)
         q_shape = query.shape
         k_shape = key.shape
-        _sgl_rope(
+        _C.rotary_embedding(
             positions_1d,
             query.view(q_shape[0], -1),
             key.view(k_shape[0], -1),
             self.head_dim,
             cache,
+            True,
         )
         return query, key
 

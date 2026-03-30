@@ -1,6 +1,6 @@
 """
-Weight loader for Llama 3.1, Llama 4, Mixtral, Qwen2-VL, and Qwen3-VL
-with tensor parallelism.
+Weight loader for Llama 3.1, Llama 4, Mixtral, Qwen2-VL, Qwen3-VL,
+and Whisper with tensor parallelism.
 
 Loads weights from HuggingFace safetensors and distributes them
 across TP shards using the weight_loader callbacks on each parameter.
@@ -18,13 +18,13 @@ from safetensors import safe_open
 from transformers import AutoConfig
 
 from .tp import _tp_size
-from ..tasks.baseline.L1.fp8_linear import Fp8Linear, postprocess_fp8_weights
 from ..tasks.baseline.L4.llama import LlamaConfig, LlamaForCausalLM
 from ..tasks.baseline.L4.llama4 import Llama4Config, Llama4ForCausalLM
 from ..tasks.baseline.L4.mixtral import MixtralConfig, MixtralForCausalLM
 from ..tasks.baseline.L4.qwen2_vl import Qwen2VLConfig, Qwen2VLForConditionalGeneration
 from ..tasks.baseline.L4.qwen3_vl import Qwen3VLConfig, Qwen3VLForConditionalGeneration
 from ..tasks.baseline.L4.flux import FluxConfig, FluxPipeline
+from ..tasks.baseline.L4.whisper import WhisperConfig, WhisperForConditionalGeneration
 
 
 def default_weight_loader(param: torch.nn.Parameter, loaded_weight: torch.Tensor):
@@ -73,6 +73,11 @@ _QWEN2_MERGER_RE = re.compile(r"(visual\.merger)\.(ln_q|mlp\.0|mlp\.2)\.(weight|
 
 # Qwen3-VL learned pos embed: visual.pos_embed.weight -> visual.pos_embed_interp.pos_embed
 _VISION_POS_EMBED_RE = re.compile(r"visual\.pos_embed\.weight$")
+
+# L1 wrapper nesting: *.embed_tokens.weight / *.lm_head.weight -> *.embedding_op.emb.weight
+_EMBED_WEIGHT_RE = re.compile(
+    r"((?:model\.)?(?:embed_tokens|lm_head))\.weight$"
+)
 
 # L1 wrapper nesting: patch_embed.proj.X -> patch_embed.proj.conv.X
 _VISION_PATCH_EMBED_RE = re.compile(r"(visual\.patch_embed\.proj)\.(weight|bias)")
@@ -140,6 +145,24 @@ def _load_vision_qkv(model, param_prefix: str, loaded_weight: torch.Tensor,
 
 _WEIGHT_SCALE_INV_RE = re.compile(r"(.+)\.weight_scale_inv$")
 
+# Whisper: remap checkpoint names
+# Strip "model." prefix, fc1/fc2 -> mlp.fc1/mlp.fc2,
+# conv -> conv.conv (L1 wrapper), layernorm -> layernorm.norm (L1 wrapper)
+_WHISPER_FC_RE = re.compile(
+    r"((?:encoder|decoder)\.layers\.\d+)\.fc([12])\.(weight|bias)"
+)
+_WHISPER_CONV_RE = re.compile(r"(encoder\.conv[12])\.(weight|bias)")
+_WHISPER_LAYER_NORM_RE = re.compile(
+    r"((?:encoder|decoder)(?:\.layers\.\d+)?\.(?:self_attn_layer_norm|"
+    r"encoder_attn_layer_norm|final_layer_norm|layer_norm))\.(weight|bias)"
+)
+_WHISPER_EMBED_RE = re.compile(
+    r"((?:encoder|decoder)\.embed_(?:positions|tokens))\.weight"
+)
+_WHISPER_OUT_PROJ_RE = re.compile(
+    r"((?:encoder|decoder)\.layers\.\d+\.(?:self_attn|encoder_attn))\.out_proj\.(weight|bias)"
+)
+
 
 def load_weights(model, model_path: str, model_type: str = "llama") -> None:
     """Load weights with support for packed modules, MoE experts, vision
@@ -150,6 +173,7 @@ def load_weights(model, model_path: str, model_type: str = "llama") -> None:
     if not safetensor_files:
         raise FileNotFoundError(f"No .safetensors files found in {model_path}")
 
+    is_whisper = model_type == "whisper"
     is_qwen2_vl = model_type == "qwen2_vl"
     is_qwen3_vl = model_type == "qwen3_vl"
     is_qwen_vl = is_qwen2_vl or is_qwen3_vl
@@ -169,6 +193,60 @@ def load_weights(model, model_path: str, model_type: str = "llama") -> None:
                     mapped_name = _remap_qwen3_vl_name(weight_name)
                 else:
                     mapped_name = weight_name
+
+                # Whisper: remap checkpoint names
+                if is_whisper:
+                    # Strip "model." prefix
+                    if mapped_name.startswith("model."):
+                        mapped_name = mapped_name[len("model."):]
+                    # proj_out -> lm_head (tied weights, skip)
+                    if mapped_name.startswith("proj_out."):
+                        continue
+
+                    # fc1/fc2 -> mlp.fc1/mlp.fc2
+                    m_fc = _WHISPER_FC_RE.match(mapped_name)
+                    if m_fc:
+                        prefix, fc_num, wb = m_fc.groups()
+                        mapped_name = f"{prefix}.mlp.fc{fc_num}.{wb}"
+
+                    # conv1/conv2 -> conv1.conv/conv2.conv (L1 wrapper)
+                    m_conv = _WHISPER_CONV_RE.match(mapped_name)
+                    if m_conv:
+                        prefix, wb = m_conv.groups()
+                        mapped_name = f"{prefix}.conv.{wb}"
+
+                    # LayerNorm -> *.norm.* (L1 wrapper)
+                    m_ln = _WHISPER_LAYER_NORM_RE.match(mapped_name)
+                    if m_ln:
+                        prefix, wb = m_ln.groups()
+                        mapped_name = f"{prefix}.norm.{wb}"
+
+                    # Embedding L1 wrapper nesting: *.weight -> *.emb.weight
+                    m_emb = _WHISPER_EMBED_RE.match(mapped_name)
+                    if m_emb:
+                        prefix = m_emb.group(1)
+                        mapped_name = f"{prefix}.emb.weight"
+
+                    # Create fake zero bias for k_proj (HF checkpoint has
+                    # no k_proj bias, but our QKVParallelLinear expects one
+                    # for the packed QKV)
+                    if mapped_name.endswith(".k_proj.weight"):
+                        tensor = f.get_tensor(weight_name)
+                        fake_bias_name = mapped_name.replace(".weight", ".bias")
+                        fake_bias = torch.zeros(tensor.size(0))
+                        # Load the fake bias through packed mapping
+                        for orig_key, (packed_name, shard_id) in packed.items():
+                            if orig_key in fake_bias_name:
+                                param_name = fake_bias_name.replace(
+                                    orig_key, packed_name)
+                                try:
+                                    param = model.get_parameter(param_name)
+                                    weight_loader_fn = getattr(
+                                        param, "weight_loader")
+                                    weight_loader_fn(param, fake_bias, shard_id)
+                                except AttributeError:
+                                    pass
+                                break
 
                 # Llama4: strip language_model. prefix, skip vision weights
                 if is_llama4:
@@ -243,7 +321,7 @@ def load_weights(model, model_path: str, model_type: str = "llama") -> None:
                 # Remap learned pos embed nesting (Qwen3-VL)
                 if is_qwen3_vl:
                     if _VISION_POS_EMBED_RE.match(mapped_name):
-                        mapped_name = "visual.pos_embed_interp.pos_embed"
+                        mapped_name = "visual.pos_embed_interp._embed.weight"
 
                 # Remap vision param names for L1 wrapper nesting
                 if is_qwen_vl:
@@ -358,6 +436,9 @@ def load_weights(model, model_path: str, model_type: str = "llama") -> None:
                     continue
                 if "rotary_emb" in mapped_name:
                     continue
+                m_emb_w = _EMBED_WEIGHT_RE.match(mapped_name)
+                if m_emb_w:
+                    mapped_name = f"{m_emb_w.group(1)}.embedding_op.emb.weight"
                 try:
                     param = model.get_parameter(mapped_name)
                 except AttributeError:
@@ -365,11 +446,21 @@ def load_weights(model, model_path: str, model_type: str = "llama") -> None:
                 weight_loader = getattr(param, "weight_loader", default_weight_loader)
                 weight_loader(param, f.get_tensor(weight_name))
                 loaded += 1
+
+                # Whisper: duplicate decoder embed_tokens -> lm_head (tied weights)
+                if is_whisper and mapped_name == "decoder.embed_tokens.emb.weight":
+                    lm_param = model.get_parameter("lm_head.embedding_op.emb.weight")
+                    lm_loader = getattr(lm_param, "weight_loader", default_weight_loader)
+                    lm_loader(lm_param, f.get_tensor(weight_name))
+                    loaded += 1
+
     print(f"  Loaded {loaded} weight shards.")
 
 
 def _postprocess_fp8_weights(model: torch.nn.Module) -> None:
     """Re-quantize FP8 weights to UE8M0 format and transform scale layout for DeepGEMM."""
+    from ..tasks.baseline.L1.fp8_linear import Fp8Linear, postprocess_fp8_weights
+
     print("  Post-processing FP8 weights for DeepGEMM...")
     count = 0
     for module in model.modules():
@@ -442,6 +533,12 @@ def load_model(
             "kb_nano.infra.diffusion_engine.DiffusionEngine, "
             "not the LLM load_model() path."
         )
+    if model_type == "whisper":
+        config = WhisperConfig.from_pretrained(model_name)
+        config.dtype = dtype
+        print(f"  Allocating Whisper model (enc={config.encoder_layers}L, "
+              f"dec={config.decoder_layers}L, d={config.d_model})...")
+        model = WhisperForConditionalGeneration(config)
     elif model_type == "llama4":
         config = Llama4Config.from_pretrained(model_name)
         config.dtype = dtype
