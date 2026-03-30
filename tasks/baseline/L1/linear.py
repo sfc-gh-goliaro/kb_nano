@@ -23,7 +23,7 @@ class Linear(nn.Module):
         super().__init__()
         self.weight = nn.Parameter(torch.empty(out_features, in_features))
         self.bias = nn.Parameter(torch.empty(out_features)) if bias else None
-        self.op = Matmul()
+        self.matmul = Matmul()
 
     def forward(self, input):
-        return self.op(input, self.weight, self.bias)
+        return self.matmul(input, self.weight, self.bias)

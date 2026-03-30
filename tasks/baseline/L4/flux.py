@@ -33,6 +33,7 @@ from torch import nn
 from transformers import CLIPTextModel, CLIPTokenizer, T5EncoderModel, T5TokenizerFast
 
 from ..L1.flux_pos_embed import FluxPosEmbed
+from ..L1.linear import Linear
 from ..L3.flux_transformer_block import FluxTransformerBlock, FluxSingleTransformerBlock
 
 logger = logging.getLogger(__name__)
@@ -138,8 +139,8 @@ class FluxTransformer2DModel(nn.Module):
             pooled_projection_dim=config.pooled_projection_dim,
         )
 
-        self.context_embedder = nn.Linear(config.joint_attention_dim, inner_dim)
-        self.x_embedder = nn.Linear(config.in_channels, inner_dim)
+        self.context_embedder = Linear(config.joint_attention_dim, inner_dim)
+        self.x_embedder = Linear(config.in_channels, inner_dim)
 
         self.transformer_blocks = nn.ModuleList([
             FluxTransformerBlock(
@@ -162,7 +163,7 @@ class FluxTransformer2DModel(nn.Module):
         self.norm_out = AdaLayerNormContinuous(
             inner_dim, inner_dim, elementwise_affine=False, eps=1e-6,
         )
-        self.proj_out = nn.Linear(
+        self.proj_out = Linear(
             inner_dim,
             config.patch_size * config.patch_size * self.out_channels,
             bias=True,
