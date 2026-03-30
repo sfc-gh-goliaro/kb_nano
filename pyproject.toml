@@ -18,6 +18,7 @@ dependencies = [
     "deep-gemm @ git+https://github.com/deepseek-ai/DeepGEMM.git@v2.1.1.post3",
     "decord",
     "mlflow>=2.10",
+    "datasets",
 ]
 
 [project.optional-dependencies]
