@@ -20,6 +20,8 @@ dependencies = [
     "decord",
     "mlflow>=2.10",
     "datasets",
+    "diffusers>=0.37",
+    "peft>=0.17.0",
 ]
 
 [project.optional-dependencies]
