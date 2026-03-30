@@ -11,26 +11,13 @@ and a custom CUDA kernel for decode / text-only (all 3 dims identical -> standar
 from __future__ import annotations
 
 import math
-import os
 
 import torch
 import torch.nn as nn
 import triton
 import triton.language as tl
-from torch.utils.cpp_extension import load as _load_ext
 
-_CSRC = os.path.join(os.path.dirname(os.path.abspath(__file__)), "csrc")
-_C = _load_ext(
-    name="kb_nano_L1_ops",
-    sources=[os.path.join(_CSRC, f) for f in [
-        "binding.cpp", "rmsnorm.cu", "activation.cu", "pos_enc.cu",
-        "moe_sum.cu", "moe_align.cu", "moe_topk_softmax.cu",
-    ]],
-    extra_cuda_cflags=["-O3", "--use_fast_math",
-                       "-DFLASHINFER_ENABLE_BF16", "-DFLASHINFER_ENABLE_F16"],
-    extra_cflags=["-O3"],
-    verbose=False,
-)
+from .csrc import _C
 
 
 @triton.jit
