@@ -109,46 +109,39 @@ ALL_VLM_WORKLOADS = {
 # ---------------------------------------------------------------------------
 
 @dataclass(frozen=True)
+class DiffusionModelConfig:
+    num_inference_steps: int
+    guidance_scale: float
+
+FLUX_CONFIG = DiffusionModelConfig(num_inference_steps=28, guidance_scale=3.5)
+SDXL_CONFIG = DiffusionModelConfig(num_inference_steps=50, guidance_scale=5.0)
+
+
+@dataclass(frozen=True)
 class DiffusionThroughputWorkload:
     name: str
     height: int
     width: int
-    num_inference_steps: int
     batch_size: int
-    guidance_scale: float = 3.5
-    num_requests: int = 1  # Each "request" generates batch_size images
-
-DIFFUSION_THROUGHPUT_WORKLOADS: list[DiffusionThroughputWorkload] = [
-    DiffusionThroughputWorkload(
-        "1024x1024-28steps", height=1024, width=1024,
-        num_inference_steps=28, batch_size=4, num_requests=10),
-    DiffusionThroughputWorkload(
-        "512x512-28steps", height=512, width=512,
-        num_inference_steps=28, batch_size=8, num_requests=10),
-    DiffusionThroughputWorkload(
-        "1024x1024-50steps", height=1024, width=1024,
-        num_inference_steps=50, batch_size=4, num_requests=5),
-]
-
+    num_requests: int = 10
 
 @dataclass(frozen=True)
 class DiffusionLatencyWorkload:
     name: str
     height: int
     width: int
-    num_inference_steps: int
     batch_size: int = 1
-    guidance_scale: float = 3.5
     num_warmup: int = 2
     num_iters: int = 5
 
+DIFFUSION_THROUGHPUT_WORKLOADS: list[DiffusionThroughputWorkload] = [
+    DiffusionThroughputWorkload("1024x1024", height=1024, width=1024, batch_size=4, num_requests=10),
+    DiffusionThroughputWorkload("512x512",   height=512,  width=512,  batch_size=8, num_requests=10),
+]
+
 DIFFUSION_LATENCY_WORKLOADS: list[DiffusionLatencyWorkload] = [
-    DiffusionLatencyWorkload(
-        "single-1024x1024", height=1024, width=1024,
-        num_inference_steps=28),
-    DiffusionLatencyWorkload(
-        "single-512x512", height=512, width=512,
-        num_inference_steps=28),
+    DiffusionLatencyWorkload("single-1024x1024", height=1024, width=1024),
+    DiffusionLatencyWorkload("single-512x512",   height=512,  width=512),
 ]
 
 ALL_DIFFUSION_WORKLOADS = {

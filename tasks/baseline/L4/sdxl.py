@@ -412,12 +412,23 @@ class SDXLPipeline(nn.Module):
     loop (Euler discrete) -> VAE decode -> postprocess.
     """
 
-    def __init__(self, config: SDXLConfig, model_name: str):
+    def __init__(
+        self,
+        config: SDXLConfig,
+        model_name: str,
+        torch_dtype: torch.dtype | None = None,
+        variant: str | None = "fp16",
+    ):
         super().__init__()
         self.config = config
         self.model_name = model_name
 
         local_files_only = os.path.isdir(model_name)
+        hf_kwargs: dict[str, Any] = {"local_files_only": local_files_only}
+        if torch_dtype is not None:
+            hf_kwargs["torch_dtype"] = torch_dtype
+        if variant is not None:
+            hf_kwargs["variant"] = variant
 
         self.scheduler = EulerDiscreteScheduler.from_pretrained(
             model_name, subfolder="scheduler", local_files_only=local_files_only,
@@ -429,13 +440,13 @@ class SDXLPipeline(nn.Module):
             model_name, subfolder="tokenizer_2", local_files_only=local_files_only,
         )
         self.text_encoder = CLIPTextModel.from_pretrained(
-            model_name, subfolder="text_encoder", local_files_only=local_files_only,
+            model_name, subfolder="text_encoder", **hf_kwargs,
         )
         self.text_encoder_2 = CLIPTextModelWithProjection.from_pretrained(
-            model_name, subfolder="text_encoder_2", local_files_only=local_files_only,
+            model_name, subfolder="text_encoder_2", **hf_kwargs,
         )
         self.vae = AutoencoderKL.from_pretrained(
-            model_name, subfolder="vae", local_files_only=local_files_only,
+            model_name, subfolder="vae", **hf_kwargs,
         )
 
         self.unet = UNet2DConditionModel(config)
@@ -601,7 +612,7 @@ class SDXLPipeline(nn.Module):
     # Forward (full pipeline)
     # -----------------------------------------------------------------------
 
-    @torch.inference_mode()
+    @torch.no_grad()
     def forward(
         self,
         prompts: str | list[str],
@@ -671,6 +682,10 @@ class SDXLPipeline(nn.Module):
         )
 
         # 5. Denoising loop
+        added_cond_kwargs = {
+            "text_embeds": add_text_embeds,
+            "time_ids": add_time_ids,
+        }
         for t in timesteps:
             latent_model_input = (
                 torch.cat([latents] * 2) if do_cfg else latents
@@ -680,10 +695,7 @@ class SDXLPipeline(nn.Module):
             noise_pred = self.unet(
                 latent_model_input, t,
                 encoder_hidden_states=prompt_embeds,
-                added_cond_kwargs={
-                    "text_embeds": add_text_embeds,
-                    "time_ids": add_time_ids,
-                },
+                added_cond_kwargs=added_cond_kwargs,
                 return_dict=False,
             )[0]
 

@@ -1,7 +1,8 @@
 """Multi-head attention for SDXL UNet spatial transformers.
 
 Supports both self-attention and cross-attention with separate Q/K/V
-projections and DenseAttention L1 backend.
+projections.  Uses DenseAttention with the ``sdpa`` backend to match
+diffusers' AttnProcessor2_0 numerics.
 
 Parameter names match diffusers' Attention class:
   to_q, to_k, to_v, to_out.0 (Linear + bias).
@@ -49,7 +50,7 @@ class SDXLAttention(nn.Module):
             Linear(inner_dim, query_dim, bias=True),
         ])
 
-        self.attn = DenseAttention()
+        self.attn = DenseAttention(backend="sdpa")
 
     def forward(
         self,
@@ -71,5 +72,6 @@ class SDXLAttention(nn.Module):
         out = self.attn(q, k, v, softmax_scale=self.scale, causal=False)
 
         out = out.reshape(batch_size, -1, self.heads * self.dim_head)
+        out = out.to(q.dtype)
         out = self.to_out[0](out)
         return out

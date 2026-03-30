@@ -47,6 +47,7 @@ from kb_nano.bench.utils.worker import run_worker
 from kb_nano.bench.utils.workloads import (
     DIFFUSION_LATENCY_WORKLOADS,
     DIFFUSION_THROUGHPUT_WORKLOADS,
+    FLUX_CONFIG,
 )
 
 
@@ -399,8 +400,8 @@ def _build_throughput_scenarios(
             "name": w.name,
             "height": w.height,
             "width": w.width,
-            "num_inference_steps": w.num_inference_steps,
-            "guidance_scale": w.guidance_scale,
+            "num_inference_steps": FLUX_CONFIG.num_inference_steps,
+            "guidance_scale": FLUX_CONFIG.guidance_scale,
             "batches": batches,
             "batch_size": bs,
             "num_requests": num_requests,
@@ -415,8 +416,8 @@ def _build_latency_scenarios(prompts: list[str]) -> list[dict]:
             "name": w.name,
             "height": w.height,
             "width": w.width,
-            "num_inference_steps": w.num_inference_steps,
-            "guidance_scale": w.guidance_scale,
+            "num_inference_steps": FLUX_CONFIG.num_inference_steps,
+            "guidance_scale": FLUX_CONFIG.guidance_scale,
             "prompts": prompts[:w.batch_size],
             "num_warmup": w.num_warmup,
             "num_iters": w.num_iters,

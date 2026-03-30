@@ -36,25 +36,34 @@ def _download_sdxl_model(model_name: str) -> str:
     )
 
 
-def _load_unet_weights(pipeline: SDXLPipeline, model_path: str) -> None:
+def _load_unet_weights(
+    pipeline: SDXLPipeline, model_path: str, variant: str = "fp16",
+) -> None:
     unet_dir = os.path.join(model_path, "unet")
-    safetensor_files = sorted(glob(os.path.join(unet_dir, "*.safetensors")))
-    if not safetensor_files:
-        safetensor_files = sorted(glob(os.path.join(model_path, "*.safetensors")))
 
-    if not safetensor_files:
+    # Prefer the variant file (e.g. diffusion_pytorch_model.fp16.safetensors)
+    # to match the diffusers loading path and avoid double-loading.
+    variant_files = sorted(glob(os.path.join(unet_dir, f"*.{variant}.safetensors")))
+    if not variant_files:
+        variant_files = sorted(glob(os.path.join(unet_dir, "*.safetensors")))
+    if not variant_files:
+        variant_files = sorted(glob(os.path.join(model_path, f"*.{variant}.safetensors")))
+    if not variant_files:
+        variant_files = sorted(glob(os.path.join(model_path, "*.safetensors")))
+
+    if not variant_files:
         raise FileNotFoundError(
             f"No .safetensors files found in {unet_dir} or {model_path}"
         )
 
     weights = []
-    for sf_file in safetensor_files:
+    for sf_file in variant_files:
         with safe_open(sf_file, "pt", "cpu") as f:
             for key in f.keys():
                 weights.append((key, f.get_tensor(key)))
 
     loaded = pipeline.unet.load_weights(weights)
-    logger.info("Loaded %d UNet weight entries", len(loaded))
+    logger.info("Loaded %d UNet weight entries from %s", len(loaded), [os.path.basename(f) for f in variant_files])
 
 
 class SDXLEngine:
@@ -84,14 +93,14 @@ class SDXLEngine:
         model_path = _download_sdxl_model(self.model_name)
 
         config = SDXLConfig.from_pretrained(model_path)
-        pipeline = SDXLPipeline(config, model_path)
+        pipeline = SDXLPipeline(
+            config, model_path,
+            torch_dtype=self.dtype, variant="fp16",
+        )
 
-        _load_unet_weights(pipeline, model_path)
+        _load_unet_weights(pipeline, model_path, variant="fp16")
 
         pipeline.to(device=self.device, dtype=self.dtype)
-        pipeline.text_encoder.to(device=self.device)
-        pipeline.text_encoder_2.to(device=self.device)
-        pipeline.vae.to(device=self.device)
 
         if not self.enforce_eager:
             try:
