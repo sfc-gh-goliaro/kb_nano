@@ -47,6 +47,7 @@ _L4_MODEL_KEYS: dict[str, str] = {
     "qwen2_vl": "qwen2_vl",
     "qwen3_vl": "qwen3_vl",
     "flux": "flux",
+    "cosyvoice3": "cosyvoice3",
 }
 
 
