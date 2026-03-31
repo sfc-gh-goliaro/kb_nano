@@ -1,6 +1,6 @@
 # kb-nano
 
-A standalone, high-performance inference engine supporting **LLMs** (Llama 3.1, Mixtral-8x7B, Qwen2-VL, Qwen3-VL), **diffusion models** (FLUX.1-dev, SDXL), audio models (Whisper) with tensor parallelism. No vLLM dependency at runtime — just PyTorch, Triton, and Flash Attention.
+A standalone, high-performance inference engine supporting **LLMs** (Llama 3.1, Mixtral-8x7B, Qwen2-VL, Qwen3-VL), **diffusion models** (FLUX.1-dev, SDXL), **segmentation models** (SAM3.1), audio models (Whisper) with tensor parallelism. No vLLM dependency at runtime — just PyTorch, Triton, and Flash Attention.
 
 ## Features
 
@@ -9,6 +9,7 @@ A standalone, high-performance inference engine supporting **LLMs** (Llama 3.1, 
 - **FLUX.1-dev** diffusion transformer (text-to-image) with Flash Attention
 - **SDXL** (Stable Diffusion XL) UNet-based text-to-image with dual CLIP text encoders
 - **Qwen2-VL / Qwen3-VL** vision-language models with image and video support
+- **SAM3.1** (facebook/sam3.1) image/video segmentation with ViT backbone, fusion encoder, detection decoder, and segmentation head
 - **Whisper** (large-v3) encoder-decoder speech-to-text with batched inference and paged cross-attention KV cache
 - **Tensor parallelism** (TP) with custom IPC-based all-reduce for multi-GPU inference
 - **Paged KV cache** with Triton store kernels (LLM models)
@@ -19,6 +20,7 @@ A standalone, high-performance inference engine supporting **LLMs** (Llama 3.1, 
 - **Benchmarking suite** for evaluating custom CUDA/Triton/PyTorch kernels at 4 abstraction levels
 - **vllm-omni comparison benchmark** for FLUX diffusion
 - **diffusers comparison benchmark** for SDXL diffusion
+- **facebook/sam3 comparison benchmark** for SAM3.1 segmentation
 
 ## Project Structure
 
@@ -42,6 +44,8 @@ A standalone, high-performance inference engine supporting **LLMs** (Llama 3.1, 
 │   │   │   ├── conv1d.py       # Conv1d wrapper (Whisper audio encoder)
 │   │   │   ├── gelu.py         # GELU activation (Whisper)
 │   │   │   ├── layer_norm.py   # LayerNorm wrapper (Whisper, vision)
+│   │   │   ├── sam3_position_encoding.py  # SAM3 2D sine position encoding
+│   │   │   ├── sam3_rope.py    # SAM3 RoPE (tiled real-valued)
 │   │   │   ├── moe_align.py    # MoE token-expert alignment
 │   │   │   ├── moe_sum.py      # Fused MoE sum kernel
 │   │   │   ├── moe_grouped_gemm.py # Triton fused MoE grouped GEMM
@@ -63,22 +67,27 @@ A standalone, high-performance inference engine supporting **LLMs** (Llama 3.1, 
 │   │   │   ├── sdxl_feedforward.py # GEGLU FeedForward
 │   │   │   ├── sdxl_time_embedding.py # SDXL text_time conditioning
 │   │   │   ├── sdxl_downsample.py  # Stride-2 Conv2d downsampling
-│   │   │   └── sdxl_upsample.py    # Nearest-neighbor + Conv2d upsampling
+│   │   │   ├── sdxl_upsample.py    # Nearest-neighbor + Conv2d upsampling
+│   │   │   ├── sam3_vit_attention.py  # SAM3 ViT windowed attention with RoPE
+│   │   │   └── sam3_mask_predictor.py # SAM3 mask prediction head (MLP)
 │   │   ├── L3/                 # Decoder layers
 │   │   │   ├── llama_decoder.py
 │   │   │   ├── mixtral_decoder.py
 │   │   │   ├── flux_transformer_block.py  # FLUX dual/single-stream DiT blocks
 │   │   │   ├── sdxl_transformer_block.py # BasicTransformerBlock (self-attn, cross-attn, GEGLU FFN)
 │   │   │   ├── sdxl_spatial_transformer.py # Transformer2DModel (spatial flatten + N transformer blocks)
-│   │   │   └── sdxl_unet_block.py  # UNet down/mid/up blocks with cross-attention
+│   │   │   ├── sdxl_unet_block.py  # UNet down/mid/up blocks with cross-attention
 │   │   │   ├── whisper_encoder_layer.py
-│   │   │   └── whisper_decoder_layer.py
+│   │   │   ├── whisper_decoder_layer.py
+│   │   │   ├── sam3_encoder_layer.py  # SAM3 fusion encoder layer
+│   │   │   └── sam3_decoder_layer.py  # SAM3 detection decoder layer
 │   │   └── L4/                 # Full models
 │   │       ├── llama.py        # LlamaForCausalLM
 │   │       ├── mixtral.py      # MixtralForCausalLM
 │   │       ├── flux.py         # FluxPipeline (text-to-image diffusion)
-│   │       └── sdxl.py         # SDXLPipeline (UNet text-to-image diffusion)
-│   │       └── whisper.py      # WhisperForConditionalGeneration
+│   │       ├── sdxl.py         # SDXLPipeline (UNet text-to-image diffusion)
+│   │       ├── whisper.py      # WhisperForConditionalGeneration
+│   │       └── sam3.py         # SAM3Model (ViT + FPN + fusion encoder + decoder + segmentation head)
 │   └── candidate/              # Generated replacement kernels (gitignored)
 │       ├── README.md           # Instructions
 │       └── L1/, L2/, ...       # Organized by level, named after the operator
@@ -100,6 +109,7 @@ A standalone, high-performance inference engine supporting **LLMs** (Llama 3.1, 
     ├── bench_vllm.py           # Multi-scenario throughput + latency + alignment benchmark vs vLLM
     ├── bench_vllm_omni.py     # FLUX diffusion benchmark: kb-nano vs vllm-omni
     ├── bench_diffusers.py     # SDXL diffusion benchmark: kb-nano vs diffusers + torch.compile
+    ├── test_sam.py            # SAM3 segmentation benchmark: kb-nano vs facebook/sam3 reference
     ├── utils/                  # Post-processing and visualization
     │   └── parse_vllm_bench_results.py  # Generate tables and plots from bench_vllm.py results
     └── debug/                  # Profiling and debugging scripts
@@ -175,6 +185,16 @@ python tests/bench_diffusers.py --skip-diffusers
 
 # Save results to a specific directory
 python tests/bench_diffusers.py --output-dir tests/results/B200/stable-diffusion-xl-base-1.0
+```
+
+### Benchmarking vs facebook/sam3 (Segmentation)
+
+```bash
+# SAM3.1: throughput + latency + correctness benchmark vs facebook/sam3 reference
+python tests/test_sam.py
+
+# Custom number of images and latency iterations
+python tests/test_sam.py  # Uses SA-Co/Gold images, 5 latency iterations by default
 ```
 
 The diffusion benchmark measures:
@@ -524,6 +544,32 @@ Correctness (eager mode, latent space, per-batch cosine similarity):
 | 512x512, 50 steps   | 0.969 | 0.952 |
 
 Correctness is measured in eager mode with bf16 precision. Both engines use identical model weights (diffusers checkpoint) and the same EulerDiscreteScheduler. The remaining cosine divergence is expected from bf16 accumulation differences across 28-50 denoising steps with CFG guidance_scale=5.0.
+
+### SAM3.1 (Segmentation)
+
+Run `tests/test_sam.py` to reproduce. Inputs are real images from SACo-VEval SmartGlasses, preprocessed to 1008x1008 with the same normalization pipeline as the reference. Reference engine: facebook/sam3 (`build_sam3_image_model`). Both engines load shared pretrained weights; correctness is checked on every image used for throughput.
+
+**Hardware: NVIDIA H200**
+
+Full pipeline (ViT backbone + FPN + text encoder + fusion encoder + decoder + segmentation head):
+
+| Metric | Reference (fp32) | Ours (bf16) | Ratio |
+|--------|------------------:|------------:|------:|
+| Throughput (img/s) | 1.0x | 1.72x | **1.72x** |
+| Latency (median) | 1.0x | 0.44x | **2.27x** |
+
+Correctness (full pipeline predictions, 50 images, per-element cosine similarity):
+
+| Output | Avg CosSim | Min CosSim |
+|--------|----------:|----------:|
+| Bounding boxes (cxcywh) | 0.862 | — |
+| Segmentation masks | 0.721 | — |
+| Backbone features | 0.999 | 0.999 |
+
+The remaining correctness gap is expected from three sources:
+- **Precision**: kb-nano runs in bfloat16 (required by Flash Attention 3) vs the reference's float32
+- **boxRPB**: the reference uses learned box-based relative position bias in the decoder, which kb-nano does not implement
+- **Attention implementation**: Flash Attention 3 vs standard SDPA produce slightly different numerics
 
 ### Key optimizations
 
