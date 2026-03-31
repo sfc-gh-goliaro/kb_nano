@@ -1,7 +1,8 @@
 """Fusion encoder layer for SAM3.
 
 Self-attention over flattened image tokens followed by cross-attention to
-text/prompt features, then a feed-forward network. Pre-norm architecture.
+text/prompt features, then a feed-forward network. Pre-norm architecture
+with ReLU activation (matching reference).
 
 Reference: sam3/model/encoder.py TransformerEncoderLayer (pre_norm path)
 """
@@ -15,7 +16,6 @@ import torch.nn as nn
 
 from ..L1.layer_norm import LayerNorm
 from ..L1.linear import Linear
-from ..L1.gelu import GELU
 from ..L2.sam3_cross_attention import Sam3CrossAttention
 
 
@@ -47,12 +47,10 @@ class Sam3EncoderLayer(nn.Module):
         self.norm2 = LayerNorm(d_model)
         self.norm3 = LayerNorm(d_model)
 
-        self.ffn = nn.Sequential(
-            Linear(d_model, dim_feedforward, bias=True),
-            GELU(),
-            nn.Dropout(dropout),
-            Linear(dim_feedforward, d_model, bias=True),
-        )
+        self.linear1 = Linear(d_model, dim_feedforward, bias=True)
+        self.linear2 = Linear(dim_feedforward, d_model, bias=True)
+        self.activation = nn.ReLU()
+        self.dropout = nn.Dropout(dropout)
 
         self.dropout1 = nn.Dropout(dropout)
         self.dropout2 = nn.Dropout(dropout)
@@ -82,19 +80,19 @@ class Sam3EncoderLayer(nn.Module):
             (B, L, D) processed tokens.
         """
         # Self-attention
-        x = self.norm1(tgt)
-        q = k = x + query_pos if query_pos is not None else x
-        x = self.self_attn(q, k, x, key_padding_mask=tgt_key_padding_mask)
-        tgt = tgt + self.dropout1(x)
+        tgt2 = self.norm1(tgt)
+        q = k = tgt2 + query_pos if query_pos is not None else tgt2
+        tgt2 = self.self_attn(q, k, tgt2, key_padding_mask=tgt_key_padding_mask)
+        tgt = tgt + self.dropout1(tgt2)
 
         # Cross-attention to prompt/text
-        x = self.norm2(tgt)
-        x = self.cross_attn(x, memory, memory, key_padding_mask=memory_key_padding_mask)
-        tgt = tgt + self.dropout2(x)
+        tgt2 = self.norm2(tgt)
+        tgt2 = self.cross_attn(tgt2, memory, memory, key_padding_mask=memory_key_padding_mask)
+        tgt = tgt + self.dropout2(tgt2)
 
         # FFN
-        x = self.norm3(tgt)
-        x = self.ffn(x)
-        tgt = tgt + self.dropout3(x)
+        tgt2 = self.norm3(tgt)
+        tgt2 = self.linear2(self.dropout(self.activation(self.linear1(tgt2))))
+        tgt = tgt + self.dropout3(tgt2)
 
         return tgt

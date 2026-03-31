@@ -1,10 +1,10 @@
 """Detection decoder layer for SAM3.
 
-Self-attention over object queries, cross-attention to encoder memory, optional
-cross-attention to text, and feed-forward network. Pre-norm architecture with
-iterative box refinement support.
+Post-norm architecture matching reference: self-attn → text cross-attn →
+image cross-attn → FFN. Position embeddings are added transiently inside
+attention (via with_pos_embed) rather than accumulated into hidden states.
 
-Reference: sam3/model/decoder.py TransformerDecoderLayer (pre_norm path)
+Reference: sam3/model/decoder.py TransformerDecoderLayer
 """
 
 from __future__ import annotations
@@ -16,14 +16,14 @@ import torch.nn as nn
 
 from ..L1.layer_norm import LayerNorm
 from ..L1.linear import Linear
-from ..L1.gelu import GELU
 from ..L2.sam3_cross_attention import Sam3CrossAttention
 
 
 class Sam3DecoderLayer(nn.Module):
-    """Single detection decoder layer for SAM3.
+    """Single detection decoder layer for SAM3 (post-norm).
 
-    Pre-norm: self-attn -> cross-attn (memory) -> cross-attn (text) -> FFN.
+    Order: self-attn → text cross-attn → image cross-attn → FFN.
+    All attention uses with_pos_embed for positional conditioning.
 
     Args:
         d_model: Model dimension.
@@ -43,44 +43,50 @@ class Sam3DecoderLayer(nn.Module):
     ):
         super().__init__()
         self.self_attn = Sam3CrossAttention(d_model, n_head)
-        self.cross_attn_memory = Sam3CrossAttention(d_model, n_head)
+        self.cross_attn = Sam3CrossAttention(d_model, n_head)
 
         self.has_text_cross_attn = text_cross_attention
         if text_cross_attention:
-            self.cross_attn_text = Sam3CrossAttention(d_model, n_head)
-            self.norm_text = LayerNorm(d_model)
-            self.dropout_text = nn.Dropout(dropout)
+            self.ca_text = Sam3CrossAttention(d_model, n_head)
+            self.catext_norm = LayerNorm(d_model)
+            self.catext_dropout = nn.Dropout(dropout)
 
         self.norm1 = LayerNorm(d_model)
         self.norm2 = LayerNorm(d_model)
         self.norm3 = LayerNorm(d_model)
 
-        self.ffn = nn.Sequential(
-            Linear(d_model, dim_feedforward, bias=True),
-            GELU(),
-            nn.Dropout(dropout),
-            Linear(dim_feedforward, d_model, bias=True),
-        )
+        self.linear1 = Linear(d_model, dim_feedforward, bias=True)
+        self.linear2 = Linear(dim_feedforward, d_model, bias=True)
+        self.activation = nn.ReLU()
 
         self.dropout1 = nn.Dropout(dropout)
         self.dropout2 = nn.Dropout(dropout)
         self.dropout3 = nn.Dropout(dropout)
+        self.dropout4 = nn.Dropout(dropout)
+
+    @staticmethod
+    def _with_pos_embed(tensor: torch.Tensor, pos: Optional[torch.Tensor]) -> torch.Tensor:
+        return tensor if pos is None else tensor + pos
 
     def forward(
         self,
         tgt: torch.Tensor,
         memory: torch.Tensor,
+        tgt_query_pos: Optional[torch.Tensor] = None,
+        memory_pos: Optional[torch.Tensor] = None,
         tgt_key_padding_mask: Optional[torch.Tensor] = None,
         memory_key_padding_mask: Optional[torch.Tensor] = None,
         memory_text: Optional[torch.Tensor] = None,
         text_attention_mask: Optional[torch.Tensor] = None,
         **kwargs,
     ) -> torch.Tensor:
-        """Forward pass.
+        """Forward pass (post-norm, matching reference decoder layer).
 
         Args:
             tgt: (B, Q, D) object queries.
             memory: (B, L, D) encoder memory.
+            tgt_query_pos: (B, Q, D) positional encoding for queries.
+            memory_pos: (B, L, D) positional encoding for memory keys.
             tgt_key_padding_mask: (B, Q) padding mask for queries.
             memory_key_padding_mask: (B, L) padding mask for memory.
             memory_text: (B, S, D) text features for text cross-attention.
@@ -89,25 +95,35 @@ class Sam3DecoderLayer(nn.Module):
         Returns:
             (B, Q, D) updated object queries.
         """
-        # Self-attention
-        x = self.norm1(tgt)
-        x = self.self_attn(x, x, x, key_padding_mask=tgt_key_padding_mask)
-        tgt = tgt + self.dropout1(x)
+        # Self-attention with positional encoding on q, k
+        q = k = self._with_pos_embed(tgt, tgt_query_pos)
+        tgt2 = self.self_attn(q, k, tgt, key_padding_mask=tgt_key_padding_mask)
+        tgt = tgt + self.dropout2(tgt2)
+        tgt = self.norm2(tgt)
 
-        # Cross-attention to encoder memory
-        x = self.norm2(tgt)
-        x = self.cross_attn_memory(x, memory, memory, key_padding_mask=memory_key_padding_mask)
-        tgt = tgt + self.dropout2(x)
-
-        # Cross-attention to text (optional)
+        # Text cross-attention (before image, matching reference order)
         if self.has_text_cross_attn and memory_text is not None:
-            x = self.norm_text(tgt)
-            x = self.cross_attn_text(x, memory_text, memory_text, key_padding_mask=text_attention_mask)
-            tgt = tgt + self.dropout_text(x)
+            tgt2 = self.ca_text(
+                self._with_pos_embed(tgt, tgt_query_pos),
+                memory_text, memory_text,
+                key_padding_mask=text_attention_mask,
+            )
+            tgt = tgt + self.catext_dropout(tgt2)
+            tgt = self.catext_norm(tgt)
 
-        # FFN
-        x = self.norm3(tgt)
-        x = self.ffn(x)
-        tgt = tgt + self.dropout3(x)
+        # Image cross-attention with pos on both q and k
+        tgt2 = self.cross_attn(
+            self._with_pos_embed(tgt, tgt_query_pos),
+            self._with_pos_embed(memory, memory_pos),
+            memory,
+            key_padding_mask=memory_key_padding_mask,
+        )
+        tgt = tgt + self.dropout1(tgt2)
+        tgt = self.norm1(tgt)
+
+        # FFN (ReLU activation, matching reference)
+        tgt2 = self.linear2(self.dropout3(self.activation(self.linear1(tgt))))
+        tgt = tgt + self.dropout4(tgt2)
+        tgt = self.norm3(tgt)
 
         return tgt

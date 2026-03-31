@@ -94,13 +94,14 @@ class Sam3Config:
 class Sam3FusionEncoder(nn.Module):
     """Multi-layer fusion encoder that fuses text and image features.
 
-    Adds pooled text to image features, then runs encoder layers with
-    cross-attention to text.
+    Uses only the last feature level (matching reference num_feature_levels=1)
+    and does NOT add pooled text to image features (matching reference
+    add_pooled_text_to_img_feat=False).
     """
 
     def __init__(self, config: Sam3Config):
         super().__init__()
-        self.num_feature_levels = len(config.scale_factors) - config.scalp
+        self.num_feature_levels = 1
         self.layers = nn.ModuleList([
             Sam3EncoderLayer(
                 config.d_model,
@@ -110,13 +111,7 @@ class Sam3FusionEncoder(nn.Module):
             for _ in range(config.encoder_layers)
         ])
         self.text_pooling_proj = Linear(config.d_model, config.d_model, bias=True)
-
-        if self.num_feature_levels > 1:
-            self.level_embed = nn.Parameter(
-                torch.zeros(self.num_feature_levels, config.d_model)
-            )
-        else:
-            self.level_embed = None
+        self.level_embed = None
 
     def forward(
         self,
@@ -128,7 +123,7 @@ class Sam3FusionEncoder(nn.Module):
         """Run fusion encoder.
 
         Args:
-            src: List of (B, C, H, W) image feature maps.
+            src: List of (B, C, H, W) image feature maps (last level used).
             src_pos: Corresponding position encodings.
             prompt: (seq, B, D) text features.
             prompt_key_padding_mask: (B, seq) padding mask.
@@ -136,28 +131,13 @@ class Sam3FusionEncoder(nn.Module):
         Returns:
             Dict with 'memory', 'memory_text', 'spatial_shapes', etc.
         """
-        bs = src[0].shape[0]
+        feat = src[-1]
+        pos = src_pos[-1]
 
-        pooled_text = prompt.mean(dim=0)  # (B, D)
-        pooled_text = self.text_pooling_proj(pooled_text)[..., None, None]
-
-        src_flatten = []
-        pos_flatten = []
-        spatial_shapes = []
-
-        for lvl, (feat, pos) in enumerate(zip(src, src_pos)):
-            feat = feat + pooled_text
-            b, c, h, w = feat.shape
-            spatial_shapes.append((h, w))
-            feat_flat = feat.flatten(2).transpose(1, 2)  # (B, HW, C)
-            pos_flat = pos.flatten(2).transpose(1, 2)
-            if self.level_embed is not None:
-                pos_flat = pos_flat + self.level_embed[lvl].view(1, 1, -1)
-            src_flatten.append(feat_flat)
-            pos_flatten.append(pos_flat)
-
-        src_flat = torch.cat(src_flatten, dim=1)  # (B, sum(HW), C)
-        pos_flat = torch.cat(pos_flatten, dim=1)
+        b, c, h, w = feat.shape
+        spatial_shapes = [(h, w)]
+        src_flat = feat.flatten(2).transpose(1, 2)  # (B, HW, C)
+        pos_flat = pos.flatten(2).transpose(1, 2)
 
         prompt_bf = prompt.transpose(0, 1)  # (B, seq, D)
 
@@ -171,7 +151,7 @@ class Sam3FusionEncoder(nn.Module):
             )
 
         return {
-            "memory": output.transpose(0, 1),  # (sum(HW), B, D)
+            "memory": output.transpose(0, 1),  # (HW, B, D)
             "memory_text": prompt,
             "pos_embed": pos_flat.transpose(0, 1),
             "spatial_shapes": spatial_shapes,
@@ -179,14 +159,21 @@ class Sam3FusionEncoder(nn.Module):
 
 
 class Sam3Decoder(nn.Module):
-    """Multi-layer detection decoder with learnable queries and box heads."""
+    """Multi-layer detection decoder with learnable queries and box heads.
+
+    Matches reference: learned reference_points, shared bbox_embed MLP,
+    query_pos only used inside attention (via with_pos_embed), and
+    memory_pos passed to decoder layers for image cross-attention keys.
+    """
 
     def __init__(self, config: Sam3Config):
         super().__init__()
         self.d_model = config.d_model
         self.num_queries = config.num_queries
+        self.num_layers = config.decoder_layers
 
         self.query_embed = nn.Embedding(config.num_queries, config.d_model)
+        self.reference_points = nn.Embedding(config.num_queries, 4)
 
         self.layers = nn.ModuleList([
             Sam3DecoderLayer(
@@ -199,16 +186,13 @@ class Sam3Decoder(nn.Module):
         ])
         self.norm = LayerNorm(config.d_model)
 
-        self.bbox_embed = nn.ModuleList([
-            nn.Sequential(
-                Linear(config.d_model, config.box_head_hidden, bias=True),
-                nn.ReLU(),
-                Linear(config.box_head_hidden, config.box_head_hidden, bias=True),
-                nn.ReLU(),
-                Linear(config.box_head_hidden, 4, bias=True),
-            )
-            for _ in range(config.decoder_layers)
-        ])
+        self.bbox_embed = nn.Sequential(
+            Linear(config.d_model, config.d_model, bias=True),
+            nn.ReLU(),
+            Linear(config.d_model, config.d_model, bias=True),
+            nn.ReLU(),
+            Linear(config.d_model, 4, bias=True),
+        )
 
         self.ref_point_head = nn.Sequential(
             Linear(2 * config.d_model, config.d_model, bias=True),
@@ -240,39 +224,48 @@ class Sam3Decoder(nn.Module):
         tgt = self.query_embed.weight.unsqueeze(0).expand(B, -1, -1)
 
         memory_bf = memory.transpose(0, 1)  # (B, L, D)
+        memory_pos_bf = pos_embed.transpose(0, 1)  # (B, L, D)
         text_bf = memory_text.transpose(0, 1) if memory_text is not None else None
 
-        # Initialize reference boxes as learned 4D points (center + wh)
-        ref_boxes = torch.zeros(B, self.num_queries, 4, device=tgt.device, dtype=tgt.dtype)
-        ref_boxes[..., :2] = 0.5  # center
-        ref_boxes[..., 2:] = 1.0  # full size
+        reference_boxes = self.reference_points.weight.unsqueeze(0).expand(B, -1, -1).sigmoid()
 
-        for i, layer in enumerate(self.layers):
-            # Generate conditional query from sine embedding of reference boxes
-            ref_sine = self._gen_sineembed(ref_boxes)  # (B, Q, 2*d_model)
-            query_pos = self.ref_point_head(ref_sine)  # (B, Q, d_model)
-            tgt = tgt + query_pos
+        intermediate_hs = []
+        intermediate_ref_boxes = [reference_boxes]
+
+        for layer in self.layers:
+            query_sine_embed = self._gen_sineembed(reference_boxes)  # (B, Q, 2*d_model)
+            query_pos = self.ref_point_head(query_sine_embed)  # (B, Q, d_model)
 
             tgt = layer(
                 tgt=tgt,
                 memory=memory_bf,
+                tgt_query_pos=query_pos,
+                memory_pos=memory_pos_bf,
                 memory_text=text_bf,
                 text_attention_mask=text_attention_mask,
             )
-            delta = self.bbox_embed[i](tgt)
-            ref_boxes = (self._inverse_sigmoid(ref_boxes) + delta).sigmoid()
 
-        hs = self.norm(tgt)
-        return hs, ref_boxes
+            delta_unsig = self.bbox_embed(self.norm(tgt))
+            new_ref = (self._inverse_sigmoid(reference_boxes) + delta_unsig).sigmoid()
+            reference_boxes = new_ref.detach()
+            intermediate_ref_boxes.append(new_ref)
+            intermediate_hs.append(self.norm(tgt))
+
+        hs = intermediate_hs[-1]  # (B, Q, D)
+        return hs, reference_boxes
 
     @staticmethod
-    def _inverse_sigmoid(x: torch.Tensor, eps: float = 1e-5) -> torch.Tensor:
-        x = x.clamp(min=eps, max=1 - eps)
-        return torch.log(x / (1 - x))
+    def _inverse_sigmoid(x: torch.Tensor, eps: float = 1e-3) -> torch.Tensor:
+        x = x.clamp(min=0, max=1)
+        x1 = x.clamp(min=eps)
+        x2 = (1 - x).clamp(min=eps)
+        return torch.log(x1 / x2)
 
     @staticmethod
     def _gen_sineembed(pos: torch.Tensor, num_feats: int = 256) -> torch.Tensor:
         """Generate sine positional embedding from normalized coordinates.
+
+        Matches reference gen_sineembed_for_position exactly.
 
         Args:
             pos: (..., 4) normalized cxcywh in [0, 1].
@@ -284,19 +277,28 @@ class Sam3Decoder(nn.Module):
         half = num_feats // 2
         scale = 2 * math.pi
         dim_t = torch.arange(half, dtype=torch.float32, device=pos.device)
-        dim_t = 10000.0 ** (2 * (dim_t // 2) / half)
+        dim_t = 10000.0 ** (2 * (torch.div(dim_t, 2, rounding_mode="floor")) / half)
 
-        parts = []
-        for coord_idx in [1, 0, 2, 3]:  # y, x, w, h order matching reference
-            embed = pos[..., coord_idx:coord_idx+1].float() * scale
-            embed = embed / dim_t
-            embed = torch.stack((embed[..., 0::2].sin(), embed[..., 1::2].cos()), dim=-1).flatten(-2)
-            parts.append(embed)
-        return torch.cat(parts, dim=-1).to(pos.dtype)
+        x_embed = pos[..., 0] * scale
+        y_embed = pos[..., 1] * scale
+        pos_x = x_embed[..., None] / dim_t
+        pos_y = y_embed[..., None] / dim_t
+        pos_x = torch.stack((pos_x[..., 0::2].sin(), pos_x[..., 1::2].cos()), dim=-1).flatten(-2)
+        pos_y = torch.stack((pos_y[..., 0::2].sin(), pos_y[..., 1::2].cos()), dim=-1).flatten(-2)
+
+        w_embed = pos[..., 2] * scale
+        h_embed = pos[..., 3] * scale
+        pos_w = w_embed[..., None] / dim_t
+        pos_h = h_embed[..., None] / dim_t
+        pos_w = torch.stack((pos_w[..., 0::2].sin(), pos_w[..., 1::2].cos()), dim=-1).flatten(-2)
+        pos_h = torch.stack((pos_h[..., 0::2].sin(), pos_h[..., 1::2].cos()), dim=-1).flatten(-2)
+
+        return torch.cat((pos_y, pos_x, pos_w, pos_h), dim=-1).to(pos.dtype)
 
 
 class Sam3SegmentationHead(nn.Module):
-    """Segmentation head combining pixel decoder and mask predictor."""
+    """Segmentation head combining pixel decoder, mask predictor,
+    and prompt cross-attention (matching reference UniversalSegmentationHead)."""
 
     def __init__(self, config: Sam3Config):
         super().__init__()
@@ -307,6 +309,9 @@ class Sam3SegmentationHead(nn.Module):
         self.mask_predictor = Sam3MaskPredictor(config.d_model, config.d_model)
         self.instance_seg_head = nn.Conv2d(config.d_model, config.d_model, kernel_size=1)
         self.semantic_seg_head = nn.Conv2d(config.d_model, 1, kernel_size=1)
+
+        self.cross_attend_prompt = Sam3CrossAttention(config.d_model, config.encoder_n_head)
+        self.cross_attn_norm = LayerNorm(config.d_model)
 
         if config.presence_head:
             self.presence_head = nn.Sequential(
@@ -322,17 +327,31 @@ class Sam3SegmentationHead(nn.Module):
         backbone_feats: List[torch.Tensor],
         obj_queries: torch.Tensor,
         encoder_hidden_states: torch.Tensor,
+        prompt: Optional[torch.Tensor] = None,
+        prompt_mask: Optional[torch.Tensor] = None,
     ) -> Dict[str, Optional[torch.Tensor]]:
         """Predict segmentation masks.
 
         Args:
             backbone_feats: FPN feature maps.
             obj_queries: (B, Q, D) decoder hidden states.
-            encoder_hidden_states: (L, B, D) encoder memory.
+            encoder_hidden_states: (L, B, D) encoder memory (seq-first).
+            prompt: (S, B, D) text/prompt features (seq-first).
+            prompt_mask: (B, S) padding mask.
 
         Returns:
             Dict with 'pred_masks', 'semantic_seg', 'presence_logit'.
         """
+        if prompt is not None:
+            tgt2 = self.cross_attn_norm(encoder_hidden_states)
+            tgt2_bf = tgt2.transpose(0, 1)  # (B, L, D)
+            prompt_bf = prompt.transpose(0, 1)  # (B, S, D)
+            tgt2 = self.cross_attend_prompt(
+                tgt2_bf, prompt_bf, prompt_bf,
+                key_padding_mask=prompt_mask,
+            )
+            encoder_hidden_states = tgt2.transpose(0, 1) + encoder_hidden_states
+
         B = obj_queries.shape[0]
 
         spatial_dim = math.prod(backbone_feats[-1].shape[-2:])
@@ -414,6 +433,10 @@ def load_sam3_checkpoint(model: "Sam3Model", checkpoint_path: str) -> Tuple[list
     skipped_prefixes = (
         "geometry_encoder.", "dot_prod_scoring.",
         "inst_interactive_predictor.",
+        "transformer.decoder.boxRPB_embed",
+        "transformer.decoder.presence_token",
+        "transformer.decoder.instance_",
+        "transformer.encoder.text_pooling_proj.",
     )
 
     for ref_key, val in det_keys.items():
@@ -521,27 +544,14 @@ def load_sam3_checkpoint(model: "Sam3Model", checkpoint_path: str) -> Tuple[list
             elif attn_rest.startswith("out_proj."):
                 new_key = f"encoder.layers.{layer_idx}.{attn_name}.{attn_rest}"
 
-        # --- Encoder FFN: linear1/linear2 -> ffn.0/ffn.3 ---
-        em_ffn = re.match(r"encoder\.layers\.(\d+)\.linear(\d)\.(.*)", new_key)
-        if em_ffn:
-            layer_idx = em_ffn.group(1)
-            lin_num = em_ffn.group(2)
-            suffix = em_ffn.group(3)
-            ffn_idx = "0" if lin_num == "1" else "3"
-            new_key = f"encoder.layers.{layer_idx}.ffn.{ffn_idx}.{suffix}"
-
         # --- Decoder layer: fused in_proj -> split q/k/v ---
+        # Reference names: self_attn, cross_attn (image), ca_text
+        # kb-nano names: self_attn, cross_attn (image), ca_text (same now)
         dm = re.match(r"decoder\.layers\.(\d+)\.(self_attn|cross_attn|ca_text)\.(.*)", new_key)
         if dm:
             layer_idx = dm.group(1)
-            ref_attn = dm.group(2)
+            kb_attn = dm.group(2)
             attn_rest = dm.group(3)
-
-            kb_attn = {
-                "self_attn": "self_attn",
-                "cross_attn": "cross_attn_memory",
-                "ca_text": "cross_attn_text",
-            }[ref_attn]
 
             if attn_rest == "in_proj_weight":
                 d = val.shape[0] // 3
@@ -558,32 +568,14 @@ def load_sam3_checkpoint(model: "Sam3Model", checkpoint_path: str) -> Tuple[list
             elif attn_rest.startswith("out_proj."):
                 new_key = f"decoder.layers.{layer_idx}.{kb_attn}.{attn_rest}"
 
-        # --- Decoder catext_norm -> norm_text ---
-        dm_norm = re.match(r"decoder\.layers\.(\d+)\.catext_norm\.(.*)", new_key)
-        if dm_norm:
-            new_key = f"decoder.layers.{dm_norm.group(1)}.norm_text.{dm_norm.group(2)}"
-
-        # --- Decoder FFN: linear1/linear2 -> ffn.0/ffn.3 ---
-        dm_ffn = re.match(r"decoder\.layers\.(\d+)\.linear(\d)\.(.*)", new_key)
-        if dm_ffn:
-            layer_idx = dm_ffn.group(1)
-            lin_num = dm_ffn.group(2)
-            suffix = dm_ffn.group(3)
-            ffn_idx = "0" if lin_num == "1" else "3"
-            new_key = f"decoder.layers.{layer_idx}.ffn.{ffn_idx}.{suffix}"
-
-        # --- Decoder bbox_embed: layers.{i} -> {i} (MLP layers) ---
+        # --- Decoder bbox_embed: single shared MLP ---
+        # Reference: bbox_embed.layers.{0,1,2} → kb-nano: bbox_embed.{0,2,4}
         dm_bbox = re.match(r"decoder\.bbox_embed\.layers\.(\d+)\.(.*)", new_key)
         if dm_bbox:
             lin_idx = int(dm_bbox.group(1))
             suffix = dm_bbox.group(2)
-            # Reference: bbox_embed is single shared MLP with layers.0/1/2
-            # kb-nano: bbox_embed is per-decoder-layer, each with Sequential(Linear,ReLU,Linear,ReLU,Linear)
-            # Sequential indices: 0=Linear, 1=ReLU, 2=Linear, 3=ReLU, 4=Linear
             seq_idx = lin_idx * 2  # 0->0, 1->2, 2->4
-            for dec_layer in range(model.config.decoder_layers):
-                remapped[f"decoder.bbox_embed.{dec_layer}.{seq_idx}.{suffix}"] = val.clone()
-            continue
+            new_key = f"decoder.bbox_embed.{seq_idx}.{suffix}"
 
         # --- Decoder ref_point_head: layers.{i} -> {i*2} ---
         dm_rph = re.match(r"decoder\.ref_point_head\.layers\.(\d+)\.(.*)", new_key)
@@ -592,6 +584,20 @@ def load_sam3_checkpoint(model: "Sam3Model", checkpoint_path: str) -> Tuple[list
             suffix = dm_rph.group(2)
             seq_idx = lin_idx * 2
             new_key = f"decoder.ref_point_head.{seq_idx}.{suffix}"
+
+        # --- Segmentation head cross_attend_prompt: fused in_proj -> split q/k/v ---
+        if new_key == "seg_head.cross_attend_prompt.in_proj_weight":
+            d = val.shape[0] // 3
+            remapped["seg_head.cross_attend_prompt.q_proj.weight"] = val[:d]
+            remapped["seg_head.cross_attend_prompt.k_proj.weight"] = val[d:2*d]
+            remapped["seg_head.cross_attend_prompt.v_proj.weight"] = val[2*d:]
+            continue
+        if new_key == "seg_head.cross_attend_prompt.in_proj_bias":
+            d = val.shape[0] // 3
+            remapped["seg_head.cross_attend_prompt.q_proj.bias"] = val[:d]
+            remapped["seg_head.cross_attend_prompt.k_proj.bias"] = val[d:2*d]
+            remapped["seg_head.cross_attend_prompt.v_proj.bias"] = val[2*d:]
+            continue
 
         # --- Segmentation head mask_predictor: mask_embed.layers -> layers ---
         sm = re.match(r"seg_head\.mask_predictor\.mask_embed\.layers\.(\d+)\.(.*)", new_key)
@@ -735,6 +741,8 @@ class Sam3Model(nn.Module):
             backbone_feats=sam3_feats,
             obj_queries=hs,
             encoder_hidden_states=encoder_out["memory"],
+            prompt=encoder_out["memory_text"],
+            prompt_mask=text_mask,
         )
 
         return {
