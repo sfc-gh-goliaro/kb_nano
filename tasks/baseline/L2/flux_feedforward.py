@@ -13,9 +13,10 @@ from .parallel_linear import ColumnParallelLinear, RowParallelLinear
 
 
 class ColumnParallelApproxGELU(nn.Module):
-    def __init__(self, dim_in: int, dim_out: int, *, approximate: str, bias: bool = True):
+    def __init__(self, dim_in: int, dim_out: int, *, approximate: str, bias: bool = True,
+                 quant_config: dict | None = None):
         super().__init__()
-        self.proj = ColumnParallelLinear(dim_in, dim_out, bias=bias)
+        self.proj = ColumnParallelLinear(dim_in, dim_out, bias=bias, quant_config=quant_config)
         self.gelu = GELU(approximate=approximate)
 
     def forward(self, x: torch.Tensor) -> torch.Tensor:
@@ -33,15 +34,17 @@ class FeedForward(nn.Module):
         mult: int = 4,
         inner_dim: int | None = None,
         bias: bool = True,
+        quant_config: dict | None = None,
     ) -> None:
         super().__init__()
         inner_dim = inner_dim or int(dim * mult)
         dim_out = dim_out or dim
 
         layers: list[nn.Module] = [
-            ColumnParallelApproxGELU(dim, inner_dim, approximate="tanh", bias=bias),
+            ColumnParallelApproxGELU(dim, inner_dim, approximate="tanh", bias=bias,
+                                      quant_config=quant_config),
             nn.Identity(),
-            RowParallelLinear(inner_dim, dim_out, bias=False),
+            RowParallelLinear(inner_dim, dim_out, bias=bias, quant_config=quant_config),
         ]
         self.net = nn.ModuleList(layers)
 

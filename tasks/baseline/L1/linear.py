@@ -1,6 +1,7 @@
 """Linear (matrix multiply) kernels.
 
 Matmul: pure functional op — F.linear(input, weight, bias).
+BMM: batch matrix multiply — torch.matmul(a, b).
 Linear: parametric op — holds weight/bias as nn.Parameter.
 """
 
@@ -14,6 +15,13 @@ class Matmul(nn.Module):
 
     def forward(self, input, weight, bias=None):
         return F.linear(input, weight, bias)
+
+
+class BMM(nn.Module):
+    """Batch matrix multiply: torch.matmul(a, b)."""
+
+    def forward(self, a: torch.Tensor, b: torch.Tensor) -> torch.Tensor:
+        return torch.matmul(a, b)
 
 
 class Linear(nn.Module):

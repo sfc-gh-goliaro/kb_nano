@@ -30,7 +30,10 @@ from diffusers.schedulers.scheduling_flow_match_euler_discrete import (
     FlowMatchEulerDiscreteScheduler,
 )
 from torch import nn
-from transformers import CLIPTextModel, CLIPTokenizer, T5EncoderModel, T5TokenizerFast
+from transformers import AutoConfig, CLIPTokenizer, T5TokenizerFast
+
+from .clip_text_model import CLIPTextModel
+from .t5_encoder import T5EncoderModel
 
 from ..L1.flux_pos_embed import FluxPosEmbed
 from ..L1.linear import Linear
@@ -116,7 +119,7 @@ class FluxTransformer2DModel(nn.Module):
     and produces noise predictions.
     """
 
-    def __init__(self, config: FluxConfig):
+    def __init__(self, config: FluxConfig, quant_config: dict | None = None):
         super().__init__()
         self.config = config
         self.in_channels = config.in_channels
@@ -147,6 +150,7 @@ class FluxTransformer2DModel(nn.Module):
                 dim=inner_dim,
                 num_attention_heads=config.num_attention_heads,
                 attention_head_dim=config.attention_head_dim,
+                quant_config=quant_config,
             )
             for _ in range(config.num_layers)
         ])
@@ -156,6 +160,7 @@ class FluxTransformer2DModel(nn.Module):
                 dim=inner_dim,
                 num_attention_heads=config.num_attention_heads,
                 attention_head_dim=config.attention_head_dim,
+                quant_config=quant_config,
             )
             for _ in range(config.num_single_layers)
         ])
@@ -241,6 +246,9 @@ class FluxTransformer2DModel(nn.Module):
             (".add_kv_proj", ".add_v_proj", "v"),
         ]
 
+        def _default_weight_loader(param, loaded_weight):
+            param.data.copy_(loaded_weight)
+
         params_dict = dict(self.named_parameters())
         for name, buffer in self.named_buffers():
             if name.endswith(".beta") or name.endswith(".eps"):
@@ -254,24 +262,16 @@ class FluxTransformer2DModel(nn.Module):
                 if weight_name not in original_name:
                     continue
                 lookup_name = original_name.replace(weight_name, param_name)
-                if lookup_name in params_dict:
-                    param = params_dict[lookup_name]
-                    weight_loader = getattr(param, "weight_loader", None)
-                    if weight_loader is not None:
-                        weight_loader(param, loaded_weight, shard_id)
-                    else:
-                        param.data.copy_(loaded_weight)
+                param = params_dict[lookup_name]
+                weight_loader = param.weight_loader
+                weight_loader(param, loaded_weight, shard_id)
                 break
             else:
                 if lookup_name not in params_dict and ".to_out.0." in lookup_name:
                     lookup_name = lookup_name.replace(".to_out.0.", ".to_out.")
-                if lookup_name in params_dict:
-                    param = params_dict[lookup_name]
-                    weight_loader = getattr(param, "weight_loader", None)
-                    if weight_loader is not None:
-                        weight_loader(param, loaded_weight)
-                    else:
-                        param.data.copy_(loaded_weight)
+                param = params_dict[lookup_name]
+                weight_loader = getattr(param, "weight_loader", _default_weight_loader)
+                weight_loader(param, loaded_weight)
             loaded_params.add(original_name)
             loaded_params.add(lookup_name)
         return loaded_params
@@ -318,9 +318,8 @@ class FluxPipeline(nn.Module):
     loop (flow-match Euler) -> VAE decode.
     """
 
-    packed_modules_mapping = {}
-
-    def __init__(self, config: FluxConfig, model_name: str):
+    def __init__(self, config: FluxConfig, model_name: str,
+                 quant_config: dict | None = None):
         super().__init__()
         self.config = config
         self.model_name = model_name
@@ -333,13 +332,14 @@ class FluxPipeline(nn.Module):
         self.text_encoder = CLIPTextModel.from_pretrained(
             model_name, subfolder="text_encoder", local_files_only=local_files_only,
         )
-        self.text_encoder_2 = T5EncoderModel.from_pretrained(
+        t5_config = AutoConfig.from_pretrained(
             model_name, subfolder="text_encoder_2", local_files_only=local_files_only,
         )
+        self.text_encoder_2 = T5EncoderModel(t5_config)
         self.vae = AutoencoderKL.from_pretrained(
             model_name, subfolder="vae", local_files_only=local_files_only,
         )
-        self.transformer = FluxTransformer2DModel(config)
+        self.transformer = FluxTransformer2DModel(config, quant_config=quant_config)
 
         self.tokenizer = CLIPTokenizer.from_pretrained(
             model_name, subfolder="tokenizer", local_files_only=local_files_only,
@@ -424,9 +424,10 @@ class FluxPipeline(nn.Module):
             max_sequence_length=max_sequence_length,
         )
 
-        dtype = self.text_encoder.dtype if self.text_encoder is not None else torch.bfloat16
+        t5_dtype = self.text_encoder_2.dtype
+        pooled_prompt_embeds = pooled_prompt_embeds.to(dtype=t5_dtype)
         text_ids = torch.zeros(prompt_embeds.shape[1], 3).to(
-            device=self.vae.device, dtype=dtype,
+            device=self.vae.device, dtype=t5_dtype,
         )
         return prompt_embeds, pooled_prompt_embeds, text_ids
 

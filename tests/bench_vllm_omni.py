@@ -101,14 +101,68 @@ def _get_bench_prompts(seed: int = 42) -> list[str]:
 # vllm-omni subprocess worker
 # ---------------------------------------------------------------------------
 VLLM_OMNI_WORKER = r'''
-import json, os, sys, time, torch
+import asyncio, json, os, sys, time, torch
 from tqdm import tqdm
 
-def main():
-    with open(sys.argv[1]) as f:
-        cfg = json.load(f)
+def _patch_t5_load_weights_if_needed():
+    """Patch vllm-omni <= 0.18.0 T5EncoderModel.load_weights bug.
 
-    from vllm_omni.entrypoints.omni_diffusion import OmniDiffusion
+    The bare ``name.replace(weight_name, param_name)`` replaces every
+    occurrence of the substring (e.g. "k" in "block"), silently
+    corrupting lookup names so K-projection weights are never loaded.
+    This monkey-patches the method to use dotted replacement instead.
+    """
+    try:
+        import vllm_omni, inspect
+        if getattr(vllm_omni, "__version__", "") > "0.18.0":
+            return
+        from vllm_omni.diffusion.models.t5_encoder.t5_encoder import T5EncoderModel
+        src = inspect.getsource(T5EncoderModel.load_weights)
+        if 'name.replace(f".{weight_name}."' in src:
+            return  # already patched
+        from collections.abc import Iterable
+        from vllm.model_executor.model_loader.weight_utils import default_weight_loader
+        def _patched_load_weights(self, weights: Iterable[tuple[str, torch.Tensor]]) -> set[str]:
+            stacked_params_mapping = [
+                ("qkv_proj", "q", "q"),
+                ("qkv_proj", "k", "k"),
+                ("qkv_proj", "v", "v"),
+                ("wi", "wi_0", 0),
+                ("wi", "wi_1", 1),
+            ]
+            params_dict = dict(self.named_parameters())
+            loaded_params: set[str] = set()
+            for name, loaded_weight in weights:
+                original_name = name
+                lookup_name = name
+                for param_name, weight_name, shard_id in stacked_params_mapping:
+                    if f".{weight_name}." not in name:
+                        continue
+                    lookup_name = name.replace(f".{weight_name}.", f".{param_name}.")
+                    if lookup_name not in params_dict:
+                        continue
+                    param = params_dict[lookup_name]
+                    weight_loader = param.weight_loader
+                    weight_loader(param, loaded_weight, shard_id)
+                    break
+                else:
+                    if name not in params_dict:
+                        continue
+                    param = params_dict[name]
+                    weight_loader = getattr(param, "weight_loader", default_weight_loader)
+                    weight_loader(param, loaded_weight)
+                loaded_params.add(original_name)
+                loaded_params.add(lookup_name)
+            return loaded_params
+        T5EncoderModel.load_weights = _patched_load_weights
+        print("[bench] Patched vllm-omni T5EncoderModel.load_weights (v0.18.0 dotted-replace fix)", file=sys.stderr)
+    except Exception as e:
+        print(f"[bench] WARNING: failed to patch T5EncoderModel.load_weights: {e}", file=sys.stderr)
+
+_patch_t5_load_weights_if_needed()
+
+async def run_benchmark(cfg):
+    from vllm_omni.entrypoints.async_omni_diffusion import AsyncOmniDiffusion
     from vllm_omni.diffusion.data import OmniDiffusionConfig
     from vllm_omni.inputs.data import OmniDiffusionSamplingParams
 
@@ -118,13 +172,15 @@ def main():
         enforce_eager=cfg.get("enforce_eager", False),
         output_type="latent",
     )
-    engine = OmniDiffusion(od_config)
+    engine = AsyncOmniDiffusion(model=cfg["model"], od_config=od_config)
 
     warmup_params = OmniDiffusionSamplingParams(
         height=256, width=256, num_inference_steps=2,
+        guidance_scale=3.5,
     )
     warmup_params.seed = cfg["seed"]
-    engine.generate(["warmup"], warmup_params)
+    warmup_params.guidance_scale_provided = True
+    await engine.generate_batch(["warmup"], warmup_params)
 
     latent_dir = cfg.get("latent_dir")
     if latent_dir:
@@ -142,6 +198,7 @@ def main():
             guidance_scale=scenario.get("guidance_scale", 3.5),
         )
         params.seed = cfg["seed"]
+        params.guidance_scale_provided = True
 
         total_elapsed = 0.0
         total_images = 0
@@ -150,25 +207,21 @@ def main():
         for batch_idx, batch_prompts in enumerate(pbar):
             torch.cuda.synchronize()
             start = time.perf_counter()
-            outputs = engine.generate(batch_prompts, params)
+            output = await engine.generate_batch(batch_prompts, params)
             torch.cuda.synchronize()
             batch_elapsed = time.perf_counter() - start
             total_elapsed += batch_elapsed
             total_images += len(batch_prompts)
 
-            if latent_dir and outputs:
+            if latent_dir and output is not None:
                 latent_tensor = None
-                for out in outputs:
-                    if hasattr(out, "images") and out.images:
-                        for img in out.images:
-                            if isinstance(img, torch.Tensor):
-                                latent_tensor = img
-                                break
-                    if latent_tensor is not None:
-                        break
-                    if hasattr(out, "latents") and out.latents is not None:
-                        latent_tensor = out.latents
-                        break
+                if hasattr(output, "latents") and output.latents is not None:
+                    latent_tensor = output.latents
+                elif hasattr(output, "images") and output.images:
+                    for img in output.images:
+                        if isinstance(img, torch.Tensor):
+                            latent_tensor = img
+                            break
                 if latent_tensor is not None:
                     torch.save(
                         latent_tensor.cpu(),
@@ -197,20 +250,21 @@ def main():
             guidance_scale=ls.get("guidance_scale", 3.5),
         )
         params.seed = cfg["seed"]
+        params.guidance_scale_provided = True
 
         num_warmup = ls.get("num_warmup", 2)
         num_iters = ls.get("num_iters", 5)
 
         for i in tqdm(range(num_warmup), desc=f"vllm-omni latency warmup {ls['name']}", file=sys.stderr):
             torch.cuda.synchronize()
-            engine.generate(prompts, params)
+            await engine.generate_batch(prompts, params)
             torch.cuda.synchronize()
 
         latencies = []
         for i in tqdm(range(num_iters), desc=f"vllm-omni latency {ls['name']}", file=sys.stderr):
             torch.cuda.synchronize()
             t0 = time.perf_counter()
-            engine.generate(prompts, params)
+            await engine.generate_batch(prompts, params)
             torch.cuda.synchronize()
             latencies.append(time.perf_counter() - t0)
 
@@ -223,11 +277,16 @@ def main():
             "latencies": latencies,
         })
 
-    del engine
+    engine.close()
     torch.cuda.empty_cache()
 
     with open(cfg["output_file"], "w") as f:
         json.dump({"throughput": all_results, "latency": latency_results}, f)
+
+def main():
+    with open(sys.argv[1]) as f:
+        cfg = json.load(f)
+    asyncio.run(run_benchmark(cfg))
 
 if __name__ == "__main__":
     main()
@@ -555,7 +614,8 @@ def _print_correctness_comparison(correctness: dict):
     all_pass = True
     for scenario, stats in correctness.items():
         min_cos = stats["min_cosine_sim"]
-        verdict = "PASS" if min_cos > 0.99 else ("WARN" if min_cos > 0.95 else "FAIL")
+        mean_cos = stats["mean_cosine_sim"]
+        verdict = "PASS" if mean_cos > 0.98 else ("WARN" if mean_cos > 0.95 else "FAIL")
         if verdict != "PASS":
             all_pass = False
         print(

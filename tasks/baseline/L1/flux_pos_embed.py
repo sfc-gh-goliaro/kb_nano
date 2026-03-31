@@ -1,27 +1,58 @@
 """2D rotary position embeddings for FLUX (concatenated per-axis 1D embeddings).
 
 Generates (cos, sin) tensors from integer grid IDs for use with DiffusionRoPE.
+
+``_get_1d_rotary_pos_embed`` is copied from diffusers'
+``get_1d_rotary_pos_embed`` (with ``use_real=False`` path only, which is
+what FLUX uses) so the implementation is identical.
 """
 
 from __future__ import annotations
 
+import numpy as np
 import torch
 import torch.nn as nn
 
 
 def _get_1d_rotary_pos_embed(
     dim: int,
-    pos: torch.Tensor,
+    pos: np.ndarray | int | torch.Tensor,
     theta: float = 10000.0,
+    use_real: bool = False,
+    linear_factor: float = 1.0,
+    ntk_factor: float = 1.0,
+    repeat_interleave_real: bool = True,
     freqs_dtype: torch.dtype = torch.float32,
 ) -> torch.Tensor:
-    """Compute 1D rotary frequency tensor as complex exponentials.
+    """Precompute the frequency tensor for complex exponentials (cis).
 
-    Returns complex64 tensor of shape [S, dim/2].
+    Copied from ``diffusers.models.embeddings.get_1d_rotary_pos_embed``.
+    Returns complex64 tensor of shape [S, dim/2] when ``use_real=False``.
     """
-    freqs = 1.0 / (theta ** (torch.arange(0, dim, 2, dtype=freqs_dtype, device=pos.device) / dim))
+    assert dim % 2 == 0
+
+    if isinstance(pos, int):
+        pos = torch.arange(pos)
+    if isinstance(pos, np.ndarray):
+        pos = torch.from_numpy(pos)
+
+    theta = theta * ntk_factor
+    freqs = (
+        1.0 / (theta ** (torch.arange(0, dim, 2, dtype=freqs_dtype, device=pos.device) / dim)) / linear_factor
+    )
     freqs = torch.outer(pos, freqs)
-    return torch.polar(torch.ones_like(freqs), freqs)
+
+    if use_real and repeat_interleave_real:
+        freqs_cos = freqs.cos().repeat_interleave(2, dim=1, output_size=freqs.shape[1] * 2).float()
+        freqs_sin = freqs.sin().repeat_interleave(2, dim=1, output_size=freqs.shape[1] * 2).float()
+        return freqs_cos, freqs_sin
+    elif use_real:
+        freqs_cos = torch.cat([freqs.cos(), freqs.cos()], dim=-1).float()
+        freqs_sin = torch.cat([freqs.sin(), freqs.sin()], dim=-1).float()
+        return freqs_cos, freqs_sin
+    else:
+        freqs_cis = torch.polar(torch.ones_like(freqs), freqs)
+        return freqs_cis
 
 
 class FluxPosEmbed(nn.Module):
@@ -37,10 +68,12 @@ class FluxPosEmbed(nn.Module):
         cos_out = []
         sin_out = []
         pos = ids.float()
+        freqs_dtype = torch.float32 if ids.device.type in ("mps", "npu") else torch.float64
         for i in range(n_axes):
             freqs_cis = _get_1d_rotary_pos_embed(
                 self.axes_dim[i], pos[:, i],
-                theta=self.theta, freqs_dtype=torch.float64,
+                theta=self.theta, use_real=False,
+                freqs_dtype=freqs_dtype,
             )
             cos_out.append(freqs_cis.real)
             sin_out.append(freqs_cis.imag)

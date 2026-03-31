@@ -1,14 +1,7 @@
 """Timestep and text projection embeddings for diffusion models (L2 composite).
 
-Contains:
-- get_timestep_embedding: sinusoidal positional encoding for timesteps
-- Timesteps: nn.Module wrapper around get_timestep_embedding
-- TimestepEmbedding: MLP that projects timestep encodings
-- TextProjection: two-layer MLP for projecting pooled text embeddings
-- CombinedTimestepTextProjEmbeddings: timestep + text for non-guidance models
-- CombinedTimestepGuidanceTextProjEmbeddings: timestep + guidance + text
-
-Mirrors the corresponding diffusers classes.
+All classes are self-contained implementations that produce weight names
+identical to the corresponding diffusers classes for checkpoint compatibility.
 """
 
 from __future__ import annotations
@@ -18,7 +11,6 @@ import math
 import torch
 import torch.nn as nn
 
-from ..L1.gelu import GELU
 from ..L1.linear import Linear
 from ..L1.silu import SiLU
 
@@ -87,35 +79,18 @@ class TimestepEmbedding(nn.Module):
         return sample
 
 
-class TextProjection(nn.Module):
-    """Two-layer MLP for projecting pooled text embeddings (PixArt-Alpha style)."""
-
-    def __init__(self, in_features: int, hidden_size: int, act_fn: str = "silu"):
-        super().__init__()
-        self.linear_1 = Linear(in_features, hidden_size, bias=True)
-        if act_fn == "silu":
-            self.act_1 = SiLU()
-        elif act_fn == "gelu_tanh":
-            self.act_1 = GELU(approximate="tanh")
-        else:
-            raise ValueError(f"Unknown activation function: {act_fn}")
-        self.linear_2 = Linear(hidden_size, hidden_size, bias=True)
-
-    def forward(self, caption: torch.Tensor) -> torch.Tensor:
-        hidden_states = self.linear_1(caption)
-        hidden_states = self.act_1(hidden_states)
-        hidden_states = self.linear_2(hidden_states)
-        return hidden_states
-
-
 class CombinedTimestepTextProjEmbeddings(nn.Module):
-    """Timestep + pooled-text conditioning for non-guidance FLUX models."""
+    """Combines sinusoidal timestep encoding with pooled text projection.
+
+    Produces ``timestep_embedder`` + ``text_embedder`` weight names matching
+    the diffusers checkpoint layout.
+    """
 
     def __init__(self, embedding_dim: int, pooled_projection_dim: int):
         super().__init__()
         self.time_proj = Timesteps(num_channels=256, flip_sin_to_cos=True, downscale_freq_shift=0)
         self.timestep_embedder = TimestepEmbedding(in_channels=256, time_embed_dim=embedding_dim)
-        self.text_embedder = TextProjection(pooled_projection_dim, embedding_dim, act_fn="silu")
+        self.text_embedder = TimestepEmbedding(in_channels=pooled_projection_dim, time_embed_dim=embedding_dim)
 
     def forward(self, timestep: torch.Tensor, pooled_projection: torch.Tensor) -> torch.Tensor:
         timesteps_proj = self.time_proj(timestep)
@@ -125,14 +100,19 @@ class CombinedTimestepTextProjEmbeddings(nn.Module):
 
 
 class CombinedTimestepGuidanceTextProjEmbeddings(nn.Module):
-    """Timestep + guidance + pooled-text conditioning for guidance FLUX models."""
+    """Combines sinusoidal timestep + guidance encoding with pooled text projection.
+
+    Adds a ``guidance_embedder`` on top of
+    :class:`CombinedTimestepTextProjEmbeddings`.  Weight names match the
+    diffusers checkpoint layout.
+    """
 
     def __init__(self, embedding_dim: int, pooled_projection_dim: int):
         super().__init__()
         self.time_proj = Timesteps(num_channels=256, flip_sin_to_cos=True, downscale_freq_shift=0)
         self.timestep_embedder = TimestepEmbedding(in_channels=256, time_embed_dim=embedding_dim)
         self.guidance_embedder = TimestepEmbedding(in_channels=256, time_embed_dim=embedding_dim)
-        self.text_embedder = TextProjection(pooled_projection_dim, embedding_dim, act_fn="silu")
+        self.text_embedder = TimestepEmbedding(in_channels=pooled_projection_dim, time_embed_dim=embedding_dim)
 
     def forward(self, timestep: torch.Tensor, guidance: torch.Tensor, pooled_projection: torch.Tensor) -> torch.Tensor:
         timesteps_proj = self.time_proj(timestep)

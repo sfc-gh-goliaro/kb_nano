@@ -207,6 +207,41 @@ class QKVParallelLinear(nn.Module):
         return F.linear(x, self.weight, self.bias)
 
 
+class ReplicatedLinear(nn.Module):
+    """Full weight replicated on every TP rank (no sharding, no all-reduce)."""
+
+    def __init__(self, input_size: int, output_size: int, bias: bool = True,
+                 quant_config: dict | None = None):
+        super().__init__()
+        self.use_fp8 = quant_config is not None
+
+        if self.use_fp8:
+            self.weight = nn.Parameter(
+                torch.empty(output_size, input_size, dtype=torch.float8_e4m3fn),
+                requires_grad=False,
+            )
+            self.weight_scale_inv = nn.Parameter(
+                torch.empty(*_scale_shape(output_size, input_size),
+                            dtype=torch.float32),
+                requires_grad=False,
+            )
+            self.weight.weight_loader = lambda p, w: p.data.copy_(w)
+            self.weight_scale_inv.weight_loader = lambda p, w: p.data.copy_(w)
+            self.linear_op = _get_fp8_linear_cls()()
+        else:
+            self.weight = nn.Parameter(torch.empty(output_size, input_size))
+            self.weight.weight_loader = lambda p, w: p.data.copy_(w)
+
+        self.bias = nn.Parameter(torch.empty(output_size)) if bias else None
+        if self.bias is not None:
+            self.bias.weight_loader = lambda p, w: p.data.copy_(w)
+
+    def forward(self, x):
+        if self.use_fp8:
+            return self.linear_op(x, self.weight, self.weight_scale_inv, self.bias)
+        return F.linear(x, self.weight, self.bias)
+
+
 class RowParallelLinear(nn.Module):
     """Splits input dim across TP ranks, all-reduces output."""
 

@@ -43,29 +43,44 @@ def _download_flux_model(model_name: str) -> str:
     )
 
 
-def _load_flux_transformer_weights(
-    pipeline: FluxPipeline,
-    model_path: str,
-) -> None:
-    """Load transformer weights from safetensors into FluxTransformer2DModel."""
-    transformer_dir = os.path.join(model_path, "transformer")
-    safetensor_files = sorted(glob(os.path.join(transformer_dir, "*.safetensors")))
-    if not safetensor_files:
-        safetensor_files = sorted(glob(os.path.join(model_path, "*.safetensors")))
-
-    if not safetensor_files:
-        raise FileNotFoundError(
-            f"No .safetensors files found in {transformer_dir} or {model_path}"
-        )
-
+def _load_safetensors_from_dir(directory: str) -> list[tuple[str, torch.Tensor]]:
+    """Load all safetensors from a directory."""
+    safetensor_files = sorted(glob(os.path.join(directory, "*.safetensors")))
     weights = []
     for sf_file in safetensor_files:
         with safe_open(sf_file, "pt", "cpu") as f:
             for key in f.keys():
                 weights.append((key, f.get_tensor(key)))
+    return weights
 
+
+def _load_flux_weights(
+    pipeline: FluxPipeline,
+    model_path: str,
+) -> None:
+    """Load transformer and T5 encoder weights from safetensors.
+
+    CLIP weights are loaded by ``from_pretrained`` in the pipeline
+    constructor.  The transformer and T5 encoder use custom weight
+    loaders for TP-aware stacked-param mapping.
+    """
+    transformer_dir = os.path.join(model_path, "transformer")
+    weights = _load_safetensors_from_dir(transformer_dir)
+    if not weights:
+        weights = _load_safetensors_from_dir(model_path)
+    if not weights:
+        raise FileNotFoundError(
+            f"No .safetensors files found in {transformer_dir} or {model_path}"
+        )
     loaded = pipeline.transformer.load_weights(weights)
     logger.info("Loaded %d transformer weight entries", len(loaded))
+
+    t5_weights = _load_safetensors_from_dir(
+        os.path.join(model_path, "text_encoder_2"),
+    )
+    if t5_weights:
+        loaded_t5 = pipeline.text_encoder_2.load_weights(t5_weights)
+        logger.info("Loaded %d T5 encoder weight entries", len(loaded_t5))
 
 
 class DiffusionEngine:
@@ -101,12 +116,11 @@ class DiffusionEngine:
         config = FluxConfig.from_pretrained(model_path)
         pipeline = FluxPipeline(config, model_path)
 
-        _load_flux_transformer_weights(pipeline, model_path)
+        _load_flux_weights(pipeline, model_path)
 
-        pipeline.to(device=self.device, dtype=self.dtype)
-
+        pipeline.transformer.to(device=self.device, dtype=self.dtype)
         pipeline.text_encoder.to(device=self.device)
-        pipeline.text_encoder_2.to(device=self.device)
+        pipeline.text_encoder_2.to(device=self.device, dtype=self.dtype)
         pipeline.vae.to(device=self.device)
 
         if not self.enforce_eager:

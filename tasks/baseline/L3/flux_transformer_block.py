@@ -13,13 +13,12 @@ from typing import Any
 
 import torch
 import torch.nn as nn
-from ..L2.ada_layer_norm import AdaLayerNormZero, AdaLayerNormZeroSingle
-
 from ..L1.gelu import GELU
 from ..L1.layer_norm import LayerNorm
+from ..L2.ada_layer_norm import AdaLayerNormZero, AdaLayerNormZeroSingle
 from ..L2.flux_attention import FluxAttention
 from ..L2.flux_feedforward import FeedForward
-from ..L2.parallel_linear import ColumnParallelLinear, RowParallelLinear
+from ..L2.parallel_linear import ReplicatedLinear
 
 
 class FluxTransformerBlock(nn.Module):
@@ -32,6 +31,7 @@ class FluxTransformerBlock(nn.Module):
         attention_head_dim: int,
         qk_norm: str = "rms_norm",
         eps: float = 1e-6,
+        quant_config: dict | None = None,
     ):
         super().__init__()
         self.norm1 = AdaLayerNormZero(dim)
@@ -46,13 +46,14 @@ class FluxTransformerBlock(nn.Module):
             context_pre_only=False,
             bias=True,
             eps=eps,
+            quant_config=quant_config,
         )
 
         self.norm2 = LayerNorm(dim, elementwise_affine=False, eps=1e-6)
-        self.ff = FeedForward(dim=dim, dim_out=dim)
+        self.ff = FeedForward(dim=dim, dim_out=dim, quant_config=quant_config)
 
         self.norm2_context = LayerNorm(dim, elementwise_affine=False, eps=1e-6)
-        self.ff_context = FeedForward(dim=dim, dim_out=dim)
+        self.ff_context = FeedForward(dim=dim, dim_out=dim, quant_config=quant_config)
 
     def forward(
         self,
@@ -121,14 +122,17 @@ class FluxSingleTransformerBlock(nn.Module):
         num_attention_heads: int,
         attention_head_dim: int,
         mlp_ratio: float = 4.0,
+        quant_config: dict | None = None,
     ):
         super().__init__()
         self.mlp_hidden_dim = int(dim * mlp_ratio)
 
         self.norm = AdaLayerNormZeroSingle(dim)
-        self.proj_mlp = ColumnParallelLinear(dim, self.mlp_hidden_dim, bias=True)
+        self.proj_mlp = ReplicatedLinear(dim, self.mlp_hidden_dim, bias=True,
+                                         quant_config=quant_config)
         self.act_mlp = GELU(approximate="tanh")
-        self.proj_out = RowParallelLinear(dim + self.mlp_hidden_dim, dim, bias=True)
+        self.proj_out = ReplicatedLinear(dim + self.mlp_hidden_dim, dim, bias=True,
+                                         quant_config=quant_config)
 
         self.attn = FluxAttention(
             query_dim=dim,
@@ -138,6 +142,7 @@ class FluxSingleTransformerBlock(nn.Module):
             bias=True,
             eps=1e-6,
             pre_only=True,
+            quant_config=quant_config,
         )
 
     def forward(

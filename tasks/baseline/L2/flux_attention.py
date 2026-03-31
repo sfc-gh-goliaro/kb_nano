@@ -17,10 +17,20 @@ from ..L1.rms_norm import RMSNorm
 from ..L1.diffusion_rope import DiffusionRoPE
 from ..L1.dense_attention import DenseAttention
 from .parallel_linear import (
-    ColumnParallelLinear,
     QKVParallelLinear,
     RowParallelLinear,
 )
+
+
+def _tensor_model_parallel_all_gather(tensor: torch.Tensor, dim: int = -1) -> torch.Tensor:
+    """Gather tensor across TP ranks along the given dimension."""
+    import torch.distributed as dist
+    tp = _tp_size()
+    if tp <= 1:
+        return tensor
+    gather_list = [torch.empty_like(tensor) for _ in range(tp)]
+    dist.all_gather(gather_list, tensor)
+    return torch.cat(gather_list, dim=dim)
 
 
 class FluxAttention(nn.Module):
@@ -47,6 +57,7 @@ class FluxAttention(nn.Module):
         out_dim: int | None = None,
         context_pre_only: bool | None = None,
         pre_only: bool = False,
+        quant_config: dict | None = None,
     ):
         super().__init__()
         self.head_dim = dim_head
@@ -69,11 +80,13 @@ class FluxAttention(nn.Module):
             total_num_heads=self.heads,
             total_num_kv_heads=self.heads,
             bias=bias,
+            quant_config=quant_config,
         )
 
         if not self.pre_only:
             self.to_out = nn.ModuleList([
-                RowParallelLinear(self.inner_dim, self.out_dim, bias=out_bias),
+                RowParallelLinear(self.inner_dim, self.out_dim, bias=out_bias,
+                                  quant_config=quant_config),
                 nn.Dropout(dropout),
             ])
 
@@ -87,14 +100,30 @@ class FluxAttention(nn.Module):
                 total_num_heads=self.heads,
                 total_num_kv_heads=self.heads,
                 bias=added_proj_bias if added_proj_bias is not None else True,
+                quant_config=quant_config,
             )
 
             self.to_add_out = RowParallelLinear(
                 self.inner_dim, query_dim, bias=out_bias,
+                quant_config=quant_config,
             )
 
         self.rope = DiffusionRoPE(is_neox_style=False)
         self.attn = DenseAttention()
+
+    def _apply_rope(
+        self,
+        query: torch.Tensor,
+        key: torch.Tensor,
+        image_rotary_emb: tuple[torch.Tensor, torch.Tensor] | None,
+    ) -> tuple[torch.Tensor, torch.Tensor]:
+        if image_rotary_emb is not None:
+            cos, sin = image_rotary_emb
+            cos = cos.to(query.dtype)
+            sin = sin.to(query.dtype)
+            query = self.rope(query, cos, sin)
+            key = self.rope(key, cos, sin)
+        return query, key
 
     def forward(
         self,
@@ -103,7 +132,6 @@ class FluxAttention(nn.Module):
         image_rotary_emb: tuple[torch.Tensor, torch.Tensor] | None = None,
         **kwargs,
     ) -> torch.Tensor | tuple[torch.Tensor, torch.Tensor]:
-        tp = _tp_size()
         num_heads = self.to_qkv.num_heads
         num_kv_heads = self.to_qkv.num_kv_heads
 
@@ -116,11 +144,8 @@ class FluxAttention(nn.Module):
         key = key.unflatten(-1, (num_kv_heads, -1))
         value = value.unflatten(-1, (num_kv_heads, -1))
 
-        # RMSNorm expects 2D; reshape (B, S, H, D) -> (B*S*H, D) -> back
-        q_shape = query.shape
-        query = self.norm_q(query.reshape(-1, self.head_dim)).view(q_shape)
-        k_shape = key.shape
-        key = self.norm_k(key.reshape(-1, self.head_dim)).view(k_shape)
+        query = self.norm_q(query)
+        key = self.norm_k(key)
 
         if self.added_kv_proj_dim is not None:
             add_num_heads = self.add_kv_proj.num_heads
@@ -137,21 +162,14 @@ class FluxAttention(nn.Module):
             encoder_key = encoder_key.unflatten(-1, (add_num_kv_heads, -1))
             encoder_value = encoder_value.unflatten(-1, (add_num_kv_heads, -1))
 
-            eq_shape = encoder_query.shape
-            encoder_query = self.norm_added_q(encoder_query.reshape(-1, self.head_dim)).view(eq_shape)
-            ek_shape = encoder_key.shape
-            encoder_key = self.norm_added_k(encoder_key.reshape(-1, self.head_dim)).view(ek_shape)
+            encoder_query = self.norm_added_q(encoder_query)
+            encoder_key = self.norm_added_k(encoder_key)
 
             query = torch.cat([encoder_query, query], dim=1)
             key = torch.cat([encoder_key, key], dim=1)
             value = torch.cat([encoder_value, value], dim=1)
 
-        if image_rotary_emb is not None:
-            cos, sin = image_rotary_emb
-            cos = cos.to(query.dtype)
-            sin = sin.to(query.dtype)
-            query = self.rope(query, cos, sin)
-            key = self.rope(key, cos, sin)
+        query, key = self._apply_rope(query, key, image_rotary_emb)
 
         softmax_scale = 1.0 / (self.head_dim ** 0.5)
         hidden_states = self.attn(query, key, value, softmax_scale=softmax_scale, causal=False)
@@ -163,18 +181,11 @@ class FluxAttention(nn.Module):
                 [encoder_hidden_states.shape[1], hidden_states.shape[1] - encoder_hidden_states.shape[1]],
                 dim=1,
             )
-            hidden_states = self.to_out[0](hidden_states)
+            hidden_states = self.to_out[0](hidden_states.contiguous())
             hidden_states = self.to_out[1](hidden_states)
-            encoder_hidden_states = self.to_add_out(encoder_hidden_states)
+            encoder_hidden_states = self.to_add_out(encoder_hidden_states.contiguous())
             return hidden_states, encoder_hidden_states
         else:
-            if tp > 1:
-                import torch.distributed as dist
-                full = torch.empty(
-                    hidden_states.shape[0], hidden_states.shape[1],
-                    hidden_states.shape[2] * tp,
-                    dtype=hidden_states.dtype, device=hidden_states.device,
-                )
-                dist.all_gather_into_tensor(full, hidden_states)
-                hidden_states = full
+            if _tp_size() > 1:
+                hidden_states = _tensor_model_parallel_all_gather(hidden_states, dim=-1)
             return hidden_states

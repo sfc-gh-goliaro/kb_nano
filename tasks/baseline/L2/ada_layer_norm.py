@@ -3,8 +3,8 @@
 AdaLayerNormZero: 6-output adaLN-Zero for dual-stream FLUX blocks.
 AdaLayerNormZeroSingle: 3-output adaLN-Zero for single-stream FLUX blocks.
 
-Mirrors the diffusers ``AdaLayerNormZero`` / ``AdaLayerNormZeroSingle``
-implementations, rebuilt on top of L1 ops.
+Implementation copied from diffusers' ``AdaLayerNormZero`` /
+``AdaLayerNormZeroSingle`` to keep the code identical.
 """
 
 from __future__ import annotations
@@ -18,25 +18,38 @@ from ..L1.silu import SiLU
 
 
 class AdaLayerNormZero(nn.Module):
-    """Adaptive layer norm zero (adaLN-Zero) for dual-stream DiT blocks.
+    r"""
+    Norm layer adaptive layer norm zero (adaLN-Zero).
 
-    Projects the timestep embedding through SiLU + Linear into 6 modulation
-    signals (shift/scale/gate for MSA and MLP), then applies LayerNorm with
-    adaptive scale and shift.
+    Parameters:
+        embedding_dim (`int`): The size of each embedding vector.
+        num_embeddings (`int`): The size of the embeddings dictionary.
     """
 
-    def __init__(self, embedding_dim: int, norm_type: str = "layer_norm", bias: bool = True):
+    def __init__(self, embedding_dim: int, num_embeddings: int | None = None,
+                 norm_type="layer_norm", bias=True):
         super().__init__()
+        self.emb = None
+
         self.silu = SiLU()
         self.linear = Linear(embedding_dim, 6 * embedding_dim, bias=bias)
-        self.norm = LayerNorm(embedding_dim, elementwise_affine=False)
+        if norm_type == "layer_norm":
+            self.norm = LayerNorm(embedding_dim, elementwise_affine=False, eps=1e-6)
+        else:
+            raise ValueError(
+                f"Unsupported `norm_type` ({norm_type}) provided. Supported ones are: 'layer_norm'."
+            )
 
     def forward(
         self,
         x: torch.Tensor,
-        emb: torch.Tensor,
-        **kwargs,
+        timestep: torch.Tensor | None = None,
+        class_labels: torch.LongTensor | None = None,
+        hidden_dtype: torch.dtype | None = None,
+        emb: torch.Tensor | None = None,
     ) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor]:
+        if self.emb is not None:
+            emb = self.emb(timestep, class_labels, hidden_dtype=hidden_dtype)
         emb = self.linear(self.silu(emb))
         shift_msa, scale_msa, gate_msa, shift_mlp, scale_mlp, gate_mlp = emb.chunk(6, dim=1)
         x = self.norm(x) * (1 + scale_msa[:, None]) + shift_msa[:, None]
@@ -44,22 +57,29 @@ class AdaLayerNormZero(nn.Module):
 
 
 class AdaLayerNormZeroSingle(nn.Module):
-    """Adaptive layer norm zero (adaLN-Zero) for single-stream DiT blocks.
+    r"""
+    Norm layer adaptive layer norm zero (adaLN-Zero) for single-stream blocks.
 
-    Projects the timestep embedding through SiLU + Linear into 3 modulation
-    signals (shift/scale/gate for the fused MSA+MLP path).
+    Parameters:
+        embedding_dim (`int`): The size of each embedding vector.
     """
 
-    def __init__(self, embedding_dim: int, norm_type: str = "layer_norm", bias: bool = True):
+    def __init__(self, embedding_dim: int, norm_type="layer_norm", bias=True):
         super().__init__()
+
         self.silu = SiLU()
         self.linear = Linear(embedding_dim, 3 * embedding_dim, bias=bias)
-        self.norm = LayerNorm(embedding_dim, elementwise_affine=False)
+        if norm_type == "layer_norm":
+            self.norm = LayerNorm(embedding_dim, elementwise_affine=False, eps=1e-6)
+        else:
+            raise ValueError(
+                f"Unsupported `norm_type` ({norm_type}) provided. Supported ones are: 'layer_norm'."
+            )
 
     def forward(
         self,
         x: torch.Tensor,
-        emb: torch.Tensor,
+        emb: torch.Tensor | None = None,
     ) -> tuple[torch.Tensor, torch.Tensor]:
         emb = self.linear(self.silu(emb))
         shift_msa, scale_msa, gate_msa = emb.chunk(3, dim=1)
