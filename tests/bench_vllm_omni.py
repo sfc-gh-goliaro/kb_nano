@@ -379,6 +379,7 @@ def main():
                     pipeline.vae_scale_factor,
                 )
                 decoded = (unpacked / pipeline.vae.config.scaling_factor) + pipeline.vae.config.shift_factor
+                decoded = decoded.to(dtype=pipeline.vae.dtype)
                 decoded = pipeline.vae.decode(decoded, return_dict=False)[0]
                 torch.save(
                     decoded.cpu(),

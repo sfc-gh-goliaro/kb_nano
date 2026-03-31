@@ -126,7 +126,7 @@ class DiffusionEngine:
         if not self.enforce_eager:
             try:
                 pipeline.transformer = torch.compile(
-                    pipeline.transformer, mode="reduce-overhead",
+                    pipeline.transformer, mode="default",
                 )
                 logger.info("torch.compile applied to transformer")
             except Exception as e:

@@ -13,7 +13,7 @@ import torch
 import torch.nn as nn
 
 from ....infra.tp import _tp_size
-from ..L1.rms_norm import RMSNorm
+from ..L1.t5_layer_norm import T5LayerNorm as FP32RMSNorm
 from ..L1.diffusion_rope import DiffusionRoPE
 from ..L1.dense_attention import DenseAttention
 from .parallel_linear import (
@@ -71,8 +71,8 @@ class FluxAttention(nn.Module):
         self.heads = out_dim // dim_head if out_dim is not None else heads
         self.added_kv_proj_dim = added_kv_proj_dim
 
-        self.norm_q = RMSNorm(dim_head, eps=eps)
-        self.norm_k = RMSNorm(dim_head, eps=eps)
+        self.norm_q = FP32RMSNorm(dim_head, eps=eps)
+        self.norm_k = FP32RMSNorm(dim_head, eps=eps)
 
         self.to_qkv = QKVParallelLinear(
             hidden_size=query_dim,
@@ -91,8 +91,8 @@ class FluxAttention(nn.Module):
             ])
 
         if added_kv_proj_dim is not None:
-            self.norm_added_q = RMSNorm(dim_head, eps=eps)
-            self.norm_added_k = RMSNorm(dim_head, eps=eps)
+            self.norm_added_q = FP32RMSNorm(dim_head, eps=eps)
+            self.norm_added_k = FP32RMSNorm(dim_head, eps=eps)
 
             self.add_kv_proj = QKVParallelLinear(
                 hidden_size=added_kv_proj_dim,
