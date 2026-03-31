@@ -102,6 +102,7 @@ def _get_bench_prompts(seed: int = 42) -> list[str]:
 # ---------------------------------------------------------------------------
 KB_NANO_WORKER = r'''
 import json, os, sys, time, torch
+import numpy as np
 from tqdm import tqdm
 
 def main():
@@ -120,9 +121,9 @@ def main():
         enforce_eager=True,
     )
 
-    latent_dir = cfg.get("latent_dir")
-    if latent_dir:
-        os.makedirs(latent_dir, exist_ok=True)
+    frames_dir = cfg.get("frames_dir")
+    if frames_dir:
+        os.makedirs(frames_dir, exist_ok=True)
 
     # Warmup at each unique resolution/frame-count
     seen = set()
@@ -142,9 +143,11 @@ def main():
             engine.generate(["warmup"], wp)
             torch.cuda.synchronize()
 
+    save_frames = frames_dir is not None
     all_results = []
     for scenario in cfg["scenarios"]:
         prompts = scenario["prompts"]
+        output_type = "pil" if save_frames else "latent"
         params = HunyuanVideoDiffusionSamplingParams(
             height=scenario["height"],
             width=scenario["width"],
@@ -152,7 +155,7 @@ def main():
             num_inference_steps=scenario["num_inference_steps"],
             guidance_scale=scenario.get("guidance_scale", 6.0),
             seed=cfg["seed"],
-            output_type="latent",
+            output_type=output_type,
         )
 
         total_elapsed = 0.0
@@ -169,14 +172,20 @@ def main():
             total_elapsed += elapsed
             total_videos += 1
 
-            if latent_dir and output.latents is not None:
-                torch.save(
-                    output.latents.cpu(),
-                    os.path.join(
-                        latent_dir,
-                        f"{scenario['name']}_prompt{pi:04d}.pt",
-                    ),
-                )
+            if save_frames and output.video is not None:
+                frames_list = output.video
+                if isinstance(frames_list, list) and frames_list:
+                    arr = np.stack(
+                        [np.array(f.convert("RGB")) for f in frames_list],
+                        axis=0,
+                    )
+                    np.save(
+                        os.path.join(
+                            frames_dir,
+                            f"{scenario['name']}_prompt{pi:04d}.npy",
+                        ),
+                        arr,
+                    )
 
             pbar.set_postfix(
                 vids=total_videos,
@@ -248,17 +257,11 @@ VLLM_OMNI_WORKER = r'''
 import json, os, sys, time, torch
 from tqdm import tqdm
 
-def _extract_latent(output):
-    """Extract latent tensor from OmniRequestOutput (list or single)."""
-    items = output if isinstance(output, list) else [output]
-    for item in items:
-        if hasattr(item, "latents") and item.latents is not None:
-            return item.latents
-        if hasattr(item, "images") and item.images:
-            for img in item.images:
-                if isinstance(img, torch.Tensor):
-                    return img
-    return None
+import numpy as np
+
+def _pil_images_to_array(images):
+    """Convert list of PIL images to uint8 numpy array (T, H, W, 3)."""
+    return np.stack([np.array(img.convert("RGB")) for img in images], axis=0)
 
 def main():
     with open(sys.argv[1]) as f:
@@ -274,9 +277,9 @@ def main():
     omni = Omni(model=model, enforce_eager=True)
     print("[vllm-omni] Engine ready", file=sys.stderr, flush=True)
 
-    latent_dir = cfg.get("latent_dir")
-    if latent_dir:
-        os.makedirs(latent_dir, exist_ok=True)
+    frames_dir = cfg.get("frames_dir")
+    if frames_dir:
+        os.makedirs(frames_dir, exist_ok=True)
 
     def _make_params(scenario_or_ls):
         generator = torch.Generator(device="cuda").manual_seed(seed)
@@ -287,7 +290,6 @@ def main():
             num_inference_steps=scenario_or_ls["num_inference_steps"],
             guidance_scale=scenario_or_ls.get("guidance_scale", 6.0),
             generator=generator,
-            output_type="latent",
         )
         return p
 
@@ -309,16 +311,18 @@ def main():
             total_elapsed += elapsed
             total_videos += 1
 
-            if latent_dir:
-                latent_tensor = _extract_latent(output)
-                if latent_tensor is not None:
-                    torch.save(
-                        latent_tensor.cpu(),
-                        os.path.join(
-                            latent_dir,
-                            f"{scenario['name']}_prompt{pi:04d}.pt",
-                        ),
-                    )
+            if frames_dir:
+                items = output if isinstance(output, list) else [output]
+                for item in items:
+                    if hasattr(item, "images") and item.images:
+                        arr = _pil_images_to_array(item.images)
+                        np.save(
+                            os.path.join(
+                                frames_dir,
+                                f"{scenario['name']}_prompt{pi:04d}.npy",
+                            ),
+                            arr,
+                        )
 
             pbar.set_postfix(
                 vids=total_videos,
@@ -422,19 +426,21 @@ def _build_latency_scenarios(
 # Correctness comparison
 # ---------------------------------------------------------------------------
 
-def _compare_latents(kb_latent_dir: str, vllm_latent_dir: str) -> dict:
-    """Compare per-prompt output latents between kb-nano and vllm-omni.
+def _compare_frames(kb_frames_dir: str, vllm_frames_dir: str) -> dict:
+    """Compare per-prompt decoded video frames between kb-nano and vllm-omni.
+
+    Both engines save frames as numpy arrays (T, H, W, 3) in .npy files.
+    Compares using PSNR, SSIM-like pixel MSE, and cosine similarity on
+    flattened float vectors.
 
     Returns a dict mapping scenario names to per-scenario correctness stats.
     """
-    import torch
-
     kb_files = sorted(
-        f for f in os.listdir(kb_latent_dir) if f.endswith(".pt")
-    ) if os.path.isdir(kb_latent_dir) else []
+        f for f in os.listdir(kb_frames_dir) if f.endswith(".npy")
+    ) if os.path.isdir(kb_frames_dir) else []
     vllm_files = sorted(
-        f for f in os.listdir(vllm_latent_dir) if f.endswith(".pt")
-    ) if os.path.isdir(vllm_latent_dir) else []
+        f for f in os.listdir(vllm_frames_dir) if f.endswith(".npy")
+    ) if os.path.isdir(vllm_frames_dir) else []
 
     common = sorted(set(kb_files) & set(vllm_files))
     if not common:
@@ -443,47 +449,43 @@ def _compare_latents(kb_latent_dir: str, vllm_latent_dir: str) -> dict:
     scenario_stats: dict[str, list[dict]] = defaultdict(list)
 
     for fname in common:
-        kb_lat = torch.load(
-            os.path.join(kb_latent_dir, fname),
-            map_location="cpu", weights_only=True,
-        ).detach().float().flatten()
-        vllm_lat = torch.load(
-            os.path.join(vllm_latent_dir, fname),
-            map_location="cpu", weights_only=True,
-        ).detach().float().flatten()
+        kb_arr = np.load(os.path.join(kb_frames_dir, fname)).astype(np.float32).flatten()
+        vllm_arr = np.load(os.path.join(vllm_frames_dir, fname)).astype(np.float32).flatten()
 
-        if len(kb_lat) != len(vllm_lat):
+        if len(kb_arr) != len(vllm_arr):
             print(
                 f"  WARNING: shape mismatch for {fname}: "
-                f"kb-nano={kb_lat.shape} vs vllm-omni={vllm_lat.shape}, skipping",
+                f"kb-nano={kb_arr.shape} vs vllm-omni={vllm_arr.shape}, skipping",
                 file=sys.stderr,
             )
             continue
 
-        kb_v = kb_lat.numpy()
-        vllm_v = vllm_lat.numpy()
-
-        mse = float(np.mean((kb_v - vllm_v) ** 2))
+        mse = float(np.mean((kb_arr - vllm_arr) ** 2))
+        psnr = float(10 * np.log10(255.0 ** 2 / max(mse, 1e-12)))
         cos_sim = float(
-            np.dot(kb_v, vllm_v)
-            / (np.linalg.norm(kb_v) * np.linalg.norm(vllm_v) + 1e-12)
+            np.dot(kb_arr, vllm_arr)
+            / (np.linalg.norm(kb_arr) * np.linalg.norm(vllm_arr) + 1e-12)
         )
 
         scenario_name = fname.rsplit("_prompt", 1)[0]
         scenario_stats[scenario_name].append({
             "file": fname,
             "mse": mse,
+            "psnr": psnr,
             "cosine_similarity": cos_sim,
         })
 
     results = {}
-    for scenario, batches in scenario_stats.items():
-        mses = [b["mse"] for b in batches]
-        cosines = [b["cosine_similarity"] for b in batches]
+    for scenario, items in scenario_stats.items():
+        mses = [b["mse"] for b in items]
+        psnrs = [b["psnr"] for b in items]
+        cosines = [b["cosine_similarity"] for b in items]
         results[scenario] = {
-            "num_prompts": len(batches),
+            "num_prompts": len(items),
             "mean_mse": float(np.mean(mses)),
             "max_mse": float(np.max(mses)),
+            "mean_psnr": float(np.mean(psnrs)),
+            "min_psnr": float(np.min(psnrs)),
             "mean_cosine_sim": float(np.mean(cosines)),
             "min_cosine_sim": float(np.min(cosines)),
         }
@@ -562,20 +564,22 @@ def _print_latency_comparison(
 
 
 def _print_correctness_comparison(correctness: dict):
-    print("\n" + "=" * 100)
-    print("  CORRECTNESS COMPARISON (latent space, per-prompt)")
-    print("=" * 100)
+    print("\n" + "=" * 110)
+    print("  CORRECTNESS COMPARISON (decoded video frames, per-prompt)")
+    print("=" * 110)
     print(
         f"  {'Scenario':<25} {'Prompts':>8} {'Mean CosSim':>12}"
-        f" {'Min CosSim':>11} {'Mean MSE':>12} {'Max MSE':>12}"
-        f" {'Result':>8}"
+        f" {'Min CosSim':>11} {'Mean PSNR':>10} {'Min PSNR':>9}"
+        f" {'Mean MSE':>12} {'Result':>8}"
     )
-    print("  " + "-" * 92)
+    print("  " + "-" * 102)
 
     all_pass = True
     for scenario, stats in correctness.items():
         mean_cos = stats["mean_cosine_sim"]
         min_cos = stats["min_cosine_sim"]
+        mean_psnr = stats.get("mean_psnr", 0)
+        min_psnr = stats.get("min_psnr", 0)
         verdict = (
             "PASS" if mean_cos > 0.98
             else ("WARN" if mean_cos > 0.95 else "FAIL")
@@ -585,7 +589,8 @@ def _print_correctness_comparison(correctness: dict):
         print(
             f"  {scenario:<25} {stats['num_prompts']:>8}"
             f" {mean_cos:>12.6f} {min_cos:>11.6f}"
-            f" {stats['mean_mse']:>12.2e} {stats['max_mse']:>12.2e}"
+            f" {mean_psnr:>10.2f} {min_psnr:>9.2f}"
+            f" {stats['mean_mse']:>12.2e}"
             f" {verdict:>8}"
         )
 
@@ -644,11 +649,11 @@ def main():
     guidance = HUNYUAN_VIDEO_CONFIG.guidance_scale
 
     run_vllm = not args.skip_vllm_omni
-    save_latents = run_vllm
+    save_frames = run_vllm
 
     os.makedirs(args.output_dir, exist_ok=True)
-    kb_latent_dir = os.path.join(args.output_dir, "latents", "kb_nano") if save_latents else None
-    vllm_latent_dir = os.path.join(args.output_dir, "latents", "vllm_omni") if save_latents else None
+    kb_frames_dir = os.path.join(args.output_dir, "frames", "kb_nano") if save_frames else None
+    vllm_frames_dir = os.path.join(args.output_dir, "frames", "vllm_omni") if save_frames else None
 
     scenarios = (
         _build_throughput_scenarios(bench_prompts, steps, guidance)
@@ -683,8 +688,8 @@ def main():
         "scenarios": scenarios,
         "latency_scenarios": latency_scenarios,
     }
-    if kb_latent_dir:
-        kb_config["latent_dir"] = kb_latent_dir
+    if kb_frames_dir:
+        kb_config["frames_dir"] = kb_frames_dir
     kb_data = run_worker(
         KB_NANO_WORKER, kb_config,
         "kb-nano HunyuanVideo benchmark", timeout=36000,
@@ -698,8 +703,8 @@ def main():
             "scenarios": scenarios,
             "latency_scenarios": latency_scenarios,
         }
-        if vllm_latent_dir:
-            vllm_config["latent_dir"] = vllm_latent_dir
+        if vllm_frames_dir:
+            vllm_config["frames_dir"] = vllm_frames_dir
         vllm_data = run_worker(
             VLLM_OMNI_WORKER, vllm_config,
             "vllm-omni HunyuanVideo benchmark", timeout=36000,
@@ -718,8 +723,8 @@ def main():
             _print_latency_comparison(kb_lat, vllm_lat)
 
         correctness = None
-        if save_latents and kb_latent_dir and vllm_latent_dir:
-            correctness = _compare_latents(kb_latent_dir, vllm_latent_dir)
+        if save_frames and kb_frames_dir and vllm_frames_dir:
+            correctness = _compare_frames(kb_frames_dir, vllm_frames_dir)
             if correctness:
                 _print_correctness_comparison(correctness)
             else:
