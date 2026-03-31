@@ -169,7 +169,7 @@ async def run_benchmark(cfg):
     od_config = OmniDiffusionConfig(
         model=cfg["model"],
         dtype=torch.bfloat16,
-        enforce_eager=cfg.get("enforce_eager", False),
+        enforce_eager=True,
         output_type="latent",
     )
     engine = AsyncOmniDiffusion(model=cfg["model"], od_config=od_config)

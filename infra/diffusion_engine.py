@@ -123,7 +123,11 @@ class DiffusionEngine:
         pipeline.text_encoder_2.to(device=self.device, dtype=self.dtype)
         pipeline.vae.to(device=self.device)
 
-        if not self.enforce_eager:
+        # FLUX: torch.compile disabled — iterative denoising (28 steps)
+        # compounds non-deterministic FP rounding, causing ~8-12% cosine
+        # divergence vs reference implementations.
+        is_flux = "flux" in self.model_name.lower()
+        if not self.enforce_eager and not is_flux:
             try:
                 pipeline.transformer = torch.compile(
                     pipeline.transformer, mode="default",
@@ -131,6 +135,8 @@ class DiffusionEngine:
                 logger.info("torch.compile applied to transformer")
             except Exception as e:
                 logger.warning("torch.compile failed, using eager: %s", e)
+        else:
+            logger.info("Running transformer in eager mode")
 
         pipeline.eval()
         self._pipeline = pipeline

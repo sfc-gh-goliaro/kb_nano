@@ -6,7 +6,7 @@ A standalone, high-performance inference engine supporting **LLMs** (Llama 3.1, 
 
 - **Llama 3.1** (8B, 70B) with frequency-scaled RoPE
 - **Mixtral-8x7B** with fused Triton MoE grouped-GEMM kernels
-- **FLUX.1-dev** diffusion transformer (text-to-image) with Flash Attention and torch.compile
+- **FLUX.1-dev** diffusion transformer (text-to-image) with Flash Attention
 - **SDXL** (Stable Diffusion XL) UNet-based text-to-image with dual CLIP text encoders
 - **Qwen2-VL / Qwen3-VL** vision-language models with image and video support
 - **Whisper** (large-v3) encoder-decoder speech-to-text with batched inference and paged cross-attention KV cache
@@ -467,34 +467,32 @@ FP8 activation quantization uses a custom Triton kernel for single-launch per-to
 
 ### FLUX.1-dev (Diffusion)
 
-Run `tests/bench_vllm_omni.py` to reproduce. Prompts drawn from the full nateraw/parti-prompts (P2) dataset (1632 prompts), shuffled deterministically. Reference engine: vllm-omni 0.16.0.
+Run `tests/bench_vllm_omni.py` to reproduce. Prompts drawn from the full nateraw/parti-prompts (P2) dataset (1632 prompts), shuffled deterministically. Reference engine: vllm-omni 0.16.0. Both engines run in eager mode.
 
-**Hardware: NVIDIA B200**
+**Hardware: NVIDIA H200**
 
-Throughput (images/sec, with `torch.compile`):
+Throughput (images/sec, eager mode, 28 steps):
 
 | Scenario | Batch | Images | vllm-omni | Ours | Ratio |
 |----------|------:|-------:|----------:|-----:|------:|
-| 1024x1024, 28 steps | 4 | 40 | 0.32 | 0.45 | **1.44x** |
-| 512x512, 28 steps   | 8 | 80 | 1.22 | 1.48 | **1.22x** |
-| 1024x1024, 50 steps | 4 | 20 | 0.18 | 0.25 | **1.40x** |
+| 1024x1024 | 4 | 40 | 0.22 | 0.22 | **1.01x** |
+| 512x512   | 8 | 80 | 0.72 | 0.72 | **1.00x** |
 
-Latency (single image, 28 steps, median of 5 runs, with `torch.compile`):
+Latency (single image, 28 steps, median of 5 runs, eager mode):
 
 | Resolution | vllm-omni | Ours | Ratio |
 |------------|----------:|-----:|------:|
-| 1024x1024  | 3.223s | 2.209s | **1.46x** |
-| 512x512    | 1.028s | 0.758s | **1.36x** |
+| 1024x1024  | 4.734s | 4.712s | **1.00x** |
+| 512x512    | 1.653s | 1.616s | **1.02x** |
 
-Correctness (eager mode, packed latent space, per-batch cosine similarity):
+Correctness (eager mode, decoded image space, per-batch cosine similarity):
 
 | Scenario | Mean CosSim | Min CosSim |
 |----------|------------:|-----------:|
-| 1024x1024, 28 steps | 0.973 | 0.947 |
-| 512x512, 28 steps   | 0.983 | 0.974 |
-| 1024x1024, 50 steps | 0.969 | 0.939 |
+| 1024x1024, 28 steps | 0.995 | 0.990 |
+| 512x512, 28 steps   | 0.994 | 0.986 |
 
-Correctness is measured in eager mode to isolate numerical differences in the model from `torch.compile` graph-level optimizations (which change floating-point evaluation order). On B200, both engines use PyTorch SDPA (which dispatches to cuDNN flash attention); on Ampere/Hopper GPUs, kb-nano uses `flash_attn_func` directly.
+Both engines run in eager mode to ensure numerically comparable outputs. The remaining cosine divergence (~0.5%) is from the CLIP text encoder: kb-nano uses a custom implementation while vllm-omni uses HuggingFace's `CLIPTextModel`, which produces slightly different pooled embeddings (`cos≈0.9999` per token) that compound over 28 denoising steps. On H200 (Hopper), both engines use `flash_attn_func` for attention.
 
 ### SDXL (Diffusion)
 
