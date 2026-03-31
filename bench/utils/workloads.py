@@ -158,3 +158,57 @@ def get_max_seq_len() -> int:
     for w in LATENCY_WORKLOADS:
         max_len = max(max_len, w.input_len + w.output_len)
     return max_len
+
+
+# ---------------------------------------------------------------------------
+# Video diffusion workloads (text-to-video generation)
+# ---------------------------------------------------------------------------
+
+@dataclass(frozen=True)
+class VideoDiffusionModelConfig:
+    num_inference_steps: int
+    guidance_scale: float
+
+HUNYUAN_VIDEO_CONFIG = VideoDiffusionModelConfig(
+    num_inference_steps=30, guidance_scale=6.0,
+)
+
+@dataclass(frozen=True)
+class VideoDiffusionThroughputWorkload:
+    name: str
+    height: int
+    width: int
+    num_frames: int
+    num_prompts: int
+
+@dataclass(frozen=True)
+class VideoDiffusionLatencyWorkload:
+    name: str
+    height: int
+    width: int
+    num_frames: int
+    num_warmup: int = 2
+    num_iters: int = 5
+
+VIDEO_DIFFUSION_THROUGHPUT_WORKLOADS: list[VideoDiffusionThroughputWorkload] = [
+    VideoDiffusionThroughputWorkload(
+        "480p-short", height=480, width=832, num_frames=25, num_prompts=16,
+    ),
+    VideoDiffusionThroughputWorkload(
+        "480p-medium", height=480, width=832, num_frames=49, num_prompts=8,
+    ),
+]
+
+VIDEO_DIFFUSION_LATENCY_WORKLOADS: list[VideoDiffusionLatencyWorkload] = [
+    VideoDiffusionLatencyWorkload(
+        "single-480p-short", height=480, width=832, num_frames=25,
+    ),
+    VideoDiffusionLatencyWorkload(
+        "single-480p-medium", height=480, width=832, num_frames=49,
+    ),
+]
+
+ALL_VIDEO_DIFFUSION_WORKLOADS = {
+    "throughput": VIDEO_DIFFUSION_THROUGHPUT_WORKLOADS,
+    "latency": VIDEO_DIFFUSION_LATENCY_WORKLOADS,
+}

@@ -25,7 +25,7 @@ from ..L2.timestep_embedding import (
     CombinedTimestepGuidanceTextProjEmbeddings,
     CombinedTimestepTextProjEmbeddings,
 )
-from .vae_image_processor import VaeImageProcessor
+from ..L1.video_processor import VideoProcessor as VaeImageProcessor
 from diffusers.schedulers.scheduling_flow_match_euler_discrete import (
     FlowMatchEulerDiscreteScheduler,
 )
