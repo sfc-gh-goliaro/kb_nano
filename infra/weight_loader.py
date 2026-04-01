@@ -258,13 +258,6 @@ def load_weights(model, model_path: str, model_type: str = "llama") -> None:
     else:
         print(f"  Loading weights from {len(safetensor_files)} safetensors file(s)...")
     loaded = 0
-    # #region agent log
-    _debug_log_path = "/home/yak/.cursor/debug-64ddb7.log"
-    _debug_moe_gate_loaded = 0
-    _debug_moe_fused_loaded = 0
-    _debug_moe_skipped = []
-    _debug_moe_unmatched = []
-    # #endregion
     _fused_expert_weights = {}
     _fused_expert_scales = {}
 
@@ -476,16 +469,10 @@ def load_weights(model, model_path: str, model_type: str = "llama") -> None:
                 try:
                     param = model.get_parameter(param_name)
                 except AttributeError:
-                    # #region agent log
-                    _debug_moe_skipped.append(("gate", mapped_name, param_name))
-                    # #endregion
                     pass
                 else:
                     param.weight_loader(param, _get_tensor())
                     loaded += 1
-                    # #region agent log
-                    _debug_moe_gate_loaded += 1
-                    # #endregion
                 continue
 
             # Buffer fused expert scale_inv tensors for deferred dequantization
@@ -498,23 +485,8 @@ def load_weights(model, model_path: str, model_type: str = "llama") -> None:
             m_fused = _QWEN3_MOE_FUSED_EXPERT_RE.match(mapped_name)
             if m_fused:
                 mlp_prefix, proj = m_fused.groups()
-                tensor = _get_tensor()
-                # #region agent log
-                import json as _json, time as _time
-                _log_entry = {"sessionId": "64ddb7", "hypothesisId": "H1", "location": "weight_loader.py:moe_fused",
-                              "message": f"Loading fused expert: {proj}", "data": {"mapped_name": mapped_name, "proj": proj, "shape": list(tensor.shape), "dtype": str(tensor.dtype)},
-                              "timestamp": int(_time.time() * 1000)}
-                try:
-                    with open(_debug_log_path, "a") as _lf:
-                        _lf.write(_json.dumps(_log_entry) + "\n")
-                except Exception:
-                    pass
-                # #endregion
-                _fused_expert_weights[(mlp_prefix, proj)] = tensor
+                _fused_expert_weights[(mlp_prefix, proj)] = _get_tensor()
                 loaded += 1
-                # #region agent log
-                _debug_moe_fused_loaded += 1
-                # #endregion
                 continue
 
         # Handle packed modules (qkv_proj, gate_up_proj)
@@ -565,54 +537,96 @@ def load_weights(model, model_path: str, model_type: str = "llama") -> None:
             lm_loader(lm_param, _get_tensor())
             loaded += 1
 
-    # Assign buffered fused expert weights (with FP8 dequantization if needed)
+    # Assign buffered fused expert weights (keep FP8 when model supports it)
     if _fused_expert_weights:
+        import math as _math
         from .tp import _tp_rank
         rank = _tp_rank() if _tp_size() > 1 else 0
         for (mlp_prefix, proj), tensor in _fused_expert_weights.items():
             scale = _fused_expert_scales.get((mlp_prefix, proj))
-            if tensor.dtype in (torch.float8_e4m3fn, torch.float8_e5m2) and scale is not None:
-                tensor = _dequant_fp8_block(tensor, scale, block_size=128)
-            weight = tensor.transpose(-1, -2)
+            is_fp8 = tensor.dtype in (torch.float8_e4m3fn, torch.float8_e5m2)
+
+            # Check if model has FP8 expert weights (Qwen3MoE with quant_config)
             if proj == "gate_up_proj":
                 param_name = f"{mlp_prefix}.w13"
-                try:
-                    param = model.get_parameter(param_name)
-                except AttributeError:
-                    continue
-                full_inter_2 = weight.shape[1]
-                half = full_inter_2 // 2
-                tp = param.shape[1] // 2
-                gate = weight[:, :half, :]
-                up = weight[:, half:, :]
-                param.data[:, :tp, :].copy_(gate[:, rank * tp:(rank + 1) * tp, :])
-                param.data[:, tp:, :].copy_(up[:, rank * tp:(rank + 1) * tp, :])
             else:
                 param_name = f"{mlp_prefix}.w2"
-                try:
-                    param = model.get_parameter(param_name)
-                except AttributeError:
-                    continue
-                full_inter = weight.shape[2]
-                tp_inter = param.shape[2]
-                param.data.copy_(weight[:, :, rank * tp_inter:(rank + 1) * tp_inter])
+            try:
+                param = model.get_parameter(param_name)
+            except AttributeError:
+                continue
+
+            model_is_fp8 = param.dtype in (torch.float8_e4m3fn, torch.float8_e5m2)
+
+            if is_fp8 and model_is_fp8 and scale is not None:
+                # Keep weights in FP8 and load scales separately
+                weight = tensor.transpose(-1, -2)
+                if proj == "gate_up_proj":
+                    full_inter_2 = weight.shape[1]
+                    half = full_inter_2 // 2
+                    tp = param.shape[1] // 2
+                    gate = weight[:, :half, :]
+                    up = weight[:, half:, :]
+                    param.data[:, :tp, :].copy_(gate[:, rank * tp:(rank + 1) * tp, :])
+                    param.data[:, tp:, :].copy_(up[:, rank * tp:(rank + 1) * tp, :])
+
+                    # Load the scale for w13
+                    scale_param_name = f"{mlp_prefix}.w13_scale"
+                    try:
+                        scale_param = model.get_parameter(scale_param_name)
+                    except AttributeError:
+                        pass
+                    else:
+                        # scale shape: [E, scale_R, scale_C] where R = ceil(inter/block_n), C = ceil(hidden/block_k)
+                        # Checkpoint scale corresponds to the full [E, inter*2, hidden] weight
+                        # We need to shard along the output (rows) dimension for TP
+                        full_scale_rows = scale.shape[1]
+                        scale_rows_per_shard = full_scale_rows // _tp_size()
+                        # gate_up_proj scale: first half = gate, second half = up
+                        gate_scale_rows = full_scale_rows // 2
+                        up_scale_rows = full_scale_rows - gate_scale_rows
+                        gate_rows_per_tp = gate_scale_rows // _tp_size()
+                        up_rows_per_tp = up_scale_rows // _tp_size()
+                        gate_s = scale[:, rank * gate_rows_per_tp:(rank + 1) * gate_rows_per_tp, :]
+                        up_s = scale[:, gate_scale_rows + rank * up_rows_per_tp:gate_scale_rows + (rank + 1) * up_rows_per_tp, :]
+                        scale_param.data[:, :gate_rows_per_tp, :].copy_(gate_s)
+                        scale_param.data[:, gate_rows_per_tp:gate_rows_per_tp + up_rows_per_tp, :].copy_(up_s)
+                else:
+                    full_inter = weight.shape[2]
+                    tp_inter = param.shape[2]
+                    param.data.copy_(weight[:, :, rank * tp_inter:(rank + 1) * tp_inter])
+
+                    # Load the scale for w2
+                    scale_param_name = f"{mlp_prefix}.w2_scale"
+                    try:
+                        scale_param = model.get_parameter(scale_param_name)
+                    except AttributeError:
+                        pass
+                    else:
+                        # w2 scale sharded along cols (input dim = intermediate)
+                        full_scale_cols = scale.shape[2]
+                        scale_cols_per_tp = full_scale_cols // _tp_size()
+                        scale_param.data.copy_(scale[:, :, rank * scale_cols_per_tp:(rank + 1) * scale_cols_per_tp])
+            else:
+                # Fallback: dequantize FP8 to BF16 (for non-FP8 model params)
+                if is_fp8 and scale is not None:
+                    tensor = _dequant_fp8_block(tensor, scale, block_size=128)
+                weight = tensor.transpose(-1, -2)
+                if proj == "gate_up_proj":
+                    full_inter_2 = weight.shape[1]
+                    half = full_inter_2 // 2
+                    tp = param.shape[1] // 2
+                    gate = weight[:, :half, :]
+                    up = weight[:, half:, :]
+                    param.data[:, :tp, :].copy_(gate[:, rank * tp:(rank + 1) * tp, :])
+                    param.data[:, tp:, :].copy_(up[:, rank * tp:(rank + 1) * tp, :])
+                else:
+                    full_inter = weight.shape[2]
+                    tp_inter = param.shape[2]
+                    param.data.copy_(weight[:, :, rank * tp_inter:(rank + 1) * tp_inter])
         del _fused_expert_weights, _fused_expert_scales
 
     print(f"  Loaded {loaded} weight shards.")
-    # #region agent log
-    if is_qwen3_vl_moe:
-        import json as _json, time as _time
-        _log_entry = {"sessionId": "64ddb7", "hypothesisId": "H1", "location": "weight_loader.py:summary",
-                      "message": "MoE weight loading summary",
-                      "data": {"gate_loaded": _debug_moe_gate_loaded, "fused_loaded": _debug_moe_fused_loaded,
-                               "skipped": _debug_moe_skipped[:20], "total_loaded": loaded},
-                      "timestamp": int(_time.time() * 1000)}
-        try:
-            with open(_debug_log_path, "a") as _lf:
-                _lf.write(_json.dumps(_log_entry) + "\n")
-        except Exception:
-            pass
-    # #endregion
 
 
 def _postprocess_fp8_weights(model: torch.nn.Module) -> None:
@@ -741,21 +755,6 @@ def load_model(
                   f"top-{config.num_experts_per_tok})...")
         else:
             print("  Allocating Qwen3-VL model...")
-        # #region agent log
-        import json as _json, time as _time
-        _log_entry = {"sessionId": "64ddb7", "hypothesisId": "H1", "location": "weight_loader.py:load_model",
-                      "message": f"Qwen3-VL config: is_moe={config.is_moe}",
-                      "data": {"model_type": model_type, "is_moe": config.is_moe,
-                               "num_experts": config.num_experts, "num_experts_per_tok": config.num_experts_per_tok,
-                               "moe_intermediate_size": config.moe_intermediate_size,
-                               "hidden_size": config.hidden_size, "num_hidden_layers": config.num_hidden_layers},
-                      "timestamp": int(_time.time() * 1000)}
-        try:
-            with open("/home/yak/.cursor/debug-64ddb7.log", "a") as _lf:
-                _lf.write(_json.dumps(_log_entry) + "\n")
-        except Exception:
-            pass
-        # #endregion
         model = Qwen3VLForConditionalGeneration(config, quant_config=quant_config)
     else:
         config = LlamaConfig.from_pretrained(model_name)
@@ -782,7 +781,7 @@ def load_model(
             if param.dtype == torch.float8_e4m3fn:
                 if not param.is_cuda:
                     param.data = param.data.to(device=device)
-            elif "weight_scale_inv" in name:
+            elif "weight_scale_inv" in name or "w13_scale" in name or "w2_scale" in name:
                 param.data = param.data.to(device=device)
             elif param.data.device != device or param.dtype != dtype:
                 param.data = param.data.to(device=device, dtype=dtype)

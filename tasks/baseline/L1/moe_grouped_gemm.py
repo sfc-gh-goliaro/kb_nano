@@ -1,4 +1,4 @@
-"""Triton fused MoE grouped GEMM kernel."""
+"""Triton fused MoE grouped GEMM kernel with FP8 W8A8 block-scaled support."""
 
 from __future__ import annotations
 
@@ -11,6 +11,7 @@ import triton.language as tl
 @triton.jit
 def _fused_moe_kernel(
     a_ptr, b_ptr, c_ptr,
+    a_scale_ptr, b_scale_ptr,
     topk_weights_ptr,
     sorted_token_ids_ptr,
     expert_ids_ptr,
@@ -20,6 +21,10 @@ def _fused_moe_kernel(
     stride_am, stride_ak,
     stride_be, stride_bk, stride_bn,
     stride_cm, stride_cn,
+    stride_asm, stride_ask,
+    stride_bse, stride_bsk, stride_bsn,
+    group_n: tl.constexpr,
+    group_k: tl.constexpr,
     MUL_ROUTED_WEIGHT: tl.constexpr,
     top_k: tl.constexpr,
     BLOCK_SIZE_M: tl.constexpr,
@@ -27,6 +32,7 @@ def _fused_moe_kernel(
     BLOCK_SIZE_K: tl.constexpr,
     GROUP_SIZE_M: tl.constexpr,
     compute_type: tl.constexpr,
+    use_fp8_w8a8: tl.constexpr,
     NAIVE_BLOCK_ASSIGNMENT: tl.constexpr = False,
 ):
     pid = tl.program_id(axis=0)
@@ -50,24 +56,52 @@ def _fused_moe_kernel(
     else:
         offs_token_id = pid_m * BLOCK_SIZE_M + offs_m
         offs_token = tl.load(sorted_token_ids_ptr + offs_token_id)
+    offs_token = offs_token.to(tl.int64)
     token_mask = offs_token < num_valid_tokens
 
     off_expert = tl.load(expert_ids_ptr + pid_m).to(tl.int64)
 
     offs_bn = (pid_n * BLOCK_SIZE_N + tl.arange(0, BLOCK_SIZE_N).to(tl.int64)) % N
-    offs_k = tl.arange(0, BLOCK_SIZE_K).to(tl.int64)
+    offs_k = tl.arange(0, BLOCK_SIZE_K)
 
     a_ptrs = a_ptr + (offs_token[:, None] // top_k * stride_am + offs_k[None, :] * stride_ak)
     b_ptrs = b_ptr + (off_expert * stride_be + offs_k[:, None] * stride_bk + offs_bn[None, :] * stride_bn)
 
+    if use_fp8_w8a8:
+        if group_k > 0 and group_n > 0:
+            a_scale_ptrs = a_scale_ptr + (offs_token // top_k) * stride_asm
+            offs_bsn = offs_bn // group_n
+            b_scale_ptrs = (
+                b_scale_ptr + off_expert * stride_bse + offs_bsn * stride_bsn
+            )
+
     accumulator = tl.zeros((BLOCK_SIZE_M, BLOCK_SIZE_N), dtype=tl.float32)
-    for k_start in range(0, K, BLOCK_SIZE_K):
-        k_mask = (k_start + offs_k) < K
+    for k in range(0, tl.cdiv(K, BLOCK_SIZE_K)):
+        k_mask = (k * BLOCK_SIZE_K + offs_k) < K
         a = tl.load(a_ptrs, mask=token_mask[:, None] & k_mask[None, :], other=0.0)
         b = tl.load(b_ptrs, mask=k_mask[:, None], other=0.0)
-        accumulator = tl.dot(a.to(compute_type), b.to(compute_type), accumulator)
+
+        if use_fp8_w8a8:
+            if group_k > 0 and group_n > 0:
+                k_start = k * BLOCK_SIZE_K
+                offs_ks = k_start // group_k
+                a_scale = tl.load(
+                    a_scale_ptrs + offs_ks * stride_ask, mask=token_mask, other=0.0
+                )
+                b_scale = tl.load(b_scale_ptrs + offs_ks * stride_bsk)
+                accumulator += tl.dot(a, b) * a_scale[:, None] * b_scale[None, :]
+            else:
+                accumulator = tl.dot(a, b, acc=accumulator)
+        else:
+            accumulator = tl.dot(a.to(compute_type), b.to(compute_type), accumulator)
+
         a_ptrs += BLOCK_SIZE_K * stride_ak
         b_ptrs += BLOCK_SIZE_K * stride_bk
+
+    if use_fp8_w8a8 and not (group_k > 0 and group_n > 0):
+        a_scale = tl.load(a_scale_ptr)
+        b_scale = tl.load(b_scale_ptr + off_expert)
+        accumulator = accumulator * a_scale * b_scale
 
     if MUL_ROUTED_WEIGHT:
         moe_weight = tl.load(topk_weights_ptr + offs_token, mask=token_mask, other=0.0)
@@ -118,20 +152,39 @@ _TUNED_CONFIGS_N4096 = {
     4096: {"BLOCK_SIZE_M": 128, "BLOCK_SIZE_N": 256, "BLOCK_SIZE_K": 64, "GROUP_SIZE_M": 32, "num_warps": 8, "num_stages": 4},
 }
 
+_TUNED_CONFIGS_SMALL_N = {
+    1: {"BLOCK_SIZE_M": 16, "BLOCK_SIZE_N": 64, "BLOCK_SIZE_K": 128, "GROUP_SIZE_M": 16, "num_warps": 4, "num_stages": 5},
+    2: {"BLOCK_SIZE_M": 16, "BLOCK_SIZE_N": 64, "BLOCK_SIZE_K": 128, "GROUP_SIZE_M": 16, "num_warps": 4, "num_stages": 5},
+    4: {"BLOCK_SIZE_M": 16, "BLOCK_SIZE_N": 64, "BLOCK_SIZE_K": 128, "GROUP_SIZE_M": 16, "num_warps": 4, "num_stages": 5},
+    8: {"BLOCK_SIZE_M": 16, "BLOCK_SIZE_N": 64, "BLOCK_SIZE_K": 128, "GROUP_SIZE_M": 16, "num_warps": 4, "num_stages": 5},
+    16: {"BLOCK_SIZE_M": 16, "BLOCK_SIZE_N": 64, "BLOCK_SIZE_K": 128, "GROUP_SIZE_M": 16, "num_warps": 4, "num_stages": 3},
+    24: {"BLOCK_SIZE_M": 16, "BLOCK_SIZE_N": 64, "BLOCK_SIZE_K": 128, "GROUP_SIZE_M": 16, "num_warps": 4, "num_stages": 3},
+    32: {"BLOCK_SIZE_M": 16, "BLOCK_SIZE_N": 64, "BLOCK_SIZE_K": 128, "GROUP_SIZE_M": 16, "num_warps": 4, "num_stages": 3},
+    48: {"BLOCK_SIZE_M": 32, "BLOCK_SIZE_N": 64, "BLOCK_SIZE_K": 128, "GROUP_SIZE_M": 16, "num_warps": 4, "num_stages": 3},
+    64: {"BLOCK_SIZE_M": 32, "BLOCK_SIZE_N": 64, "BLOCK_SIZE_K": 128, "GROUP_SIZE_M": 16, "num_warps": 4, "num_stages": 4},
+    96: {"BLOCK_SIZE_M": 32, "BLOCK_SIZE_N": 128, "BLOCK_SIZE_K": 128, "GROUP_SIZE_M": 16, "num_warps": 4, "num_stages": 4},
+    128: {"BLOCK_SIZE_M": 64, "BLOCK_SIZE_N": 128, "BLOCK_SIZE_K": 128, "GROUP_SIZE_M": 16, "num_warps": 8, "num_stages": 4},
+    256: {"BLOCK_SIZE_M": 64, "BLOCK_SIZE_N": 128, "BLOCK_SIZE_K": 128, "GROUP_SIZE_M": 16, "num_warps": 8, "num_stages": 4},
+    512: {"BLOCK_SIZE_M": 128, "BLOCK_SIZE_N": 128, "BLOCK_SIZE_K": 128, "GROUP_SIZE_M": 16, "num_warps": 8, "num_stages": 4},
+    1024: {"BLOCK_SIZE_M": 128, "BLOCK_SIZE_N": 128, "BLOCK_SIZE_K": 128, "GROUP_SIZE_M": 16, "num_warps": 8, "num_stages": 4},
+    2048: {"BLOCK_SIZE_M": 128, "BLOCK_SIZE_N": 128, "BLOCK_SIZE_K": 128, "GROUP_SIZE_M": 32, "num_warps": 8, "num_stages": 4},
+    4096: {"BLOCK_SIZE_M": 128, "BLOCK_SIZE_N": 128, "BLOCK_SIZE_K": 128, "GROUP_SIZE_M": 32, "num_warps": 8, "num_stages": 4},
+}
+
 _TUNED_GRID_KEYS_N14336 = sorted(_TUNED_CONFIGS_N14336.keys())
 _TUNED_GRID_KEYS_N4096 = sorted(_TUNED_CONFIGS_N4096.keys())
+_TUNED_GRID_KEYS_SMALL_N = sorted(_TUNED_CONFIGS_SMALL_N.keys())
 
 
 def _get_default_config(M: int, N: int = 0) -> dict:
-    """Select best kernel config based on batch size M and output dim N.
-
-    Uses autotuned configs from vLLM (H200) when N matches known dimensions.
-    Falls back to a reasonable generic config otherwise.
-    """
+    """Select best kernel config based on batch size M and output dim N."""
     if N > 0:
         if N >= 14336 or (N >= 7168 and N < 8192):
             configs = _TUNED_CONFIGS_N14336
             grid_keys = _TUNED_GRID_KEYS_N14336
+        elif N <= 1024:
+            configs = _TUNED_CONFIGS_SMALL_N
+            grid_keys = _TUNED_GRID_KEYS_SMALL_N
         elif N <= 4096:
             configs = _TUNED_CONFIGS_N4096
             grid_keys = _TUNED_GRID_KEYS_N4096
@@ -187,9 +240,15 @@ class MoeGroupedGemm(nn.Module):
         mul_routed_weight: bool,
         top_k: int,
         config: dict | None = None,
+        a_scale: torch.Tensor | None = None,
+        b_scale: torch.Tensor | None = None,
+        use_fp8_w8a8: bool = False,
+        block_shape: list[int] | None = None,
     ):
         if config is None:
             config = _get_default_config(A.size(0), B.size(1))
+        else:
+            config = config.copy()
 
         naive = sorted_token_ids is None
         if naive:
@@ -203,12 +262,20 @@ class MoeGroupedGemm(nn.Module):
             triton.cdiv(EM, config["BLOCK_SIZE_M"]) * triton.cdiv(B.size(1), config["BLOCK_SIZE_N"]),
         )
 
-        if A.dtype == torch.bfloat16:
+        if use_fp8_w8a8:
+            compute_type = tl.bfloat16
+        elif A.dtype == torch.bfloat16:
             compute_type = tl.bfloat16
         elif A.dtype == torch.float16:
             compute_type = tl.float16
         else:
             compute_type = tl.float32
+
+        if use_fp8_w8a8 and block_shape is not None:
+            group_n, group_k = block_shape[0], block_shape[1]
+            config["BLOCK_SIZE_K"] = min(config["BLOCK_SIZE_K"], min(group_n, group_k))
+        else:
+            group_n, group_k = 0, 0
 
         launch_kwargs = {}
         if "num_warps" in config:
@@ -217,9 +284,12 @@ class MoeGroupedGemm(nn.Module):
             launch_kwargs["num_stages"] = config["num_stages"]
 
         sorted_ids_ptr = sorted_token_ids if sorted_token_ids is not None else A
+        a_scale_ptr = a_scale if a_scale is not None else A
+        b_scale_ptr = b_scale if b_scale is not None else B
 
         _fused_moe_kernel[grid](
             A, B, C,
+            a_scale_ptr, b_scale_ptr,
             topk_weights,
             sorted_ids_ptr,
             expert_ids,
@@ -229,9 +299,17 @@ class MoeGroupedGemm(nn.Module):
             A.stride(0), A.stride(1),
             B.stride(0), B.stride(2), B.stride(1),
             C.stride(0), C.stride(1),
+            a_scale.stride(0) if a_scale is not None and a_scale.ndim >= 2 else 0,
+            a_scale.stride(1) if a_scale is not None and a_scale.ndim >= 2 else 0,
+            b_scale.stride(0) if b_scale is not None and b_scale.ndim >= 2 else 0,
+            b_scale.stride(2) if b_scale is not None and b_scale.ndim == 3 else 0,
+            b_scale.stride(1) if b_scale is not None and b_scale.ndim >= 2 else 0,
+            group_n=group_n,
+            group_k=group_k,
             MUL_ROUTED_WEIGHT=mul_routed_weight,
             top_k=top_k,
             compute_type=compute_type,
+            use_fp8_w8a8=use_fp8_w8a8,
             BLOCK_SIZE_M=config["BLOCK_SIZE_M"],
             BLOCK_SIZE_N=config["BLOCK_SIZE_N"],
             BLOCK_SIZE_K=config["BLOCK_SIZE_K"],

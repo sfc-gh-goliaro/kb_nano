@@ -51,9 +51,9 @@ class Qwen3VLVisionConfig:
 class Qwen3VLConfig:
     hidden_size: int = 4096
     intermediate_size: int = 12288
-    num_hidden_layers: int = 36
-    num_attention_heads: int = 32
-    num_key_value_heads: int = 8
+    num_hidden_layers: int = 94
+    num_attention_heads: int = 64
+    num_key_value_heads: int = 4
     head_dim: int = 128
     vocab_size: int = 151936
     max_position_embeddings: int = 262144
