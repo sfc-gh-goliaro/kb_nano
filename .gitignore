@@ -222,3 +222,5 @@ tasks/candidate/prev-attempts/
 
 # MLflow tracking store
 mlruns/
+
+data/

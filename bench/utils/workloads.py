@@ -150,6 +150,101 @@ ALL_DIFFUSION_WORKLOADS = {
 }
 
 
+# ---------------------------------------------------------------------------
+# Segmentation workloads (promptable concept segmentation)
+# ---------------------------------------------------------------------------
+
+@dataclass(frozen=True)
+class SegmentationThroughputWorkload:
+    """Workload for segmentation throughput measurement."""
+    name: str
+    resolution: int
+    num_requests: int
+    dataset_name: str
+    dataset_subset: str = ""
+    modality: str = "image"  # "image" or "video"
+
+@dataclass(frozen=True)
+class SegmentationLatencyWorkload:
+    """Workload for segmentation latency measurement."""
+    name: str
+    resolution: int
+    batch_size: int
+    dataset_name: str
+    dataset_subset: str = ""
+    modality: str = "image"
+    num_warmup: int = 3
+    num_iters: int = 10
+
+SEGMENTATION_THROUGHPUT_WORKLOADS: list[SegmentationThroughputWorkload] = [
+    SegmentationThroughputWorkload(
+        "gold-metaclip-nps", resolution=1008, num_requests=500,
+        dataset_name="facebook/SACo-Gold", dataset_subset="metaclip_nps",
+    ),
+    SegmentationThroughputWorkload(
+        "gold-wiki-common", resolution=1008, num_requests=500,
+        dataset_name="facebook/SACo-Gold", dataset_subset="wiki_common",
+    ),
+    SegmentationThroughputWorkload(
+        "gold-crowded", resolution=1008, num_requests=500,
+        dataset_name="facebook/SACo-Gold", dataset_subset="crowded",
+    ),
+    SegmentationThroughputWorkload(
+        "veval-sav-val", resolution=1008, num_requests=100,
+        dataset_name="facebook/SACo-VEval", dataset_subset="sav_val",
+        modality="video",
+    ),
+    SegmentationThroughputWorkload(
+        "veval-yt1b-val", resolution=1008, num_requests=100,
+        dataset_name="facebook/SACo-VEval", dataset_subset="yt1b_val",
+        modality="video",
+    ),
+]
+
+SEGMENTATION_LATENCY_WORKLOADS: list[SegmentationLatencyWorkload] = [
+    SegmentationLatencyWorkload(
+        "single-image-1008", resolution=1008, batch_size=1,
+        dataset_name="facebook/SACo-Gold", dataset_subset="metaclip_nps",
+    ),
+    SegmentationLatencyWorkload(
+        "batch-4-image-1008", resolution=1008, batch_size=4,
+        dataset_name="facebook/SACo-Gold", dataset_subset="metaclip_nps",
+    ),
+    SegmentationLatencyWorkload(
+        "single-video-frame-1008", resolution=1008, batch_size=1,
+        dataset_name="facebook/SACo-VEval", dataset_subset="smartglasses_val",
+        modality="video",
+    ),
+]
+
+@dataclass(frozen=True)
+class SegmentationVideoWorkload:
+    """Workload for multi-frame video segmentation benchmark."""
+    name: str
+    resolution: int
+    num_clips: int
+    frames_per_clip: int
+    dataset_name: str
+    dataset_subset: str = ""
+    text_prompt: str = "objects"
+
+SEGMENTATION_VIDEO_WORKLOADS: list[SegmentationVideoWorkload] = [
+    SegmentationVideoWorkload(
+        "sav-val-video", resolution=1008, num_clips=10, frames_per_clip=16,
+        dataset_name="facebook/SACo-VEval", dataset_subset="sav_val",
+    ),
+    SegmentationVideoWorkload(
+        "smartglasses-val-video", resolution=1008, num_clips=10, frames_per_clip=16,
+        dataset_name="facebook/SACo-VEval", dataset_subset="smartglasses_val",
+    ),
+]
+
+ALL_SEGMENTATION_WORKLOADS = {
+    "throughput": SEGMENTATION_THROUGHPUT_WORKLOADS,
+    "latency": SEGMENTATION_LATENCY_WORKLOADS,
+    "video": SEGMENTATION_VIDEO_WORKLOADS,
+}
+
 
 # ---------------------------------------------------------------------------
 # TTS workloads (text-to-speech, e.g. CosyVoice3)
