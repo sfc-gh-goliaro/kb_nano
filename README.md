@@ -217,10 +217,21 @@ python tests/bench_diffusers.py --output-dir tests/results/B200/stable-diffusion
 
 ```bash
 # SAM3.1: throughput + latency + correctness benchmark vs facebook/sam3 reference
+# Uses 100 images (SACo-Gold + SACo-VEval), 20 latency iterations, all modalities
 python tests/test_sam.py
 
-# Custom number of images and latency iterations
-python tests/test_sam.py  # Uses SA-Co/Gold images, 5 latency iterations by default
+# Custom number of images
+python tests/test_sam.py --num-items 200
+
+# Image-only or video-only modality
+python tests/test_sam.py --modality image
+python tests/test_sam.py --modality video
+
+# kb-nano only (skip reference comparison)
+python tests/test_sam.py --skip-reference
+
+# Skip latency phase
+python tests/test_sam.py --skip-latency
 ```
 
 The diffusion benchmark measures:
@@ -635,29 +646,33 @@ Correctness is measured in eager mode with bf16 precision. Both engines use iden
 
 ### SAM3.1 (Segmentation)
 
-Run `tests/test_sam.py` to reproduce. Inputs are real images from SACo-VEval SmartGlasses, preprocessed to 1008x1008 with the same normalization pipeline as the reference. Reference engine: facebook/sam3 (`build_sam3_image_model`). Both engines load shared pretrained weights; correctness is checked on every image used for throughput.
+Run `tests/test_sam.py` to reproduce. 100 images from SACo-Gold and SACo-VEval SmartGlasses (image + video frames), preprocessed to 1008x1008. Reference engine: facebook/sam3 (`build_sam3_image_model`). Both engines load shared pretrained weights; correctness is checked on every image used for throughput. kb-nano implements the full reference architecture including boxRPB, presence_token, DotProductScoring, and geometry encoder.
 
 **Hardware: NVIDIA H200**
 
-Full pipeline (ViT backbone + FPN + text encoder + fusion encoder + decoder + segmentation head):
+Throughput (100 images, full pipeline):
 
-| Metric | Reference (fp32) | Ours (bf16) | Ratio |
-|--------|------------------:|------------:|------:|
-| Throughput (img/s) | 1.0x | 1.72x | **1.72x** |
-| Latency (median) | 1.0x | 0.44x | **2.27x** |
+| Scenario | Images | Reference (img/s) | Ours (img/s) | Speedup |
+|----------|-------:|-----------:|-----------:|--------:|
+| full-pipeline | 100 | 6.48 | 6.79 | **1.05x** |
 
-Correctness (full pipeline predictions, 50 images, per-element cosine similarity):
+Latency (median of 20 iterations):
 
-| Output | Avg CosSim | Min CosSim |
-|--------|----------:|----------:|
-| Bounding boxes (cxcywh) | 0.862 | — |
-| Segmentation masks | 0.721 | — |
-| Backbone features | 0.999 | 0.999 |
+| Scenario | BS | Resolution | Reference p50 | Ours p50 | Speedup |
+|----------|---:|-----------:|--------------:|---------:|--------:|
+| single-image-1008 | 1 | 1008 | 0.083s | 0.076s | **1.09x** |
+| batch-4-image-1008 | 4 | 1008 | 0.082s | 0.076s | **1.09x** |
+| single-video-frame-1008 | 1 | 1008 | 0.082s | 0.076s | **1.09x** |
 
-The remaining correctness gap is expected from three sources:
-- **Precision**: kb-nano runs in bfloat16 (required by Flash Attention 3) vs the reference's float32
-- **boxRPB**: the reference uses learned box-based relative position bias in the decoder, which kb-nano does not implement
-- **Attention implementation**: Flash Attention 3 vs standard SDPA produce slightly different numerics
+Correctness (100 images, per-element cosine similarity):
+
+| Output | Avg CosSim | Min CosSim | Result |
+|--------|----------:|-----------:|-------:|
+| Bounding Boxes | 0.980 | 0.959 | PASS |
+| Segmentation Masks | 0.949 | 0.871 | PASS |
+| Classification Logits | 0.975 | 0.924 | PASS |
+
+The remaining numerical divergence is expected from SDPA vs Flash Attention numerics and bf16/fp32 precision differences accumulated through the deep pipeline (backbone + encoder + decoder + pixel decoder + mask predictor). All metrics pass their thresholds (boxes/logits: mean >= 0.95, min >= 0.90; masks: mean >= 0.90, min >= 0.85).
 
 ### Key optimizations
 

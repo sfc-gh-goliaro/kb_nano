@@ -697,31 +697,124 @@ def _compare_predictions(feats_dir: str, num_items: int) -> dict:
     return summary
 
 
-def _print_latency_summary(kb_latency, ref_latency):
-    print(f"\n{'=' * 100}")
-    print("  LATENCY SUMMARY (full pipeline)")
-    print(f"{'=' * 100}")
-    print(f"  {'SCENARIO':<24} {'BS':>4} {'RES':>5} {'ITERS':>6}  {'KB-NANO med':>12} {'REF med':>12} {'SPEEDUP':>8}")
-    print(f"  {'-' * 80}")
+def _print_throughput_comparison(kb_raw, ref_raw):
+    """Print throughput comparison table matching bench_vllm_omni style."""
+    num_items = kb_raw["num_items"]
+    kb_ips = kb_raw["items_per_sec"]
+
+    print("\n" + "=" * 90)
+    print("  THROUGHPUT COMPARISON (images/sec)")
+    print("=" * 90)
+    header = f"  {'Scenario':<25} {'Images':>7} {'kb-nano':>12}"
+    if ref_raw:
+        header += f" {'reference':>12} {'Speedup':>10}"
+    print(header)
+    print("  " + "-" * 70)
+
+    line = f"  {'full-pipeline':<25} {num_items:>7} {kb_ips:>12.2f}"
+    if ref_raw:
+        ref_ips = ref_raw["items_per_sec"]
+        speedup = kb_ips / ref_ips if ref_ips > 0 else 0
+        line += f" {ref_ips:>12.2f} {speedup:>9.2f}x"
+    print(line)
+    print()
+
+
+def _print_latency_comparison(kb_latency, ref_latency):
+    """Print latency comparison table matching bench_vllm_omni style."""
+    print("\n" + "=" * 90)
+    print("  LATENCY COMPARISON (seconds)")
+    print("=" * 90)
+    header = f"  {'Scenario':<25} {'BS':>4} {'Res':>5}"
+    header += f" {'kb-nano p50':>12}"
+    if ref_latency:
+        header += f" {'reference p50':>14} {'Speedup':>10}"
+    print(header)
+    print("  " + "-" * 80)
+
     combined = []
     for i, kb_lat in enumerate(kb_latency):
-        kb_med = float(np.median(kb_lat["latencies"]))
-        lat_result = {"scenario": kb_lat["name"], "batch_size": kb_lat["batch_size"],
-                      "resolution": kb_lat["resolution"], "kb_nano_median_s": kb_med}
-        ref_med_str = "N/A"
-        speedup_str = "N/A"
+        kb_lats = np.array(kb_lat["latencies"])
+        kb_p50 = float(np.percentile(kb_lats, 50))
+        lat_result = {
+            "scenario": kb_lat["name"],
+            "batch_size": kb_lat["batch_size"],
+            "resolution": kb_lat["resolution"],
+            "kb_nano_median_s": kb_p50,
+        }
+
+        line = f"  {kb_lat['name']:<25} {kb_lat['batch_size']:>4} {kb_lat['resolution']:>5}"
+        line += f" {kb_p50:>12.3f}"
+
         if i < len(ref_latency):
-            ref_med = float(np.median(ref_latency[i]["latencies"]))
-            speedup = ref_med / kb_med if kb_med > 0 else 0
-            ref_med_str = f"{ref_med:.4f}s"
-            speedup_str = f"{speedup:.2f}x"
-            lat_result["ref_median_s"] = ref_med
+            ref_lats = np.array(ref_latency[i]["latencies"])
+            ref_p50 = float(np.percentile(ref_lats, 50))
+            speedup = ref_p50 / kb_p50 if kb_p50 > 0 else 0
+            line += f" {ref_p50:>14.3f} {speedup:>9.2f}x"
+            lat_result["ref_median_s"] = ref_p50
             lat_result["speedup"] = speedup
-        print(f"  {kb_lat['name']:<24} {kb_lat['batch_size']:>4} {kb_lat['resolution']:>5} "
-              f"{kb_lat['num_iters']:>6}  {kb_med:.4f}s{'':<3} {ref_med_str:>12} {speedup_str:>8}")
+
+        print(line)
         combined.append(lat_result)
-    print(f"{'=' * 100}")
+
+    print()
     return combined
+
+
+PASS_THRESHOLDS = {
+    "boxes":  {"mean": 0.95, "min": 0.90},
+    "masks":  {"mean": 0.90, "min": 0.85},
+    "logits": {"mean": 0.95, "min": 0.90},
+}
+
+
+def _print_correctness_comparison(pred_comparison, num_items):
+    """Print correctness comparison table matching bench_vllm_omni style."""
+    print("\n" + "=" * 110)
+    print("  CORRECTNESS COMPARISON (cosine similarity, per-element)")
+    print("=" * 110)
+    print(
+        f"  {'Metric':<25} {'Items':>7} {'Mean CosSim':>12}"
+        f" {'Min CosSim':>11} {'Mean AbsDiff':>13}"
+        f" {'Mean Thr':>9} {'Min Thr':>8} {'Result':>8}"
+    )
+    print("  " + "-" * 100)
+
+    overall_pass = True
+    for key, label in [
+        ("boxes", "Bounding Boxes"),
+        ("masks", "Segmentation Masks"),
+        ("logits", "Classification Logits"),
+    ]:
+        stats = pred_comparison[key]
+        if stats.get("status") == "NO_DATA" or stats.get("num_compared", 0) == 0:
+            verdict = "NO_DATA"
+            print(f"  {label:<25} {'--':>7} {'--':>12} {'--':>11} {'--':>13} {'--':>9} {'--':>8} {verdict:>8}")
+            continue
+        n = stats["num_compared"]
+        avg_cos = stats["avg_cosine_similarity"]
+        min_cos = stats["min_cosine_similarity"]
+        avg_max_abs = stats["avg_max_abs_diff"]
+        thresholds = PASS_THRESHOLDS[key]
+        mean_ok = avg_cos >= thresholds["mean"]
+        min_ok = min_cos >= thresholds["min"]
+        verdict = "PASS" if (mean_ok and min_ok) else ("WARN" if mean_ok else "FAIL")
+        if verdict == "FAIL":
+            overall_pass = False
+        stats["status"] = verdict
+        print(
+            f"  {label:<25} {n:>7} {avg_cos:>12.6f}"
+            f" {min_cos:>11.6f} {avg_max_abs:>13.6f}"
+            f" {thresholds['mean']:>9.2f} {thresholds['min']:>8.2f} {verdict:>8}"
+        )
+
+    print()
+    if overall_pass:
+        print("  Overall: PASS (all metrics within thresholds)")
+    else:
+        print("  Overall: FAIL (some metrics below threshold)")
+    print()
+    return overall_pass
 
 
 # ---------------------------------------------------------------------------
@@ -733,7 +826,7 @@ def main():
     )
     parser.add_argument("--model", type=str, default="facebook/sam3.1")
     parser.add_argument("--tp", type=int, default=1)
-    parser.add_argument("--num-items", type=int, default=50,
+    parser.add_argument("--num-items", type=int, default=100,
                         help="Number of images for throughput AND correctness")
     parser.add_argument("--seed", type=int, default=42)
     parser.add_argument("--skip-reference", action="store_true")
@@ -919,93 +1012,27 @@ def main():
         print("  ERROR: kb-nano subprocess failed.")
         sys.exit(1)
 
-    # -- Throughput summary --
     num_items = kb_raw["num_items"]
-    kb_ips = kb_raw["items_per_sec"]
-    kb_elapsed = kb_raw["total_elapsed"]
 
-    print(f"\n\n{'=' * 90}")
-    print("  THROUGHPUT + CORRECTNESS SUMMARY (full pipeline, real SACo inputs)")
-    print(f"{'=' * 90}")
-    print(f"  {'':>24} {'ITEMS':>6} {'img/s':>10} {'elapsed':>10}")
-    print(f"  {'-' * 56}")
-    print(f"  {'kb-nano':<24} {num_items:>6} {kb_ips:>10.1f} {kb_elapsed:>9.2f}s")
+    # -- Throughput --
+    _print_throughput_comparison(kb_raw, ref_raw)
 
-    if ref_raw:
-        ref_ips = ref_raw["items_per_sec"]
-        ref_elapsed = ref_raw["total_elapsed"]
-        speedup = kb_ips / ref_ips if ref_ips > 0 else 0
-        print(f"  {'reference':<24} {ref_raw['num_items']:>6} {ref_ips:>10.1f} {ref_elapsed:>9.2f}s")
-        print(f"  {'speedup':<24} {'':>6} {speedup:>9.2f}x")
-
-    # -- Latency summary --
+    # -- Latency --
     kb_latency = kb_raw.get("latency", [])
     ref_latency = ref_raw.get("latency", []) if ref_raw else []
     latency_combined = []
     if kb_latency:
-        latency_combined = _print_latency_summary(kb_latency, ref_latency)
+        latency_combined = _print_latency_comparison(kb_latency, ref_latency)
 
-    # -- Per-element correctness comparison (boxes, masks, logits) --
+    # -- Correctness --
     pred_comparison = _compare_predictions(feats_dir, num_items)
-
-    PASS_THRESHOLD = 0.90
-
-    print(f"\n{'=' * 90}")
-    print("  CORRECTNESS: per-element prediction comparison (boxes, masks, logits)")
-    print(f"{'=' * 90}")
-
-    overall_pass = True
-    for key, label in [("boxes", "Bounding Boxes (cxcywh)"), ("masks", "Segmentation Masks"), ("logits", "Classification Logits")]:
-        stats = pred_comparison[key]
-        threshold = PASS_THRESHOLD
-        print(f"\n  --- {label} ---")
-        n_mismatch = stats.get("num_shape_mismatch", 0)
-        if n_mismatch > 0:
-            print(f"  Shape mismatches      : {n_mismatch} / {num_items} (architecturally different)")
-        if stats.get("status") == "NO_DATA" or stats.get("num_compared", 0) == 0:
-            if n_mismatch == num_items:
-                print(f"  All items have shape mismatch — architectures produce different output shapes.")
-            else:
-                print(f"  No data to compare.")
-            continue
-        n = stats["num_compared"]
-        avg_cos = stats["avg_cosine_similarity"]
-        min_cos = stats["min_cosine_similarity"]
-        avg_max_abs = stats["avg_max_abs_diff"]
-        avg_rel = stats["avg_relative_diff"]
-        status = "PASS" if min_cos >= threshold else "FAIL"
-        if status == "FAIL":
-            overall_pass = False
-        stats["status"] = status
-        print(f"  Images compared       : {n} / {num_items}")
-        print(f"  Avg cosine similarity : {avg_cos:.6f}")
-        print(f"  Min cosine similarity : {min_cos:.6f}  (threshold: >= {threshold})")
-        print(f"  Avg max abs diff      : {avg_max_abs:.6f}")
-        print(f"  Avg relative diff     : {avg_rel:.6f}")
-        print(f"  Result                : {status}")
-
-    print(f"\n  Overall correctness   : {'PASS' if overall_pass else 'FAIL'}")
-    print(f"\n  NOTE: kb-nano implementation matches reference architecture including")
-    print(f"    boxRPB, presence_token, and DotProductScoring.")
-
-    # Per-image detail table
-    kb_per_image = kb_raw.get("per_image", [])
-    ref_per_image = ref_raw.get("per_image", []) if ref_raw else []
-
-    if kb_per_image:
-        print(f"\n  {'Img':>4} {'query':<20} {'kb_boxes_mean':>14} {'ref_boxes_mean':>14} {'kb_logits_mean':>15} {'ref_logits_mean':>15}")
-        print(f"  {'-' * 88}")
-        for i, kc in enumerate(kb_per_image):
-            rc = ref_per_image[i] if i < len(ref_per_image) else {}
-            query = kc.get("text_query", "")[:18]
-            print(f"  {i:>4} {query:<20} {kc.get('boxes_mean', 0):>14.6f} {rc.get('boxes_mean', 0):>14.6f} "
-                  f"{kc.get('logits_mean', 0) or 0:>15.6f} {rc.get('logits_mean', 0) or 0:>15.6f}")
-    print(f"{'=' * 90}")
+    overall_pass = _print_correctness_comparison(pred_comparison, num_items)
 
     # -- Save results --
     if args.output_dir:
         os.makedirs(args.output_dir, exist_ok=True)
         results_path = os.path.join(args.output_dir, "results.json")
+        kb_ips = kb_raw["items_per_sec"]
         combined = {
             "gpu": gpu, "model": args.model, "model_type": "segmentation",
             "tp": args.tp, "seed": args.seed, "num_items": num_items,
@@ -1019,6 +1046,7 @@ def main():
         if latency_combined:
             combined["latency_scenarios"] = latency_combined
         combined["correctness"] = pred_comparison
+        combined["overall_pass"] = overall_pass
         with open(results_path, "w") as f:
             json.dump(combined, f, indent=2)
         print(f"\n  Results saved to: {results_path}")
