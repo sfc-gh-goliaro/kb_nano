@@ -22,13 +22,13 @@ class WhisperDecoderLayer(nn.Module):
         self.self_attn = WhisperDecoderSelfAttention(
             config.d_model, config.decoder_attention_heads,
         )
-        self.self_attn_layer_norm = LayerNorm(config.d_model)
+        self.self_attn_layer_norm = LayerNorm(config.d_model, eps=1e-5)
         self.encoder_attn = WhisperCrossAttention(
             config.d_model, config.decoder_attention_heads,
         )
-        self.encoder_attn_layer_norm = LayerNorm(config.d_model)
+        self.encoder_attn_layer_norm = LayerNorm(config.d_model, eps=1e-5)
         self.mlp = WhisperMLP(config.d_model, config.decoder_ffn_dim)
-        self.final_layer_norm = LayerNorm(config.d_model)
+        self.final_layer_norm = LayerNorm(config.d_model, eps=1e-5)
 
     def forward(
         self,

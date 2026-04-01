@@ -103,7 +103,7 @@ class WhisperEncoder(nn.Module):
             WhisperEncoderLayer(config)
             for _ in range(config.encoder_layers)
         ])
-        self.layer_norm = LayerNorm(embed_dim)
+        self.layer_norm = LayerNorm(embed_dim, eps=1e-5)
 
         self.embed_positions = Embedding(config.max_source_positions, embed_dim)
 
@@ -143,7 +143,7 @@ class WhisperDecoder(nn.Module):
             WhisperDecoderLayer(config)
             for _ in range(config.decoder_layers)
         ])
-        self.layer_norm = LayerNorm(config.d_model)
+        self.layer_norm = LayerNorm(config.d_model, eps=1e-5)
 
     def forward(
         self,

@@ -8,7 +8,7 @@ import torch.nn as nn
 
 from ....infra.context import get_context
 from ....infra.tp import _tp_size, _tp_rank
-from ..L1.linear import Linear
+from ..L1.linear import Matmul
 from ..L1.embedding import Embedding
 from ..L1.allreduce import AllReduce
 
@@ -61,7 +61,7 @@ class ParallelLMHead(VocabParallelEmbedding):
                          params_dtype=params_dtype,
                          org_num_embeddings=org_num_embeddings,
                          padding_size=padding_size)
-        self.linear_op = Linear()
+        self.linear_op = Matmul()
 
     def project(self, x):
         """Linear projection only (no gather). Used inside CUDA graph."""

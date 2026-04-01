@@ -1,20 +1,29 @@
 # kb-nano
 
-A standalone, high-performance LLM inference engine supporting **Llama 3.1**, **Mixtral-8x7B**, **Qwen2/3-VL**, and **Whisper** with tensor parallelism. No vLLM dependency at runtime — just PyTorch, Triton, and Flash Attention.
+A standalone, high-performance inference engine supporting **LLMs** (Llama 3.1, Mixtral-8x7B, Qwen2-VL, Qwen3-VL), **diffusion models** (FLUX.1-dev, SDXL, HunyuanVideo-1.5), **segmentation models** (SAM3.1), audio models (Whisper), and **TTS models** (CosyVoice3) with tensor parallelism. No vLLM dependency at runtime — just PyTorch, Triton, and Flash Attention.
 
 ## Features
 
 - **Llama 3.1** (8B, 70B) with frequency-scaled RoPE
 - **Mixtral-8x7B** with fused Triton MoE grouped-GEMM kernels
+- **FLUX.1-dev** diffusion transformer (text-to-image) with Flash Attention
+- **SDXL** (Stable Diffusion XL) UNet-based text-to-image with dual CLIP text encoders
+- **HunyuanVideo-1.5** 3D video diffusion transformer (text-to-video) with dual-stream joint attention, M-RoPE, and Qwen2.5-VL text encoder
 - **Qwen2-VL / Qwen3-VL** vision-language models with image and video support
+- **SAM3.1** (facebook/sam3.1) image/video segmentation with ViT backbone, fusion encoder, detection decoder, and segmentation head
 - **Whisper** (large-v3) encoder-decoder speech-to-text with batched inference and paged cross-attention KV cache
+- **CosyVoice3** (Fun-CosyVoice3-0.5B-2512) text-to-speech with flow matching DiT + HiFi-GAN vocoder
 - **Tensor parallelism** (TP) with custom IPC-based all-reduce for multi-GPU inference
-- **Paged KV cache** with Triton store kernels
-- **CUDA graph capture** for decode steps
-- **Flash Attention** for both prefill and paged decode
-- Greedy and top-p sampling
+- **Paged KV cache** with Triton store kernels (LLM models)
+- **CUDA graph capture** for decode steps (LLM models)
+- **Flash Attention** for both prefill/paged decode (LLMs) and non-causal bidirectional attention (diffusion)
+- Greedy and top-p sampling (LLMs); flow-match Euler discrete scheduling (diffusion)
 - **Layered operator architecture** (L1 single-kernel ops through L4 full models) with clean separation of concerns
 - **Benchmarking suite** for evaluating custom CUDA/Triton/PyTorch kernels at 4 abstraction levels
+- **vllm-omni comparison benchmark** for FLUX diffusion and HunyuanVideo-1.5 video diffusion
+- **vllm-omni comparison benchmark** for CosyVoice3 TTS (SEED-TTS-Eval dataset)
+- **diffusers comparison benchmark** for SDXL diffusion
+- **facebook/sam3 comparison benchmark** for SAM3.1 segmentation
 
 ## Project Structure
 
@@ -25,6 +34,10 @@ A standalone, high-performance LLM inference engine supporting **Llama 3.1**, **
 │   │   │   ├── rms_norm.py     # Fused RMSNorm
 │   │   │   ├── silu_and_mul.py # SiLU activation with gate
 │   │   │   ├── rotary_emb.py   # RoPE (standard + Llama 3.1 frequency scaling)
+│   │   │   ├── diffusion_rope.py   # Interleaved RoPE for diffusion models
+│   │   │   ├── dense_attention.py   # Dense attention (non-paged, no KV cache; FA3>FA2>SDPA)
+│   │   │   ├── conv2d.py       # Conv2d op (wraps F.conv2d)
+│   │   │   ├── group_norm.py   # GroupNorm op (wraps F.group_norm)
 │   │   │   ├── store_kvcache.py# Triton KV cache store kernel
 │   │   │   ├── flash_attn_prefill.py
 │   │   │   ├── flash_attn_decode.py
@@ -34,6 +47,8 @@ A standalone, high-performance LLM inference engine supporting **Llama 3.1**, **
 │   │   │   ├── conv1d.py       # Conv1d wrapper (Whisper audio encoder)
 │   │   │   ├── gelu.py         # GELU activation (Whisper)
 │   │   │   ├── layer_norm.py   # LayerNorm wrapper (Whisper, vision)
+│   │   │   ├── sam3_position_encoding.py  # SAM3 2D sine position encoding
+│   │   │   ├── sam3_rope.py    # SAM3 RoPE (tiled real-valued)
 │   │   │   ├── moe_align.py    # MoE token-expert alignment
 │   │   │   ├── moe_sum.py      # Fused MoE sum kernel
 │   │   │   ├── moe_grouped_gemm.py # Triton fused MoE grouped GEMM
@@ -41,22 +56,47 @@ A standalone, high-performance LLM inference engine supporting **Llama 3.1**, **
 │   │   │       └── custom_allreduce_kernels.cu
 │   │   ├── L2/                 # Multi-op blocks
 │   │   │   ├── attention.py    # LlamaAttention (GQA + QKV proj + RoPE + output proj)
+│   │   │   ├── flux_attention.py   # FluxAttention (joint/cross attention for DiT)
+│   │   │   ├── flux_feedforward.py # FLUX FFN (GELU + TP-sharded linears)
+│   │   │   ├── hunyuan_video_attention.py # HunyuanVideo dual-stream joint attention
+│   │   │   ├── hunyuan_video_embeddings.py # 3D patch embed + timestep/text conditioning
+│   │   │   ├── hunyuan_video_token_refiner.py # Token refiner block (ByT5 conditioning)
 │   │   │   ├── llama_mlp.py    # Llama SwiGLU MLP
 │   │   │   ├── whisper_attention.py # Whisper encoder/decoder/cross-attention
 │   │   │   ├── whisper_mlp.py  # Whisper GELU MLP
 │   │   │   ├── mixtral_moe.py  # Mixtral MoE routing + experts
 │   │   │   ├── fused_experts.py# Fused expert execution
 │   │   │   ├── parallel_linear.py  # TP-aware linear layers
-│   │   │   └── parallel_embedding.py
-│   │   ├── L3/                 # Decoder/encoder layers
+│   │   │   ├── parallel_embedding.py
+│   │   │   ├── sdxl_attention.py   # SDXL multi-head attention (self/cross)
+│   │   │   ├── sdxl_resnet.py      # ResnetBlock2D for UNet
+│   │   │   ├── sdxl_feedforward.py # GEGLU FeedForward
+│   │   │   ├── sdxl_time_embedding.py # SDXL text_time conditioning
+│   │   │   ├── sdxl_downsample.py  # Stride-2 Conv2d downsampling
+│   │   │   ├── sdxl_upsample.py    # Nearest-neighbor + Conv2d upsampling
+│   │   │   ├── sam3_vit_attention.py  # SAM3 ViT windowed attention with RoPE
+│   │   │   └── sam3_mask_predictor.py # SAM3 mask prediction head (MLP)
+│   │   ├── L3/                 # Decoder layers
 │   │   │   ├── llama_decoder.py
 │   │   │   ├── mixtral_decoder.py
+│   │   │   ├── flux_transformer_block.py  # FLUX dual/single-stream DiT blocks
+│   │   │   ├── hunyuan_video_block.py     # HunyuanVideo dual/single-stream transformer blocks
+│   │   │   ├── sdxl_transformer_block.py # BasicTransformerBlock (self-attn, cross-attn, GEGLU FFN)
+│   │   │   ├── sdxl_spatial_transformer.py # Transformer2DModel (spatial flatten + N transformer blocks)
+│   │   │   ├── sdxl_unet_block.py  # UNet down/mid/up blocks with cross-attention
 │   │   │   ├── whisper_encoder_layer.py
-│   │   │   └── whisper_decoder_layer.py
+│   │   │   ├── whisper_decoder_layer.py
+│   │   │   ├── sam3_encoder_layer.py  # SAM3 fusion encoder layer
+│   │   │   └── sam3_decoder_layer.py  # SAM3 detection decoder layer
 │   │   └── L4/                 # Full models
 │   │       ├── llama.py        # LlamaForCausalLM
 │   │       ├── mixtral.py      # MixtralForCausalLM
-│   │       └── whisper.py      # WhisperForConditionalGeneration
+│   │       ├── flux.py         # FluxPipeline (text-to-image diffusion)
+│   │       ├── sdxl.py         # SDXLPipeline (UNet text-to-image diffusion)
+│   │       ├── hunyuan_video.py # HunyuanVideoPipeline (text-to-video diffusion)
+│   │       ├── qwen25_vl_encoder.py # Qwen2.5-VL text encoder (custom paged-attn impl)
+│   │       ├── whisper.py      # WhisperForConditionalGeneration
+│   │       └── sam3.py         # SAM3Model (ViT + FPN + fusion encoder + decoder + segmentation head)
 │   └── candidate/              # Generated replacement kernels (gitignored)
 │       ├── README.md           # Instructions
 │       └── L1/, L2/, ...       # Organized by level, named after the operator
@@ -76,6 +116,9 @@ A standalone, high-performance LLM inference engine supporting **Llama 3.1**, **
 └── tests/                      # Test suite
     ├── test_bench.py           # Bench module tests (discovery, replacement, kernel and E2E integration)
     ├── bench_vllm.py           # Multi-scenario throughput + latency + alignment benchmark vs vLLM
+    ├── bench_vllm_omni.py     # Diffusion (FLUX / HunyuanVideo) and TTS (CosyVoice3) benchmark: kb-nano vs vllm-omni
+    ├── bench_diffusers.py     # SDXL diffusion benchmark: kb-nano vs diffusers + torch.compile
+    ├── test_sam.py            # SAM3 segmentation benchmark: kb-nano vs facebook/sam3 reference
     ├── utils/                  # Post-processing and visualization
     │   └── parse_vllm_bench_results.py  # Generate tables and plots from bench_vllm.py results
     └── debug/                  # Profiling and debugging scripts
@@ -101,7 +144,7 @@ python -m kb_nano kernels --list
 python -m kb_nano eval --help
 ```
 
-### Benchmarking vs vLLM
+### Benchmarking vs vLLM (LLMs)
 
 ```bash
 # Throughput + latency + alignment benchmark vs vLLM
@@ -120,6 +163,81 @@ python tests/test_bench.py
 # Bench module unit tests only (no GPU required)
 python tests/test_bench.py --unit-only
 ```
+
+### Benchmarking vs vllm-omni (Diffusion)
+
+```bash
+# FLUX.1-dev: throughput + latency + correctness benchmark vs vllm-omni
+python tests/bench_vllm_omni.py --model black-forest-labs/FLUX.1-dev
+
+# HunyuanVideo-1.5: text-to-video benchmark vs vllm-omni
+python tests/bench_vllm_omni.py --model hunyuanvideo-community/HunyuanVideo-1.5-Diffusers-480p_t2v
+
+# kb-nano only (skip vllm-omni comparison)
+python tests/bench_vllm_omni.py --skip-vllm-omni
+
+# Override batch size for FLUX scenarios
+python tests/bench_vllm_omni.py --batch-size 2
+
+# Skip throughput or latency phases
+python tests/bench_vllm_omni.py --skip-throughput
+python tests/bench_vllm_omni.py --skip-latency
+
+# Save results to a specific directory
+python tests/bench_vllm_omni.py --output-dir tests/results/B200/FLUX.1-dev
+```
+
+### Benchmarking vs vllm-omni (TTS / CosyVoice3)
+
+```bash
+# CosyVoice3: throughput + latency benchmark vs vllm-omni (SEED-TTS-Eval dataset)
+python tests/bench_vllm_omni.py --model FunAudioLLM/Fun-CosyVoice3-0.5B-2512
+
+# kb-nano only
+python tests/bench_vllm_omni.py --model FunAudioLLM/Fun-CosyVoice3-0.5B-2512 --skip-vllm-omni
+```
+
+### Benchmarking vs diffusers (SDXL Diffusion)
+
+```bash
+# SDXL: throughput + latency + correctness benchmark vs diffusers + torch.compile
+python tests/bench_diffusers.py --model stabilityai/stable-diffusion-xl-base-1.0
+
+# Eager mode (for correctness measurement without compile divergence)
+python tests/bench_diffusers.py --enforce-eager
+
+# kb-nano only (skip diffusers comparison)
+python tests/bench_diffusers.py --skip-diffusers
+
+# Save results to a specific directory
+python tests/bench_diffusers.py --output-dir tests/results/B200/stable-diffusion-xl-base-1.0
+```
+
+### Benchmarking vs facebook/sam3 (Segmentation)
+
+```bash
+# SAM3.1: throughput + latency + correctness benchmark vs facebook/sam3 reference
+# Uses 100 images (SACo-Gold + SACo-VEval), 20 latency iterations, all modalities
+python tests/test_sam.py
+
+# Custom number of images
+python tests/test_sam.py --num-items 200
+
+# Image-only or video-only modality
+python tests/test_sam.py --modality image
+python tests/test_sam.py --modality video
+
+# kb-nano only (skip reference comparison)
+python tests/test_sam.py --skip-reference
+
+# Skip latency phase
+python tests/test_sam.py --skip-latency
+```
+
+The diffusion benchmark measures:
+- **Throughput**: images/sec (FLUX) or videos/sec (HunyuanVideo) at various resolutions
+- **Latency**: per-image/video latency with P50 percentile stats
+- **Correctness**: per-batch latent cosine similarity (FLUX) or per-prompt decoded-frame PSNR and cosine similarity (HunyuanVideo)
 
 ## Benchmarking
 
@@ -403,6 +521,158 @@ Latency (batch size 1, 128 output tokens, 5 iterations):
 | Qwen3-VL-8B-FP8 | 1 | single-video | 0.557s | 0.541s | **1.03x** |
 
 FP8 activation quantization uses a custom Triton kernel for single-launch per-token-group UE8M0 quantization. Pre-allocated shared prefill buffers eliminate dynamic allocation during FP8 prefill, and DeepGEMM is JIT-warmed for both decode and prefill batch sizes. The remaining throughput gap vs vLLM is primarily from vLLM's `torch.compile` + Inductor fusion passes (RMSNorm+quant, SiLU+quant).
+
+### FLUX.1-dev (Diffusion)
+
+Run `tests/bench_vllm_omni.py` to reproduce. Prompts drawn from the full nateraw/parti-prompts (P2) dataset (1632 prompts), shuffled deterministically. Reference engine: vllm-omni 0.16.0. Both engines run in eager mode.
+
+**Hardware: NVIDIA H200**
+
+Throughput (images/sec, eager mode, 28 steps):
+
+| Scenario | Batch | Images | vllm-omni | Ours | Ratio |
+|----------|------:|-------:|----------:|-----:|------:|
+| 1024x1024 | 4 | 40 | 0.22 | 0.22 | **1.01x** |
+| 512x512   | 8 | 80 | 0.72 | 0.72 | **1.00x** |
+
+Latency (single image, 28 steps, median of 5 runs, eager mode):
+
+| Resolution | vllm-omni | Ours | Ratio |
+|------------|----------:|-----:|------:|
+| 1024x1024  | 4.734s | 4.712s | **1.00x** |
+| 512x512    | 1.653s | 1.616s | **1.02x** |
+
+Correctness (eager mode, decoded image space, per-batch cosine similarity):
+
+| Scenario | Mean CosSim | Min CosSim |
+|----------|------------:|-----------:|
+| 1024x1024, 28 steps | 0.995 | 0.990 |
+| 512x512, 28 steps   | 0.994 | 0.986 |
+
+Both engines run in eager mode to ensure numerically comparable outputs. The remaining cosine divergence (~0.5%) is from the CLIP text encoder: kb-nano uses a custom implementation while vllm-omni uses HuggingFace's `CLIPTextModel`, which produces slightly different pooled embeddings (`cos≈0.9999` per token) that compound over 28 denoising steps. On H200 (Hopper), both engines use `flash_attn_func` for attention.
+
+### HunyuanVideo-1.5 (Video Diffusion)
+
+Run `tests/bench_vllm_omni.py --model hunyuanvideo-community/HunyuanVideo-1.5-Diffusers-480p_t2v` to reproduce. Prompts drawn from the Movie Gen Video Bench dataset (1003 prompts), shuffled deterministically. Reference engine: vllm-omni (Omni sync API). Both engines run in eager mode with 30 inference steps, guidance_scale=6.0.
+
+**Hardware: NVIDIA H200**
+
+Throughput (videos/sec, eager mode, 30 steps):
+
+| Scenario | Resolution | Frames | Videos | vllm-omni | Ours | Ratio |
+|----------|:----------:|-------:|-------:|----------:|-----:|------:|
+| 480p-short  | 480x832 | 25 | 16 | 0.0466 | 0.0454 | 0.97x |
+| 480p-medium | 480x832 | 49 |  8 | 0.0221 | 0.0215 | 0.97x |
+
+Latency (single video, 30 steps, median of 5 runs, eager mode):
+
+| Scenario | Resolution | Frames | vllm-omni | Ours | Ratio |
+|----------|:----------:|-------:|----------:|-----:|------:|
+| single-480p-short  | 480x832 | 25 | 21.504s | 20.462s | **1.05x** |
+| single-480p-medium | 480x832 | 49 | 45.165s | 43.262s | **1.04x** |
+
+Correctness (eager mode, decoded video frames, per-prompt cosine similarity):
+
+| Scenario | Prompts | Mean CosSim | Min CosSim | Mean PSNR | Result |
+|----------|--------:|------------:|-----------:|----------:|-------:|
+| 480p-short  | 16 | 0.925 | 0.833 | 12.96 dB | WARN |
+| 480p-medium |  8 | 0.923 | 0.862 | 12.92 dB | WARN |
+
+Correctness is measured in decoded pixel space (both engines produce PIL video frames which are compared as uint8 numpy arrays). The pixel-level cosine similarity of ~0.92 is expected for two independent bf16 implementations: numerical differences in the 30-step denoising loop are amplified by the VAE decoder. For reference, latent-space comparison between kb-nano and HF diffusers yields CosSim=0.986, confirming the transformer backbone is correctly implemented. The pixel-space divergence is dominated by VAE decode amplification and different text encoder implementations (kb-nano uses a custom Qwen2.5-VL paged-attention encoder vs vllm-omni's HuggingFace-based encoder).
+
+### CosyVoice3 (TTS)
+
+Run `tests/bench_vllm_omni.py --model FunAudioLLM/Fun-CosyVoice3-0.5B-2512` to reproduce. Dataset: SEED-TTS-Eval (110 utterances across short/medium/long scenarios). Both engines run in float32 with greedy decoding. Reference engine: vllm-omni 0.16.0.
+
+**Hardware: NVIDIA H200**
+
+Throughput (utterances/sec):
+
+| Scenario | Utts | vllm-omni (utt/s) | vllm-omni RTF | Ours (utt/s) | Ours RTF | Speedup |
+|----------|-----:|-----------:|----------:|-----------:|----------:|--------:|
+| tts-short   |  27 | 0.46 | 0.436 | 0.99 | 0.201 | **2.15x** |
+| tts-medium  | 100 | 0.39 | 0.391 | 0.87 | 0.165 | **2.22x** |
+| tts-long    |  50 | 0.38 | 0.389 | 0.78 | 0.164 | **2.03x** |
+
+Latency (single utterance, median of 5 runs):
+
+| Scenario | vllm-omni | Ours | Speedup |
+|----------|----------:|-----:|--------:|
+| single-utterance | 2.072s | 1.138s | **1.82x** |
+
+Correctness (mel spectrogram cosine similarity, kb-nano vs vllm-omni):
+
+| Scenario | Utts | Median | Mean | P10 | Min |
+|----------|-----:|-------:|-----:|----:|----:|
+| tts-short   |  27 | 0.892 | 0.847 | 0.692 | 0.171 |
+| tts-medium  | 100 | 0.904 | 0.874 | 0.754 | 0.513 |
+| tts-long    |  50 | 0.870 | 0.860 | 0.766 | 0.467 |
+| **Overall** | 177 | **0.894** | 0.866 | — | — |
+
+Code2Wav equivalence (same speech tokens, same CFM seed): mel cosine similarity **0.999**.
+
+The Code2Wav stage (flow-matching DiT + HiFi-GAN vocoder) produces near-identical output when given the same tokens. The remaining E2E divergence comes from the Talker LLM stage, where kb-nano uses SDPA while vllm-omni uses PagedAttention with TritonAttention kernels — these attention backends accumulate small numerical differences that can cause token sequences to diverge, especially on longer utterances.
+
+### SDXL (Diffusion)
+
+Run `tests/bench_diffusers.py` to reproduce. Prompts drawn from the full nateraw/parti-prompts (P2) dataset (1632 prompts), shuffled deterministically. Reference engine: diffusers 0.31 with `torch.compile(mode="max-autotune")`, eager mode for correctness.
+
+**Hardware: NVIDIA B200**
+
+Throughput (images/sec, eager mode):
+
+| Scenario | Batch | Images | diffusers | Ours | Ratio |
+|----------|------:|-------:|----------:|-----:|------:|
+| 1024x1024, 50 steps | 1 | 5 | 0.51 | 0.57 | **1.12x** |
+| 512x512, 50 steps   | 4 | 20 | 2.03 | 2.62 | **1.29x** |
+| 1024x1024, 28 steps | 1 | 5 | 0.92 | 1.01 | **1.10x** |
+
+Latency (single image, 50 steps, median of 5 runs, eager mode):
+
+| Resolution | diffusers | Ours | Ratio |
+|------------|----------:|-----:|------:|
+| 1024x1024  | 1.914s | 1.753s | **1.09x** |
+| 512x512    | 1.906s | 1.370s | **1.39x** |
+
+Correctness (eager mode, latent space, per-batch cosine similarity):
+
+| Scenario | Mean CosSim | Min CosSim |
+|----------|------------:|-----------:|
+| 1024x1024, 50 steps | 0.990 | 0.967 |
+| 1024x1024, 28 steps | 0.987 | 0.977 |
+| 512x512, 50 steps   | 0.969 | 0.952 |
+
+Correctness is measured in eager mode with bf16 precision. Both engines use identical model weights (diffusers checkpoint) and the same EulerDiscreteScheduler. The remaining cosine divergence is expected from bf16 accumulation differences across 28-50 denoising steps with CFG guidance_scale=5.0.
+
+### SAM3.1 (Segmentation)
+
+Run `tests/test_sam.py` to reproduce. 100 images from SACo-Gold and SACo-VEval SmartGlasses (image + video frames), preprocessed to 1008x1008. Reference engine: facebook/sam3 (`build_sam3_image_model`). Both engines load shared pretrained weights; correctness is checked on every image used for throughput. kb-nano implements the full reference architecture including boxRPB, presence_token, DotProductScoring, and geometry encoder.
+
+**Hardware: NVIDIA H200**
+
+Throughput (100 images, full pipeline):
+
+| Scenario | Images | Reference (img/s) | Ours (img/s) | Speedup |
+|----------|-------:|-----------:|-----------:|--------:|
+| full-pipeline | 100 | 6.48 | 6.79 | **1.05x** |
+
+Latency (median of 20 iterations):
+
+| Scenario | BS | Resolution | Reference p50 | Ours p50 | Speedup |
+|----------|---:|-----------:|--------------:|---------:|--------:|
+| single-image-1008 | 1 | 1008 | 0.083s | 0.076s | **1.09x** |
+| batch-4-image-1008 | 4 | 1008 | 0.082s | 0.076s | **1.09x** |
+| single-video-frame-1008 | 1 | 1008 | 0.082s | 0.076s | **1.09x** |
+
+Correctness (100 images, per-element cosine similarity):
+
+| Output | Avg CosSim | Min CosSim | Result |
+|--------|----------:|-----------:|-------:|
+| Bounding Boxes | 0.980 | 0.959 | PASS |
+| Segmentation Masks | 0.949 | 0.871 | PASS |
+| Classification Logits | 0.975 | 0.924 | PASS |
+
+The remaining numerical divergence is expected from SDPA vs Flash Attention numerics and bf16/fp32 precision differences accumulated through the deep pipeline (backbone + encoder + decoder + pixel decoder + mask predictor). All metrics pass their thresholds (boxes/logits: mean >= 0.95, min >= 0.90; masks: mean >= 0.90, min >= 0.85).
 
 ### Key optimizations
 
