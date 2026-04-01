@@ -217,9 +217,32 @@ SEGMENTATION_LATENCY_WORKLOADS: list[SegmentationLatencyWorkload] = [
     ),
 ]
 
+@dataclass(frozen=True)
+class SegmentationVideoWorkload:
+    """Workload for multi-frame video segmentation benchmark."""
+    name: str
+    resolution: int
+    num_clips: int
+    frames_per_clip: int
+    dataset_name: str
+    dataset_subset: str = ""
+    text_prompt: str = "objects"
+
+SEGMENTATION_VIDEO_WORKLOADS: list[SegmentationVideoWorkload] = [
+    SegmentationVideoWorkload(
+        "sav-val-video", resolution=1008, num_clips=10, frames_per_clip=16,
+        dataset_name="facebook/SACo-VEval", dataset_subset="sav_val",
+    ),
+    SegmentationVideoWorkload(
+        "smartglasses-val-video", resolution=1008, num_clips=10, frames_per_clip=16,
+        dataset_name="facebook/SACo-VEval", dataset_subset="smartglasses_val",
+    ),
+]
+
 ALL_SEGMENTATION_WORKLOADS = {
     "throughput": SEGMENTATION_THROUGHPUT_WORKLOADS,
     "latency": SEGMENTATION_LATENCY_WORKLOADS,
+    "video": SEGMENTATION_VIDEO_WORKLOADS,
 }
 
 

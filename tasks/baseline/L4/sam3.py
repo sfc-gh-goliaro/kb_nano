@@ -943,6 +943,72 @@ def load_sam3_checkpoint(model: "Sam3Model", checkpoint_path: str) -> Tuple[list
     return missing, unexpected
 
 
+def load_sam3_tracker_checkpoint(
+    tracker: "Sam3TrackerPredictor",
+    checkpoint_path: str,
+) -> Tuple[list, list]:
+    """Load tracker weights from a full SAM3 video model checkpoint.
+
+    Handles remapping from reference tracker.xxx keys to kb-nano Sam3TrackerPredictor.
+
+    The reference checkpoint stores tracker weights under:
+    - tracker.sam_prompt_encoder.xxx -> sam_prompt_encoder.xxx
+    - tracker.sam_mask_decoder.xxx -> sam_mask_decoder.xxx
+    - tracker.maskmem_backbone.xxx -> maskmem_backbone.xxx
+    - tracker.transformer.encoder.xxx -> memory_attention.xxx
+    - tracker.obj_ptr_proj.xxx -> obj_ptr_proj.xxx
+    - tracker.maskmem_tpos_enc -> maskmem_tpos_enc
+    etc.
+
+    Reference: sam3/model_builder.py build_sam3_video_model checkpoint loading
+    """
+    import re
+
+    ckpt = torch.load(checkpoint_path, map_location="cpu", weights_only=True)
+    if "model" in ckpt and isinstance(ckpt["model"], dict):
+        ckpt = ckpt["model"]
+
+    tracker_keys = {
+        k.replace("tracker.", ""): v
+        for k, v in ckpt.items()
+        if k.startswith("tracker.")
+    }
+
+    remapped = {}
+
+    for ref_key, val in tracker_keys.items():
+        new_key = ref_key
+
+        # --- Memory attention: transformer.encoder.xxx -> memory_attention.xxx ---
+        if new_key.startswith("transformer.encoder."):
+            rest = new_key[len("transformer.encoder."):]
+            new_key = f"memory_attention.{rest}"
+
+        # --- SAM mask decoder: split fused attention weights ---
+        # TwoWayTransformer layers use Sam3Attention with q/k/v/out_proj
+        # Reference may store them as q_proj/k_proj/v_proj/out_proj already
+        # (since sam3/sam/transformer.py Attention uses separate projections)
+        # So no splitting needed.
+
+        # --- Memory attention layers: RoPEAttention uses q/k/v/out_proj ---
+        # Reference sam3/sam/transformer.py RoPEAttention also uses separate
+        # projections, so naming should match directly.
+
+        # --- freqs_cis buffers in RoPEAttention ---
+        # These are computed from params, not stored, so skip if present
+        if "freqs_cis" in new_key:
+            continue
+
+        # --- Skip backbone weights (loaded separately) ---
+        if new_key.startswith("backbone."):
+            continue
+
+        remapped[new_key] = val
+
+    missing, unexpected = tracker.load_state_dict(remapped, strict=False)
+    return missing, unexpected
+
+
 class Sam3Model(nn.Module):
     """Full SAM3 image segmentation model.
 

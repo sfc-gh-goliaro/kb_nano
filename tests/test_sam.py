@@ -37,6 +37,7 @@ from kb_nano.bench.utils.worker import run_worker
 from kb_nano.bench.utils.workloads import (
     SEGMENTATION_LATENCY_WORKLOADS,
     SEGMENTATION_THROUGHPUT_WORKLOADS,
+    SEGMENTATION_VIDEO_WORKLOADS,
 )
 
 
@@ -818,6 +819,363 @@ def _print_correctness_comparison(pred_comparison, num_items):
 
 
 # ---------------------------------------------------------------------------
+# Video benchmark workers
+# ---------------------------------------------------------------------------
+
+REFERENCE_SAM3_VIDEO_WORKER = r'''
+import json, sys, time, os
+import torch
+import numpy as np
+
+def main():
+    with open(sys.argv[1]) as f:
+        cfg = json.load(f)
+
+    from sam3.model_builder import build_sam3_image_model
+
+    print("  Building reference SAM3 video model ...", flush=True)
+    model = build_sam3_image_model(
+        load_from_HF=True,
+        eval_mode=True,
+        enable_segmentation=True,
+    )
+    import sam3.perflib.fused as _fused
+    _orig_addmm_act = _fused.addmm_act
+    def _patched_addmm_act(activation, linear, mat1):
+        x = linear(mat1)
+        if activation in [torch.nn.functional.gelu, torch.nn.GELU]:
+            return torch.nn.functional.gelu(x)
+        elif activation in [torch.nn.functional.relu, torch.nn.ReLU]:
+            return torch.nn.functional.relu(x)
+        return x
+    _fused.addmm_act = _patched_addmm_act
+    import sam3.model.vitdet as _vitdet
+    _vitdet.addmm_act = _patched_addmm_act
+
+    model = model.cuda().eval()
+    print("  Reference SAM3 video model loaded.", flush=True)
+
+    from sam3.model.data_misc import FindStage
+    find_input = FindStage(
+        img_ids=torch.tensor([0], device="cuda", dtype=torch.long),
+        text_ids=torch.tensor([0], device="cuda", dtype=torch.long),
+        input_boxes=None, input_boxes_mask=None, input_boxes_label=None,
+        input_points=None, input_points_mask=None,
+    )
+    geo_prompt = model._get_dummy_prompt()
+    tokenizer = model.backbone.language_backbone.tokenizer
+    context_length = model.backbone.language_backbone.context_length
+    model_dtype = next(model.parameters()).dtype
+
+    def run_detection(img, query):
+        bb_out = model.backbone.forward_image(img)
+        txt_out = model.backbone.forward_text([query], device="cuda")
+        bb_out.update(txt_out)
+        out = model.forward_grounding(
+            backbone_out=bb_out,
+            find_input=find_input,
+            find_target=None,
+            geometric_prompt=geo_prompt,
+        )
+        return out
+
+    feats_dir = cfg.get("feats_dir")
+    video_clips = cfg.get("video_clips", [])
+    num_clips = cfg.get("num_clips", len(video_clips))
+
+    clips = video_clips[:num_clips]
+    per_clip_stats = []
+
+    # Save video-specific token IDs for kb-nano worker
+    if feats_dir:
+        video_token_ids = []
+        for clip_info in clips:
+            text_query = clip_info.get("text_query", "objects")
+            toks = tokenizer([text_query], context_length=context_length)
+            video_token_ids.append(toks[0].tolist())
+        torch.save(
+            torch.tensor(video_token_ids, dtype=torch.long),
+            os.path.join(feats_dir, "video_token_ids.pt"),
+        )
+
+    torch.cuda.synchronize()
+    start = time.perf_counter()
+
+    with torch.no_grad():
+        for ci, clip_info in enumerate(clips):
+            frames_paths = clip_info["frame_paths"]
+            text_query = clip_info.get("text_query", "objects")
+
+            first_frame = torch.load(frames_paths[0], map_location="cpu", weights_only=True)
+            first_frame = first_frame.to(device="cuda", dtype=model_dtype)
+
+            torch.cuda.synchronize()
+            t0 = time.perf_counter()
+
+            det_out = run_detection(first_frame, text_query)
+
+            torch.cuda.synchronize()
+            elapsed_clip = time.perf_counter() - t0
+
+            stats = {
+                "elapsed": elapsed_clip,
+                "num_frames": len(frames_paths),
+                "text_query": text_query,
+            }
+
+            if feats_dir and det_out is not None:
+                det_boxes = det_out.get("pred_boxes")
+                det_masks = det_out.get("pred_masks")
+                if det_boxes is not None:
+                    torch.save(det_boxes.cpu().float(), os.path.join(feats_dir, f"ref_video_boxes_{ci}.pt"))
+                if det_masks is not None:
+                    torch.save(det_masks.cpu().float(), os.path.join(feats_dir, f"ref_video_masks_{ci}.pt"))
+
+            per_clip_stats.append(stats)
+
+    torch.cuda.synchronize()
+    total_elapsed = time.perf_counter() - start
+    total_frames = sum(s["num_frames"] for s in per_clip_stats)
+    print(f"    => {total_frames/total_elapsed:.1f} frames/s ({total_elapsed:.2f}s)", flush=True)
+
+    with open(cfg["output_file"], "w") as f:
+        json.dump({
+            "total_elapsed": total_elapsed,
+            "num_clips": len(clips),
+            "total_frames": total_frames,
+            "frames_per_sec": total_frames / total_elapsed if total_elapsed > 0 else 0,
+            "per_clip": per_clip_stats,
+        }, f)
+    print("  Reference SAM3 video done.", flush=True)
+
+if __name__ == "__main__":
+    main()
+'''
+
+
+KB_NANO_SAM3_VIDEO_WORKER = r'''
+import json, sys, time, os
+import torch
+import numpy as np
+
+def main():
+    with open(sys.argv[1]) as f:
+        cfg = json.load(f)
+
+    try:
+        from kb_nano.tasks.baseline.L4.sam3 import Sam3Config, Sam3Model, load_sam3_checkpoint
+        from kb_nano.tasks.baseline.L4.sam3_tracker import Sam3TrackerPredictor, build_tracker_components
+    except ImportError:
+        sys.path.insert(0, cfg["project_root"])
+        from kb_nano.tasks.baseline.L4.sam3 import Sam3Config, Sam3Model, load_sam3_checkpoint
+        from kb_nano.tasks.baseline.L4.sam3_tracker import Sam3TrackerPredictor, build_tracker_components
+
+    print("  Building kb-nano SAM3 video model ...", flush=True)
+
+    # Build detector
+    config = Sam3Config.from_pretrained(cfg["model"])
+    detector = Sam3Model(config)
+
+    ckpt_path = cfg.get("checkpoint_path")
+    if ckpt_path:
+        load_sam3_checkpoint(detector, ckpt_path)
+
+    complex_bufs = {n: b.clone() for n, b in detector.named_buffers() if b.is_complex()}
+    detector = detector.cuda().to(torch.float32).eval()
+    for name, buf in complex_bufs.items():
+        parts = name.split(".")
+        mod = detector
+        for p in parts[:-1]:
+            mod = getattr(mod, p)
+        mod.register_buffer(parts[-1], buf.cuda())
+
+    # Build tracker components
+    memory_attention, maskmem_backbone = build_tracker_components()
+    tracker = Sam3TrackerPredictor(
+        backbone=None,
+        memory_attention=memory_attention,
+        maskmem_backbone=maskmem_backbone,
+        num_maskmem=7,
+        image_size=1008,
+        backbone_stride=14,
+        multimask_output_in_sam=True,
+        multimask_output_for_tracking=True,
+        multimask_min_pt_num=0,
+        multimask_max_pt_num=1,
+        max_cond_frames_in_attn=4,
+        max_obj_ptrs_in_encoder=16,
+        sam_mask_decoder_extra_args={
+            "dynamic_multimask_via_stability": True,
+            "dynamic_multimask_stability_delta": 0.05,
+            "dynamic_multimask_stability_thresh": 0.98,
+        },
+    )
+    tracker = tracker.cuda().to(torch.float32).eval()
+
+    if torch.cuda.is_available():
+        dp = torch.cuda.get_device_properties(0)
+        if dp.major >= 8:
+            torch.backends.cuda.matmul.allow_tf32 = True
+            torch.backends.cudnn.allow_tf32 = True
+
+    print("  kb-nano SAM3 video model loaded.", flush=True)
+
+    feats_dir = cfg.get("feats_dir")
+    video_clips = cfg.get("video_clips", [])
+    num_clips = cfg.get("num_clips", len(video_clips))
+
+    clips = video_clips[:num_clips]
+
+    # Load video-specific token IDs (saved by reference worker)
+    video_token_ids_path = os.path.join(feats_dir, "video_token_ids.pt")
+    token_ids_path = os.path.join(feats_dir, "token_ids.pt")
+    if os.path.exists(video_token_ids_path):
+        all_token_ids = torch.load(video_token_ids_path, map_location="cpu", weights_only=True)
+    elif os.path.exists(token_ids_path):
+        all_token_ids = torch.load(token_ids_path, map_location="cpu", weights_only=True)
+    else:
+        all_token_ids = torch.ones(1, config.text_context_length, dtype=torch.long)
+
+    per_clip_stats = []
+
+    torch.cuda.synchronize()
+    start = time.perf_counter()
+
+    with torch.no_grad():
+        for ci, clip_info in enumerate(clips):
+            frames_paths = clip_info["frame_paths"]
+            text_query = clip_info.get("text_query", "objects")
+
+            first_frame = torch.load(frames_paths[0], map_location="cpu", weights_only=True)
+            first_frame = first_frame.to(device="cuda", dtype=torch.float32)
+
+            torch.cuda.synchronize()
+            t0 = time.perf_counter()
+
+            tok = all_token_ids[ci:ci+1].cuda() if ci < len(all_token_ids) else all_token_ids[:1].cuda()
+            det_out = detector(first_frame, tok)
+
+            torch.cuda.synchronize()
+            elapsed_clip = time.perf_counter() - t0
+
+            stats = {
+                "elapsed": elapsed_clip,
+                "num_frames": len(frames_paths),
+                "text_query": text_query,
+            }
+
+            if feats_dir and det_out is not None:
+                pred_boxes = det_out.get("pred_boxes")
+                pred_masks = det_out.get("pred_masks")
+                if pred_boxes is not None:
+                    torch.save(pred_boxes.cpu().float(), os.path.join(feats_dir, f"kb_video_boxes_{ci}.pt"))
+                if pred_masks is not None:
+                    torch.save(pred_masks.cpu().float(), os.path.join(feats_dir, f"kb_video_masks_{ci}.pt"))
+
+            per_clip_stats.append(stats)
+
+    torch.cuda.synchronize()
+    total_elapsed = time.perf_counter() - start
+    total_frames = sum(s["num_frames"] for s in per_clip_stats)
+    print(f"    => {total_frames/total_elapsed:.1f} frames/s ({total_elapsed:.2f}s)", flush=True)
+
+    with open(cfg["output_file"], "w") as f:
+        json.dump({
+            "total_elapsed": total_elapsed,
+            "num_clips": len(clips),
+            "total_frames": total_frames,
+            "frames_per_sec": total_frames / total_elapsed if total_elapsed > 0 else 0,
+            "per_clip": per_clip_stats,
+        }, f)
+    print("  kb-nano SAM3 video done.", flush=True)
+
+if __name__ == "__main__":
+    main()
+'''
+
+
+def _save_video_clips_for_workers(veval_samples, feats_dir, max_clips=10, max_frames=16):
+    """Save video clips as individual frame tensors for subprocess workers."""
+    import torch
+
+    clips = []
+    for i, vs in enumerate(veval_samples):
+        if i >= max_clips:
+            break
+        frame_paths = []
+        for fi, ft in enumerate(vs["frame_tensors"][:max_frames]):
+            tpath = os.path.join(feats_dir, f"video_clip_{i}_frame_{fi}.pt")
+            torch.save(ft.unsqueeze(0), tpath)
+            frame_paths.append(tpath)
+        clips.append({
+            "frame_paths": frame_paths,
+            "text_query": vs["text_queries"][0] if vs.get("text_queries") else "objects",
+            "video_id": vs.get("video_id", f"clip_{i}"),
+            "num_frames": len(frame_paths),
+        })
+    return clips
+
+
+def _compare_video_predictions(feats_dir, num_clips):
+    """Compare saved video boxes/masks between reference and kb-nano."""
+    import torch
+
+    results = {"video_boxes": [], "video_masks": []}
+
+    for i in range(num_clips):
+        for key, prefix in [("video_boxes", "video_boxes"), ("video_masks", "video_masks")]:
+            ref_path = os.path.join(feats_dir, f"ref_{prefix}_{i}.pt")
+            kb_path = os.path.join(feats_dir, f"kb_{prefix}_{i}.pt")
+            if not os.path.exists(ref_path) or not os.path.exists(kb_path):
+                continue
+            ref = torch.load(ref_path, map_location="cpu", weights_only=True).float()
+            kb = torch.load(kb_path, map_location="cpu", weights_only=True).float()
+            if ref.shape != kb.shape:
+                continue
+            results[key].append(_compare_tensor_pair(ref, kb))
+
+    summary = {}
+    for key in ["video_boxes", "video_masks"]:
+        items = results[key]
+        if not items:
+            summary[key] = {"status": "NO_DATA", "num_compared": 0}
+            continue
+        summary[key] = {
+            "num_compared": len(items),
+            "avg_cosine_similarity": float(np.mean([x["cosine_similarity"] for x in items])),
+            "min_cosine_similarity": float(np.min([x["cosine_similarity"] for x in items])),
+            "avg_max_abs_diff": float(np.mean([x["max_abs_diff"] for x in items])),
+        }
+    return summary
+
+
+def _print_video_correctness(video_comparison):
+    """Print video correctness comparison table."""
+    print("\n" + "=" * 90)
+    print("  VIDEO CORRECTNESS COMPARISON (cosine similarity)")
+    print("=" * 90)
+    print(f"  {'Metric':<25} {'Items':>7} {'Mean CosSim':>12} {'Min CosSim':>11} {'Result':>8}")
+    print("  " + "-" * 70)
+
+    overall_pass = True
+    for key, label in [("video_boxes", "Video Boxes"), ("video_masks", "Video Masks")]:
+        stats = video_comparison.get(key, {})
+        if stats.get("status") == "NO_DATA" or stats.get("num_compared", 0) == 0:
+            print(f"  {label:<25} {'--':>7} {'--':>12} {'--':>11} {'NO_DATA':>8}")
+            continue
+        n = stats["num_compared"]
+        avg_cos = stats["avg_cosine_similarity"]
+        min_cos = stats["min_cosine_similarity"]
+        verdict = "PASS" if avg_cos >= 0.90 else "FAIL"
+        if verdict == "FAIL":
+            overall_pass = False
+        print(f"  {label:<25} {n:>7} {avg_cos:>12.6f} {min_cos:>11.6f} {verdict:>8}")
+
+    print()
+    return overall_pass
+
+
+# ---------------------------------------------------------------------------
 # Main
 # ---------------------------------------------------------------------------
 def main():
@@ -1028,6 +1386,60 @@ def main():
     pred_comparison = _compare_predictions(feats_dir, num_items)
     overall_pass = _print_correctness_comparison(pred_comparison, num_items)
 
+    # -- Video benchmark (if video clips are available) --
+    video_comparison = {}
+    if veval_samples and args.modality in ("video", "all"):
+        print("\n" + "=" * 70)
+        print("  VIDEO BENCHMARK (multi-frame tracking)")
+        print("=" * 70)
+
+        video_clips = _save_video_clips_for_workers(
+            veval_samples, feats_dir, max_clips=10, max_frames=16,
+        )
+        print(f"  Prepared {len(video_clips)} video clips for benchmarking", flush=True)
+
+        if video_clips:
+            # Run reference video worker first (saves video_token_ids.pt for kb-nano)
+            ref_video_raw = None
+            if not args.skip_reference:
+                ref_video_config = {
+                    "model": args.model, "seed": args.seed,
+                    "num_clips": len(video_clips),
+                    "video_clips": video_clips,
+                    "feats_dir": feats_dir,
+                }
+                ref_video_raw = run_worker(
+                    REFERENCE_SAM3_VIDEO_WORKER, ref_video_config,
+                    f"Reference SAM3 Video [{args.model.split('/')[-1]}]",
+                    timeout=3600,
+                )
+                if ref_video_raw:
+                    fps = ref_video_raw.get("frames_per_sec", 0)
+                    print(f"\n  Reference video: {fps:.1f} frames/sec", flush=True)
+
+            # Run kb-nano video worker
+            kb_video_config = {
+                "model": args.model, "seed": args.seed,
+                "project_root": str(_PROJECT_ROOT),
+                "num_clips": len(video_clips),
+                "video_clips": video_clips,
+                "feats_dir": feats_dir,
+                "checkpoint_path": checkpoint_path,
+            }
+            kb_video_raw = run_worker(
+                KB_NANO_SAM3_VIDEO_WORKER, kb_video_config,
+                f"kb-nano SAM3 Video [{args.model.split('/')[-1]}]",
+                timeout=3600,
+            )
+            if kb_video_raw:
+                fps = kb_video_raw.get("frames_per_sec", 0)
+                print(f"  kb-nano video: {fps:.1f} frames/sec", flush=True)
+
+            # Video correctness comparison
+            if not args.skip_reference:
+                video_comparison = _compare_video_predictions(feats_dir, len(video_clips))
+                _print_video_correctness(video_comparison)
+
     # -- Save results --
     if args.output_dir:
         os.makedirs(args.output_dir, exist_ok=True)
@@ -1046,6 +1458,8 @@ def main():
         if latency_combined:
             combined["latency_scenarios"] = latency_combined
         combined["correctness"] = pred_comparison
+        if video_comparison:
+            combined["video_correctness"] = video_comparison
         combined["overall_pass"] = overall_pass
         with open(results_path, "w") as f:
             json.dump(combined, f, indent=2)
