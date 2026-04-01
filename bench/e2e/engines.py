@@ -345,6 +345,7 @@ class EngineRegistry:
         "gemma": LLMEngine,
         "phi": LLMEngine,
         "flux": DiffusionBenchEngine,
+        "hunyuan": DiffusionBenchEngine,
     }
 
     @classmethod
