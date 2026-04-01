@@ -472,6 +472,7 @@ class EngineRegistry:
         "phi": LLMEngine,
         "flux": DiffusionBenchEngine,
         "sam3": SegmentationBenchEngine,
+        "hunyuan": DiffusionBenchEngine,
     }
 
     @classmethod

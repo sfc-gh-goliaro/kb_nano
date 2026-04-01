@@ -218,6 +218,59 @@ ALL_SEGMENTATION_WORKLOADS = {
 }
 
 
+# ---------------------------------------------------------------------------
+# TTS workloads (text-to-speech, e.g. CosyVoice3)
+# ---------------------------------------------------------------------------
+
+@dataclass(frozen=True)
+class TTSModelConfig:
+    sample_rate: int
+    n_timesteps: int
+
+COSYVOICE3_CONFIG = TTSModelConfig(sample_rate=24000, n_timesteps=10)
+
+
+@dataclass(frozen=True)
+class TTSThroughputWorkload:
+    """TTS throughput workload definition.
+
+    Uses the SEED-TTS-Eval dataset for realistic TTS benchmarking.
+    Each request has a text prompt and a reference audio for voice cloning.
+    """
+    name: str
+    num_requests: int = 100
+    max_text_len: int = 200
+    dataset_name: str = "zhaochenyang20/seed-tts-eval"
+    dataset_split: str = "train"
+
+
+@dataclass(frozen=True)
+class TTSLatencyWorkload:
+    name: str
+    batch_size: int = 1
+    max_text_len: int = 200
+    dataset_name: str = "zhaochenyang20/seed-tts-eval"
+    dataset_split: str = "train"
+    num_warmup: int = 2
+    num_iters: int = 5
+
+
+TTS_THROUGHPUT_WORKLOADS: list[TTSThroughputWorkload] = [
+    TTSThroughputWorkload("tts-short", num_requests=100, max_text_len=50),
+    TTSThroughputWorkload("tts-medium", num_requests=100, max_text_len=200),
+    TTSThroughputWorkload("tts-long", num_requests=50, max_text_len=500),
+]
+
+TTS_LATENCY_WORKLOADS: list[TTSLatencyWorkload] = [
+    TTSLatencyWorkload("single-utterance", batch_size=1, max_text_len=100),
+]
+
+ALL_TTS_WORKLOADS = {
+    "throughput": TTS_THROUGHPUT_WORKLOADS,
+    "latency": TTS_LATENCY_WORKLOADS,
+}
+
+
 def get_max_seq_len() -> int:
     """Return the maximum sequence length across all standardized LLM workloads."""
     max_len = 0
@@ -226,3 +279,57 @@ def get_max_seq_len() -> int:
     for w in LATENCY_WORKLOADS:
         max_len = max(max_len, w.input_len + w.output_len)
     return max_len
+
+
+# ---------------------------------------------------------------------------
+# Video diffusion workloads (text-to-video generation)
+# ---------------------------------------------------------------------------
+
+@dataclass(frozen=True)
+class VideoDiffusionModelConfig:
+    num_inference_steps: int
+    guidance_scale: float
+
+HUNYUAN_VIDEO_CONFIG = VideoDiffusionModelConfig(
+    num_inference_steps=30, guidance_scale=6.0,
+)
+
+@dataclass(frozen=True)
+class VideoDiffusionThroughputWorkload:
+    name: str
+    height: int
+    width: int
+    num_frames: int
+    num_prompts: int
+
+@dataclass(frozen=True)
+class VideoDiffusionLatencyWorkload:
+    name: str
+    height: int
+    width: int
+    num_frames: int
+    num_warmup: int = 2
+    num_iters: int = 5
+
+VIDEO_DIFFUSION_THROUGHPUT_WORKLOADS: list[VideoDiffusionThroughputWorkload] = [
+    VideoDiffusionThroughputWorkload(
+        "480p-short", height=480, width=832, num_frames=25, num_prompts=16,
+    ),
+    VideoDiffusionThroughputWorkload(
+        "480p-medium", height=480, width=832, num_frames=49, num_prompts=8,
+    ),
+]
+
+VIDEO_DIFFUSION_LATENCY_WORKLOADS: list[VideoDiffusionLatencyWorkload] = [
+    VideoDiffusionLatencyWorkload(
+        "single-480p-short", height=480, width=832, num_frames=25,
+    ),
+    VideoDiffusionLatencyWorkload(
+        "single-480p-medium", height=480, width=832, num_frames=49,
+    ),
+]
+
+ALL_VIDEO_DIFFUSION_WORKLOADS = {
+    "throughput": VIDEO_DIFFUSION_THROUGHPUT_WORKLOADS,
+    "latency": VIDEO_DIFFUSION_LATENCY_WORKLOADS,
+}
