@@ -210,6 +210,11 @@ SEGMENTATION_LATENCY_WORKLOADS: list[SegmentationLatencyWorkload] = [
         "batch-4-image-1008", resolution=1008, batch_size=4,
         dataset_name="facebook/SACo-Gold", dataset_subset="metaclip_nps",
     ),
+    SegmentationLatencyWorkload(
+        "single-video-frame-1008", resolution=1008, batch_size=1,
+        dataset_name="facebook/SACo-VEval", dataset_subset="smartglasses_val",
+        modality="video",
+    ),
 ]
 
 ALL_SEGMENTATION_WORKLOADS = {

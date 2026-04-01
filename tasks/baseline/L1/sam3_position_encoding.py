@@ -79,7 +79,7 @@ class Sam3PositionEncoding(nn.Module):
         Returns a (N, d_model + 2) tensor: [enc_x, enc_y, w, h].
         """
         enc_x, enc_y = self._encode_xy(cx, cy)
-        return torch.cat([enc_x, enc_y, w[:, None], h[:, None]], dim=-1)
+        return torch.cat([enc_y, enc_x, h[:, None], w[:, None]], dim=-1)
 
     def forward(self, x: torch.Tensor) -> torch.Tensor:
         """Generate position encoding for a feature map.
@@ -97,8 +97,9 @@ class Sam3PositionEncoding(nn.Module):
         x_embed = torch.arange(1, W + 1, dtype=torch.float32, device=device)
 
         if self.normalize:
-            y_embed = y_embed / H * self.scale
-            x_embed = x_embed / W * self.scale
+            eps = 1e-6
+            y_embed = y_embed / (y_embed[-1] + eps) * self.scale
+            x_embed = x_embed / (x_embed[-1] + eps) * self.scale
 
         dim_t = torch.arange(self.half_d, dtype=torch.float32, device=device)
         dim_t = self.temperature ** (2 * (dim_t // 2) / self.half_d)
@@ -115,8 +116,8 @@ class Sam3PositionEncoding(nn.Module):
 
         pos = torch.cat(
             [
-                pos_x[None, :, :].expand(H, -1, -1),
                 pos_y[:, None, :].expand(-1, W, -1),
+                pos_x[None, :, :].expand(H, -1, -1),
             ],
             dim=-1,
         )  # (H, W, d_model)

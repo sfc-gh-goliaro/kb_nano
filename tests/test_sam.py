@@ -371,12 +371,13 @@ def main():
         bb_out = model.backbone.forward_image(img)
         txt_out = model.backbone.forward_text([query], device="cuda")
         bb_out.update(txt_out)
-        return model.forward_grounding(
+        out = model.forward_grounding(
             backbone_out=bb_out,
             find_input=find_input,
             find_target=None,
             geometric_prompt=geo_prompt,
         )
+        return out
 
     # Warmup with full pipeline
     with torch.no_grad():
@@ -503,7 +504,20 @@ def main():
         missing, unexpected = load_sam3_checkpoint(model, ckpt_path)
         print(f"  Loaded: {len(missing)} missing, {len(unexpected)} unexpected keys", flush=True)
 
-    model = model.cuda().to(torch.bfloat16).eval()
+    # Preserve complex RoPE buffers before .to(float32) which discards imaginary parts
+    complex_bufs = {n: b.clone() for n, b in model.named_buffers() if b.is_complex()}
+    model = model.cuda().to(torch.float32).eval()
+    for name, buf in complex_bufs.items():
+        parts = name.split(".")
+        mod = model
+        for p in parts[:-1]:
+            mod = getattr(mod, p)
+        mod.register_buffer(parts[-1], buf.cuda())
+    if torch.cuda.is_available():
+        dp = torch.cuda.get_device_properties(0)
+        if dp.major >= 8:
+            torch.backends.cuda.matmul.allow_tf32 = True
+            torch.backends.cudnn.allow_tf32 = True
     print("  kb-nano SAM3 model loaded.", flush=True)
 
     feats_dir = cfg.get("feats_dir")
@@ -518,7 +532,7 @@ def main():
     images = []
     for entry in entries:
         t = torch.load(entry["tensor_path"], map_location="cpu", weights_only=True)
-        images.append(t.to(device="cuda", dtype=torch.bfloat16))
+        images.append(t.to(device="cuda", dtype=torch.float32))
 
     # Load token IDs produced by reference tokenizer
     token_ids_path = os.path.join(feats_dir, "token_ids.pt")
@@ -726,7 +740,7 @@ def main():
     parser.add_argument("--skip-latency", action="store_true")
     parser.add_argument("--latency-iters", type=int, default=20)
     parser.add_argument("--output-dir", type=str, default=None)
-    parser.add_argument("--modality", type=str, default="image",
+    parser.add_argument("--modality", type=str, default="all",
                         choices=["all", "image", "video"])
     parser.add_argument("--data-cache-dir", type=str,
                         default=str(Path(__file__).resolve().parent.parent / "data" / "saco_cache"))
@@ -943,6 +957,7 @@ def main():
     overall_pass = True
     for key, label in [("boxes", "Bounding Boxes (cxcywh)"), ("masks", "Segmentation Masks"), ("logits", "Classification Logits")]:
         stats = pred_comparison[key]
+        threshold = PASS_THRESHOLD
         print(f"\n  --- {label} ---")
         n_mismatch = stats.get("num_shape_mismatch", 0)
         if n_mismatch > 0:
@@ -958,23 +973,20 @@ def main():
         min_cos = stats["min_cosine_similarity"]
         avg_max_abs = stats["avg_max_abs_diff"]
         avg_rel = stats["avg_relative_diff"]
-        status = "PASS" if min_cos >= PASS_THRESHOLD else "FAIL"
+        status = "PASS" if min_cos >= threshold else "FAIL"
         if status == "FAIL":
             overall_pass = False
         stats["status"] = status
         print(f"  Images compared       : {n} / {num_items}")
         print(f"  Avg cosine similarity : {avg_cos:.6f}")
-        print(f"  Min cosine similarity : {min_cos:.6f}  (threshold: >= {PASS_THRESHOLD})")
+        print(f"  Min cosine similarity : {min_cos:.6f}  (threshold: >= {threshold})")
         print(f"  Avg max abs diff      : {avg_max_abs:.6f}")
         print(f"  Avg relative diff     : {avg_rel:.6f}")
         print(f"  Result                : {status}")
 
     print(f"\n  Overall correctness   : {'PASS' if overall_pass else 'FAIL'}")
-    print(f"\n  NOTE: Remaining divergence sources:")
-    print(f"    - bfloat16 (kb-nano) vs float32 (reference) precision")
-    print(f"    - Reference uses boxRPB (learned spatial attention bias), kb-nano does not")
-    print(f"    - Flash Attention 3 vs standard SDPA numerical differences")
-    print(f"    - Backbone features match closely (>0.99 cosine sim in prior tests)")
+    print(f"\n  NOTE: kb-nano implementation matches reference architecture including")
+    print(f"    boxRPB, presence_token, and DotProductScoring.")
 
     # Per-image detail table
     kb_per_image = kb_raw.get("per_image", [])

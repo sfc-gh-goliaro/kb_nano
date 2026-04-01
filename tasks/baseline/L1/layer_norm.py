@@ -8,7 +8,7 @@ import torch.nn.functional as F
 
 
 class LayerNorm(nn.Module):
-    def __init__(self, normalized_shape: int, eps: float = 1e-6,
+    def __init__(self, normalized_shape: int, eps: float = 1e-5,
                  elementwise_affine: bool = True):
         super().__init__()
         self.normalized_shape = (normalized_shape,)

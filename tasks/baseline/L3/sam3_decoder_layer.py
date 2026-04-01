@@ -78,8 +78,10 @@ class Sam3DecoderLayer(nn.Module):
         memory_key_padding_mask: Optional[torch.Tensor] = None,
         memory_text: Optional[torch.Tensor] = None,
         text_attention_mask: Optional[torch.Tensor] = None,
+        cross_attn_mask: Optional[torch.Tensor] = None,
+        presence_token: Optional[torch.Tensor] = None,
         **kwargs,
-    ) -> torch.Tensor:
+    ) -> tuple:
         """Forward pass (post-norm, matching reference decoder layer).
 
         Args:
@@ -91,12 +93,22 @@ class Sam3DecoderLayer(nn.Module):
             memory_key_padding_mask: (B, L) padding mask for memory.
             memory_text: (B, S, D) text features for text cross-attention.
             text_attention_mask: (B, S) padding mask for text.
+            cross_attn_mask: (B*H, Q, L) additive mask for image cross-attn (boxRPB).
+            presence_token: (B, 1, D) presence token or None.
 
         Returns:
-            (B, Q, D) updated object queries.
+            (tgt, presence_token_out): tgt is (B, Q, D), presence_token_out is (B, 1, D) or None.
         """
+        tgt_query_pos_sa = tgt_query_pos
+
+        if presence_token is not None:
+            tgt = torch.cat([presence_token, tgt], dim=1)
+            zero_pos = torch.zeros_like(presence_token)
+            tgt_query_pos_sa = torch.cat([zero_pos, tgt_query_pos], dim=1)
+            tgt_query_pos = torch.cat([zero_pos, tgt_query_pos], dim=1)
+
         # Self-attention with positional encoding on q, k
-        q = k = self._with_pos_embed(tgt, tgt_query_pos)
+        q = k = self._with_pos_embed(tgt, tgt_query_pos_sa)
         tgt2 = self.self_attn(q, k, tgt, key_padding_mask=tgt_key_padding_mask)
         tgt = tgt + self.dropout2(tgt2)
         tgt = self.norm2(tgt)
@@ -111,19 +123,31 @@ class Sam3DecoderLayer(nn.Module):
             tgt = tgt + self.catext_dropout(tgt2)
             tgt = self.catext_norm(tgt)
 
+        # Prepend presence token zero-row to cross_attn_mask so it has no RPB bias
+        if presence_token is not None and cross_attn_mask is not None:
+            pres_mask = torch.zeros_like(cross_attn_mask[:, :1, :])
+            cross_attn_mask = torch.cat([pres_mask, cross_attn_mask], dim=1)
+
         # Image cross-attention with pos on both q and k
         tgt2 = self.cross_attn(
             self._with_pos_embed(tgt, tgt_query_pos),
             self._with_pos_embed(memory, memory_pos),
             memory,
             key_padding_mask=memory_key_padding_mask,
+            attn_mask=cross_attn_mask,
         )
         tgt = tgt + self.dropout1(tgt2)
         tgt = self.norm1(tgt)
 
         # FFN (ReLU activation, matching reference)
-        tgt2 = self.linear2(self.dropout3(self.activation(self.linear1(tgt))))
+        with torch.amp.autocast(device_type="cuda", enabled=False):
+            tgt2 = self.linear2(self.dropout3(self.activation(self.linear1(tgt))))
         tgt = tgt + self.dropout4(tgt2)
         tgt = self.norm3(tgt)
 
-        return tgt
+        presence_token_out = None
+        if presence_token is not None:
+            presence_token_out = tgt[:, :1, :]
+            tgt = tgt[:, 1:, :]
+
+        return tgt, presence_token_out
