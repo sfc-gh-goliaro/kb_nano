@@ -302,9 +302,6 @@ def main():
     with open(sys.argv[1]) as f:
         cfg = json.load(f)
 
-    sam3_repo = cfg["sam3_repo_path"]
-    sys.path.insert(0, sam3_repo)
-
     from sam3.model_builder import build_sam3_image_model
     from sam3.model.sam3_image_processor import Sam3Processor
 
@@ -731,8 +728,6 @@ def main():
     parser.add_argument("--output-dir", type=str, default=None)
     parser.add_argument("--modality", type=str, default="image",
                         choices=["all", "image", "video"])
-    parser.add_argument("--sam3-repo-path", type=str,
-                        default=str(Path(__file__).resolve().parent.parent.parent / "vllm_repo" / "sam3"))
     parser.add_argument("--data-cache-dir", type=str,
                         default=str(Path(__file__).resolve().parent.parent / "data" / "saco_cache"))
     parser.add_argument("--gold-subset", type=str, default="metaclip",
@@ -854,7 +849,6 @@ def main():
     checkpoint_path = None
     if not args.skip_reference:
         try:
-            sys.path.insert(0, args.sam3_repo_path)
             from sam3.model_builder import download_ckpt_from_hf
             checkpoint_path = download_ckpt_from_hf("sam3")
             print(f"  Checkpoint: {checkpoint_path}")
@@ -879,7 +873,6 @@ def main():
     if not args.skip_reference:
         ref_config = {
             "model": args.model, "seed": args.seed,
-            "sam3_repo_path": args.sam3_repo_path,
             "num_items": len(all_samples),
             "latency_scenarios": latency_data,
             "feats_dir": feats_dir,
