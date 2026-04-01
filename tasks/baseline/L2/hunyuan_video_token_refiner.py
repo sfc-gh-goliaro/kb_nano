@@ -1,170 +1,120 @@
-"""HunyuanVideo-1.5 token refiner (L2 composite).
+"""HunyuanVideo-1.5 token refiner ops (L2 composites).
 
-Text conditioning encoder that refines encoder hidden states before the
-main DiT transformer blocks.  Uses diffusers' Attention and FeedForward
-for the non-TP self-attention path (matching vllm-omni exactly).
-
-Mirrors the ``HunyuanVideo15IndividualTokenRefinerBlock``,
-``HunyuanVideo15IndividualTokenRefiner``, and ``HunyuanVideo15TokenRefiner``
-classes in vllm-omni's ``hunyuan_video_15_transformer.py``.
+Self-attention and feedforward sub-modules used by the L3 token refiner
+blocks.  These replicate the behavior of diffusers' ``Attention`` (with
+``AttnProcessor2_0``) and ``FeedForward`` (with ``activation_fn="linear-silu"``)
+respectively, using only L1 ops.
 """
 
 from __future__ import annotations
 
 import torch
 import torch.nn as nn
+import torch.nn.functional as F
 
-from ..L1.layer_norm import LayerNorm
 from ..L1.linear import Linear
-from .hunyuan_video_embeddings import HunyuanVideo15AdaNorm
-from .timestep_embedding import CombinedTimestepTextProjEmbeddings
+from ..L1.silu import SiLU
 
 
-class HunyuanVideo15IndividualTokenRefinerBlock(nn.Module):
+class TokenRefinerSelfAttention(nn.Module):
+    """Self-attention for the token refiner.
+
+    Equivalent to diffusers' ``Attention`` with ``AttnProcessor2_0`` for
+    self-attention (``cross_attention_dim=None``, no qk_norm, no added_kv).
+
+    Weight names (``to_q``, ``to_k``, ``to_v``, ``to_out.0``) match the HF
+    checkpoint layout so weight loading works without extra remapping.
+    """
+
     def __init__(
         self,
-        num_attention_heads: int,
-        attention_head_dim: int,
-        mlp_width_ratio: float = 4.0,
-        mlp_drop_rate: float = 0.0,
-        attention_bias: bool = True,
+        query_dim: int,
+        heads: int,
+        dim_head: int,
+        bias: bool = True,
     ) -> None:
         super().__init__()
-        hidden_size = num_attention_heads * attention_head_dim
+        self.inner_dim = dim_head * heads
+        self.heads = heads
+        self.head_dim = dim_head
 
-        self.norm1 = LayerNorm(hidden_size, eps=1e-6)
+        self.to_q = Linear(query_dim, self.inner_dim, bias=bias)
+        self.to_k = Linear(query_dim, self.inner_dim, bias=bias)
+        self.to_v = Linear(query_dim, self.inner_dim, bias=bias)
 
-        from diffusers.models.attention_processor import Attention as DiffusersAttention
-
-        self.attn = DiffusersAttention(
-            query_dim=hidden_size,
-            cross_attention_dim=None,
-            heads=num_attention_heads,
-            dim_head=attention_head_dim,
-            bias=attention_bias,
-        )
-
-        self.norm2 = LayerNorm(hidden_size, eps=1e-6)
-
-        from diffusers.models.attention import FeedForward as DiffusersFeedForward
-
-        self.ff = DiffusersFeedForward(
-            hidden_size, mult=mlp_width_ratio, activation_fn="linear-silu", dropout=mlp_drop_rate
-        )
-
-        self.norm_out = HunyuanVideo15AdaNorm(hidden_size, 2 * hidden_size)
+        self.to_out = nn.ModuleList([
+            Linear(self.inner_dim, query_dim, bias=True),
+            nn.Identity(),
+        ])
 
     def forward(
         self,
         hidden_states: torch.Tensor,
-        temb: torch.Tensor,
         attention_mask: torch.Tensor | None = None,
     ) -> torch.Tensor:
-        norm_hidden_states = self.norm1(hidden_states)
+        batch_size = hidden_states.shape[0]
 
-        attn_output = self.attn(
-            hidden_states=norm_hidden_states,
-            encoder_hidden_states=None,
-            attention_mask=attention_mask,
+        query = self.to_q(hidden_states)
+        key = self.to_k(hidden_states)
+        value = self.to_v(hidden_states)
+
+        query = query.view(batch_size, -1, self.heads, self.head_dim).transpose(1, 2)
+        key = key.view(batch_size, -1, self.heads, self.head_dim).transpose(1, 2)
+        value = value.view(batch_size, -1, self.heads, self.head_dim).transpose(1, 2)
+
+        hidden_states = F.scaled_dot_product_attention(
+            query, key, value, attn_mask=attention_mask, dropout_p=0.0, is_causal=False,
         )
 
-        gate_msa, gate_mlp = self.norm_out(temb)
-        hidden_states = hidden_states + attn_output * gate_msa
+        hidden_states = hidden_states.transpose(1, 2).reshape(batch_size, -1, self.inner_dim)
+        hidden_states = hidden_states.to(query.dtype)
 
-        ff_output = self.ff(self.norm2(hidden_states))
-        hidden_states = hidden_states + ff_output * gate_mlp
+        hidden_states = self.to_out[0](hidden_states)
 
         return hidden_states
 
 
-class HunyuanVideo15IndividualTokenRefiner(nn.Module):
+class _LinearSiLU(nn.Module):
+    """Linear projection followed by SiLU activation.
+
+    Matches diffusers' ``LinearActivation(activation="silu")``.
+    Parameter name ``self.proj`` matches the HF checkpoint key ``net.0.proj``.
+    """
+
+    def __init__(self, dim_in: int, dim_out: int, bias: bool = True) -> None:
+        super().__init__()
+        self.proj = Linear(dim_in, dim_out, bias=bias)
+        self.activation = SiLU()
+
+    def forward(self, hidden_states: torch.Tensor) -> torch.Tensor:
+        return self.activation(self.proj(hidden_states))
+
+
+class TokenRefinerFeedForward(nn.Module):
+    """SiLU feedforward for the token refiner.
+
+    Equivalent to diffusers' ``FeedForward`` with
+    ``activation_fn="linear-silu"``: Linear → SiLU → Linear.
+
+    Weight names (``net.0.proj``, ``net.2``) match the HF checkpoint layout.
+    """
+
     def __init__(
         self,
-        num_attention_heads: int,
-        attention_head_dim: int,
-        num_layers: int,
-        mlp_width_ratio: float = 4.0,
-        mlp_drop_rate: float = 0.0,
-        attention_bias: bool = True,
+        dim: int,
+        mult: float = 4.0,
+        dropout: float = 0.0,
     ) -> None:
         super().__init__()
-        self.refiner_blocks = nn.ModuleList(
-            [
-                HunyuanVideo15IndividualTokenRefinerBlock(
-                    num_attention_heads=num_attention_heads,
-                    attention_head_dim=attention_head_dim,
-                    mlp_width_ratio=mlp_width_ratio,
-                    mlp_drop_rate=mlp_drop_rate,
-                    attention_bias=attention_bias,
-                )
-                for _ in range(num_layers)
-            ]
-        )
+        inner_dim = int(dim * mult)
 
-    def forward(
-        self,
-        hidden_states: torch.Tensor,
-        temb: torch.Tensor,
-        attention_mask: torch.Tensor | None = None,
-    ) -> torch.Tensor:
-        self_attn_mask = None
-        if attention_mask is not None:
-            batch_size = attention_mask.shape[0]
-            seq_len = attention_mask.shape[1]
-            attention_mask = attention_mask.to(hidden_states.device).bool()
-            self_attn_mask_1 = attention_mask.view(batch_size, 1, 1, seq_len).repeat(1, 1, seq_len, 1)
-            self_attn_mask_2 = self_attn_mask_1.transpose(2, 3)
-            self_attn_mask = (self_attn_mask_1 & self_attn_mask_2).bool()
+        self.net = nn.ModuleList([
+            _LinearSiLU(dim, inner_dim),
+            nn.Identity(),
+            Linear(inner_dim, dim, bias=True),
+        ])
 
-        for block in self.refiner_blocks:
-            hidden_states = block(hidden_states, temb, self_attn_mask)
-
-        return hidden_states
-
-
-class HunyuanVideo15TokenRefiner(nn.Module):
-    def __init__(
-        self,
-        in_channels: int,
-        num_attention_heads: int,
-        attention_head_dim: int,
-        num_layers: int,
-        mlp_ratio: float = 4.0,
-        mlp_drop_rate: float = 0.0,
-        attention_bias: bool = True,
-    ) -> None:
-        super().__init__()
-        hidden_size = num_attention_heads * attention_head_dim
-
-        self.time_text_embed = CombinedTimestepTextProjEmbeddings(
-            embedding_dim=hidden_size, pooled_projection_dim=in_channels
-        )
-        self.proj_in = Linear(in_channels, hidden_size, bias=True)
-        self.token_refiner = HunyuanVideo15IndividualTokenRefiner(
-            num_attention_heads=num_attention_heads,
-            attention_head_dim=attention_head_dim,
-            num_layers=num_layers,
-            mlp_width_ratio=mlp_ratio,
-            mlp_drop_rate=mlp_drop_rate,
-            attention_bias=attention_bias,
-        )
-
-    def forward(
-        self,
-        hidden_states: torch.Tensor,
-        timestep: torch.LongTensor,
-        attention_mask: torch.LongTensor | None = None,
-    ) -> torch.Tensor:
-        if attention_mask is None:
-            pooled_projections = hidden_states.mean(dim=1)
-        else:
-            original_dtype = hidden_states.dtype
-            mask_float = attention_mask.float().unsqueeze(-1)
-            pooled_projections = (hidden_states * mask_float).sum(dim=1) / mask_float.sum(dim=1)
-            pooled_projections = pooled_projections.to(original_dtype)
-
-        temb = self.time_text_embed(timestep, pooled_projections)
-        hidden_states = self.proj_in(hidden_states)
-        hidden_states = self.token_refiner(hidden_states, temb, attention_mask)
-
+    def forward(self, hidden_states: torch.Tensor) -> torch.Tensor:
+        for module in self.net:
+            hidden_states = module(hidden_states)
         return hidden_states

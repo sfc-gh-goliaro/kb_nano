@@ -45,7 +45,7 @@ from ..L2.hunyuan_video_embeddings import (
     HunyuanVideo15TimeEmbedding,
 )
 from ..L2.hunyuan_video_conditioning import HunyuanVideo15ConditioningMerge
-from ..L2.hunyuan_video_token_refiner import HunyuanVideo15TokenRefiner
+from ..L3.hunyuan_video_token_refiner_block import HunyuanVideo15TokenRefiner
 from ..L3.hunyuan_video_transformer_block import HunyuanVideo15TransformerBlock
 from .t5_encoder import T5EncoderModel
 
