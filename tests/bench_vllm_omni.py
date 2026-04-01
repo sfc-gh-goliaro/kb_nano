@@ -367,10 +367,13 @@ from tqdm import tqdm
 def main():
     with open(sys.argv[1]) as f:
         cfg = json.load(f)
-    sys.path.insert(0, cfg["project_root"])
     pkg = cfg["package_name"]
 
-    eng_mod = __import__(f"{pkg}.infra.diffusion_engine", fromlist=["DiffusionEngine"])
+    try:
+        eng_mod = __import__(f"{pkg}.infra.diffusion_engine", fromlist=["DiffusionEngine"])
+    except (ImportError, ModuleNotFoundError):
+        sys.path.insert(0, cfg["project_root"])
+        eng_mod = __import__(f"{pkg}.infra.diffusion_engine", fromlist=["DiffusionEngine"])
     flux_mod = __import__(f"{pkg}.tasks.baseline.L4.flux", fromlist=["DiffusionSamplingParams"])
     DiffusionEngine = eng_mod.DiffusionEngine
     DiffusionSamplingParams = flux_mod.DiffusionSamplingParams
@@ -491,12 +494,18 @@ from tqdm import tqdm
 def main():
     with open(sys.argv[1]) as f:
         cfg = json.load(f)
-    sys.path.insert(0, cfg["project_root"])
 
-    from kb_nano.infra.diffusion_engine import DiffusionEngine
-    from kb_nano.tasks.baseline.L4.hunyuan_video import (
-        HunyuanVideoDiffusionSamplingParams,
-    )
+    try:
+        from kb_nano.infra.diffusion_engine import DiffusionEngine
+        from kb_nano.tasks.baseline.L4.hunyuan_video import (
+            HunyuanVideoDiffusionSamplingParams,
+        )
+    except (ImportError, ModuleNotFoundError):
+        sys.path.insert(0, cfg["project_root"])
+        from kb_nano.infra.diffusion_engine import DiffusionEngine
+        from kb_nano.tasks.baseline.L4.hunyuan_video import (
+            HunyuanVideoDiffusionSamplingParams,
+        )
 
     engine = DiffusionEngine(
         model_name=cfg["model"], seed=cfg["seed"], enforce_eager=True,
