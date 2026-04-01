@@ -17,6 +17,14 @@ from huggingface_hub import snapshot_download
 from safetensors import safe_open
 from transformers import AutoConfig
 
+try:
+    from fastsafetensors import SafeTensorsFileLoader, SingleGroup
+    _HAS_FASTSAFETENSORS = True
+except ImportError:
+    _HAS_FASTSAFETENSORS = False
+
+from concurrent.futures import ThreadPoolExecutor
+
 from .tp import _tp_size
 from ..tasks.baseline.L4.llama import LlamaConfig, LlamaForCausalLM
 from ..tasks.baseline.L4.llama4 import Llama4Config, Llama4ForCausalLM
@@ -39,6 +47,17 @@ def download_model(model_name: str) -> str:
 _EXPERT_RE = re.compile(
     r"(.+\.block_sparse_moe)\.experts\.(\d+)\.(w[123])\.weight"
 )
+
+# Qwen3-MoE fused expert weight patterns: gate_up_proj [E, 2*inter, hidden], down_proj [E, hidden, inter]
+_QWEN3_MOE_FUSED_EXPERT_RE = re.compile(
+    r"(.+\.mlp)\.experts\.(gate_up_proj|down_proj)$"
+)
+_QWEN3_MOE_FUSED_SCALE_RE = re.compile(
+    r"(.+\.mlp)\.experts\.(gate_up_proj|down_proj)_scale_inv$"
+)
+
+# Qwen3-MoE gate (router) weight
+_QWEN3_MOE_GATE_RE = re.compile(r"(.+\.mlp)\.gate\.weight$")
 
 
 # Qwen2-VL weight name remapping: checkpoint -> model parameter
@@ -163,6 +182,55 @@ _WHISPER_OUT_PROJ_RE = re.compile(
 )
 
 
+def _dequant_fp8_block(tensor: torch.Tensor, scale_inv: torch.Tensor,
+                       block_size: int = 128) -> torch.Tensor:
+    """Dequantize FP8 block-quantized tensor: out = fp8_val * scale_inv (per block).
+
+    Each block of block_size elements along each non-batch dim shares one scale factor.
+    Supports 2D [R, C] and 3D [E, R, C] tensors.
+    """
+    shape = tensor.shape
+    ndim = len(shape)
+    if ndim == 3:
+        E, R, C = shape
+        _, sR, sC = scale_inv.shape
+        bR = (R + sR - 1) // sR
+        bC = (C + sC - 1) // sC
+        out = torch.zeros(E, sR * bR, sC * bC, dtype=torch.bfloat16, device=tensor.device)
+        out[:, :R, :C] = tensor.to(torch.bfloat16)
+        out = out.reshape(E, sR, bR, sC, bC) * scale_inv[:, :, None, :, None]
+        return out.reshape(E, sR * bR, sC * bC)[:, :R, :C].contiguous()
+    elif ndim == 2:
+        R, C = shape
+        sR, sC = scale_inv.shape
+        bR = (R + sR - 1) // sR
+        bC = (C + sC - 1) // sC
+        out = torch.zeros(sR * bR, sC * bC, dtype=torch.bfloat16, device=tensor.device)
+        out[:R, :C] = tensor.to(torch.bfloat16)
+        out = out.reshape(sR, bR, sC, bC) * scale_inv[:, None, :, None]
+        return out.reshape(sR * bR, sC * bC)[:R, :C].contiguous()
+    else:
+        raise ValueError(f"Unsupported tensor ndim={ndim} for FP8 dequantization")
+
+
+def _threaded_safetensors_iterator(safetensor_files):
+    """Yield (weight_name, tensor) with threaded pre-loading of safetensors files."""
+    def _load_one(path):
+        tensors = {}
+        with safe_open(path, "pt", "cpu") as f:
+            for k in f.keys():
+                tensors[k] = f.get_tensor(k)
+        return tensors
+
+    with ThreadPoolExecutor(max_workers=min(4, len(safetensor_files))) as pool:
+        futures = [pool.submit(_load_one, sf) for sf in sorted(safetensor_files)]
+        for fut in futures:
+            tensors = fut.result()
+            for k, v in tensors.items():
+                yield k, v
+            del tensors
+
+
 def load_weights(model, model_path: str, model_type: str = "llama") -> None:
     """Load weights with support for packed modules, MoE experts, vision
     encoder QKV, FP8 weight_scale_inv, and TP sharding.
@@ -174,286 +242,375 @@ def load_weights(model, model_path: str, model_type: str = "llama") -> None:
 
     is_whisper = model_type == "whisper"
     is_qwen2_vl = model_type == "qwen2_vl"
-    is_qwen3_vl = model_type == "qwen3_vl"
+    is_qwen3_vl = model_type in ("qwen3_vl", "qwen3_vl_moe")
+    is_qwen3_vl_moe = model_type == "qwen3_vl_moe"
     is_qwen_vl = is_qwen2_vl or is_qwen3_vl
     is_llama4 = model_type == "llama4"
     if is_llama4:
         llama4_config = model.config
 
-    print(f"  Loading weights from {len(safetensor_files)} safetensors file(s)...")
+    use_threaded = len(safetensor_files) > 1
+    if use_threaded:
+        print(f"  Loading weights from {len(safetensor_files)} safetensors file(s) "
+              f"[threaded]...")
+    else:
+        print(f"  Loading weights from {len(safetensor_files)} safetensors file(s)...")
     loaded = 0
-    for sf_file in safetensor_files:
-        with safe_open(sf_file, "pt", "cpu") as f:
-            for weight_name in f.keys():
-                # Remap checkpoint names for Qwen VL models
-                if is_qwen2_vl:
-                    mapped_name = _remap_qwen2_vl_name(weight_name)
-                elif is_qwen3_vl:
-                    mapped_name = _remap_qwen3_vl_name(weight_name)
+    # #region agent log
+    _debug_log_path = "/home/yak/.cursor/debug-64ddb7.log"
+    _debug_moe_gate_loaded = 0
+    _debug_moe_fused_loaded = 0
+    _debug_moe_skipped = []
+    _debug_moe_unmatched = []
+    # #endregion
+    _fused_expert_weights = {}
+    _fused_expert_scales = {}
+
+    if use_threaded:
+        _weight_iter = _threaded_safetensors_iterator(safetensor_files)
+    else:
+        def _std_iter():
+            for sf_file in safetensor_files:
+                with safe_open(sf_file, "pt", "cpu") as f:
+                    for wn in f.keys():
+                        yield wn, f.get_tensor(wn)
+        _weight_iter = _std_iter()
+
+    for weight_name, _loaded_tensor in _weight_iter:
+        def _get_tensor(_t=_loaded_tensor):
+            return _t
+        # Remap checkpoint names for Qwen VL models
+        if is_qwen2_vl:
+            mapped_name = _remap_qwen2_vl_name(weight_name)
+        elif is_qwen3_vl:
+            mapped_name = _remap_qwen3_vl_name(weight_name)
+        else:
+            mapped_name = weight_name
+
+        # Whisper: remap checkpoint names
+        if is_whisper:
+            if mapped_name.startswith("model."):
+                mapped_name = mapped_name[len("model."):]
+            if mapped_name.startswith("proj_out."):
+                continue
+            m_fc = _WHISPER_FC_RE.match(mapped_name)
+            if m_fc:
+                prefix, fc_num, wb = m_fc.groups()
+                mapped_name = f"{prefix}.mlp.fc{fc_num}.{wb}"
+            m_conv = _WHISPER_CONV_RE.match(mapped_name)
+            if m_conv:
+                prefix, wb = m_conv.groups()
+                mapped_name = f"{prefix}.conv.{wb}"
+            m_ln = _WHISPER_LAYER_NORM_RE.match(mapped_name)
+            if m_ln:
+                prefix, wb = m_ln.groups()
+                mapped_name = f"{prefix}.norm.{wb}"
+            m_emb = _WHISPER_EMBED_RE.match(mapped_name)
+            if m_emb:
+                prefix = m_emb.group(1)
+                mapped_name = f"{prefix}.emb.weight"
+            if mapped_name.endswith(".k_proj.weight"):
+                tensor = _get_tensor()
+                fake_bias_name = mapped_name.replace(".weight", ".bias")
+                fake_bias = torch.zeros(tensor.size(0))
+                for orig_key, (packed_name, shard_id) in packed.items():
+                    if orig_key in fake_bias_name:
+                        param_name = fake_bias_name.replace(orig_key, packed_name)
+                        try:
+                            param = model.get_parameter(param_name)
+                            weight_loader_fn = getattr(param, "weight_loader")
+                            weight_loader_fn(param, fake_bias, shard_id)
+                        except AttributeError:
+                            pass
+                        break
+
+        # Llama4: strip language_model. prefix, skip vision weights
+        if is_llama4:
+            if not mapped_name.startswith("language_model."):
+                continue
+            mapped_name = mapped_name[len("language_model."):]
+            m_fused = _LLAMA4_FUSED_EXPERT_RE.match(mapped_name)
+            if m_fused:
+                prefix_part, proj = m_fused.groups()
+                tensor = _get_tensor()
+                if proj == "gate_up_proj":
+                    param_name = f"{prefix_part}.w13"
+                    try:
+                        param = model.get_parameter(param_name)
+                    except AttributeError:
+                        continue
+                    weight = tensor.transpose(-1, -2)
+                    E = weight.shape[0]
+                    full_inter = weight.shape[1] // 2
+                    tp = param.shape[1] // 2
+                    rank = 0
+                    if full_inter != tp:
+                        from .tp import _tp_rank
+                        rank = _tp_rank()
+                    gate = weight[:, :full_inter, :]
+                    up = weight[:, full_inter:, :]
+                    param.data[:, :tp, :].copy_(gate[:, rank * tp:(rank + 1) * tp, :])
+                    param.data[:, tp:, :].copy_(up[:, rank * tp:(rank + 1) * tp, :])
                 else:
-                    mapped_name = weight_name
-
-                # Whisper: remap checkpoint names
-                if is_whisper:
-                    # Strip "model." prefix
-                    if mapped_name.startswith("model."):
-                        mapped_name = mapped_name[len("model."):]
-                    # proj_out -> lm_head (tied weights, skip)
-                    if mapped_name.startswith("proj_out."):
+                    param_name = f"{prefix_part}.w2"
+                    try:
+                        param = model.get_parameter(param_name)
+                    except AttributeError:
                         continue
+                    weight = tensor.transpose(-1, -2)
+                    full_inter = weight.shape[2]
+                    tp_inter = param.shape[2]
+                    rank = 0
+                    if full_inter != tp_inter:
+                        from .tp import _tp_rank
+                        rank = _tp_rank()
+                    param.data.copy_(weight[:, :, rank * tp_inter:(rank + 1) * tp_inter])
+                loaded += 1
+                continue
 
-                    # fc1/fc2 -> mlp.fc1/mlp.fc2
-                    m_fc = _WHISPER_FC_RE.match(mapped_name)
-                    if m_fc:
-                        prefix, fc_num, wb = m_fc.groups()
-                        mapped_name = f"{prefix}.mlp.fc{fc_num}.{wb}"
+        # Handle Qwen2-VL merger: ln_q -> norm, mlp.0 -> fc1, mlp.2 -> fc2
+        if is_qwen2_vl:
+            m_merger = _QWEN2_MERGER_RE.match(mapped_name)
+            if m_merger:
+                prefix, attr, wb = m_merger.groups()
+                remap = {"ln_q": "norm", "mlp.0": "fc1", "mlp.2": "fc2"}
+                mapped_name = f"{prefix}.{remap[attr]}.{wb}"
 
-                    # conv1/conv2 -> conv1.conv/conv2.conv (L1 wrapper)
-                    m_conv = _WHISPER_CONV_RE.match(mapped_name)
-                    if m_conv:
-                        prefix, wb = m_conv.groups()
-                        mapped_name = f"{prefix}.conv.{wb}"
+        # Handle Qwen3-VL vision MLP: linear_fc1 -> fc1, linear_fc2 -> fc2
+        if is_qwen3_vl:
+            m_mlp = _QWEN3_VISION_MLP_RE.match(mapped_name)
+            if m_mlp:
+                prefix, fc_num, wb = m_mlp.groups()
+                mapped_name = f"{prefix}.fc{fc_num}.{wb}"
+            m_merger = _QWEN3_MERGER_FC_RE.match(mapped_name)
+            if m_merger and "merger" in mapped_name:
+                prefix, fc_name, wb = m_merger.groups()
+                fc = "fc1" if fc_name == "linear_fc1" else "fc2"
+                mapped_name = f"{prefix}.{fc}.{wb}"
 
-                    # LayerNorm -> *.norm.* (L1 wrapper)
-                    m_ln = _WHISPER_LAYER_NORM_RE.match(mapped_name)
-                    if m_ln:
-                        prefix, wb = m_ln.groups()
-                        mapped_name = f"{prefix}.norm.{wb}"
+        # Remap learned pos embed nesting (Qwen3-VL)
+        if is_qwen3_vl:
+            if _VISION_POS_EMBED_RE.match(mapped_name):
+                mapped_name = "visual.pos_embed_interp._embed.weight"
 
-                    # Embedding L1 wrapper nesting: *.weight -> *.emb.weight
-                    m_emb = _WHISPER_EMBED_RE.match(mapped_name)
-                    if m_emb:
-                        prefix = m_emb.group(1)
-                        mapped_name = f"{prefix}.emb.weight"
+        # Remap vision param names for L1 wrapper nesting
+        if is_qwen_vl:
+            m = _VISION_PATCH_EMBED_RE.match(mapped_name)
+            if m:
+                prefix, wb = m.groups()
+                mapped_name = f"{prefix}.conv.{wb}"
+            m = _VISION_BLOCK_NORM_RE.match(mapped_name)
+            if m:
+                prefix, wb = m.groups()
+                mapped_name = f"{prefix}.norm.{wb}"
+            m = _VISION_MERGER_NORM_RE.match(mapped_name)
+            if m:
+                prefix, wb = m.groups()
+                mapped_name = f"{prefix}.norm.{wb}"
 
-                    # Create fake zero bias for k_proj (HF checkpoint has
-                    # no k_proj bias, but our QKVParallelLinear expects one
-                    # for the packed QKV)
-                    if mapped_name.endswith(".k_proj.weight"):
-                        tensor = f.get_tensor(weight_name)
-                        fake_bias_name = mapped_name.replace(".weight", ".bias")
-                        fake_bias = torch.zeros(tensor.size(0))
-                        # Load the fake bias through packed mapping
-                        for orig_key, (packed_name, shard_id) in packed.items():
-                            if orig_key in fake_bias_name:
-                                param_name = fake_bias_name.replace(
-                                    orig_key, packed_name)
-                                try:
-                                    param = model.get_parameter(param_name)
-                                    weight_loader_fn = getattr(
-                                        param, "weight_loader")
-                                    weight_loader_fn(param, fake_bias, shard_id)
-                                except AttributeError:
-                                    pass
-                                break
+        # Handle vision encoder merged QKV weights
+        if is_qwen_vl:
+            m_qkv = _VISION_QKV_RE.match(mapped_name)
+            if m_qkv:
+                prefix, wb = m_qkv.groups()
+                loaded += _load_vision_qkv(model, prefix, _get_tensor(), wb)
+                continue
 
-                # Llama4: strip language_model. prefix, skip vision weights
-                if is_llama4:
-                    if not mapped_name.startswith("language_model."):
-                        continue  # skip vision weights
-                    mapped_name = mapped_name[len("language_model."):]
-
-                    # Handle fused expert weights
-                    m_fused = _LLAMA4_FUSED_EXPERT_RE.match(mapped_name)
-                    if m_fused:
-                        prefix_part, proj = m_fused.groups()
-                        tensor = f.get_tensor(weight_name)
-                        if proj == "gate_up_proj":
-                            param_name = f"{prefix_part}.w13"
-                            try:
-                                param = model.get_parameter(param_name)
-                            except AttributeError:
-                                continue
-                            # [E, hidden, 2*inter] → transpose → [E, 2*inter, hidden]
-                            weight = tensor.transpose(-1, -2)
-                            E = weight.shape[0]
-                            full_inter = weight.shape[1] // 2
-                            tp = param.shape[1] // 2
-                            rank = 0
-                            if full_inter != tp:
-                                from .tp import _tp_rank
-                                rank = _tp_rank()
-                            gate = weight[:, :full_inter, :]
-                            up = weight[:, full_inter:, :]
-                            param.data[:, :tp, :].copy_(gate[:, rank * tp:(rank + 1) * tp, :])
-                            param.data[:, tp:, :].copy_(up[:, rank * tp:(rank + 1) * tp, :])
-                        else:  # down_proj
-                            param_name = f"{prefix_part}.w2"
-                            try:
-                                param = model.get_parameter(param_name)
-                            except AttributeError:
-                                continue
-                            # [E, inter, hidden] → transpose → [E, hidden, inter]
-                            weight = tensor.transpose(-1, -2)
-                            full_inter = weight.shape[2]
-                            tp_inter = param.shape[2]
-                            rank = 0
-                            if full_inter != tp_inter:
-                                from .tp import _tp_rank
-                                rank = _tp_rank()
-                            param.data.copy_(weight[:, :, rank * tp_inter:(rank + 1) * tp_inter])
-                        loaded += 1
-                        continue
-
-                # Handle Qwen2-VL merger: ln_q -> norm, mlp.0 -> fc1, mlp.2 -> fc2
-                if is_qwen2_vl:
-                    m_merger = _QWEN2_MERGER_RE.match(mapped_name)
-                    if m_merger:
-                        prefix, attr, wb = m_merger.groups()
-                        remap = {"ln_q": "norm", "mlp.0": "fc1", "mlp.2": "fc2"}
-                        mapped_name = f"{prefix}.{remap[attr]}.{wb}"
-
-                # Handle Qwen3-VL vision MLP: linear_fc1 -> fc1, linear_fc2 -> fc2
-                if is_qwen3_vl:
-                    m_mlp = _QWEN3_VISION_MLP_RE.match(mapped_name)
-                    if m_mlp:
-                        prefix, fc_num, wb = m_mlp.groups()
-                        mapped_name = f"{prefix}.fc{fc_num}.{wb}"
-
-                    # Handle Qwen3-VL merger: linear_fc1 -> fc1, linear_fc2 -> fc2
-                    m_merger = _QWEN3_MERGER_FC_RE.match(mapped_name)
-                    if m_merger and "merger" in mapped_name:
-                        prefix, fc_name, wb = m_merger.groups()
-                        fc = "fc1" if fc_name == "linear_fc1" else "fc2"
-                        mapped_name = f"{prefix}.{fc}.{wb}"
-
-                # Remap learned pos embed nesting (Qwen3-VL)
-                if is_qwen3_vl:
-                    if _VISION_POS_EMBED_RE.match(mapped_name):
-                        mapped_name = "visual.pos_embed_interp._embed.weight"
-
-                # Remap vision param names for L1 wrapper nesting
-                if is_qwen_vl:
-                    m = _VISION_PATCH_EMBED_RE.match(mapped_name)
-                    if m:
-                        prefix, wb = m.groups()
-                        mapped_name = f"{prefix}.conv.{wb}"
-                    m = _VISION_BLOCK_NORM_RE.match(mapped_name)
-                    if m:
-                        prefix, wb = m.groups()
-                        mapped_name = f"{prefix}.norm.{wb}"
-                    m = _VISION_MERGER_NORM_RE.match(mapped_name)
-                    if m:
-                        prefix, wb = m.groups()
-                        mapped_name = f"{prefix}.norm.{wb}"
-
-                # Handle vision encoder merged QKV weights
-                if is_qwen_vl:
-                    m_qkv = _VISION_QKV_RE.match(mapped_name)
-                    if m_qkv:
-                        prefix, wb = m_qkv.groups()
-                        loaded += _load_vision_qkv(
-                            model, prefix, f.get_tensor(weight_name), wb,
-                        )
-                        continue
-
-                # Handle FP8 weight_scale_inv tensors
-                m_scale = _WEIGHT_SCALE_INV_RE.match(mapped_name)
-                if m_scale:
-                    layer_prefix = m_scale.group(1)
-                    matched_scale = False
-                    for orig_key, (packed_name, shard_id) in packed.items():
-                        if orig_key in layer_prefix:
-                            scale_param_name = layer_prefix.replace(
-                                orig_key, packed_name) + ".weight_scale_inv"
-                            try:
-                                param = model.get_parameter(scale_param_name)
-                            except AttributeError:
-                                break
-                            scale_loader = getattr(param, "weight_loader", None)
-                            if scale_loader:
-                                scale_loader(param, f.get_tensor(weight_name), shard_id)
-                            else:
-                                default_weight_loader(param, f.get_tensor(weight_name))
-                            loaded += 1
-                            matched_scale = True
-                            break
-                    if matched_scale:
-                        continue
-                    scale_param_name = layer_prefix + ".weight_scale_inv"
+        # Handle FP8 weight_scale_inv tensors
+        m_scale = _WEIGHT_SCALE_INV_RE.match(mapped_name)
+        if m_scale:
+            layer_prefix = m_scale.group(1)
+            matched_scale = False
+            for orig_key, (packed_name, shard_id) in packed.items():
+                if orig_key in layer_prefix:
+                    scale_param_name = layer_prefix.replace(
+                        orig_key, packed_name) + ".weight_scale_inv"
                     try:
                         param = model.get_parameter(scale_param_name)
                     except AttributeError:
-                        continue
-                    scale_loader = getattr(param, "weight_loader", default_weight_loader)
-                    scale_loader(param, f.get_tensor(weight_name))
-                    loaded += 1
-                    continue
-
-                # Handle MoE expert weights
-                m = _EXPERT_RE.match(mapped_name)
-                if m:
-                    moe_prefix, expert_id_str, w_name = m.groups()
-                    expert_id = int(expert_id_str)
-                    if w_name in ("w1", "w3"):
-                        param_name = f"{moe_prefix}.w13"
-                        param = model.get_parameter(param_name)
-                        param.weight_loader(
-                            param, f.get_tensor(weight_name),
-                            expert_id, is_w1=(w_name == "w1"),
-                        )
-                    else:
-                        param_name = f"{moe_prefix}.w2"
-                        param = model.get_parameter(param_name)
-                        param.weight_loader(
-                            param, f.get_tensor(weight_name), expert_id,
-                        )
-                    loaded += 1
-                    continue
-
-                # Handle packed modules (qkv_proj, gate_up_proj)
-                matched = False
-                for orig_key, (packed_name, shard_id) in packed.items():
-                    # Llama4: skip packed mapping for expert weight names
-                    # (e.g. shared_expert.gate_proj should match, but
-                    #  experts.gate_up_proj should not)
-                    if is_llama4 and "experts." in mapped_name:
-                        continue
-                    if orig_key in mapped_name:
-                        param_name = mapped_name.replace(orig_key, packed_name)
-                        try:
-                            param = model.get_parameter(param_name)
-                        except AttributeError:
-                            break
-                        weight_loader = getattr(param, "weight_loader")
-                        # Llama4: use permuted Q/K weights for rotary
-                        if is_llama4 and orig_key in ("q_proj", "k_proj"):
-                            tensor = f.get_tensor(weight_name)
-                            n_heads = (
-                                llama4_config.num_key_value_heads
-                                if orig_key == "k_proj"
-                                else llama4_config.num_attention_heads
-                            )
-                            tensor = _permute_qk_for_rotary(tensor, n_heads)
-                            weight_loader(param, tensor, shard_id)
-                        else:
-                            weight_loader(param, f.get_tensor(weight_name), shard_id)
-                        loaded += 1
-                        matched = True
                         break
-                if matched:
-                    continue
-                if "rotary_emb" in mapped_name:
-                    continue
-                m_emb_w = _EMBED_WEIGHT_RE.match(mapped_name)
-                if m_emb_w:
-                    mapped_name = f"{m_emb_w.group(1)}.embedding_op.emb.weight"
+                    scale_loader = getattr(param, "weight_loader", None)
+                    if scale_loader:
+                        scale_loader(param, _get_tensor(), shard_id)
+                    else:
+                        default_weight_loader(param, _get_tensor())
+                    loaded += 1
+                    matched_scale = True
+                    break
+            if matched_scale:
+                continue
+            scale_param_name = layer_prefix + ".weight_scale_inv"
+            try:
+                param = model.get_parameter(scale_param_name)
+            except AttributeError:
+                continue
+            scale_loader = getattr(param, "weight_loader", default_weight_loader)
+            scale_loader(param, _get_tensor())
+            loaded += 1
+            continue
+
+        # Handle MoE expert weights
+        m = _EXPERT_RE.match(mapped_name)
+        if m:
+            moe_prefix, expert_id_str, w_name = m.groups()
+            expert_id = int(expert_id_str)
+            if w_name in ("w1", "w3"):
+                param_name = f"{moe_prefix}.w13"
+                param = model.get_parameter(param_name)
+                param.weight_loader(param, _get_tensor(), expert_id, is_w1=(w_name == "w1"))
+            else:
+                param_name = f"{moe_prefix}.w2"
+                param = model.get_parameter(param_name)
+                param.weight_loader(param, _get_tensor(), expert_id)
+            loaded += 1
+            continue
+
+        # Handle Qwen3-VL-MoE fused 3D expert weights, scales, and gate
+        if is_qwen3_vl_moe:
+            m_gate = _QWEN3_MOE_GATE_RE.match(mapped_name)
+            if m_gate:
+                mlp_prefix = m_gate.group(1)
+                param_name = f"{mlp_prefix}.gate_weight"
                 try:
-                    param = model.get_parameter(mapped_name)
+                    param = model.get_parameter(param_name)
+                except AttributeError:
+                    # #region agent log
+                    _debug_moe_skipped.append(("gate", mapped_name, param_name))
+                    # #endregion
+                    pass
+                else:
+                    param.weight_loader(param, _get_tensor())
+                    loaded += 1
+                    # #region agent log
+                    _debug_moe_gate_loaded += 1
+                    # #endregion
+                continue
+
+            # Buffer fused expert scale_inv tensors for deferred dequantization
+            m_fused_scale = _QWEN3_MOE_FUSED_SCALE_RE.match(mapped_name)
+            if m_fused_scale:
+                mlp_prefix, proj = m_fused_scale.groups()
+                _fused_expert_scales[(mlp_prefix, proj)] = _get_tensor()
+                continue
+
+            m_fused = _QWEN3_MOE_FUSED_EXPERT_RE.match(mapped_name)
+            if m_fused:
+                mlp_prefix, proj = m_fused.groups()
+                tensor = _get_tensor()
+                # #region agent log
+                import json as _json, time as _time
+                _log_entry = {"sessionId": "64ddb7", "hypothesisId": "H1", "location": "weight_loader.py:moe_fused",
+                              "message": f"Loading fused expert: {proj}", "data": {"mapped_name": mapped_name, "proj": proj, "shape": list(tensor.shape), "dtype": str(tensor.dtype)},
+                              "timestamp": int(_time.time() * 1000)}
+                try:
+                    with open(_debug_log_path, "a") as _lf:
+                        _lf.write(_json.dumps(_log_entry) + "\n")
+                except Exception:
+                    pass
+                # #endregion
+                _fused_expert_weights[(mlp_prefix, proj)] = tensor
+                loaded += 1
+                # #region agent log
+                _debug_moe_fused_loaded += 1
+                # #endregion
+                continue
+
+        # Handle packed modules (qkv_proj, gate_up_proj)
+        matched = False
+        for orig_key, (packed_name, shard_id) in packed.items():
+            if (is_llama4 or is_qwen3_vl_moe) and "experts." in mapped_name:
+                continue
+            if orig_key in mapped_name:
+                param_name = mapped_name.replace(orig_key, packed_name)
+                try:
+                    param = model.get_parameter(param_name)
+                except AttributeError:
+                    break
+                weight_loader = getattr(param, "weight_loader")
+                if is_llama4 and orig_key in ("q_proj", "k_proj"):
+                    tensor = _get_tensor()
+                    n_heads = (
+                        llama4_config.num_key_value_heads
+                        if orig_key == "k_proj"
+                        else llama4_config.num_attention_heads
+                    )
+                    tensor = _permute_qk_for_rotary(tensor, n_heads)
+                    weight_loader(param, tensor, shard_id)
+                else:
+                    weight_loader(param, _get_tensor(), shard_id)
+                loaded += 1
+                matched = True
+                break
+        if matched:
+            continue
+        if "rotary_emb" in mapped_name:
+            continue
+        m_emb_w = _EMBED_WEIGHT_RE.match(mapped_name)
+        if m_emb_w:
+            mapped_name = f"{m_emb_w.group(1)}.embedding_op.emb.weight"
+        try:
+            param = model.get_parameter(mapped_name)
+        except AttributeError:
+            continue
+        weight_loader = getattr(param, "weight_loader", default_weight_loader)
+        weight_loader(param, _get_tensor())
+        loaded += 1
+
+        # Whisper: duplicate decoder embed_tokens -> lm_head (tied weights)
+        if is_whisper and mapped_name == "decoder.embed_tokens.emb.weight":
+            lm_param = model.get_parameter("lm_head.embedding_op.emb.weight")
+            lm_loader = getattr(lm_param, "weight_loader", default_weight_loader)
+            lm_loader(lm_param, _get_tensor())
+            loaded += 1
+
+    # Assign buffered fused expert weights (with FP8 dequantization if needed)
+    if _fused_expert_weights:
+        from .tp import _tp_rank
+        rank = _tp_rank() if _tp_size() > 1 else 0
+        for (mlp_prefix, proj), tensor in _fused_expert_weights.items():
+            scale = _fused_expert_scales.get((mlp_prefix, proj))
+            if tensor.dtype in (torch.float8_e4m3fn, torch.float8_e5m2) and scale is not None:
+                tensor = _dequant_fp8_block(tensor, scale, block_size=128)
+            weight = tensor.transpose(-1, -2)
+            if proj == "gate_up_proj":
+                param_name = f"{mlp_prefix}.w13"
+                try:
+                    param = model.get_parameter(param_name)
                 except AttributeError:
                     continue
-                weight_loader = getattr(param, "weight_loader", default_weight_loader)
-                weight_loader(param, f.get_tensor(weight_name))
-                loaded += 1
-
-                # Whisper: duplicate decoder embed_tokens -> lm_head (tied weights)
-                if is_whisper and mapped_name == "decoder.embed_tokens.emb.weight":
-                    lm_param = model.get_parameter("lm_head.embedding_op.emb.weight")
-                    lm_loader = getattr(lm_param, "weight_loader", default_weight_loader)
-                    lm_loader(lm_param, f.get_tensor(weight_name))
-                    loaded += 1
+                full_inter_2 = weight.shape[1]
+                half = full_inter_2 // 2
+                tp = param.shape[1] // 2
+                gate = weight[:, :half, :]
+                up = weight[:, half:, :]
+                param.data[:, :tp, :].copy_(gate[:, rank * tp:(rank + 1) * tp, :])
+                param.data[:, tp:, :].copy_(up[:, rank * tp:(rank + 1) * tp, :])
+            else:
+                param_name = f"{mlp_prefix}.w2"
+                try:
+                    param = model.get_parameter(param_name)
+                except AttributeError:
+                    continue
+                full_inter = weight.shape[2]
+                tp_inter = param.shape[2]
+                param.data.copy_(weight[:, :, rank * tp_inter:(rank + 1) * tp_inter])
+        del _fused_expert_weights, _fused_expert_scales
 
     print(f"  Loaded {loaded} weight shards.")
+    # #region agent log
+    if is_qwen3_vl_moe:
+        import json as _json, time as _time
+        _log_entry = {"sessionId": "64ddb7", "hypothesisId": "H1", "location": "weight_loader.py:summary",
+                      "message": "MoE weight loading summary",
+                      "data": {"gate_loaded": _debug_moe_gate_loaded, "fused_loaded": _debug_moe_fused_loaded,
+                               "skipped": _debug_moe_skipped[:20], "total_loaded": loaded},
+                      "timestamp": int(_time.time() * 1000)}
+        try:
+            with open(_debug_log_path, "a") as _lf:
+                _lf.write(_json.dumps(_log_entry) + "\n")
+        except Exception:
+            pass
+    # #endregion
 
 
 def _postprocess_fp8_weights(model: torch.nn.Module) -> None:
@@ -532,10 +689,29 @@ def load_model(
         config.dtype = dtype
         print("  Allocating Qwen2-VL model...")
         model = Qwen2VLForConditionalGeneration(config)
-    elif model_type == "qwen3_vl":
+    elif model_type in ("qwen3_vl", "qwen3_vl_moe"):
         config = Qwen3VLConfig.from_pretrained(model_name)
         config.dtype = dtype
-        print("  Allocating Qwen3-VL model...")
+        if config.is_moe:
+            print(f"  Allocating Qwen3-VL-MoE model ({config.num_experts} experts, "
+                  f"top-{config.num_experts_per_tok})...")
+        else:
+            print("  Allocating Qwen3-VL model...")
+        # #region agent log
+        import json as _json, time as _time
+        _log_entry = {"sessionId": "64ddb7", "hypothesisId": "H1", "location": "weight_loader.py:load_model",
+                      "message": f"Qwen3-VL config: is_moe={config.is_moe}",
+                      "data": {"model_type": model_type, "is_moe": config.is_moe,
+                               "num_experts": config.num_experts, "num_experts_per_tok": config.num_experts_per_tok,
+                               "moe_intermediate_size": config.moe_intermediate_size,
+                               "hidden_size": config.hidden_size, "num_hidden_layers": config.num_hidden_layers},
+                      "timestamp": int(_time.time() * 1000)}
+        try:
+            with open("/home/yak/.cursor/debug-64ddb7.log", "a") as _lf:
+                _lf.write(_json.dumps(_log_entry) + "\n")
+        except Exception:
+            pass
+        # #endregion
         model = Qwen3VLForConditionalGeneration(config, quant_config=quant_config)
     else:
         config = LlamaConfig.from_pretrained(model_name)

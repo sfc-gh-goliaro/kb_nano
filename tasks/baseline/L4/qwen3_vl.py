@@ -27,6 +27,7 @@ from ..L2.vision_patch_embed import VisionPatchEmbed
 from ..L2.vision_patch_merger import VisionPatchMerger
 from ..L2.vision_pos_embed_interpolate import VisionPosEmbedInterpolate
 from ..L3.llama_decoder import LlamaDecoderLayer
+from ..L3.qwen3_moe_decoder import Qwen3MoEDecoderLayer
 from ..L3.vision_block import VisionBlock
 
 
@@ -65,6 +66,12 @@ class Qwen3VLConfig:
     video_token_id: int = 151656
     vision: Qwen3VLVisionConfig = field(default_factory=Qwen3VLVisionConfig)
     dtype: torch.dtype = torch.bfloat16
+    # MoE fields (only used when is_moe=True)
+    is_moe: bool = False
+    num_experts: int = 0
+    num_experts_per_tok: int = 0
+    moe_intermediate_size: int = 0
+    norm_topk_prob: bool = True
 
     @classmethod
     def from_pretrained(cls, model_name: str) -> "Qwen3VLConfig":
@@ -73,6 +80,8 @@ class Qwen3VLConfig:
         text_config = hf.get_text_config()
         rope = getattr(text_config, "rope_scaling", None) or getattr(text_config, "rope_parameters", None) or {}
         rope_theta = getattr(text_config, "rope_theta", None) or rope.get("rope_theta", 5000000.0)
+
+        is_moe = hasattr(text_config, "num_experts") and text_config.num_experts > 0
         return cls(
             hidden_size=text_config.hidden_size,
             intermediate_size=text_config.intermediate_size,
@@ -104,6 +113,11 @@ class Qwen3VLConfig:
                 deepstack_visual_indexes=getattr(vc, "deepstack_visual_indexes", [8, 16, 24]),
                 num_position_embeddings=getattr(vc, "num_position_embeddings", 2304),
             ),
+            is_moe=is_moe,
+            num_experts=getattr(text_config, "num_experts", 0) if is_moe else 0,
+            num_experts_per_tok=getattr(text_config, "num_experts_per_tok", 0) if is_moe else 0,
+            moe_intermediate_size=getattr(text_config, "moe_intermediate_size", 0) if is_moe else 0,
+            norm_topk_prob=getattr(text_config, "norm_topk_prob", True) if is_moe else True,
         )
 
 
@@ -216,11 +230,18 @@ class Qwen3Model(nn.Module):
             config.rope_theta, config.mrope_section,
             config.mrope_interleaved,
         )
-        self.layers = nn.ModuleList([
-            LlamaDecoderLayer(config, rotary_emb=self.rotary_emb, qk_norm=True,
-                              quant_config=quant_config)
-            for _ in range(config.num_hidden_layers)
-        ])
+        if config.is_moe:
+            self.layers = nn.ModuleList([
+                Qwen3MoEDecoderLayer(config, rotary_emb=self.rotary_emb,
+                                     quant_config=quant_config)
+                for _ in range(config.num_hidden_layers)
+            ])
+        else:
+            self.layers = nn.ModuleList([
+                LlamaDecoderLayer(config, rotary_emb=self.rotary_emb, qk_norm=True,
+                                  quant_config=quant_config)
+                for _ in range(config.num_hidden_layers)
+            ])
         self.norm = RMSNorm(config.hidden_size, eps=config.rms_norm_eps)
 
     def forward(self, input_ids, positions, inputs_embeds=None,
@@ -248,6 +269,12 @@ class Qwen3VLForConditionalGeneration(nn.Module):
     }
 
     def __init__(self, config: Qwen3VLConfig, quant_config: dict | None = None):
+        if config.is_moe:
+            self.packed_modules_mapping = {
+                "q_proj": ("qkv_proj", "q"),
+                "k_proj": ("qkv_proj", "k"),
+                "v_proj": ("qkv_proj", "v"),
+            }
         super().__init__()
         self.config = config
         self.quant_config = quant_config

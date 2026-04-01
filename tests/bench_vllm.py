@@ -122,7 +122,7 @@ def main():
 
     with open(sys.argv[1]) as f:
         cfg = json.load(f)
-    llm = LLM(
+    llm_kwargs = dict(
         model=cfg["model"],
         seed=cfg["seed"],
         enforce_eager=cfg.get("enforce_eager", False),
@@ -131,6 +131,9 @@ def main():
         max_model_len=cfg["max_model_len"],
         enable_prefix_caching=False,
     )
+    if cfg.get("load_format"):
+        llm_kwargs["load_format"] = cfg["load_format"]
+    llm = LLM(**llm_kwargs)
 
     # Warmup
     llm.generate(
@@ -524,7 +527,7 @@ def main():
     model_name = cfg["model"]
     processor = AutoProcessor.from_pretrained(model_name, trust_remote_code=True)
 
-    llm = LLM(
+    llm_kwargs = dict(
         model=model_name,
         seed=cfg["seed"],
         enforce_eager=cfg.get("enforce_eager", False),
@@ -533,6 +536,9 @@ def main():
         max_model_len=cfg["max_model_len"],
         enable_prefix_caching=False,
     )
+    if cfg.get("load_format"):
+        llm_kwargs["load_format"] = cfg["load_format"]
+    llm = LLM(**llm_kwargs)
 
     llm.generate(
         [dict(prompt_token_ids=[0] * 16)],
@@ -885,7 +891,7 @@ def main():
     with open(sys.argv[1]) as f:
         cfg = json.load(f)
 
-    llm = LLM(
+    llm_kwargs = dict(
         model=cfg["model"],
         seed=cfg["seed"],
         enforce_eager=cfg.get("enforce_eager", False),
@@ -894,6 +900,9 @@ def main():
         max_model_len=cfg["max_model_len"],
         enable_prefix_caching=False,
     )
+    if cfg.get("load_format"):
+        llm_kwargs["load_format"] = cfg["load_format"]
+    llm = LLM(**llm_kwargs)
 
     from vllm.inputs import ExplicitEncoderDecoderPrompt, TextPrompt
 
@@ -1456,6 +1465,7 @@ def main():
             "max_model_len": global_max_seq_len,
             "scenarios": scenario_data,
             "latency_scenarios": latency_data,
+            # "load_format": "fastsafetensors",  # disabled: OOM for large models
         }
         vllm_raw = run_worker(
             vllm_worker, vllm_config,

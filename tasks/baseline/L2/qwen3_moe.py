@@ -1,0 +1,88 @@
+"""Qwen3 Mixture-of-Experts block with fused Triton grouped GEMM.
+
+Similar to MixtralMoE but uses Qwen3-style naming and supports
+fused 3D expert weights (gate_up_proj / down_proj stored as [E, ...]).
+"""
+
+from __future__ import annotations
+
+import torch
+import torch.nn as nn
+
+from ....infra.tp import _tp_rank, _tp_size
+from ..L1.allreduce import AllReduce
+from ..L1.linear import Linear
+from ..L1.topk_softmax import TopKSoftmax
+from ..L2.fused_experts import FusedExperts
+
+
+class Qwen3MoE(nn.Module):
+    """Qwen3 Mixture-of-Experts with fused Triton grouped GEMM.
+
+    Weights:
+      gate:  [num_experts, hidden_size]
+      w13: [E, 2*moe_intermediate_per_tp, hidden_size] -- gate (w1) and up (w3)
+      w2:  [E, hidden_size, moe_intermediate_per_tp]
+    """
+
+    def __init__(self, config, quant_config: dict | None = None):
+        super().__init__()
+        self.num_experts = config.num_experts
+        self.top_k = config.num_experts_per_tok
+        self.hidden_size = config.hidden_size
+        tp = _tp_size()
+        self.tp_size = tp
+        self.intermediate_per_tp = config.moe_intermediate_size // tp
+        self.renormalize = getattr(config, "norm_topk_prob", True)
+
+        self.gate_weight = nn.Parameter(
+            torch.empty(config.num_experts, config.hidden_size),
+        )
+        self.gate_weight.weight_loader = lambda p, w: p.data.copy_(w)
+
+        self.w13 = nn.Parameter(torch.empty(
+            config.num_experts, 2 * self.intermediate_per_tp, config.hidden_size,
+        ))
+        self.w13.weight_loader = self._w13_weight_loader
+
+        self.w2 = nn.Parameter(torch.empty(
+            config.num_experts, config.hidden_size, self.intermediate_per_tp,
+        ))
+        self.w2.weight_loader = self._w2_weight_loader
+
+        self.linear_op = Linear()
+        self.topk_softmax = TopKSoftmax()
+        self.fused_experts = FusedExperts()
+        self.allreduce = AllReduce()
+
+    def _w13_weight_loader(self, param, loaded_weight, expert_id: int, is_w1: bool):
+        tp, rank = _tp_size(), _tp_rank()
+        N = self.intermediate_per_tp
+        shard = loaded_weight.narrow(0, rank * N, N)
+        offset = 0 if is_w1 else N
+        param.data[expert_id, offset:offset + N, :].copy_(shard)
+
+    def _w2_weight_loader(self, param, loaded_weight, expert_id: int):
+        tp, rank = _tp_size(), _tp_rank()
+        N = self.intermediate_per_tp
+        param.data[expert_id].copy_(loaded_weight.narrow(1, rank * N, N))
+
+    def forward(self, hidden_states: torch.Tensor) -> torch.Tensor:
+        orig_shape = hidden_states.shape
+        hidden_states = hidden_states.view(-1, self.hidden_size)
+
+        router_logits = self.linear_op(hidden_states, self.gate_weight)
+        topk_weights, topk_ids = self.topk_softmax(
+            router_logits, self.top_k, renormalize=self.renormalize,
+        )
+        topk_weights = topk_weights.to(hidden_states.dtype)
+
+        out = self.fused_experts(
+            hidden_states, self.w13, self.w2,
+            topk_weights, topk_ids, self.num_experts,
+        )
+
+        if self.tp_size > 1:
+            out = self.allreduce(out)
+
+        return out.view(orig_shape)
