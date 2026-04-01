@@ -44,8 +44,6 @@ _THIS_DIR = Path(__file__).resolve().parent
 _PACKAGE_DIR = _THIS_DIR.parent
 _PROJECT_ROOT = _PACKAGE_DIR.parent
 
-sys.path.insert(0, str(_PROJECT_ROOT))
-
 from kb_nano.bench.eval.config import MODEL_CATEGORY
 from kb_nano.bench.utils.worker import run_worker
 from kb_nano.bench.utils.workloads import (
@@ -836,13 +834,19 @@ def _preprocess(text, prompt_text, ref_audio, ref_sr, tokenizer, speech_tok, cam
 def main():
     with open(sys.argv[1]) as f:
         cfg = json.load(f)
-    sys.path.insert(0, cfg["project_root"])
     pkg = cfg["package_name"]
 
-    cosyvoice_mod = __import__(
-        f"{pkg}.tasks.baseline.L4.cosyvoice3",
-        fromlist=["CosyVoice3Config", "CosyVoice3ForTTS"],
-    )
+    try:
+        cosyvoice_mod = __import__(
+            f"{pkg}.tasks.baseline.L4.cosyvoice3",
+            fromlist=["CosyVoice3Config", "CosyVoice3ForTTS"],
+        )
+    except ImportError:
+        sys.path.insert(0, cfg["project_root"])
+        cosyvoice_mod = __import__(
+            f"{pkg}.tasks.baseline.L4.cosyvoice3",
+            fromlist=["CosyVoice3Config", "CosyVoice3ForTTS"],
+        )
     CosyVoice3Config = cosyvoice_mod.CosyVoice3Config
     CosyVoice3ForTTS = cosyvoice_mod.CosyVoice3ForTTS
 
@@ -853,10 +857,9 @@ def main():
     device = torch.device("cuda")
 
     model = CosyVoice3ForTTS(config, model_stage="e2e")
-    model = model.to(device=device, dtype=torch.bfloat16)
     model.load_weights_e2e(model_dir, device)
     model.eval()
-    print(f"  Loaded CosyVoice3 e2e model: {cfg['model']}", file=sys.stderr)
+    print(f"  Loaded CosyVoice3 e2e model (talker=f32, code2wav=f32): {cfg['model']}", file=sys.stderr)
 
     tokenizer, speech_tok, campplus, feat_ext = _init_preprocessing(model_dir, config)
 
@@ -1051,16 +1054,14 @@ def main():
             conds = conds.transpose(1, 2)
             mel_mask = (~make_pad_mask(torch.tensor([mel_len1 + mel_len2]))).to(h_kb)
 
-            torch.manual_seed(12345); torch.cuda.manual_seed(12345)
             feat_kb, _ = kb_c2w.flow_model.decoder(
                 mu=h_kb.transpose(1, 2).contiguous(), mask=mel_mask.unsqueeze(1),
-                spks=emb_kb, cond=conds, n_timesteps=10,
+                spks=emb_kb, cond=conds, n_timesteps=10, cfm_seed=12345,
             )
 
-            torch.manual_seed(12345); torch.cuda.manual_seed(12345)
             feat_vl, _ = vl_c2w.flow_model.decoder(
                 mu=h_vl.transpose(1, 2).contiguous(), mask=mel_mask.unsqueeze(1),
-                spks=emb_vl, cond=conds, n_timesteps=10,
+                spks=emb_vl, cond=conds, n_timesteps=10, cfm_seed=12345,
             )
 
             feat_kb_gen = feat_kb[:, :, mel_len1:].float()
@@ -1492,17 +1493,50 @@ def _run_diffusion(args, gpu_name: str):
         sys.exit(1)
 
 
+def _compute_mel_spectrogram(audio: np.ndarray, sr: int = 24000,
+                              n_fft: int = 1024, hop_length: int = 256,
+                              n_mels: int = 80) -> np.ndarray:
+    """Compute log-mel spectrogram from audio waveform using numpy/scipy."""
+    from scipy.signal import get_window
+
+    win = get_window("hann", n_fft, fftbins=True)
+    n_frames = 1 + (len(audio) - n_fft) // hop_length
+    if n_frames <= 0:
+        return np.zeros((n_mels, 1), dtype=np.float32)
+
+    frames = np.lib.stride_tricks.as_strided(
+        audio,
+        shape=(n_frames, n_fft),
+        strides=(audio.strides[0] * hop_length, audio.strides[0]),
+    ).copy()
+    frames *= win
+    spec = np.abs(np.fft.rfft(frames, n=n_fft, axis=1)).T ** 2
+
+    fmin, fmax = 0.0, sr / 2.0
+    mel_lo = 2595.0 * np.log10(1.0 + fmin / 700.0)
+    mel_hi = 2595.0 * np.log10(1.0 + fmax / 700.0)
+    mel_pts = 700.0 * (10.0 ** (np.linspace(mel_lo, mel_hi, n_mels + 2) / 2595.0) - 1.0)
+    bins = np.floor((n_fft + 1) * mel_pts / sr).astype(int)
+
+    fb = np.zeros((n_mels, n_fft // 2 + 1), dtype=np.float32)
+    for m in range(n_mels):
+        for k in range(bins[m], bins[m + 1]):
+            fb[m, k] = (k - bins[m]) / max(bins[m + 1] - bins[m], 1)
+        for k in range(bins[m + 1], bins[m + 2]):
+            fb[m, k] = (bins[m + 2] - k) / max(bins[m + 2] - bins[m + 1], 1)
+
+    mel_spec = fb @ spec
+    log_mel = np.log(np.maximum(mel_spec, 1e-10))
+    return log_mel.astype(np.float32)
+
+
 def _compare_tts_audio(kb_audio_dir: str, vllm_audio_dir: str) -> dict:
-    """Functional correctness: verify both engines produce non-empty audio.
+    """Compare TTS audio between kb-nano and vllm-omni using mel spectrogram
+    cosine similarity.
 
-    The Talker LLM uses different attention backends (SDPA in kb-nano vs
-    PagedAttention in vllm-omni), so greedy decoding produces different
-    token sequences.  This means raw waveform cosine similarity is NOT a
-    meaningful metric for end-to-end comparison.
-
-    Code2Wav equivalence (same tokens → same mel, cos≈0.999) is verified
-    separately.  Here we check that both engines produce non-empty audio
-    of reasonable length for each utterance.
+    Raw waveform cosine similarity is phase-sensitive and misleading.
+    Mel spectrogram captures perceptual content and is the standard metric
+    for TTS evaluation.
     """
     import torch
     from collections import defaultdict
@@ -1522,13 +1556,13 @@ def _compare_tts_audio(kb_audio_dir: str, vllm_audio_dir: str) -> dict:
     for fname in common:
         kb_audio = torch.load(
             os.path.join(kb_audio_dir, fname), map_location="cpu", weights_only=True
-        ).detach().float().flatten()
+        ).detach().float().flatten().numpy()
         vllm_audio = torch.load(
             os.path.join(vllm_audio_dir, fname), map_location="cpu", weights_only=True
-        ).detach().float().flatten()
+        ).detach().float().flatten().numpy()
 
-        kb_len = kb_audio.numel()
-        vllm_len = vllm_audio.numel()
+        kb_len = len(kb_audio)
+        vllm_len = len(vllm_audio)
         scenario_name = fname.rsplit("_utt", 1)[0]
 
         entry: dict = {
@@ -1539,64 +1573,106 @@ def _compare_tts_audio(kb_audio_dir: str, vllm_audio_dir: str) -> dict:
             "vllm_nonempty": vllm_len > 0,
             "both_nonempty": kb_len > 0 and vllm_len > 0,
         }
+
         if kb_len > 0 and vllm_len > 0:
             entry["len_ratio"] = kb_len / vllm_len
+            min_len = min(kb_len, vllm_len)
+            kb_mel = _compute_mel_spectrogram(kb_audio[:min_len])
+            vllm_mel = _compute_mel_spectrogram(vllm_audio[:min_len])
+            kb_flat = kb_mel.flatten()
+            vllm_flat = vllm_mel.flatten()
+            norm_product = np.linalg.norm(kb_flat) * np.linalg.norm(vllm_flat)
+            if norm_product > 1e-12:
+                entry["mel_cosine_sim"] = float(
+                    np.dot(kb_flat, vllm_flat) / norm_product)
+            else:
+                entry["mel_cosine_sim"] = 0.0
+            entry["length_match"] = abs(kb_len - vllm_len) < 10
 
         scenario_utts[scenario_name].append(entry)
 
     results = {}
     for scenario, utts in scenario_utts.items():
+        mel_sims = [u["mel_cosine_sim"] for u in utts if "mel_cosine_sim" in u]
         len_ratios = [u["len_ratio"] for u in utts if "len_ratio" in u]
+        length_matches = sum(1 for u in utts if u.get("length_match", False))
         results[scenario] = {
             "num_utterances": len(utts),
             "both_nonempty": sum(1 for u in utts if u["both_nonempty"]),
             "kb_nonempty": sum(1 for u in utts if u["kb_nonempty"]),
             "vllm_nonempty": sum(1 for u in utts if u["vllm_nonempty"]),
+            "mel_cosine_sims": mel_sims,
+            "mean_mel_cosine_sim": float(np.mean(mel_sims)) if mel_sims else None,
+            "median_mel_cosine_sim": float(np.median(mel_sims)) if mel_sims else None,
+            "min_mel_cosine_sim": float(np.min(mel_sims)) if mel_sims else None,
+            "p10_mel_cosine_sim": float(np.percentile(mel_sims, 10)) if mel_sims else None,
             "mean_len_ratio": float(np.mean(len_ratios)) if len_ratios else None,
+            "length_match_count": length_matches,
+            "length_match_total": len(utts),
             "per_utt": utts,
         }
     return results
 
 
 def _print_tts_correctness(audio_check: dict):
-    """Print functional audio comparison table."""
-    print("\n" + "=" * 90)
-    print("  CORRECTNESS: functional audio check (both engines produce audio)")
-    print("=" * 90)
-    print(f"  {'Scenario':<16} {'Utts':>5} {'KB OK':>6} {'VL OK':>6} "
-          f"{'Both OK':>8} {'Len Ratio':>10} {'Result':>8}")
-    print("  " + "-" * 70)
+    """Print e2e correctness table using mel spectrogram cosine similarity.
 
-    all_pass = True
+    PASS/FAIL is based on the **overall median** mel cosine similarity across
+    all utterances (threshold >= 0.88).  Median is used instead of mean because
+    attention-backend divergence (SDPA vs TritonAttention) causes a long tail
+    of outliers that disproportionately pulls down the mean.
+    """
+    THRESHOLD = 0.88
+
+    print("\n" + "=" * 100)
+    print("  E2E CORRECTNESS: mel spectrogram cosine similarity (median for PASS/FAIL)")
+    print("=" * 100)
+    print(f"  {'Scenario':<16} {'Utts':>5} {'Median':>8} {'Mean':>8} "
+          f"{'P10':>8} {'Min':>8} {'LenMatch':>10}")
+    print("  " + "-" * 80)
+
+    all_sims: list[float] = []
+    all_medians = []
     total_utts = 0
-    total_both_ok = 0
     for scenario, s in sorted(audio_check.items()):
         n = s["num_utterances"]
-        kb_ok = s["kb_nonempty"]
-        vl_ok = s["vllm_nonempty"]
-        both_ok = s["both_nonempty"]
         total_utts += n
-        total_both_ok += both_ok
-        lr = s["mean_len_ratio"]
-        lr_s = f"{lr:.3f}" if lr is not None else "N/A"
-        verdict = "PASS" if kb_ok >= 0.8 * n and vl_ok >= 0.8 * n else "FAIL"
-        if verdict != "PASS":
-            all_pass = False
-        print(f"  {scenario:<16} {n:>5} {kb_ok:>6} {vl_ok:>6} "
-              f"{both_ok:>8} {lr_s:>10} {verdict:>8}")
+        median_sim = s.get("median_mel_cosine_sim")
+        mean_sim = s.get("mean_mel_cosine_sim")
+        min_sim = s.get("min_mel_cosine_sim")
+        p10_sim = s.get("p10_mel_cosine_sim")
+        lm_count = s.get("length_match_count", 0)
+        lm_total = s.get("length_match_total", n)
+
+        if median_sim is not None:
+            all_medians.append(median_sim)
+        sims = s.get("mel_cosine_sims", [])
+        all_sims.extend(sims)
+
+        def _fmt(v):
+            return f"{v:.3f}" if v is not None else "N/A"
+
+        lm_str = f"{lm_count}/{lm_total}"
+        print(f"  {scenario:<16} {n:>5} {_fmt(median_sim):>8} {_fmt(mean_sim):>8} "
+              f"{_fmt(p10_sim):>8} {_fmt(min_sim):>8} "
+              f"{lm_str:>10}")
+
+    overall_median = float(np.median(all_sims)) if all_sims else None
+    overall_mean = float(np.mean(all_sims)) if all_sims else None
 
     print()
-    print(f"  Total: {total_utts} utterances, {total_both_ok} both produced audio")
+    print(f"  Overall median mel cosine similarity: "
+          f"{overall_median:.3f}" if overall_median is not None else "  N/A")
+    print(f"  Overall mean mel cosine similarity:   "
+          f"{overall_mean:.3f}" if overall_mean is not None else "  N/A")
     print()
-    print("  NOTE: Raw audio waveform comparison (cosine similarity) is NOT meaningful")
-    print("  across engines because the Talker LLM uses different attention backends")
-    print("  (SDPA vs PagedAttention), producing different token sequences.")
-    print("  Code2Wav equivalence is verified separately (same tokens → cos≈0.999).")
-    print()
-    if all_pass:
-        print("  RESULT: PASS — both engines produce non-empty audio")
+
+    passed = overall_median is not None and overall_median >= THRESHOLD
+    if passed:
+        print(f"  E2E RESULT: PASS (overall median {overall_median:.3f} >= {THRESHOLD})")
     else:
-        print("  RESULT: FAIL — some utterances produced empty audio")
+        print(f"  E2E RESULT: FAIL (overall median "
+              f"{overall_median:.3f if overall_median is not None else 'N/A'} < {THRESHOLD})")
     print()
 
 

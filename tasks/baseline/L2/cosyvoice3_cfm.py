@@ -38,11 +38,20 @@ class CausalConditionalCFM(BASECFM):
         self.estimator = estimator
 
     @torch.inference_mode()
-    def forward(self, mu, mask, n_timesteps, temperature=1.0, spks=None, cond=None):
-        z = torch.randn(
-            (mu.size(0), mu.size(1), mu.size(2)),
-            device=mu.device, dtype=mu.dtype,
-        ) * temperature
+    def forward(self, mu, mask, n_timesteps, temperature=1.0, spks=None, cond=None,
+                cfm_seed: int | None = None):
+        if cfm_seed is not None:
+            gen = torch.Generator(device=mu.device)
+            gen.manual_seed(cfm_seed)
+            z = torch.randn(
+                (mu.size(0), mu.size(1), mu.size(2)),
+                device=mu.device, dtype=mu.dtype, generator=gen,
+            ) * temperature
+        else:
+            z = torch.randn(
+                (mu.size(0), mu.size(1), mu.size(2)),
+                device=mu.device, dtype=mu.dtype,
+            ) * temperature
 
         t_span = torch.linspace(0, 1, n_timesteps + 1, device=mu.device, dtype=mu.dtype)
         if self.t_scheduler == "cosine":

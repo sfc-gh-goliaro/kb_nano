@@ -86,7 +86,7 @@ class DenseAttention(nn.Module):
             self.fa_func = _resolve_flash_attn_func()
 
     def forward(self, query, key, value, softmax_scale=None, causal=False):
-        if self.fa_func is not None:
+        if self.fa_func is not None and query.dtype != torch.float32:
             out = self.fa_func(
                 query, key, value,
                 softmax_scale=softmax_scale,

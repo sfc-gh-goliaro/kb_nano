@@ -323,6 +323,7 @@ class CosyVoice3Code2Wav(nn.Module):
         prompt_feat: torch.Tensor,
         embedding: torch.Tensor,
         n_timesteps: int = 10,
+        cfm_seed: int | None = None,
     ) -> torch.Tensor:
         device = token.device
         dtype = next(self.flow_model.parameters()).dtype
@@ -362,6 +363,7 @@ class CosyVoice3Code2Wav(nn.Module):
             spks=embedding,
             cond=conds,
             n_timesteps=n_timesteps,
+            cfm_seed=cfm_seed,
         )
         feat = feat[:, :, mel_len1:]
 
@@ -570,6 +572,13 @@ class CosyVoice3ForTTS(nn.Module):
         speech_token_size = self.config.speech_token_size
         generated_tokens = []
 
+        prompt_token_set: set[int] = set()
+        if repetition_penalty != 1.0:
+            logits_size = speech_token_size + 200
+            placeholder_ids = [1] * (2 + speech_token.shape[1])
+            all_prompt_ids = placeholder_ids + input_ids[0].cpu().tolist()
+            prompt_token_set = {t for t in all_prompt_ids if t < logits_size}
+
         cur_emb = prefix_emb
         kv_cache = None
         for step in range(max_tokens):
@@ -581,14 +590,16 @@ class CosyVoice3ForTTS(nn.Module):
             last_hidden = hidden[:, -1:]
             logits = self.compute_logits(last_hidden).squeeze(0).squeeze(0).float()
 
-            if repetition_penalty != 1.0 and generated_tokens:
-                seen = torch.tensor(generated_tokens, device=device).unique()
-                penalty_logits = logits[seen]
-                logits[seen] = torch.where(
-                    penalty_logits > 0,
-                    penalty_logits / repetition_penalty,
-                    penalty_logits * repetition_penalty,
-                )
+            if repetition_penalty != 1.0:
+                seen_set = prompt_token_set | set(generated_tokens)
+                if seen_set:
+                    seen = torch.tensor(sorted(seen_set), device=device)
+                    penalty_logits = logits[seen]
+                    logits[seen] = torch.where(
+                        penalty_logits > 0,
+                        penalty_logits / repetition_penalty,
+                        penalty_logits * repetition_penalty,
+                    )
 
             if temperature > 0:
                 logits = logits / temperature
@@ -626,17 +637,13 @@ class CosyVoice3ForTTS(nn.Module):
 
         gen_token = torch.tensor([generated_tokens], device=device)
 
-        if cfm_seed is not None:
-            torch.manual_seed(cfm_seed)
-            if device.type == "cuda":
-                torch.cuda.manual_seed(cfm_seed)
-
         audio = self.code2wav(
             token=gen_token,
             prompt_token=speech_token[:1].to(device),
-            prompt_feat=speech_feat[:1].to(device=device, dtype=dtype),
-            embedding=spk_embedding[:1].to(device=device, dtype=dtype),
+            prompt_feat=speech_feat[:1].to(device=device),
+            embedding=spk_embedding[:1].to(device=device),
             n_timesteps=n_timesteps,
+            cfm_seed=cfm_seed,
         )
         return audio, generated_tokens
 
@@ -723,7 +730,7 @@ class CosyVoice3ForTTS(nn.Module):
 
         qwen_dir = os.path.join(model_dir, self._qwen_pretrain_path)
         qwen_config = LlamaConfig.from_pretrained(qwen_dir)
-        new_llm = LlamaModel(qwen_config).to(device=device, dtype=torch.bfloat16)
+        new_llm = LlamaModel(qwen_config).to(device=device, dtype=torch.float32)
         self.talker.llm = new_llm
 
         llm_path = os.path.join(model_dir, "llm.pt")
@@ -791,6 +798,7 @@ class CosyVoice3ForTTS(nn.Module):
             if k.startswith("llm_decoder.")
         }
         self.talker.llm_decoder.load_state_dict(llm_decoder_state)
-        self.talker.to(device).eval()
+        self.talker.to(device=device, dtype=torch.float32).eval()
 
         self.code2wav.load_weights(model_dir, device)
+        self.code2wav.flow_model.to(dtype=torch.float32)
