@@ -1,20 +1,15 @@
 #!/usr/bin/env python3
 """
 Throughput, latency, and correctness benchmark: kb-nano vs vllm-omni
-for diffusion models (FLUX.1-dev, HunyuanVideo-1.5).
+for diffusion models (FLUX.1-dev, HunyuanVideo-1.5) and TTS models (CosyVoice3).
 
-Runs standardized diffusion workloads and compares:
-  - Throughput: images/sec or videos/sec at various resolutions
-  - Latency: per-image/video latency with percentile stats
-  - Correctness: per-batch/prompt MSE and cosine similarity between
-    outputs of both engines
+The benchmark mode is inferred from the model's category:
+  - diffusion: FLUX.1-dev, HunyuanVideo-1.5
+  - tts: CosyVoice3
 
-FLUX: Both engines run with output_type="latent"; packed latents are saved
-per-batch and compared numerically.  Prompts from nateraw/parti-prompts.
-
-HunyuanVideo: Since vllm-omni does not expose raw latents through its sync
-API, both engines produce decoded video frames (PIL) which are saved as
-numpy arrays and compared per-prompt.  Prompts from Movie Gen Video Bench.
+Diffusion workloads compare throughput, latency, and correctness (latent/frame).
+TTS workloads compare throughput (utterances/sec), latency, and mel spectrogram
+cosine similarity.
 
 Each engine runs in a subprocess to avoid import contamination.
 
@@ -25,6 +20,9 @@ Usage:
 
     # HunyuanVideo
     python tests/bench_vllm_omni.py --model hunyuanvideo-community/HunyuanVideo-1.5-Diffusers-480p_t2v
+
+    # CosyVoice3
+    python tests/bench_vllm_omni.py --model FunAudioLLM/Fun-CosyVoice3-0.5B-2512
 """
 
 from __future__ import annotations
@@ -45,17 +43,21 @@ _THIS_DIR = Path(__file__).resolve().parent
 _PACKAGE_DIR = _THIS_DIR.parent
 _PROJECT_ROOT = _PACKAGE_DIR.parent
 
-sys.path.insert(0, str(_PROJECT_ROOT))
-
+from kb_nano.bench.eval.config import MODEL_CATEGORY
 from kb_nano.bench.utils.worker import run_worker
 from kb_nano.bench.utils.workloads import (
+    COSYVOICE3_CONFIG,
     DIFFUSION_LATENCY_WORKLOADS,
     DIFFUSION_THROUGHPUT_WORKLOADS,
     FLUX_CONFIG,
     HUNYUAN_VIDEO_CONFIG,
+    TTS_LATENCY_WORKLOADS,
+    TTS_THROUGHPUT_WORKLOADS,
     VIDEO_DIFFUSION_LATENCY_WORKLOADS,
     VIDEO_DIFFUSION_THROUGHPUT_WORKLOADS,
 )
+
+_SEED_TTS_EVAL_REPO = "zhaochenyang20/seed-tts-eval"
 
 
 def _detect_gpu_name() -> str:
@@ -122,6 +124,61 @@ def _get_movie_gen_prompts(seed: int = 42) -> list[str]:
     if _MOVIE_GEN_PROMPTS is None:
         _MOVIE_GEN_PROMPTS = _load_movie_gen_prompts(seed)
     return _MOVIE_GEN_PROMPTS
+
+
+def _load_seed_tts_eval(seed: int = 42, max_samples: int = 200) -> list[dict]:
+    """Load text pairs from SEED-TTS-Eval for TTS benchmarking.
+
+    Downloads only en/meta.lst (a few KB) via hf_hub_download rather than
+    the full 1 GB+ repo, avoiding the many-small-files bottleneck.
+
+    Each meta.lst line has the format:
+        utterance_id | prompt_text | prompt_wav_path | target_text
+
+    Returns list of dicts with keys: text, prompt_text, prompt_wav_rel,
+    utterance_id.
+    """
+    from huggingface_hub import hf_hub_download
+
+    meta_path = hf_hub_download(
+        _SEED_TTS_EVAL_REPO, filename="en/meta.lst",
+        repo_type="dataset",
+    )
+
+    samples = []
+    with open(meta_path) as f:
+        for line in f:
+            line = line.strip()
+            if not line:
+                continue
+            parts = line.split("|")
+            if len(parts) < 4:
+                continue
+            utt_id, prompt_text, prompt_wav_rel, target_text = (
+                parts[0].strip(), parts[1].strip(),
+                parts[2].strip(), parts[3].strip(),
+            )
+            samples.append({
+                "text": target_text,
+                "prompt_text": prompt_text,
+                "prompt_wav_rel": prompt_wav_rel,
+                "utterance_id": utt_id,
+            })
+
+    rng = random.Random(seed)
+    rng.shuffle(samples)
+    return samples[:max_samples]
+
+
+_TTS_SAMPLES: list[dict] | None = None
+
+
+def _get_tts_samples(seed: int = 42, max_samples: int = 200) -> list[dict]:
+    """Return TTS samples (cached after first load)."""
+    global _TTS_SAMPLES
+    if _TTS_SAMPLES is None:
+        _TTS_SAMPLES = _load_seed_tts_eval(seed, max_samples)
+    return _TTS_SAMPLES
 
 
 # ═══════════════════════════════════════════════════════════════════════════
@@ -310,10 +367,13 @@ from tqdm import tqdm
 def main():
     with open(sys.argv[1]) as f:
         cfg = json.load(f)
-    sys.path.insert(0, cfg["project_root"])
     pkg = cfg["package_name"]
 
-    eng_mod = __import__(f"{pkg}.infra.diffusion_engine", fromlist=["DiffusionEngine"])
+    try:
+        eng_mod = __import__(f"{pkg}.infra.diffusion_engine", fromlist=["DiffusionEngine"])
+    except (ImportError, ModuleNotFoundError):
+        sys.path.insert(0, cfg["project_root"])
+        eng_mod = __import__(f"{pkg}.infra.diffusion_engine", fromlist=["DiffusionEngine"])
     flux_mod = __import__(f"{pkg}.tasks.baseline.L4.flux", fromlist=["DiffusionSamplingParams"])
     DiffusionEngine = eng_mod.DiffusionEngine
     DiffusionSamplingParams = flux_mod.DiffusionSamplingParams
@@ -434,12 +494,18 @@ from tqdm import tqdm
 def main():
     with open(sys.argv[1]) as f:
         cfg = json.load(f)
-    sys.path.insert(0, cfg["project_root"])
 
-    from kb_nano.infra.diffusion_engine import DiffusionEngine
-    from kb_nano.tasks.baseline.L4.hunyuan_video import (
-        HunyuanVideoDiffusionSamplingParams,
-    )
+    try:
+        from kb_nano.infra.diffusion_engine import DiffusionEngine
+        from kb_nano.tasks.baseline.L4.hunyuan_video import (
+            HunyuanVideoDiffusionSamplingParams,
+        )
+    except (ImportError, ModuleNotFoundError):
+        sys.path.insert(0, cfg["project_root"])
+        from kb_nano.infra.diffusion_engine import DiffusionEngine
+        from kb_nano.tasks.baseline.L4.hunyuan_video import (
+            HunyuanVideoDiffusionSamplingParams,
+        )
 
     engine = DiffusionEngine(
         model_name=cfg["model"], seed=cfg["seed"], enforce_eager=True,
@@ -629,6 +695,589 @@ if __name__ == "__main__":
 
 
 # ═══════════════════════════════════════════════════════════════════════════
+# TTS workers (CosyVoice3)
+# ═══════════════════════════════════════════════════════════════════════════
+
+VLLM_OMNI_TTS_WORKER = r'''
+import asyncio, json, os, sys, time, torch
+import numpy as np
+from tqdm import tqdm
+
+def _find_stage_config():
+    """Return a patched cosyvoice3.yaml with enforce_eager=true.
+
+    CUDA graph capture for the multi-stage CosyVoice3 pipeline can
+    take 10+ minutes on first run, easily exceeding the default
+    stage_init_timeout.  We copy the shipped YAML and force eager
+    mode so startup is fast and predictable.
+    """
+    import tempfile
+    import vllm_omni
+    import yaml
+
+    pkg_dir = os.path.dirname(vllm_omni.__file__)
+    src = os.path.join(pkg_dir, "model_executor", "stage_configs", "cosyvoice3.yaml")
+    if not os.path.exists(src):
+        raise FileNotFoundError(f"cosyvoice3.yaml not found at {src}")
+
+    with open(src) as f:
+        cfg = yaml.safe_load(f)
+
+    for stage in cfg.get("stage_args", []):
+        ea = stage.get("engine_args", {})
+        ea["enforce_eager"] = True
+
+    patched = tempfile.NamedTemporaryFile(
+        mode="w", suffix=".yaml", prefix="cosyvoice3_eager_",
+        delete=False,
+    )
+    yaml.dump(cfg, patched, default_flow_style=False)
+    patched.close()
+    print(f"  Using eager-mode stage config: {patched.name}", file=sys.stderr)
+    return patched.name
+
+def _download_and_get_tokenizer_path(model_name):
+    """Download model and return path to CosyVoice-BlankEN tokenizer dir."""
+    from huggingface_hub import snapshot_download
+    model_dir = snapshot_download(model_name)
+    tok_dir = os.path.join(model_dir, "CosyVoice-BlankEN")
+    if os.path.isdir(tok_dir):
+        return model_dir, tok_dir
+    raise FileNotFoundError(f"Tokenizer dir not found: {tok_dir}")
+
+def _ensure_config_has_model_type(model_dir, model_type="cosyvoice3"):
+    """Patch config.json to include model_type if missing.
+
+    The HF repo ships an empty config.json (``{}``), which causes
+    ``AutoConfig.from_pretrained`` to fail with *Unrecognized model*.
+    vllm-omni's ``OmniEngineArgs`` injects ``architectures`` via
+    ``hf_overrides`` but does not inject ``model_type``.  Writing it
+    into the cached config.json is the simplest workaround.
+    """
+    cfg_path = os.path.join(model_dir, "config.json")
+    if not os.path.exists(cfg_path):
+        return
+    with open(cfg_path) as f:
+        data = json.load(f)
+    if data.get("model_type") == model_type:
+        return
+    data["model_type"] = model_type
+    with open(cfg_path, "w") as f:
+        json.dump(data, f, indent=2)
+    print(f"  Patched {cfg_path}: added model_type={model_type!r}", file=sys.stderr)
+
+def _ensure_mel_filters_asset():
+    """Download mel_filters.npz for vllm-omni's CosyVoice3 audio processor."""
+    import urllib.request
+    import vllm_omni
+    pkg_dir = os.path.dirname(vllm_omni.__file__)
+    assets_dir = os.path.join(pkg_dir, "model_executor", "models", "cosyvoice3", "assets")
+    filters_path = os.path.join(assets_dir, "mel_filters.npz")
+    if os.path.exists(filters_path):
+        return
+    os.makedirs(assets_dir, exist_ok=True)
+    url = "https://raw.githubusercontent.com/openai/whisper/main/whisper/assets/mel_filters.npz"
+    print(f"  Downloading mel_filters.npz from {url}", file=sys.stderr)
+    urllib.request.urlretrieve(url, filters_path)
+    print(f"  Saved to {filters_path}", file=sys.stderr)
+
+def _make_prompt(text, prompt_text, ref_audio, ref_sr):
+    """Build an Omni prompt dict for CosyVoice3."""
+    return {
+        "prompt": text,
+        "multi_modal_data": {
+            "audio": (ref_audio, ref_sr),
+        },
+        "mm_processor_kwargs": {
+            "prompt_text": prompt_text,
+            "sample_rate": ref_sr,
+        },
+    }
+
+def _build_sampling_params(config):
+    from vllm import SamplingParams
+    from vllm_omni.model_executor.models.cosyvoice3.config import CosyVoice3Config
+    cv_cfg = CosyVoice3Config()
+    greedy = config.get("greedy", False)
+    temp = 0.0 if greedy else 1.0
+    seed_val = config.get("seed", None) if greedy else None
+    gpt_sampling = SamplingParams(
+        temperature=temp,
+        top_p=1.0 if greedy else 0.8,
+        top_k=-1 if greedy else 25,
+        repetition_penalty=2.0,
+        min_tokens=10,
+        max_tokens=2048,
+        stop_token_ids=[6561 + 1],
+        detokenize=False,
+        seed=seed_val,
+    )
+    s2mel_sampling = SamplingParams(
+        temperature=1.0, top_p=1.0, top_k=-1,
+        repetition_penalty=2.0, max_tokens=256, detokenize=False,
+    )
+    return [gpt_sampling, s2mel_sampling]
+
+def _extract_audio(output, sample_rate):
+    """Extract audio tensor and duration from an OmniRequestOutput."""
+    ro = output.request_output if hasattr(output, "request_output") else output
+    mm = getattr(ro, "multimodal_output", None)
+    if not mm and hasattr(ro, "outputs") and ro.outputs:
+        mm = getattr(ro.outputs[0], "multimodal_output", None)
+    if mm and "audio" in mm:
+        audio = mm["audio"]
+        if isinstance(audio, torch.Tensor) and audio.numel() > 0:
+            return audio.shape[-1] / sample_rate, audio
+    return 0.0, None
+
+def main():
+    with open(sys.argv[1]) as f:
+        cfg = json.load(f)
+
+    stage_config = _find_stage_config()
+    model_dir, tok_dir = _download_and_get_tokenizer_path(cfg["model"])
+    _ensure_config_has_model_type(model_dir)
+    _ensure_mel_filters_asset()
+
+    from vllm_omni.entrypoints.omni import Omni
+    omni = Omni(
+        model=model_dir,
+        stage_configs_path=stage_config,
+        trust_remote_code=True,
+        tokenizer=tok_dir,
+        stage_init_timeout=600,
+    )
+    sampling_params_list = _build_sampling_params(cfg)
+
+    ref_audio = cfg.get("ref_audio")
+    if ref_audio is None:
+        ref_audio = np.random.randn(24000 * 3).astype(np.float32)
+    else:
+        ref_audio = np.array(ref_audio, dtype=np.float32)
+    ref_sr = cfg.get("ref_sr", 24000)
+    prompt_text = cfg.get("prompt_text", "Testing my voice.")
+    sample_rate = cfg.get("sample_rate", 24000)
+
+    audio_dir = cfg.get("audio_dir")
+    if audio_dir:
+        os.makedirs(audio_dir, exist_ok=True)
+
+    # Warmup
+    warmup_prompt = _make_prompt("Warmup.", prompt_text, ref_audio, ref_sr)
+    list(omni.generate(warmup_prompt, sampling_params_list, use_tqdm=False))
+    print("  vllm-omni warmup done", file=sys.stderr)
+
+    all_results = []
+    for scenario in cfg["scenarios"]:
+        texts = scenario["texts"]
+        total_elapsed = 0.0
+        total_utterances = 0
+        total_audio_duration = 0.0
+
+        desc = f"vllm-omni TTS {scenario['name']}"
+        pbar = tqdm(texts, desc=desc, unit="utt", file=sys.stderr)
+        for utt_idx, text in enumerate(pbar):
+            prompt = _make_prompt(text, prompt_text, ref_audio, ref_sr)
+            torch.cuda.synchronize()
+            start = time.perf_counter()
+            outputs = list(omni.generate(prompt, sampling_params_list, use_tqdm=False))
+            torch.cuda.synchronize()
+            elapsed = time.perf_counter() - start
+            total_elapsed += elapsed
+            total_utterances += 1
+
+            for out in outputs:
+                dur, audio_tensor = _extract_audio(out, sample_rate)
+                total_audio_duration += dur
+                if audio_dir and audio_tensor is not None:
+                    torch.save(
+                        audio_tensor.cpu(),
+                        os.path.join(audio_dir, f"{scenario['name']}_utt{utt_idx:04d}.pt"),
+                    )
+
+            pbar.set_postfix(
+                utts=total_utterances,
+                ups=f"{total_utterances / total_elapsed:.2f}",
+            )
+
+        all_results.append({
+            "name": scenario["name"],
+            "elapsed": total_elapsed,
+            "num_utterances": total_utterances,
+            "utterances_per_second": total_utterances / total_elapsed if total_elapsed > 0 else 0,
+            "total_audio_duration_s": total_audio_duration,
+            "rtf": total_elapsed / total_audio_duration if total_audio_duration > 0 else float("inf"),
+        })
+
+    latency_results = []
+    for ls in cfg.get("latency_scenarios", []):
+        text = ls["texts"][0] if ls["texts"] else "Test utterance."
+        num_warmup = ls.get("num_warmup", 2)
+        num_iters = ls.get("num_iters", 5)
+        prompt = _make_prompt(text, prompt_text, ref_audio, ref_sr)
+
+        for _ in tqdm(range(num_warmup), desc=f"vllm-omni latency warmup {ls['name']}", file=sys.stderr):
+            torch.cuda.synchronize()
+            list(omni.generate(prompt, sampling_params_list, use_tqdm=False))
+            torch.cuda.synchronize()
+
+        latencies = []
+        for _ in tqdm(range(num_iters), desc=f"vllm-omni latency {ls['name']}", file=sys.stderr):
+            torch.cuda.synchronize()
+            t0 = time.perf_counter()
+            list(omni.generate(prompt, sampling_params_list, use_tqdm=False))
+            torch.cuda.synchronize()
+            latencies.append(time.perf_counter() - t0)
+
+        latency_results.append({
+            "name": ls["name"],
+            "num_iters": num_iters,
+            "latencies": latencies,
+        })
+
+    omni.close()
+    torch.cuda.empty_cache()
+
+    with open(cfg["output_file"], "w") as f:
+        json.dump({"throughput": all_results, "latency": latency_results}, f)
+
+if __name__ == "__main__":
+    main()
+'''
+
+
+KB_NANO_TTS_WORKER = r'''
+import json, os, sys, time, torch
+import numpy as np
+from tqdm import tqdm
+from functools import partial
+
+def _init_preprocessing(model_dir, config):
+    """Initialise tokenizer, speech tokenizer, speaker embedder and mel extractor."""
+    import onnxruntime
+    from vllm_omni.model_executor.models.cosyvoice3.tokenizer import get_qwen_tokenizer
+    from vllm_omni.model_executor.models.cosyvoice3.utils import mel_spectrogram
+
+    option = onnxruntime.SessionOptions()
+    option.graph_optimization_level = onnxruntime.GraphOptimizationLevel.ORT_ENABLE_ALL
+    option.intra_op_num_threads = 1
+
+    tokenizer = get_qwen_tokenizer(
+        token_path=os.path.join(model_dir, config.qwen_pretrain_path),
+        skip_special_tokens=config.skip_special_tokens,
+        version=config.version,
+    )
+    speech_tokenizer = onnxruntime.InferenceSession(
+        os.path.join(model_dir, config.speech_tokenizer_path),
+        sess_options=option,
+        providers=["CUDAExecutionProvider" if torch.cuda.is_available() else "CPUExecutionProvider"],
+    )
+    campplus = onnxruntime.InferenceSession(
+        os.path.join(model_dir, config.campplus_onxx_path),
+        sess_options=option,
+        providers=["CPUExecutionProvider"],
+    )
+    feat_extractor = partial(mel_spectrogram, **getattr(config, "feat_extractor", {}))
+    return tokenizer, speech_tokenizer, campplus, feat_extractor
+
+
+def _preprocess(text, prompt_text, ref_audio, ref_sr, tokenizer, speech_tok, campplus, feat_ext, config, device):
+    """Run the same preprocessing as vllm-omni to produce model inputs."""
+    from vllm_omni.model_executor.models.cosyvoice3.utils import (
+        extract_text_token, extract_speech_token, extract_speech_feat,
+        extract_spk_embedding,
+    )
+    text_token, _ = extract_text_token(text, tokenizer, config.allowed_special)
+    prompt_text_token, _ = extract_text_token(prompt_text, tokenizer, config.allowed_special)
+    speech_token, _ = extract_speech_token((ref_audio, ref_sr), speech_tok, device)
+    speech_feat, speech_feat_len = extract_speech_feat((ref_audio, ref_sr), feat_ext, device)
+
+    if config.sample_rate == 24000:
+        tok_len = min(int(speech_feat.shape[1] / 2), speech_token.shape[1])
+        speech_feat = speech_feat[:, :2 * tok_len]
+        speech_token = speech_token[:, :tok_len]
+
+    spk_embedding = extract_spk_embedding((ref_audio, ref_sr), campplus, device)
+
+    return {
+        "text_token": text_token.to(device),
+        "prompt_text_token": prompt_text_token.to(device),
+        "speech_token": speech_token.to(device),
+        "speech_feat": speech_feat.to(device),
+        "spk_embedding": spk_embedding.to(device),
+    }
+
+
+def main():
+    with open(sys.argv[1]) as f:
+        cfg = json.load(f)
+    pkg = cfg["package_name"]
+
+    try:
+        cosyvoice_mod = __import__(
+            f"{pkg}.tasks.baseline.L4.cosyvoice3",
+            fromlist=["CosyVoice3Config", "CosyVoice3ForTTS"],
+        )
+    except ImportError:
+        sys.path.insert(0, cfg["project_root"])
+        cosyvoice_mod = __import__(
+            f"{pkg}.tasks.baseline.L4.cosyvoice3",
+            fromlist=["CosyVoice3Config", "CosyVoice3ForTTS"],
+        )
+    CosyVoice3Config = cosyvoice_mod.CosyVoice3Config
+    CosyVoice3ForTTS = cosyvoice_mod.CosyVoice3ForTTS
+
+    from huggingface_hub import snapshot_download
+    model_dir = snapshot_download(cfg["model"])
+
+    config = CosyVoice3Config.from_pretrained(cfg["model"])
+    device = torch.device("cuda")
+
+    model = CosyVoice3ForTTS(config, model_stage="e2e")
+    model.load_weights_e2e(model_dir, device)
+    model.eval()
+    print(f"  Loaded CosyVoice3 e2e model (talker=f32, code2wav=f32): {cfg['model']}", file=sys.stderr)
+
+    tokenizer, speech_tok, campplus, feat_ext = _init_preprocessing(model_dir, config)
+
+    ref_audio = cfg.get("ref_audio")
+    if ref_audio is None:
+        ref_audio = np.random.randn(24000 * 3).astype(np.float32)
+    else:
+        ref_audio = np.array(ref_audio, dtype=np.float32)
+    ref_sr = cfg.get("ref_sr", 24000)
+    prompt_text = cfg.get("prompt_text", "Testing my voice.")
+    sample_rate = cfg.get("sample_rate", 24000)
+    n_timesteps = cfg.get("n_timesteps", 10)
+    greedy = cfg.get("greedy", False)
+    gen_temperature = 0 if greedy else 1.0
+    cfm_seed = 12345 if greedy else None
+
+    audio_dir = cfg.get("audio_dir")
+    if audio_dir:
+        os.makedirs(audio_dir, exist_ok=True)
+
+    all_results = []
+    for scenario in cfg["scenarios"]:
+        texts = scenario["texts"]
+        total_elapsed = 0.0
+        total_utterances = 0
+        total_audio_duration = 0.0
+
+        desc = f"kb-nano TTS {scenario['name']}"
+        pbar = tqdm(texts, desc=desc, unit="utt", file=sys.stderr)
+        for utt_idx, text in enumerate(pbar):
+            inputs = _preprocess(
+                text, prompt_text, ref_audio, ref_sr,
+                tokenizer, speech_tok, campplus, feat_ext, config, "cpu",
+            )
+
+            torch.cuda.synchronize()
+            start = time.perf_counter()
+            audio, _ = model.generate(
+                text_token=inputs["text_token"],
+                prompt_text_token=inputs["prompt_text_token"],
+                speech_token=inputs["speech_token"],
+                speech_feat=inputs["speech_feat"],
+                spk_embedding=inputs["spk_embedding"],
+                n_timesteps=n_timesteps,
+                temperature=gen_temperature,
+                cfm_seed=cfm_seed,
+            )
+            torch.cuda.synchronize()
+            elapsed = time.perf_counter() - start
+
+            total_elapsed += elapsed
+            total_utterances += 1
+
+            if isinstance(audio, torch.Tensor) and audio.numel() > 0:
+                audio_dur = audio.shape[-1] / sample_rate
+                total_audio_duration += audio_dur
+                if audio_dir:
+                    torch.save(
+                        audio.cpu(),
+                        os.path.join(audio_dir, f"{scenario['name']}_utt{utt_idx:04d}.pt"),
+                    )
+
+            pbar.set_postfix(
+                utts=total_utterances,
+                ups=f"{total_utterances / total_elapsed:.2f}",
+            )
+
+        all_results.append({
+            "name": scenario["name"],
+            "elapsed": total_elapsed,
+            "num_utterances": total_utterances,
+            "utterances_per_second": total_utterances / total_elapsed if total_elapsed > 0 else 0,
+            "total_audio_duration_s": total_audio_duration,
+            "rtf": total_elapsed / total_audio_duration if total_audio_duration > 0 else float("inf"),
+        })
+
+    latency_results = []
+    for ls in cfg.get("latency_scenarios", []):
+        text = ls["texts"][0] if ls["texts"] else "Test utterance."
+        num_warmup = ls.get("num_warmup", 2)
+        num_iters = ls.get("num_iters", 5)
+
+        inputs = _preprocess(
+            text, prompt_text, ref_audio, ref_sr,
+            tokenizer, speech_tok, campplus, feat_ext, config, "cpu",
+        )
+
+        for _ in tqdm(range(num_warmup), desc=f"kb-nano latency warmup {ls['name']}", file=sys.stderr):
+            torch.cuda.synchronize()
+            model.generate(
+                text_token=inputs["text_token"],
+                prompt_text_token=inputs["prompt_text_token"],
+                speech_token=inputs["speech_token"],
+                speech_feat=inputs["speech_feat"],
+                spk_embedding=inputs["spk_embedding"],
+                n_timesteps=n_timesteps,
+            )
+            torch.cuda.synchronize()
+
+        latencies = []
+        for _ in tqdm(range(num_iters), desc=f"kb-nano latency {ls['name']}", file=sys.stderr):
+            torch.cuda.synchronize()
+            t0 = time.perf_counter()
+            model.generate(
+                text_token=inputs["text_token"],
+                prompt_text_token=inputs["prompt_text_token"],
+                speech_token=inputs["speech_token"],
+                speech_feat=inputs["speech_feat"],
+                spk_embedding=inputs["spk_embedding"],
+                n_timesteps=n_timesteps,
+            )
+            torch.cuda.synchronize()
+            latencies.append(time.perf_counter() - t0)
+
+        latency_results.append({
+            "name": ls["name"],
+            "num_iters": num_iters,
+            "latencies": latencies,
+        })
+
+    # ── Code2Wav equivalence test ──────────────────────────────────────────
+    c2w_check = {}
+    try:
+        import torch.nn.functional as F
+        cosyvoice_c2w = cosyvoice_mod.CosyVoice3Code2Wav
+        make_pad_mask = cosyvoice_mod.make_pad_mask
+
+        from vllm_omni.model_executor.models.cosyvoice3.cosyvoice3_code2wav import (
+            CosyVoice3Code2Wav as VCode2Wav,
+        )
+
+        test_text = cfg["scenarios"][0]["texts"][0] if cfg["scenarios"] else "Hello."
+        test_inputs = _preprocess(
+            test_text, prompt_text, ref_audio, ref_sr,
+            tokenizer, speech_tok, campplus, feat_ext, config, "cpu",
+        )
+        _, test_tokens = model.generate(
+            text_token=test_inputs["text_token"],
+            prompt_text_token=test_inputs["prompt_text_token"],
+            speech_token=test_inputs["speech_token"],
+            speech_feat=test_inputs["speech_feat"],
+            spk_embedding=test_inputs["spk_embedding"],
+            n_timesteps=n_timesteps, temperature=0, cfm_seed=12345,
+        )
+
+        del model
+        torch.cuda.empty_cache()
+
+        kb_c2w = cosyvoice_c2w(config)
+        kb_c2w = kb_c2w.to(device=device, dtype=torch.bfloat16)
+        kb_c2w.load_weights(model_dir, device)
+        kb_c2w.eval()
+
+        class _Cfg:
+            pass
+        vc = _Cfg()
+        for k, v in vars(config).items():
+            setattr(vc, k, v)
+        vl_c2w = VCode2Wav(vc)
+        vl_c2w.load_weights(model_dir, device)
+        vl_c2w = vl_c2w.to(device=device, dtype=torch.bfloat16)
+        vl_c2w.eval()
+
+        gen_token = torch.tensor([test_tokens], device=device)
+        prompt_token = test_inputs["speech_token"][:1].to(device)
+        prompt_feat = test_inputs["speech_feat"][:1].to(device=device, dtype=torch.bfloat16)
+        embedding = test_inputs["spk_embedding"][:1].to(device=device, dtype=torch.bfloat16)
+
+        with torch.inference_mode():
+            emb = F.normalize(embedding, dim=1)
+
+            emb_kb = kb_c2w.flow_model.spk_embed_affine_layer(emb.clone())
+            full_token = torch.cat([prompt_token, gen_token], dim=1)
+            tl = torch.tensor([full_token.shape[1]], device=device, dtype=torch.int32)
+            mask = (~make_pad_mask(tl)).unsqueeze(-1).to(emb_kb)
+            tok_emb_kb = kb_c2w.flow_model.input_embedding(torch.clamp(full_token, min=0)) * mask
+            h_kb = kb_c2w.flow_model.pre_lookahead_layer(tok_emb_kb).repeat_interleave(2, dim=1)
+
+            emb_vl = vl_c2w.flow_model.spk_embed_affine_layer(emb.clone())
+            tok_emb_vl = vl_c2w.flow_model.input_embedding(torch.clamp(full_token, min=0)) * mask
+            h_vl = vl_c2w.flow_model.pre_lookahead_layer(tok_emb_vl).repeat_interleave(2, dim=1)
+
+            mel_len1 = prompt_feat.shape[1]
+            mel_len2 = h_kb.shape[1] - mel_len1
+            conds = torch.zeros([1, mel_len1 + mel_len2, 80], device=device, dtype=torch.bfloat16)
+            conds[:, :mel_len1] = prompt_feat
+            conds = conds.transpose(1, 2)
+            mel_mask = (~make_pad_mask(torch.tensor([mel_len1 + mel_len2]))).to(h_kb)
+
+            feat_kb, _ = kb_c2w.flow_model.decoder(
+                mu=h_kb.transpose(1, 2).contiguous(), mask=mel_mask.unsqueeze(1),
+                spks=emb_kb, cond=conds, n_timesteps=10, cfm_seed=12345,
+            )
+
+            feat_vl, _ = vl_c2w.flow_model.decoder(
+                mu=h_vl.transpose(1, 2).contiguous(), mask=mel_mask.unsqueeze(1),
+                spks=emb_vl, cond=conds, n_timesteps=10, cfm_seed=12345,
+            )
+
+            feat_kb_gen = feat_kb[:, :, mel_len1:].float()
+            feat_vl_gen = feat_vl[:, :, mel_len1:].float()
+            cos_mel = torch.nn.functional.cosine_similarity(
+                feat_kb_gen.flatten().unsqueeze(0),
+                feat_vl_gen.flatten().unsqueeze(0),
+            ).item()
+            mse_mel = ((feat_kb_gen - feat_vl_gen) ** 2).mean().item()
+
+        c2w_check = {
+            "mel_cosine_similarity": cos_mel,
+            "mel_mse": mse_mel,
+            "num_tokens": len(test_tokens),
+            "pass": cos_mel > 0.99,
+        }
+        print(f"  Code2Wav equivalence: mel cos={cos_mel:.6f}, mse={mse_mel:.2e}, "
+              f"{'PASS' if cos_mel > 0.99 else 'FAIL'}", file=sys.stderr)
+
+        del kb_c2w, vl_c2w
+        torch.cuda.empty_cache()
+    except Exception as e:
+        print(f"  Code2Wav equivalence check failed: {e}", file=sys.stderr)
+        import traceback; traceback.print_exc(file=sys.stderr)
+        c2w_check = {"error": str(e)}
+        try:
+            del model
+        except NameError:
+            pass
+        torch.cuda.empty_cache()
+
+    with open(cfg["output_file"], "w") as f:
+        json.dump({
+            "throughput": all_results,
+            "latency": latency_results,
+            "code2wav_equivalence": c2w_check,
+        }, f)
+
+if __name__ == "__main__":
+    main()
+'''
+
+
+# ═══════════════════════════════════════════════════════════════════════════
 # Scenario builders
 # ═══════════════════════════════════════════════════════════════════════════
 
@@ -706,6 +1355,38 @@ def _build_hunyuan_latency_scenarios(
             "num_inference_steps": steps,
             "guidance_scale": guidance,
             "prompt": prompts[0],
+            "num_warmup": w.num_warmup,
+            "num_iters": w.num_iters,
+        })
+    return scenarios
+
+
+def _build_tts_throughput_scenarios(samples: list[dict]) -> list[dict]:
+    scenarios = []
+    for w in TTS_THROUGHPUT_WORKLOADS:
+        texts = [s["text"] for s in samples if len(s["text"]) <= w.max_text_len]
+        texts = texts[:w.num_requests]
+        if not texts:
+            texts = [s["text"][:w.max_text_len] for s in samples[:w.num_requests]]
+        scenarios.append({
+            "name": w.name,
+            "texts": texts,
+            "num_requests": len(texts),
+            "max_text_len": w.max_text_len,
+        })
+    return scenarios
+
+
+def _build_tts_latency_scenarios(samples: list[dict]) -> list[dict]:
+    scenarios = []
+    for w in TTS_LATENCY_WORKLOADS:
+        texts = [s["text"] for s in samples if len(s["text"]) <= w.max_text_len]
+        texts = texts[:w.batch_size]
+        if not texts:
+            texts = [samples[0]["text"][:w.max_text_len]] if samples else ["Test."]
+        scenarios.append({
+            "name": w.name,
+            "texts": texts,
             "num_warmup": w.num_warmup,
             "num_iters": w.num_iters,
         })
@@ -935,14 +1616,263 @@ def _print_correctness_hunyuan(correctness: dict):
 
 
 # ═══════════════════════════════════════════════════════════════════════════
+# TTS result printing & comparison
+# ═══════════════════════════════════════════════════════════════════════════
+
+def _print_tts_throughput_comparison(kb_results: list[dict],
+                                     vllm_results: list[dict] | None):
+    print("\n" + "=" * 90)
+    print("  TTS THROUGHPUT COMPARISON")
+    print("=" * 90)
+    header = f"  {'Scenario':<20} {'Utts':>6} {'kb-nano utt/s':>14} {'kb-nano RTF':>12}"
+    if vllm_results:
+        header += f" {'vllm-omni utt/s':>16} {'vllm-omni RTF':>14} {'Speedup':>8}"
+    print(header)
+    print("  " + "-" * 80)
+
+    for kb in kb_results:
+        line = (f"  {kb['name']:<20} {kb['num_utterances']:>6} "
+                f"{kb['utterances_per_second']:>14.2f} "
+                f"{kb['rtf']:>12.3f}")
+        if vllm_results:
+            vllm = next((v for v in vllm_results if v["name"] == kb["name"]), None)
+            if vllm:
+                speedup = kb["utterances_per_second"] / max(vllm["utterances_per_second"], 1e-9)
+                line += (f" {vllm['utterances_per_second']:>16.2f} "
+                         f"{vllm['rtf']:>14.3f} {speedup:>7.2f}x")
+        print(line)
+    print()
+
+
+def _print_tts_latency_comparison(kb_results: list[dict],
+                                   vllm_results: list[dict] | None):
+    print("\n" + "=" * 80)
+    print("  TTS LATENCY COMPARISON (seconds)")
+    print("=" * 80)
+    header = f"  {'Scenario':<20} {'kb-nano p50':>12}"
+    if vllm_results:
+        header += f" {'vllm-omni p50':>14} {'Speedup':>8}"
+    print(header)
+    print("  " + "-" * 60)
+
+    for kb in kb_results:
+        kb_lats = np.array(kb["latencies"])
+        kb_p50 = np.percentile(kb_lats, 50)
+        line = f"  {kb['name']:<20} {kb_p50:>12.3f}"
+        if vllm_results:
+            vllm = next((v for v in vllm_results if v["name"] == kb["name"]), None)
+            if vllm:
+                vllm_lats = np.array(vllm["latencies"])
+                vllm_p50 = np.percentile(vllm_lats, 50)
+                speedup = vllm_p50 / kb_p50 if kb_p50 > 0 else float("inf")
+                line += f" {vllm_p50:>14.3f} {speedup:>7.2f}x"
+        print(line)
+    print()
+
+
+def _compute_mel_spectrogram(audio: np.ndarray, sr: int = 24000,
+                              n_fft: int = 1024, hop_length: int = 256,
+                              n_mels: int = 80) -> np.ndarray:
+    """Compute log-mel spectrogram from audio waveform using numpy/scipy."""
+    from scipy.signal import get_window
+
+    win = get_window("hann", n_fft, fftbins=True)
+    n_frames = 1 + (len(audio) - n_fft) // hop_length
+    if n_frames <= 0:
+        return np.zeros((n_mels, 1), dtype=np.float32)
+
+    frames = np.lib.stride_tricks.as_strided(
+        audio,
+        shape=(n_frames, n_fft),
+        strides=(audio.strides[0] * hop_length, audio.strides[0]),
+    ).copy()
+    frames *= win
+    spec = np.abs(np.fft.rfft(frames, n=n_fft, axis=1)).T ** 2
+
+    fmin, fmax = 0.0, sr / 2.0
+    mel_lo = 2595.0 * np.log10(1.0 + fmin / 700.0)
+    mel_hi = 2595.0 * np.log10(1.0 + fmax / 700.0)
+    mel_pts = 700.0 * (10.0 ** (np.linspace(mel_lo, mel_hi, n_mels + 2) / 2595.0) - 1.0)
+    bins = np.floor((n_fft + 1) * mel_pts / sr).astype(int)
+
+    fb = np.zeros((n_mels, n_fft // 2 + 1), dtype=np.float32)
+    for m in range(n_mels):
+        for k in range(bins[m], bins[m + 1]):
+            fb[m, k] = (k - bins[m]) / max(bins[m + 1] - bins[m], 1)
+        for k in range(bins[m + 1], bins[m + 2]):
+            fb[m, k] = (bins[m + 2] - k) / max(bins[m + 2] - bins[m + 1], 1)
+
+    mel_spec = fb @ spec
+    log_mel = np.log(np.maximum(mel_spec, 1e-10))
+    return log_mel.astype(np.float32)
+
+
+def _compare_tts_audio(kb_audio_dir: str, vllm_audio_dir: str) -> dict:
+    """Compare TTS audio between kb-nano and vllm-omni using mel spectrogram
+    cosine similarity.
+    """
+    import torch
+
+    kb_files = sorted(
+        f for f in os.listdir(kb_audio_dir) if f.endswith(".pt")
+    ) if os.path.isdir(kb_audio_dir) else []
+    vllm_files = sorted(
+        f for f in os.listdir(vllm_audio_dir) if f.endswith(".pt")
+    ) if os.path.isdir(vllm_audio_dir) else []
+    common = sorted(set(kb_files) & set(vllm_files))
+    if not common:
+        return {}
+
+    scenario_utts: dict[str, list[dict]] = defaultdict(list)
+
+    for fname in common:
+        kb_audio = torch.load(
+            os.path.join(kb_audio_dir, fname), map_location="cpu", weights_only=True
+        ).detach().float().flatten().numpy()
+        vllm_audio = torch.load(
+            os.path.join(vllm_audio_dir, fname), map_location="cpu", weights_only=True
+        ).detach().float().flatten().numpy()
+
+        kb_len = len(kb_audio)
+        vllm_len = len(vllm_audio)
+        scenario_name = fname.rsplit("_utt", 1)[0]
+
+        entry: dict = {
+            "file": fname,
+            "kb_samples": kb_len,
+            "vllm_samples": vllm_len,
+            "kb_nonempty": kb_len > 0,
+            "vllm_nonempty": vllm_len > 0,
+            "both_nonempty": kb_len > 0 and vllm_len > 0,
+        }
+
+        if kb_len > 0 and vllm_len > 0:
+            entry["len_ratio"] = kb_len / vllm_len
+            min_len = min(kb_len, vllm_len)
+            kb_mel = _compute_mel_spectrogram(kb_audio[:min_len])
+            vllm_mel = _compute_mel_spectrogram(vllm_audio[:min_len])
+            kb_flat = kb_mel.flatten()
+            vllm_flat = vllm_mel.flatten()
+            norm_product = np.linalg.norm(kb_flat) * np.linalg.norm(vllm_flat)
+            if norm_product > 1e-12:
+                entry["mel_cosine_sim"] = float(
+                    np.dot(kb_flat, vllm_flat) / norm_product)
+            else:
+                entry["mel_cosine_sim"] = 0.0
+            entry["length_match"] = abs(kb_len - vllm_len) < 10
+
+        scenario_utts[scenario_name].append(entry)
+
+    results = {}
+    for scenario, utts in scenario_utts.items():
+        mel_sims = [u["mel_cosine_sim"] for u in utts if "mel_cosine_sim" in u]
+        len_ratios = [u["len_ratio"] for u in utts if "len_ratio" in u]
+        length_matches = sum(1 for u in utts if u.get("length_match", False))
+        results[scenario] = {
+            "num_utterances": len(utts),
+            "both_nonempty": sum(1 for u in utts if u["both_nonempty"]),
+            "kb_nonempty": sum(1 for u in utts if u["kb_nonempty"]),
+            "vllm_nonempty": sum(1 for u in utts if u["vllm_nonempty"]),
+            "mel_cosine_sims": mel_sims,
+            "mean_mel_cosine_sim": float(np.mean(mel_sims)) if mel_sims else None,
+            "median_mel_cosine_sim": float(np.median(mel_sims)) if mel_sims else None,
+            "min_mel_cosine_sim": float(np.min(mel_sims)) if mel_sims else None,
+            "p10_mel_cosine_sim": float(np.percentile(mel_sims, 10)) if mel_sims else None,
+            "mean_len_ratio": float(np.mean(len_ratios)) if len_ratios else None,
+            "length_match_count": length_matches,
+            "length_match_total": len(utts),
+            "per_utt": utts,
+        }
+    return results
+
+
+def _print_tts_correctness(audio_check: dict):
+    """Print e2e correctness table using mel spectrogram cosine similarity.
+
+    PASS/FAIL is based on the **overall median** mel cosine similarity across
+    all utterances (threshold >= 0.88).  Median is used instead of mean because
+    attention-backend divergence (SDPA vs TritonAttention) causes a long tail
+    of outliers that disproportionately pulls down the mean.
+    """
+    THRESHOLD = 0.88
+
+    print("\n" + "=" * 100)
+    print("  E2E CORRECTNESS: mel spectrogram cosine similarity (median for PASS/FAIL)")
+    print("=" * 100)
+    print(f"  {'Scenario':<16} {'Utts':>5} {'Median':>8} {'Mean':>8} "
+          f"{'P10':>8} {'Min':>8} {'LenMatch':>10}")
+    print("  " + "-" * 80)
+
+    all_sims: list[float] = []
+    all_medians = []
+    total_utts = 0
+    for scenario, s in sorted(audio_check.items()):
+        n = s["num_utterances"]
+        total_utts += n
+        median_sim = s.get("median_mel_cosine_sim")
+        mean_sim = s.get("mean_mel_cosine_sim")
+        min_sim = s.get("min_mel_cosine_sim")
+        p10_sim = s.get("p10_mel_cosine_sim")
+        lm_count = s.get("length_match_count", 0)
+        lm_total = s.get("length_match_total", n)
+
+        if median_sim is not None:
+            all_medians.append(median_sim)
+        sims = s.get("mel_cosine_sims", [])
+        all_sims.extend(sims)
+
+        def _fmt(v):
+            return f"{v:.3f}" if v is not None else "N/A"
+
+        lm_str = f"{lm_count}/{lm_total}"
+        print(f"  {scenario:<16} {n:>5} {_fmt(median_sim):>8} {_fmt(mean_sim):>8} "
+              f"{_fmt(p10_sim):>8} {_fmt(min_sim):>8} "
+              f"{lm_str:>10}")
+
+    overall_median = float(np.median(all_sims)) if all_sims else None
+    overall_mean = float(np.mean(all_sims)) if all_sims else None
+
+    print()
+    print(f"  Overall median mel cosine similarity: "
+          f"{overall_median:.3f}" if overall_median is not None else "  N/A")
+    print(f"  Overall mean mel cosine similarity:   "
+          f"{overall_mean:.3f}" if overall_mean is not None else "  N/A")
+    print()
+
+    passed = overall_median is not None and overall_median >= THRESHOLD
+    if passed:
+        print(f"  E2E RESULT: PASS (overall median {overall_median:.3f} >= {THRESHOLD})")
+    else:
+        print(f"  E2E RESULT: FAIL (overall median "
+              f"{overall_median:.3f if overall_median is not None else 'N/A'} < {THRESHOLD})")
+    print()
+
+
+# ═══════════════════════════════════════════════════════════════════════════
 # Main
 # ═══════════════════════════════════════════════════════════════════════════
 
+def _infer_mode(model: str) -> str:
+    """Infer benchmark mode from the model's category."""
+    category = MODEL_CATEGORY.get(model)
+    if category == "tts":
+        return "tts"
+    if _is_hunyuan_video(model):
+        return "video"
+    if category == "diffusion":
+        return "diffusion"
+    raise ValueError(
+        f"Cannot infer benchmark mode for model {model!r}. "
+        f"Known categories: {dict(MODEL_CATEGORY)}"
+    )
+
+
 def main():
     parser = argparse.ArgumentParser(
-        description="Diffusion benchmark: kb-nano vs vllm-omni (FLUX / HunyuanVideo)",
+        description="Benchmark: kb-nano vs vllm-omni (diffusion / TTS)",
     )
-    parser.add_argument("--model", type=str, default="black-forest-labs/FLUX.1-dev")
+    parser.add_argument("--model", type=str, default="black-forest-labs/FLUX.1-dev",
+                        help="Model name (mode is inferred from MODEL_CATEGORY)")
     parser.add_argument("--seed", type=int, default=42)
     parser.add_argument("--enforce-eager", action="store_true")
     parser.add_argument("--skip-vllm-omni", action="store_true",
@@ -953,13 +1883,15 @@ def main():
                         help="Skip latency phase")
     parser.add_argument("--batch-size", type=int, default=None,
                         help="Override batch size for FLUX scenarios")
+    parser.add_argument("--max-tts-samples", type=int, default=None,
+                        help="Limit TTS utterances per scenario (for quick tests)")
     parser.add_argument("--latency-iters", type=int, default=5,
                         help="Timed iterations per latency scenario")
     parser.add_argument("--output-dir", type=str, default=None)
     args = parser.parse_args()
 
+    mode = _infer_mode(args.model)
     gpu_name = _detect_gpu_name()
-    is_video = _is_hunyuan_video(args.model)
 
     if args.output_dir is None:
         short = args.model.split("/")[-1]
@@ -967,7 +1899,9 @@ def main():
 
     os.makedirs(args.output_dir, exist_ok=True)
 
-    if is_video:
+    if mode == "tts":
+        _run_tts(args, gpu_name)
+    elif mode == "video":
         _run_hunyuan(args, gpu_name)
     else:
         _run_flux(args, gpu_name)
@@ -1115,6 +2049,127 @@ def _run_hunyuan(args, gpu_name: str):
                       prompts_source="meta-ai-for-media-research/movie_gen_video_bench")
     else:
         print("ERROR: kb-nano benchmark failed.")
+        sys.exit(1)
+
+
+def _run_tts(args, gpu_name: str):
+    """Run TTS (CosyVoice3) benchmark."""
+    print(f"\nBenchmark: CosyVoice3 TTS on {gpu_name}")
+    print(f"Model: {args.model}")
+    print(f"Seed: {args.seed}")
+    print(f"Output dir: {args.output_dir}")
+
+    max_samples = max(w.num_requests for w in TTS_THROUGHPUT_WORKLOADS) + 10
+    tts_samples = _get_tts_samples(args.seed, max_samples)
+    print(f"Loaded {len(tts_samples)} TTS samples from SEED-TTS-Eval")
+
+    run_vllm = not args.skip_vllm_omni
+    os.makedirs(args.output_dir, exist_ok=True)
+
+    rng = np.random.RandomState(args.seed)
+    ref_audio = rng.randn(24000 * 3).astype(np.float32)
+    ref_sr = 24000
+    prompt_text = "Testing my voice."
+
+    kb_audio_dir = os.path.join(args.output_dir, "audio", "kb_nano")
+    vllm_audio_dir = os.path.join(args.output_dir, "audio", "vllm_omni")
+
+    base_config = {
+        "model": args.model,
+        "seed": args.seed,
+        "n_timesteps": COSYVOICE3_CONFIG.n_timesteps,
+        "sample_rate": COSYVOICE3_CONFIG.sample_rate,
+        "project_root": str(_PROJECT_ROOT),
+        "package_name": "kb_nano",
+        "ref_audio": ref_audio.tolist(),
+        "ref_sr": ref_sr,
+        "prompt_text": prompt_text,
+        "greedy": True,
+    }
+
+    scenarios = _build_tts_throughput_scenarios(tts_samples)
+    latency_scenarios = _build_tts_latency_scenarios(tts_samples)
+
+    if getattr(args, "max_tts_samples", None):
+        cap = args.max_tts_samples
+        for s in scenarios:
+            s["texts"] = s["texts"][:cap]
+            s["num_requests"] = len(s["texts"])
+        print(f"  (capped to {cap} utterances per scenario for quick test)")
+
+    kb_config = {
+        **base_config,
+        "scenarios": scenarios,
+        "latency_scenarios": latency_scenarios,
+        "audio_dir": kb_audio_dir,
+    }
+    kb_data = run_worker(
+        KB_NANO_TTS_WORKER, kb_config,
+        "kb-nano TTS benchmark", timeout=36000,
+    )
+
+    vllm_data = None
+    if run_vllm:
+        vllm_config = {
+            **base_config,
+            "scenarios": scenarios,
+            "latency_scenarios": latency_scenarios,
+            "audio_dir": vllm_audio_dir,
+        }
+        vllm_data = run_worker(
+            VLLM_OMNI_TTS_WORKER, vllm_config,
+            "vllm-omni TTS benchmark", timeout=36000,
+        )
+
+    if kb_data:
+        kb_tp = kb_data.get("throughput", [])
+        kb_lat = kb_data.get("latency", [])
+        vllm_tp = vllm_data.get("throughput", []) if vllm_data else None
+        vllm_lat = vllm_data.get("latency", []) if vllm_data else None
+
+        _print_tts_throughput_comparison(kb_tp, vllm_tp)
+        _print_tts_latency_comparison(kb_lat, vllm_lat)
+
+        c2w_eq = kb_data.get("code2wav_equivalence", {})
+        if c2w_eq:
+            print("\n" + "=" * 70)
+            print("  CODE2WAV EQUIVALENCE (same tokens, same seed)")
+            print("=" * 70)
+            if "error" in c2w_eq:
+                print(f"  ERROR: {c2w_eq['error']}")
+            else:
+                print(f"  Mel cosine similarity: {c2w_eq.get('mel_cosine_similarity', 'N/A'):.6f}")
+                print(f"  Mel MSE:               {c2w_eq.get('mel_mse', 'N/A'):.2e}")
+                print(f"  Tokens tested:         {c2w_eq.get('num_tokens', 'N/A')}")
+                print(f"  Result:                {'PASS' if c2w_eq.get('pass') else 'FAIL'}")
+            print()
+
+        audio_check = None
+        if run_vllm:
+            audio_check = _compare_tts_audio(kb_audio_dir, vllm_audio_dir)
+            _print_tts_correctness(audio_check)
+
+        results_path = os.path.join(args.output_dir, "results.json")
+        results = {
+            "model": args.model,
+            "gpu": gpu_name,
+            "seed": args.seed,
+            "n_timesteps": COSYVOICE3_CONFIG.n_timesteps,
+            "dataset": "SEED-TTS-Eval",
+            "kb_nano": kb_data,
+            "code2wav_equivalence": c2w_eq,
+        }
+        if vllm_data:
+            results["vllm_omni"] = vllm_data
+        if audio_check:
+            for sc in audio_check.values():
+                sc.pop("per_utt", None)
+            results["audio_correctness"] = audio_check
+        with open(results_path, "w") as f:
+            json.dump(results, f, indent=2)
+        print(f"\n  Results saved to: {results_path}")
+    else:
+        print("ERROR: kb-nano TTS benchmark failed.")
         sys.exit(1)
 
 

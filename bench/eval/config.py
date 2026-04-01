@@ -12,7 +12,8 @@ MODEL_KEY_TO_DEFAULT_HF: dict[str, str] = {
     "qwen2_vl": "Qwen/Qwen2-VL-7B-Instruct",
     "qwen3_vl": "Qwen/Qwen3-VL-8B-Instruct-FP8",
     "flux": "black-forest-labs/FLUX.1-dev",
-    "hunyuan_video": "tencent/HunyuanVideo-1.5",
+    "cosyvoice3": "FunAudioLLM/Fun-CosyVoice3-0.5B-2512",
+    "hunyuan_video": "hunyuanvideo-community/HunyuanVideo-1.5-Diffusers-480p_t2v",
 }
 
 MODEL_CATEGORY: dict[str, str] = {
@@ -23,7 +24,8 @@ MODEL_CATEGORY: dict[str, str] = {
     "Qwen/Qwen2-VL-7B-Instruct": "vlm",
     "Qwen/Qwen3-VL-8B-Instruct-FP8": "vlm",
     "black-forest-labs/FLUX.1-dev": "diffusion",
-    "tencent/HunyuanVideo-1.5": "diffusion",
+    "FunAudioLLM/Fun-CosyVoice3-0.5B-2512": "tts",
+    "hunyuanvideo-community/HunyuanVideo-1.5-Diffusers-480p_t2v": "diffusion",
 }
 
 

@@ -25,6 +25,7 @@ from ..tasks.baseline.L4.qwen2_vl import Qwen2VLConfig, Qwen2VLForConditionalGen
 from ..tasks.baseline.L4.qwen3_vl import Qwen3VLConfig, Qwen3VLForConditionalGeneration
 from ..tasks.baseline.L4.flux import FluxConfig, FluxPipeline
 from ..tasks.baseline.L4.whisper import WhisperConfig, WhisperForConditionalGeneration
+from ..tasks.baseline.L4.cosyvoice3 import CosyVoice3Config, CosyVoice3ForTTS
 
 
 def default_weight_loader(param: torch.nn.Parameter, loaded_weight: torch.Tensor):
@@ -545,6 +546,12 @@ def load_model(
         raise ValueError(
             "Diffusion models should be loaded via "
             "kb_nano.infra.diffusion_engine.DiffusionEngine, "
+            "not the LLM load_model() path."
+        )
+    if model_type == "cosyvoice3":
+        raise ValueError(
+            "CosyVoice3 TTS models should be loaded via "
+            "kb_nano.infra.tts_engine.TTSEngine, "
             "not the LLM load_model() path."
         )
     if model_type == "whisper":

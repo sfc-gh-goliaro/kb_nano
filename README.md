@@ -1,6 +1,6 @@
 # kb-nano
 
-A standalone, high-performance inference engine supporting **LLMs** (Llama 3.1, Mixtral-8x7B, Qwen2-VL, Qwen3-VL), **diffusion models** (FLUX.1-dev, SDXL, HunyuanVideo-1.5), audio models (Whisper) with tensor parallelism. No vLLM dependency at runtime — just PyTorch, Triton, and Flash Attention.
+A standalone, high-performance inference engine supporting **LLMs** (Llama 3.1, Mixtral-8x7B, Qwen2-VL, Qwen3-VL), **diffusion models** (FLUX.1-dev, SDXL, HunyuanVideo-1.5), audio models (Whisper), and **TTS models** (CosyVoice3) with tensor parallelism. No vLLM dependency at runtime — just PyTorch, Triton, and Flash Attention.
 
 ## Features
 
@@ -11,6 +11,7 @@ A standalone, high-performance inference engine supporting **LLMs** (Llama 3.1, 
 - **HunyuanVideo-1.5** 3D video diffusion transformer (text-to-video) with dual-stream joint attention, M-RoPE, and Qwen2.5-VL text encoder
 - **Qwen2-VL / Qwen3-VL** vision-language models with image and video support
 - **Whisper** (large-v3) encoder-decoder speech-to-text with batched inference and paged cross-attention KV cache
+- **CosyVoice3** (Fun-CosyVoice3-0.5B-2512) text-to-speech with flow matching DiT + HiFi-GAN vocoder
 - **Tensor parallelism** (TP) with custom IPC-based all-reduce for multi-GPU inference
 - **Paged KV cache** with Triton store kernels (LLM models)
 - **CUDA graph capture** for decode steps (LLM models)
@@ -19,6 +20,7 @@ A standalone, high-performance inference engine supporting **LLMs** (Llama 3.1, 
 - **Layered operator architecture** (L1 single-kernel ops through L4 full models) with clean separation of concerns
 - **Benchmarking suite** for evaluating custom CUDA/Triton/PyTorch kernels at 4 abstraction levels
 - **vllm-omni comparison benchmark** for FLUX diffusion and HunyuanVideo-1.5 video diffusion
+- **vllm-omni comparison benchmark** for CosyVoice3 TTS (SEED-TTS-Eval dataset)
 - **diffusers comparison benchmark** for SDXL diffusion
 
 ## Project Structure
@@ -105,7 +107,7 @@ A standalone, high-performance inference engine supporting **LLMs** (Llama 3.1, 
 └── tests/                      # Test suite
     ├── test_bench.py           # Bench module tests (discovery, replacement, kernel and E2E integration)
     ├── bench_vllm.py           # Multi-scenario throughput + latency + alignment benchmark vs vLLM
-    ├── bench_vllm_omni.py     # Diffusion benchmark: kb-nano vs vllm-omni (FLUX / HunyuanVideo)
+    ├── bench_vllm_omni.py     # Diffusion (FLUX / HunyuanVideo) and TTS (CosyVoice3) benchmark: kb-nano vs vllm-omni
     ├── bench_diffusers.py     # SDXL diffusion benchmark: kb-nano vs diffusers + torch.compile
     ├── utils/                  # Post-processing and visualization
     │   └── parse_vllm_bench_results.py  # Generate tables and plots from bench_vllm.py results
@@ -173,6 +175,16 @@ python tests/bench_vllm_omni.py --skip-latency
 
 # Save results to a specific directory
 python tests/bench_vllm_omni.py --output-dir tests/results/B200/FLUX.1-dev
+```
+
+### Benchmarking vs vllm-omni (TTS / CosyVoice3)
+
+```bash
+# CosyVoice3: throughput + latency benchmark vs vllm-omni (SEED-TTS-Eval dataset)
+python tests/bench_vllm_omni.py --model FunAudioLLM/Fun-CosyVoice3-0.5B-2512
+
+# kb-nano only
+python tests/bench_vllm_omni.py --model FunAudioLLM/Fun-CosyVoice3-0.5B-2512 --skip-vllm-omni
 ```
 
 ### Benchmarking vs diffusers (SDXL Diffusion)
@@ -536,6 +548,39 @@ Correctness (eager mode, decoded video frames, per-prompt cosine similarity):
 | 480p-medium |  8 | 0.923 | 0.862 | 12.92 dB | WARN |
 
 Correctness is measured in decoded pixel space (both engines produce PIL video frames which are compared as uint8 numpy arrays). The pixel-level cosine similarity of ~0.92 is expected for two independent bf16 implementations: numerical differences in the 30-step denoising loop are amplified by the VAE decoder. For reference, latent-space comparison between kb-nano and HF diffusers yields CosSim=0.986, confirming the transformer backbone is correctly implemented. The pixel-space divergence is dominated by VAE decode amplification and different text encoder implementations (kb-nano uses a custom Qwen2.5-VL paged-attention encoder vs vllm-omni's HuggingFace-based encoder).
+
+### CosyVoice3 (TTS)
+
+Run `tests/bench_vllm_omni.py --model FunAudioLLM/Fun-CosyVoice3-0.5B-2512` to reproduce. Dataset: SEED-TTS-Eval (110 utterances across short/medium/long scenarios). Both engines run in float32 with greedy decoding. Reference engine: vllm-omni 0.16.0.
+
+**Hardware: NVIDIA H200**
+
+Throughput (utterances/sec):
+
+| Scenario | Utts | vllm-omni (utt/s) | vllm-omni RTF | Ours (utt/s) | Ours RTF | Speedup |
+|----------|-----:|-----------:|----------:|-----------:|----------:|--------:|
+| tts-short   |  27 | 0.46 | 0.436 | 0.99 | 0.201 | **2.15x** |
+| tts-medium  | 100 | 0.39 | 0.391 | 0.87 | 0.165 | **2.22x** |
+| tts-long    |  50 | 0.38 | 0.389 | 0.78 | 0.164 | **2.03x** |
+
+Latency (single utterance, median of 5 runs):
+
+| Scenario | vllm-omni | Ours | Speedup |
+|----------|----------:|-----:|--------:|
+| single-utterance | 2.072s | 1.138s | **1.82x** |
+
+Correctness (mel spectrogram cosine similarity, kb-nano vs vllm-omni):
+
+| Scenario | Utts | Median | Mean | P10 | Min |
+|----------|-----:|-------:|-----:|----:|----:|
+| tts-short   |  27 | 0.892 | 0.847 | 0.692 | 0.171 |
+| tts-medium  | 100 | 0.904 | 0.874 | 0.754 | 0.513 |
+| tts-long    |  50 | 0.870 | 0.860 | 0.766 | 0.467 |
+| **Overall** | 177 | **0.894** | 0.866 | — | — |
+
+Code2Wav equivalence (same speech tokens, same CFM seed): mel cosine similarity **0.999**.
+
+The Code2Wav stage (flow-matching DiT + HiFi-GAN vocoder) produces near-identical output when given the same tokens. The remaining E2E divergence comes from the Talker LLM stage, where kb-nano uses SDPA while vllm-omni uses PagedAttention with TritonAttention kernels — these attention backends accumulate small numerical differences that can cause token sequences to diverge, especially on longer utterances.
 
 ### SDXL (Diffusion)
 

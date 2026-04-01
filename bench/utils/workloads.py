@@ -150,6 +150,60 @@ ALL_DIFFUSION_WORKLOADS = {
 }
 
 
+
+# ---------------------------------------------------------------------------
+# TTS workloads (text-to-speech, e.g. CosyVoice3)
+# ---------------------------------------------------------------------------
+
+@dataclass(frozen=True)
+class TTSModelConfig:
+    sample_rate: int
+    n_timesteps: int
+
+COSYVOICE3_CONFIG = TTSModelConfig(sample_rate=24000, n_timesteps=10)
+
+
+@dataclass(frozen=True)
+class TTSThroughputWorkload:
+    """TTS throughput workload definition.
+
+    Uses the SEED-TTS-Eval dataset for realistic TTS benchmarking.
+    Each request has a text prompt and a reference audio for voice cloning.
+    """
+    name: str
+    num_requests: int = 100
+    max_text_len: int = 200
+    dataset_name: str = "zhaochenyang20/seed-tts-eval"
+    dataset_split: str = "train"
+
+
+@dataclass(frozen=True)
+class TTSLatencyWorkload:
+    name: str
+    batch_size: int = 1
+    max_text_len: int = 200
+    dataset_name: str = "zhaochenyang20/seed-tts-eval"
+    dataset_split: str = "train"
+    num_warmup: int = 2
+    num_iters: int = 5
+
+
+TTS_THROUGHPUT_WORKLOADS: list[TTSThroughputWorkload] = [
+    TTSThroughputWorkload("tts-short", num_requests=100, max_text_len=50),
+    TTSThroughputWorkload("tts-medium", num_requests=100, max_text_len=200),
+    TTSThroughputWorkload("tts-long", num_requests=50, max_text_len=500),
+]
+
+TTS_LATENCY_WORKLOADS: list[TTSLatencyWorkload] = [
+    TTSLatencyWorkload("single-utterance", batch_size=1, max_text_len=100),
+]
+
+ALL_TTS_WORKLOADS = {
+    "throughput": TTS_THROUGHPUT_WORKLOADS,
+    "latency": TTS_LATENCY_WORKLOADS,
+}
+
+
 def get_max_seq_len() -> int:
     """Return the maximum sequence length across all standardized LLM workloads."""
     max_len = 0
