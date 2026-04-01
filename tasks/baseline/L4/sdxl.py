@@ -36,7 +36,7 @@ from ..L3.sdxl_unet_block import (
     UNetMidBlock2DCrossAttn,
     UpBlock2D,
 )
-from .vae_image_processor import VaeImageProcessor
+from ..L1.video_processor import VideoProcessor as VaeImageProcessor
 
 logger = logging.getLogger(__name__)
 
