@@ -33,8 +33,6 @@ _THIS_DIR = Path(__file__).resolve().parent
 _PACKAGE_DIR = _THIS_DIR.parent
 _PROJECT_ROOT = _PACKAGE_DIR.parent
 
-sys.path.insert(0, str(_PROJECT_ROOT))
-
 from kb_nano.bench.utils.worker import run_worker
 from kb_nano.bench.utils.workloads import (
     SEGMENTATION_LATENCY_WORKLOADS,
@@ -491,9 +489,12 @@ import numpy as np
 def main():
     with open(sys.argv[1]) as f:
         cfg = json.load(f)
-    sys.path.insert(0, cfg["project_root"])
 
-    from kb_nano.tasks.baseline.L4.sam3 import Sam3Config, Sam3Model, load_sam3_checkpoint
+    try:
+        from kb_nano.tasks.baseline.L4.sam3 import Sam3Config, Sam3Model, load_sam3_checkpoint
+    except ImportError:
+        sys.path.insert(0, cfg["project_root"])
+        from kb_nano.tasks.baseline.L4.sam3 import Sam3Config, Sam3Model, load_sam3_checkpoint
 
     print("  Building kb-nano SAM3 model ...", flush=True)
     config = Sam3Config.from_pretrained(cfg["model"])
