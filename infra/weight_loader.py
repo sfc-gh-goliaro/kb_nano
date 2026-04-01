@@ -31,7 +31,9 @@ from ..tasks.baseline.L4.llama4 import Llama4Config, Llama4ForCausalLM
 from ..tasks.baseline.L4.mixtral import MixtralConfig, MixtralForCausalLM
 from ..tasks.baseline.L4.qwen2_vl import Qwen2VLConfig, Qwen2VLForConditionalGeneration
 from ..tasks.baseline.L4.qwen3_vl import Qwen3VLConfig, Qwen3VLForConditionalGeneration
+from ..tasks.baseline.L4.flux import FluxConfig, FluxPipeline
 from ..tasks.baseline.L4.whisper import WhisperConfig, WhisperForConditionalGeneration
+from ..tasks.baseline.L4.cosyvoice3 import CosyVoice3Config, CosyVoice3ForTTS
 
 
 def default_weight_loader(param: torch.nn.Parameter, loaded_weight: torch.Tensor):
@@ -630,8 +632,38 @@ def _postprocess_fp8_weights(model: torch.nn.Module) -> None:
     print(f"  Post-processed {count} FP8 linear layers.")
 
 
+def _is_diffusion_model(model_name: str) -> bool:
+    """Check if the model is a diffusion model (e.g., FLUX, HunyuanVideo) by looking for model_index.json."""
+    import json as _json
+    model_path = model_name if os.path.isdir(model_name) else download_model(model_name)
+    index_path = os.path.join(model_path, "model_index.json")
+    if os.path.exists(index_path):
+        with open(index_path) as f:
+            data = _json.load(f)
+        class_name = data.get("_class_name", "")
+        if "Flux" in class_name or "Diffusion" in class_name or "HunyuanVideo" in class_name:
+            return True
+    return False
+
+
+def _detect_diffusion_type(model_name: str) -> str:
+    """Distinguish between diffusion model types (flux vs hunyuan_video)."""
+    import json as _json
+    model_path = model_name if os.path.isdir(model_name) else download_model(model_name)
+    index_path = os.path.join(model_path, "model_index.json")
+    if os.path.exists(index_path):
+        with open(index_path) as f:
+            data = _json.load(f)
+        class_name = data.get("_class_name", "")
+        if "HunyuanVideo" in class_name:
+            return "hunyuan_video"
+    return "flux"
+
+
 def _detect_model_type(model_name: str) -> str:
     """Detect model architecture from HuggingFace config."""
+    if _is_diffusion_model(model_name):
+        return _detect_diffusion_type(model_name)
     hf_config = AutoConfig.from_pretrained(model_name, trust_remote_code=True)
     model_type = getattr(hf_config, "model_type", "llama")
     return model_type
@@ -667,6 +699,18 @@ def load_model(
         print(f"  Detected FP8 quantization: {quant_config.get('quant_method')}, "
               f"block_size={quant_config.get('weight_block_size')}")
 
+    if model_type in ("flux", "hunyuan_video"):
+        raise ValueError(
+            "Diffusion models should be loaded via "
+            "kb_nano.infra.diffusion_engine.DiffusionEngine, "
+            "not the LLM load_model() path."
+        )
+    if model_type == "cosyvoice3":
+        raise ValueError(
+            "CosyVoice3 TTS models should be loaded via "
+            "kb_nano.infra.tts_engine.TTSEngine, "
+            "not the LLM load_model() path."
+        )
     if model_type == "whisper":
         config = WhisperConfig.from_pretrained(model_name)
         config.dtype = dtype
