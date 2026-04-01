@@ -508,6 +508,39 @@ Correctness (eager mode, packed latent space, per-batch cosine similarity):
 
 Correctness is measured in eager mode to isolate numerical differences in the model from `torch.compile` graph-level optimizations (which change floating-point evaluation order). On B200, both engines use PyTorch SDPA (which dispatches to cuDNN flash attention); on Ampere/Hopper GPUs, kb-nano uses `flash_attn_func` directly.
 
+### CosyVoice3 (TTS)
+
+Run `tests/bench_vllm_omni.py --model FunAudioLLM/Fun-CosyVoice3-0.5B-2512` to reproduce. Dataset: SEED-TTS-Eval (110 utterances across short/medium/long scenarios). Both engines run in float32 with greedy decoding. Reference engine: vllm-omni 0.16.0.
+
+**Hardware: NVIDIA H200**
+
+Throughput (utterances/sec):
+
+| Scenario | Utts | vllm-omni (utt/s) | vllm-omni RTF | Ours (utt/s) | Ours RTF | Speedup |
+|----------|-----:|-----------:|----------:|-----------:|----------:|--------:|
+| tts-short   |  27 | 0.46 | 0.436 | 0.99 | 0.201 | **2.15x** |
+| tts-medium  | 100 | 0.39 | 0.391 | 0.87 | 0.165 | **2.22x** |
+| tts-long    |  50 | 0.38 | 0.389 | 0.78 | 0.164 | **2.03x** |
+
+Latency (single utterance, median of 5 runs):
+
+| Scenario | vllm-omni | Ours | Speedup |
+|----------|----------:|-----:|--------:|
+| single-utterance | 2.072s | 1.138s | **1.82x** |
+
+Correctness (mel spectrogram cosine similarity, kb-nano vs vllm-omni):
+
+| Scenario | Utts | Median | Mean | P10 | Min |
+|----------|-----:|-------:|-----:|----:|----:|
+| tts-short   |  27 | 0.892 | 0.847 | 0.692 | 0.171 |
+| tts-medium  | 100 | 0.904 | 0.874 | 0.754 | 0.513 |
+| tts-long    |  50 | 0.870 | 0.860 | 0.766 | 0.467 |
+| **Overall** | 177 | **0.894** | 0.866 | — | — |
+
+Code2Wav equivalence (same speech tokens, same CFM seed): mel cosine similarity **0.999**.
+
+The Code2Wav stage (flow-matching DiT + HiFi-GAN vocoder) produces near-identical output when given the same tokens. The remaining E2E divergence comes from the Talker LLM stage, where kb-nano uses SDPA while vllm-omni uses PagedAttention with TritonAttention kernels — these attention backends accumulate small numerical differences that can cause token sequences to diverge, especially on longer utterances.
+
 ### SDXL (Diffusion)
 
 Run `tests/bench_diffusers.py` to reproduce. Prompts drawn from the full nateraw/parti-prompts (P2) dataset (1632 prompts), shuffled deterministically. Reference engine: diffusers 0.31 with `torch.compile(mode="max-autotune")`, eager mode for correctness.
