@@ -239,7 +239,14 @@ python tests/test_sam.py --skip-latency
 
 ### Benchmarking vs Embedding Baselines
 
-Set `FLAGEMBEDDING_SRC` or `COLBERT_SRC` to local reference source trees, or pass `--flagembedding-src` / `--colbert-src`.
+Install the reference packages in the `kb` environment:
+
+```bash
+python -m pip install datasets==4.8.4 peft==0.18.1 GitPython==3.1.46 ujson==5.12.0 scipy==1.17.1
+python -m pip install --no-deps FlagEmbedding==1.3.5 colbert-ai==0.2.22
+```
+
+After that, the following commands can be run directly from the repo root:
 
 ```bash
 # BGE-M3: throughput + latency + alignment benchmark vs FlagEmbedding
@@ -557,14 +564,14 @@ Throughput (8 texts, batch size 4, fp16):
 
 | Model | Len | FlagEmbedding (docs/s) | Ours (docs/s) | Ratio |
 |-------|----:|-----------------------:|--------------:|------:|
-| BGE-M3 | 128 | 297.82 | 369.02 | **1.24x** |
+| BGE-M3 | 128 | 222.28 | 348.60 | **1.57x** |
 
 Latency (median of 5 runs, fp16):
 
 | Batch Size | Len | FlagEmbedding median | Ours median | Ratio |
 |-----------:|----:|---------------------:|------------:|------:|
-| 1 | 128 | 0.0176s | 0.0055s | **3.22x** |
-| 4 | 128 | 0.0079s | 0.0062s | **1.29x** |
+| 1 | 128 | 0.0177s | 0.0058s | **3.07x** |
+| 4 | 128 | 0.0197s | 0.0065s | **3.05x** |
 
 Alignment:
 
@@ -583,17 +590,17 @@ Throughput (8 texts, batch size 4, fp16):
 
 | Scenario | Reference (docs/s) | Ours (docs/s) | Ratio |
 |----------|-------------------:|--------------:|------:|
-| Query len 32 | 805.19 | 987.85 | **1.23x** |
-| Doc len 128 | 333.75 | 393.80 | **1.18x** |
+| Query len 32 | 758.83 | 975.56 | **1.29x** |
+| Doc len 128 | 318.92 | 389.34 | **1.22x** |
 
 Latency (median of 5 runs, fp16):
 
 | Scenario | Reference median | Ours median | Ratio |
 |----------|-----------------:|------------:|------:|
-| Query bs=1 len=32 | 0.0043s | 0.0035s | **1.21x** |
-| Query bs=4 len=32 | 0.0068s | 0.0037s | **1.84x** |
-| Doc bs=1 len=128 | 0.0065s | 0.0039s | **1.68x** |
-| Doc bs=4 len=128 | 0.0062s | 0.0046s | **1.36x** |
+| Query bs=1 len=32 | 0.0038s | 0.0033s | **1.14x** |
+| Query bs=4 len=32 | 0.0046s | 0.0036s | **1.28x** |
+| Doc bs=1 len=128 | 0.0043s | 0.0039s | **1.10x** |
+| Doc bs=4 len=128 | 0.0102s | 0.0046s | **2.23x** |
 
 Alignment:
 

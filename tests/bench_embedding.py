@@ -24,7 +24,6 @@ Usage:
 from __future__ import annotations
 
 import argparse
-import glob
 import importlib.util
 import json
 import os
@@ -52,32 +51,6 @@ def _detect_gpu_name() -> str:
 
 def _parse_int_list(value: str) -> list[int]:
     return [int(x.strip()) for x in value.split(",") if x.strip()]
-
-
-def _find_flagembedding_src(explicit: str | None) -> str | None:
-    """Resolve a local FlagEmbedding source tree without installing packages."""
-    if explicit:
-        return explicit
-    env_path = os.environ.get("FLAGEMBEDDING_SRC")
-    if env_path:
-        return env_path
-    matches = sorted(glob.glob("/tmp/FlagEmbedding_src_*"))
-    if matches:
-        return matches[-1]
-    return None
-
-
-def _find_colbert_src(explicit: str | None) -> str | None:
-    """Resolve a local ColBERT source tree without installing packages."""
-    if explicit:
-        return explicit
-    env_path = os.environ.get("COLBERT_SRC")
-    if env_path:
-        return env_path
-    matches = sorted(glob.glob("/tmp/ColBERT_src_*"))
-    if matches:
-        return matches[-1]
-    return None
 
 
 def _detect_embedding_family(model_name: str) -> str:
@@ -736,10 +709,6 @@ def main():
     with open(sys.argv[1]) as f:
         cfg = json.load(f)
 
-    flagembedding_src = cfg.get("flagembedding_src")
-    if flagembedding_src:
-        sys.path.insert(0, flagembedding_src)
-
     try:
         from FlagEmbedding import BGEM3FlagModel
     except ModuleNotFoundError as exc:
@@ -1168,15 +1137,7 @@ if __name__ == "__main__":
 
 
 OFFICIAL_COLBERT_WORKER = _COLBERT_WORKER_SHARED + r'''
-import os
 import types
-
-
-def _prepare_colbert_package(colbert_src):
-    pkg_root = os.path.join(colbert_src, "colbert")
-    module = types.ModuleType("colbert")
-    module.__path__ = [pkg_root]
-    sys.modules["colbert"] = module
 
 
 def _build_skiplist(tokenizer):
@@ -1190,7 +1151,6 @@ def _build_skiplist(tokenizer):
 
 class OfficialColBERTBackend:
     def __init__(self, cfg):
-        _prepare_colbert_package(cfg["colbert_src"])
         from colbert.modeling.hf_colbert import class_factory
 
         self.model_name = cfg["model"]
@@ -1332,7 +1292,6 @@ if __name__ == "__main__":
 
 
 def _run_bge_benchmark(args, gpu: str, device: str, lengths: list[int], latency_batch_sizes: list[int]) -> None:
-    flagembedding_src = _find_flagembedding_src(args.flagembedding_src)
     scenarios = []
     if not args.skip_throughput:
         scenarios = [
@@ -1357,11 +1316,6 @@ def _run_bge_benchmark(args, gpu: str, device: str, lengths: list[int], latency_
             for bs in latency_batch_sizes
         ]
 
-    if not args.skip_reference and flagembedding_src is None:
-        print("ERROR: FlagEmbedding source not found.")
-        print("Clone it locally and pass --flagembedding-src, or set FLAGEMBEDDING_SRC.")
-        sys.exit(1)
-
     print("=" * 88)
     print("  Embedding Benchmark: kb-nano vs FlagEmbedding")
     print("=" * 88)
@@ -1377,8 +1331,6 @@ def _run_bge_benchmark(args, gpu: str, device: str, lengths: list[int], latency_
     print(f"  Latency scenarios   : {[s['name'] for s in latency_scenarios] if latency_scenarios else '(skipped)'}")
     print(f"  Alignment           : {'skipped' if args.skip_alignment else f'{args.alignment_texts} texts @ len {args.alignment_len}'}")
     print(f"  Output dir          : {args.output_dir}")
-    if flagembedding_src:
-        print(f"  FlagEmbedding src   : {flagembedding_src}")
     print("=" * 88)
 
     local_config = {
@@ -1398,10 +1350,7 @@ def _run_bge_benchmark(args, gpu: str, device: str, lengths: list[int], latency_
         "repo_dir": str(_PACKAGE_DIR),
     }
 
-    ref_config = {
-        **local_config,
-        "flagembedding_src": flagembedding_src,
-    }
+    ref_config = dict(local_config)
 
     ref_raw = None
     if not args.skip_reference:
@@ -1572,12 +1521,6 @@ def _run_bge_benchmark(args, gpu: str, device: str, lengths: list[int], latency_
 
 
 def _run_colbert_benchmark(args, gpu: str, device: str, lengths: list[int], latency_batch_sizes: list[int]) -> None:
-    colbert_src = _find_colbert_src(args.colbert_src)
-    if not args.skip_reference and colbert_src is None:
-        print("ERROR: ColBERT source not found.")
-        print("Clone it locally and pass --colbert-src, or set COLBERT_SRC.")
-        sys.exit(1)
-
     scenarios = []
     if not args.skip_throughput:
         scenarios.append({
@@ -1638,8 +1581,6 @@ def _run_colbert_benchmark(args, gpu: str, device: str, lengths: list[int], late
         f"{'skipped' if args.skip_alignment else f'{args.alignment_texts} pairs @ q={args.query_len}, d={args.alignment_len}'}",
     )
     print(f"  Output dir          : {args.output_dir}")
-    if colbert_src:
-        print(f"  ColBERT src         : {colbert_src}")
     print("=" * 88)
 
     local_config = {
@@ -1658,10 +1599,7 @@ def _run_colbert_benchmark(args, gpu: str, device: str, lengths: list[int], late
         "alignment_doc_len": args.alignment_len,
         "repo_dir": str(_PACKAGE_DIR),
     }
-    ref_config = {
-        **local_config,
-        "colbert_src": colbert_src,
-    }
+    ref_config = dict(local_config)
 
     ref_raw = None
     if not args.skip_reference:
@@ -1839,14 +1777,19 @@ def main() -> None:
     parser.add_argument(
         "--lengths",
         type=str,
-        default="128,512,2048",
+        default="128",
         help="Comma-separated throughput sequence lengths.",
     )
     parser.add_argument("--query-len", type=int, default=32)
-    parser.add_argument("--num-texts", type=int, default=256)
-    parser.add_argument("--batch-size", type=int, default=32)
+    parser.add_argument("--num-texts", type=int, default=8)
+    parser.add_argument("--batch-size", type=int, default=4)
     parser.add_argument("--seed", type=int, default=42)
-    parser.add_argument("--use-fp16", action="store_true", default=False)
+    parser.add_argument(
+        "--use-fp16",
+        action=argparse.BooleanOptionalAction,
+        default=None,
+        help="Use fp16. Defaults to enabled on CUDA and disabled on CPU.",
+    )
     parser.add_argument(
         "--dense-only",
         action="store_true",
@@ -1857,28 +1800,16 @@ def main() -> None:
     parser.add_argument("--skip-throughput", action="store_true")
     parser.add_argument("--skip-latency", action="store_true")
     parser.add_argument("--skip-alignment", action="store_true")
-    parser.add_argument("--alignment-texts", type=int, default=8)
+    parser.add_argument("--alignment-texts", type=int, default=4)
     parser.add_argument("--alignment-len", type=int, default=128)
     parser.add_argument("--latency-len", type=int, default=128)
     parser.add_argument(
         "--latency-batch-sizes",
         type=str,
-        default="1,32",
+        default="1,4",
         help="Comma-separated batch sizes for latency scenarios.",
     )
     parser.add_argument("--latency-iters", type=int, default=5)
-    parser.add_argument(
-        "--flagembedding-src",
-        type=str,
-        default=None,
-        help="Optional local FlagEmbedding source tree; avoids global installs.",
-    )
-    parser.add_argument(
-        "--colbert-src",
-        type=str,
-        default=None,
-        help="Optional local ColBERT source tree; avoids global installs.",
-    )
     parser.add_argument(
         "--output-dir",
         type=str,
@@ -1889,6 +1820,8 @@ def main() -> None:
 
     gpu = _detect_gpu_name()
     device = "cuda:0" if gpu != "unknown" else "cpu"
+    if args.use_fp16 is None:
+        args.use_fp16 = device.startswith("cuda")
     lengths = _parse_int_list(args.lengths)
     latency_batch_sizes = _parse_int_list(args.latency_batch_sizes)
     family = _detect_embedding_family(args.model)
