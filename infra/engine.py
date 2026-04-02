@@ -308,6 +308,7 @@ class ModelRunner:
         self.warmup_model()
         self._warmup_deepgemm()
         self.allocate_kv_cache()
+        self._init_fa3_decode_buffers()
         if not self.enforce_eager:
             self.capture_cudagraph()
         self._init_greedy_buffers()
@@ -637,6 +638,23 @@ class ModelRunner:
 
         del processor, dummy_img, dummy_vid, vid_frames_pil, pv, vpv
         del inputs, messages, text
+
+    def _init_fa3_decode_buffers(self):
+        """Pre-allocate cu_seqlens_q buffers for FA3 decode to avoid
+        allocations during CUDA graph capture."""
+        try:
+            from ..tasks.baseline.L1.flash_attn_decode import _FA3_AVAILABLE
+        except ImportError:
+            return
+        if not _FA3_AVAILABLE:
+            return
+        max_bs = self.max_num_seqs
+        for module in self.model.modules():
+            if hasattr(module, '_cu_seqlens_q'):
+                module._cu_seqlens_q = torch.arange(
+                    max_bs + 1, dtype=torch.int32,
+                    device=f"cuda:{self.rank}",
+                )
 
     def allocate_kv_cache(self):
         if not hasattr(self, '_attn_layers') or not self._attn_layers:
@@ -1157,12 +1175,10 @@ class ModelRunner:
         gathered = [g[:n] for g in self._greedy_gathered]
         dist.all_gather(gathered, info)
 
-        for i, g in enumerate(gathered):
-            self._greedy_all_info[i, :n] = g
-        all_vals = self._greedy_all_info[:, :n, 0]
-        all_idxs = self._greedy_all_info[:, :n, 1].long()
-        best_rank = all_vals.argmax(dim=0)
-        token_ids = all_idxs[best_rank, self._greedy_arange[:n]]
+        all_info = self._greedy_all_info
+        torch.stack(gathered, out=all_info[:, :n])
+        best_rank = all_info[:, :n, 0].argmax(dim=0)
+        token_ids = all_info[:, :n, 1].long()[best_rank, self._greedy_arange[:n]]
 
         if self.rank == 0:
             return token_ids
@@ -1361,6 +1377,173 @@ class ModelRunner:
         reset_context()
         return result
 
+    @staticmethod
+    def _strip_mm_tensors(seqs):
+        """Return lightweight copies of sequences for SHM dispatch (no large tensors)."""
+        stripped = []
+        for s in seqs:
+            c = Sequence.__new__(Sequence)
+            c.__dict__.update(s.__dict__)
+            c.pixel_values = None
+            c.video_pixel_values = None
+            c.encoder_features = None
+            stripped.append(c)
+        return stripped
+
+    def _run_mm_lm(self, prefill_seqs, prefill_chunk_sizes, decode_seqs,
+                   vis_cache_map):
+        """Run LM forward with vision embeddings from _vis_cache.
+
+        All ranks have vision outputs in self._vis_cache from prior
+        _broadcast_visual calls. This method:
+        1. Computes text embeddings via embed_fn (TP allreduce)
+        2. Merges cached vision embeddings into text embeddings
+        3. Runs LM forward pass
+
+        vis_cache_map: list of dicts per prefill seq:
+          [{"cache_idx": int, "modality": str, "thw": [[t,h,w],...]}]
+          None entries mean no vision for that seq.
+        """
+        input_ids, positions = self.prepare_mixed_batch(
+            prefill_seqs, prefill_chunk_sizes, decode_seqs,
+        )
+        device = input_ids.device
+        model = self.model
+        embed_fn = model.get_input_embeddings()
+
+        has_deepstack = hasattr(model.visual, 'deepstack_merger_list')
+        if has_deepstack:
+            visual_dim = model.config.vision.out_hidden_size
+        merge_size = model.config.vision.spatial_merge_size
+        image_token_id = self.config.image_token_id
+        video_token_id = self.config.video_token_id
+
+        all_inputs_embeds = []
+        all_deepstack = [] if has_deepstack else None
+
+        for seq_idx, seq in enumerate(prefill_seqs):
+            full_ids = torch.tensor(seq.token_ids, dtype=torch.int64, device=device)
+            if prefill_chunk_sizes is not None:
+                start = seq.num_computed_tokens
+                end = start + prefill_chunk_sizes[seq_idx]
+                chunk_ids = full_ids[start:end]
+            else:
+                chunk_ids = full_ids
+                start = 0
+                end = len(full_ids)
+
+            text_embeds = embed_fn(chunk_ids)
+            seq_deepstack = [] if has_deepstack else None
+
+            info = vis_cache_map[seq_idx] if seq_idx < len(vis_cache_map) else None
+            if info is not None:
+                vis_out = self._vis_cache[info["cache_idx"]]
+                modality = info["modality"]
+                tok_id = image_token_id if modality == "image" else video_token_id
+
+                if has_deepstack:
+                    all_vis_embeds = vis_out[:, :visual_dim]
+                    ds_cat = vis_out[:, visual_dim:]
+                    all_ds_features = list(ds_cat.split(visual_dim, dim=1))
+                else:
+                    all_vis_embeds = vis_out
+                    all_ds_features = []
+
+                if "embed_start" in info:
+                    es = info["embed_start"]
+                    ec = info["embed_count"]
+                    embeds = all_vis_embeds[es:es+ec]
+                    ds_features = [d[es:es+ec] for d in all_ds_features]
+                else:
+                    embeds = all_vis_embeds
+                    ds_features = all_ds_features
+
+                mask = chunk_ids == tok_id
+                if mask.any():
+                    if prefill_chunk_sizes is not None:
+                        full_mask = full_ids == tok_id
+                        chunk_vis_start = full_mask[:start].sum().item()
+                        n_vis = mask.sum().item()
+                        text_embeds[mask] = embeds[chunk_vis_start:chunk_vis_start+n_vis].to(text_embeds.dtype)
+                    else:
+                        text_embeds[mask] = embeds.to(text_embeds.dtype)
+
+                if has_deepstack and ds_features:
+                    for ds_feat in ds_features:
+                        ds_e = torch.zeros_like(text_embeds)
+                        if mask.any():
+                            if prefill_chunk_sizes is not None:
+                                ds_e[mask] = ds_feat[chunk_vis_start:chunk_vis_start+n_vis].to(text_embeds.dtype)
+                            else:
+                                ds_e[mask] = ds_feat.to(text_embeds.dtype)
+                        seq_deepstack.append(ds_e)
+
+            all_inputs_embeds.append(text_embeds)
+            if has_deepstack:
+                all_deepstack.append(seq_deepstack if seq_deepstack else [])
+
+        for seq in decode_seqs:
+            dc_id = torch.tensor([seq.last_token], dtype=torch.int64, device=device)
+            dc_embed = embed_fn(dc_id)
+            all_inputs_embeds.append(dc_embed)
+            if has_deepstack:
+                all_deepstack.append([])
+
+        inputs_embeds = torch.cat(all_inputs_embeds, dim=0)
+
+        deepstack_embeds = None
+        if has_deepstack and all_deepstack:
+            num_levels = max((len(ds) for ds in all_deepstack), default=0)
+            if num_levels > 0:
+                deepstack_embeds = []
+                hidden_dim = inputs_embeds.shape[-1]
+                for level in range(num_levels):
+                    level_parts = []
+                    for ds_idx, ds in enumerate(all_deepstack):
+                        if level < len(ds):
+                            level_parts.append(ds[level])
+                        else:
+                            n_tokens = all_inputs_embeds[ds_idx].shape[0]
+                            level_parts.append(torch.zeros(n_tokens, hidden_dim,
+                                                           device=device, dtype=inputs_embeds.dtype))
+                    deepstack_embeds.append(torch.cat(level_parts, dim=0))
+
+        self._vis_cache = []
+
+        result = self.run_model(input_ids, positions, True,
+                                inputs_embeds=inputs_embeds,
+                                deepstack_embeds=deepstack_embeds)
+        reset_context()
+        return result
+
+    def _broadcast_visual(self, pv_shape, thw_shape):
+        """Broadcast pixel values and run vision encoder on all ranks.
+
+        Rank 0 must set self._mm_pv and self._mm_thw before calling.
+        Other ranks receive via NCCL broadcast.
+        All ranks participate in model.visual() which uses TP allreduce.
+        Returns the vision encoder output tensor.
+        """
+        device = torch.device("cuda")
+        vis_dtype = self.model.visual.patch_embed.proj.weight.dtype
+        if self.rank == 0:
+            bpv = self._mm_pv.to(device=device, dtype=vis_dtype)
+            bthw = (self._mm_thw.clone() if isinstance(self._mm_thw, torch.Tensor)
+                    else torch.tensor(self._mm_thw, dtype=torch.long)).to(device)
+            self._mm_pv = None
+            self._mm_thw = None
+        else:
+            bpv = torch.empty(pv_shape, dtype=vis_dtype, device=device)
+            bthw = torch.empty(thw_shape, dtype=torch.long, device=device)
+        dist.broadcast(bpv, src=0)
+        dist.broadcast(bthw, src=0)
+        vis_out = self.model.visual(bpv, grid_thw=bthw.cpu())
+        del bpv
+        if not hasattr(self, '_vis_cache'):
+            self._vis_cache = []
+        self._vis_cache.append(vis_out)
+        return vis_out
+
     # ------------------------------------------------------------------
     # Whisper cross-attention context helpers
     # ------------------------------------------------------------------
@@ -1536,7 +1719,11 @@ class ModelRunner:
         context_lens = torch.zeros(max_bs, dtype=torch.int32)
         block_tables = torch.zeros(max_bs, max_num_blocks, dtype=torch.int32)
 
-        self.graph_bs_list = [1, 2, 4, 8] + list(range(16, max_bs + 1, 16))
+        self.graph_bs_list = sorted(set(
+            [1, 2, 4] +
+            list(range(8, min(max_bs + 1, 256), 8)) +
+            list(range(256, max_bs + 1, 16))
+        ))
         self.graphs = {}
         self.graph_pool = None
 
@@ -1737,6 +1924,94 @@ class LlamaEngine:
         return (token_ids, pixel_values, image_grid_thw,
                 video_pixel_values, video_grid_thw)
 
+    def _dispatch_vision_encoder(self, seqs):
+        """Dispatch vision encoder to all TP ranks and build vis_cache_map.
+
+        For each sequence with images/videos, broadcasts pixel values via NCCL
+        and runs the vision encoder on all ranks (required for TP allreduce).
+
+        Returns (vis_cache_map, cache_count) where vis_cache_map is a list
+        with one entry per seq: None for text-only seqs, or a dict with
+        cache_idx/modality for vision seqs.
+        """
+        mr = self.model_runner
+        model = mr.model
+        merge_size = model.config.vision.spatial_merge_size
+
+        mr._vis_cache = []
+        vis_cache_map = []
+        cache_idx = 0
+
+        img_pv_list = []
+        img_thw_list = []
+        img_seq_idxs = []
+        for i, seq in enumerate(seqs):
+            if seq.pixel_values is not None:
+                img_pv_list.append(seq.pixel_values.cuda())
+                thw = seq.image_grid_thw
+                if not isinstance(thw, torch.Tensor):
+                    thw = torch.tensor(thw, dtype=torch.long)
+                img_thw_list.append(thw)
+                img_seq_idxs.append(i)
+
+        if img_pv_list:
+            batched_pv = torch.cat(img_pv_list, dim=0)
+            batched_thw = torch.cat(img_thw_list, dim=0).cpu()
+            pv_shape = list(batched_pv.shape)
+            thw_shape = list(batched_thw.shape)
+            mr._mm_pv = batched_pv
+            mr._mm_thw = batched_thw
+            mr.call("_broadcast_visual", pv_shape, thw_shape)
+            for si in img_seq_idxs:
+                vis_cache_map.append({"cache_idx": cache_idx, "modality": "image",
+                                      "seq_idx": si})
+            cache_idx += 1
+
+        vid_seq_idxs = []
+        for i, seq in enumerate(seqs):
+            if seq.video_pixel_values is not None:
+                video_pv = seq.video_pixel_values.cuda()
+                grid_thw = seq.video_grid_thw
+                if not isinstance(grid_thw, torch.Tensor):
+                    grid_thw = torch.tensor(grid_thw, dtype=torch.long)
+                grid_thw = grid_thw.cpu()
+                vpv_shape = list(video_pv.shape)
+                vthw_shape = list(grid_thw.shape)
+                mr._mm_pv = video_pv
+                mr._mm_thw = grid_thw
+                mr.call("_broadcast_visual", vpv_shape, vthw_shape)
+                vid_seq_idxs.append((i, cache_idx))
+                cache_idx += 1
+                del video_pv
+
+        per_seq_map = [None] * len(seqs)
+        if img_pv_list:
+            batched_thw_cpu = torch.cat(img_thw_list, dim=0).cpu()
+            sizes = (batched_thw_cpu.prod(-1) // (merge_size ** 2)).tolist()
+            embed_offset = 0
+            thw_offset = 0
+            for si_idx, si in enumerate(img_seq_idxs):
+                seq = seqs[si]
+                thw_list = seq.image_grid_thw
+                n_items = len(thw_list) if isinstance(thw_list, list) else 1
+                seq_sizes = sizes[thw_offset:thw_offset+n_items]
+                per_seq_map[si] = {
+                    "cache_idx": 0,
+                    "modality": "image",
+                    "embed_start": embed_offset,
+                    "embed_count": sum(seq_sizes),
+                }
+                embed_offset += sum(seq_sizes)
+                thw_offset += n_items
+
+        for si, ci in vid_seq_idxs:
+            per_seq_map[si] = {
+                "cache_idx": ci,
+                "modality": "video",
+            }
+
+        return per_seq_map, cache_idx
+
     @torch.inference_mode()
     def _run_vision_encoder(self, seqs, chunk_sizes=None):
         """Run vision encoder with batching and caching.
@@ -1777,7 +2052,13 @@ class LlamaEngine:
         if img_seqs:
             batched_pv = torch.cat(img_pv_list, dim=0)
             batched_thw = torch.cat(img_thw_list, dim=0).cpu()
-            vis_out = model.visual(batched_pv, grid_thw=batched_thw)
+            pv_shape = list(batched_pv.shape)
+            thw_shape = list(batched_thw.shape)
+            self.model_runner._mm_pv = batched_pv
+            self.model_runner._mm_thw = batched_thw
+            vis_out = self.model_runner.call(
+                "_broadcast_visual", pv_shape, thw_shape,
+            )
 
             sizes = (batched_thw.prod(-1) // (merge_size ** 2)).tolist()
             if has_deepstack and deepstack_num_levels > 0:
@@ -1821,7 +2102,13 @@ class LlamaEngine:
                 if not isinstance(grid_thw, torch.Tensor):
                     grid_thw = torch.tensor(grid_thw, dtype=torch.long)
                 grid_thw = grid_thw.cpu()
-                vis_out = model.visual(video_pv, grid_thw=grid_thw)
+                vpv_shape = list(video_pv.shape)
+                vthw_shape = list(grid_thw.shape)
+                self.model_runner._mm_pv = video_pv
+                self.model_runner._mm_thw = grid_thw
+                vis_out = self.model_runner.call(
+                    "_broadcast_visual", vpv_shape, vthw_shape,
+                )
 
                 if has_deepstack and deepstack_num_levels > 0:
                     video_embeds = vis_out[:, :visual_dim]
@@ -2137,11 +2424,11 @@ class LlamaEngine:
                         mr._write_decode_shm(*decode_data)
                         mr.shm.buf[mr._SHM_FLAG_OFFSET] = 1
                         mr._signal_workers()
-                    gpu_result = mr.run_decode_greedy_fast(decode_data)
+                    has_result, _async_n = mr.run_decode_greedy_fast_async(decode_data)
                     if _PROFILE:
                         _fp_t2 = time.perf_counter()
-                    if gpu_result is not None:
-                        token_ids = gpu_result.tolist()
+                    if has_result:
+                        token_ids = mr._wait_async_tokens(_async_n)
                         if _PROFILE:
                             _fp_t3 = time.perf_counter()
                         any_finished = False
@@ -2193,7 +2480,6 @@ class LlamaEngine:
                                 if len(seq) % block_size == 1:
                                     seq.block_table.append(
                                         bm.free_block_ids.popleft())
-
                             if _PROFILE:
                                 _fp_t0 = time.perf_counter()
                             if use_incr:
@@ -2210,11 +2496,11 @@ class LlamaEngine:
                                 mr._write_decode_shm(*decode_data)
                                 mr.shm.buf[mr._SHM_FLAG_OFFSET] = 1
                                 mr._signal_workers()
-                            gpu_result = mr.run_decode_greedy_fast(decode_data)
+                            has_result, _async_n = mr.run_decode_greedy_fast_async(decode_data)
                             if _PROFILE:
                                 _fp_t2 = time.perf_counter()
-                            if gpu_result is not None:
-                                token_ids = gpu_result.tolist()
+                            if has_result:
+                                token_ids = mr._wait_async_tokens(_async_n)
                                 if _PROFILE:
                                     _fp_t3 = time.perf_counter()
                                 for seq, tid in zip(decode_seqs, token_ids):
@@ -2492,17 +2778,12 @@ class LlamaEngine:
                     for s in prefill_seqs
                 )
                 if has_mm:
-                    inputs_embeds, deepstack_embeds = self._run_vision_encoder(
-                        prefill_seqs, chunk_sizes=prefill_chunk_sizes)
-                    input_ids_t, positions_t = self.model_runner.prepare_mixed_batch(
-                        prefill_seqs, prefill_chunk_sizes, [],
+                    vis_cache_map, _ = self._dispatch_vision_encoder(prefill_seqs)
+                    _stripped_pf = self.model_runner._strip_mm_tensors(prefill_seqs)
+                    logits = self.model_runner.call(
+                        "_run_mm_lm", _stripped_pf, prefill_chunk_sizes, [],
+                        vis_cache_map,
                     )
-                    logits = self.model_runner.run_model(
-                        input_ids_t, positions_t, True,
-                        inputs_embeds=inputs_embeds,
-                        deepstack_embeds=deepstack_embeds,
-                    )
-                    reset_context()
                     if _step_profile_active:
                         torch.cuda.synchronize()
                         step_profile["mm_prefill_time"] += time.perf_counter() - _spt0
@@ -2535,31 +2816,13 @@ class LlamaEngine:
                     for s in prefill_seqs
                 )
                 if has_mm:
-                    pf_embeds, deepstack_embeds = self._run_vision_encoder(
-                        prefill_seqs, chunk_sizes=prefill_chunk_sizes)
-                    embed_fn = self.model_runner.model.get_input_embeddings()
-                    dc_ids = torch.tensor(
-                        [s.last_token for s in decode_seqs],
-                        dtype=torch.int64, device="cuda",
+                    vis_cache_map, _ = self._dispatch_vision_encoder(prefill_seqs)
+                    _stripped_pf = self.model_runner._strip_mm_tensors(prefill_seqs)
+                    _stripped_dc = self.model_runner._strip_mm_tensors(decode_seqs)
+                    logits = self.model_runner.call(
+                        "_run_mm_lm", _stripped_pf, prefill_chunk_sizes,
+                        _stripped_dc, vis_cache_map,
                     )
-                    dc_embeds = embed_fn(dc_ids)
-                    inputs_embeds = torch.cat([pf_embeds, dc_embeds], dim=0)
-                    if deepstack_embeds is not None:
-                        dc_zeros = torch.zeros_like(dc_embeds).unsqueeze(0).expand(
-                            len(deepstack_embeds), -1, -1)
-                        deepstack_embeds = [
-                            torch.cat([ds, dc_zeros[i]], dim=0)
-                            for i, ds in enumerate(deepstack_embeds)
-                        ]
-                    input_ids_t, positions_t = self.model_runner.prepare_mixed_batch(
-                        prefill_seqs, prefill_chunk_sizes, decode_seqs,
-                    )
-                    logits = self.model_runner.run_model(
-                        input_ids_t, positions_t, True,
-                        inputs_embeds=inputs_embeds,
-                        deepstack_embeds=deepstack_embeds,
-                    )
-                    reset_context()
                     if _step_profile_active:
                         torch.cuda.synchronize()
                         step_profile["mixed_mm_time"] += time.perf_counter() - _spt0
