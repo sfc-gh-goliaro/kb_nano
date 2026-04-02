@@ -24,6 +24,7 @@ dependencies = [
     "peft>=0.17.0",
     "sam3 @ git+https://github.com/facebookresearch/sam3.git",
     "pycocotools",
+    "fastsafetensors",
 ]
 
 [project.optional-dependencies]

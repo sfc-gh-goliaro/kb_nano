@@ -116,6 +116,7 @@ def _is_whisper_model(model_name: str) -> bool:
 VLLM_WORKER = r'''
 import json, os, sys, time
 os.environ.setdefault("VLLM_WORKER_MULTIPROC_METHOD", "spawn")
+os.environ.setdefault("VLLM_DEEP_GEMM_WARMUP", "skip")
 
 def main():
     from vllm import LLM, SamplingParams
@@ -515,6 +516,7 @@ def _filter_and_prepare(mm_data, processor, max_input_tokens):
 VLLM_VLM_WORKER = _MM_PRELOAD_FN + r'''
 import json, os, sys, time
 os.environ.setdefault("VLLM_WORKER_MULTIPROC_METHOD", "spawn")
+os.environ.setdefault("VLLM_DEEP_GEMM_WARMUP", "skip")
 
 
 def main():
@@ -869,6 +871,7 @@ VLLM_WHISPER_WORKER = r'''
 import json, os, sys, time
 import numpy as np
 os.environ.setdefault("VLLM_WORKER_MULTIPROC_METHOD", "spawn")
+os.environ.setdefault("VLLM_DEEP_GEMM_WARMUP", "skip")
 
 def _load_librispeech(dataset_name, dataset_split, num_seqs, seed):
     """Load audio samples from LibriSpeech and return as list of numpy arrays."""
@@ -1465,7 +1468,7 @@ def main():
             "max_model_len": global_max_seq_len,
             "scenarios": scenario_data,
             "latency_scenarios": latency_data,
-            # "load_format": "fastsafetensors",  # disabled: OOM for large models
+            "load_format": "fastsafetensors",
         }
         vllm_raw = run_worker(
             vllm_worker, vllm_config,

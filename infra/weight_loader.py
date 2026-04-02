@@ -233,6 +233,109 @@ def _threaded_safetensors_iterator(safetensor_files):
             del tensors
 
 
+def _fastsafetensors_iterator(safetensor_files):
+    """Yield (weight_name, tensor) using fastsafetensors GPU-direct loading."""
+    device = torch.device(f"cuda:{torch.cuda.current_device()}")
+    pg = SingleGroup()
+    sorted_files = sorted(safetensor_files)
+
+    for f_path in sorted_files:
+        loader = SafeTensorsFileLoader(pg, device, nogds=True)
+        loader.add_filenames({0: [f_path]})
+        try:
+            fb = loader.copy_files_to_device()
+            try:
+                for k in list(fb.key_to_rank_lidx.keys()):
+                    yield k, fb.get_tensor(k)
+            finally:
+                fb.close()
+        finally:
+            loader.close()
+
+
+def _assign_fused_expert(model, key, tensor, scale):
+    """Assign a single fused expert weight+scale to the model, then free them.
+
+    Handles FP8 TP-sharded assignment with scale transposition.
+    Called as soon as both weight and scale are available for a given
+    (mlp_prefix, proj) key, avoiding buffering all layers simultaneously.
+    """
+    from .tp import _tp_rank
+    mlp_prefix, proj = key
+    rank = _tp_rank() if _tp_size() > 1 else 0
+    is_fp8 = tensor.dtype in (torch.float8_e4m3fn, torch.float8_e5m2)
+
+    if proj == "gate_up_proj":
+        param_name = f"{mlp_prefix}.w13"
+    else:
+        param_name = f"{mlp_prefix}.w2"
+    try:
+        param = model.get_parameter(param_name)
+    except AttributeError:
+        return
+
+    model_is_fp8 = param.dtype in (torch.float8_e4m3fn, torch.float8_e5m2)
+
+    if is_fp8 and model_is_fp8 and scale is not None:
+        weight = tensor.transpose(-1, -2)
+        if proj == "gate_up_proj":
+            full_inter_2 = weight.shape[1]
+            half = full_inter_2 // 2
+            tp = param.shape[1] // 2
+            gate = weight[:, :half, :]
+            up = weight[:, half:, :]
+            param.data[:, :tp, :].copy_(gate[:, rank * tp:(rank + 1) * tp, :])
+            param.data[:, tp:, :].copy_(up[:, rank * tp:(rank + 1) * tp, :])
+
+            scale_param_name = f"{mlp_prefix}.w13_scale"
+            try:
+                scale_param = model.get_parameter(scale_param_name)
+            except AttributeError:
+                pass
+            else:
+                s = scale.transpose(1, 2)
+                full_scale_rows = s.shape[1]
+                gate_scale_rows = full_scale_rows // 2
+                up_scale_rows = full_scale_rows - gate_scale_rows
+                gate_rows_per_tp = gate_scale_rows // _tp_size()
+                up_rows_per_tp = up_scale_rows // _tp_size()
+                gate_s = s[:, rank * gate_rows_per_tp:(rank + 1) * gate_rows_per_tp, :]
+                up_s = s[:, gate_scale_rows + rank * up_rows_per_tp:gate_scale_rows + (rank + 1) * up_rows_per_tp, :]
+                scale_param.data[:, :gate_rows_per_tp, :].copy_(gate_s)
+                scale_param.data[:, gate_rows_per_tp:gate_rows_per_tp + up_rows_per_tp, :].copy_(up_s)
+        else:
+            full_inter = weight.shape[2]
+            tp_inter = param.shape[2]
+            param.data.copy_(weight[:, :, rank * tp_inter:(rank + 1) * tp_inter])
+
+            scale_param_name = f"{mlp_prefix}.w2_scale"
+            try:
+                scale_param = model.get_parameter(scale_param_name)
+            except AttributeError:
+                pass
+            else:
+                s = scale.transpose(1, 2)
+                full_scale_cols = s.shape[2]
+                scale_cols_per_tp = full_scale_cols // _tp_size()
+                scale_param.data.copy_(s[:, :, rank * scale_cols_per_tp:(rank + 1) * scale_cols_per_tp])
+    else:
+        if is_fp8 and scale is not None:
+            tensor = _dequant_fp8_block(tensor, scale, block_size=128)
+        weight = tensor.transpose(-1, -2)
+        if proj == "gate_up_proj":
+            full_inter_2 = weight.shape[1]
+            half = full_inter_2 // 2
+            tp = param.shape[1] // 2
+            gate = weight[:, :half, :]
+            up = weight[:, half:, :]
+            param.data[:, :tp, :].copy_(gate[:, rank * tp:(rank + 1) * tp, :])
+            param.data[:, tp:, :].copy_(up[:, rank * tp:(rank + 1) * tp, :])
+        else:
+            full_inter = weight.shape[2]
+            tp_inter = param.shape[2]
+            param.data.copy_(weight[:, :, rank * tp_inter:(rank + 1) * tp_inter])
+
+
 def load_weights(model, model_path: str, model_type: str = "llama") -> None:
     """Load weights with support for packed modules, MoE experts, vision
     encoder QKV, FP8 weight_scale_inv, and TP sharding.
@@ -251,8 +354,10 @@ def load_weights(model, model_path: str, model_type: str = "llama") -> None:
     if is_llama4:
         llama4_config = model.config
 
-    use_threaded = len(safetensor_files) > 1
-    if use_threaded:
+    if _HAS_FASTSAFETENSORS:
+        print(f"  Loading weights from {len(safetensor_files)} safetensors file(s) "
+              f"[fastsafetensors GPU-direct]...")
+    elif len(safetensor_files) > 1:
         print(f"  Loading weights from {len(safetensor_files)} safetensors file(s) "
               f"[threaded]...")
     else:
@@ -261,7 +366,9 @@ def load_weights(model, model_path: str, model_type: str = "llama") -> None:
     _fused_expert_weights = {}
     _fused_expert_scales = {}
 
-    if use_threaded:
+    if _HAS_FASTSAFETENSORS:
+        _weight_iter = _fastsafetensors_iterator(safetensor_files)
+    elif len(safetensor_files) > 1:
         _weight_iter = _threaded_safetensors_iterator(safetensor_files)
     else:
         def _std_iter():
@@ -465,28 +572,39 @@ def load_weights(model, model_path: str, model_type: str = "llama") -> None:
             m_gate = _QWEN3_MOE_GATE_RE.match(mapped_name)
             if m_gate:
                 mlp_prefix = m_gate.group(1)
-                param_name = f"{mlp_prefix}.gate_weight"
+                param_name = f"{mlp_prefix}.gate.weight"
                 try:
                     param = model.get_parameter(param_name)
                 except AttributeError:
                     pass
                 else:
-                    param.weight_loader(param, _get_tensor())
+                    weight_loader = getattr(param, "weight_loader", default_weight_loader)
+                    weight_loader(param, _get_tensor())
                     loaded += 1
                 continue
 
-            # Buffer fused expert scale_inv tensors for deferred dequantization
             m_fused_scale = _QWEN3_MOE_FUSED_SCALE_RE.match(mapped_name)
             if m_fused_scale:
                 mlp_prefix, proj = m_fused_scale.groups()
                 _fused_expert_scales[(mlp_prefix, proj)] = _get_tensor()
+                key = (mlp_prefix, proj)
+                if key in _fused_expert_weights:
+                    _assign_fused_expert(model, key, _fused_expert_weights.pop(key),
+                                         _fused_expert_scales.pop(key))
+                    loaded += 1
                 continue
 
             m_fused = _QWEN3_MOE_FUSED_EXPERT_RE.match(mapped_name)
             if m_fused:
                 mlp_prefix, proj = m_fused.groups()
-                _fused_expert_weights[(mlp_prefix, proj)] = _get_tensor()
-                loaded += 1
+                key = (mlp_prefix, proj)
+                _fused_expert_weights[key] = _get_tensor()
+                if key in _fused_expert_scales:
+                    _assign_fused_expert(model, key, _fused_expert_weights.pop(key),
+                                         _fused_expert_scales.pop(key))
+                    loaded += 1
+                else:
+                    loaded += 1
                 continue
 
         # Handle packed modules (qkv_proj, gate_up_proj)
@@ -537,104 +655,109 @@ def load_weights(model, model_path: str, model_type: str = "llama") -> None:
             lm_loader(lm_param, _get_tensor())
             loaded += 1
 
-    # Assign buffered fused expert weights (keep FP8 when model supports it)
+    # Assign any remaining buffered fused expert weights (weight arrived
+    # in a different safetensors file than its scale, so the pair wasn't
+    # complete during the main loop).
     if _fused_expert_weights:
-        import math as _math
-        from .tp import _tp_rank
-        rank = _tp_rank() if _tp_size() > 1 else 0
-        for (mlp_prefix, proj), tensor in _fused_expert_weights.items():
-            scale = _fused_expert_scales.get((mlp_prefix, proj))
-            is_fp8 = tensor.dtype in (torch.float8_e4m3fn, torch.float8_e5m2)
-
-            # Check if model has FP8 expert weights (Qwen3MoE with quant_config)
-            if proj == "gate_up_proj":
-                param_name = f"{mlp_prefix}.w13"
-            else:
-                param_name = f"{mlp_prefix}.w2"
-            try:
-                param = model.get_parameter(param_name)
-            except AttributeError:
-                continue
-
-            model_is_fp8 = param.dtype in (torch.float8_e4m3fn, torch.float8_e5m2)
-
-            if is_fp8 and model_is_fp8 and scale is not None:
-                # Keep weights in FP8 and load scales separately
-                weight = tensor.transpose(-1, -2)
-                if proj == "gate_up_proj":
-                    full_inter_2 = weight.shape[1]
-                    half = full_inter_2 // 2
-                    tp = param.shape[1] // 2
-                    gate = weight[:, :half, :]
-                    up = weight[:, half:, :]
-                    param.data[:, :tp, :].copy_(gate[:, rank * tp:(rank + 1) * tp, :])
-                    param.data[:, tp:, :].copy_(up[:, rank * tp:(rank + 1) * tp, :])
-
-                    # Load the scale for w13
-                    scale_param_name = f"{mlp_prefix}.w13_scale"
-                    try:
-                        scale_param = model.get_parameter(scale_param_name)
-                    except AttributeError:
-                        pass
-                    else:
-                        # scale shape: [E, scale_R, scale_C] where R = ceil(inter/block_n), C = ceil(hidden/block_k)
-                        # Checkpoint scale corresponds to the full [E, inter*2, hidden] weight
-                        # We need to shard along the output (rows) dimension for TP
-                        full_scale_rows = scale.shape[1]
-                        scale_rows_per_shard = full_scale_rows // _tp_size()
-                        # gate_up_proj scale: first half = gate, second half = up
-                        gate_scale_rows = full_scale_rows // 2
-                        up_scale_rows = full_scale_rows - gate_scale_rows
-                        gate_rows_per_tp = gate_scale_rows // _tp_size()
-                        up_rows_per_tp = up_scale_rows // _tp_size()
-                        gate_s = scale[:, rank * gate_rows_per_tp:(rank + 1) * gate_rows_per_tp, :]
-                        up_s = scale[:, gate_scale_rows + rank * up_rows_per_tp:gate_scale_rows + (rank + 1) * up_rows_per_tp, :]
-                        scale_param.data[:, :gate_rows_per_tp, :].copy_(gate_s)
-                        scale_param.data[:, gate_rows_per_tp:gate_rows_per_tp + up_rows_per_tp, :].copy_(up_s)
-                else:
-                    full_inter = weight.shape[2]
-                    tp_inter = param.shape[2]
-                    param.data.copy_(weight[:, :, rank * tp_inter:(rank + 1) * tp_inter])
-
-                    # Load the scale for w2
-                    scale_param_name = f"{mlp_prefix}.w2_scale"
-                    try:
-                        scale_param = model.get_parameter(scale_param_name)
-                    except AttributeError:
-                        pass
-                    else:
-                        # w2 scale sharded along cols (input dim = intermediate)
-                        full_scale_cols = scale.shape[2]
-                        scale_cols_per_tp = full_scale_cols // _tp_size()
-                        scale_param.data.copy_(scale[:, :, rank * scale_cols_per_tp:(rank + 1) * scale_cols_per_tp])
-            else:
-                # Fallback: dequantize FP8 to BF16 (for non-FP8 model params)
-                if is_fp8 and scale is not None:
-                    tensor = _dequant_fp8_block(tensor, scale, block_size=128)
-                weight = tensor.transpose(-1, -2)
-                if proj == "gate_up_proj":
-                    full_inter_2 = weight.shape[1]
-                    half = full_inter_2 // 2
-                    tp = param.shape[1] // 2
-                    gate = weight[:, :half, :]
-                    up = weight[:, half:, :]
-                    param.data[:, :tp, :].copy_(gate[:, rank * tp:(rank + 1) * tp, :])
-                    param.data[:, tp:, :].copy_(up[:, rank * tp:(rank + 1) * tp, :])
-                else:
-                    full_inter = weight.shape[2]
-                    tp_inter = param.shape[2]
-                    param.data.copy_(weight[:, :, rank * tp_inter:(rank + 1) * tp_inter])
+        for key in list(_fused_expert_weights.keys()):
+            scale = _fused_expert_scales.pop(key, None)
+            _assign_fused_expert(model, key, _fused_expert_weights.pop(key), scale)
         del _fused_expert_weights, _fused_expert_scales
 
     print(f"  Loaded {loaded} weight shards.")
 
 
+def _postprocess_moe_fp8_weights(module) -> int:
+    """Post-process MoE expert FP8 weights for DeepGEMM UE8M0 format.
+
+    For each expert's w13 and w2: dequantize with old scales, requantize
+    with UE8M0 power-of-two scales. The requantized scales (still in the
+    original [E, rows, cols] layout) are kept in w13_scale / w2_scale for
+    the Triton fallback path. Additionally, DeepGEMM-layout transformed
+    scales are stored in w13_scale_dg / w2_scale_dg for the DeepGEMM path.
+    Matches vLLM's prepare_fp8_moe_layer_for_deepgemm.
+
+    Only runs when DeepGEMM is available on Hopper+ GPUs.
+    """
+    import deep_gemm
+
+    if not hasattr(module, 'w13') or not hasattr(module, 'w13_scale'):
+        return 0
+    if module.w13.dtype != torch.float8_e4m3fn:
+        return 0
+
+    from ..tasks.baseline.L1.moe_grouped_gemm import _is_deep_gemm_supported
+    if not _is_deep_gemm_supported():
+        return 0
+
+    block_shape = getattr(module, 'block_shape', [128, 128])
+    block_m, block_k = int(block_shape[0]), int(block_shape[1])
+    assert block_m == 128 and block_k == 128, (
+        f"deep_gemm.per_block_cast_to_fp8 only supports 128x128 blocks, "
+        f"got [{block_m}, {block_k}]"
+    )
+
+    count = 0
+    for wname, sname in [('w13', 'w13_scale'), ('w2', 'w2_scale')]:
+        wq = getattr(module, wname).data
+        ws = getattr(module, sname).data
+
+        E = wq.size(0)
+        # PyTorch 2.10+/CUDA 13.0 treats float8_e4m3fn 0x7F/0xFF as NaN
+        # (older spec mapped them to ±448). Remap to ±240 (current max) before
+        # the dequant→requant cycle so the values survive the float32 round-trip.
+        _fp8_max = torch.finfo(torch.float8_e4m3fn).max
+        _raw = wq.view(torch.uint8)
+        _mask_7f = _raw == 0x7F
+        _mask_ff = _raw == 0xFF
+        if _mask_7f.any() or _mask_ff.any():
+            _pos_max = torch.tensor([_fp8_max], dtype=torch.float8_e4m3fn, device=wq.device)
+            _neg_max = torch.tensor([-_fp8_max], dtype=torch.float8_e4m3fn, device=wq.device)
+            _raw_rw = wq.view(torch.uint8)
+            _raw_rw[_mask_7f] = _pos_max.view(torch.uint8).item()
+            _raw_rw[_mask_ff] = _neg_max.view(torch.uint8).item()
+
+        for idx in range(E):
+            w_slice = wq[idx]
+            s_slice = ws[idx]
+            m_cur, k_cur = w_slice.shape
+            s_float = s_slice.to(torch.float32)
+            s_exp_r = torch.repeat_interleave(s_float, block_m, dim=0)
+            s_exp = torch.repeat_interleave(s_exp_r, block_k, dim=1)
+            s_exp = s_exp[:m_cur, :k_cur]
+            w_dq = w_slice.to(torch.float32) * s_exp
+            w_requant, s_requant = deep_gemm.per_block_cast_to_fp8(
+                w_dq, use_ue8m0=True
+            )
+            wq[idx].copy_(w_requant)
+            ws[idx].copy_(s_requant)
+
+        recipe = (1, block_m, block_k)
+        dg_ws = deep_gemm.transform_sf_into_required_layout(
+            sf=ws,
+            mn=wq.size(1),
+            k=wq.size(2),
+            recipe=recipe,
+            num_groups=E,
+            is_sfa=False,
+        )
+        dg_sname = sname + "_dg"
+        module.register_parameter(
+            dg_sname, torch.nn.Parameter(dg_ws, requires_grad=False)
+        )
+        count += 1
+
+    return count
+
+
 def _postprocess_fp8_weights(model: torch.nn.Module) -> None:
     """Re-quantize FP8 weights to UE8M0 format and transform scale layout for DeepGEMM."""
     from ..tasks.baseline.L1.fp8_linear import Fp8Linear, postprocess_fp8_weights
+    from ..tasks.baseline.L2.qwen3_moe import Qwen3MoE
 
     print("  Post-processing FP8 weights for DeepGEMM...")
     count = 0
+    moe_count = 0
     for module in model.modules():
         if isinstance(module.linear_op if hasattr(module, 'linear_op') else None, Fp8Linear):
             w = module.weight
@@ -643,7 +766,11 @@ def _postprocess_fp8_weights(model: torch.nn.Module) -> None:
             module.weight = torch.nn.Parameter(w_new, requires_grad=False)
             module.weight_scale_inv = torch.nn.Parameter(s_new, requires_grad=False)
             count += 1
-    print(f"  Post-processed {count} FP8 linear layers.")
+        elif isinstance(module, Qwen3MoE) and getattr(module, 'use_fp8', False):
+            moe_count += _postprocess_moe_fp8_weights(module)
+    if count > 0 or moe_count > 0:
+        torch.cuda.empty_cache()
+    print(f"  Post-processed {count} FP8 linear layers, {moe_count} MoE weight sets.")
 
 
 def _is_diffusion_model(model_name: str) -> bool:

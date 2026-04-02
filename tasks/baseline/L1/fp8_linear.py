@@ -32,7 +32,7 @@ def _fp8_group_quant_kernel(
     x = tl.load(x_base + cols).to(tl.float32)
 
     absmax = tl.max(tl.abs(x))
-    absmax = tl.maximum(absmax, 1e-12)
+    absmax = tl.maximum(absmax, 1e-10)
     scale = tl.math.exp2(tl.math.ceil(tl.math.log2(absmax / fp8_max)))
 
     x_scaled = x / scale
@@ -147,13 +147,17 @@ class Fp8Linear(nn.Module):
 def postprocess_fp8_weights(weight_fp8: torch.Tensor,
                             scale_inv: torch.Tensor) -> tuple[torch.Tensor, torch.Tensor]:
     """Re-quantize FP8 weights to UE8M0 scale format and transform scale layout
-    for DeepGEMM compatibility. Must be called once after weight loading."""
+    for DeepGEMM compatibility. Must be called once after weight loading.
+
+    Matches vllm's requant_weight_ue8m0_inplace + deepgemm_post_process_fp8_weight_block:
+    dequantize to float32 (not BF16) then requantize with UE8M0 power-of-two scales.
+    """
     N, K = weight_fp8.shape
     block_size = Fp8Linear.BLOCK_SIZE
 
     scale_rows = math.ceil(N / block_size)
     scale_cols = math.ceil(K / block_size)
-    scale = scale_inv[:scale_rows, :scale_cols]
+    scale = scale_inv[:scale_rows, :scale_cols].to(torch.float32)
 
     w_padded = weight_fp8
     need_n_pad = (block_size - N % block_size) % block_size
@@ -167,13 +171,13 @@ def postprocess_fp8_weights(weight_fp8: torch.Tensor,
                       if need_n_pad or need_k_pad else \
                       w_padded.view(scale_rows, block_size, scale_cols, block_size)
 
-    w_bf16 = w_view.to(torch.bfloat16) * scale[:, None, :, None]
+    w_f32 = w_view.to(torch.float32) * scale[:, None, :, None]
 
-    w_bf16_flat = w_bf16.reshape(-1, w_bf16.shape[2] * block_size)
+    w_f32_flat = w_f32.reshape(-1, w_f32.shape[2] * block_size)
     if need_n_pad or need_k_pad:
-        w_bf16_flat = w_bf16_flat[:N, :K].contiguous()
+        w_f32_flat = w_f32_flat[:N, :K].contiguous()
 
-    w_fp8_new, scale_ue8m0 = deep_gemm.per_block_cast_to_fp8(w_bf16_flat, use_ue8m0=True)
+    w_fp8_new, scale_ue8m0 = deep_gemm.per_block_cast_to_fp8(w_f32_flat, use_ue8m0=True)
 
     recipe = (1, block_size, block_size)
     scale_transformed = deep_gemm.transform_sf_into_required_layout(

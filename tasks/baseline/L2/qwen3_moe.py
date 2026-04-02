@@ -14,9 +14,9 @@ import torch.nn as nn
 
 from ....infra.tp import _tp_rank, _tp_size
 from ..L1.allreduce import AllReduce
-from ..L1.linear import Matmul
 from ..L1.topk_softmax import TopKSoftmax
 from ..L2.fused_experts import FusedExperts
+from ..L2.parallel_linear import ReplicatedLinear
 
 _FP8_BLOCK = 128
 
@@ -48,10 +48,9 @@ class Qwen3MoE(nn.Module):
         self.renormalize = getattr(config, "norm_topk_prob", True)
         self.use_fp8 = quant_config is not None
 
-        self.gate_weight = nn.Parameter(
-            torch.empty(config.num_experts, config.hidden_size),
+        self.gate = ReplicatedLinear(
+            config.hidden_size, config.num_experts, bias=False,
         )
-        self.gate_weight.weight_loader = lambda p, w: p.data.copy_(w)
 
         w13_rows = 2 * self.intermediate_per_tp
         w2_cols = self.intermediate_per_tp
@@ -102,7 +101,6 @@ class Qwen3MoE(nn.Module):
             self.w13_scale = None
             self.w2_scale = None
 
-        self.linear_op = Matmul()
         self.topk_softmax = TopKSoftmax()
         self.fused_experts = FusedExperts()
         self.allreduce = AllReduce()
@@ -160,18 +158,23 @@ class Qwen3MoE(nn.Module):
         orig_shape = hidden_states.shape
         hidden_states = hidden_states.view(-1, self.hidden_size)
 
-        router_logits = self.linear_op(hidden_states, self.gate_weight)
+        router_logits = self.gate(hidden_states)
         topk_weights, topk_ids = self.topk_softmax(
             router_logits, self.top_k, renormalize=self.renormalize,
         )
         # topk_weights stays float32 — router weight multiplication MUST be
         # performed in float32 before precision conversion (vLLM requirement)
 
+        w13_scale_dg = getattr(self, 'w13_scale_dg', None)
+        w2_scale_dg = getattr(self, 'w2_scale_dg', None)
+
         out = self.fused_experts(
             hidden_states, self.w13, self.w2,
             topk_weights, topk_ids, self.num_experts,
             w13_scale=self.w13_scale,
             w2_scale=self.w2_scale,
+            w13_scale_dg=w13_scale_dg,
+            w2_scale_dg=w2_scale_dg,
             use_fp8_w8a8=self.use_fp8,
             block_shape=self.block_shape,
         )

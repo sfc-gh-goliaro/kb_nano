@@ -215,8 +215,10 @@ class Qwen3VisionTransformer(nn.Module):
 
         hidden_states = self.merger(hidden_states)
         if deepstack_features:
-            return hidden_states, deepstack_features
-        return hidden_states, []
+            hidden_states = torch.cat(
+                [hidden_states] + deepstack_features, dim=1
+            )
+        return hidden_states
 
 
 # ---- Language Model ----

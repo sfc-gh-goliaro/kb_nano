@@ -1,11 +1,86 @@
-"""Triton fused MoE grouped GEMM kernel with FP8 W8A8 block-scaled support."""
+"""Triton fused MoE grouped GEMM kernel with FP8 W8A8 block-scaled support.
+
+Also supports DeepGEMM m_grouped_fp8_gemm_nt_contiguous for Hopper+ GPUs
+when shapes are aligned, matching vLLM's TritonOrDeepGemmExperts behavior.
+
+Triton kernel config selection uses per-device JSON tuning files (same format
+as vLLM), falling back to hardcoded defaults when no file is found.
+"""
 
 from __future__ import annotations
+
+import functools
+import json
+import os
 
 import torch
 import torch.nn as nn
 import triton
 import triton.language as tl
+
+try:
+    import deep_gemm as _dg
+    _HAS_DEEP_GEMM = True
+except ImportError:
+    _dg = None
+    _HAS_DEEP_GEMM = False
+
+
+_BLOCK_ALIGNMENT = 128
+
+
+def _is_deep_gemm_supported() -> bool:
+    if not _HAS_DEEP_GEMM:
+        return False
+    cap = torch.cuda.get_device_capability()
+    return cap[0] >= 9
+
+
+@functools.cache
+def _deep_gemm_alignment() -> int:
+    if not _HAS_DEEP_GEMM:
+        return _BLOCK_ALIGNMENT
+    try:
+        return _dg.get_mk_alignment_for_contiguous_layout()
+    except AttributeError:
+        return _BLOCK_ALIGNMENT
+
+
+def _valid_deep_gemm_shape(M: int, N: int, K: int) -> bool:
+    align = _deep_gemm_alignment()
+    return align <= M and N % align == 0 and K % align == 0
+
+
+def _valid_deep_gemm(hidden_states: torch.Tensor, w1: torch.Tensor,
+                     w2: torch.Tensor) -> bool:
+    if not _is_deep_gemm_supported():
+        return False
+    M = hidden_states.size(0)
+    _, K, N = w2.size()
+    if not _valid_deep_gemm_shape(M, N, K):
+        return False
+    if N <= 512:
+        return False
+    if w1.dtype != torch.float8_e4m3fn or w2.dtype != torch.float8_e4m3fn:
+        return False
+    if not (hidden_states.is_contiguous() and w1.is_contiguous() and w2.is_contiguous()):
+        return False
+    return True
+
+
+def m_grouped_fp8_gemm_nt_contiguous(a_and_scale, b_and_scale, output, expert_ids):
+    """Wrapper for deep_gemm.m_grouped_fp8_gemm_nt_contiguous.
+
+    Args:
+        a_and_scale: tuple of (a_fp8, a_scale)
+        b_and_scale: tuple of (b_fp8, b_scale)
+        output: output buffer
+        expert_ids: per-row expert assignment (int32, -1 = skip)
+    """
+    _dg.m_grouped_fp8_gemm_nt_contiguous(
+        a_and_scale, b_and_scale, output, expert_ids,
+        disable_ue8m0_cast=False,
+    )
 
 
 @triton.jit
@@ -114,119 +189,107 @@ def _fused_moe_kernel(
     tl.store(c_ptrs, accumulator, mask=c_mask)
 
 
-_TUNED_CONFIGS_N14336 = {
-    1: {"BLOCK_SIZE_M": 16, "BLOCK_SIZE_N": 128, "BLOCK_SIZE_K": 128, "GROUP_SIZE_M": 16, "num_warps": 4, "num_stages": 5},
-    2: {"BLOCK_SIZE_M": 32, "BLOCK_SIZE_N": 64, "BLOCK_SIZE_K": 128, "GROUP_SIZE_M": 1, "num_warps": 4, "num_stages": 5},
-    4: {"BLOCK_SIZE_M": 16, "BLOCK_SIZE_N": 64, "BLOCK_SIZE_K": 64, "GROUP_SIZE_M": 1, "num_warps": 4, "num_stages": 5},
-    8: {"BLOCK_SIZE_M": 16, "BLOCK_SIZE_N": 128, "BLOCK_SIZE_K": 128, "GROUP_SIZE_M": 1, "num_warps": 4, "num_stages": 5},
-    16: {"BLOCK_SIZE_M": 16, "BLOCK_SIZE_N": 64, "BLOCK_SIZE_K": 256, "GROUP_SIZE_M": 16, "num_warps": 4, "num_stages": 3},
-    24: {"BLOCK_SIZE_M": 16, "BLOCK_SIZE_N": 128, "BLOCK_SIZE_K": 256, "GROUP_SIZE_M": 16, "num_warps": 4, "num_stages": 2},
-    32: {"BLOCK_SIZE_M": 16, "BLOCK_SIZE_N": 128, "BLOCK_SIZE_K": 128, "GROUP_SIZE_M": 16, "num_warps": 8, "num_stages": 3},
-    48: {"BLOCK_SIZE_M": 32, "BLOCK_SIZE_N": 128, "BLOCK_SIZE_K": 128, "GROUP_SIZE_M": 16, "num_warps": 4, "num_stages": 3},
-    64: {"BLOCK_SIZE_M": 32, "BLOCK_SIZE_N": 128, "BLOCK_SIZE_K": 128, "GROUP_SIZE_M": 64, "num_warps": 4, "num_stages": 3},
-    96: {"BLOCK_SIZE_M": 32, "BLOCK_SIZE_N": 128, "BLOCK_SIZE_K": 128, "GROUP_SIZE_M": 64, "num_warps": 4, "num_stages": 3},
-    128: {"BLOCK_SIZE_M": 64, "BLOCK_SIZE_N": 128, "BLOCK_SIZE_K": 128, "GROUP_SIZE_M": 1, "num_warps": 8, "num_stages": 4},
-    256: {"BLOCK_SIZE_M": 128, "BLOCK_SIZE_N": 256, "BLOCK_SIZE_K": 64, "GROUP_SIZE_M": 1, "num_warps": 8, "num_stages": 4},
-    512: {"BLOCK_SIZE_M": 128, "BLOCK_SIZE_N": 256, "BLOCK_SIZE_K": 64, "GROUP_SIZE_M": 16, "num_warps": 8, "num_stages": 4},
-    1024: {"BLOCK_SIZE_M": 128, "BLOCK_SIZE_N": 256, "BLOCK_SIZE_K": 64, "GROUP_SIZE_M": 16, "num_warps": 8, "num_stages": 4},
-    2048: {"BLOCK_SIZE_M": 128, "BLOCK_SIZE_N": 256, "BLOCK_SIZE_K": 64, "GROUP_SIZE_M": 32, "num_warps": 8, "num_stages": 4},
-    4096: {"BLOCK_SIZE_M": 128, "BLOCK_SIZE_N": 256, "BLOCK_SIZE_K": 64, "GROUP_SIZE_M": 16, "num_warps": 8, "num_stages": 4},
+def _get_config_file_name(E: int, N: int, dtype: str | None,
+                          block_shape: list[int] | None = None) -> str:
+    device_name = torch.cuda.get_device_name().replace(" ", "_")
+    if "H200" in device_name.split("_"):
+        device_name = "NVIDIA_H200"
+    dtype_selector = "" if not dtype else f",dtype={dtype}"
+    block_shape_selector = (
+        "" if not block_shape or not all(block_shape) else f",block_shape={block_shape}"
+    ).replace(" ", "")
+    return f"E={E},N={N},device_name={device_name}{dtype_selector}{block_shape_selector}.json"
+
+
+@functools.lru_cache
+def _get_moe_configs(E: int, N: int, dtype: str | None,
+                     block_n: int | None = None,
+                     block_k: int | None = None) -> dict[int, dict] | None:
+    block_shape = [block_n, block_k] if block_n and block_k else None
+    json_file_name = _get_config_file_name(E, N, dtype, block_shape)
+
+    config_file_paths = []
+
+    user_folder = os.environ.get("KB_NANO_TUNED_CONFIG_FOLDER")
+    if user_folder is not None:
+        config_file_paths.append(os.path.join(user_folder, json_file_name))
+
+    vllm_configs_dir = os.path.join(
+        os.path.dirname(os.path.abspath(__file__)),
+        "..", "..", "..", "..",
+        "vllm_repo", "vllm", "vllm", "model_executor", "layers",
+        "fused_moe", "configs",
+    )
+    if os.path.isdir(vllm_configs_dir):
+        config_file_paths.append(os.path.join(vllm_configs_dir, json_file_name))
+
+    local_configs_dir = os.path.join(os.path.dirname(os.path.abspath(__file__)), "moe_configs")
+    if os.path.isdir(local_configs_dir):
+        config_file_paths.append(os.path.join(local_configs_dir, json_file_name))
+
+    for config_file_path in config_file_paths:
+        if os.path.exists(config_file_path):
+            with open(config_file_path) as f:
+                tuned_config = json.load(f)
+                tuned_config.pop("triton_version", None)
+                return {int(key): val for key, val in tuned_config.items()}
+
+    return None
+
+
+_DEFAULT_CONFIG_HEURISTIC = {
+    "small": {
+        "BLOCK_SIZE_M": 16, "BLOCK_SIZE_N": 128, "BLOCK_SIZE_K": 128,
+        "GROUP_SIZE_M": 16, "num_warps": 4, "num_stages": 5,
+    },
+    "medium": {
+        "BLOCK_SIZE_M": 32, "BLOCK_SIZE_N": 128, "BLOCK_SIZE_K": 128,
+        "GROUP_SIZE_M": 64, "num_warps": 4, "num_stages": 3,
+    },
+    "large": {
+        "BLOCK_SIZE_M": 128, "BLOCK_SIZE_N": 256, "BLOCK_SIZE_K": 64,
+        "GROUP_SIZE_M": 16, "num_warps": 8, "num_stages": 4,
+    },
 }
 
-_TUNED_CONFIGS_N4096 = {
-    1: {"BLOCK_SIZE_M": 16, "BLOCK_SIZE_N": 64, "BLOCK_SIZE_K": 128, "GROUP_SIZE_M": 16, "num_warps": 4, "num_stages": 5},
-    2: {"BLOCK_SIZE_M": 32, "BLOCK_SIZE_N": 256, "BLOCK_SIZE_K": 64, "GROUP_SIZE_M": 32, "num_warps": 4, "num_stages": 5},
-    4: {"BLOCK_SIZE_M": 16, "BLOCK_SIZE_N": 128, "BLOCK_SIZE_K": 256, "GROUP_SIZE_M": 16, "num_warps": 8, "num_stages": 3},
-    8: {"BLOCK_SIZE_M": 32, "BLOCK_SIZE_N": 128, "BLOCK_SIZE_K": 128, "GROUP_SIZE_M": 64, "num_warps": 4, "num_stages": 5},
-    16: {"BLOCK_SIZE_M": 16, "BLOCK_SIZE_N": 256, "BLOCK_SIZE_K": 128, "GROUP_SIZE_M": 16, "num_warps": 8, "num_stages": 2},
-    24: {"BLOCK_SIZE_M": 16, "BLOCK_SIZE_N": 128, "BLOCK_SIZE_K": 128, "GROUP_SIZE_M": 64, "num_warps": 4, "num_stages": 2},
-    32: {"BLOCK_SIZE_M": 16, "BLOCK_SIZE_N": 128, "BLOCK_SIZE_K": 128, "GROUP_SIZE_M": 1, "num_warps": 4, "num_stages": 2},
-    48: {"BLOCK_SIZE_M": 32, "BLOCK_SIZE_N": 256, "BLOCK_SIZE_K": 128, "GROUP_SIZE_M": 64, "num_warps": 4, "num_stages": 2},
-    64: {"BLOCK_SIZE_M": 32, "BLOCK_SIZE_N": 128, "BLOCK_SIZE_K": 128, "GROUP_SIZE_M": 1, "num_warps": 4, "num_stages": 4},
-    96: {"BLOCK_SIZE_M": 64, "BLOCK_SIZE_N": 128, "BLOCK_SIZE_K": 128, "GROUP_SIZE_M": 1, "num_warps": 8, "num_stages": 4},
-    128: {"BLOCK_SIZE_M": 64, "BLOCK_SIZE_N": 128, "BLOCK_SIZE_K": 128, "GROUP_SIZE_M": 1, "num_warps": 8, "num_stages": 4},
-    256: {"BLOCK_SIZE_M": 128, "BLOCK_SIZE_N": 256, "BLOCK_SIZE_K": 64, "GROUP_SIZE_M": 1, "num_warps": 8, "num_stages": 4},
-    512: {"BLOCK_SIZE_M": 128, "BLOCK_SIZE_N": 256, "BLOCK_SIZE_K": 64, "GROUP_SIZE_M": 64, "num_warps": 8, "num_stages": 4},
-    1024: {"BLOCK_SIZE_M": 128, "BLOCK_SIZE_N": 256, "BLOCK_SIZE_K": 64, "GROUP_SIZE_M": 32, "num_warps": 8, "num_stages": 4},
-    2048: {"BLOCK_SIZE_M": 128, "BLOCK_SIZE_N": 256, "BLOCK_SIZE_K": 64, "GROUP_SIZE_M": 64, "num_warps": 8, "num_stages": 3},
-    4096: {"BLOCK_SIZE_M": 128, "BLOCK_SIZE_N": 256, "BLOCK_SIZE_K": 64, "GROUP_SIZE_M": 32, "num_warps": 8, "num_stages": 4},
-}
 
-_TUNED_CONFIGS_SMALL_N = {
-    1: {"BLOCK_SIZE_M": 16, "BLOCK_SIZE_N": 64, "BLOCK_SIZE_K": 128, "GROUP_SIZE_M": 16, "num_warps": 4, "num_stages": 5},
-    2: {"BLOCK_SIZE_M": 16, "BLOCK_SIZE_N": 64, "BLOCK_SIZE_K": 128, "GROUP_SIZE_M": 16, "num_warps": 4, "num_stages": 5},
-    4: {"BLOCK_SIZE_M": 16, "BLOCK_SIZE_N": 64, "BLOCK_SIZE_K": 128, "GROUP_SIZE_M": 16, "num_warps": 4, "num_stages": 5},
-    8: {"BLOCK_SIZE_M": 16, "BLOCK_SIZE_N": 64, "BLOCK_SIZE_K": 128, "GROUP_SIZE_M": 16, "num_warps": 4, "num_stages": 5},
-    16: {"BLOCK_SIZE_M": 16, "BLOCK_SIZE_N": 64, "BLOCK_SIZE_K": 128, "GROUP_SIZE_M": 16, "num_warps": 4, "num_stages": 3},
-    24: {"BLOCK_SIZE_M": 16, "BLOCK_SIZE_N": 64, "BLOCK_SIZE_K": 128, "GROUP_SIZE_M": 16, "num_warps": 4, "num_stages": 3},
-    32: {"BLOCK_SIZE_M": 16, "BLOCK_SIZE_N": 64, "BLOCK_SIZE_K": 128, "GROUP_SIZE_M": 16, "num_warps": 4, "num_stages": 3},
-    48: {"BLOCK_SIZE_M": 32, "BLOCK_SIZE_N": 64, "BLOCK_SIZE_K": 128, "GROUP_SIZE_M": 16, "num_warps": 4, "num_stages": 3},
-    64: {"BLOCK_SIZE_M": 32, "BLOCK_SIZE_N": 64, "BLOCK_SIZE_K": 128, "GROUP_SIZE_M": 16, "num_warps": 4, "num_stages": 4},
-    96: {"BLOCK_SIZE_M": 32, "BLOCK_SIZE_N": 128, "BLOCK_SIZE_K": 128, "GROUP_SIZE_M": 16, "num_warps": 4, "num_stages": 4},
-    128: {"BLOCK_SIZE_M": 64, "BLOCK_SIZE_N": 128, "BLOCK_SIZE_K": 128, "GROUP_SIZE_M": 16, "num_warps": 8, "num_stages": 4},
-    256: {"BLOCK_SIZE_M": 64, "BLOCK_SIZE_N": 128, "BLOCK_SIZE_K": 128, "GROUP_SIZE_M": 16, "num_warps": 8, "num_stages": 4},
-    512: {"BLOCK_SIZE_M": 128, "BLOCK_SIZE_N": 128, "BLOCK_SIZE_K": 128, "GROUP_SIZE_M": 16, "num_warps": 8, "num_stages": 4},
-    1024: {"BLOCK_SIZE_M": 128, "BLOCK_SIZE_N": 128, "BLOCK_SIZE_K": 128, "GROUP_SIZE_M": 16, "num_warps": 8, "num_stages": 4},
-    2048: {"BLOCK_SIZE_M": 128, "BLOCK_SIZE_N": 128, "BLOCK_SIZE_K": 128, "GROUP_SIZE_M": 32, "num_warps": 8, "num_stages": 4},
-    4096: {"BLOCK_SIZE_M": 128, "BLOCK_SIZE_N": 128, "BLOCK_SIZE_K": 128, "GROUP_SIZE_M": 32, "num_warps": 8, "num_stages": 4},
-}
-
-_TUNED_GRID_KEYS_N14336 = sorted(_TUNED_CONFIGS_N14336.keys())
-_TUNED_GRID_KEYS_N4096 = sorted(_TUNED_CONFIGS_N4096.keys())
-_TUNED_GRID_KEYS_SMALL_N = sorted(_TUNED_CONFIGS_SMALL_N.keys())
-
-
-def _get_default_config(M: int, N: int = 0) -> dict:
-    """Select best kernel config based on batch size M and output dim N."""
-    if N > 0:
-        if N >= 14336 or (N >= 7168 and N < 8192):
-            configs = _TUNED_CONFIGS_N14336
-            grid_keys = _TUNED_GRID_KEYS_N14336
-        elif N <= 1024:
-            configs = _TUNED_CONFIGS_SMALL_N
-            grid_keys = _TUNED_GRID_KEYS_SMALL_N
-        elif N <= 4096:
-            configs = _TUNED_CONFIGS_N4096
-            grid_keys = _TUNED_GRID_KEYS_N4096
-        else:
-            configs = _TUNED_CONFIGS_N14336
-            grid_keys = _TUNED_GRID_KEYS_N14336
-        best_key = min(grid_keys, key=lambda x: abs(x - M))
-        return dict(configs[best_key])
-
+def _get_default_config(M: int, E: int = 0, N: int = 0,
+                        block_shape: list[int] | None = None) -> dict:
     if M <= 4:
-        return {
-            "BLOCK_SIZE_M": 16,
-            "BLOCK_SIZE_N": 128,
-            "BLOCK_SIZE_K": 128,
-            "GROUP_SIZE_M": 16,
-            "num_warps": 4,
-            "num_stages": 5,
-        }
+        return dict(_DEFAULT_CONFIG_HEURISTIC["small"])
     if M <= 64:
-        return {
-            "BLOCK_SIZE_M": 32,
-            "BLOCK_SIZE_N": 128,
-            "BLOCK_SIZE_K": 128,
-            "GROUP_SIZE_M": 64,
-            "num_warps": 4,
-            "num_stages": 3,
-        }
-    return {
-        "BLOCK_SIZE_M": 128,
-        "BLOCK_SIZE_N": 256,
-        "BLOCK_SIZE_K": 64,
-        "GROUP_SIZE_M": 16,
-        "num_warps": 8,
-        "num_stages": 4,
-    }
+        return dict(_DEFAULT_CONFIG_HEURISTIC["medium"])
+    return dict(_DEFAULT_CONFIG_HEURISTIC["large"])
+
+
+def get_triton_config(M: int, w1_shape: tuple[int, ...], w2_shape: tuple[int, ...],
+                      top_k: int, use_fp8: bool,
+                      block_shape: list[int] | None = None) -> dict:
+    """Select best Triton kernel config, preferring JSON tuning files."""
+    E, _, N = w2_shape
+    dtype = "fp8_w8a8" if use_fp8 else None
+    block_n = block_shape[0] if block_shape else 0
+    block_k = block_shape[1] if block_shape else 0
+
+    configs = _get_moe_configs(E, N, dtype, block_n, block_k)
+    if configs:
+        config = configs[min(configs.keys(), key=lambda x: abs(x - M))]
+        return dict(config)
+
+    return _get_default_config(M, E, N, block_shape)
 
 
 class MoeGroupedGemm(nn.Module):
     @staticmethod
-    def get_config(M: int, N: int = 0) -> dict:
+    def get_config(M: int, N: int = 0, E: int = 0,
+                   use_fp8: bool = False,
+                   block_shape: list[int] | None = None) -> dict:
         """Select best kernel config based on batch size M and output dim N."""
-        return _get_default_config(M, N)
+        if E > 0:
+            w2_shape = (E, 0, N // 2 if N > 0 else 0)
+            w1_shape = (E, N, 0)
+            return get_triton_config(M, w1_shape, w2_shape, 1, use_fp8, block_shape)
+        return _get_default_config(M, E, N, block_shape)
 
     def forward(
         self,
@@ -246,7 +309,7 @@ class MoeGroupedGemm(nn.Module):
         block_shape: list[int] | None = None,
     ):
         if config is None:
-            config = _get_default_config(A.size(0), B.size(1))
+            config = _get_default_config(A.size(0), N=B.size(1))
         else:
             config = config.copy()
 

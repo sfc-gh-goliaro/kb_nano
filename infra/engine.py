@@ -409,9 +409,9 @@ class ModelRunner:
         torch.cuda.empty_cache()
 
     def _share_activation_buffers(self):
-        """Share a single SiluAndMul activation buffer across all layers.
+        """Share activation buffers across layers.
 
-        Layers execute sequentially so the buffer is safe to reuse.
+        Layers execute sequentially so buffers are safe to reuse.
         Must be called before warmup so only one buffer grows to max size
         instead of one per layer (saves ~14 GiB for 32-layer models).
         """
@@ -419,11 +419,10 @@ class ModelRunner:
         silu_modules = [
             m for m in self.model.modules() if isinstance(m, SiluAndMul)
         ]
-        if len(silu_modules) <= 1:
-            return
-        shared = silu_modules[0]._act_buf
-        for m in silu_modules[1:]:
-            m.set_shared_buffer(shared)
+        if len(silu_modules) > 1:
+            shared = silu_modules[0]._act_buf
+            for m in silu_modules[1:]:
+                m.set_shared_buffer(shared)
 
     def warmup_model(self):
         torch.cuda.empty_cache()
@@ -1755,6 +1754,9 @@ class LlamaEngine:
         """
         model = self.model_runner.model
         has_deepstack = hasattr(model.visual, 'deepstack_merger_list')
+        if has_deepstack:
+            visual_dim = model.config.vision.out_hidden_size
+            deepstack_num_levels = len(model.visual.deepstack_visual_indexes)
         merge_size = model.config.vision.spatial_merge_size
         image_token_id = self.model_runner.config.image_token_id
         video_token_id = self.model_runner.config.video_token_id
@@ -1777,13 +1779,15 @@ class LlamaEngine:
             batched_thw = torch.cat(img_thw_list, dim=0).cpu()
             vis_out = model.visual(batched_pv, grid_thw=batched_thw)
 
-            if has_deepstack:
-                all_img_embeds, all_ds_features = vis_out
+            sizes = (batched_thw.prod(-1) // (merge_size ** 2)).tolist()
+            if has_deepstack and deepstack_num_levels > 0:
+                all_img_embeds = vis_out[:, :visual_dim]
+                ds_cat = vis_out[:, visual_dim:]
+                all_ds_features = list(ds_cat.split(visual_dim, dim=1))
             else:
                 all_img_embeds = vis_out
                 all_ds_features = None
 
-            sizes = (batched_thw.prod(-1) // (merge_size ** 2)).tolist()
             per_seq_embeds = all_img_embeds.split(sizes)
             if all_ds_features is not None:
                 per_seq_ds = [ds.split(sizes) for ds in all_ds_features]
@@ -1819,8 +1823,10 @@ class LlamaEngine:
                 grid_thw = grid_thw.cpu()
                 vis_out = model.visual(video_pv, grid_thw=grid_thw)
 
-                if has_deepstack:
-                    video_embeds, ds_features = vis_out
+                if has_deepstack and deepstack_num_levels > 0:
+                    video_embeds = vis_out[:, :visual_dim]
+                    ds_cat = vis_out[:, visual_dim:]
+                    ds_features = list(ds_cat.split(visual_dim, dim=1))
                 else:
                     video_embeds = vis_out
                     ds_features = []
