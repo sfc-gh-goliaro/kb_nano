@@ -1,11 +1,13 @@
 # kb-nano
 
-A standalone, high-performance inference engine supporting **LLMs** (Llama 3.1, Mixtral-8x7B, Qwen2-VL, Qwen3-VL), **diffusion models** (FLUX.1-dev, SDXL, HunyuanVideo-1.5), **segmentation models** (SAM3.1), audio models (Whisper), and **TTS models** (CosyVoice3) with tensor parallelism. No vLLM dependency at runtime — just PyTorch, Triton, and Flash Attention.
+A standalone, high-performance inference engine supporting **LLMs** (Llama 3.1, Mixtral-8x7B, Qwen2-VL, Qwen3-VL), **embedding / retrieval models** (BGE-M3, ColBERTv2), **diffusion models** (FLUX.1-dev, SDXL, HunyuanVideo-1.5), **segmentation models** (SAM3.1), audio models (Whisper), and **TTS models** (CosyVoice3) with tensor parallelism. No vLLM dependency at runtime — just PyTorch, Triton, and Flash Attention.
 
 ## Features
 
 - **Llama 3.1** (8B, 70B) with frequency-scaled RoPE
 - **Mixtral-8x7B** with fused Triton MoE grouped-GEMM kernels
+- **BGE-M3** dense + sparse + ColBERT-style embedding outputs
+- **ColBERTv2** query/doc encoders with MaxSim scoring
 - **FLUX.1-dev** diffusion transformer (text-to-image) with Flash Attention
 - **SDXL** (Stable Diffusion XL) UNet-based text-to-image with dual CLIP text encoders
 - **HunyuanVideo-1.5** 3D video diffusion transformer (text-to-video) with dual-stream joint attention, M-RoPE, and Qwen2.5-VL text encoder
@@ -24,6 +26,7 @@ A standalone, high-performance inference engine supporting **LLMs** (Llama 3.1, 
 - **vllm-omni comparison benchmark** for CosyVoice3 TTS (SEED-TTS-Eval dataset)
 - **diffusers comparison benchmark** for SDXL diffusion
 - **facebook/sam3 comparison benchmark** for SAM3.1 segmentation
+- **FlagEmbedding / ColBERT comparison benchmark** for embedding and retrieval models
 
 ## Project Structure
 
@@ -232,6 +235,28 @@ python tests/test_sam.py --skip-reference
 
 # Skip latency phase
 python tests/test_sam.py --skip-latency
+```
+
+### Benchmarking vs Embedding Baselines
+
+Set `FLAGEMBEDDING_SRC` or `COLBERT_SRC` to local reference source trees, or pass `--flagembedding-src` / `--colbert-src`.
+
+```bash
+# BGE-M3: throughput + latency + alignment benchmark vs FlagEmbedding
+python tests/bench_embedding.py --model BAAI/bge-m3
+
+# ColBERTv2: query/doc throughput + latency + alignment benchmark vs official ColBERT
+python tests/bench_embedding.py --model colbert-ir/colbertv2.0
+
+# kb-nano only (skip reference comparison)
+python tests/bench_embedding.py --model BAAI/bge-m3 --skip-reference
+
+# Skip latency phase
+python tests/bench_embedding.py --model BAAI/bge-m3 --skip-latency
+
+# Save results to a specific directory
+python tests/bench_embedding.py --model BAAI/bge-m3 --output-dir tests/results/H200/bge-m3_embedding
+python tests/bench_embedding.py --model colbert-ir/colbertv2.0 --output-dir tests/results/H200/colbertv2.0_embedding
 ```
 
 The diffusion benchmark measures:
@@ -521,6 +546,62 @@ Latency (batch size 1, 128 output tokens, 5 iterations):
 | Qwen3-VL-8B-FP8 | 1 | single-video | 0.557s | 0.541s | **1.03x** |
 
 FP8 activation quantization uses a custom Triton kernel for single-launch per-token-group UE8M0 quantization. Pre-allocated shared prefill buffers eliminate dynamic allocation during FP8 prefill, and DeepGEMM is JIT-warmed for both decode and prefill batch sizes. The remaining throughput gap vs vLLM is primarily from vLLM's `torch.compile` + Inductor fusion passes (RMSNorm+quant, SiLU+quant).
+
+### BGE-M3 (Embedding)
+
+Run `tests/bench_embedding.py --model BAAI/bge-m3` to reproduce. Reference baseline: FlagEmbedding / BGEM3FlagModel.
+
+**Hardware: NVIDIA H200**
+
+Throughput (8 texts, batch size 4, fp16):
+
+| Model | Len | FlagEmbedding (docs/s) | Ours (docs/s) | Ratio |
+|-------|----:|-----------------------:|--------------:|------:|
+| BGE-M3 | 128 | 297.82 | 369.02 | **1.24x** |
+
+Latency (median of 5 runs, fp16):
+
+| Batch Size | Len | FlagEmbedding median | Ours median | Ratio |
+|-----------:|----:|---------------------:|------------:|------:|
+| 1 | 128 | 0.0176s | 0.0055s | **3.22x** |
+| 4 | 128 | 0.0079s | 0.0062s | **1.29x** |
+
+Alignment:
+
+| Output | Avg CosSim | Avg Mean Abs Diff | Notes |
+|--------|-----------:|------------------:|:------|
+| Dense | 0.99999905 | 3.33e-05 | PASS |
+| Sparse | — | 1.30e-04 | 100% exact key match |
+
+### ColBERTv2 (Retrieval)
+
+Run `tests/bench_embedding.py --model colbert-ir/colbertv2.0` to reproduce. Reference baseline: official ColBERT / HF_ColBERT.
+
+**Hardware: NVIDIA H200**
+
+Throughput (8 texts, batch size 4, fp16):
+
+| Scenario | Reference (docs/s) | Ours (docs/s) | Ratio |
+|----------|-------------------:|--------------:|------:|
+| Query len 32 | 805.19 | 987.85 | **1.23x** |
+| Doc len 128 | 333.75 | 393.80 | **1.18x** |
+
+Latency (median of 5 runs, fp16):
+
+| Scenario | Reference median | Ours median | Ratio |
+|----------|-----------------:|------------:|------:|
+| Query bs=1 len=32 | 0.0043s | 0.0035s | **1.21x** |
+| Query bs=4 len=32 | 0.0068s | 0.0037s | **1.84x** |
+| Doc bs=1 len=128 | 0.0065s | 0.0039s | **1.68x** |
+| Doc bs=4 len=128 | 0.0062s | 0.0046s | **1.36x** |
+
+Alignment:
+
+| Output | Avg CosSim | Avg Mean Abs Diff | Notes |
+|--------|-----------:|------------------:|:------|
+| Query | 0.99999928 | 8.22e-05 | PASS |
+| Doc | 0.99999940 | 7.45e-05 | PASS |
+| MaxSim score | — | 1.08e-03 | PASS |
 
 ### FLUX.1-dev (Diffusion)
 
