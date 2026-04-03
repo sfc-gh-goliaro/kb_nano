@@ -52,6 +52,8 @@ _L4_MODEL_KEYS: dict[str, str] = {
     "hunyuan_video": "hunyuan_video",
     "bge_m3": "bge_m3",
     "colbertv2": "colbertv2",
+    "dlrmv2": "dlrmv2",
+    "lightgcn": "lightgcn",
 }
 
 

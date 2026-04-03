@@ -1,6 +1,6 @@
 # kb-nano
 
-A standalone, high-performance inference engine supporting **LLMs** (Llama 3.1, Mixtral-8x7B, Qwen2-VL, Qwen3-VL), **embedding / retrieval models** (BGE-M3, ColBERTv2), **diffusion models** (FLUX.1-dev, SDXL, HunyuanVideo-1.5), **segmentation models** (SAM3.1), audio models (Whisper), and **TTS models** (CosyVoice3) with tensor parallelism. No vLLM dependency at runtime — just PyTorch, Triton, and Flash Attention.
+A standalone, high-performance inference engine supporting **LLMs** (Llama 3.1, Mixtral-8x7B, Qwen2-VL, Qwen3-VL), **embedding / retrieval models** (BGE-M3, ColBERTv2), **recsys / graph recommendation models** (DLRMv2, LightGCN), **diffusion models** (FLUX.1-dev, SDXL, HunyuanVideo-1.5), **segmentation models** (SAM3.1), audio models (Whisper), and **TTS models** (CosyVoice3) with tensor parallelism. No vLLM dependency at runtime — just PyTorch, Triton, and Flash Attention.
 
 ## Features
 
@@ -8,6 +8,8 @@ A standalone, high-performance inference engine supporting **LLMs** (Llama 3.1, 
 - **Mixtral-8x7B** with fused Triton MoE grouped-GEMM kernels
 - **BGE-M3** dense + sparse + ColBERT-style embedding outputs
 - **ColBERTv2** query/doc encoders with MaxSim scoring
+- **DLRMv2** dense + sparse feature recommendation model with packed embedding-bag inference
+- **LightGCN** graph recommendation model with CSR propagation
 - **FLUX.1-dev** diffusion transformer (text-to-image) with Flash Attention
 - **SDXL** (Stable Diffusion XL) UNet-based text-to-image with dual CLIP text encoders
 - **HunyuanVideo-1.5** 3D video diffusion transformer (text-to-video) with dual-stream joint attention, M-RoPE, and Qwen2.5-VL text encoder
@@ -27,6 +29,7 @@ A standalone, high-performance inference engine supporting **LLMs** (Llama 3.1, 
 - **diffusers comparison benchmark** for SDXL diffusion
 - **facebook/sam3 comparison benchmark** for SAM3.1 segmentation
 - **FlagEmbedding / ColBERT comparison benchmark** for embedding and retrieval models
+- **TorchRec / PyG comparison benchmark** for recsys and graph recommendation models
 
 ## Project Structure
 
@@ -239,7 +242,7 @@ python tests/test_sam.py --skip-latency
 
 ### Benchmarking vs Embedding Baselines
 
-Set `FLAGEMBEDDING_SRC` or `COLBERT_SRC` to local reference source trees, or pass `--flagembedding-src` / `--colbert-src`.
+Install the optional benchmark baseline packages listed in [Dependencies](#dependencies) to run reference comparisons.
 
 ```bash
 # BGE-M3: throughput + latency + alignment benchmark vs FlagEmbedding
@@ -257,6 +260,29 @@ python tests/bench_embedding.py --model BAAI/bge-m3 --skip-latency
 # Save results to a specific directory
 python tests/bench_embedding.py --model BAAI/bge-m3 --output-dir tests/results/H200/bge-m3_embedding
 python tests/bench_embedding.py --model colbert-ir/colbertv2.0 --output-dir tests/results/H200/colbertv2.0_embedding
+```
+
+### Benchmarking vs Recsys Baselines
+
+Install the optional benchmark baseline packages listed in [Dependencies](#dependencies) to run reference comparisons.
+
+```bash
+# DLRMv2: throughput + alignment benchmark vs TorchRec DLRM
+python tests/bench_recsys.py --model dlrmv2
+
+# LightGCN: throughput + alignment benchmark vs torch_geometric LightGCN
+python tests/bench_recsys.py --model lightgcn
+
+# Run both recsys baselines in one invocation
+python tests/bench_recsys.py --model all
+
+# Skip throughput or alignment
+python tests/bench_recsys.py --model lightgcn --skip-throughput
+python tests/bench_recsys.py --model dlrmv2 --skip-alignment
+
+# Save results to a specific directory
+python tests/bench_recsys.py --model dlrmv2 --output-dir tests/results/H200/dlrmv2_recsys
+python tests/bench_recsys.py --model lightgcn --output-dir tests/results/H200/lightgcn_recsys
 ```
 
 The diffusion benchmark measures:
@@ -419,6 +445,23 @@ Each run is tagged with a `tier` (`agent`, `kernel`, `eval`, or `e2e`) indicatin
 - MLflow (experiment tracking — gracefully skipped if not installed)
 - vLLM (only needed for running comparison tests)
 - matplotlib (only needed for benchmark plotting)
+
+### Optional benchmark baselines
+
+Embedding / retrieval:
+
+```bash
+pip install FlagEmbedding==1.3.5 colbert-ai==0.2.22 datasets==4.8.4 \
+    peft==0.18.1 GitPython==3.1.46 ujson==5.12.0 scipy==1.17.1
+```
+
+RecSys / graph recommendation:
+
+```bash
+pip install torchrec==1.4.0 fbgemm-gpu==1.5.0 torch-geometric==2.7.0
+```
+
+`torch-sparse` is optional and is not required for the current `LightGCN` benchmark path.
 
 ### GPU architecture and library compatibility
 
@@ -602,6 +645,47 @@ Alignment:
 | Query | 0.99999928 | 8.22e-05 | PASS |
 | Doc | 0.99999940 | 7.45e-05 | PASS |
 | MaxSim score | — | 1.08e-03 | PASS |
+
+### DLRMv2 (RecSys)
+
+Run `tests/bench_recsys.py --model dlrmv2` to reproduce. Reference baseline: `torchrec.models.dlrm.DLRM`.
+
+**Hardware: NVIDIA H200**
+
+Throughput (default config: batch size 1024, bag size 4):
+
+| Model | TorchRec (samples/s) | Ours (samples/s) | Ratio |
+|-------|----------------------:|-----------------:|------:|
+| DLRMv2 | 1,721,374 | 3,422,866 | **1.99x** |
+
+Alignment:
+
+| Output | Avg CosSim | Avg Mean Abs Diff | Notes |
+|--------|-----------:|------------------:|:------|
+| Dense embedding | 0.99999988 | 0.00e+00 | PASS |
+| Sparse embeddings | 1.00000000 | 0.00e+00 | PASS |
+| Interaction | 0.99999988 | 0.00e+00 | PASS |
+| Logits | 1.00000000 | 0.00e+00 | PASS |
+
+### LightGCN (Graph Recommendation)
+
+Run `tests/bench_recsys.py --model lightgcn` to reproduce. Reference baseline: `torch_geometric.nn.models.LightGCN`.
+
+**Hardware: NVIDIA H200**
+
+Throughput (default config: 4096 users, 8192 items, 32768 edges, 8192 query pairs):
+
+| Model | torch_geometric (pairs/s) | Ours (pairs/s) | Ratio |
+|-------|---------------------------:|---------------:|------:|
+| LightGCN | 48,544,792 | 59,398,305 | **1.22x** |
+
+Alignment:
+
+| Output | Avg CosSim | Avg Mean Abs Diff | Notes |
+|--------|-----------:|------------------:|:------|
+| User embeddings | 0.99999988 | 0.00e+00 | PASS |
+| Item embeddings | 1.00000000 | 0.00e+00 | PASS |
+| Scores | 0.99999988 | 0.00e+00 | PASS |
 
 ### FLUX.1-dev (Diffusion)
 
