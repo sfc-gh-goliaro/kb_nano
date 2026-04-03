@@ -1,6 +1,6 @@
 # kb-nano
 
-A standalone, high-performance inference engine supporting **LLMs** (Llama 3.1, Mixtral-8x7B, Qwen2-VL, Qwen3-VL), **diffusion models** (FLUX.1-dev, SDXL, HunyuanVideo-1.5), **segmentation models** (SAM3.1), audio models (Whisper), and **TTS models** (CosyVoice3) with tensor parallelism. No vLLM dependency at runtime — just PyTorch, Triton, and Flash Attention.
+A standalone, high-performance inference engine supporting **LLMs** (Llama 3.1, Mixtral-8x7B, Qwen2-VL, Qwen3-VL), **diffusion models** (FLUX.1-dev, SDXL, HunyuanVideo-1.5), **predictive video models** (V-JEPA 2), **segmentation models** (SAM3.1), audio models (Whisper), and **TTS models** (CosyVoice3) with tensor parallelism. No vLLM dependency at runtime — just PyTorch, Triton, and Flash Attention.
 
 ## Features
 
@@ -9,6 +9,7 @@ A standalone, high-performance inference engine supporting **LLMs** (Llama 3.1, 
 - **FLUX.1-dev** diffusion transformer (text-to-image) with Flash Attention
 - **SDXL** (Stable Diffusion XL) UNet-based text-to-image with dual CLIP text encoders
 - **HunyuanVideo-1.5** 3D video diffusion transformer (text-to-video) with dual-stream joint attention, M-RoPE, and Qwen2.5-VL text encoder
+- **V-JEPA 2** predictive video model with asymmetric spatio-temporal masking and predictor head
 - **Qwen2-VL / Qwen3-VL** vision-language models with image and video support
 - **SAM3.1** (facebook/sam3.1) image/video segmentation with ViT backbone, fusion encoder, detection decoder, and segmentation head
 - **Whisper** (large-v3) encoder-decoder speech-to-text with batched inference and paged cross-attention KV cache
@@ -24,6 +25,7 @@ A standalone, high-performance inference engine supporting **LLMs** (Llama 3.1, 
 - **vllm-omni comparison benchmark** for CosyVoice3 TTS (SEED-TTS-Eval dataset)
 - **diffusers comparison benchmark** for SDXL diffusion
 - **facebook/sam3 comparison benchmark** for SAM3.1 segmentation
+- **transformers comparison benchmark** for V-JEPA 2 predictor / encoder alignment
 
 ## Project Structure
 
@@ -61,6 +63,9 @@ A standalone, high-performance inference engine supporting **LLMs** (Llama 3.1, 
 │   │   │   ├── hunyuan_video_attention.py # HunyuanVideo dual-stream joint attention
 │   │   │   ├── hunyuan_video_embeddings.py # 3D patch embed + timestep/text conditioning
 │   │   │   ├── hunyuan_video_token_refiner.py # Token refiner block (ByT5 conditioning)
+│   │   │   ├── vjepa2_attention.py  # V-JEPA 2 rotary attention + pooler attention
+│   │   │   ├── vjepa2_embeddings.py # V-JEPA 2 3D tubelet patch embeddings
+│   │   │   ├── vjepa2_mlp.py    # V-JEPA 2 GELU MLP
 │   │   │   ├── llama_mlp.py    # Llama SwiGLU MLP
 │   │   │   ├── whisper_attention.py # Whisper encoder/decoder/cross-attention
 │   │   │   ├── whisper_mlp.py  # Whisper GELU MLP
@@ -86,6 +91,9 @@ A standalone, high-performance inference engine supporting **LLMs** (Llama 3.1, 
 │   │   │   ├── sdxl_unet_block.py  # UNet down/mid/up blocks with cross-attention
 │   │   │   ├── whisper_encoder_layer.py
 │   │   │   ├── whisper_decoder_layer.py
+│   │   │   ├── vjepa2_layer.py  # V-JEPA 2 transformer block
+│   │   │   ├── vjepa2_predictor.py  # V-JEPA 2 predictor stack
+│   │   │   ├── vjepa2_pooler.py  # V-JEPA 2 attentive pooler
 │   │   │   ├── sam3_encoder_layer.py  # SAM3 fusion encoder layer
 │   │   │   └── sam3_decoder_layer.py  # SAM3 detection decoder layer
 │   │   └── L4/                 # Full models
@@ -94,6 +102,7 @@ A standalone, high-performance inference engine supporting **LLMs** (Llama 3.1, 
 │   │       ├── flux.py         # FluxPipeline (text-to-image diffusion)
 │   │       ├── sdxl.py         # SDXLPipeline (UNet text-to-image diffusion)
 │   │       ├── hunyuan_video.py # HunyuanVideoPipeline (text-to-video diffusion)
+│   │       ├── vjepa2.py       # VJEPA2Model / VJEPA2ForVideoClassification
 │   │       ├── qwen25_vl_encoder.py # Qwen2.5-VL text encoder (custom paged-attn impl)
 │   │       ├── whisper.py      # WhisperForConditionalGeneration
 │   │       └── sam3.py         # SAM3Model (ViT + FPN + fusion encoder + decoder + segmentation head)
@@ -118,6 +127,7 @@ A standalone, high-performance inference engine supporting **LLMs** (Llama 3.1, 
     ├── bench_vllm.py           # Multi-scenario throughput + latency + alignment benchmark vs vLLM
     ├── bench_vllm_omni.py     # Diffusion (FLUX / HunyuanVideo) and TTS (CosyVoice3) benchmark: kb-nano vs vllm-omni
     ├── bench_diffusers.py     # SDXL diffusion benchmark: kb-nano vs diffusers + torch.compile
+    ├── bench_vjepa2.py        # V-JEPA 2 predictor benchmark: kb-nano vs transformers
     ├── test_sam.py            # SAM3 segmentation benchmark: kb-nano vs facebook/sam3 reference
     ├── utils/                  # Post-processing and visualization
     │   └── parse_vllm_bench_results.py  # Generate tables and plots from bench_vllm.py results
@@ -232,6 +242,28 @@ python tests/test_sam.py --skip-reference
 
 # Skip latency phase
 python tests/test_sam.py --skip-latency
+```
+
+### Benchmarking vs transformers (V-JEPA 2)
+
+```bash
+# V-JEPA 2 predictor: throughput + latency + alignment benchmark vs transformers
+python tests/bench_vjepa2.py --model facebook/vjepa2-vitl-fpc64-256
+
+# kb-nano only
+python tests/bench_vjepa2.py --model facebook/vjepa2-vitl-fpc64-256 --skip-reference
+
+# Encoder-only benchmark (skip predictor path)
+python tests/bench_vjepa2.py --model facebook/vjepa2-vitl-fpc64-256 --task encoder
+
+# Classification checkpoint benchmark
+python tests/bench_vjepa2.py --model facebook/vjepa2-vitl-fpc16-256-ssv2 --task classification
+
+# Skip latency phase
+python tests/bench_vjepa2.py --model facebook/vjepa2-vitl-fpc64-256 --skip-latency
+
+# Save results to a specific directory
+python tests/bench_vjepa2.py --model facebook/vjepa2-vitl-fpc64-256 --output-dir tests/results/H200/vjepa2-vitl-fpc64-256
 ```
 
 The diffusion benchmark measures:
@@ -579,6 +611,39 @@ Correctness (eager mode, decoded video frames, per-prompt cosine similarity):
 | 480p-medium |  8 | 0.923 | 0.862 | 12.92 dB | WARN |
 
 Correctness is measured in decoded pixel space (both engines produce PIL video frames which are compared as uint8 numpy arrays). The pixel-level cosine similarity of ~0.92 is expected for two independent bf16 implementations: numerical differences in the 30-step denoising loop are amplified by the VAE decoder. For reference, latent-space comparison between kb-nano and HF diffusers yields CosSim=0.986, confirming the transformer backbone is correctly implemented. The pixel-space divergence is dominated by VAE decode amplification and different text encoder implementations (kb-nano uses a custom Qwen2.5-VL paged-attention encoder vs vllm-omni's HuggingFace-based encoder).
+
+### V-JEPA 2 (Predictive Video)
+
+Run `tests/bench_vjepa2.py --model facebook/vjepa2-vitl-fpc64-256` to reproduce the default predictor benchmark. Reference engine: `transformers` 4.57.6. The benchmark uses deterministic synthetic videos generated with `torch.randn`, not downloaded dataset videos. Predictor and encoder use the V-JEPA 2 pretraining geometry (64 frames, 256x256), bf16 precision, `context_ratio=0.75`, and `target_ratio=0.25`. Classification uses `facebook/vjepa2-vitl-fpc16-256-ssv2`. The classification rows below use larger workloads than the default smoke because `8 videos / batch 2` was too noisy.
+
+**Hardware: NVIDIA H200**
+
+Throughput (videos/sec):
+
+| Model | Task | Videos | Batch | transformers | Ours | Ratio |
+|-------|------|-------:|------:|-------------:|-----:|------:|
+| facebook/vjepa2-vitl-fpc64-256 | predictor | 8 | 2 | 13.33 | 14.15 | **1.06x** |
+| facebook/vjepa2-vitl-fpc64-256 | encoder | 8 | 2 | 17.11 | 17.32 | **1.01x** |
+| facebook/vjepa2-vitl-fpc16-256-ssv2 | classification | 64 | 4 | 112.61 | 108.78 | 0.97x |
+| facebook/vjepa2-vitl-fpc16-256-ssv2 | classification | 128 | 8 | 129.58 | 127.14 | 0.98x |
+
+Latency (median of 3 iterations, predictor path):
+
+| Batch | transformers | Ours | Ratio |
+|------:|-------------:|-----:|------:|
+| 1 | 0.071s | 0.077s | 0.92x |
+| 2 | 0.126s | 0.147s | 0.86x |
+
+Alignment:
+
+| Output | Cosine | Mean Abs Diff |
+|--------|-------:|--------------:|
+| last_hidden_state | 1.000000 | 7.89e-02 |
+| masked_hidden_state | 1.000000 | 7.87e-02 |
+| predictor_hidden_state | 1.000000 | 5.96e-03 |
+| target_hidden_state | 0.999261 | 7.95e-02 |
+
+Classification alignment on `facebook/vjepa2-vitl-fpc16-256-ssv2` also remains stable after the short-sequence attention change: logits cosine `0.999853` and mean absolute difference `1.80e-02` over 16 synthetic videos.
 
 ### CosyVoice3 (TTS)
 
