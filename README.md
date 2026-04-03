@@ -1,6 +1,6 @@
 # kb-nano
 
-A standalone, high-performance inference engine supporting **LLMs** (Llama 3.1, Mixtral-8x7B, Qwen2-VL, Qwen3-VL), **diffusion models** (FLUX.1-dev, SDXL, HunyuanVideo-1.5), **segmentation models** (SAM3.1), audio models (Whisper), and **TTS models** (CosyVoice3) with tensor parallelism. No vLLM dependency at runtime — just PyTorch, Triton, and Flash Attention.
+A standalone, high-performance inference engine supporting **LLMs** (Llama 3.1, Mixtral-8x7B, Qwen2-VL, Qwen3-VL), **diffusion models** (FLUX.1-dev, SDXL, HunyuanVideo-1.5), **world models** (Oasis 500M), **segmentation models** (SAM3.1), audio models (Whisper), and **TTS models** (CosyVoice3) with tensor parallelism. No vLLM dependency at runtime — just PyTorch, Triton, and Flash Attention.
 
 ## Features
 
@@ -9,6 +9,7 @@ A standalone, high-performance inference engine supporting **LLMs** (Llama 3.1, 
 - **FLUX.1-dev** diffusion transformer (text-to-image) with Flash Attention
 - **SDXL** (Stable Diffusion XL) UNet-based text-to-image with dual CLIP text encoders
 - **HunyuanVideo-1.5** 3D video diffusion transformer (text-to-video) with dual-stream joint attention, M-RoPE, and Qwen2.5-VL text encoder
+- **Oasis 500M** action-conditioned autoregressive diffusion world model
 - **Qwen2-VL / Qwen3-VL** vision-language models with image and video support
 - **SAM3.1** (facebook/sam3.1) image/video segmentation with ViT backbone, fusion encoder, detection decoder, and segmentation head
 - **Whisper** (large-v3) encoder-decoder speech-to-text with batched inference and paged cross-attention KV cache
@@ -24,6 +25,7 @@ A standalone, high-performance inference engine supporting **LLMs** (Llama 3.1, 
 - **vllm-omni comparison benchmark** for CosyVoice3 TTS (SEED-TTS-Eval dataset)
 - **diffusers comparison benchmark** for SDXL diffusion
 - **facebook/sam3 comparison benchmark** for SAM3.1 segmentation
+- **open-oasis comparison benchmark** for autoregressive diffusion world models
 
 ## Project Structure
 
@@ -239,6 +241,23 @@ The diffusion benchmark measures:
 - **Latency**: per-image/video latency with P50 percentile stats
 - **Correctness**: per-batch latent cosine similarity (FLUX) or per-prompt decoded-frame PSNR and cosine similarity (HunyuanVideo)
 
+### Benchmarking vs open-oasis (Autoregressive Diffusion)
+
+```bash
+# Oasis 500M: throughput + alignment benchmark vs official open-oasis
+python tests/bench_oasis.py --model Etched/oasis-500m
+
+# Larger rollout
+python tests/bench_oasis.py --model Etched/oasis-500m --num-frames 8 --ddim-steps 4
+
+# Skip throughput or alignment
+python tests/bench_oasis.py --model Etched/oasis-500m --skip-throughput
+python tests/bench_oasis.py --model Etched/oasis-500m --skip-alignment
+
+# Save results to a specific directory
+python tests/bench_oasis.py --model Etched/oasis-500m --output-dir tests/results/H200/oasis-500m
+```
+
 ## Benchmarking
 
 The benchmark suite lets you evaluate custom kernel implementations at 4 abstraction levels:
@@ -394,6 +413,7 @@ Each run is tagged with a `tier` (`agent`, `kernel`, `eval`, or `e2e`) indicatin
 - MLflow (experiment tracking — gracefully skipped if not installed)
 - vLLM (only needed for running comparison tests)
 - matplotlib (only needed for benchmark plotting)
+- timm and av (only needed for the Oasis / open-oasis comparison benchmark)
 
 ### GPU architecture and library compatibility
 
@@ -579,6 +599,31 @@ Correctness (eager mode, decoded video frames, per-prompt cosine similarity):
 | 480p-medium |  8 | 0.923 | 0.862 | 12.92 dB | WARN |
 
 Correctness is measured in decoded pixel space (both engines produce PIL video frames which are compared as uint8 numpy arrays). The pixel-level cosine similarity of ~0.92 is expected for two independent bf16 implementations: numerical differences in the 30-step denoising loop are amplified by the VAE decoder. For reference, latent-space comparison between kb-nano and HF diffusers yields CosSim=0.986, confirming the transformer backbone is correctly implemented. The pixel-space divergence is dominated by VAE decode amplification and different text encoder implementations (kb-nano uses a custom Qwen2.5-VL paged-attention encoder vs vllm-omni's HuggingFace-based encoder).
+
+### Oasis 500M (Autoregressive Diffusion)
+
+Run `tests/bench_oasis.py --model Etched/oasis-500m` to reproduce. Reference baseline: official `open-oasis`.
+
+**Hardware: NVIDIA H200**
+
+Throughput:
+
+| Scenario | Reference (videos/s) | Ours (videos/s) | Ratio |
+|----------|---------------------:|----------------:|------:|
+| 4 frames, 2 DDIM | 4.26 | 5.72 | **1.34x** |
+| 8 frames, 4 DDIM | 0.68 | 1.11 | **1.64x** |
+| 16 frames, 4 DDIM | 0.38 | 0.56 | **1.47x** |
+
+Alignment:
+
+| Scenario | Output | Avg CosSim | Avg Mean Abs Diff | Notes |
+|----------|--------|-----------:|------------------:|:------|
+| 4 frames, 2 DDIM | Prompt latents | 0.99985957 | 3.85e-03 | PASS |
+| 4 frames, 2 DDIM | Rollout latents | 0.99965012 | 1.08e-02 | PASS |
+| 4 frames, 2 DDIM | Decoded video | 0.99993378 | 2.55e-03 | PASS |
+| 8 frames, 4 DDIM | Prompt latents | 0.99985957 | 3.85e-03 | PASS |
+| 8 frames, 4 DDIM | Rollout latents | 0.99740279 | 2.61e-02 | PASS |
+| 8 frames, 4 DDIM | Decoded video | 0.99958181 | 5.13e-03 | PASS |
 
 ### CosyVoice3 (TTS)
 
