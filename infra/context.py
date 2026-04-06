@@ -1,10 +1,30 @@
-"""Global inference context for paged KV cache coordination."""
+"""Global inference context for paged KV cache coordination.
+
+The ``Context`` dataclass carries per-step metadata used by attention, MoE,
+CUDA graph capture, and torch.compile.  The ``no_compile_layers`` dict
+mirrors vLLM's ``ForwardContext.no_compile_layers`` / ``static_forward_context``
+so that custom ops can resolve their target module at runtime without baking
+references into the compiled graph.
+"""
 
 from __future__ import annotations
 
+import enum
+from contextlib import contextmanager
 from dataclasses import dataclass, field
+from typing import TYPE_CHECKING
 
 import torch
+
+if TYPE_CHECKING:
+    import torch.nn as nn
+
+
+class CUDAGraphMode(enum.IntEnum):
+    """Runtime mode for CUDA graph dispatch (mirrors vLLM CUDAGraphMode)."""
+    NONE = 0
+    PIECEWISE = 1
+    FULL = 2
 
 
 @dataclass(frozen=True)
@@ -100,6 +120,62 @@ class Context:
     cross_context_lens: torch.Tensor | None = None
     cross_max_context_len: int = 0
 
+    # --- Compilation / CUDA-graph fields (mirror vLLM ForwardContext) ---
+    # Maps layer prefix -> live nn.Module for custom-op runtime lookup.
+    no_compile_layers: dict[str, "nn.Module"] = field(default_factory=dict)
+    # Runtime mode for CUDAGraphWrapper dispatch.
+    cudagraph_runtime_mode: CUDAGraphMode = CUDAGraphMode.NONE
+    # Batch size key used by CUDAGraphWrapper for per-shape graph caching.
+    batch_size_for_graph: int = 0
+
+
+# Global module registry populated once at model init; copied into each
+# Context so compiled custom ops can resolve their target modules.
+_STATIC_NO_COMPILE_LAYERS: dict[str, "nn.Module"] = {}
+
+
+def register_no_compile_layers(layers: dict[str, "nn.Module"]) -> None:
+    """Register attention/MoE modules for custom-op lookup during compiled
+    execution.  Called once after model construction."""
+    _STATIC_NO_COMPILE_LAYERS.update(layers)
+
+
+def get_no_compile_layers() -> dict[str, "nn.Module"]:
+    return _STATIC_NO_COMPILE_LAYERS
+
+
+def auto_register_no_compile_layers(model: "nn.Module") -> None:
+    """Walk *model* and register every MoE and Attention sub-module by its
+    fully-qualified prefix so custom ops can find them at runtime.
+
+    Recognized types (by class name to avoid circular imports):
+      - ``Qwen3MoE``, ``MixtralMoE``  (MoE blocks)
+      - ``Attention``                  (paged-KV attention impl)
+
+    Also sets ``_layer_name`` on each module so it knows its own key.
+    ``_use_custom_op`` remains ``False`` until compilation is enabled.
+    """
+    _TARGET_NAMES = {"Qwen3MoE", "MixtralMoE", "Attention"}
+    layers: dict[str, "nn.Module"] = {}
+    for name, mod in model.named_modules():
+        if type(mod).__name__ in _TARGET_NAMES:
+            layers[name] = mod
+            mod._layer_name = name  # type: ignore[attr-defined]
+    register_no_compile_layers(layers)
+
+
+def enable_custom_ops() -> None:
+    """Switch all registered no-compile layers to dispatch through custom ops.
+    Called once after torch.compile is applied to the model."""
+    for mod in _STATIC_NO_COMPILE_LAYERS.values():
+        mod._use_custom_op = True  # type: ignore[attr-defined]
+
+
+def disable_custom_ops() -> None:
+    """Revert to eager dispatch (used for testing/fallback)."""
+    for mod in _STATIC_NO_COMPILE_LAYERS.values():
+        mod._use_custom_op = False  # type: ignore[attr-defined]
+
 
 _CONTEXT = Context()
 
@@ -115,7 +191,8 @@ def set_context(is_prefill, cu_seqlens_q=None, cu_seqlens_k=None,
     global _CONTEXT
     _CONTEXT = Context(is_prefill, cu_seqlens_q, cu_seqlens_k,
                        max_seqlen_q, max_seqlen_k, slot_mapping,
-                       context_lens, block_tables, max_context_len)
+                       context_lens, block_tables, max_context_len,
+                       no_compile_layers=_STATIC_NO_COMPILE_LAYERS)
 
 
 def set_mixed_context(
@@ -143,9 +220,38 @@ def set_mixed_context(
         decode_block_tables=decode_block_tables,
         decode_max_context_len=decode_max_context_len,
         logit_indices=logit_indices,
+        no_compile_layers=_STATIC_NO_COMPILE_LAYERS,
     )
 
 
 def reset_context():
     global _CONTEXT
-    _CONTEXT = Context()
+    _CONTEXT = Context(no_compile_layers=_STATIC_NO_COMPILE_LAYERS)
+
+
+@contextmanager
+def set_forward_context(
+    is_prefill: bool = False,
+    cudagraph_runtime_mode: CUDAGraphMode = CUDAGraphMode.NONE,
+    batch_size_for_graph: int = 0,
+    **ctx_kwargs,
+):
+    """Context manager that sets both KV-cache metadata and compile/graph
+    fields for the duration of a forward pass.
+
+    ``no_compile_layers`` is always populated from the global registry so
+    custom ops can resolve modules without the caller threading it through.
+    """
+    global _CONTEXT
+    prev = _CONTEXT
+    _CONTEXT = Context(
+        is_prefill=is_prefill,
+        no_compile_layers=_STATIC_NO_COMPILE_LAYERS,
+        cudagraph_runtime_mode=cudagraph_runtime_mode,
+        batch_size_for_graph=batch_size_for_graph,
+        **ctx_kwargs,
+    )
+    try:
+        yield _CONTEXT
+    finally:
+        _CONTEXT = prev

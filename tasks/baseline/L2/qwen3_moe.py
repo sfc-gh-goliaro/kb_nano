@@ -105,6 +105,10 @@ class Qwen3MoE(nn.Module):
         self.fused_experts = FusedExperts()
         self.allreduce = AllReduce()
 
+        # Custom-op dispatch for torch.compile (set by engine after model init)
+        self._use_custom_op = False
+        self._layer_name = ""
+
     # --- BF16 weight loaders ---
 
     def _w13_weight_loader(self, param, loaded_weight, expert_id: int, is_w1: bool):
@@ -154,7 +158,8 @@ class Qwen3MoE(nn.Module):
         src = loaded_weight.narrow(1, rank * cols_per_tp, cols_per_tp)
         param.data[expert_id].copy_(src)
 
-    def forward(self, hidden_states: torch.Tensor) -> torch.Tensor:
+    def forward_impl(self, hidden_states: torch.Tensor) -> torch.Tensor:
+        """Core MoE logic, callable from both eager and custom-op paths."""
         orig_shape = hidden_states.shape
         hidden_states = hidden_states.view(-1, self.hidden_size)
 
@@ -162,8 +167,6 @@ class Qwen3MoE(nn.Module):
         topk_weights, topk_ids = self.topk_softmax(
             router_logits, self.top_k, renormalize=self.renormalize,
         )
-        # topk_weights stays float32 — router weight multiplication MUST be
-        # performed in float32 before precision conversion (vLLM requirement)
 
         w13_scale_dg = getattr(self, 'w13_scale_dg', None)
         w2_scale_dg = getattr(self, 'w2_scale_dg', None)
@@ -183,3 +186,8 @@ class Qwen3MoE(nn.Module):
             out = self.allreduce(out)
 
         return out.view(orig_shape)
+
+    def forward(self, hidden_states: torch.Tensor) -> torch.Tensor:
+        if self._use_custom_op:
+            return torch.ops.kb_nano.moe_forward(hidden_states, self._layer_name)
+        return self.forward_impl(hidden_states)

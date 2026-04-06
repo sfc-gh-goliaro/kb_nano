@@ -1,4 +1,17 @@
-"""RMSNorm using custom CUDA kernels for high-performance fused normalization."""
+"""RMSNorm with dual dispatch: CUDA custom op (eager) and pure-PyTorch (compiled).
+
+Mirrors vLLM's ``CustomOp`` dispatch pattern:
+  - ``forward_cuda``: calls the fast ``_C.rmsnorm`` / ``_C.fused_add_rmsnorm``
+    CUDA kernels, registered as ``torch.ops.kb_nano_norm.*`` for torch.compile
+    compatibility.  Used in eager mode and as the kernel backing CUDA graph
+    capture.
+  - ``forward_native``: pure PyTorch implementation (f32 promotion, variance,
+    rsqrt, weight multiply).  Used when torch.compile is active so Inductor
+    can inline, fuse, and optimise the norm with adjacent ops — this is the
+    key mechanism that enables RMSNorm+FP8-quant fusion.
+
+The ``forward`` method dispatches based on ``torch.compiler.is_compiling()``.
+"""
 
 from __future__ import annotations
 
@@ -8,9 +21,46 @@ import torch.nn.functional as F
 
 from .csrc import _C
 
+# ---------------------------------------------------------------------------
+# Register _C ops as torch.library custom ops for torch.compile compatibility.
+# These are used in eager mode and as CUDA graph replay targets.
+# ---------------------------------------------------------------------------
+
+_lib = torch.library.Library("kb_nano_norm", "DEF")
+
+_lib.define("rmsnorm(Tensor! result, Tensor input, Tensor weight, float eps) -> ()")
+
+def _rmsnorm_impl(result, input, weight, eps):
+    _C.rmsnorm(result, input, weight, eps)
+
+_lib.impl("rmsnorm", _rmsnorm_impl, "CUDA")
+
+@torch.library.impl(_lib, "rmsnorm", "Meta")
+def _rmsnorm_meta(result, input, weight, eps):
+    pass
+
+_lib.define(
+    "fused_add_rmsnorm(Tensor(a!) input, Tensor(b!) residual, "
+    "Tensor weight, float eps) -> ()"
+)
+
+def _fused_add_rmsnorm_impl(input, residual, weight, eps):
+    _C.fused_add_rmsnorm(input, residual, weight, eps)
+
+_lib.impl("fused_add_rmsnorm", _fused_add_rmsnorm_impl, "CUDA")
+
+@torch.library.impl(_lib, "fused_add_rmsnorm", "Meta")
+def _fused_add_rmsnorm_meta(input, residual, weight, eps):
+    pass
+
+
+# ---------------------------------------------------------------------------
+# RMSNorm module
+# ---------------------------------------------------------------------------
 
 class RMSNorm(nn.Module):
-    def __init__(self, hidden_size: int, eps: float = 1e-6, elementwise_affine: bool = True):
+    def __init__(self, hidden_size: int, eps: float = 1e-6,
+                 elementwise_affine: bool = True):
         super().__init__()
         self.hidden_size = hidden_size
         self.eps = eps
@@ -18,21 +68,65 @@ class RMSNorm(nn.Module):
         if elementwise_affine:
             self.weight = nn.Parameter(torch.ones(hidden_size))
 
-    def forward(self, x, residual=None):
-        if self.elementwise_affine:
+    # -- Pure PyTorch path (used under torch.compile so Inductor can fuse) --
+
+    @staticmethod
+    def forward_native(
+        x: torch.Tensor,
+        weight: torch.Tensor | None,
+        eps: float,
+        hidden_size: int,
+        residual: torch.Tensor | None = None,
+    ) -> torch.Tensor | tuple[torch.Tensor, torch.Tensor]:
+        """Pure PyTorch RMSNorm matching vLLM's forward_static."""
+        orig_dtype = x.dtype
+        x = x.float()
+        if residual is not None:
+            x = x + residual.float()
+            residual = x.to(orig_dtype)
+        variance = x.pow(2).mean(dim=-1, keepdim=True)
+        x = x * torch.rsqrt(variance + eps)
+        x = x.to(orig_dtype)
+        if weight is not None:
+            x = x * weight
+        if residual is None:
+            return x
+        return x, residual
+
+    # -- CUDA kernel path (used in eager mode / CUDA graph replay) --
+
+    @staticmethod
+    def forward_cuda(
+        x: torch.Tensor,
+        weight: torch.Tensor | None,
+        eps: float,
+        residual: torch.Tensor | None = None,
+    ) -> torch.Tensor | tuple[torch.Tensor, torch.Tensor]:
+        if weight is not None:
             if residual is None:
                 out = torch.empty_like(x)
-                _C.rmsnorm(out, x, self.weight, self.eps)
+                torch.ops.kb_nano_norm.rmsnorm(out, x, weight, eps)
                 return out
             else:
-                _C.fused_add_rmsnorm(x, residual, self.weight, self.eps)
+                torch.ops.kb_nano_norm.fused_add_rmsnorm(
+                    x, residual, weight, eps,
+                )
                 return x, residual
         else:
             if residual is None:
-                x = F.rms_norm(x, (self.hidden_size,), eps=self.eps)
-                return x
+                return F.rms_norm(x, (x.size(-1),), eps=eps)
             else:
                 x = x + residual
                 residual = x
-                x = F.rms_norm(x, (self.hidden_size,), eps=self.eps)
-                return x, residual
+                return F.rms_norm(x, (x.size(-1),), eps=eps), residual
+
+    def forward(self, x, residual=None):
+        if torch.compiler.is_compiling():
+            return self.forward_native(
+                x, self.weight if self.elementwise_affine else None,
+                self.eps, self.hidden_size, residual,
+            )
+        return self.forward_cuda(
+            x, self.weight if self.elementwise_affine else None,
+            self.eps, residual,
+        )

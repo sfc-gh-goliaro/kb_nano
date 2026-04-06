@@ -107,10 +107,22 @@ class Fp8Linear(nn.Module):
         self._s_buf = torch.empty(max_tokens, num_groups, dtype=torch.float32, device=device)
         self._o_buf = torch.empty(max_tokens, N, dtype=torch.bfloat16, device=device)
 
-    def forward(self, input_bf16: torch.Tensor,
-                weight_fp8: torch.Tensor,
-                weight_scale_inv: torch.Tensor,
-                bias: torch.Tensor | None = None) -> torch.Tensor:
+    @staticmethod
+    def forward_native(input_bf16: torch.Tensor,
+                       weight_fp8: torch.Tensor,
+                       weight_scale_inv: torch.Tensor,
+                       bias: torch.Tensor | None = None) -> torch.Tensor:
+        """Pure PyTorch fallback for torch.compile — dequantizes FP8 weight
+        and uses F.linear.  Slower than DeepGEMM but fully traceable by
+        Inductor, enabling fusion with adjacent ops."""
+        weight_bf16 = weight_fp8.to(input_bf16.dtype)
+        return torch.nn.functional.linear(input_bf16, weight_bf16, bias)
+
+    def forward_cuda(self, input_bf16: torch.Tensor,
+                     weight_fp8: torch.Tensor,
+                     weight_scale_inv: torch.Tensor,
+                     bias: torch.Tensor | None = None) -> torch.Tensor:
+        """DeepGEMM FP8 GEMM — fast CUDA kernel path for eager / CUDA graph."""
         N, K = weight_fp8.shape
         input_2d = input_bf16.reshape(-1, K)
         M = input_2d.shape[0]
@@ -142,6 +154,16 @@ class Fp8Linear(nn.Module):
             output = output + bias
 
         return output.view(*input_bf16.shape[:-1], N)
+
+    def forward(self, input_bf16: torch.Tensor,
+                weight_fp8: torch.Tensor,
+                weight_scale_inv: torch.Tensor,
+                bias: torch.Tensor | None = None) -> torch.Tensor:
+        if torch.compiler.is_compiling():
+            return self.forward_native(input_bf16, weight_fp8,
+                                       weight_scale_inv, bias)
+        return self.forward_cuda(input_bf16, weight_fp8,
+                                 weight_scale_inv, bias)
 
 
 def postprocess_fp8_weights(weight_fp8: torch.Tensor,

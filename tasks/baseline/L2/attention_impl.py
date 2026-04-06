@@ -179,6 +179,10 @@ class Attention(nn.Module):
         self._use_trtllm = attn_cfg.use_trtllm
         self._block_size = attn_cfg.block_size
 
+        # Custom-op dispatch for torch.compile (set by engine after model init)
+        self._use_custom_op = False
+        self._layer_name = ""
+
         if self._use_trtllm:
             self.store_kvcache = StoreKVCacheHND(page_size=attn_cfg.block_size)
             from ..L1.flashinfer_prefill import TRTLLMPrefill
@@ -205,8 +209,9 @@ class Attention(nn.Module):
             self.decode_op._workspace = workspace
             self.prefill_op._workspace = workspace
 
-    def forward(self, query: torch.Tensor, key: torch.Tensor,
-                value: torch.Tensor) -> torch.Tensor:
+    def forward_impl(self, query: torch.Tensor, key: torch.Tensor,
+                     value: torch.Tensor) -> torch.Tensor:
+        """Core attention logic, callable from both eager and custom-op paths."""
         ctx = get_context()
         N = query.shape[0]
 
@@ -224,6 +229,14 @@ class Attention(nn.Module):
             o = self._forward_pure(q, k, v, k_cache, v_cache, ctx)
 
         return o.reshape(N, self.num_heads * self.head_size)
+
+    def forward(self, query: torch.Tensor, key: torch.Tensor,
+                value: torch.Tensor) -> torch.Tensor:
+        if self._use_custom_op:
+            return torch.ops.kb_nano.unified_attention(
+                query, key, value, self._layer_name,
+            )
+        return self.forward_impl(query, key, value)
 
     def _forward_pure(self, q, k, v, k_cache, v_cache, ctx):
         if ctx.is_prefill:

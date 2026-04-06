@@ -30,8 +30,9 @@ import torch.multiprocessing as mp
 from transformers import AutoTokenizer
 
 from .context import (
-    AttnBackendConfig, get_attn_backend_config, get_context,
-    reset_context, set_context, set_mixed_context,
+    AttnBackendConfig, CUDAGraphMode, auto_register_no_compile_layers,
+    get_attn_backend_config, get_context,
+    reset_context, set_context, set_forward_context, set_mixed_context,
 )
 from ..tasks.baseline.L1.allreduce import set_custom_ar
 from .weight_loader import load_model
@@ -303,6 +304,10 @@ class ModelRunner:
                 self.max_model_len,
                 getattr(self.config, "max_target_positions", self.max_model_len),
             )
+
+        auto_register_no_compile_layers(self.model)
+
+        self._compiled = False
         self._share_trtllm_workspace()
         self._share_activation_buffers()
         self.warmup_model()
@@ -310,6 +315,7 @@ class ModelRunner:
         self.allocate_kv_cache()
         self._init_fa3_decode_buffers()
         if not self.enforce_eager:
+            self._compile_model()
             self.capture_cudagraph()
         self._init_greedy_buffers()
         torch.set_default_device("cpu")
@@ -986,16 +992,20 @@ class ModelRunner:
     def run_model(self, input_ids, positions, is_prefill, inputs_embeds=None,
                   deepstack_embeds=None, encoder_outputs=None):
         if is_prefill or self.enforce_eager or input_ids.size(0) > self.graph_bs_list[-1]:
+            # Use eager model for prefill: prefill inputs can have shapes
+            # incompatible with the compiled decode graph (e.g. MRoPE 2D
+            # positions). vLLM also runs prefill outside CUDA graphs.
+            model = getattr(self, '_eager_model', self.model)
             if inputs_embeds is not None:
-                return self.model.compute_logits(
-                    self.model(input_ids, positions, inputs_embeds=inputs_embeds,
-                               deepstack_embeds=deepstack_embeds)
+                return model.compute_logits(
+                    model(input_ids, positions, inputs_embeds=inputs_embeds,
+                          deepstack_embeds=deepstack_embeds)
                 )
             if encoder_outputs is not None:
-                return self.model.compute_logits(
-                    self.model(input_ids, positions, encoder_outputs=encoder_outputs)
+                return model.compute_logits(
+                    model(input_ids, positions, encoder_outputs=encoder_outputs)
                 )
-            return self.model.compute_logits(self.model(input_ids, positions))
+            return model.compute_logits(model(input_ids, positions))
         bs = input_ids.size(0)
         ctx = get_context()
         graph_bs = self._graph_bs_for_n[bs]
@@ -1708,6 +1718,32 @@ class ModelRunner:
         ctx.cross_max_seqlen_k = cross_max_sk
         ctx.cross_block_tables = cross_bt
 
+    def _compile_model(self):
+        """Apply torch.compile with KBNanoBackend (mirrors vLLM).
+
+        The backend:
+        1. Splits the graph at attention custom-op boundaries
+        2. Compiles each subgraph with symbolic shapes (one compile per
+           unique subgraph structure, not per batch size)
+        3. Drops all Dynamo guards so no re-tracing occurs
+
+        After this, the model works for any batch size.  The subsequent
+        ``capture_cudagraph`` call records the compiled kernels into
+        per-batch-size CUDA graphs for decode replay.
+
+        The original model is kept as ``_eager_model`` for prefill calls
+        where input shapes may differ from the traced decode path (e.g.
+        MRoPE 2D positions).
+        """
+        from .compilation import compile_model
+        from .passes import configure_post_grad_passes
+
+        configure_post_grad_passes()
+        self._eager_model = self.model
+        self.model = compile_model(self.model)
+        self._compiled = True
+        self._mark_dynamic_done = False
+
     @torch.inference_mode()
     def capture_cudagraph(self):
         from contextlib import nullcontext
@@ -1744,7 +1780,21 @@ class ModelRunner:
                     context_lens=context_lens[:bs], block_tables=block_tables[:bs],
                     max_context_len=self.max_model_len,
                 )
-                outputs[:bs] = self.model(input_ids[:bs], positions[:bs])
+
+                ids_slice = input_ids[:bs]
+                pos_slice = positions[:bs]
+
+                # On the first call, mark batch dimensions as dynamic so
+                # Dynamo traces with symbolic shapes. This mirrors vLLM's
+                # _mark_dynamic_inputs: Dynamo sees SymInt batch dims and
+                # compiles shape-generic code. Guards are dropped so no
+                # re-tracing occurs on subsequent calls.
+                if self._compiled and not self._mark_dynamic_done:
+                    torch._dynamo.mark_dynamic(ids_slice, 0)
+                    torch._dynamo.mark_dynamic(pos_slice, 0)
+                    self._mark_dynamic_done = True
+
+                outputs[:bs] = self.model(ids_slice, pos_slice)
                 lm_logits[:bs] = lm_head.linear_op(outputs[:bs], lm_head.embedding_op.emb.weight).float()
                 lm_max_vals[:bs], lm_max_idxs[:bs] = lm_logits[:bs].max(dim=-1)
 

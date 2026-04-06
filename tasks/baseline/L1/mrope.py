@@ -17,7 +17,8 @@ import torch.nn as nn
 import triton
 import triton.language as tl
 
-from .csrc import _C
+from .csrc import _C  # noqa: F401
+from . import rotary_emb as _rotary_emb_reg  # noqa: F401 — registers kb_nano_rope ops
 
 
 @triton.jit
@@ -131,16 +132,22 @@ class MRotaryEmbedding(nn.Module):
         self.register_buffer("cos_sin_cache", cache, persistent=False)
 
     def _apply_sgl_rope(self, positions_1d, query, key):
-        """Fast path using CUDA kernel for 1D positions (decode or text-only)."""
+        """Apply standard RoPE for 1D positions (decode or text-only)."""
         cache = self.cos_sin_cache
         if cache.dtype != query.dtype:
             cache = cache.to(query.dtype)
-        q_shape = query.shape
-        k_shape = key.shape
-        _C.rotary_embedding(
+        if torch.compiler.is_compiling():
+            from .rotary_emb import RotaryEmbedding
+            return RotaryEmbedding.forward_native(
+                positions_1d,
+                query.view(query.shape[0], -1),
+                key.view(key.shape[0], -1),
+                self.head_dim, cache,
+            )
+        torch.ops.kb_nano_rope.rotary_embedding(
             positions_1d,
-            query.view(q_shape[0], -1),
-            key.view(k_shape[0], -1),
+            query.view(query.shape[0], -1),
+            key.view(key.shape[0], -1),
             self.head_dim,
             cache,
             True,
