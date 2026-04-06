@@ -1,4 +1,10 @@
-"""FP8 linear (block-scaled FP8 matrix multiply) using deep_gemm."""
+"""FP8 linear (block-scaled FP8 matrix multiply) using deep_gemm.
+
+Registers the FP8 GEMM as a ``torch.library`` custom op so it stays
+**opaque** during ``torch.compile`` tracing (Inductor does not attempt
+to inline or fuse it).  At runtime the real DeepGEMM kernel executes —
+matching vLLM's approach of using ``torch.ops.vllm.fp8_gemm_nt_op``.
+"""
 
 import math
 
@@ -12,6 +18,53 @@ import deep_gemm
 
 _FP8_INFO = torch.finfo(torch.float8_e4m3fn)
 _GROUP_SIZE: tl.constexpr = 128
+
+# ---------------------------------------------------------------------------
+# Register FP8 GEMM as torch.library custom ops (opaque to Inductor).
+# This mirrors vLLM's direct_register_custom_op for fp8_gemm_nt_op.
+# ---------------------------------------------------------------------------
+
+_fp8_lib = torch.library.Library("kb_nano_fp8", "DEF")
+
+_fp8_lib.define(
+    "fp8_gemm_nt(Tensor q_input, Tensor input_scale, "
+    "Tensor weight, Tensor weight_scale, Tensor! output) -> ()"
+)
+
+
+def _fp8_gemm_nt_impl(q_input, input_scale, weight, weight_scale, output):
+    deep_gemm.fp8_gemm_nt(
+        (q_input, input_scale),
+        (weight, weight_scale),
+        output,
+    )
+
+
+_fp8_lib.impl("fp8_gemm_nt", _fp8_gemm_nt_impl, "CUDA")
+
+
+@torch.library.impl(_fp8_lib, "fp8_gemm_nt", "Meta")
+def _fp8_gemm_nt_meta(q_input, input_scale, weight, weight_scale, output):
+    pass
+
+
+_fp8_lib.define(
+    "per_token_group_quant_fp8(Tensor input, Tensor! output_fp8, "
+    "Tensor! output_scale) -> ()"
+)
+
+
+def _per_token_group_quant_fp8_op_impl(input, output_fp8, output_scale):
+    _per_token_group_quant_fp8(input, output_fp8, output_scale)
+
+
+_fp8_lib.impl("per_token_group_quant_fp8", _per_token_group_quant_fp8_op_impl,
+              "CUDA")
+
+
+@torch.library.impl(_fp8_lib, "per_token_group_quant_fp8", "Meta")
+def _per_token_group_quant_fp8_op_meta(input, output_fp8, output_scale):
+    pass
 
 
 @triton.jit
@@ -107,63 +160,51 @@ class Fp8Linear(nn.Module):
         self._s_buf = torch.empty(max_tokens, num_groups, dtype=torch.float32, device=device)
         self._o_buf = torch.empty(max_tokens, N, dtype=torch.bfloat16, device=device)
 
-    @staticmethod
-    def forward_native(input_bf16: torch.Tensor,
-                       weight_fp8: torch.Tensor,
-                       weight_scale_inv: torch.Tensor,
-                       bias: torch.Tensor | None = None) -> torch.Tensor:
-        """Pure PyTorch fallback for torch.compile — dequantizes FP8 weight
-        and uses F.linear.  Slower than DeepGEMM but fully traceable by
-        Inductor, enabling fusion with adjacent ops."""
-        weight_bf16 = weight_fp8.to(input_bf16.dtype)
-        return torch.nn.functional.linear(input_bf16, weight_bf16, bias)
+    def forward(self, input_bf16: torch.Tensor,
+                weight_fp8: torch.Tensor,
+                weight_scale_inv: torch.Tensor,
+                bias: torch.Tensor | None = None) -> torch.Tensor:
+        """FP8 block-scaled GEMM via custom ops (opaque to Inductor).
 
-    def forward_cuda(self, input_bf16: torch.Tensor,
-                     weight_fp8: torch.Tensor,
-                     weight_scale_inv: torch.Tensor,
-                     bias: torch.Tensor | None = None) -> torch.Tensor:
-        """DeepGEMM FP8 GEMM — fast CUDA kernel path for eager / CUDA graph."""
+        Uses registered ``torch.ops.kb_nano_fp8.*`` ops so the FP8 GEMM
+        stays as an opaque node in the compiled FX graph — matching vLLM's
+        approach.  Pre-allocated buffers are used when available (CUDA
+        graph compatibility); fresh allocations otherwise.
+        """
         N, K = weight_fp8.shape
         input_2d = input_bf16.reshape(-1, K)
         M = input_2d.shape[0]
+        num_groups = (K + self.BLOCK_SIZE - 1) // self.BLOCK_SIZE
 
-        if self._a_buf is not None and M <= self._a_buf.shape[0]:
-            _per_token_group_quant_fp8(input_2d, self._a_buf[:M], self._s_buf[:M])
-            q_input = self._a_buf[:M]
-            input_scale = self._s_buf[:M]
-            output = self._o_buf[:M]
-        elif self._pf is not None and M <= self._pf.a.shape[0]:
-            _per_token_group_quant_fp8(input_2d, self._pf.a[:M], self._pf.s[:M])
-            q_input = self._pf.a[:M]
-            input_scale = self._pf.s[:M]
-            output = self._pf.o[:M]
+        if not torch.compiler.is_compiling():
+            if self._a_buf is not None and M <= self._a_buf.shape[0]:
+                q_input = self._a_buf[:M]
+                input_scale = self._s_buf[:M]
+                output = self._o_buf[:M]
+            elif self._pf is not None and M <= self._pf.a.shape[0]:
+                q_input = self._pf.a[:M]
+                input_scale = self._pf.s[:M]
+                output = self._pf.o[:M]
+            else:
+                q_input = torch.empty(M, K, dtype=torch.float8_e4m3fn, device=input_2d.device)
+                input_scale = torch.empty(M, num_groups, dtype=torch.float32, device=input_2d.device)
+                output = torch.empty(M, N, dtype=torch.bfloat16, device=input_2d.device)
         else:
-            num_groups = math.ceil(K / self.BLOCK_SIZE)
             q_input = torch.empty(M, K, dtype=torch.float8_e4m3fn, device=input_2d.device)
             input_scale = torch.empty(M, num_groups, dtype=torch.float32, device=input_2d.device)
-            _per_token_group_quant_fp8(input_2d, q_input, input_scale)
             output = torch.empty(M, N, dtype=torch.bfloat16, device=input_2d.device)
 
-        deep_gemm.fp8_gemm_nt(
-            (q_input, input_scale),
-            (weight_fp8, weight_scale_inv),
-            output,
+        torch.ops.kb_nano_fp8.per_token_group_quant_fp8(
+            input_2d, q_input, input_scale,
+        )
+        torch.ops.kb_nano_fp8.fp8_gemm_nt(
+            q_input, input_scale, weight_fp8, weight_scale_inv, output,
         )
 
         if bias is not None:
             output = output + bias
 
         return output.view(*input_bf16.shape[:-1], N)
-
-    def forward(self, input_bf16: torch.Tensor,
-                weight_fp8: torch.Tensor,
-                weight_scale_inv: torch.Tensor,
-                bias: torch.Tensor | None = None) -> torch.Tensor:
-        if torch.compiler.is_compiling():
-            return self.forward_native(input_bf16, weight_fp8,
-                                       weight_scale_inv, bias)
-        return self.forward_cuda(input_bf16, weight_fp8,
-                                 weight_scale_inv, bias)
 
 
 def postprocess_fp8_weights(weight_fp8: torch.Tensor,

@@ -992,9 +992,6 @@ class ModelRunner:
     def run_model(self, input_ids, positions, is_prefill, inputs_embeds=None,
                   deepstack_embeds=None, encoder_outputs=None):
         if is_prefill or self.enforce_eager or input_ids.size(0) > self.graph_bs_list[-1]:
-            # Use eager model for prefill: prefill inputs can have shapes
-            # incompatible with the compiled decode graph (e.g. MRoPE 2D
-            # positions). vLLM also runs prefill outside CUDA graphs.
             model = getattr(self, '_eager_model', self.model)
             if inputs_embeds is not None:
                 return model.compute_logits(
