@@ -1,6 +1,6 @@
 # kb-nano
 
-A standalone, high-performance inference engine supporting **LLMs** (Llama 3.1, Mixtral-8x7B, Qwen2-VL, Qwen3-VL), **diffusion models** (FLUX.1-dev, SDXL, HunyuanVideo-1.5), **segmentation models** (SAM3.1), audio models (Whisper), and **TTS models** (CosyVoice3) with tensor parallelism. No vLLM dependency at runtime — just PyTorch, Triton, and Flash Attention.
+A standalone, high-performance inference engine supporting **LLMs** (Llama 3.1, Mixtral-8x7B, Qwen2-VL, Qwen3-VL), **diffusion models** (FLUX.1-dev, SDXL, HunyuanVideo-1.5), **detection models** (YOLOv10, RTDetrV2), **segmentation models** (SAM3.1), audio models (Whisper), and **TTS models** (CosyVoice3) with tensor parallelism. No vLLM dependency at runtime — just PyTorch, Triton, and Flash Attention.
 
 ## Features
 
@@ -9,6 +9,8 @@ A standalone, high-performance inference engine supporting **LLMs** (Llama 3.1, 
 - **FLUX.1-dev** diffusion transformer (text-to-image) with Flash Attention
 - **SDXL** (Stable Diffusion XL) UNet-based text-to-image with dual CLIP text encoders
 - **HunyuanVideo-1.5** 3D video diffusion transformer (text-to-video) with dual-stream joint attention, M-RoPE, and Qwen2.5-VL text encoder
+- **YOLOv10** (`jameslahm/yolov10n`) NMS-free object detection with rank sorting
+- **RTDetrV2** (`PekingU/rtdetr_v2_r101vd`) real-time detection transformer with deformable attention
 - **Qwen2-VL / Qwen3-VL** vision-language models with image and video support
 - **SAM3.1** (facebook/sam3.1) image/video segmentation with ViT backbone, fusion encoder, detection decoder, and segmentation head
 - **Whisper** (large-v3) encoder-decoder speech-to-text with batched inference and paged cross-attention KV cache
@@ -23,6 +25,7 @@ A standalone, high-performance inference engine supporting **LLMs** (Llama 3.1, 
 - **vllm-omni comparison benchmark** for FLUX diffusion and HunyuanVideo-1.5 video diffusion
 - **vllm-omni comparison benchmark** for CosyVoice3 TTS (SEED-TTS-Eval dataset)
 - **diffusers comparison benchmark** for SDXL diffusion
+- **Detection benchmark** for YOLOv10 and RTDetrV2
 - **facebook/sam3 comparison benchmark** for SAM3.1 segmentation
 
 ## Project Structure
@@ -234,6 +237,23 @@ python tests/test_sam.py --skip-reference
 python tests/test_sam.py --skip-latency
 ```
 
+### Benchmarking detection models
+
+```bash
+# YOLOv10: throughput + latency + alignment benchmark vs official THU-MIG/yolov10
+python tests/bench_detection.py --model jameslahm/yolov10n --use-fp16
+
+# RTDetrV2: throughput + latency + alignment benchmark vs transformers
+python tests/bench_detection.py --model PekingU/rtdetr_v2_r101vd --use-fp16
+
+# kb-nano only
+python tests/bench_detection.py --model jameslahm/yolov10n --use-fp16 --skip-reference
+
+# Save results to a specific directory
+python tests/bench_detection.py --model jameslahm/yolov10n --use-fp16 --output-dir tests/results/H200/yolov10n
+python tests/bench_detection.py --model PekingU/rtdetr_v2_r101vd --use-fp16 --output-dir tests/results/H200/rtdetr_v2_r101vd
+```
+
 The diffusion benchmark measures:
 - **Throughput**: images/sec (FLUX) or videos/sec (HunyuanVideo) at various resolutions
 - **Latency**: per-image/video latency with P50 percentile stats
@@ -394,6 +414,14 @@ Each run is tagged with a `tier` (`agent`, `kernel`, `eval`, or `e2e`) indicatin
 - MLflow (experiment tracking — gracefully skipped if not installed)
 - vLLM (only needed for running comparison tests)
 - matplotlib (only needed for benchmark plotting)
+- ultralytics (YOLOv10 baseline benchmarking)
+
+### Optional detection benchmark dependencies
+
+```bash
+pip install ultralytics==8.4.35
+git clone https://github.com/THU-MIG/yolov10.git third_party/yolov10
+```
 
 ### GPU architecture and library compatibility
 
@@ -673,6 +701,60 @@ Correctness (100 images, per-element cosine similarity):
 | Classification Logits | 0.975 | 0.924 | PASS |
 
 The remaining numerical divergence is expected from SDPA vs Flash Attention numerics and bf16/fp32 precision differences accumulated through the deep pipeline (backbone + encoder + decoder + pixel decoder + mask predictor). All metrics pass their thresholds (boxes/logits: mean >= 0.95, min >= 0.90; masks: mean >= 0.90, min >= 0.85).
+
+### YOLOv10 (Detection)
+
+Run `tests/bench_detection.py --model jameslahm/yolov10n` to reproduce. Throughput uses synthetic 640x640 image tensors; the reference baseline is the official `THU-MIG/yolov10` implementation loaded from `third_party/yolov10`.
+
+**Hardware: NVIDIA H200**
+
+| Model | Images | Batch | Reference (img/s) | Ours (img/s) | Ratio |
+|-------|-------:|------:|------------------:|-------------:|------:|
+| jameslahm/yolov10n | 8 | 2 | 323.66 | 343.75 | **1.06x** |
+
+Latency (median of 3 iterations):
+
+| Batch Size | Reference p50 | Ours p50 | Ratio |
+|-----------:|--------------:|---------:|------:|
+| 1 | 0.00591s | 0.00592s | 1.00x |
+| 4 | 0.01059s | 0.00778s | **1.36x** |
+
+Alignment:
+
+| Output | Metric | Value |
+|--------|--------|------:|
+| Boxes | Cosine | 1.000 |
+| Boxes | MAE | 0.0 |
+| Scores | Cosine | 1.000 |
+| Scores | MAE | 0.0 |
+| Labels | Match Rate | 1.000 |
+
+### RTDetrV2 (Detection)
+
+Run `tests/bench_detection.py --model PekingU/rtdetr_v2_r101vd` to reproduce. Throughput uses synthetic 640x640 image tensors; the reference baseline is `transformers.RTDetrV2ForObjectDetection`.
+
+**Hardware: NVIDIA H200**
+
+| Model | Images | Batch | Reference (img/s) | Ours (img/s) | Ratio |
+|-------|-------:|------:|------------------:|-------------:|------:|
+| PekingU/rtdetr_v2_r101vd | 8 | 2 | 80.49 | 87.01 | **1.08x** |
+
+Latency (median of 3 iterations):
+
+| Batch Size | Reference p50 | Ours p50 | Ratio |
+|-----------:|--------------:|---------:|------:|
+| 1 | 0.02305s | 0.02227s | **1.04x** |
+| 4 | 0.02374s | 0.02431s | 0.98x |
+
+Alignment:
+
+| Output | Metric | Value |
+|--------|--------|------:|
+| Boxes | Cosine | 1.000 |
+| Boxes | MAE | 0.0 |
+| Scores | Cosine | 1.000 |
+| Scores | MAE | 0.0 |
+| Labels | Match Rate | 1.000 |
 
 ### Key optimizations
 
