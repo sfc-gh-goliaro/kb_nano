@@ -1,6 +1,6 @@
 # kb-nano
 
-A standalone, high-performance inference engine supporting **LLMs** (Llama 3.1, Mixtral-8x7B, Qwen2-VL, Qwen3-VL), **diffusion models** (FLUX.1-dev, SDXL, HunyuanVideo-1.5), **segmentation models** (SAM3.1), audio models (Whisper), and **TTS models** (CosyVoice3) with tensor parallelism. No vLLM dependency at runtime — just PyTorch, Triton, and Flash Attention.
+A standalone, high-performance inference engine supporting **LLMs** (Llama 3.1, Mixtral-8x7B, Qwen2-VL, Qwen3-VL), **diffusion models** (FLUX.1-dev, SDXL, HunyuanVideo-1.5), **segmentation models** (SAM3.1), **3D point models** (PointTransformerV3), audio models (Whisper), and **TTS models** (CosyVoice3) with tensor parallelism. No vLLM dependency at runtime — just PyTorch, Triton, and Flash Attention.
 
 ## Features
 
@@ -11,6 +11,7 @@ A standalone, high-performance inference engine supporting **LLMs** (Llama 3.1, 
 - **HunyuanVideo-1.5** 3D video diffusion transformer (text-to-video) with dual-stream joint attention, M-RoPE, and Qwen2.5-VL text encoder
 - **Qwen2-VL / Qwen3-VL** vision-language models with image and video support
 - **SAM3.1** (facebook/sam3.1) image/video segmentation with ViT backbone, fusion encoder, detection decoder, and segmentation head
+- **PointTransformerV3** (Pointcept/PointTransformerV3) 3D point cloud transformer with serialized pooling, sparse conv stems, and optional Flash Attention
 - **Whisper** (large-v3) encoder-decoder speech-to-text with batched inference and paged cross-attention KV cache
 - **CosyVoice3** (Fun-CosyVoice3-0.5B-2512) text-to-speech with flow matching DiT + HiFi-GAN vocoder
 - **Tensor parallelism** (TP) with custom IPC-based all-reduce for multi-GPU inference
@@ -24,6 +25,7 @@ A standalone, high-performance inference engine supporting **LLMs** (Llama 3.1, 
 - **vllm-omni comparison benchmark** for CosyVoice3 TTS (SEED-TTS-Eval dataset)
 - **diffusers comparison benchmark** for SDXL diffusion
 - **facebook/sam3 comparison benchmark** for SAM3.1 segmentation
+- **PointTransformerV3 detached comparison benchmark** for 3D point cloud encoding
 
 ## Project Structure
 
@@ -234,6 +236,25 @@ python tests/test_sam.py --skip-reference
 python tests/test_sam.py --skip-latency
 ```
 
+### Benchmarking vs official PointTransformerV3 (Point Cloud)
+
+```bash
+# Clone detached PointTransformerV3 reference once
+git clone https://github.com/Pointcept/PointTransformerV3.git third_party/PointTransformerV3
+
+# PointTransformerV3: throughput + alignment benchmark vs official detached implementation
+python tests/bench_pointcloud.py --model Pointcept/PointTransformerV3 --use-fp16
+
+# Enable Flash Attention in both ours and reference
+python tests/bench_pointcloud.py --model Pointcept/PointTransformerV3 --use-fp16 --enable-flash
+
+# kb-nano only (skip reference comparison)
+python tests/bench_pointcloud.py --model Pointcept/PointTransformerV3 --use-fp16 --skip-reference
+
+# Save results to a specific directory
+python tests/bench_pointcloud.py --model Pointcept/PointTransformerV3 --use-fp16 --output-dir tests/results/H200/PointTransformerV3
+```
+
 The diffusion benchmark measures:
 - **Throughput**: images/sec (FLUX) or videos/sec (HunyuanVideo) at various resolutions
 - **Latency**: per-image/video latency with P50 percentile stats
@@ -394,6 +415,14 @@ Each run is tagged with a `tier` (`agent`, `kernel`, `eval`, or `e2e`) indicatin
 - MLflow (experiment tracking — gracefully skipped if not installed)
 - vLLM (only needed for running comparison tests)
 - matplotlib (only needed for benchmark plotting)
+
+Optional benchmark baselines:
+
+```bash
+pip install addict spconv-cu121==2.3.8
+```
+
+PointTransformerV3 benchmarking compares against the official detached implementation in `third_party/PointTransformerV3`. The current benchmark path uses a local `torch_scatter.segment_csr` shim backed by `torch.segment_reduce`, so `torch_scatter` is not required.
 
 ### GPU architecture and library compatibility
 
@@ -673,6 +702,26 @@ Correctness (100 images, per-element cosine similarity):
 | Classification Logits | 0.975 | 0.924 | PASS |
 
 The remaining numerical divergence is expected from SDPA vs Flash Attention numerics and bf16/fp32 precision differences accumulated through the deep pipeline (backbone + encoder + decoder + pixel decoder + mask predictor). All metrics pass their thresholds (boxes/logits: mean >= 0.95, min >= 0.90; masks: mean >= 0.90, min >= 0.85).
+
+### PointTransformerV3 (Point Cloud)
+
+Run `tests/bench_pointcloud.py` to reproduce. The upstream PointTransformerV3 repository currently marks released pretrained weights as invalid, so this benchmark uses synthetic point clouds with synchronized random weights loaded into both the official detached implementation and kb-nano. Reported correctness is feature-space alignment on the final point features.
+
+**Hardware: NVIDIA H200**
+
+Throughput (points/sec):
+
+| Attention Backend | Points/Cloud | Batch | Official Detached | Ours | Ratio |
+|-------------------|-------------:|------:|------------------:|-----:|------:|
+| SDPA | 4096 | 2 | 106,301 | 99,678 | 0.94x |
+| Flash Attention | 4096 | 2 | 113,489 | 110,542 | 0.97x |
+
+Correctness (feature space, 2048 alignment points):
+
+| Attention Backend | Feature CosSim | Feature MAE | Feature Shape |
+|-------------------|---------------:|------------:|:-------------:|
+| SDPA | 0.999984 | 0.007682 | 2048x64 |
+| Flash Attention | 0.999984 | 0.007678 | 2048x64 |
 
 ### Key optimizations
 

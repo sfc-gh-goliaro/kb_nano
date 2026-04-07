@@ -50,6 +50,7 @@ _L4_MODEL_KEYS: dict[str, str] = {
     "sam3": "sam3",
     "cosyvoice3": "cosyvoice3",
     "hunyuan_video": "hunyuan_video",
+    "pointtransformerv3": "pointtransformerv3",
 }
 
 
