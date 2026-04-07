@@ -45,6 +45,8 @@ _L4_MODEL_KEYS: dict[str, str] = {
     "llada": "llada",
     "llama4": "llama4",
     "mixtral": "mixtral",
+    "convnextv2": "convnextv2",
+    "efficientnetv2": "efficientnetv2",
     "qwen2_vl": "qwen2_vl",
     "qwen3_vl": "qwen3_vl",
     "flux": "flux",

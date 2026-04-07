@@ -1,12 +1,14 @@
 # kb-nano
 
-A standalone, high-performance inference engine supporting **LLMs** (Llama 3.1, Mixtral-8x7B, Qwen2-VL, Qwen3-VL), **text diffusion models** (LLaDA / Fast-dLLM-style decoding), **diffusion models** (FLUX.1-dev, SDXL, HunyuanVideo-1.5), **segmentation models** (SAM3.1), audio models (Whisper), and **TTS models** (CosyVoice3) with tensor parallelism. No vLLM dependency at runtime — just PyTorch, Triton, and Flash Attention.
+A standalone, high-performance inference engine supporting **LLMs** (Llama 3.1, Mixtral-8x7B, Qwen2-VL, Qwen3-VL), **text diffusion models** (LLaDA / Fast-dLLM-style decoding), **image classification models** (ConvNeXtV2, EfficientNetV2), **diffusion models** (FLUX.1-dev, SDXL, HunyuanVideo-1.5), **segmentation models** (SAM3.1), audio models (Whisper), and **TTS models** (CosyVoice3) with tensor parallelism. No vLLM dependency at runtime — just PyTorch, Triton, and Flash Attention.
 
 ## Features
 
 - **Llama 3.1** (8B, 70B) with frequency-scaled RoPE
 - **Mixtral-8x7B** with fused Triton MoE grouped-GEMM kernels
 - **LLaDA-8B-Instruct** with vanilla / prefix-cache / dual-cache masked diffusion decoding
+- **ConvNeXtV2** image classification with GRN and large-kernel depthwise blocks
+- **EfficientNetV2** image classification with fused MBConv / EdgeResidual blocks
 - **FLUX.1-dev** diffusion transformer (text-to-image) with Flash Attention
 - **SDXL** (Stable Diffusion XL) UNet-based text-to-image with dual CLIP text encoders
 - **HunyuanVideo-1.5** 3D video diffusion transformer (text-to-video) with dual-stream joint attention, M-RoPE, and Qwen2.5-VL text encoder
@@ -117,6 +119,7 @@ A standalone, high-performance inference engine supporting **LLMs** (Llama 3.1, 
 └── tests/                      # Test suite
     ├── test_bench.py           # Bench module tests (discovery, replacement, kernel and E2E integration)
     ├── bench_vllm.py           # Multi-scenario throughput + latency + alignment benchmark vs vLLM
+    ├── bench_image_cls.py     # Image classification benchmark: kb-nano vs transformers / timm
     ├── bench_vllm_omni.py     # Diffusion (FLUX / HunyuanVideo) and TTS (CosyVoice3) benchmark: kb-nano vs vllm-omni
     ├── bench_diffusers.py     # SDXL diffusion benchmark: kb-nano vs diffusers + torch.compile
     ├── test_sam.py            # SAM3 segmentation benchmark: kb-nano vs facebook/sam3 reference
@@ -196,6 +199,33 @@ python tests/bench_dllm.py \
 
 # kb-nano only
 python tests/bench_dllm.py --ours-backend dual --skip-reference
+```
+
+### Benchmarking vs transformers / timm (Image Classification)
+
+```bash
+# ConvNeXtV2: throughput + latency + logits alignment vs transformers
+python tests/bench_image_cls.py \
+    --model facebook/convnextv2-base-22k-384 \
+    --use-fp16
+
+# EfficientNetV2: throughput + latency + logits alignment vs timm
+python tests/bench_image_cls.py \
+    --model timm/efficientnetv2_rw_m.agc_in1k \
+    --use-fp16
+
+# kb-nano only
+python tests/bench_image_cls.py \
+    --model facebook/convnextv2-base-22k-384 \
+    --use-fp16 --skip-reference
+
+# Save results to a specific directory
+python tests/bench_image_cls.py \
+    --model facebook/convnextv2-base-22k-384 \
+    --use-fp16 --output-dir tests/results/H200/convnextv2-base-22k-384
+python tests/bench_image_cls.py \
+    --model timm/efficientnetv2_rw_m.agc_in1k \
+    --use-fp16 --output-dir tests/results/H200/efficientnetv2_rw_m.agc_in1k
 ```
 
 ### Benchmarking vs vllm-omni (Diffusion)
@@ -424,6 +454,7 @@ Each run is tagged with a `tier` (`agent`, `kernel`, `eval`, or `e2e`) indicatin
 - SGLang kernel library (`sgl-kernel`) — fused RMSNorm, SiLU, RoPE, MoE ops
 - FlashInfer (`flashinfer-python`) — TRTLLM-gen attention kernels on Blackwell+
 - Hugging Face (`transformers`, `huggingface_hub`, `safetensors`)
+- timm (only needed for EfficientNetV2 baseline comparison)
 - aiohttp (for the LLM kernel agent)
 - MLflow (experiment tracking — gracefully skipped if not installed)
 - vLLM (only needed for running comparison tests)
@@ -510,6 +541,29 @@ Run `tests/bench_dllm.py` to reproduce. Model: `GSAI-ML/LLaDA-8B-Instruct`. Prom
 | dual   | official Fast-dLLM dual-cache   | 128/128 | 40.26 | 54.98 | **1.37x** | 1.00 | 1.00 |
 
 Logit alignment stays close to the reference on all three runs (`cosine=0.9999239`).
+
+### ConvNeXtV2 / EfficientNetV2 (Image Classification)
+
+Run `tests/bench_image_cls.py` to reproduce. Synthetic random image tensors are used to isolate model compute. Both engines run in fp16 on H200.
+
+| Model | Reference | Image Size | Ref (img/s) | Ours (img/s) | Ratio | Top1 Match |
+|-------|-----------|-----------:|------------:|-------------:|------:|-----------:|
+| facebook/convnextv2-base-22k-384 | transformers | 384 | 772.46 | 771.44 | **1.00x** | 1.00 |
+| timm/efficientnetv2_rw_m.agc_in1k | timm | 320 | 465.30 | 522.71 | **1.12x** | 1.00 |
+
+Latency ratio (`reference median / ours median`):
+
+| Model | Batch 1 | Batch 8 |
+|-------|--------:|--------:|
+| ConvNeXtV2 | **1.10x** | **1.00x** |
+| EfficientNetV2 | **1.11x** | **1.10x** |
+
+Logit alignment:
+
+| Model | Cosine | MAE |
+|-------|-------:|----:|
+| ConvNeXtV2 | 1.000000 | 0.0 |
+| EfficientNetV2 | 1.000000 | 0.0 |
 
 ### Qwen2-VL / Qwen3-VL (VLM)
 

@@ -17,6 +17,8 @@ class Conv2d(nn.Module):
         kernel_size: int | tuple[int, int],
         stride: int | tuple[int, int] = 1,
         padding: int | tuple[int, int] = 0,
+        dilation: int | tuple[int, int] = 1,
+        groups: int = 1,
         bias: bool = True,
     ):
         super().__init__()
@@ -26,15 +28,20 @@ class Conv2d(nn.Module):
             stride = (stride, stride)
         if isinstance(padding, int):
             padding = (padding, padding)
+        if isinstance(dilation, int):
+            dilation = (dilation, dilation)
 
         self.stride = stride
         self.padding = padding
+        self.dilation = dilation
+        self.groups = groups
 
         self.weight = nn.Parameter(
-            torch.empty(out_channels, in_channels, *kernel_size)
+            torch.empty(out_channels, in_channels // groups, *kernel_size)
         )
         self.bias = nn.Parameter(torch.empty(out_channels)) if bias else None
 
     def forward(self, x: torch.Tensor) -> torch.Tensor:
         return F.conv2d(x, self.weight, self.bias,
-                        stride=self.stride, padding=self.padding)
+                        stride=self.stride, padding=self.padding,
+                        dilation=self.dilation, groups=self.groups)
