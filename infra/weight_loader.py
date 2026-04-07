@@ -101,10 +101,6 @@ _EMBED_WEIGHT_RE = re.compile(
 
 # L1 wrapper nesting: patch_embed.proj.X -> patch_embed.proj.conv.X
 _VISION_PATCH_EMBED_RE = re.compile(r"(visual\.patch_embed\.proj)\.(weight|bias)")
-# L1 wrapper nesting: *.norm1.X / *.norm2.X -> *.norm1.norm.X / *.norm2.norm.X (VisionBlock)
-_VISION_BLOCK_NORM_RE = re.compile(r"(visual\.blocks\.\d+\.norm[12])\.(weight|bias)")
-# L1 wrapper nesting: *.merger*.norm.X -> *.merger*.norm.norm.X (VisionPatchMerger)
-_VISION_MERGER_NORM_RE = re.compile(r"(visual\.(?:merger|deepstack_merger_list\.\d+)\.norm)\.(weight|bias)")
 
 
 # Llama4 fused expert weight patterns
@@ -493,7 +489,7 @@ def load_weights(model, model_path: str, model_type: str = "llama") -> None:
         # Remap learned pos embed nesting (Qwen3-VL)
         if is_qwen3_vl:
             if _VISION_POS_EMBED_RE.match(mapped_name):
-                mapped_name = "visual.pos_embed_interp._embed.weight"
+                mapped_name = "visual.pos_embed_interp._embed.emb.weight"
 
         # Remap vision param names for L1 wrapper nesting
         if is_qwen_vl:
@@ -501,14 +497,6 @@ def load_weights(model, model_path: str, model_type: str = "llama") -> None:
             if m:
                 prefix, wb = m.groups()
                 mapped_name = f"{prefix}.conv.{wb}"
-            m = _VISION_BLOCK_NORM_RE.match(mapped_name)
-            if m:
-                prefix, wb = m.groups()
-                mapped_name = f"{prefix}.norm.{wb}"
-            m = _VISION_MERGER_NORM_RE.match(mapped_name)
-            if m:
-                prefix, wb = m.groups()
-                mapped_name = f"{prefix}.norm.{wb}"
 
         # Handle vision encoder merged QKV weights
         if is_qwen_vl:

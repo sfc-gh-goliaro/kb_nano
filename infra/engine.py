@@ -1989,32 +1989,24 @@ class LlamaEngine:
         vis_cache_map = []
         cache_idx = 0
 
-        img_pv_list = []
+        seq_entries = []
         img_thw_list = []
-        img_seq_idxs = []
         for i, seq in enumerate(seqs):
             if seq.pixel_values is not None:
-                img_pv_list.append(seq.pixel_values.cuda())
+                pv = seq.pixel_values.cuda()
                 thw = seq.image_grid_thw
                 if not isinstance(thw, torch.Tensor):
                     thw = torch.tensor(thw, dtype=torch.long)
                 img_thw_list.append(thw)
-                img_seq_idxs.append(i)
+                pv_shape = list(pv.shape)
+                thw_shape = list(thw.shape)
+                mr._mm_pv = pv
+                mr._mm_thw = thw
+                mr.call("_broadcast_visual", pv_shape, thw_shape)
+                seq_entries.append((i, cache_idx, "image"))
+                cache_idx += 1
+                del pv
 
-        if img_pv_list:
-            batched_pv = torch.cat(img_pv_list, dim=0)
-            batched_thw = torch.cat(img_thw_list, dim=0).cpu()
-            pv_shape = list(batched_pv.shape)
-            thw_shape = list(batched_thw.shape)
-            mr._mm_pv = batched_pv
-            mr._mm_thw = batched_thw
-            mr.call("_broadcast_visual", pv_shape, thw_shape)
-            for si in img_seq_idxs:
-                vis_cache_map.append({"cache_idx": cache_idx, "modality": "image",
-                                      "seq_idx": si})
-            cache_idx += 1
-
-        vid_seq_idxs = []
         for i, seq in enumerate(seqs):
             if seq.video_pixel_values is not None:
                 video_pv = seq.video_pixel_values.cuda()
@@ -2027,35 +2019,31 @@ class LlamaEngine:
                 mr._mm_pv = video_pv
                 mr._mm_thw = grid_thw
                 mr.call("_broadcast_visual", vpv_shape, vthw_shape)
-                vid_seq_idxs.append((i, cache_idx))
+                seq_entries.append((i, cache_idx, "video"))
                 cache_idx += 1
                 del video_pv
 
         per_seq_map = [None] * len(seqs)
-        if img_pv_list:
-            batched_thw_cpu = torch.cat(img_thw_list, dim=0).cpu()
-            sizes = (batched_thw_cpu.prod(-1) // (merge_size ** 2)).tolist()
-            embed_offset = 0
-            thw_offset = 0
-            for si_idx, si in enumerate(img_seq_idxs):
-                seq = seqs[si]
+        for si, ci, modality in seq_entries:
+            seq = seqs[si]
+            if modality == "image":
                 thw_list = seq.image_grid_thw
-                n_items = len(thw_list) if isinstance(thw_list, list) else 1
-                seq_sizes = sizes[thw_offset:thw_offset+n_items]
+                if isinstance(thw_list, list):
+                    thw_t = torch.tensor(thw_list, dtype=torch.long)
+                else:
+                    thw_t = thw_list if isinstance(thw_list, torch.Tensor) else torch.tensor(thw_list, dtype=torch.long)
+                sizes = (thw_t.prod(-1) // (merge_size ** 2)).tolist()
                 per_seq_map[si] = {
-                    "cache_idx": 0,
+                    "cache_idx": ci,
                     "modality": "image",
-                    "embed_start": embed_offset,
-                    "embed_count": sum(seq_sizes),
+                    "embed_start": 0,
+                    "embed_count": sum(sizes),
                 }
-                embed_offset += sum(seq_sizes)
-                thw_offset += n_items
-
-        for si, ci in vid_seq_idxs:
-            per_seq_map[si] = {
-                "cache_idx": ci,
-                "modality": "video",
-            }
+            else:
+                per_seq_map[si] = {
+                    "cache_idx": ci,
+                    "modality": "video",
+                }
 
         return per_seq_map, cache_idx
 
