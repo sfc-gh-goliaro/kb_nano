@@ -1,11 +1,12 @@
 # kb-nano
 
-A standalone, high-performance inference engine supporting **LLMs** (Llama 3.1, Mixtral-8x7B, Qwen2-VL, Qwen3-VL), **diffusion models** (FLUX.1-dev, SDXL, HunyuanVideo-1.5), **segmentation models** (SAM3.1), audio models (Whisper), and **TTS models** (CosyVoice3) with tensor parallelism. No vLLM dependency at runtime — just PyTorch, Triton, and Flash Attention.
+A standalone, high-performance inference engine supporting **LLMs** (Llama 3.1, Mixtral-8x7B, Qwen2-VL, Qwen3-VL), **text diffusion models** (LLaDA / Fast-dLLM-style decoding), **diffusion models** (FLUX.1-dev, SDXL, HunyuanVideo-1.5), **segmentation models** (SAM3.1), audio models (Whisper), and **TTS models** (CosyVoice3) with tensor parallelism. No vLLM dependency at runtime — just PyTorch, Triton, and Flash Attention.
 
 ## Features
 
 - **Llama 3.1** (8B, 70B) with frequency-scaled RoPE
 - **Mixtral-8x7B** with fused Triton MoE grouped-GEMM kernels
+- **LLaDA-8B-Instruct** with vanilla / prefix-cache / dual-cache masked diffusion decoding
 - **FLUX.1-dev** diffusion transformer (text-to-image) with Flash Attention
 - **SDXL** (Stable Diffusion XL) UNet-based text-to-image with dual CLIP text encoders
 - **HunyuanVideo-1.5** 3D video diffusion transformer (text-to-video) with dual-stream joint attention, M-RoPE, and Qwen2.5-VL text encoder
@@ -162,6 +163,39 @@ python tests/test_bench.py
 
 # Bench module unit tests only (no GPU required)
 python tests/test_bench.py --unit-only
+```
+
+### Benchmarking vs HF / Fast-dLLM (Text Diffusion)
+
+```bash
+# Optional: clone the official Fast-dLLM baseline locally
+git clone https://github.com/NVlabs/Fast-dLLM.git third_party/Fast-dLLM
+
+# Extra packages only needed for Fast-dLLM comparison runs
+pip install lm_eval==0.4.8 antlr4-python3-runtime==4.11 math_verify gradio
+
+# Compare kb-nano LLaDA against the official HF implementation
+python tests/bench_dllm.py --reference-backends hf
+
+# Compare our prefix-cache decoding against official Fast-dLLM prefix-cache
+python tests/bench_dllm.py \
+    --ours-backend prefix \
+    --reference-backends fastdllm-prefix
+
+# Compare our dual-cache decoding against official Fast-dLLM dual-cache
+python tests/bench_dllm.py \
+    --ours-backend dual \
+    --reference-backends fastdllm-dual
+
+# Longer rollout
+python tests/bench_dllm.py \
+    --ours-backend dual \
+    --reference-backends fastdllm-dual \
+    --gen-length 128 \
+    --steps 128
+
+# kb-nano only
+python tests/bench_dllm.py --ours-backend dual --skip-reference
 ```
 
 ### Benchmarking vs vllm-omni (Diffusion)
@@ -393,6 +427,7 @@ Each run is tagged with a `tier` (`agent`, `kernel`, `eval`, or `e2e`) indicatin
 - aiohttp (for the LLM kernel agent)
 - MLflow (experiment tracking — gracefully skipped if not installed)
 - vLLM (only needed for running comparison tests)
+- lm_eval, antlr4-python3-runtime, math_verify, gradio (only needed for Fast-dLLM comparison tests)
 - matplotlib (only needed for benchmark plotting)
 
 ### GPU architecture and library compatibility
@@ -463,6 +498,18 @@ Run `tests/bench_vllm.py` to reproduce. Three scenarios per model, 1000 sequence
 | Mixtral-8x7B | 4 | prefill-heavy | 1024/512  | 15,060 | 23,064 | **1.53x** |
 | Mixtral-8x7B | 4 | balanced      |  512/512  | 20,530 | 33,443 | **1.63x** |
 | Mixtral-8x7B | 4 | decode-heavy  |  512/1024 | 24,728 | 37,761 | **1.53x** |
+
+### LLaDA / Fast-dLLM (Text Diffusion)
+
+Run `tests/bench_dllm.py` to reproduce. Model: `GSAI-ML/LLaDA-8B-Instruct`. Prompt batch size `2`, `temperature=0`, `remasking=low_confidence`, block length `32`.
+
+| Ours Backend | Reference | Gen/Steps | Reference (tok/s) | Ours (tok/s) | Ratio | Token Match | Seq Exact |
+|--------------|-----------|----------:|------------------:|-------------:|------:|------------:|----------:|
+| prefix | official Fast-dLLM prefix-cache | 64/64 | 75.13 | 137.13 | **1.83x** | 1.00 | 1.00 |
+| dual   | official Fast-dLLM dual-cache   | 64/64 | 26.38 | 30.46  | **1.15x** | 1.00 | 1.00 |
+| dual   | official Fast-dLLM dual-cache   | 128/128 | 40.26 | 54.98 | **1.37x** | 1.00 | 1.00 |
+
+Logit alignment stays close to the reference on all three runs (`cosine=0.9999239`).
 
 ### Qwen2-VL / Qwen3-VL (VLM)
 
