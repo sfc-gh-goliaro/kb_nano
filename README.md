@@ -509,9 +509,10 @@ Throughput (1000 sequences per scenario, `temperature=0`, `max_model_len=16896`)
 
 | Model | TP | Scenario | Output | vLLM (tok/s) | Ours (tok/s) | Ratio | Avg Match Tokens |
 |-------|---:|----------|-------:|-------------:|-------------:|------:|-----------------:|
-| Qwen3-VL-8B-FP8 | 1 | text-only | 1024 | 22,921 | 19,951 | **0.87x** | 765.3/1024 |
-| Qwen3-VL-8B-FP8 | 1 | image     |  512 | 15,963 | 13,308 | **0.83x** |   73.2/512 |
-| Qwen3-VL-8B-FP8 | 1 | video     |  512 |  4,148 |  8,842 | **2.13x** | 102.1/512 |
+| Qwen3-VL-8B-FP8 | 1 | text-only | 1024 |  8,138 | 10,350 | **1.27x** | 795.6/1024 |
+| Qwen3-VL-8B-FP8 | 1 | image     |  512 |  7,761 |  7,863 | **1.01x** |  16.2/512 |
+| Qwen3-VL-8B-FP8 | 1 | video     |  512 |  2,195 |  6,071 | **2.77x** |  57.7/512 |
+| Qwen3-VL-30B-FP8 (MoE) | 1 | image |  512 | 10,598 |  7,612 | 0.72x |  60.8/512 |
 | Qwen3-VL-235B-FP8 (MoE) | 4 | text-only | 1024 | 8,129 | 8,232 | **1.01x** | 392.1/1024 |
 | Qwen3-VL-235B-FP8 (MoE) | 4 | image     |  512 | 6,564 | 4,691 | 0.71x |  27.9/512 |
 | Qwen3-VL-235B-FP8 (MoE) | 4 | video     |  512 | 1,638 | 4,547 | **2.78x** |  73.7/512 |
@@ -520,8 +521,9 @@ Latency (batch size 1, 128 output tokens, 5 iterations):
 
 | Model | TP | Scenario | vLLM median | Ours median | Ratio |
 |-------|---:|----------|------------:|------------:|------:|
-| Qwen3-VL-8B-FP8 | 1 | single-image | 0.516s | 0.528s | **0.98x** |
-| Qwen3-VL-8B-FP8 | 1 | single-video | 0.557s | 0.541s | **1.03x** |
+| Qwen3-VL-8B-FP8 | 1 | single-image | 0.560s | 0.728s | 0.77x |
+| Qwen3-VL-8B-FP8 | 1 | single-video | 0.724s | 0.731s | 0.99x |
+| Qwen3-VL-30B-FP8 (MoE) | 1 | single-image | 0.682s | 0.777s | 0.88x |
 | Qwen3-VL-235B-FP8 (MoE) | 4 | single-image | 1.431s | 1.801s | 0.79x |
 | Qwen3-VL-235B-FP8 (MoE) | 4 | single-video | 1.854s | 1.746s | **1.06x** |
 
