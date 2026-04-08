@@ -995,15 +995,14 @@ class ModelRunner:
                   deepstack_embeds=None, encoder_outputs=None):
         if is_prefill or self.enforce_eager or input_ids.size(0) > self.graph_bs_list[-1]:
             if inputs_embeds is not None:
-                model = getattr(self, '_eager_model', self.model)
+                model = self.model
                 return model.compute_logits(
                     model(input_ids, positions, inputs_embeds=inputs_embeds,
                           deepstack_embeds=deepstack_embeds)
                 )
             if encoder_outputs is not None:
-                model = getattr(self, '_eager_model', self.model)
-                return model.compute_logits(
-                    model(input_ids, positions, encoder_outputs=encoder_outputs)
+                return self.model.compute_logits(
+                    self.model(input_ids, positions, encoder_outputs=encoder_outputs)
                 )
             return self.model.compute_logits(self.model(input_ids, positions))
         bs = input_ids.size(0)
@@ -1500,6 +1499,12 @@ class ModelRunner:
             seq_deepstack = [] if has_deepstack else None
 
             info = vis_cache_map[seq_idx] if seq_idx < len(vis_cache_map) else None
+            if os.environ.get("KB_DIAG_MM") and self.rank == 0:
+                _dc2 = getattr(self, '_diag_mm_count', 0)
+                if _dc2 < 2:
+                    print(f"  [DIAG_MM seq_idx={seq_idx}] info={info} "
+                          f"chunk_ids_len={len(chunk_ids)} "
+                          f"has_img_tokens={(chunk_ids == image_token_id).sum().item()}")
             if info is not None:
                 vis_out = self._vis_cache[info["cache_idx"]]
                 modality = info["modality"]
@@ -1524,6 +1529,17 @@ class ModelRunner:
 
                 mask = chunk_ids == tok_id
                 if mask.any():
+                    if os.environ.get("KB_DIAG_MM") and self.rank == 0:
+                        _dc = getattr(self, '_diag_mm_count', 0)
+                        if _dc < 2:
+                            n_m = mask.sum().item()
+                            print(f"  [DIAG_MM seq={seq_idx}] vis_out={vis_out.shape} "
+                                  f"modality={modality} "
+                                  f"embeds={embeds.shape} mask_count={n_m} "
+                                  f"vis_norm={embeds.norm().item():.4f} "
+                                  f"text_norm_before={text_embeds.norm().item():.4f} "
+                                  f"chunk_ids_len={len(chunk_ids)} "
+                                  f"ds_features={len(ds_features)}")
                     if prefill_chunk_sizes is not None:
                         full_mask = full_ids == tok_id
                         chunk_vis_start = full_mask[:start].sum().item()
@@ -1573,6 +1589,32 @@ class ModelRunner:
                     deepstack_embeds.append(torch.cat(level_parts, dim=0))
 
         self._vis_cache = []
+
+        if os.environ.get("KB_DIAG_MM") and self.rank == 0:
+            _diag_count = getattr(self, '_diag_mm_count', 0)
+            if _diag_count < 2:
+                print(f"\n[DIAG_MM seq_count={len(prefill_seqs)}] "
+                      f"inputs_embeds={inputs_embeds.shape} "
+                      f"norm={inputs_embeds.norm().item():.4f} "
+                      f"positions={'x'.join(str(d) for d in positions.shape)} "
+                      f"pos_range=[{positions.min().item()},{positions.max().item()}]")
+                if deepstack_embeds:
+                    for i, ds in enumerate(deepstack_embeds):
+                        print(f"  deepstack[{i}]: shape={ds.shape} "
+                              f"norm={ds.norm().item():.4f} "
+                              f"nonzero={ds.abs().sum(dim=-1).gt(0).sum().item()}")
+                # Print per-seq position info
+                offset = 0
+                for si, seq in enumerate(prefill_seqs):
+                    sl = len(seq) if prefill_chunk_sizes is None else prefill_chunk_sizes[si]
+                    seq_pos = positions[:, offset:offset+sl]
+                    print(f"  seq[{si}] len={sl} pos_range=["
+                          f"t:{seq_pos[0].min().item()}-{seq_pos[0].max().item()}, "
+                          f"h:{seq_pos[1].min().item()}-{seq_pos[1].max().item()}, "
+                          f"w:{seq_pos[2].min().item()}-{seq_pos[2].max().item()}] "
+                          f"mrope_delta={getattr(seq, 'mrope_position_delta', 'N/A')}")
+                    offset += sl
+                self._diag_mm_count = _diag_count + 1
 
         result = self.run_model(input_ids, positions, True,
                                 inputs_embeds=inputs_embeds,
@@ -1785,8 +1827,8 @@ class ModelRunner:
         ``capture_cudagraph`` call records the compiled kernels into
         per-batch-size CUDA graphs for decode replay.
 
-        The original model is kept as ``_eager_model`` for prefill calls
-        that use ``inputs_embeds`` (multimodal image embedding injection).
+        The original model is kept as ``_eager_model`` as a reference.
+        All prefill paths (including multimodal) use the compiled model.
         """
         from .compilation import compile_model
         from .passes import configure_post_grad_passes

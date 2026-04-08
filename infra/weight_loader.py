@@ -292,13 +292,11 @@ def _assign_fused_expert(model, key, tensor, scale):
                 s = scale.transpose(1, 2)
                 full_scale_rows = s.shape[1]
                 gate_scale_rows = full_scale_rows // 2
-                up_scale_rows = full_scale_rows - gate_scale_rows
-                gate_rows_per_tp = gate_scale_rows // _tp_size()
-                up_rows_per_tp = up_scale_rows // _tp_size()
-                gate_s = s[:, rank * gate_rows_per_tp:(rank + 1) * gate_rows_per_tp, :]
-                up_s = s[:, gate_scale_rows + rank * up_rows_per_tp:gate_scale_rows + (rank + 1) * up_rows_per_tp, :]
-                scale_param.data[:, :gate_rows_per_tp, :].copy_(gate_s)
-                scale_param.data[:, gate_rows_per_tp:gate_rows_per_tp + up_rows_per_tp, :].copy_(up_s)
+                shard_scale_rows = scale_param.data.shape[1] // 2
+                gate_s = s[:, rank * shard_scale_rows:(rank + 1) * shard_scale_rows, :]
+                up_s = s[:, gate_scale_rows + rank * shard_scale_rows:gate_scale_rows + (rank + 1) * shard_scale_rows, :]
+                scale_param.data[:, :shard_scale_rows, :].copy_(gate_s)
+                scale_param.data[:, shard_scale_rows:2 * shard_scale_rows, :].copy_(up_s)
         else:
             full_inter = weight.shape[2]
             tp_inter = param.shape[2]
@@ -311,9 +309,8 @@ def _assign_fused_expert(model, key, tensor, scale):
                 pass
             else:
                 s = scale.transpose(1, 2)
-                full_scale_cols = s.shape[2]
-                scale_cols_per_tp = full_scale_cols // _tp_size()
-                scale_param.data.copy_(s[:, :, rank * scale_cols_per_tp:(rank + 1) * scale_cols_per_tp])
+                shard_scale_cols = scale_param.data.shape[2]
+                scale_param.data.copy_(s[:, :, rank * shard_scale_cols:(rank + 1) * shard_scale_cols])
     else:
         if is_fp8 and scale is not None:
             tensor = _dequant_fp8_block(tensor, scale, block_size=128)
