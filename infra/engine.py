@@ -995,7 +995,16 @@ class ModelRunner:
                   deepstack_embeds=None, encoder_outputs=None):
         if is_prefill or self.enforce_eager or input_ids.size(0) > self.graph_bs_list[-1]:
             if inputs_embeds is not None:
-                model = self.model
+                # Use the eager (uncompiled) model when inputs_embeds is
+                # provided.  The compiled graph was traced without
+                # inputs_embeds (during CUDA-graph warmup with text-only
+                # input_ids), and skip_all_guards_unsafe prevents Dynamo
+                # from re-tracing — so the compiled graph silently ignores
+                # inputs_embeds and routes through embed_tokens instead.
+                # vLLM avoids this by *always* passing inputs_embeds for VL
+                # models; here we fall back to eager for the multimodal
+                # prefill path, which is not performance-critical.
+                model = getattr(self, '_eager_model', self.model)
                 return model.compute_logits(
                     model(input_ids, positions, inputs_embeds=inputs_embeds,
                           deepstack_embeds=deepstack_embeds)
