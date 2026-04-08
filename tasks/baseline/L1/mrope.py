@@ -154,6 +154,55 @@ class MRotaryEmbedding(nn.Module):
         )
         return query, key
 
+    def forward_native_2d(self, positions, query, key):
+        """Pure PyTorch MRoPE for (3, seq_len) positions -- Inductor-friendly.
+
+        Mirrors the Triton _mrope_kernel: splits q/k into first/second half,
+        gathers cos/sin per T/H/W section, and applies the standard neox-style
+        rotation to all head_dim elements.
+        """
+        cache = self.cos_sin_cache
+        if cache.dtype != query.dtype:
+            cache = cache.to(query.dtype)
+
+        num_tokens = query.shape[0]
+        cos_sin = cache[positions]          # (3, seq_len, head_dim)
+        cos, sin = cos_sin.chunk(2, dim=-1) # each (3, seq_len, head_dim/2)
+
+        if self.mrope_interleaved:
+            cos = self._apply_interleaved(cos)
+            sin = self._apply_interleaved(sin)
+        else:
+            cos = torch.cat(
+                [m[i] for i, m in enumerate(cos.split(self.mrope_section, dim=-1))],
+                dim=-1,
+            )
+            sin = torch.cat(
+                [m[i] for i, m in enumerate(sin.split(self.mrope_section, dim=-1))],
+                dim=-1,
+            )
+        # cos, sin: (seq_len, head_dim/2)
+
+        hd = self.head_dim
+        half = hd // 2
+        q_shape = query.shape
+        k_shape = key.shape
+        q = query.view(num_tokens, -1, hd)
+        k = key.view(num_tokens, -1, hd)
+
+        cos = cos.unsqueeze(1)  # (seq_len, 1, head_dim/2)
+        sin = sin.unsqueeze(1)
+
+        q1 = q[..., :half]
+        q2 = q[..., half:]
+        k1 = k[..., :half]
+        k2 = k[..., half:]
+
+        new_q = torch.cat([q1 * cos - q2 * sin, q2 * cos + q1 * sin], dim=-1)
+        new_k = torch.cat([k1 * cos - k2 * sin, k2 * cos + k1 * sin], dim=-1)
+
+        return new_q.view(q_shape), new_k.view(k_shape)
+
     def forward(self, positions, query, key):
         """Apply M-RoPE in-place.
 
@@ -164,6 +213,9 @@ class MRotaryEmbedding(nn.Module):
         """
         if positions.ndim == 1:
             return self._apply_sgl_rope(positions, query, key)
+
+        if torch.compiler.is_compiling():
+            return self.forward_native_2d(positions, query, key)
 
         # 2D M-RoPE: positions (3, seq_len) with potentially different T/H/W dims (multimodal prefill)
         cache = self.cos_sin_cache

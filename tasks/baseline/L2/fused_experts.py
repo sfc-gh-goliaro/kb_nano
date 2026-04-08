@@ -71,26 +71,35 @@ def _deepgemm_permute(
     expert_offsets = torch.zeros(local_num_experts + 1, dtype=torch.int64, device=device)
     torch.cumsum(aligned_counts, dim=0, out=expert_offsets[1:])
 
-    expert_ids = torch.full((M_sum,), -1, dtype=torch.int32, device=device)
-    for e in range(local_num_experts):
-        start = expert_offsets[e].item()
-        count = expert_num_tokens[e].item()
-        if count > 0:
-            expert_ids[start:start + count] = e
+    # Build expert_ids without host-device sync (.item()) so this is safe
+    # inside CUDA graph capture.  For each position in [0, M_sum), determine
+    # which expert's aligned block it falls into via searchsorted, then check
+    # whether it's within the actual (non-padding) token count.
+    pos_idx = torch.arange(M_sum, device=device, dtype=torch.int64)
+    # searchsorted(offsets, pos, right=True) - 1 gives the expert whose block
+    # contains `pos`.  expert_offsets has E+1 entries (0-based cumsum).
+    expert_for_pos = torch.searchsorted(expert_offsets, pos_idx, right=True) - 1
+    expert_for_pos = expert_for_pos.clamp_(0, local_num_experts - 1)
+    local_pos = pos_idx - expert_offsets[expert_for_pos]
+    valid = local_pos < expert_num_tokens[expert_for_pos]
+    # Use torch.where (element-wise, fixed output size) instead of boolean
+    # indexing which produces data-dependent shapes and breaks CUDA graphs.
+    expert_ids = torch.where(valid, expert_for_pos.to(torch.int32),
+                             torch.tensor(-1, dtype=torch.int32, device=device))
 
     sorted_order = torch.argsort(flat_ids, stable=True)
 
-    within_expert_idx = torch.zeros(num_tokens_total, dtype=torch.int64, device=device)
+    # Compute within-expert indices using only GPU ops.
     sorted_experts = flat_ids[sorted_order]
-    expert_boundaries = torch.cat([
-        torch.tensor([0], device=device),
-        torch.nonzero(sorted_experts[1:] != sorted_experts[:-1]).flatten() + 1,
-        torch.tensor([num_tokens_total], device=device),
-    ])
-    for i in range(expert_boundaries.size(0) - 1):
-        start = expert_boundaries[i].item()
-        end = expert_boundaries[i + 1].item()
-        within_expert_idx[sorted_order[start:end]] = torch.arange(end - start, device=device)
+    rank_in_sorted = torch.arange(num_tokens_total, device=device, dtype=torch.int64)
+    # For each expert, find the first position in sorted order.
+    expert_first = torch.full((local_num_experts,), num_tokens_total,
+                              dtype=torch.int64, device=device)
+    expert_first.scatter_reduce_(0, sorted_experts,
+                                 rank_in_sorted, reduce="amin",
+                                 include_self=False)
+    within_expert_idx = torch.zeros(num_tokens_total, dtype=torch.int64, device=device)
+    within_expert_idx[sorted_order] = rank_in_sorted - expert_first[sorted_experts]
 
     dest_positions = expert_offsets[flat_ids] + within_expert_idx
 
@@ -214,7 +223,9 @@ class FusedExperts(nn.Module):
         N = N2 // 2
         top_k = topk_ids.size(1)
 
-        if use_fp8_w8a8 and _valid_deep_gemm(hidden_states, w13, w2):
+        if (use_fp8_w8a8
+                and _valid_deep_gemm(hidden_states, w13, w2)
+                and not torch.cuda.is_current_stream_capturing()):
             dg_w13_scale = w13_scale_dg if w13_scale_dg is not None else w13_scale
             dg_w2_scale = w2_scale_dg if w2_scale_dg is not None else w2_scale
             return self._forward_deep_gemm(

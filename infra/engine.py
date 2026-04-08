@@ -297,6 +297,9 @@ class ModelRunner:
         )
         self.is_moe = hasattr(self.config, "num_local_experts") or getattr(self.config, "is_moe", False)
         self.is_qwen_vl = hasattr(self.config, "mrope_section")
+        self.is_qwen3_vl = self.is_qwen_vl and hasattr(
+            getattr(self.config, "vision", None), "deepstack_visual_indexes"
+        )
         self.is_whisper = getattr(self.config, "is_encoder_decoder", False)
         if self.is_whisper:
             self.enforce_eager = True
@@ -766,19 +769,19 @@ class ModelRunner:
         slot_mapping = []
         max_bt = 0
         has_block_tables = False
-        use_mrope = self.is_qwen_vl and any(s.mrope_positions is not None for s in seqs)
+        use_mrope = self.is_qwen_vl
         mrope_pos_list = [] if use_mrope else None
 
         for seq in seqs:
             sl = len(seq)
             input_ids.extend(seq.token_ids)
-            if use_mrope and seq.mrope_positions is not None:
+            if use_mrope and getattr(seq, 'mrope_positions', None) is not None:
                 mrope_pos_list.append(seq.mrope_positions)
             else:
                 positions.extend(range(sl))
                 if use_mrope:
                     mrope_pos_list.append(
-                        torch.arange(sl, dtype=torch.int64).unsqueeze(0).expand(3, -1)
+                        torch.arange(sl, dtype=torch.int64, device="cpu").unsqueeze(0).expand(3, -1)
                     )
             cu_seqlens_q.append(cu_seqlens_q[-1] + sl)
             cu_seqlens_k.append(cu_seqlens_k[-1] + sl)
@@ -882,8 +885,7 @@ class ModelRunner:
         slot_mapping = []
         block_size = self.block_size
 
-        use_mrope = self.is_qwen_vl and any(
-            getattr(s, 'mrope_positions', None) is not None for s in prefill_seqs)
+        use_mrope = self.is_qwen_vl
         mrope_pos_list = [] if use_mrope else None
 
         # --- Prefill portion ---
@@ -895,14 +897,14 @@ class ModelRunner:
             start_pos = seq.num_computed_tokens
             chunk_ids = seq.token_ids[start_pos:start_pos + chunk_size]
             input_ids.extend(chunk_ids)
-            if use_mrope and seq.mrope_positions is not None:
+            if use_mrope and getattr(seq, 'mrope_positions', None) is not None:
                 mrope_pos_list.append(seq.mrope_positions[:, start_pos:start_pos + chunk_size])
             else:
                 positions.extend(range(start_pos, start_pos + chunk_size))
                 if use_mrope:
                     mrope_pos_list.append(
                         torch.arange(start_pos, start_pos + chunk_size,
-                                     dtype=torch.int64).unsqueeze(0).expand(3, -1)
+                                     dtype=torch.int64, device="cpu").unsqueeze(0).expand(3, -1)
                     )
 
             kv_len = start_pos + chunk_size
@@ -942,7 +944,7 @@ class ModelRunner:
                 delta = getattr(seq, 'mrope_position_delta', 0)
                 p = pos + delta
                 mrope_pos_list.append(
-                    torch.tensor([[p], [p], [p]], dtype=torch.int64))
+                    torch.tensor([[p], [p], [p]], dtype=torch.int64, device="cpu"))
             else:
                 positions.append(pos)
             dc_cl[i] = len(seq)
@@ -992,23 +994,27 @@ class ModelRunner:
     def run_model(self, input_ids, positions, is_prefill, inputs_embeds=None,
                   deepstack_embeds=None, encoder_outputs=None):
         if is_prefill or self.enforce_eager or input_ids.size(0) > self.graph_bs_list[-1]:
-            model = getattr(self, '_eager_model', self.model)
             if inputs_embeds is not None:
+                model = getattr(self, '_eager_model', self.model)
                 return model.compute_logits(
                     model(input_ids, positions, inputs_embeds=inputs_embeds,
                           deepstack_embeds=deepstack_embeds)
                 )
             if encoder_outputs is not None:
+                model = getattr(self, '_eager_model', self.model)
                 return model.compute_logits(
                     model(input_ids, positions, encoder_outputs=encoder_outputs)
                 )
-            return model.compute_logits(model(input_ids, positions))
+            return self.model.compute_logits(self.model(input_ids, positions))
         bs = input_ids.size(0)
         ctx = get_context()
         graph_bs = self._graph_bs_for_n[bs]
         gv = self.graph_vars
         gv["input_ids"][:bs] = input_ids
-        gv["positions"][:bs] = positions
+        if self.is_qwen_vl:
+            gv["positions"][:, :bs] = positions
+        else:
+            gv["positions"][:bs] = positions
         gv["slot_mapping"][:bs] = ctx.slot_mapping
         if bs < graph_bs:
             gv["slot_mapping"][bs:graph_bs].fill_(-1)
@@ -1049,7 +1055,10 @@ class ModelRunner:
         prev_n = getattr(self, '_prev_decode_n', -1)
 
         gv["input_ids"][:n].copy_(torch.from_numpy(ids_np), non_blocking=True)
-        gv["positions"][:n].copy_(torch.from_numpy(pos_np), non_blocking=True)
+        if self.is_qwen_vl:
+            gv["positions"][:, :n].copy_(torch.from_numpy(pos_np), non_blocking=True)
+        else:
+            gv["positions"][:n].copy_(torch.from_numpy(pos_np), non_blocking=True)
         gv["slot_mapping"][:n].copy_(torch.from_numpy(sm_np), non_blocking=True)
         if n < graph_bs and n != prev_n:
             gv["slot_mapping"][n:graph_bs].fill_(-1)
@@ -1089,7 +1098,10 @@ class ModelRunner:
     def _run_decode_greedy_eager(self, n, ids_np, pos_np, sm_np, cl_np, bt_np):
         """Eager decode path for greedy sampling with TP (no CUDA graphs)."""
         self._eager_input_ids[:n].copy_(torch.from_numpy(ids_np), non_blocking=True)
-        self._eager_positions[:n].copy_(torch.from_numpy(pos_np), non_blocking=True)
+        if self.is_qwen_vl:
+            self._eager_positions[:, :n].copy_(torch.from_numpy(pos_np), non_blocking=True)
+        else:
+            self._eager_positions[:n].copy_(torch.from_numpy(pos_np), non_blocking=True)
         bt_cols = bt_np.shape[1]
         self._eager_slot_mapping[:n].copy_(torch.from_numpy(sm_np), non_blocking=True)
         self._eager_context_lens[:n].copy_(torch.from_numpy(cl_np), non_blocking=True)
@@ -1097,7 +1109,10 @@ class ModelRunner:
             torch.from_numpy(bt_np), non_blocking=True)
 
         input_ids = self._eager_input_ids[:n]
-        positions = self._eager_positions[:n]
+        if self.is_qwen_vl:
+            positions = self._eager_positions[:, :n]
+        else:
+            positions = self._eager_positions[:n]
         slot_mapping = self._eager_slot_mapping[:n]
         context_lens = self._eager_context_lens[:n]
         block_tables = self._eager_block_tables[:n, :bt_cols]
@@ -1144,13 +1159,19 @@ class ModelRunner:
 
         max_num_blocks = (self.max_model_len + BLOCK_SIZE - 1) // BLOCK_SIZE
         self._np_ids = np.empty(max_bs, dtype=np.int64)
-        self._np_pos = np.empty(max_bs, dtype=np.int64)
+        if self.is_qwen_vl:
+            self._np_pos = np.empty((3, max_bs), dtype=np.int64)
+        else:
+            self._np_pos = np.empty(max_bs, dtype=np.int64)
         self._np_sm = np.empty(max_bs, dtype=np.int32)
         self._np_cl = np.empty(max_bs, dtype=np.int32)
         self._np_bt = np.full((max_bs, max_num_blocks), -1, dtype=np.int32)
 
         self._eager_input_ids = torch.zeros(max_bs, dtype=torch.int64, device=dev)
-        self._eager_positions = torch.zeros(max_bs, dtype=torch.int64, device=dev)
+        if self.is_qwen_vl:
+            self._eager_positions = torch.zeros(3, max_bs, dtype=torch.int64, device=dev)
+        else:
+            self._eager_positions = torch.zeros(max_bs, dtype=torch.int64, device=dev)
         self._eager_slot_mapping = torch.zeros(max_bs, dtype=torch.int32, device=dev)
         self._eager_context_lens = torch.zeros(max_bs, dtype=torch.int32, device=dev)
         self._eager_block_tables = torch.zeros(max_bs, max_num_blocks, dtype=torch.int32, device=dev)
@@ -1231,7 +1252,8 @@ class ModelRunner:
                 slen = seq._num_tokens
                 ids_np[i] = seq._last_token
             if self.is_qwen_vl:
-                pos_np[i] = slen - 1 + seq.mrope_position_delta
+                decode_pos = slen - 1 + seq.mrope_position_delta
+                pos_np[:, i] = decode_pos
             else:
                 pos_np[i] = slen - 1
             cl_np[i] = slen
@@ -1249,6 +1271,8 @@ class ModelRunner:
             if blen < max_bt:
                 bt_np[i, blen:max_bt] = -1
         self._prev_max_bt = max_bt
+        if self.is_qwen_vl:
+            return (n, ids_np[:n], pos_np[:, :n], sm_np[:n], cl_np[:n], bt_np[:n, :max_bt])
         return (n, ids_np[:n], pos_np[:n], sm_np[:n], cl_np[:n], bt_np[:n, :max_bt])
 
     def _update_decode_arrays_incremental(self, n, token_ids, decode_seqs):
@@ -1265,7 +1289,10 @@ class ModelRunner:
         bs = BLOCK_SIZE
 
         ids_np[:n] = token_ids
-        pos_np[:n] += 1
+        if self.is_qwen_vl:
+            pos_np[:, :n] += 1
+        else:
+            pos_np[:n] += 1
         cl_np[:n] += 1
         sm_np[:n] += 1
 
@@ -1290,20 +1317,24 @@ class ModelRunner:
                 self._prev_max_bt = max_bt
         else:
             max_bt = self._prev_max_bt
+        if self.is_qwen_vl:
+            return (n, ids_np[:n], pos_np[:, :n], sm_np[:n], cl_np[:n],
+                    bt_np[:n, :max_bt])
         return (n, ids_np[:n], pos_np[:n], sm_np[:n], cl_np[:n],
                 bt_np[:n, :max_bt])
 
     def _write_decode_shm(self, n, ids_np, pos_np, sm_np, cl_np, bt_np):
         """Write decode arrays directly into SHM with binary layout.
         
-        Layout: [n(2)][max_bt(2)][ids(n*8)][pos(n*8)][sm(n*4)][cl(n*4)][bt(n*max_bt*4)]
+        Layout: [n(2)][max_bt(2)][ids(n*8)][pos(n*8 or 3*n*8)][sm(n*4)][cl(n*4)][bt(n*max_bt*4)]
+        pos_np is (n,) for standard models or (3, n) for MRoPE models.
         """
         max_bt = bt_np.shape[1]
         buf = self.shm.buf
         buf[0:2] = n.to_bytes(2, "little")
         buf[2:4] = max_bt.to_bytes(2, "little")
         off = 4
-        for arr in (ids_np, pos_np, sm_np, cl_np, bt_np):
+        for arr in (ids_np, pos_np.ravel(), sm_np, cl_np, bt_np):
             nb = arr.nbytes
             buf[off:off+nb] = arr.tobytes()
             off += nb
@@ -1315,7 +1346,10 @@ class ModelRunner:
         max_bt = int.from_bytes(buf[2:4], "little")
         off = 4
         ids_np = np.frombuffer(buf, dtype=np.int64, count=n, offset=off).copy(); off += n * 8
-        pos_np = np.frombuffer(buf, dtype=np.int64, count=n, offset=off).copy(); off += n * 8
+        if self.is_qwen_vl:
+            pos_np = np.frombuffer(buf, dtype=np.int64, count=3*n, offset=off).copy().reshape(3, n); off += 3 * n * 8
+        else:
+            pos_np = np.frombuffer(buf, dtype=np.int64, count=n, offset=off).copy(); off += n * 8
         sm_np = np.frombuffer(buf, dtype=np.int32, count=n, offset=off).copy(); off += n * 4
         cl_np = np.frombuffer(buf, dtype=np.int32, count=n, offset=off).copy(); off += n * 4
         bt_np = np.frombuffer(buf, dtype=np.int32, count=n*max_bt, offset=off).copy().reshape(n, max_bt)
@@ -1414,6 +1448,29 @@ class ModelRunner:
         input_ids, positions = self.prepare_mixed_batch(
             prefill_seqs, prefill_chunk_sizes, decode_seqs,
         )
+
+        if self.is_qwen_vl and self.world_size > 1:
+            if self.rank == 0:
+                if positions.ndim == 1:
+                    shape_flag = torch.zeros(1, dtype=torch.int64, device="cuda")
+                else:
+                    shape_flag = torch.tensor([positions.shape[0]], dtype=torch.int64, device="cuda")
+                dist.broadcast(shape_flag, src=0)
+                pos_gpu = positions.cuda() if not positions.is_cuda else positions
+                dist.broadcast(pos_gpu, src=0)
+                positions = pos_gpu
+            else:
+                shape_flag = torch.zeros(1, dtype=torch.int64, device="cuda")
+                dist.broadcast(shape_flag, src=0)
+                ndim0 = shape_flag.item()
+                if ndim0 > 0:
+                    n_tokens = input_ids.shape[0]
+                    positions = torch.empty(int(ndim0), n_tokens, dtype=torch.int64, device="cuda")
+                    dist.broadcast(positions, src=0)
+                else:
+                    pos_gpu = positions.cuda() if not positions.is_cuda else positions
+                    dist.broadcast(pos_gpu, src=0)
+                    positions = pos_gpu
         device = input_ids.device
         model = self.model
         embed_fn = model.get_input_embeddings()
@@ -1729,8 +1786,7 @@ class ModelRunner:
         per-batch-size CUDA graphs for decode replay.
 
         The original model is kept as ``_eager_model`` for prefill calls
-        where input shapes may differ from the traced decode path (e.g.
-        MRoPE 2D positions).
+        that use ``inputs_embeds`` (multimodal image embedding injection).
         """
         from .compilation import compile_model
         from .passes import configure_post_grad_passes
@@ -1747,7 +1803,10 @@ class ModelRunner:
         max_bs = self.max_num_seqs
         max_num_blocks = (self.max_model_len + BLOCK_SIZE - 1) // BLOCK_SIZE
         input_ids = torch.zeros(max_bs, dtype=torch.int64)
-        positions = torch.zeros(max_bs, dtype=torch.int64)
+        if self.is_qwen_vl:
+            positions = torch.zeros(3, max_bs + 1, dtype=torch.int64)
+        else:
+            positions = torch.zeros(max_bs, dtype=torch.int64)
         slot_mapping = torch.full((max_bs,), -1, dtype=torch.int32)
         context_lens = torch.zeros(max_bs, dtype=torch.int32)
         block_tables = torch.zeros(max_bs, max_num_blocks, dtype=torch.int32)
@@ -1779,16 +1838,18 @@ class ModelRunner:
                 )
 
                 ids_slice = input_ids[:bs]
-                pos_slice = positions[:bs]
+                if self.is_qwen_vl:
+                    pos_slice = positions[:, :bs]
+                else:
+                    pos_slice = positions[:bs]
 
-                # On the first call, mark batch dimensions as dynamic so
-                # Dynamo traces with symbolic shapes. This mirrors vLLM's
-                # _mark_dynamic_inputs: Dynamo sees SymInt batch dims and
-                # compiles shape-generic code. Guards are dropped so no
-                # re-tracing occurs on subsequent calls.
                 if self._compiled and not self._mark_dynamic_done:
                     torch._dynamo.mark_dynamic(ids_slice, 0)
-                    torch._dynamo.mark_dynamic(pos_slice, 0)
+                    if self.is_qwen_vl:
+                        torch._dynamo.mark_dynamic(pos_slice, 0)
+                        torch._dynamo.mark_dynamic(pos_slice, 1)
+                    else:
+                        torch._dynamo.mark_dynamic(pos_slice, 0)
                     self._mark_dynamic_done = True
 
                 outputs[:bs] = self.model(ids_slice, pos_slice)
@@ -1796,7 +1857,10 @@ class ModelRunner:
                 lm_max_vals[:bs], lm_max_idxs[:bs] = lm_logits[:bs].max(dim=-1)
 
                 with torch.cuda.graph(graph, self.graph_pool):
-                    outputs[:bs] = self.model(input_ids[:bs], positions[:bs])
+                    if self.is_qwen_vl:
+                        outputs[:bs] = self.model(input_ids[:bs], positions[:, :bs])
+                    else:
+                        outputs[:bs] = self.model(input_ids[:bs], positions[:bs])
                     lm_logits[:bs] = lm_head.linear_op(outputs[:bs], lm_head.embedding_op.emb.weight).float()
                     lm_max_vals[:bs], lm_max_idxs[:bs] = lm_logits[:bs].max(dim=-1)
 
@@ -1891,6 +1955,7 @@ class LlamaEngine:
             self.tokenizer.pad_token_id = self.tokenizer.eos_token_id
 
         self.is_qwen_vl = self.model_runner.is_qwen_vl
+        self.is_qwen3_vl = self.model_runner.is_qwen3_vl
         self.is_whisper = self.model_runner.is_whisper
         self.processor = None
         if self.is_qwen_vl:
@@ -2308,6 +2373,8 @@ class LlamaEngine:
 
                 model = self.model_runner.model
                 merge_size = model.config.vision.spatial_merge_size
+                image_token_id = self.model_runner.config.image_token_id
+                video_token_id = self.model_runner.config.video_token_id
                 image_offsets = []
                 video_offsets = []
                 img_idx = 0
@@ -2315,18 +2382,32 @@ class LlamaEngine:
                 i_tok = 0
                 while i_tok < len(ids):
                     tid = ids[i_tok]
-                    if tid == self.model_runner.config.image_token_id and seq.image_grid_thw and img_idx < len(seq.image_grid_thw):
+                    if tid == image_token_id and seq.image_grid_thw and img_idx < len(seq.image_grid_thw):
                         image_offsets.append(i_tok)
                         t, h, w = seq.image_grid_thw[img_idx]
                         num_tokens = t * (h // merge_size) * (w // merge_size)
                         i_tok += num_tokens
                         img_idx += 1
-                    elif tid == self.model_runner.config.video_token_id and seq.video_grid_thw and vid_idx < len(seq.video_grid_thw):
-                        video_offsets.append(i_tok)
+                    elif tid == video_token_id and seq.video_grid_thw and vid_idx < len(seq.video_grid_thw):
                         t, h, w = seq.video_grid_thw[vid_idx]
-                        num_tokens = t * (h // merge_size) * (w // merge_size)
-                        i_tok += num_tokens
-                        vid_idx += 1
+                        tokens_per_frame = (h // merge_size) * (w // merge_size)
+                        if self.is_qwen3_vl:
+                            frames_found = 0
+                            j = i_tok
+                            while j < len(ids) and frames_found < t:
+                                if ids[j] == video_token_id:
+                                    video_offsets.append(j)
+                                    j += tokens_per_frame
+                                    frames_found += 1
+                                else:
+                                    j += 1
+                            vid_idx += 1
+                            i_tok = j
+                        else:
+                            video_offsets.append(i_tok)
+                            num_tokens = t * tokens_per_frame
+                            i_tok += num_tokens
+                            vid_idx += 1
                     else:
                         i_tok += 1
 
