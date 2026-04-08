@@ -12,7 +12,7 @@ import torch
 import torch.nn as nn
 
 from ..L1.openfold3_swiglu import ConditionedTransitionBlock
-from ..L2.openfold3_attention_pair_bias import AttentionPairBias
+from ..L2.openfold3_attention_pair_bias import AttentionPairBias, CrossAttentionPairBias
 
 
 class DiffusionTransformerBlock(nn.Module):
@@ -43,16 +43,30 @@ class DiffusionTransformerBlock(nn.Module):
         inf: float = 1e9,
     ):
         super().__init__()
+        self.use_cross_attention = n_query is not None
 
-        self.attention_pair_bias = AttentionPairBias(
-            c_q=c_a, c_k=c_a, c_v=c_a,
-            c_s=c_s, c_z=c_z,
-            c_hidden=c_hidden,
-            no_heads=no_heads,
-            use_ada_layer_norm=use_ada_layer_norm,
-            gating=True,
-            inf=inf,
-        )
+        if not self.use_cross_attention:
+            self.attention_pair_bias = AttentionPairBias(
+                c_q=c_a, c_k=c_a, c_v=c_a,
+                c_s=c_s, c_z=c_z,
+                c_hidden=c_hidden,
+                no_heads=no_heads,
+                use_ada_layer_norm=use_ada_layer_norm,
+                gating=True,
+                inf=inf,
+            )
+        else:
+            self.attention_pair_bias = CrossAttentionPairBias(
+                c_q=c_a, c_k=c_a, c_v=c_a,
+                c_s=c_s, c_z=c_z,
+                c_hidden=c_hidden,
+                no_heads=no_heads,
+                use_ada_layer_norm=use_ada_layer_norm,
+                n_query=n_query,
+                n_key=n_key,
+                gating=True,
+                inf=inf,
+            )
 
         self.conditioned_transition = ConditionedTransitionBlock(
             c_a=c_a, c_s=c_s, n=n_transition,
@@ -120,12 +134,20 @@ class DiffusionTransformer(nn.Module):
         **kwargs,
     ):
         super().__init__()
+        from ..L1.layer_norm import LayerNorm
+
+        self.use_cross_attention = n_query is not None
+        if self.use_cross_attention:
+            self.layer_norm_z = LayerNorm(c_z, create_offset=False)
+
         self.blocks = nn.ModuleList([
             DiffusionTransformerBlock(
                 c_a=c_a, c_s=c_s, c_z=c_z,
                 c_hidden=c_hidden, no_heads=no_heads,
                 n_transition=n_transition,
                 use_ada_layer_norm=use_ada_layer_norm,
+                n_query=n_query,
+                n_key=n_key,
                 inf=inf,
             )
             for _ in range(no_blocks)
@@ -153,6 +175,9 @@ class DiffusionTransformer(nn.Module):
         Returns:
             [*, N, C_token] updated token embedding
         """
+        if self.use_cross_attention:
+            z = self.layer_norm_z(z)
+
         for block in self.blocks:
             a = block(a=a, s=s, z=z, mask=mask)
 

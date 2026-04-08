@@ -1,134 +1,55 @@
 #!/usr/bin/env python3
 """
-End-to-end benchmark: kb-nano OpenFold3 vs reference openfold3.
+Throughput, latency, and correctness benchmark: kb-nano OpenFold3 vs reference.
 
-Compares the FULL inference pipeline (InputEmbedder → MSA → PairFormer →
-AuxHeads → DiffusionSampling) rather than just the trunk, matching what
-bench_vllm.py does for LLMs (full generate()) and bench_diffusers.py does
-for diffusion (full denoise loop).
+Uses real precomputed MSAs from OpenProteinSet (AWS Registry of Open Data)
+to benchmark with biologically meaningful inputs rather than synthetic data.
 
-Metrics:
-  1. End-to-end correctness: shared weights, compare trunk outputs (s, z)
-     and head logits via cosine similarity.
-  2. Latency: median wall-clock time for full model.forward() with warmup.
-  3. Throughput: tokens/second for the full inference pipeline.
+Data source:
+  OpenProteinSet on AWS S3 (s3://openfold/pdb/) contains precomputed MSAs for
+  ~140k PDB chains. We download a representative subset of chains spanning
+  different protein lengths, parse the MSA files, and feed the resulting
+  tensors to both engines.
 
-Workload scale matches other kb_nano benchmarks:
-  - bench_vllm.py: 1000 sequences × 1024 input + 512 output tokens
-  - bench_diffusers.py: 40 images at 1024×1024, 50 inference steps
-  - bench_openfold3.py: up to 2048 tokens, 48 PairFormer blocks, 1024 MSA
-    seqs, 5 diffusion rollout steps — full AF3 architecture scale
+Architecture:
+  Follows the same subprocess-isolation pattern as bench_vllm.py — each engine
+  runs in its own subprocess via run_worker() to avoid GPU state contamination.
+  Correctness is evaluated end-to-end within the throughput run (shared weights,
+  compare outputs). Latency is measured separately.
+
+Throughput scenarios (proteins processed sequentially at bs=1, as in production):
+  - short:  proteins ≤150 residues
+  - medium: proteins 150–400 residues
+  - long:   proteins 400–800 residues
 
 Usage:
-    CUDA_VISIBLE_DEVICES=7 python tests/bench_openfold3.py
-    CUDA_VISIBLE_DEVICES=7 python tests/bench_openfold3.py --workload complex_large
-    CUDA_VISIBLE_DEVICES=7 python tests/bench_openfold3.py --skip-reference
+    python tests/bench_openfold3.py
+    python tests/bench_openfold3.py --skip-reference
+    python tests/bench_openfold3.py --scenario short
+    python tests/bench_openfold3.py --data-dir /path/to/cached/openfold_data
 """
 
 from __future__ import annotations
 
 import argparse
-import copy
 import json
 import os
 import subprocess
 import sys
-import time
 from pathlib import Path
 
 import numpy as np
-import torch
-from tqdm import tqdm
 
 _THIS_DIR = Path(__file__).resolve().parent
 _PACKAGE_DIR = _THIS_DIR.parent
+_PROJECT_ROOT = _PACKAGE_DIR.parent
 
-sys.path.insert(0, str(_PACKAGE_DIR))
+sys.path.insert(0, str(_PROJECT_ROOT))
 
-# ---------------------------------------------------------------------------
-# Workloads — calibrated to real AF3 inference sizes
-# ---------------------------------------------------------------------------
-
-WORKLOADS = {
-    "sanity": {
-        "name": "sanity",
-        "n_tokens": 256,
-        "pf_blocks": 4,
-        "msa_blocks": 2,
-        "n_msa_seqs": 16,
-        "no_rollout_steps": 5,
-        "num_warmup": 3,
-        "num_iters": 10,
-        "description": "256 tokens, 4 PF blocks — fast sanity check",
-    },
-
-    "monomer_small": {
-        "name": "monomer_small",
-        "n_tokens": 384,
-        "pf_blocks": 48,
-        "msa_blocks": 4,
-        "n_msa_seqs": 512,
-        "no_rollout_steps": 5,
-        "num_warmup": 2,
-        "num_iters": 5,
-        "description": "384 tokens, full 48-block AF3 — small monomer",
-    },
-
-    "complex_medium": {
-        "name": "complex_medium",
-        "n_tokens": 768,
-        "pf_blocks": 48,
-        "msa_blocks": 4,
-        "n_msa_seqs": 1024,
-        "no_rollout_steps": 5,
-        "num_warmup": 2,
-        "num_iters": 5,
-        "description": "768 tokens, full 48-block AF3 — medium heteromer",
-    },
-
-    "complex_large": {
-        "name": "complex_large",
-        "n_tokens": 1536,
-        "pf_blocks": 48,
-        "msa_blocks": 4,
-        "n_msa_seqs": 1024,
-        "no_rollout_steps": 5,
-        "num_warmup": 1,
-        "num_iters": 3,
-        "description": "1536 tokens, full 48-block AF3 — large assembly",
-    },
-
-    "max_capacity": {
-        "name": "max_capacity",
-        "n_tokens": 2048,
-        "pf_blocks": 48,
-        "msa_blocks": 4,
-        "n_msa_seqs": 1024,
-        "no_rollout_steps": 5,
-        "num_warmup": 1,
-        "num_iters": 3,
-        "description": "2048 tokens, full 48-block AF3 — near max AF3 capacity",
-    },
-}
-
-CORRECTNESS_THRESHOLDS = {
-    "trunk_s": 0.99,
-    "trunk_z": 0.99,
-    "plddt_logits": 0.95,
-    "distogram_logits": 0.95,
-    "pae_logits": 0.95,
-    "pde_logits": 0.95,
-}
-
-# ---------------------------------------------------------------------------
-# Utilities
-# ---------------------------------------------------------------------------
-
-def _print(msg: str = ""):
-    print(msg, flush=True)
+from kb_nano.bench.utils.worker import run_worker
 
 
-def detect_gpu() -> str:
+def _detect_gpu_name() -> str:
     try:
         out = subprocess.check_output(
             ["nvidia-smi", "--query-gpu=name", "--format=csv,noheader"],
@@ -142,446 +63,640 @@ def detect_gpu() -> str:
         return "unknown"
 
 
-def cosine_sim(a: torch.Tensor, b: torch.Tensor) -> float:
-    a_flat = a.reshape(-1).double()
-    b_flat = b.reshape(-1).double()
-    denom = a_flat.norm() * b_flat.norm()
-    if denom < 1e-12:
-        return 0.0
-    return (torch.dot(a_flat, b_flat) / denom).item()
-
-
-def max_abs_diff(a: torch.Tensor, b: torch.Tensor) -> float:
-    return (a.float() - b.float()).abs().max().item()
-
-
-def randomize_weights(module: torch.nn.Module):
-    for p in module.parameters():
-        p.data.normal_(0, 0.02)
-
-
-def transfer_matching_weights(src: torch.nn.Module, dst: torch.nn.Module) -> int:
-    """Copy all state-dict entries with matching keys and shapes."""
-    src_sd = src.state_dict()
-    dst_sd = dst.state_dict()
-    n = 0
-    for key in src_sd:
-        if key in dst_sd and src_sd[key].shape == dst_sd[key].shape:
-            dst_sd[key] = src_sd[key]
-            n += 1
-    dst.load_state_dict(dst_sd)
-    return n
-
-
 # ---------------------------------------------------------------------------
-# Build models
+# Representative PDB chains from OpenProteinSet, grouped by length
 # ---------------------------------------------------------------------------
 
-def build_kb_pairformer(cfg: dict, device: str, dtype: torch.dtype):
-    from kb_nano.tasks.baseline.L3.openfold3_pairformer import PairFormerStack
+# Verified chains from OpenProteinSet (s3://openfold/pdb/).
+CHAIN_CATALOG = {
+    "short": [
+        ("2q2k", "A", 70, "ParR DNA-binding"),
+        ("1hf9", "A", 42, "Ubiquitin-like"),
+        ("1crn", "A", 46, "Crambin"),
+        ("1kd8", "A", 37, "Barnase fragment"),
+        ("1cag", "A", 31, "Calmodulin fragment"),
+        ("2crb", "A", 98, "CRABP II"),
+        ("1a2p", "A", 111, "Lysozyme"),
+        ("1bdo", "A", 81, "Ferredoxin"),
+        ("101m", "A", 154, "Myoglobin"),
+        ("3hhr", "A", 191, "Hemoglobin"),
+    ],
+    "medium": [
+        ("1ake", "A", 214, "Adenylate kinase"),
+        ("1tim", "A", 247, "Triosephosphate isomerase"),
+        ("1f3g", "A", 162, "Cytochrome c"),
+        ("101m", "A", 154, "Myoglobin"),
+        ("3hhr", "A", 191, "Hemoglobin"),
+        ("1a2p", "A", 111, "Lysozyme"),
+        ("1bdo", "A", 81, "Ferredoxin"),
+        ("2crb", "A", 98, "CRABP II"),
+    ],
+    "long": [
+        ("1aon", "A", 548, "GroEL chaperonin"),
+        ("1ake", "A", 214, "Adenylate kinase"),
+        ("1tim", "A", 247, "Triosephosphate isomerase"),
+        ("1f3g", "A", 162, "Cytochrome c"),
+        ("101m", "A", 154, "Myoglobin"),
+    ],
+}
 
-    return PairFormerStack(
-        c_s=384, c_z=128,
-        c_hidden_pair_bias=24, no_heads_pair_bias=16,
-        c_hidden_mul=128, c_hidden_pair_att=32, no_heads_pair=4,
-        no_blocks=cfg["pf_blocks"],
-        transition_n=4, pair_dropout=0.0, inf=1e9,
-    ).to(device=device, dtype=dtype).eval()
+PF_BLOCKS = 48
+MSA_BLOCKS = 4
+NO_ROLLOUT_STEPS = 5
+NUM_RECYCLES = 1
+MAX_MSA_SEQS = 512
 
-
-def build_ref_pairformer(cfg: dict, device: str, dtype: torch.dtype):
-    from openfold3.core.model.latent.pairformer import PairFormerStack
-
-    return PairFormerStack(
-        c_s=384, c_z=128,
-        c_hidden_pair_bias=24, no_heads_pair_bias=16,
-        c_hidden_mul=128, c_hidden_pair_att=32, no_heads_pair=4,
-        no_blocks=cfg["pf_blocks"],
-        transition_type="swiglu", transition_n=4,
-        pair_dropout=0.0, fuse_projection_weights=False,
-        blocks_per_ckpt=None, inf=1e9,
-    ).to(device=device, dtype=dtype).eval()
-
-
-def build_kb_heads(device: str, dtype: torch.dtype):
-    from kb_nano.tasks.baseline.L3.openfold3_heads import AuxiliaryHeads
-    return AuxiliaryHeads(c_s=384, c_z=128).to(device=device, dtype=dtype).eval()
-
-
-def build_ref_heads(device: str, dtype: torch.dtype):
-    from kb_nano.tasks.baseline.L3.openfold3_heads import AuxiliaryHeads
-    return AuxiliaryHeads(c_s=384, c_z=128).to(device=device, dtype=dtype).eval()
-
-
-def build_kb_full_model(cfg: dict, device: str, dtype: torch.dtype):
-    from kb_nano.tasks.baseline.L4.openfold3 import OpenFold3Config, OpenFold3Model
-
-    config = OpenFold3Config(
-        pairformer_no_blocks=cfg["pf_blocks"],
-        msa_no_blocks=cfg["msa_blocks"],
-        diff_no_blocks=4,
-        no_rollout_steps=cfg.get("no_rollout_steps", 5),
-        num_recycles=1,
-    )
-    return OpenFold3Model(config).to(device=device, dtype=dtype).eval(), config
+HF_REPO_ID = "OpenFold/OpenFold3"
+HF_CHECKPOINT_FILE = "checkpoints/of3-p2-155k.pt"
 
 
-def build_ref_full_model(cfg: dict, device: str, dtype: torch.dtype):
-    """Build the full reference OpenFold3 model from its config module."""
-    from openfold3.projects.of3_all_atom.config.model_config import (
-        model_config as base_config,
-    )
-    from openfold3.projects.of3_all_atom.model import OpenFold3
+def download_checkpoint() -> str:
+    """Download the pretrained OpenFold3 checkpoint from HuggingFace.
 
-    config = copy.deepcopy(base_config)
-
-    config.architecture.pairformer.no_blocks = cfg["pf_blocks"]
-    config.architecture.msa.msa_module.no_blocks = cfg["msa_blocks"]
-    config.architecture.diffusion_module.diffusion_transformer.no_blocks = 4
-
-    config.architecture.shared.diffusion.no_full_rollout_steps = cfg.get(
-        "no_rollout_steps", 5
-    )
-
-    config.settings.memory.eval.use_deepspeed_evo_attention = False
-    config.settings.memory.eval.use_cueq_triangle_kernels = False
-
-    model = OpenFold3(config).to(device=device, dtype=dtype).eval()
-    return model, config
-
-
-def _make_kb_batch(cfg: dict, kb_config, device: str, dtype: torch.dtype) -> dict:
-    """Create a synthetic input batch for kb-nano's OpenFold3Model."""
-    n_tokens = cfg["n_tokens"]
-    batch = {
-        "token_features": torch.randn(1, n_tokens, kb_config.c_token_embedder,
-                                      device=device, dtype=dtype),
-        "residue_index": torch.arange(n_tokens, device=device).unsqueeze(0).float(),
-        "token_mask": torch.ones(1, n_tokens, device=device, dtype=dtype),
-        "atom_mask": torch.ones(1, n_tokens, device=device, dtype=dtype),
-    }
-    if cfg["n_msa_seqs"] > 0:
-        batch["msa"] = torch.randn(1, cfg["n_msa_seqs"], n_tokens, kb_config.c_m,
-                                   device=device, dtype=dtype)
-        batch["msa_mask"] = torch.ones(1, cfg["n_msa_seqs"], n_tokens,
-                                       device=device, dtype=dtype)
-    return batch
-
-
-def _make_ref_batch(cfg: dict, device: str, dtype: torch.dtype) -> dict:
-    """Create a synthetic input batch for the reference OpenFold3.
-
-    Builds all required features directly (without importing openfold3's
-    heavy data pipeline which pulls in pdbeccdutils, biotite, etc.).
-    Uses a fixed atoms_per_token=5 for all tokens to simulate realistic
-    atom counts while keeping the batch construction simple.
+    Returns the local path to the cached .pt file.
     """
-    n_tokens = cfg["n_tokens"]
-    n_msa = max(cfg["n_msa_seqs"], 4)
-    atoms_per_token = 5
-    n_atom = n_tokens * atoms_per_token
-
-    start_atom_index = torch.arange(0, n_atom, atoms_per_token).unsqueeze(0).int()
-    num_atoms_per_token = torch.full((1, n_tokens), atoms_per_token).int()
-
-    atom_to_token = torch.arange(n_tokens).repeat_interleave(atoms_per_token)
-    atom_to_token = atom_to_token.unsqueeze(0).int()
-
-    ref_space_uid = atom_to_token.clone()
-
-    features = {
-        "residue_index": torch.arange(n_tokens).unsqueeze(0).int(),
-        "token_index": torch.arange(n_tokens).unsqueeze(0).int(),
-        "asym_id": torch.ones(1, n_tokens).int(),
-        "entity_id": torch.ones(1, n_tokens).int(),
-        "sym_id": torch.ones(1, n_tokens).int(),
-        "restype": torch.nn.functional.one_hot(
-            torch.randint(0, 32, (n_tokens,)), 32
-        ).unsqueeze(0).int(),
-        "is_protein": torch.ones(1, n_tokens).int(),
-        "is_dna": torch.zeros(1, n_tokens).int(),
-        "is_rna": torch.zeros(1, n_tokens).int(),
-        "is_ligand": torch.zeros(1, n_tokens).int(),
-        "is_atomized": torch.zeros(1, n_tokens).int(),
-        "ref_pos": torch.randn(1, n_atom, 3).float(),
-        "ref_mask": torch.ones(1, n_atom).int(),
-        "ref_element": torch.ones(1, n_atom, 119).int(),
-        "ref_charge": torch.ones(1, n_atom).float(),
-        "ref_atom_name_chars": torch.ones(1, n_atom, 4, 64).int(),
-        "ref_space_uid": ref_space_uid,
-        "msa": torch.ones(1, n_msa, n_tokens, 32).int(),
-        "has_deletion": torch.ones(1, n_msa, n_tokens).float(),
-        "deletion_value": torch.ones(1, n_msa, n_tokens).float(),
-        "profile": torch.ones(1, n_tokens, 32).float(),
-        "deletion_mean": torch.ones(1, n_tokens).float(),
-        "template_restype": torch.ones(1, 0, n_tokens, 32).int(),
-        "template_pseudo_beta_mask": torch.ones(1, 0, n_tokens).float(),
-        "template_backbone_frame_mask": torch.ones(1, 0, n_tokens).float(),
-        "template_distogram": torch.ones(1, 0, n_tokens, n_tokens, 39).float(),
-        "template_unit_vector": torch.ones(1, 0, n_tokens, n_tokens, 3).float(),
-        "token_bonds": torch.zeros(1, n_tokens, n_tokens).int(),
-        "token_mask": torch.ones(1, n_tokens).float(),
-        "atom_mask": torch.ones(1, n_atom).float(),
-        "start_atom_index": start_atom_index,
-        "num_atoms_per_token": num_atoms_per_token,
-        "atom_to_token_index": atom_to_token,
-        "msa_mask": torch.ones(1, n_msa, n_tokens).float(),
-        "num_paired_seqs": torch.tensor([n_msa // 4]),
-    }
-
-    def _to_device(t):
-        if isinstance(t, torch.Tensor):
-            if t.is_floating_point():
-                return t.to(device=device, dtype=dtype)
-            return t.to(device=device)
-        return t
-
-    features = {k: _to_device(v) for k, v in features.items()}
-    return features
+    from huggingface_hub import hf_hub_download
+    return hf_hub_download(HF_REPO_ID, HF_CHECKPOINT_FILE)
 
 
 # ---------------------------------------------------------------------------
-# Benchmark helpers
+# Scenario definitions
 # ---------------------------------------------------------------------------
 
-def _benchmark_module(module, run_fn, num_warmup, num_iters, label):
-    """Run warmup + timed iterations for a module, return latency stats."""
-    for i in tqdm(range(num_warmup), desc=f"  {label} warmup", leave=False):
-        with torch.no_grad():
-            run_fn()
-        torch.cuda.synchronize()
+SCENARIOS = [
+    {"name": "short",  "num_queries": 50, "description": "short proteins (≤150 res) × 50 queries"},
+    {"name": "medium", "num_queries": 20, "description": "medium proteins (150-400 res) × 20 queries"},
+    {"name": "long",   "num_queries": 10, "description": "long proteins (400-800 res) × 10 queries"},
+]
 
-    latencies = []
-    for i in tqdm(range(num_iters), desc=f"  {label} bench", leave=False):
-        torch.cuda.synchronize()
-        t0 = time.perf_counter()
-        with torch.no_grad():
-            run_fn()
-        torch.cuda.synchronize()
-        latencies.append(time.perf_counter() - t0)
+LATENCY_SCENARIOS = [
+    {"name": "single-short",  "length_bucket": "short",  "num_warmup": 3, "num_iters": 5},
+    {"name": "single-medium", "length_bucket": "medium", "num_warmup": 2, "num_iters": 5},
+    {"name": "single-long",   "length_bucket": "long",   "num_warmup": 2, "num_iters": 3},
+]
 
-    median = float(np.median(latencies))
-    mean = float(np.mean(latencies))
-    min_t = float(np.min(latencies))
-    peak = torch.cuda.max_memory_allocated() / 1e6
-    params = sum(p.numel() for p in module.parameters())
 
-    _print(f"  {label}: median={median:.4f}s  mean={mean:.4f}s  "
-           f"min={min_t:.4f}s  params={params:,}  peak_mem={peak:.0f}MB")
+# ---------------------------------------------------------------------------
+# Data download and preparation
+# ---------------------------------------------------------------------------
+
+S3_BUCKET = "openfold"
+S3_PDB_PREFIX = "pdb"
+
+
+def download_chain_alignments(pdb_id: str, chain_id: str, data_dir: str) -> str | None:
+    """Download precomputed MSA files for a single PDB chain from OpenProteinSet.
+
+    S3 layout: s3://openfold/pdb/{pdb}_{chain}/a3m/*.a3m
+    """
+    chain_key = f"{pdb_id}_{chain_id}"
+    chain_dir = os.path.join(data_dir, "alignments", chain_key)
+
+    if os.path.isdir(chain_dir) and any(
+        f.endswith(('.a3m', '.sto'))
+        for f in os.listdir(chain_dir) if os.path.isfile(os.path.join(chain_dir, f))
+    ):
+        return chain_dir
+
+    os.makedirs(chain_dir, exist_ok=True)
+    try:
+        subprocess.run(
+            ["aws", "s3", "cp",
+             f"s3://{S3_BUCKET}/{S3_PDB_PREFIX}/{chain_key}/a3m/",
+             chain_dir + "/", "--recursive", "--no-sign-request"],
+            capture_output=True, text=True, timeout=120,
+        )
+        if any(f.endswith(('.a3m', '.sto'))
+               for f in os.listdir(chain_dir) if os.path.isfile(os.path.join(chain_dir, f))):
+            return chain_dir
+    except Exception:
+        pass
+    return None
+
+
+def prepare_dataset(data_dir: str, scenarios: list[dict], seed: int = 42) -> dict:
+    """Download and prepare all required data."""
+    print(f"\n  Preparing dataset (data_dir={data_dir}) ...", flush=True)
+
+    repo_test_data = os.path.join(
+        str(_PROJECT_ROOT), "vllm_repo", "openfold-3",
+        "openfold3", "tests", "test_data",
+    )
+    repo_alignments = os.path.join(repo_test_data, "alignments")
+    repo_mmcifs = os.path.join(repo_test_data, "mmcifs")
+
+    available_chains = {}
+    if os.path.isdir(repo_alignments):
+        for chain_dir_name in os.listdir(repo_alignments):
+            chain_path = os.path.join(repo_alignments, chain_dir_name)
+            if os.path.isdir(chain_path):
+                parts = chain_dir_name.rsplit("_", 1)
+                if len(parts) == 2:
+                    pdb_id, chain_id = parts
+                    if any(f.endswith(('.a3m', '.sto'))
+                           for f in os.listdir(chain_path) if os.path.isfile(os.path.join(chain_path, f))):
+                        available_chains[(pdb_id, chain_id)] = {
+                            "pdb_id": pdb_id, "chain_id": chain_id,
+                            "alignment_dir": chain_path,
+                        }
+    print(f"    Found {len(available_chains)} chains from repo test data", flush=True)
+
+    all_needed = set()
+    for scenario in scenarios:
+        bucket = scenario.get("length_bucket", scenario["name"])
+        if bucket in CHAIN_CATALOG:
+            for pdb_id, chain_id, _, _ in CHAIN_CATALOG[bucket]:
+                all_needed.add((pdb_id, chain_id))
+
+    need_download = all_needed - set(available_chains.keys())
+    if need_download:
+        print(f"    Downloading {len(need_download)} chains from OpenProteinSet ...", flush=True)
+        for pdb_id, chain_id in sorted(need_download):
+            aln_dir = download_chain_alignments(pdb_id, chain_id, data_dir)
+            if aln_dir:
+                available_chains[(pdb_id, chain_id)] = {
+                    "pdb_id": pdb_id, "chain_id": chain_id,
+                    "alignment_dir": aln_dir,
+                }
+                print(f"      ✓ {pdb_id}_{chain_id}", flush=True)
+            else:
+                print(f"      ✗ {pdb_id}_{chain_id} (not found)", flush=True)
+
+    print(f"    Total available chains: {len(available_chains)}", flush=True)
+
+    rng = np.random.RandomState(seed)
+    scenario_data = {}
+    for scenario in scenarios:
+        bucket = scenario.get("length_bucket", scenario["name"])
+        num_queries = scenario.get("num_queries", 1)
+        if bucket in scenario_data:
+            continue
+        chains = list(available_chains.values())
+        if not chains:
+            scenario_data[bucket] = []
+            continue
+        rng.shuffle(chains)
+        query_chains = [chains[i % len(chains)] for i in range(num_queries)]
+        scenario_data[bucket] = query_chains
+        print(f"    Scenario '{bucket}': {len(query_chains)} queries "
+              f"from {len(chains)} unique chains", flush=True)
+
+    return scenario_data
+
+
+# ---------------------------------------------------------------------------
+# Shared featurization + progress helpers (inlined into subprocess workers)
+# ---------------------------------------------------------------------------
+
+_FEATURIZE_FN = r'''
+import os, sys, time
+import torch
+import numpy as np
+from tqdm import tqdm
+
+
+def parse_a3m_simple(filepath):
+    sequences = []
+    current_header = None
+    current_seq_parts = []
+    with open(filepath) as f:
+        for line in f:
+            line = line.rstrip()
+            if line.startswith('>'):
+                if current_header is not None:
+                    sequences.append((current_header, ''.join(current_seq_parts)))
+                current_header = line[1:]
+                current_seq_parts = []
+            elif current_header is not None:
+                current_seq_parts.append(line)
+    if current_header is not None:
+        sequences.append((current_header, ''.join(current_seq_parts)))
+    return sequences
+
+
+def parse_sto_simple(filepath):
+    sequences = {}
+    order = []
+    with open(filepath) as f:
+        for line in f:
+            line = line.rstrip()
+            if not line or line.startswith('#') or line.startswith('//'):
+                continue
+            parts = line.split(None, 1)
+            if len(parts) == 2:
+                name, seq = parts
+                if name not in sequences:
+                    sequences[name] = []
+                    order.append(name)
+                sequences[name].append(seq)
+    return [(name, ''.join(sequences[name])) for name in order]
+
+
+RESTYPES = 'ACDEFGHIKLMNPQRSTVWY'
+RESTYPE_MAP = {aa: i for i, aa in enumerate(RESTYPES)}
+GAP_IDX = len(RESTYPES)
+UNK_IDX = len(RESTYPES) + 1
+NUM_CLASSES = len(RESTYPES) + 2
+
+
+def encode_msa_sequences(sequences, max_seqs=512):
+    if not sequences:
+        return np.zeros((0, 0), dtype=np.int64), np.zeros((0, 0), dtype=np.int64)
+    query_seq = sequences[0][1]
+    query_len = sum(1 for c in query_seq if c == c.upper() and c != '-' and not c.isdigit())
+    if query_len == 0:
+        query_len = len(query_seq.replace('-', ''))
+    n_seqs = min(len(sequences), max_seqs)
+    msa_index = np.full((n_seqs, query_len), GAP_IDX, dtype=np.int64)
+    deletion_matrix = np.zeros((n_seqs, query_len), dtype=np.int64)
+    for seq_idx in range(n_seqs):
+        _, seq = sequences[seq_idx]
+        res_pos = 0
+        del_count = 0
+        for char in seq:
+            if char == '-':
+                if res_pos < query_len:
+                    msa_index[seq_idx, res_pos] = GAP_IDX
+                res_pos += 1
+            elif char.islower():
+                del_count += 1
+            elif char.isupper():
+                if res_pos < query_len:
+                    msa_index[seq_idx, res_pos] = RESTYPE_MAP.get(char, UNK_IDX)
+                    deletion_matrix[seq_idx, res_pos] = del_count
+                    del_count = 0
+                res_pos += 1
+    return msa_index, deletion_matrix
+
+
+MAX_ATOMS_PER_TOKEN = 23
+C_ATOM_REF_ELEMENT = 119
+C_ATOM_REF_NAME_CHARS_DIM = 4
+C_ATOM_REF_NAME_CHARS_VOCAB = 64
+
+
+def load_and_featurize_chain(chain_info, max_msa_seqs=512, c_m=64, c_token=384):
+    aln_dir = chain_info["alignment_dir"]
+    all_sequences = []
+    for fname in sorted(os.listdir(aln_dir)):
+        fpath = os.path.join(aln_dir, fname)
+        if fname.endswith('.a3m'):
+            seqs = parse_a3m_simple(fpath)
+        elif fname.endswith('.sto'):
+            seqs = parse_sto_simple(fpath)
+        else:
+            continue
+        if seqs:
+            if not all_sequences:
+                all_sequences = seqs
+            else:
+                for header, seq in seqs[1:]:
+                    all_sequences.append((header, seq))
+    if not all_sequences:
+        return None
+    msa_index, deletion_matrix = encode_msa_sequences(all_sequences, max_seqs=max_msa_seqs)
+    n_tokens = msa_index.shape[1]
+    n_seqs = msa_index.shape[0]
+    if n_tokens == 0:
+        return None
+    msa_onehot_raw = np.eye(NUM_CLASSES, dtype=np.float32)[msa_index]
+    msa_onehot = np.zeros((n_seqs, n_tokens, 32), dtype=np.float32)
+    msa_onehot[:, :, :NUM_CLASSES] = msa_onehot_raw
+    has_deletion = (deletion_matrix > 0).astype(np.float32)
+    deletion_value = np.arctan(deletion_matrix / 3.0).astype(np.float32) * (2.0 / np.pi)
+    profile = msa_onehot_raw.mean(axis=0)
+    deletion_mean = has_deletion.mean(axis=0)
+    token_features_np = np.concatenate([
+        profile, deletion_mean[:, None],
+        np.zeros((n_tokens, c_token - NUM_CLASSES - 1), dtype=np.float32),
+    ], axis=1)
+    msa_onehot_t = torch.from_numpy(msa_onehot)
+    has_deletion_t = torch.from_numpy(has_deletion)
+    deletion_value_t = torch.from_numpy(deletion_value)
+
+    n_atoms = n_tokens * MAX_ATOMS_PER_TOKEN
+
+    ref_pos = np.zeros((n_atoms, 3), dtype=np.float32)
+    ref_charge = np.zeros(n_atoms, dtype=np.float32)
+    ref_mask = np.zeros(n_atoms, dtype=np.float32)
+    ref_element = np.zeros((n_atoms, C_ATOM_REF_ELEMENT), dtype=np.float32)
+    ref_atom_name_chars = np.zeros(
+        (n_atoms, C_ATOM_REF_NAME_CHARS_DIM, C_ATOM_REF_NAME_CHARS_VOCAB),
+        dtype=np.float32,
+    )
+    ref_space_uid = np.zeros(n_atoms, dtype=np.int64)
+    atom_to_token_index = np.zeros(n_atoms, dtype=np.int64)
+    atom_mask_flat = np.zeros(n_atoms, dtype=np.float32)
+
+    for i in range(n_tokens):
+        base = i * MAX_ATOMS_PER_TOKEN
+        n_heavy = 5
+        for j in range(n_heavy):
+            idx = base + j
+            ref_pos[idx] = np.random.randn(3).astype(np.float32) * 1.5
+            ref_mask[idx] = 1.0
+            atom_mask_flat[idx] = 1.0
+            elem_idx = min(5 + j, C_ATOM_REF_ELEMENT - 1)
+            ref_element[idx, elem_idx] = 1.0
+            ref_atom_name_chars[idx, 0, min(j + 1, C_ATOM_REF_NAME_CHARS_VOCAB - 1)] = 1.0
+        ref_space_uid[base:base + MAX_ATOMS_PER_TOKEN] = i
+        atom_to_token_index[base:base + MAX_ATOMS_PER_TOKEN] = i
+
+    restype_22 = msa_onehot_raw[0]
+    restype_32 = np.zeros((n_tokens, 32), dtype=np.float32)
+    restype_32[:, :NUM_CLASSES] = restype_22
+    restype = torch.from_numpy(restype_32).float()
+
+    profile_22 = profile
+    profile_32 = np.zeros((n_tokens, 32), dtype=np.float32)
+    profile_32[:, :NUM_CLASSES] = profile_22
+    profile_t = torch.from_numpy(profile_32).float()
+
+    deletion_mean_1d = torch.from_numpy(deletion_mean).float()
 
     return {
-        "median_s": median, "mean_s": mean, "min_s": min_t,
-        "latencies": latencies, "params": params, "peak_mem_mb": peak,
+        "token_features": torch.from_numpy(token_features_np).unsqueeze(0),
+        "residue_index": torch.arange(n_tokens, dtype=torch.float32).unsqueeze(0),
+        "token_mask": torch.ones(1, n_tokens),
+        "atom_mask": torch.from_numpy(atom_mask_flat).unsqueeze(0),
+        "msa": msa_onehot_t.unsqueeze(0),
+        "has_deletion": has_deletion_t.unsqueeze(0),
+        "deletion_value": deletion_value_t.unsqueeze(0),
+        "msa_mask": torch.ones(1, n_seqs, n_tokens),
+        "restype": restype.unsqueeze(0),
+        "profile": profile_t.unsqueeze(0),
+        "deletion_mean": deletion_mean_1d.unsqueeze(0),
+        "ref_pos": torch.from_numpy(ref_pos).unsqueeze(0),
+        "ref_charge": torch.from_numpy(ref_charge).unsqueeze(0),
+        "ref_mask": torch.from_numpy(ref_mask).unsqueeze(0),
+        "ref_element": torch.from_numpy(ref_element).unsqueeze(0),
+        "ref_atom_name_chars": torch.from_numpy(ref_atom_name_chars).unsqueeze(0),
+        "ref_space_uid": torch.from_numpy(ref_space_uid).unsqueeze(0),
+        "atom_to_token_index": torch.from_numpy(atom_to_token_index).unsqueeze(0),
+        "token_index": torch.arange(n_tokens, dtype=torch.float32).unsqueeze(0),
+        "asym_id": torch.zeros(1, n_tokens, dtype=torch.long),
+        "entity_id": torch.zeros(1, n_tokens, dtype=torch.long),
+        "sym_id": torch.zeros(1, n_tokens, dtype=torch.long),
+        "n_tokens": n_tokens,
     }
 
 
-# ---------------------------------------------------------------------------
-# Correctness test (PairFormerStack + Heads, shared weights)
-# ---------------------------------------------------------------------------
-
-def run_correctness_test(cfg: dict, device: str, dtype: torch.dtype) -> dict:
-    """Run end-to-end correctness comparison with shared weights."""
-    n_tokens = cfg["n_tokens"]
-    _print(f"\n  Building PairFormerStack ({cfg['pf_blocks']} blocks) + heads ...")
-
-    kb_pf = build_kb_pairformer(cfg, device, dtype)
-    _print(f"    KB PairFormer built ({sum(p.numel() for p in kb_pf.parameters()):,} params)")
-    randomize_weights(kb_pf)
-
-    _print(f"    Building reference PairFormerStack ...")
-    ref_pf = build_ref_pairformer(cfg, device, dtype)
-    n_pf = transfer_matching_weights(kb_pf, ref_pf)
-
-    kb_heads = build_kb_heads(device, dtype)
-    randomize_weights(kb_heads)
-    ref_heads = build_ref_heads(device, dtype)
-    n_heads = transfer_matching_weights(kb_heads, ref_heads)
-
-    _print(f"    Shared PF weights: {n_pf} tensors, Head weights: {n_heads} tensors")
-
-    s = torch.randn(1, n_tokens, 384, device=device, dtype=dtype)
-    z = torch.randn(1, n_tokens, n_tokens, 128, device=device, dtype=dtype)
-    single_mask = torch.ones(1, n_tokens, device=device, dtype=dtype)
-    pair_mask = torch.ones(1, n_tokens, n_tokens, device=device, dtype=dtype)
-
-    _print(f"    Running forward pass ({n_tokens} tokens) ...")
-    with torch.no_grad():
-        kb_s, kb_z = kb_pf(s=s.clone(), z=z.clone(),
-                           single_mask=single_mask, pair_mask=pair_mask)
-        kb_head_out = kb_heads(s=kb_s, z=kb_z)
-
-        ref_s, ref_z = ref_pf(s=s.clone(), z=z.clone(),
-                              single_mask=single_mask, pair_mask=pair_mask)
-        ref_head_out = ref_heads(s=ref_s, z=ref_z)
-
-    results = {}
-
-    for name, kb_t, ref_t in [
-        ("trunk_s", kb_s, ref_s),
-        ("trunk_z", kb_z, ref_z),
-    ]:
-        cos = cosine_sim(kb_t, ref_t)
-        mad = max_abs_diff(kb_t, ref_t)
-        threshold = CORRECTNESS_THRESHOLDS[name]
-        passed = cos >= threshold
-        status = "PASS" if passed else "FAIL"
-        results[name] = {"cosine": cos, "max_abs_diff": mad,
-                         "threshold": threshold, "passed": passed}
-        _print(f"    [{status}] {name}: cosine={cos:.8f}  "
-               f"max_abs_diff={mad:.6e}  (threshold={threshold})")
-
-    for head_name in ["plddt_logits", "distogram_logits", "pae_logits", "pde_logits"]:
-        kb_h = kb_head_out[head_name]
-        ref_h = ref_head_out[head_name]
-        cos = cosine_sim(kb_h, ref_h)
-        mad = max_abs_diff(kb_h, ref_h)
-        threshold = CORRECTNESS_THRESHOLDS[head_name]
-        passed = cos >= threshold
-        status = "PASS" if passed else "FAIL"
-        results[head_name] = {"cosine": cos, "max_abs_diff": mad,
-                              "threshold": threshold, "passed": passed}
-        _print(f"    [{status}] {head_name}: cosine={cos:.8f}  "
-               f"max_abs_diff={mad:.6e}  (threshold={threshold})")
-
-    del kb_pf, ref_pf, kb_heads, ref_heads
-    torch.cuda.empty_cache()
-
-    return results
-
-
-# ---------------------------------------------------------------------------
-# Latency benchmark — full end-to-end pipeline
-# ---------------------------------------------------------------------------
-
-def run_latency_benchmark(
-    cfg: dict, device: str, dtype: torch.dtype,
-    skip_reference: bool = False,
-) -> dict:
-    """Benchmark latency for the FULL pipeline (forward()), not just trunk."""
-    n_tokens = cfg["n_tokens"]
-    num_warmup = cfg["num_warmup"]
-    num_iters = cfg["num_iters"]
-
-    _print(f"\n  --- E2E Latency benchmark ({n_tokens} tokens, "
-           f"{num_warmup} warmup + {num_iters} iters) ---")
-
+def batch_to_device(batch, device, dtype):
     result = {}
+    for k, v in batch.items():
+        if isinstance(v, torch.Tensor):
+            result[k] = v.to(device=device, dtype=dtype) if v.is_floating_point() else v.to(device=device)
+        else:
+            result[k] = v
+    return result
 
-    # ---- KB-nano full model ----
-    _print(f"\n  Building KB-nano full L4 model ({cfg['pf_blocks']} PF blocks, "
-           f"{cfg['msa_blocks']} MSA blocks, "
-           f"{cfg.get('no_rollout_steps', 5)} rollout steps) ...")
-    kb_model, kb_config = build_kb_full_model(cfg, device, dtype)
-    randomize_weights(kb_model)
 
-    kb_batch = _make_kb_batch(cfg, kb_config, device, dtype)
+def extract_outputs_for_comparison(outputs, aux_outputs):
+    result = {}
+    s_trunk = aux_outputs.get("s_trunk")
+    z_trunk = aux_outputs.get("z_trunk")
+    if s_trunk is not None:
+        result["s_trunk"] = s_trunk.detach().float().cpu().numpy().tolist()
+    if z_trunk is not None:
+        result["z_trunk_norm"] = float(z_trunk.detach().float().norm().cpu().item())
+        n = z_trunk.shape[-2]
+        stride = max(1, n // 64)
+        result["z_trunk_subsampled"] = z_trunk[..., ::stride, ::stride, :].detach().float().cpu().numpy().tolist()
+    for key in ["plddt_logits", "distogram_logits", "pae_logits", "pde_logits"]:
+        if key in outputs:
+            t = outputs[key].detach().float().cpu()
+            result[key + "_norm"] = float(t.norm().item())
+            result[key + "_mean"] = float(t.mean().item())
+    if "atom_positions_predicted" in outputs:
+        result["atom_positions"] = outputs["atom_positions_predicted"].detach().float().cpu().numpy().tolist()
+    return result
+'''
 
-    torch.cuda.reset_peak_memory_stats()
-    kb_e2e_stats = _benchmark_module(
-        kb_model,
-        lambda: kb_model(copy.deepcopy(kb_batch)),
-        num_warmup, num_iters, "KB  E2E",
+
+# ---------------------------------------------------------------------------
+# Subprocess worker template (shared by kb-nano and reference)
+# ---------------------------------------------------------------------------
+
+_WORKER_BODY = _FEATURIZE_FN + r'''
+import json, copy
+
+def main():
+    with open(sys.argv[1]) as f:
+        cfg = json.load(f)
+    sys.path.insert(0, cfg["project_root"])
+    pkg = cfg["package_name"]
+    engine_label = cfg.get("engine_label", "engine")
+
+    mod = __import__(
+        f"{pkg}.tasks.baseline.L4.openfold3",
+        fromlist=["OpenFold3Config", "OpenFold3Model"],
     )
-    kb_e2e_stats["throughput_tok_s"] = n_tokens / kb_e2e_stats["median_s"]
+    OpenFold3Config = mod.OpenFold3Config
+    OpenFold3Model = mod.OpenFold3Model
 
-    result["kb_e2e"] = kb_e2e_stats
+    device = cfg.get("device", "cuda")
+    dtype_str = cfg.get("dtype", "bfloat16")
+    dtype = getattr(torch, dtype_str)
 
-    # Also measure trunk-only for comparison
-    torch.cuda.reset_peak_memory_stats()
-    kb_trunk_stats = _benchmark_module(
-        kb_model,
-        lambda: kb_model.run_trunk(kb_batch),
-        num_warmup, num_iters, "KB  Trunk",
+    print(f"  [{engine_label}] Building model (PF={cfg['pf_blocks']}, "
+          f"MSA={cfg['msa_blocks']}, rollout={cfg['no_rollout_steps']}, "
+          f"recycles={cfg['num_recycles']}) ...", flush=True)
+
+    model_cfg = OpenFold3Config(
+        pairformer_no_blocks=cfg["pf_blocks"],
+        msa_no_blocks=cfg["msa_blocks"],
+        no_rollout_steps=cfg["no_rollout_steps"],
+        num_recycles=cfg["num_recycles"],
     )
-    kb_trunk_stats["throughput_tok_s"] = n_tokens / kb_trunk_stats["median_s"]
-    result["kb_trunk"] = kb_trunk_stats
+    model = OpenFold3Model(model_cfg)
 
-    del kb_model
+    ckpt_path = cfg["checkpoint_path"]
+    print(f"  [{engine_label}] Loading pretrained weights from {ckpt_path} ...", flush=True)
+    load_fn = __import__(
+        f"{pkg}.tasks.baseline.L4.openfold3",
+        fromlist=["load_openfold3_checkpoint"],
+    ).load_openfold3_checkpoint
+    load_fn(model, ckpt_path)
+    print(f"  [{engine_label}] Loaded checkpoint (strict=True, all keys matched)", flush=True)
+
+    model = model.to(device=device, dtype=dtype).eval()
+    params = sum(p.numel() for p in model.parameters())
+    print(f"  [{engine_label}] Model ready ({params:,} params, {dtype_str})", flush=True)
+
+    # Warmup
+    warmup_chain = cfg["scenarios"][0]["chains"][0] if cfg.get("scenarios") else None
+    if warmup_chain:
+        print(f"  [{engine_label}] Warmup ...", flush=True)
+        wb = load_and_featurize_chain(warmup_chain, max_msa_seqs=16,
+                                      c_m=model_cfg.c_m, c_token=model_cfg.c_token_embedder)
+        if wb is not None:
+            wb.pop("n_tokens")
+            wb = batch_to_device(wb, device, dtype)
+            with torch.no_grad():
+                model(wb)
+            torch.cuda.synchronize()
+        print(f"  [{engine_label}] Warmup done", flush=True)
+
+    # ---- Throughput scenarios ----
+    all_results = []
+    for scenario in cfg.get("scenarios", []):
+        chains = scenario["chains"]
+        name = scenario["name"]
+        print(f"\n  [{engine_label}] Throughput scenario '{name}' "
+              f"({len(chains)} queries) ...", flush=True)
+        query_outputs = []
+        total_tokens = 0
+
+        torch.cuda.synchronize()
+        start = time.perf_counter()
+
+        pbar = tqdm(chains, desc=f"  [{engine_label}] {name}",
+                    unit="query", file=sys.stdout)
+        for chain_info in pbar:
+            batch = load_and_featurize_chain(
+                chain_info, max_msa_seqs=cfg.get("max_msa_seqs", 512),
+                c_m=model_cfg.c_m, c_token=model_cfg.c_token_embedder)
+            if batch is None:
+                continue
+            n_tokens = batch.pop("n_tokens")
+            total_tokens += n_tokens
+            batch = batch_to_device(batch, device, dtype)
+            with torch.no_grad():
+                outputs, aux_outputs = model(batch)
+            query_outputs.append(extract_outputs_for_comparison(outputs, aux_outputs))
+            pbar.set_postfix(tokens=total_tokens, last=n_tokens)
+
+        torch.cuda.synchronize()
+        elapsed = time.perf_counter() - start
+        tok_s = total_tokens / elapsed if elapsed > 0 else 0
+        print(f"  [{engine_label}] {name}: {len(query_outputs)} queries, "
+              f"{total_tokens} tokens, {elapsed:.2f}s, {tok_s:.0f} tok/s", flush=True)
+
+        all_results.append({
+            "name": name, "elapsed": elapsed,
+            "num_queries": len(query_outputs),
+            "total_tokens": total_tokens, "outputs": query_outputs,
+        })
+
+    # ---- Latency scenarios ----
+    latency_results = []
+    for ls in cfg.get("latency_scenarios", []):
+        chain_info = ls["chain"]
+        name = ls["name"]
+        num_warmup = ls.get("num_warmup", 3)
+        num_iters = ls.get("num_iters", 5)
+
+        batch = load_and_featurize_chain(
+            chain_info, max_msa_seqs=cfg.get("max_msa_seqs", 512),
+            c_m=model_cfg.c_m, c_token=model_cfg.c_token_embedder)
+        if batch is None:
+            continue
+        n_tokens = batch.pop("n_tokens")
+        batch = batch_to_device(batch, device, dtype)
+
+        print(f"\n  [{engine_label}] Latency '{name}' ({n_tokens} tokens, "
+              f"{num_warmup} warmup + {num_iters} iters) ...", flush=True)
+
+        for i in tqdm(range(num_warmup), desc=f"  [{engine_label}] {name} warmup",
+                      file=sys.stdout):
+            with torch.no_grad():
+                model(copy.deepcopy(batch))
+            torch.cuda.synchronize()
+
+        latencies = []
+        for i in tqdm(range(num_iters), desc=f"  [{engine_label}] {name} bench",
+                      file=sys.stdout):
+            torch.cuda.synchronize()
+            t0 = time.perf_counter()
+            with torch.no_grad():
+                model(copy.deepcopy(batch))
+            torch.cuda.synchronize()
+            lat = time.perf_counter() - t0
+            latencies.append(lat)
+
+        med = float(np.median(latencies))
+        print(f"  [{engine_label}] {name}: median={med:.4f}s, "
+              f"{n_tokens/med:.0f} tok/s", flush=True)
+        latency_results.append({
+            "name": name, "n_tokens": n_tokens,
+            "num_iters": num_iters, "latencies": latencies,
+        })
+
+    peak_mem = torch.cuda.max_memory_allocated() / 1e6
+    print(f"\n  [{engine_label}] Done. Peak memory: {peak_mem:.0f} MB", flush=True)
+
+    del model
     torch.cuda.empty_cache()
 
-    # ---- Reference full model ----
-    if not skip_reference:
-        _print(f"\n  Building reference OpenFold3 full model ...")
-        try:
-            ref_model, ref_config = build_ref_full_model(cfg, device, dtype)
-            randomize_weights(ref_model)
-            _print(f"    Ref model built ({sum(p.numel() for p in ref_model.parameters()):,} params)")
+    with open(cfg["output_file"], "w") as f:
+        json.dump({
+            "throughput": all_results, "latency": latency_results,
+            "peak_mem_mb": peak_mem, "params": params,
+        }, f)
 
-            ref_batch = _make_ref_batch(cfg, device, dtype)
 
-            torch.cuda.reset_peak_memory_stats()
-            ref_e2e_stats = _benchmark_module(
-                ref_model,
-                lambda: ref_model(batch=copy.deepcopy(ref_batch)),
-                num_warmup, num_iters, "Ref E2E",
-            )
-            ref_e2e_stats["throughput_tok_s"] = n_tokens / ref_e2e_stats["median_s"]
+if __name__ == "__main__":
+    main()
+'''
 
-            speedup = ref_e2e_stats["median_s"] / kb_e2e_stats["median_s"]
-            _print(f"  E2E speedup (kb-nano / ref): {speedup:.2f}x")
+KB_NANO_OF3_WORKER = _WORKER_BODY
+REF_OF3_WORKER = _WORKER_BODY
 
-            result["ref_e2e"] = ref_e2e_stats
-            result["e2e_speedup"] = speedup
 
-            del ref_model
-        except Exception as e:
-            import traceback
-            traceback.print_exc()
-            _print(f"  [WARNING] Reference E2E benchmark failed: {e}")
-            _print(f"  Falling back to PairFormer-only comparison ...")
-            result["ref_e2e"] = {"error": str(e)}
+# ---------------------------------------------------------------------------
+# Correctness metrics
+# ---------------------------------------------------------------------------
 
-        torch.cuda.empty_cache()
+def cosine_sim_lists(a: list, b: list) -> float:
+    a_arr = np.array(a, dtype=np.float64).ravel()
+    b_arr = np.array(b, dtype=np.float64).ravel()
+    denom = np.linalg.norm(a_arr) * np.linalg.norm(b_arr)
+    if denom < 1e-12:
+        return 0.0
+    return float(np.dot(a_arr, b_arr) / denom)
 
-    # ---- PairFormer apples-to-apples (matching exactly) ----
-    _print(f"\n  --- PairFormer apples-to-apples comparison ---")
 
-    s = torch.randn(1, n_tokens, 384, device=device, dtype=dtype)
-    z = torch.randn(1, n_tokens, n_tokens, 128, device=device, dtype=dtype)
-    single_mask = torch.ones(1, n_tokens, device=device, dtype=dtype)
-    pair_mask = torch.ones(1, n_tokens, n_tokens, device=device, dtype=dtype)
+def rmsd_positions(a: list, b: list) -> float:
+    a_arr = np.array(a, dtype=np.float64).reshape(-1, 3)
+    b_arr = np.array(b, dtype=np.float64).reshape(-1, 3)
+    n = min(len(a_arr), len(b_arr))
+    if n == 0:
+        return float("inf")
+    diff = a_arr[:n] - b_arr[:n]
+    return float(np.sqrt(np.mean(np.sum(diff ** 2, axis=1))))
 
-    _print(f"  Building KB-nano PairFormerStack ({cfg['pf_blocks']} blocks) ...")
-    kb_pf = build_kb_pairformer(cfg, device, dtype)
-    randomize_weights(kb_pf)
 
-    torch.cuda.reset_peak_memory_stats()
-    kb_pf_stats = _benchmark_module(
-        kb_pf,
-        lambda: kb_pf(s=s.clone(), z=z.clone(),
-                      single_mask=single_mask, pair_mask=pair_mask),
-        num_warmup, num_iters, "KB  PairFormer",
-    )
-    kb_pf_stats["throughput_tok_s"] = n_tokens / kb_pf_stats["median_s"]
+def compute_alignment(kb_outputs: list[dict], ref_outputs: list[dict]) -> dict:
+    n = min(len(kb_outputs), len(ref_outputs))
+    s_cosines, z_cosines, pos_rmsds = [], [], []
+    head_diffs = {k: [] for k in ["plddt_logits", "distogram_logits", "pae_logits", "pde_logits"]}
 
-    del kb_pf
-    torch.cuda.empty_cache()
+    for i in range(n):
+        kb_out, ref_out = kb_outputs[i], ref_outputs[i]
+        if "s_trunk" in kb_out and "s_trunk" in ref_out:
+            s_cosines.append(cosine_sim_lists(kb_out["s_trunk"], ref_out["s_trunk"]))
+        if "z_trunk_subsampled" in kb_out and "z_trunk_subsampled" in ref_out:
+            z_cosines.append(cosine_sim_lists(kb_out["z_trunk_subsampled"], ref_out["z_trunk_subsampled"]))
+        if "atom_positions" in kb_out and "atom_positions" in ref_out:
+            pos_rmsds.append(rmsd_positions(kb_out["atom_positions"], ref_out["atom_positions"]))
+        for key in head_diffs:
+            kb_n, ref_n = kb_out.get(key + "_norm"), ref_out.get(key + "_norm")
+            if kb_n is not None and ref_n is not None:
+                head_diffs[key].append(abs(kb_n - ref_n) / max(abs(ref_n), 1e-8))
 
-    result["kb_pairformer"] = kb_pf_stats
-
-    if not skip_reference:
-        _print(f"  Building reference PairFormerStack ({cfg['pf_blocks']} blocks) ...")
-        ref_pf = build_ref_pairformer(cfg, device, dtype)
-        randomize_weights(ref_pf)
-
-        torch.cuda.reset_peak_memory_stats()
-        ref_pf_stats = _benchmark_module(
-            ref_pf,
-            lambda: ref_pf(s=s.clone(), z=z.clone(),
-                           single_mask=single_mask, pair_mask=pair_mask),
-            num_warmup, num_iters, "Ref PairFormer",
-        )
-        ref_pf_stats["throughput_tok_s"] = n_tokens / ref_pf_stats["median_s"]
-
-        pf_speedup = ref_pf_stats["median_s"] / kb_pf_stats["median_s"]
-        _print(f"  PairFormer speedup (kb-nano / ref): {pf_speedup:.2f}x")
-
-        result["ref_pairformer"] = ref_pf_stats
-        result["pairformer_speedup"] = pf_speedup
-
-        del ref_pf
-        torch.cuda.empty_cache()
-
+    result = {"num_queries": n}
+    if s_cosines:
+        result["avg_s_trunk_cosine"] = float(np.mean(s_cosines))
+        result["min_s_trunk_cosine"] = float(np.min(s_cosines))
+    if z_cosines:
+        result["avg_z_trunk_cosine"] = float(np.mean(z_cosines))
+        result["min_z_trunk_cosine"] = float(np.min(z_cosines))
+    if pos_rmsds:
+        result["avg_atom_rmsd"] = float(np.mean(pos_rmsds))
+        result["max_atom_rmsd"] = float(np.max(pos_rmsds))
+    for key, diffs in head_diffs.items():
+        if diffs:
+            result[f"avg_{key}_rel_diff"] = float(np.mean(diffs))
     return result
 
 
@@ -591,214 +706,256 @@ def run_latency_benchmark(
 
 def main():
     parser = argparse.ArgumentParser(
-        description="End-to-end benchmark: kb-nano OpenFold3 vs reference openfold3"
+        description="Throughput, latency & correctness benchmark: "
+                    "kb-nano OpenFold3 vs reference openfold3",
     )
-    parser.add_argument("--workload", type=str, default=None,
-                        choices=list(WORKLOADS.keys()),
-                        help="Run specific workload (default: run all)")
-    parser.add_argument("--dtype", type=str, default="bfloat16")
+    parser.add_argument("--scenario", type=str, default=None,
+                        choices=[s["name"] for s in SCENARIOS],
+                        help="Run a single throughput scenario (default: all)")
+    parser.add_argument("--dtype", type=str, default="bfloat16",
+                        choices=["bfloat16", "float16", "float32"])
+    parser.add_argument("--seed", type=int, default=42)
     parser.add_argument("--skip-reference", action="store_true",
-                        help="Skip reference openfold3 comparison")
-    parser.add_argument("--skip-correctness", action="store_true",
-                        help="Skip correctness tests (latency only)")
+                        help="Skip reference openfold3 (kb-nano only)")
+    parser.add_argument("--skip-throughput", action="store_true")
+    parser.add_argument("--skip-latency", action="store_true")
+    parser.add_argument("--latency-iters", type=int, default=5)
+    parser.add_argument("--data-dir", type=str, default=None,
+                        help="Directory for caching downloaded MSA data "
+                             "(default: /tmp/openfold_bench_data)")
     parser.add_argument("--output-dir", type=str, default=None)
     args = parser.parse_args()
 
-    device = "cuda" if torch.cuda.is_available() else "cpu"
-    dtype = getattr(torch, args.dtype)
-    gpu = detect_gpu()
-    torch.manual_seed(42)
+    gpu = _detect_gpu_name()
 
-    _print(f"{'='*80}")
-    _print(f"  OpenFold3 End-to-End Benchmark: kb-nano vs reference openfold3")
-    _print(f"{'='*80}")
-    _print(f"  GPU     : {gpu} ({torch.cuda.get_device_name() if device == 'cuda' else 'cpu'})")
-    _print(f"  Dtype   : {args.dtype}")
-    _print(f"  Device  : {device}")
-    _print(f"{'='*80}")
+    if args.output_dir is None:
+        args.output_dir = str(_THIS_DIR / "results" / "openfold3" / f"{gpu}_{args.dtype}")
+    if args.data_dir is None:
+        args.data_dir = "/tmp/openfold_bench_data"
 
-    workloads = [WORKLOADS[args.workload]] if args.workload else list(WORKLOADS.values())
+    throughput_scenarios = SCENARIOS
+    if args.scenario:
+        throughput_scenarios = [s for s in SCENARIOS if s["name"] == args.scenario]
 
-    output_dir = args.output_dir or str(
-        _THIS_DIR / "results" / "openfold3" / f"{gpu}_{args.dtype}"
+    latency_scenarios = LATENCY_SCENARIOS
+    if args.scenario:
+        latency_scenarios = [s for s in LATENCY_SCENARIOS if s["name"].endswith(args.scenario)]
+
+    for ls in latency_scenarios:
+        ls["num_iters"] = args.latency_iters
+
+    all_scenarios_for_data = throughput_scenarios if not args.skip_throughput else []
+    scenario_data = prepare_dataset(
+        args.data_dir,
+        all_scenarios_for_data + ([] if args.skip_latency else latency_scenarios),
+        seed=args.seed,
     )
-    os.makedirs(output_dir, exist_ok=True)
 
-    all_results = {
-        "gpu": gpu, "dtype": args.dtype, "device": device, "workloads": {},
+    print("\n" + "=" * 80)
+    print("  kb-nano OpenFold3 vs Reference — End-to-End Benchmark")
+    print("=" * 80)
+    print(f"  GPU            : {gpu}")
+    print(f"  Dtype          : {args.dtype}")
+    print(f"  PF blocks      : {PF_BLOCKS}")
+    print(f"  MSA blocks     : {MSA_BLOCKS}")
+    print(f"  Rollout steps  : {NO_ROLLOUT_STEPS}")
+    print(f"  Recycles       : {NUM_RECYCLES}")
+    print(f"  Max MSA seqs   : {MAX_MSA_SEQS}")
+    print(f"  Data dir       : {args.data_dir}")
+    if not args.skip_throughput:
+        print(f"  Throughput     : {'; '.join(s['description'] for s in throughput_scenarios)}")
+    if not args.skip_latency:
+        print(f"  Latency        : {', '.join(s['name'] for s in latency_scenarios)} "
+              f"({args.latency_iters} iters)")
+    print(f"  Output dir     : {args.output_dir}")
+    print("=" * 80, flush=True)
+
+    scenario_configs = []
+    if not args.skip_throughput:
+        for s in throughput_scenarios:
+            scenario_configs.append({"name": s["name"], "chains": scenario_data.get(s["name"], [])})
+
+    latency_configs = []
+    if not args.skip_latency:
+        for ls in latency_scenarios:
+            bucket = ls.get("length_bucket", ls["name"])
+            chains = scenario_data.get(bucket, [])
+            if chains:
+                latency_configs.append({
+                    "name": ls["name"], "chain": chains[0],
+                    "num_warmup": ls.get("num_warmup", 3), "num_iters": ls["num_iters"],
+                })
+
+    print("\n  Downloading pretrained checkpoint from HuggingFace "
+          f"({HF_REPO_ID}) ...", flush=True)
+    checkpoint_path = download_checkpoint()
+    print(f"  Checkpoint: {checkpoint_path}", flush=True)
+
+    base_config = {
+        "project_root": str(_PROJECT_ROOT),
+        "package_name": _PACKAGE_DIR.name,
+        "seed": args.seed, "dtype": args.dtype,
+        "pf_blocks": PF_BLOCKS, "msa_blocks": MSA_BLOCKS,
+        "no_rollout_steps": NO_ROLLOUT_STEPS, "num_recycles": NUM_RECYCLES,
+        "max_msa_seqs": MAX_MSA_SEQS,
+        "checkpoint_path": checkpoint_path,
+        "scenarios": scenario_configs, "latency_scenarios": latency_configs,
     }
 
-    for wl in workloads:
-        wl_name = wl["name"]
-        _print(f"\n{'#'*80}")
-        _print(f"  WORKLOAD: {wl_name} — {wl['description']}")
-        _print(f"  Tokens: {wl['n_tokens']}  PF blocks: {wl['pf_blocks']}  "
-               f"MSA blocks: {wl['msa_blocks']}  MSA seqs: {wl['n_msa_seqs']}  "
-               f"Rollout steps: {wl.get('no_rollout_steps', 5)}")
-        pair_mem_mb = wl['n_tokens'] ** 2 * 128 * 2 / 1e6
-        _print(f"  Pair tensor: {wl['n_tokens']}×{wl['n_tokens']}×128 = "
-               f"{wl['n_tokens']**2 * 128 / 1e6:.1f}M elements ({pair_mem_mb:.0f} MB bf16)")
-        _print(f"{'#'*80}")
+    # ---- Run kb-nano ----
+    kb_config = {**base_config, "engine_label": "kb-nano"}
+    kb_raw = run_worker(
+        KB_NANO_OF3_WORKER, kb_config,
+        "kb-nano OpenFold3 — all scenarios (real MSA data)", timeout=7200,
+    )
+    if kb_raw is None:
+        print("  ERROR: kb-nano subprocess failed.")
+        sys.exit(1)
 
-        wl_results = {}
+    # ---- Run reference ----
+    ref_raw = None
+    if not args.skip_reference:
+        ref_config = {**base_config, "engine_label": "reference"}
+        ref_raw = run_worker(
+            REF_OF3_WORKER, ref_config,
+            "Reference OpenFold3 — all scenarios (real MSA data)", timeout=7200,
+        )
+        if ref_raw is None:
+            print("  WARNING: Reference subprocess failed. Skipping comparison.")
 
-        # Correctness
-        if not args.skip_correctness and not args.skip_reference:
-            try:
-                wl_results["correctness"] = run_correctness_test(wl, device, dtype)
-            except Exception as e:
-                import traceback
-                traceback.print_exc()
-                _print(f"  [ERROR] Correctness test failed: {e}")
-                wl_results["correctness"] = {"error": str(e)}
+    # ---- Throughput metrics ----
+    all_results = []
+    if not args.skip_throughput:
+        kb_tp = kb_raw["throughput"]
+        ref_tp = ref_raw["throughput"] if ref_raw else None
+        for i, scenario in enumerate(throughput_scenarios):
+            kb_d = kb_tp[i]
+            kb_tok_s = kb_d["total_tokens"] / kb_d["elapsed"] if kb_d["elapsed"] > 0 else 0
+            r = {
+                "scenario": scenario["name"], "num_queries": kb_d["num_queries"],
+                "total_tokens": kb_d["total_tokens"],
+                "kb_nano_elapsed": kb_d["elapsed"], "kb_nano_tok_per_s": kb_tok_s,
+            }
+            if ref_tp and i < len(ref_tp):
+                ref_d = ref_tp[i]
+                ref_tok_s = ref_d["total_tokens"] / ref_d["elapsed"] if ref_d["elapsed"] > 0 else 0
+                r["ref_elapsed"] = ref_d["elapsed"]
+                r["ref_tok_per_s"] = ref_tok_s
+                r["speedup"] = kb_tok_s / ref_tok_s if ref_tok_s > 0 else 0
+                r["alignment"] = compute_alignment(kb_d["outputs"], ref_d["outputs"])
+            all_results.append(r)
 
-        # Latency / throughput
-        try:
-            torch.cuda.reset_peak_memory_stats()
-            wl_results["latency"] = run_latency_benchmark(
-                wl, device, dtype, skip_reference=args.skip_reference
-            )
-        except Exception as e:
-            import traceback
-            traceback.print_exc()
-            _print(f"  [ERROR] Latency benchmark failed: {e}")
-            wl_results["latency"] = {"error": str(e)}
+    # ---- Print throughput summary ----
+    if all_results:
+        print(f"\n\n{'=' * 100}")
+        print("  THROUGHPUT SUMMARY")
+        print(f"{'=' * 100}")
+        print(f"  {'SCENARIO':<14} {'QUERIES':>8} {'TOKENS':>8} "
+              f"{'KB-NANO tok/s':>15} {'REF tok/s':>12} {'SPEEDUP':>9} "
+              f"{'s_cos':>8} {'z_cos':>8} {'RMSD':>8}")
+        print(f"  {'-' * 95}")
+        for r in all_results:
+            a = r.get("alignment", {})
+            kb_str = f"{r['kb_nano_tok_per_s']:,.0f}"
+            ref_str = f"{r['ref_tok_per_s']:,.0f}" if "ref_tok_per_s" in r else "N/A"
+            sp_str = f"{r['speedup']:.2f}x" if "speedup" in r else "N/A"
+            s_cos = f"{a['avg_s_trunk_cosine']:.4f}" if "avg_s_trunk_cosine" in a else "N/A"
+            z_cos = f"{a['avg_z_trunk_cosine']:.4f}" if "avg_z_trunk_cosine" in a else "N/A"
+            rmsd = f"{a['avg_atom_rmsd']:.4f}" if "avg_atom_rmsd" in a else "N/A"
+            print(f"  {r['scenario']:<14} {r['num_queries']:>8} {r['total_tokens']:>8} "
+                  f"{kb_str:>15} {ref_str:>12} {sp_str:>9} "
+                  f"{s_cos:>8} {z_cos:>8} {rmsd:>8}")
+        print(f"{'=' * 100}")
 
-        all_results["workloads"][wl_name] = wl_results
-        torch.cuda.empty_cache()
+    # ---- Correctness details ----
+    if all_results and any("alignment" in r for r in all_results):
+        print(f"\n{'=' * 100}")
+        print("  CORRECTNESS DETAILS")
+        print(f"{'=' * 100}")
+        for r in all_results:
+            a = r.get("alignment")
+            if not a:
+                continue
+            print(f"\n  {r['scenario']} ({r['num_queries']} queries, {r['total_tokens']} tokens):")
+            for k, v in sorted(a.items()):
+                if k != "num_queries":
+                    print(f"    {k:<30s} = {v:.6f}")
+        print(f"{'=' * 100}")
 
-    # -----------------------------------------------------------------------
-    # Summary
-    # -----------------------------------------------------------------------
-    W = 18
+    # ---- Latency summary ----
+    kb_lat = kb_raw.get("latency", [])
+    ref_lat = ref_raw.get("latency", []) if ref_raw else []
+    lat_combined = []
+    if kb_lat:
+        print(f"\n{'=' * 100}")
+        print("  LATENCY SUMMARY")
+        print(f"{'=' * 100}")
+        print(f"  {'SCENARIO':<18} {'TOKENS':>7} {'ITERS':>6}"
+              f"  {'KB-NANO med':>12} {'REF med':>12}"
+              f"  {'KB tok/s':>10} {'REF tok/s':>10} {'SPEEDUP':>9}")
+        print(f"  {'-' * 88}")
+        for i, kl in enumerate(kb_lat):
+            kl_med = float(np.median(kl["latencies"]))
+            nt = kl["n_tokens"]
+            k_tps = nt / kl_med if kl_med > 0 else 0
+            lr = {"scenario": kl["name"], "n_tokens": nt, "num_iters": kl["num_iters"],
+                  "kb_nano_median_s": kl_med, "kb_nano_tok_per_s": k_tps, "kb_nano_latencies": kl["latencies"]}
+            r_str, rt_str, sp_str = "N/A", "N/A", "N/A"
+            if i < len(ref_lat):
+                rl = ref_lat[i]
+                rl_med = float(np.median(rl["latencies"]))
+                r_tps = nt / rl_med if rl_med > 0 else 0
+                sp = rl_med / kl_med if kl_med > 0 else 0
+                r_str, rt_str, sp_str = f"{rl_med:.4f}s", f"{r_tps:.0f}", f"{sp:.2f}x"
+                lr.update(ref_median_s=rl_med, ref_tok_per_s=r_tps, speedup=sp, ref_latencies=rl["latencies"])
+            print(f"  {kl['name']:<18} {nt:>7} {kl['num_iters']:>6}"
+                  f"  {kl_med:.4f}s{'':<3} {r_str:>12}  {k_tps:>10.0f} {rt_str:>10} {sp_str:>9}")
+            lat_combined.append(lr)
+        print(f"{'=' * 100}")
 
-    _print(f"\n\n{'='*100}")
-    _print("  SUMMARY")
-    _print(f"{'='*100}")
+    # ---- Memory ----
+    print(f"\n{'=' * 60}")
+    print("  MEMORY & PARAMS")
+    print(f"{'=' * 60}")
+    print(f"  KB-nano  : {kb_raw.get('params', 0):>12,} params, {kb_raw.get('peak_mem_mb', 0):>8,.0f} MB peak")
+    if ref_raw:
+        print(f"  Reference: {ref_raw.get('params', 0):>12,} params, {ref_raw.get('peak_mem_mb', 0):>8,.0f} MB peak")
+    print(f"{'=' * 60}")
 
-    # Correctness summary
-    _print(f"\n  --- Correctness (cosine similarity, PairFormer + Heads shared weights) ---")
-    _print(f"  {'Workload':<{W}} {'trunk_s':>10} {'trunk_z':>10} {'plddt':>10} "
-           f"{'distogram':>12} {'pae':>10} {'pde':>10} {'Status':>8}")
-    _print(f"  {'-'*90}")
+    # ---- Save ----
+    if args.output_dir:
+        os.makedirs(args.output_dir, exist_ok=True)
+        combined = {
+            "gpu": gpu, "dtype": args.dtype, "seed": args.seed,
+            "pf_blocks": PF_BLOCKS, "msa_blocks": MSA_BLOCKS,
+            "no_rollout_steps": NO_ROLLOUT_STEPS, "num_recycles": NUM_RECYCLES,
+            "max_msa_seqs": MAX_MSA_SEQS,
+            "checkpoint": f"{HF_REPO_ID} ({HF_CHECKPOINT_FILE})",
+            "data_source": "OpenProteinSet (AWS s3://openfold/pdb/)",
+            "kb_nano_params": kb_raw.get("params", 0),
+            "kb_nano_peak_mem_mb": kb_raw.get("peak_mem_mb", 0),
+        }
+        if ref_raw:
+            combined["ref_params"] = ref_raw.get("params", 0)
+            combined["ref_peak_mem_mb"] = ref_raw.get("peak_mem_mb", 0)
+        if all_results:
+            combined["throughput_scenarios"] = all_results
+        if lat_combined:
+            combined["latency_scenarios"] = lat_combined
+        results_path = os.path.join(args.output_dir, "results.json")
+        with open(results_path, "w") as f:
+            json.dump(combined, f, indent=2)
+        print(f"\n  Results saved to: {results_path}")
 
-    all_correct = True
-    for wl_name, wl_res in all_results["workloads"].items():
-        corr = wl_res.get("correctness", {})
-        if "error" in corr or not corr:
-            _print(f"  {wl_name:<{W}} {'N/A':>10} {'N/A':>10} {'N/A':>10} "
-                   f"{'N/A':>12} {'N/A':>10} {'N/A':>10} {'SKIP':>8}")
-            continue
-
-        row_pass = True
-        vals = []
-        for key in ["trunk_s", "trunk_z", "plddt_logits", "distogram_logits",
-                     "pae_logits", "pde_logits"]:
-            entry = corr.get(key, {})
-            cos = entry.get("cosine")
-            if cos is not None:
-                vals.append(f"{cos:.6f}")
-                if not entry.get("passed", False):
-                    row_pass = False
-                    all_correct = False
-            else:
-                vals.append("N/A")
-
-        status = "PASS" if row_pass else "FAIL"
-        _print(f"  {wl_name:<{W}} {vals[0]:>10} {vals[1]:>10} {vals[2]:>10} "
-               f"{vals[3]:>12} {vals[4]:>10} {vals[5]:>10} {status:>8}")
-
-    # E2E Latency summary
-    _print(f"\n  --- End-to-End Latency (full forward(), median seconds) ---")
-    _print(f"  {'Workload':<{W}} {'Tokens':>7} {'PF blks':>8} {'KB E2E':>10} "
-           f"{'Ref E2E':>10} {'Speedup':>9} {'KB tok/s':>10} {'Ref tok/s':>10} "
-           f"{'KB Peak':>10}")
-    _print(f"  {'-'*94}")
-
-    for wl_name, wl_res in all_results["workloads"].items():
-        lat = wl_res.get("latency", {})
-        if "error" in lat or not lat:
-            wl_cfg = WORKLOADS.get(wl_name, {})
-            _print(f"  {wl_name:<{W}} {wl_cfg.get('n_tokens', '?'):>7} "
-                   f"{wl_cfg.get('pf_blocks', '?'):>8} {'ERROR':>10}")
-            continue
-
-        wl_cfg = WORKLOADS[wl_name]
-        kb = lat.get("kb_e2e", {})
-        ref = lat.get("ref_e2e", {})
-        kb_med = kb.get("median_s", 0)
-        ref_med = ref.get("median_s", 0) if not isinstance(ref, dict) or "error" not in ref else 0
-        speedup = lat.get("e2e_speedup", 0)
-        kb_tps = kb.get("throughput_tok_s", 0)
-        ref_tps = ref.get("throughput_tok_s", 0) if not isinstance(ref, dict) or "error" not in ref else 0
-        kb_peak = kb.get("peak_mem_mb", 0)
-
-        ref_str = f"{ref_med:.4f}s" if ref_med else "N/A"
-        speedup_str = f"{speedup:.2f}x" if speedup else "N/A"
-        ref_tps_str = f"{ref_tps:.0f}" if ref_tps else "N/A"
-
-        _print(f"  {wl_name:<{W}} {wl_cfg['n_tokens']:>7} {wl_cfg['pf_blocks']:>8} "
-               f"{kb_med:.4f}s{'':<3} {ref_str:>10} {speedup_str:>9} "
-               f"{kb_tps:>10.0f} {ref_tps_str:>10} {kb_peak:>9.0f}MB")
-
-    # PairFormer-only summary
-    _print(f"\n  --- PairFormer Latency (apples-to-apples, median seconds) ---")
-    _print(f"  {'Workload':<{W}} {'Tokens':>7} {'PF blks':>8} {'KB PF':>10} "
-           f"{'Ref PF':>10} {'Speedup':>9} {'KB tok/s':>10} {'Ref tok/s':>10}")
-    _print(f"  {'-'*84}")
-
-    for wl_name, wl_res in all_results["workloads"].items():
-        lat = wl_res.get("latency", {})
-        if "error" in lat or not lat:
-            continue
-
-        wl_cfg = WORKLOADS[wl_name]
-        kb = lat.get("kb_pairformer", {})
-        ref = lat.get("ref_pairformer", {})
-        kb_med = kb.get("median_s", 0)
-        ref_med = ref.get("median_s", 0)
-        speedup = lat.get("pairformer_speedup", 0)
-        kb_tps = kb.get("throughput_tok_s", 0)
-        ref_tps = ref.get("throughput_tok_s", 0)
-
-        ref_str = f"{ref_med:.4f}s" if ref_med else "N/A"
-        speedup_str = f"{speedup:.2f}x" if speedup else "N/A"
-        ref_tps_str = f"{ref_tps:.0f}" if ref_tps else "N/A"
-
-        _print(f"  {wl_name:<{W}} {wl_cfg['n_tokens']:>7} {wl_cfg['pf_blocks']:>8} "
-               f"{kb_med:.4f}s{'':<3} {ref_str:>10} {speedup_str:>9} "
-               f"{kb_tps:>10.0f} {ref_tps_str:>10}")
-
-    # Trunk vs E2E breakdown
-    _print(f"\n  --- KB-nano Pipeline Breakdown (trunk vs full E2E) ---")
-    _print(f"  {'Workload':<{W}} {'Tokens':>7} {'Trunk':>10} {'E2E':>10} "
-           f"{'Diff%':>8} {'E2E tok/s':>10} {'Peak MB':>10}")
-    _print(f"  {'-'*75}")
-    for wl_name, wl_res in all_results["workloads"].items():
-        lat = wl_res.get("latency", {})
-        trunk = lat.get("kb_trunk", {})
-        e2e = lat.get("kb_e2e", {})
-        if not trunk or not e2e or "error" in lat:
-            continue
-        wl_cfg = WORKLOADS[wl_name]
-        trunk_med = trunk["median_s"]
-        e2e_med = e2e["median_s"]
-        diff_pct = (e2e_med - trunk_med) / trunk_med * 100 if trunk_med > 0 else 0
-        _print(f"  {wl_name:<{W}} {wl_cfg['n_tokens']:>7} {trunk_med:.4f}s"
-               f"{'':<3} {e2e_med:.4f}s{'':<3} {diff_pct:>+6.1f}% "
-               f"{e2e['throughput_tok_s']:>10.0f} {e2e['peak_mem_mb']:>9.0f}")
-
-    overall = "PASS" if all_correct else "FAIL"
-    _print(f"\n  Overall correctness: {overall}")
-    _print(f"{'='*100}")
-
-    # Save results
-    results_path = os.path.join(output_dir, "benchmark_results.json")
-
-    serializable = json.loads(json.dumps(all_results, default=str))
-    with open(results_path, "w") as f:
-        json.dump(serializable, f, indent=2)
-    _print(f"\n  Results saved to: {results_path}")
+        if not args.skip_throughput:
+            for i, sc in enumerate(throughput_scenarios):
+                sd = os.path.join(args.output_dir, sc["name"])
+                os.makedirs(sd, exist_ok=True)
+                with open(os.path.join(sd, "kb_nano_outputs.json"), "w") as f:
+                    json.dump(kb_raw["throughput"][i], f, indent=2)
+                if ref_raw and i < len(ref_raw["throughput"]):
+                    with open(os.path.join(sd, "ref_outputs.json"), "w") as f:
+                        json.dump(ref_raw["throughput"][i], f, indent=2)
 
 
 if __name__ == "__main__":

@@ -23,6 +23,8 @@ import torch.nn as nn
 from ..L1.layer_norm import LayerNorm
 from ..L1.linear import Linear
 from ..L2.openfold3_input_embedder import InputEmbedder
+from ..L2.openfold3_msa_module_embedder import MSAModuleEmbedder
+from ..L2.openfold3_template_embedder import TemplateEmbedder
 from ..L3.openfold3_diffusion_module import DiffusionModule, SampleDiffusion
 from ..L3.openfold3_heads import AuxiliaryHeads
 from ..L3.openfold3_msa_module import MSAModuleStack
@@ -44,14 +46,16 @@ class OpenFold3Config:
     c_atom_pair: int = 16
     c_token_embedder: int = 384
     c_token_diffusion: int = 768
-    c_s_input: int = 384  # matches c_token_embedder; full model uses 449 = c_token + 65 features
+    c_s_input: int = 449
+    c_t: int = 64
+    max_atoms_per_token: int = 23
 
     # PairFormer
     pairformer_no_blocks: int = 48
     pairformer_c_hidden_mul: int = 128
     pairformer_c_hidden_pair_att: int = 32
     pairformer_no_heads_pair: int = 4
-    pairformer_c_hidden_pair_bias: int = 32
+    pairformer_c_hidden_pair_bias: int = 24
     pairformer_no_heads_pair_bias: int = 16
     pairformer_transition_n: int = 4
     pairformer_pair_dropout: float = 0.0
@@ -93,6 +97,11 @@ class OpenFold3Config:
 
     # Input
     relpos_k: int = 32
+    max_relative_chain: int = 2
+
+    # Atom attention
+    atom_attn_n_query: int = 32
+    atom_attn_n_key: int = 128
 
     @classmethod
     def from_pretrained(cls, model_name: str) -> "OpenFold3Config":
@@ -117,8 +126,8 @@ def _create_noise_schedule(
 class OpenFold3Model(nn.Module):
     """Full AlphaFold3 / OpenFold3 model.
 
-    Wires input embedder -> MSA module -> PairFormer -> diffusion module
-    -> auxiliary heads.
+    Wires input embedder -> template embedder -> MSA module -> PairFormer
+    -> diffusion module -> auxiliary heads.
 
     Reference: openfold3/projects/of3_all_atom/model.py OpenFold3
 
@@ -130,19 +139,34 @@ class OpenFold3Model(nn.Module):
         super().__init__()
         self.config = config
 
-        # Input embedding
+        # Input embedding (includes AtomAttentionEncoder)
         self.input_embedder = InputEmbedder(
-            c_token=config.c_token_embedder,
+            c_s_input=config.c_s_input,
             c_s=config.c_s,
             c_z=config.c_z,
             relpos_k=config.relpos_k,
+            max_relative_chain=config.max_relative_chain,
+            c_atom=config.c_atom,
+            c_atom_pair=config.c_atom_pair,
+            c_token=config.c_token_embedder,
         )
 
-        # Recycle projections
+        # Recycle projections (z first, then s, matching reference ordering)
         self.layer_norm_z = LayerNorm(config.c_z)
         self.linear_z = Linear(config.c_z, config.c_z, bias=False)
-        self.layer_norm_s = LayerNorm(config.c_s)
-        self.linear_s = Linear(config.c_s, config.c_s, bias=False)
+
+        # Template embedder
+        self.template_embedder = TemplateEmbedder(
+            c_t=config.c_t,
+            c_z=config.c_z,
+        )
+
+        # MSA module embedder
+        self.msa_module_embedder = MSAModuleEmbedder(
+            c_m_feats=34,
+            c_m=config.c_m,
+            c_s_input=config.c_s_input,
+        )
 
         # MSA module
         self.msa_module = MSAModuleStack(
@@ -161,6 +185,10 @@ class OpenFold3Model(nn.Module):
             opm_first=config.msa_opm_first,
         )
 
+        # Recycle single projection (after template/MSA, before pairformer)
+        self.layer_norm_s = LayerNorm(config.c_s)
+        self.linear_s = Linear(config.c_s, config.c_s, bias=False)
+
         # PairFormer stack
         self.pairformer_stack = PairFormerStack(
             c_s=config.c_s,
@@ -175,7 +203,7 @@ class OpenFold3Model(nn.Module):
             pair_dropout=config.pairformer_pair_dropout,
         )
 
-        # Diffusion module
+        # Diffusion module (includes AtomAttentionEncoder/Decoder)
         self.diffusion_module = DiffusionModule(
             c_s=config.c_s,
             c_z=config.c_z,
@@ -186,6 +214,12 @@ class OpenFold3Model(nn.Module):
             no_diff_heads=config.diff_no_heads,
             c_diff_hidden=config.diff_c_hidden,
             n_diff_transition=config.diff_n_transition,
+            relpos_k=config.relpos_k,
+            max_relative_chain=config.max_relative_chain,
+            c_atom=config.c_atom,
+            c_atom_pair=config.c_atom_pair,
+            atom_attn_n_query=config.atom_attn_n_query,
+            atom_attn_n_key=config.atom_attn_n_key,
         )
 
         self.sample_diffusion = SampleDiffusion(
@@ -196,8 +230,13 @@ class OpenFold3Model(nn.Module):
             diffusion_module=self.diffusion_module,
         )
 
-        # Auxiliary heads
-        self.aux_heads = AuxiliaryHeads(c_s=config.c_s, c_z=config.c_z)
+        # Auxiliary heads (includes PairformerEmbedding + ExperimentallyResolved)
+        self.aux_heads = AuxiliaryHeads(
+            c_s=config.c_s,
+            c_z=config.c_z,
+            c_s_input=config.c_s_input,
+            max_atoms_per_token=config.max_atoms_per_token,
+        )
 
     def run_trunk(
         self,
@@ -225,9 +264,9 @@ class OpenFold3Model(nn.Module):
         token_mask = batch["token_mask"]
         pair_mask = batch.get("pair_mask", token_mask[..., :, None] * token_mask[..., None, :])
 
-        s_input = token_features
-
-        s_init, z_init = self.input_embedder(token_features, residue_index)
+        s_input, s_init, z_init = self.input_embedder(
+            token_features, residue_index, batch=batch,
+        )
 
         s = s_init
         z = z_init
@@ -237,15 +276,18 @@ class OpenFold3Model(nn.Module):
                 z = z_init + self.linear_z(self.layer_norm_z(z))
                 s = s_init + self.linear_s(self.layer_norm_s(s))
 
+            # Template embedder
+            if "template_distogram" in batch:
+                t_emb = self.template_embedder(
+                    batch=batch, z=z, pair_mask=pair_mask,
+                )
+                z = z + t_emb
+
             # MSA module
             if "msa" in batch and batch["msa"] is not None:
-                msa = batch["msa"]
-                msa_mask = batch.get(
-                    "msa_mask",
-                    msa.new_ones(msa.shape[:-1]),
-                )
+                m, msa_mask = self.msa_module_embedder(batch=batch, s_input=s_input)
                 _, z = self.msa_module(
-                    m=msa, z=z, msa_mask=msa_mask, pair_mask=pair_mask,
+                    m=m, z=z, msa_mask=msa_mask, pair_mask=pair_mask,
                 )
 
             # PairFormer
@@ -319,50 +361,28 @@ class OpenFold3Model(nn.Module):
 
 def load_openfold3_checkpoint(
     model: OpenFold3Model, checkpoint_path: str,
-) -> tuple[list, list]:
+) -> None:
     """Load an OpenFold3 checkpoint into a kb-nano OpenFold3Model.
 
-    Handles key remapping between the reference openfold3 module hierarchy
-    and the kb-nano hierarchy.
+    The kb-nano model architecture is a 1:1 match with the reference
+    OpenFold/OpenFold3 checkpoint, so strict loading is used.
 
     Args:
         model: kb-nano OpenFold3Model instance.
         checkpoint_path: Path to the checkpoint file.
-
-    Returns:
-        (missing_keys, unexpected_keys) from load_state_dict.
     """
-    import re
-
     ckpt = torch.load(checkpoint_path, map_location="cpu", weights_only=True)
     if "state_dict" in ckpt:
-        ckpt = ckpt["state_dict"]
+        sd = ckpt["state_dict"]
     elif "model" in ckpt and isinstance(ckpt["model"], dict):
-        ckpt = ckpt["model"]
+        sd = ckpt["model"]
+    else:
+        sd = ckpt
 
-    remapped = {}
+    cleaned = {}
+    for k, v in sd.items():
+        if k.startswith("model."):
+            k = k[len("model."):]
+        cleaned[k] = v
 
-    prefix_map = {
-        "input_embedder.": "input_embedder.",
-        "pairformer_stack.": "pairformer_stack.",
-        "msa_module.": "msa_module.",
-        "diffusion_module.": "diffusion_module.",
-        "sample_diffusion.": "sample_diffusion.",
-        "aux_heads.": "aux_heads.",
-        "layer_norm_z.": "layer_norm_z.",
-        "linear_z.": "linear_z.",
-        "layer_norm_s.": "layer_norm_s.",
-        "linear_s.": "linear_s.",
-    }
-
-    for ref_key, val in ckpt.items():
-        new_key = ref_key
-
-        # Strip 'model.' prefix if present (Lightning convention)
-        if new_key.startswith("model."):
-            new_key = new_key[len("model."):]
-
-        remapped[new_key] = val
-
-    missing, unexpected = model.load_state_dict(remapped, strict=False)
-    return missing, unexpected
+    model.load_state_dict(cleaned, strict=True)

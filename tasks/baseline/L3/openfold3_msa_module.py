@@ -51,18 +51,21 @@ class MSAModuleBlock(nn.Module):
         fuse_projection_weights: bool = False,
         inf: float = 1e9,
         eps: float = 1e-3,
+        last_block: bool = False,
     ):
         super().__init__()
         self.opm_first = opm_first
+        self.skip_msa_update = last_block and opm_first
 
-        self.msa_att_row = MSARowAttentionWithPairBias(
-            c_m=c_m, c_z=c_z,
-            c_hidden=c_hidden_msa_att,
-            no_heads=no_heads_msa,
-            inf=inf,
-        )
+        if not self.skip_msa_update:
+            self.msa_att_row = MSARowAttentionWithPairBias(
+                c_m=c_m, c_z=c_z,
+                c_hidden=c_hidden_msa_att,
+                no_heads=no_heads_msa,
+                inf=inf,
+            )
 
-        self.msa_transition = SwiGLUTransition(c_in=c_m, n=transition_n)
+            self.msa_transition = SwiGLUTransition(c_in=c_m, n=transition_n)
 
         self.outer_product_mean = OuterProductMean(
             c_m=c_m, c_z=c_z, c_hidden=c_hidden_opm, eps=eps,
@@ -104,8 +107,9 @@ class MSAModuleBlock(nn.Module):
         if self.opm_first:
             z = z + self.outer_product_mean(m, mask=msa_mask)
 
-        m = m + self.msa_att_row(m, z=z, mask=msa_mask)
-        m = m + self.msa_transition(m)
+        if not self.skip_msa_update:
+            m = m + self.msa_att_row(m, z=z, mask=pair_mask)
+            m = m + self.msa_transition(m)
 
         if not self.opm_first:
             z = z + self.outer_product_mean(m, mask=msa_mask)
@@ -169,8 +173,9 @@ class MSAModuleStack(nn.Module):
                 opm_first=opm_first,
                 inf=inf,
                 eps=eps,
+                last_block=(i == no_blocks - 1),
             )
-            for _ in range(no_blocks)
+            for i in range(no_blocks)
         ])
 
     def forward(

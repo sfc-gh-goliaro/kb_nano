@@ -14,6 +14,7 @@ import torch.nn as nn
 
 from ..L1.layer_norm import LayerNorm
 from ..L1.linear import Linear
+from ..L2.openfold3_atom_attention import AtomAttentionDecoder, AtomAttentionEncoder
 from ..L2.openfold3_diffusion_conditioning import DiffusionConditioning
 from .openfold3_diffusion_transformer import DiffusionTransformer
 
@@ -21,9 +22,8 @@ from .openfold3_diffusion_transformer import DiffusionTransformer
 class DiffusionModule(nn.Module):
     """AF3 Algorithm 20: Diffusion module.
 
-    Simplified version without atom-level attention encoder/decoder
-    (those are complex and will be added as separate L2 modules when
-    needed for full end-to-end inference).
+    Full version with atom-level attention encoder/decoder matching the
+    reference OpenFold3 DiffusionModule.
 
     Args:
         c_s: Single representation channel dimension
@@ -35,6 +35,12 @@ class DiffusionModule(nn.Module):
         no_diff_heads: Number of diffusion attention heads
         c_diff_hidden: Per-head hidden dim for diffusion attention
         n_diff_transition: Transition scale
+        relpos_k: Relative position max index
+        max_relative_chain: Max relative chain index
+        c_atom: Atom single representation dim
+        c_atom_pair: Atom pair representation dim
+        atom_attn_n_query: Block height for atom attention
+        atom_attn_n_key: Block width for atom attention
     """
 
     def __init__(
@@ -48,6 +54,12 @@ class DiffusionModule(nn.Module):
         no_diff_heads: int = 16,
         c_diff_hidden: int = 48,
         n_diff_transition: int = 2,
+        relpos_k: int = 32,
+        max_relative_chain: int = 2,
+        c_atom: int = 128,
+        c_atom_pair: int = 16,
+        atom_attn_n_query: int = 32,
+        atom_attn_n_key: int = 128,
     ):
         super().__init__()
         self.c_s = c_s
@@ -56,10 +68,25 @@ class DiffusionModule(nn.Module):
 
         self.diffusion_conditioning = DiffusionConditioning(
             c_s=c_s, c_z=c_z, c_s_input=c_s_input,
+            sigma_data=sigma_data,
+            relpos_k=relpos_k, max_relative_chain=max_relative_chain,
         )
 
-        self.layer_norm_s = LayerNorm(c_s, elementwise_affine=False)
-        self.linear_s = Linear(c_s, c_token, bias=False)
+        self.atom_attn_enc = AtomAttentionEncoder(
+            c_atom=c_atom,
+            c_atom_pair=c_atom_pair,
+            c_token=c_token,
+            add_noisy_pos=True,
+            c_s=c_s,
+            c_z=c_z,
+            c_hidden=32,
+            no_heads=4,
+            no_blocks=3,
+            n_transition=2,
+            n_query=atom_attn_n_query,
+            n_key=atom_attn_n_key,
+            use_ada_layer_norm=True,
+        )
 
         self.diffusion_transformer = DiffusionTransformer(
             c_a=c_token, c_s=c_s, c_z=c_z,
@@ -69,8 +96,23 @@ class DiffusionModule(nn.Module):
             use_ada_layer_norm=True,
         )
 
-        self.layer_norm_a = LayerNorm(c_token, elementwise_affine=False)
-        self.linear_out = Linear(c_token, 3, bias=False)
+        self.atom_attn_dec = AtomAttentionDecoder(
+            c_atom=c_atom,
+            c_atom_pair=c_atom_pair,
+            c_token=c_token,
+            c_hidden=32,
+            no_heads=4,
+            no_blocks=3,
+            n_transition=2,
+            n_query=atom_attn_n_query,
+            n_key=atom_attn_n_key,
+            use_ada_layer_norm=True,
+        )
+
+        self.layer_norm_s = LayerNorm(c_s, create_offset=False)
+        self.linear_s = Linear(c_s, c_token, bias=False)
+
+        self.layer_norm_a = LayerNorm(c_token, create_offset=False)
 
     def forward(
         self,
@@ -115,16 +157,24 @@ class DiffusionModule(nn.Module):
 
         rl_noisy = xl_noisy / torch.sqrt(t[..., None, None] ** 2 + self.sigma_data ** 2)
 
-        # Simplified: use token-level instead of full atom encoder/decoder
-        # This handles the standard case where N_atom == N_token (one atom per token)
-        ai = self.linear_s(self.layer_norm_s(si))
+        ai, ql, cl, plm = self.atom_attn_enc(
+            batch=batch,
+            rl=rl_noisy,
+            si_trunk=si,
+            zij_trunk=zij,
+        )
+
+        ai = ai + self.linear_s(self.layer_norm_s(si))
 
         ai = self.diffusion_transformer(
             a=ai, s=si, z=zij, mask=token_mask,
         )
 
         ai = self.layer_norm_a(ai)
-        rl_update = self.linear_out(ai)
+
+        rl_update = self.atom_attn_dec(
+            batch=batch, ai=ai, ql=ql, cl=cl, plm=plm,
+        )
 
         # EDM-style combination
         xl_out = (
