@@ -68,7 +68,7 @@ MODEL_REGISTRY = {
         "short_name": "siglip2-so400m",
         "image_mean": [0.5, 0.5, 0.5],
         "image_std": [0.5, 0.5, 0.5],
-        "default_num_images": 40000,
+        "default_num_images": 10000,
     },
     "facebook/dinov3-vit7b16-pretrain-lvd1689m": {
         "timm_name": "vit_7b_patch16_dinov3.lvd1689m",
@@ -78,7 +78,7 @@ MODEL_REGISTRY = {
         "short_name": "dinov3-7b",
         "image_mean": [0.485, 0.456, 0.406],
         "image_std": [0.229, 0.224, 0.225],
-        "default_num_images": 3000,
+        "default_num_images": 1500,
     },
     "timm/swinv2_large_window12_192.ms_in22k": {
         "timm_name": "swinv2_large_window12_192.ms_in22k",
@@ -88,7 +88,7 @@ MODEL_REGISTRY = {
         "short_name": "swinv2-large",
         "image_mean": [0.485, 0.456, 0.406],
         "image_std": [0.229, 0.224, 0.225],
-        "default_num_images": 10000,
+        "default_num_images": 5000,
         "strict_img_size": False,
     },
 }

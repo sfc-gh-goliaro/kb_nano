@@ -77,6 +77,8 @@ class SigLIP2Model(nn.Module):
         # Learned position embedding: (1, H, W, C) matching timm NaFlex format
         gh, gw = pos_embed_grid_size
         self.pos_embed = nn.Parameter(torch.zeros(1, gh, gw, embed_dim))
+        self._pos_embed_cached_size: Tuple[int, int] = (0, 0)
+        self.register_buffer("_pos_embed_cached", None, persistent=False)
 
         # Transformer blocks
         self.blocks = nn.Sequential(*[
@@ -111,16 +113,51 @@ class SigLIP2Model(nn.Module):
         self,
         grid_size: Tuple[int, int],
     ) -> torch.Tensor:
-        """Interpolate position embedding to match the input grid size."""
+        """Interpolate position embedding to match the input grid size.
+
+        Uses a cached buffer when the grid matches the pre-computed size
+        (common case at default resolution), avoiding per-forward bicubic
+        interpolation entirely.  For non-default resolutions, interpolates
+        in float32 with antialias=True (matching timm's kernel path).
+        """
         pos = self.pos_embed  # (1, Hg, Wg, C)
         gh, gw = pos.shape[1], pos.shape[2]
         th, tw = grid_size
         if (gh, gw) == (th, tw):
             return pos.reshape(1, gh * gw, -1)
-        pos = pos.permute(0, 3, 1, 2)  # (1, C, Hg, Wg)
-        pos = F.interpolate(pos, size=(th, tw), mode="bicubic", align_corners=False)
-        pos = pos.permute(0, 2, 3, 1)  # (1, H, W, C)
-        return pos.reshape(1, th * tw, -1)
+
+        # Check for cached interpolation at default resolution
+        cached = self._pos_embed_cached
+        if cached is not None and self._pos_embed_cached_size == (th, tw):
+            return cached.to(dtype=pos.dtype)
+
+        # Interpolate in float32 with antialias for speed (matches timm)
+        pos_nchw = pos.permute(0, 3, 1, 2).float()
+        pos_nchw = F.interpolate(
+            pos_nchw, size=(th, tw), mode="bicubic",
+            align_corners=False, antialias=True,
+        )
+        return pos_nchw.flatten(2).transpose(1, 2).to(dtype=pos.dtype)
+
+    def set_default_grid(self, grid_size: Tuple[int, int]) -> None:
+        """Pre-compute and cache the position embedding for a target grid.
+
+        Call once after loading weights to eliminate per-forward interpolation
+        at the most common resolution.  The cached tensor is stored as a
+        non-persistent buffer so it automatically follows ``.to()`` calls.
+        """
+        pos = self.pos_embed
+        gh, gw = pos.shape[1], pos.shape[2]
+        if (gh, gw) == grid_size:
+            return
+        pos_nchw = pos.permute(0, 3, 1, 2).float()
+        pos_nchw = F.interpolate(
+            pos_nchw, size=grid_size, mode="bicubic",
+            align_corners=False, antialias=True,
+        )
+        cached = pos_nchw.flatten(2).transpose(1, 2)
+        self._pos_embed_cached_size = grid_size
+        self.register_buffer("_pos_embed_cached", cached, persistent=False)
 
     def forward_features(self, x: torch.Tensor) -> torch.Tensor:
         """Extract features from a standard (B, C, H, W) image tensor."""
@@ -191,6 +228,12 @@ class SigLIP2Model(nn.Module):
             print(f"  SigLIP2 load: {len(missing)} missing keys: {missing[:5]}...")
         if unexpected:
             print(f"  SigLIP2 load: {len(unexpected)} unexpected keys: {unexpected[:5]}...")
+
+        # Pre-interpolate pos_embed to the default resolution grid so that
+        # the common-case forward pass pays zero interpolation cost.
+        default_res = cfg["default_resolution"]
+        default_grid = (default_res // cfg["patch_size"],) * 2
+        kb_model.set_default_grid(default_grid)
 
         del timm_model
         return kb_model
