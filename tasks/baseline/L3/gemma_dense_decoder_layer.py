@@ -13,8 +13,30 @@ import torch
 import torch.nn as nn
 
 from ..L1.rms_norm import RMSNorm
+from ..L1.gelu_and_mul import GeluAndMul
 from ..L2.gemma_dense_attention import GemmaDenseAttention
-from ..L2.llama_mlp import LlamaMLP
+from ..L2.parallel_linear import MergedColumnParallelLinear, RowParallelLinear
+
+
+class GemmaMLP(nn.Module):
+    """Gemma MLP with GELUTanh activation (not SiLU like Llama)."""
+
+    def __init__(self, config, quant_config: dict | None = None):
+        super().__init__()
+        self.gate_up_proj = MergedColumnParallelLinear(
+            config.hidden_size, [config.intermediate_size] * 2,
+            quant_config=quant_config,
+        )
+        self.down_proj = RowParallelLinear(
+            config.intermediate_size, config.hidden_size,
+            quant_config=quant_config,
+        )
+        self.act_fn = GeluAndMul()
+
+    def forward(self, x):
+        x = self.gate_up_proj(x)
+        x = self.act_fn(x)
+        return self.down_proj(x)
 
 
 class GemmaDenseDecoderLayer(nn.Module):
@@ -35,7 +57,7 @@ class GemmaDenseDecoderLayer(nn.Module):
             head_dim=config.head_dim,
         )
         self.post_attention_layernorm = RMSNorm(config.hidden_size, eps=config.rms_norm_eps)
-        self.mlp = LlamaMLP(config)
+        self.mlp = GemmaMLP(config)
 
     def forward(
         self,
@@ -44,6 +66,7 @@ class GemmaDenseDecoderLayer(nn.Module):
         sin: torch.Tensor,
         attention_mask: torch.Tensor | None = None,
         kv_cache: tuple[torch.Tensor, torch.Tensor] | None = None,
+        causal: bool = False,
     ) -> tuple[torch.Tensor, tuple[torch.Tensor, torch.Tensor]]:
         """
         Returns:
@@ -55,6 +78,7 @@ class GemmaDenseDecoderLayer(nn.Module):
         hidden_states, new_kv = self.self_attn(
             hidden_states, cos, sin,
             attention_mask=attention_mask, kv_cache=kv_cache,
+            causal=causal,
         )
         hidden_states = residual + hidden_states
 

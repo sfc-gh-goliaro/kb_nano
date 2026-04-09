@@ -81,10 +81,10 @@ def _load_libero_task_texts(dataset_name="lerobot/libero"):
         from huggingface_hub import hf_hub_download
         import pyarrow.parquet as pq
         path = hf_hub_download(dataset_name, "meta/tasks.parquet", repo_type="dataset")
-        table = pq.read_table(path)
+        df = pq.read_table(path).to_pandas()
         task_map = {}
-        for idx, task in zip(table["task_index"].to_pylist(), table["task"].to_pylist()):
-            task_map[idx] = task
+        for task_text, row in df.iterrows():
+            task_map[int(row["task_index"])] = str(task_text)
         _LIBERO_TASK_TEXTS = task_map
         return task_map
     except Exception as e:
@@ -260,6 +260,16 @@ def make_synthetic_batch(batch_size, num_cameras, image_size=224, max_state_dim=
         "pixel_attention_mask": pixel_attention_mask,
         "attention_mask": attention_mask,
     }
+
+
+def make_pi0_flow_noise(batch_size, chunk_size, max_action_dim, noise_seed, device, dtype):
+    """Deterministic flow-matching noise; must match kb-nano and HF workers."""
+    g = torch.Generator(device=device)
+    g.manual_seed(int(noise_seed))
+    return torch.randn(
+        batch_size, chunk_size, max_action_dim,
+        generator=g, dtype=dtype, device=device,
+    )
 '''
 
 
@@ -298,6 +308,8 @@ def main():
 
     num_cameras = cfg.get("num_cameras", 1)
     image_size = cfg.get("image_size", 224)
+    chunk_size = cfg.get("chunk_size", 50)
+    max_action_dim = cfg.get("max_action_dim", 32)
     use_real_data = cfg.get("use_real_data", True)
 
     max_samples = max(
@@ -337,6 +349,10 @@ def main():
         for req_idx in pbar:
             batch = _get_batch(dataset_batches, sample_offset + req_idx,
                                scenario["num_cameras"], image_size, seed)
+            dev = batch["state"].device
+            dt = batch["state"].dtype
+            noise_seed = seed + 10000 * (sample_offset + req_idx) + 424242
+            noise = make_pi0_flow_noise(1, chunk_size, max_action_dim, noise_seed, dev, dt)
             torch.cuda.synchronize()
             t0 = time.perf_counter()
             with torch.inference_mode():
@@ -346,6 +362,7 @@ def main():
                     pixel_attention_mask=batch["pixel_attention_mask"],
                     attention_mask=batch["attention_mask"],
                     num_steps=num_steps,
+                    noise=noise,
                 )
             torch.cuda.synchronize()
             total_elapsed += time.perf_counter() - t0
@@ -457,6 +474,8 @@ def main():
     num_steps = cfg["num_steps"]
     num_cameras = cfg.get("num_cameras", 1)
     image_size = cfg.get("image_size", 224)
+    chunk_size = cfg.get("chunk_size", 50)
+    max_action_dim = cfg.get("max_action_dim", 32)
     use_real_data = cfg.get("use_real_data", True)
 
     engine = Pi0Engine(
@@ -504,6 +523,10 @@ def main():
         for req_idx in pbar:
             batch = _get_batch(dataset_batches, sample_offset + req_idx,
                                scenario["num_cameras"], image_size, seed)
+            dev = batch["state"].device
+            dt = batch["state"].dtype
+            noise_seed = seed + 10000 * (sample_offset + req_idx) + 424242
+            noise = make_pi0_flow_noise(1, chunk_size, max_action_dim, noise_seed, dev, dt)
             torch.cuda.synchronize()
             t0 = time.perf_counter()
             output = engine.generate(
@@ -512,6 +535,7 @@ def main():
                 pixel_attention_mask=batch["pixel_attention_mask"],
                 attention_mask=batch["attention_mask"],
                 params=params,
+                noise=noise,
             )
             torch.cuda.synchronize()
             total_elapsed += time.perf_counter() - t0
@@ -790,6 +814,8 @@ def main():
         "project_root": str(_PROJECT_ROOT),
         "package_name": "kb_nano",
         "image_size": PI0_CONFIG.image_resolution[0],
+        "chunk_size": PI0_CONFIG.chunk_size,
+        "max_action_dim": PI0_CONFIG.max_action_dim,
         "use_real_data": use_real_data,
     }
 

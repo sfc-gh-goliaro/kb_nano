@@ -12,7 +12,7 @@ import torch
 import torch.nn as nn
 
 from ..L1.dense_attention import DenseAttention
-from .parallel_linear import ColumnParallelLinear, RowParallelLinear
+from ..L1.linear import Linear
 
 
 class SigLIPAttention(nn.Module):
@@ -26,10 +26,10 @@ class SigLIPAttention(nn.Module):
         self.num_heads = num_heads
         self.head_dim = embed_dim // num_heads
 
-        self.q_proj = ColumnParallelLinear(embed_dim, embed_dim, bias=True)
-        self.k_proj = ColumnParallelLinear(embed_dim, embed_dim, bias=True)
-        self.v_proj = ColumnParallelLinear(embed_dim, embed_dim, bias=True)
-        self.out_proj = RowParallelLinear(embed_dim, embed_dim, bias=True)
+        self.q_proj = Linear(embed_dim, embed_dim, bias=True)
+        self.k_proj = Linear(embed_dim, embed_dim, bias=True)
+        self.v_proj = Linear(embed_dim, embed_dim, bias=True)
+        self.out_proj = Linear(embed_dim, embed_dim, bias=True)
         self.attn = DenseAttention()
 
     def forward(self, hidden_states: torch.Tensor) -> torch.Tensor:

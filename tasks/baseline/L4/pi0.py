@@ -27,7 +27,7 @@ from ..L1.embedding import Embedding
 from ..L1.layer_norm import LayerNorm
 from ..L1.linear import Linear
 from ..L1.rms_norm import RMSNorm
-from ..L2.gemma_dense_attention import GemmaRotaryEmbedding
+from ..L2.gemma_dense_attention import GemmaRotaryEmbedding, build_pi0_dit_attn_bias
 from ..L2.pi0_action_embed import Pi0ActionTimeEmbedding
 from ..L3.gemma_dense_decoder_layer import GemmaDenseDecoderLayer
 from ..L3.siglip_encoder_layer import SigLIPEncoderLayer
@@ -248,21 +248,56 @@ class GemmaModel(nn.Module):
             hidden_states = inputs_embeds
 
         bsz, seq_len = hidden_states.shape[:2]
+        is_dit_with_prefix = kv_caches is not None and not use_cache
+
         if position_ids is None:
-            cache_len = kv_caches[0][0].shape[1] if kv_caches else 0
-            position_ids = torch.arange(
-                cache_len, cache_len + seq_len,
-                device=hidden_states.device,
-            ).unsqueeze(0).expand(bsz, -1)
+            if is_dit_with_prefix:
+                prefix_len = kv_caches[0][0].shape[1]
+                if attention_mask is not None:
+                    ones_suf = torch.ones(
+                        bsz, seq_len,
+                        device=hidden_states.device,
+                        dtype=attention_mask.dtype,
+                    )
+                    dit_am = torch.cat([attention_mask, ones_suf], dim=1)
+                else:
+                    am = torch.ones(
+                        bsz, prefix_len,
+                        device=hidden_states.device,
+                        dtype=torch.long,
+                    )
+                    ones_suf = torch.ones(
+                        bsz, seq_len,
+                        device=hidden_states.device,
+                        dtype=torch.long,
+                    )
+                    dit_am = torch.cat([am, ones_suf], dim=1)
+                position_ids = (dit_am.cumsum(dim=1) - 1)[:, -seq_len:]
+            else:
+                cache_len = kv_caches[0][0].shape[1] if kv_caches else 0
+                position_ids = torch.arange(
+                    cache_len, cache_len + seq_len,
+                    device=hidden_states.device,
+                ).unsqueeze(0).expand(bsz, -1)
 
         cos, sin = self.rotary_emb(hidden_states, position_ids)
+
+        pi0_attn_bias = None
+        if is_dit_with_prefix:
+            prefix_len = kv_caches[0][0].shape[1]
+            pi0_attn_bias = build_pi0_dit_attn_bias(
+                prefix_len, seq_len, bsz, hidden_states.device,
+            )
 
         new_kv_caches = [] if use_cache else None
         for i, layer in enumerate(self.layers):
             layer_kv = kv_caches[i] if kv_caches else None
             hidden_states, new_kv = layer(
-                hidden_states, cos, sin,
-                attention_mask=attention_mask, kv_cache=layer_kv,
+                hidden_states,
+                cos,
+                sin,
+                attention_mask=pi0_attn_bias,
+                kv_cache=layer_kv,
             )
             if use_cache:
                 new_kv_caches.append(new_kv)
@@ -374,21 +409,15 @@ class Pi0Model(nn.Module):
         Args:
             action_embeds: (batch, 1 + chunk_size, dit_hidden_size)
             kv_caches: VLM-prefix KV caches.
-            attention_mask: Optional.
+            attention_mask: (batch, prefix_seq_len) mask for the VLM prefix (HF-aligned).
 
         Returns:
             (batch, 1 + chunk_size, dit_hidden_size)
         """
-        prefix_len = kv_caches[0][0].shape[1] if kv_caches else 0
-        suffix_len = action_embeds.shape[1]
-        position_ids = torch.arange(
-            prefix_len, prefix_len + suffix_len,
-            device=action_embeds.device,
-        ).unsqueeze(0).expand(action_embeds.shape[0], -1)
-
         hidden_states, _ = self.dit(
             inputs_embeds=action_embeds,
-            position_ids=position_ids,
+            position_ids=None,
+            attention_mask=attention_mask,
             kv_caches=kv_caches,
             use_cache=False,
         )
@@ -492,7 +521,9 @@ class Pi0Pipeline(nn.Module):
 
             action_embeds = self.embed_action_time(state, noise, timestep)
 
-            dit_out = self.model.forward_dit(action_embeds, vlm_kv)
+            dit_out = self.model.forward_dit(
+                action_embeds, vlm_kv, attention_mask=attention_mask,
+            )
 
             velocity = self.action_out_proj(
                 dit_out[:, -self.config.chunk_size:],
@@ -510,46 +541,41 @@ class Pi0Pipeline(nn.Module):
     def load_weights(
         self, weights: Iterable[tuple[str, torch.Tensor]],
     ) -> set[str]:
-        """Load weights from HuggingFace-format checkpoint.
+        """Load weights from LeRobot-format checkpoint (lerobot/pi0_base).
 
-        Handles name remapping between HF Transformers PI0 weight keys
-        and our module hierarchy.
+        Handles name remapping between LeRobot's ``paligemma_with_expert``
+        weight keys and our module hierarchy.
         """
+        _PWE_PAL = "paligemma_with_expert.paligemma."
+        _PWE_EXP = "paligemma_with_expert.gemma_expert."
+
         remap = {
-            "model.vlm.vision_tower.vision_model.embeddings.patch_embedding.": "model.vision_tower.patch_embedding.",
-            "model.vlm.vision_tower.vision_model.embeddings.position_embedding.": "_position_embedding_",
-            "model.vlm.vision_tower.vision_model.encoder.layers.": "model.vision_tower.layers.",
-            "model.vlm.vision_tower.vision_model.post_layernorm.": "model.vision_tower.post_layernorm.",
-            "model.vlm.multi_modal_projector.linear.": "model.multi_modal_projector.",
-            "model.vlm.language_model.model.embed_tokens.": "model.vlm.embed_tokens.emb.",
-            "model.vlm.language_model.model.layers.": "model.vlm.layers.",
-            "model.vlm.language_model.model.norm.": "model.vlm.norm.",
-            "model.dit.model.layers.": "model.dit.layers.",
-            "model.dit.model.norm.": "model.dit.norm.",
-            "embed_action_time.sinusoid_embeds.": "embed_action_time.sinusoid_embeds.",
-            "embed_action_time.action_in_proj.": "embed_action_time.action_in_proj.",
-            "embed_action_time.state_proj.": "embed_action_time.state_proj.",
-            "embed_action_time.action_time_mlp_in.": "embed_action_time.action_time_mlp_in.",
-            "embed_action_time.action_time_mlp_out.": "embed_action_time.action_time_mlp_out.",
+            # Vision tower
+            f"{_PWE_PAL}model.vision_tower.vision_model.embeddings.patch_embedding.": "model.vision_tower.patch_embedding.",
+            f"{_PWE_PAL}model.vision_tower.vision_model.encoder.layers.": "model.vision_tower.layers.",
+            f"{_PWE_PAL}model.vision_tower.vision_model.post_layernorm.": "model.vision_tower.post_layernorm.",
+            # Multi-modal projector
+            f"{_PWE_PAL}model.multi_modal_projector.linear.": "model.multi_modal_projector.",
+            # VLM language model
+            f"{_PWE_PAL}model.language_model.layers.": "model.vlm.layers.",
+            f"{_PWE_PAL}model.language_model.norm.": "model.vlm.norm.",
+            # DiT action expert
+            f"{_PWE_EXP}model.layers.": "model.dit.layers.",
+            f"{_PWE_EXP}model.norm.": "model.dit.norm.",
+            # Action embeddings (top-level in checkpoint)
+            "action_in_proj.": "embed_action_time.action_in_proj.",
+            "action_time_mlp_in.": "embed_action_time.action_time_mlp_in.",
+            "action_time_mlp_out.": "embed_action_time.action_time_mlp_out.",
+            "state_proj.": "embed_action_time.state_proj.",
+            # Action output projection
             "action_out_proj.": "action_out_proj.",
         }
 
-        siglip_attn_remap = {
-            ".self_attn.q_proj.": ".self_attn.q_proj.",
-            ".self_attn.k_proj.": ".self_attn.k_proj.",
-            ".self_attn.v_proj.": ".self_attn.v_proj.",
-            ".self_attn.out_proj.": ".self_attn.out_proj.",
-        }
-
-        gemma_layer_remap = {
-            ".self_attn.q_proj.": ".self_attn.q_proj.",
-            ".self_attn.k_proj.": ".self_attn.k_proj.",
-            ".self_attn.v_proj.": ".self_attn.v_proj.",
-            ".self_attn.o_proj.": ".self_attn.o_proj.",
-            ".mlp.gate_proj.": ".mlp.gate_up_proj.",
-            ".mlp.up_proj.": ".mlp.gate_up_proj.",
-            ".mlp.down_proj.": ".mlp.down_proj.",
-        }
+        _POS_EMB_KEY = (
+            f"{_PWE_PAL}model.vision_tower.vision_model."
+            "embeddings.position_embedding.weight"
+        )
+        _VLM_LM_HEAD = f"{_PWE_PAL}lm_head.weight"
 
         params_dict = dict(self.named_parameters())
         for name, buf in self.named_buffers():
@@ -560,10 +586,19 @@ class Pi0Pipeline(nn.Module):
         for name, tensor in weights:
             original_name = name
 
-            if name == "model.vlm.vision_tower.vision_model.embeddings.position_embedding.weight":
+            if name == _POS_EMB_KEY:
                 self.model.vision_tower.position_embedding.data.copy_(
                     tensor.unsqueeze(0) if tensor.ndim == 2 else tensor,
                 )
+                loaded.add(original_name)
+                continue
+
+            if name == _VLM_LM_HEAD:
+                self.model.vlm.embed_tokens.emb.weight.data.copy_(tensor)
+                loaded.add(original_name)
+                continue
+
+            if "lm_head" in name:
                 loaded.add(original_name)
                 continue
 
@@ -577,7 +612,9 @@ class Pi0Pipeline(nn.Module):
             is_up = ".mlp.up_proj." in name
 
             if is_gate or is_up:
-                gate_up_name = mapped.replace(".mlp.gate_proj.", ".mlp.gate_up_proj.").replace(
+                gate_up_name = mapped.replace(
+                    ".mlp.gate_proj.", ".mlp.gate_up_proj.",
+                ).replace(
                     ".mlp.up_proj.", ".mlp.gate_up_proj.",
                 )
                 if gate_up_name in params_dict:
@@ -591,15 +628,18 @@ class Pi0Pipeline(nn.Module):
                     continue
 
             if mapped in params_dict:
-                param = params_dict[mapped]
-                if hasattr(param, "weight_loader"):
-                    param.weight_loader(param, tensor)
+                # Gemma RMSNorm stores weight as offset from 1 (initialized
+                # to zeros, applied as ``x * (1 + w)``).  Our RMSNorm uses
+                # ``x * w``, so we add 1 to compensate.
+                is_gemma_norm = (
+                    mapped.startswith("model.vlm.") or mapped.startswith("model.dit.")
+                ) and mapped.endswith(("layernorm.weight", "norm.weight"))
+                if is_gemma_norm:
+                    params_dict[mapped].data.copy_(tensor + 1.0)
                 else:
-                    param.data.copy_(tensor)
-                loaded.add(original_name)
-            elif "lm_head" in name or "language_model.lm_head" in name:
+                    params_dict[mapped].data.copy_(tensor)
                 loaded.add(original_name)
             else:
-                logger.debug("Skipping unrecognized weight: %s", name)
+                logger.debug("Skipping unrecognized weight: %s -> %s", name, mapped)
 
         return loaded

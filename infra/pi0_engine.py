@@ -113,6 +113,7 @@ class Pi0Engine:
         pixel_attention_mask: torch.Tensor,
         attention_mask: torch.Tensor | None = None,
         params: Pi0SamplingParams | None = None,
+        noise: torch.Tensor | None = None,
     ) -> Pi0Output:
         """Generate action chunk from observation.
 
@@ -123,6 +124,7 @@ class Pi0Engine:
             pixel_attention_mask: (batch, num_cameras) bool mask.
             attention_mask: (batch, seq_len) text mask.
             params: Sampling parameters.
+            noise: Optional pre-generated noise for reproducibility.
 
         Returns:
             Pi0Output with action chunk and timing info.
@@ -130,16 +132,19 @@ class Pi0Engine:
         pipeline = self._get_pipeline()
         params = params or Pi0SamplingParams()
 
-        seed = params.seed if params.seed is not None else self.seed
-        generator = torch.Generator(device=self.device).manual_seed(seed)
-        noise = torch.randn(
-            state.shape[0],
-            pipeline.config.chunk_size,
-            pipeline.config.max_action_dim,
-            generator=generator,
-            dtype=self.dtype,
-            device=self.device,
-        )
+        if noise is None:
+            seed = params.seed if params.seed is not None else self.seed
+            generator = torch.Generator(device=self.device).manual_seed(seed)
+            noise = torch.randn(
+                state.shape[0],
+                pipeline.config.chunk_size,
+                pipeline.config.max_action_dim,
+                generator=generator,
+                dtype=self.dtype,
+                device=self.device,
+            )
+        else:
+            noise = noise.to(device=self.device, dtype=self.dtype)
 
         state = state.to(device=self.device, dtype=self.dtype)
         input_ids = input_ids.to(device=self.device)

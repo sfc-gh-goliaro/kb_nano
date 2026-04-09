@@ -18,11 +18,7 @@ import torch
 import torch.nn as nn
 
 from ..L1.dense_attention import DenseAttention
-from .parallel_linear import (
-    ColumnParallelLinear,
-    QKVParallelLinear,
-    RowParallelLinear,
-)
+from ..L1.linear import Linear
 
 
 def _rotate_half(x: torch.Tensor) -> torch.Tensor:
@@ -50,6 +46,34 @@ def _apply_rotary_pos_emb(
     q_embed = (q * cos) + (_rotate_half(q) * sin)
     k_embed = (k * cos) + (_rotate_half(k) * sin)
     return q_embed, k_embed
+
+
+def build_pi0_dit_attn_bias(
+    prefix_len: int,
+    suffix_len: int,
+    batch: int,
+    device: torch.device,
+) -> torch.Tensor:
+    """Blockwise attention bias matching HF ``PI0Model`` (kv_block <= q_block).
+
+    Returns a tensor of shape ``(batch, 1, suffix_len, prefix_len + suffix_len)``
+    suitable for :func:`torch.nn.functional.scaled_dot_product_attention``.
+    """
+    total_kv = prefix_len + suffix_len
+    k_idx = torch.arange(total_kv, device=device, dtype=torch.float32).view(1, 1, total_kv)
+    q_idx = torch.arange(
+        prefix_len, prefix_len + suffix_len, device=device, dtype=torch.float32,
+    ).view(1, suffix_len, 1)
+    bk = (k_idx > prefix_len).to(torch.float32)
+    bq = (q_idx > prefix_len).to(torch.float32)
+    invalid = bk > bq
+    neg_inf = torch.finfo(torch.float32).min
+    bias = torch.where(
+        invalid,
+        torch.full_like(invalid, neg_inf, dtype=torch.float32),
+        torch.zeros_like(invalid, dtype=torch.float32),
+    )
+    return bias.expand(batch, -1, -1).unsqueeze(1).contiguous()
 
 
 class GemmaRotaryEmbedding(nn.Module):
@@ -106,18 +130,10 @@ class GemmaDenseAttention(nn.Module):
         self.head_dim = head_dim
         self.num_kv_groups = num_heads // num_kv_heads
 
-        self.q_proj = ColumnParallelLinear(
-            hidden_size, num_heads * head_dim, bias=False,
-        )
-        self.k_proj = ColumnParallelLinear(
-            hidden_size, num_kv_heads * head_dim, bias=False,
-        )
-        self.v_proj = ColumnParallelLinear(
-            hidden_size, num_kv_heads * head_dim, bias=False,
-        )
-        self.o_proj = RowParallelLinear(
-            num_heads * head_dim, hidden_size, bias=False,
-        )
+        self.q_proj = Linear(hidden_size, num_heads * head_dim, bias=False)
+        self.k_proj = Linear(hidden_size, num_kv_heads * head_dim, bias=False)
+        self.v_proj = Linear(hidden_size, num_kv_heads * head_dim, bias=False)
+        self.o_proj = Linear(num_heads * head_dim, hidden_size, bias=False)
         self.attn = DenseAttention()
 
     def forward(
@@ -127,14 +143,19 @@ class GemmaDenseAttention(nn.Module):
         sin: torch.Tensor,
         attention_mask: torch.Tensor | None = None,
         kv_cache: tuple[torch.Tensor, torch.Tensor] | None = None,
+        causal: bool = False,
     ) -> tuple[torch.Tensor, tuple[torch.Tensor, torch.Tensor]]:
         """
         Args:
             hidden_states: (batch, seq, hidden_size)
             cos, sin: (batch, seq, head_dim) RoPE embeddings for current positions.
-            attention_mask: Optional 4D mask (batch, 1, q_seq, kv_seq).
+            attention_mask: Optional additive mask for SDPA, shape
+                ``(batch, 1, q_seq, kv_seq)`` (e.g. Pi0 DiT block mask).
+                When provided, ``causal`` is ignored.
             kv_cache: Optional (cached_k, cached_v) each
                       (batch, cached_len, num_kv_heads, head_dim).
+            causal: Use causal (lower-triangular) masking. Ignored when
+                ``attention_mask`` is not None.
 
         Returns:
             output: (batch, seq, hidden_size)
@@ -164,7 +185,13 @@ class GemmaDenseAttention(nn.Module):
             ).reshape(bsz, v.shape[1], self.num_heads, self.head_dim)
 
         scale = self.head_dim ** -0.5
-        out = self.attn(q, k, v, softmax_scale=scale, causal=False)
+        use_causal = causal and attention_mask is None
+        out = self.attn(
+            q, k, v,
+            softmax_scale=scale,
+            causal=use_causal,
+            attn_mask=attention_mask,
+        )
 
         out = out.reshape(bsz, seq_len, -1)
         return self.o_proj(out), new_kv
