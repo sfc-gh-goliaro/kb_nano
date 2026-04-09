@@ -1,7 +1,7 @@
 #!/usr/bin/env python3
 """
 Throughput, latency, and correctness benchmark: kb-nano vs timm
-for vision encoder models (SigLIP-2, DINOv3, SwinV2).
+for vision encoder models (SigLIP-2, DINOv3, SwinV2, MobileNetV4).
 
 Runs standardized vision encoder workloads and compares:
   - Throughput: images/sec at default and high resolution
@@ -26,6 +26,7 @@ Usage:
     python tests/bench_timm.py --model facebook/dinov3-vit7b16-pretrain-lvd1689m
     python tests/bench_timm.py --model timm/swinv2_large_window12_192.ms_in22k
     python tests/bench_timm.py --model google/siglip2-so400m-patch16-naflex --skip-timm
+    python tests/bench_timm.py --model timm/mobilenetv4_conv_medium.e500_r256_in1k
     python tests/bench_timm.py --model google/siglip2-so400m-patch16-naflex --dataset food101 --dataset-split validation
 """
 
@@ -90,6 +91,16 @@ MODEL_REGISTRY = {
         "image_std": [0.229, 0.224, 0.225],
         "default_num_images": 5000,
         "strict_img_size": False,
+    },
+    "timm/mobilenetv4_conv_medium.e500_r256_in1k": {
+        "timm_name": "mobilenetv4_conv_medium.e500_r256_in1k",
+        "kb_module": "mobilenetv4",
+        "kb_class": "MobileNetV4Model",
+        "default_resolution": 256,
+        "short_name": "mobilenetv4-conv-medium",
+        "image_mean": [0.485, 0.456, 0.406],
+        "image_std": [0.229, 0.224, 0.225],
+        "default_num_images": 5000,
     },
 }
 
