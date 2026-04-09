@@ -546,22 +546,29 @@ Latency (448 output tokens, 5 iterations):
 
 ### Qwen3-VL FP8 (W8A8 block-quantized)
 
-FP8 support uses `Qwen/Qwen3-VL-8B-Instruct-FP8` with block-scaled FP8 GEMM via DeepGEMM. Vision encoder and lm_head remain in BF16; only LLM decoder layers use FP8.
+FP8 support uses block-scaled FP8 GEMM via DeepGEMM. Vision encoder and lm_head remain in BF16; only LLM decoder layers use FP8.
 
 Throughput (1000 sequences per scenario, `temperature=0`, `max_model_len=16896`):
 
 | Model | TP | Scenario | Output | vLLM (tok/s) | Ours (tok/s) | Ratio | Avg Match Tokens |
 |-------|---:|----------|-------:|-------------:|-------------:|------:|-----------------:|
-| Qwen3-VL-8B-FP8 | 1 | text-only | 1024 | 22,921 | 19,951 | **0.87x** | 765.3/1024 |
-| Qwen3-VL-8B-FP8 | 1 | image     |  512 | 15,963 | 13,308 | **0.83x** |   73.2/512 |
-| Qwen3-VL-8B-FP8 | 1 | video     |  512 |  4,148 |  8,842 | **2.13x** | 102.1/512 |
+| Qwen3-VL-8B-FP8 | 1 | text-only | 1024 |  8,138 | 10,350 | **1.27x** | 795.6/1024 |
+| Qwen3-VL-8B-FP8 | 1 | image     |  512 |  7,761 |  7,863 | **1.01x** |  16.2/512 |
+| Qwen3-VL-8B-FP8 | 1 | video     |  512 |  2,195 |  6,071 | **2.77x** |  57.7/512 |
+| Qwen3-VL-30B-FP8 (MoE) | 1 | image |  512 | 10,598 |  7,612 | 0.72x |  60.8/512 |
+| Qwen3-VL-235B-FP8 (MoE) | 4 | text-only | 1024 | 8,262 | 8,213 | 0.99x | 418.5/1024 |
+| Qwen3-VL-235B-FP8 (MoE) | 4 | image     |  512 | 6,578 | 4,809 | 0.73x |  94.8/512 |
+| Qwen3-VL-235B-FP8 (MoE) | 4 | video     |  512 | 1,581 | 4,675 | **2.96x** |  77.1/512 |
 
 Latency (batch size 1, 128 output tokens, 5 iterations):
 
 | Model | TP | Scenario | vLLM median | Ours median | Ratio |
 |-------|---:|----------|------------:|------------:|------:|
-| Qwen3-VL-8B-FP8 | 1 | single-image | 0.516s | 0.528s | **0.98x** |
-| Qwen3-VL-8B-FP8 | 1 | single-video | 0.557s | 0.541s | **1.03x** |
+| Qwen3-VL-8B-FP8 | 1 | single-image | 0.560s | 0.728s | 0.77x |
+| Qwen3-VL-8B-FP8 | 1 | single-video | 0.724s | 0.731s | 0.99x |
+| Qwen3-VL-30B-FP8 (MoE) | 1 | single-image | 0.682s | 0.777s | 0.88x |
+| Qwen3-VL-235B-FP8 (MoE) | 4 | single-image | 1.433s | 1.808s | 0.79x |
+| Qwen3-VL-235B-FP8 (MoE) | 4 | single-video | 1.882s | 1.768s | **1.06x** |
 
 FP8 activation quantization uses a custom Triton kernel for single-launch per-token-group UE8M0 quantization. Pre-allocated shared prefill buffers eliminate dynamic allocation during FP8 prefill, and DeepGEMM is JIT-warmed for both decode and prefill batch sizes. The remaining throughput gap vs vLLM is primarily from vLLM's `torch.compile` + Inductor fusion passes (RMSNorm+quant, SiLU+quant).
 

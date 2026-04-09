@@ -25,6 +25,7 @@ dependencies = [
     "sam3 @ git+https://github.com/sfc-gh-goliaro/sam3.git",
     "pycocotools",
     "timm",
+    "fastsafetensors",
 ]
 
 [project.optional-dependencies]
