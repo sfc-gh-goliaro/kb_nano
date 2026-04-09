@@ -137,7 +137,7 @@ A standalone, high-performance inference engine supporting **LLMs** (Llama 3.1, 
     ├── bench_vllm.py           # Multi-scenario throughput + latency + alignment benchmark vs vLLM
     ├── bench_vllm_omni.py     # Diffusion (FLUX / HunyuanVideo) and TTS (CosyVoice3) benchmark: kb-nano vs vllm-omni
     ├── bench_diffusers.py     # SDXL diffusion benchmark: kb-nano vs diffusers + torch.compile
-    ├── bench_timm.py          # Vision encoder benchmark: kb-nano vs timm (SigLIP-2, DINOv3)
+    ├── bench_timm.py          # Vision encoder benchmark: kb-nano vs timm (SigLIP-2, DINOv3, SwinV2)
     ├── test_sam.py            # SAM3 segmentation benchmark: kb-nano vs facebook/sam3 reference
     ├── utils/                  # Post-processing and visualization
     │   └── parse_vllm_bench_results.py  # Generate tables and plots from bench_vllm.py results
@@ -235,15 +235,25 @@ python tests/bench_diffusers.py --output-dir tests/results/B200/stable-diffusion
 
 ### Benchmarking vs timm (Vision Encoders)
 
+Supported models:
+
+| Short Name | Model ID |
+|------------|----------|
+| SigLIP-2 | `google/siglip2-so400m-patch16-naflex` |
+| DINOv3 | `facebook/dinov3-vit7b16-pretrain-lvd1689m` |
+| SwinV2 | `timm/swinv2_large_window12_192.ms_in22k` |
+
 ```bash
-# SigLIP-2: throughput + latency + correctness benchmark vs timm (ImageNet-1K validation)
+# Run a single model benchmark (throughput + latency + correctness vs timm)
 python tests/bench_timm.py --model google/siglip2-so400m-patch16-naflex
-
-# DINOv3: throughput + latency + correctness benchmark vs timm
 python tests/bench_timm.py --model facebook/dinov3-vit7b16-pretrain-lvd1689m
-
-# SwinV2: throughput + latency + correctness benchmark vs timm (ImageNet-1K validation)
 python tests/bench_timm.py --model timm/swinv2_large_window12_192.ms_in22k
+
+# Run all three in parallel on separate GPUs
+CUDA_VISIBLE_DEVICES=0 python tests/bench_timm.py --model timm/swinv2_large_window12_192.ms_in22k &
+CUDA_VISIBLE_DEVICES=1 python tests/bench_timm.py --model facebook/dinov3-vit7b16-pretrain-lvd1689m &
+CUDA_VISIBLE_DEVICES=2 python tests/bench_timm.py --model google/siglip2-so400m-patch16-naflex &
+wait
 
 # kb-nano only (skip timm comparison)
 python tests/bench_timm.py --model google/siglip2-so400m-patch16-naflex --skip-timm
@@ -696,7 +706,7 @@ Correctness is measured in eager mode with bf16 precision. Both engines use iden
 
 ### SigLIP-2 (Vision Encoder)
 
-Run `tests/bench_timm.py --model google/siglip2-so400m-patch16-naflex` to reproduce. 40,000 unique images from ImageNet-1K validation (ILSVRC/imagenet-1k), loaded via streaming and preprocessed with Inception normalization (mean/std=0.5). Each image processed exactly once. Reference engine: timm (pytorch-image-models).
+Run `tests/bench_timm.py --model google/siglip2-so400m-patch16-naflex` to reproduce. 10,000 unique images from ImageNet-1K validation (ILSVRC/imagenet-1k), loaded via streaming and preprocessed with Inception normalization (mean/std=0.5). Each image processed exactly once. Reference engine: timm (pytorch-image-models).
 
 **Hardware: NVIDIA H200**
 
@@ -704,55 +714,26 @@ Throughput (images/sec, bf16):
 
 | Scenario | Resolution | Images | timm (img/s) | Ours (img/s) | Ratio |
 |----------|:----------:|-------:|-------------:|-------------:|------:|
-| default-res | 384x384 | 40,000 | 833 | 788 | 0.95x |
-| high-res    | 512x512 | 40,000 | 459 | 403 | 0.88x |
+| default-res | 384x384 | 10,000 | 927 | 832 | 0.90x |
+| high-res    | 512x512 | 10,000 | 512 | 494 | 0.96x |
 
-Latency (median of 50 iterations, bf16):
-
-| Scenario | Batch | timm p50 | Ours p50 | Ratio |
-|----------|------:|---------:|---------:|------:|
-| single-image | 1 | 5.1 ms | 6.7 ms | 0.76x |
-| batch-8 | 8 | 9.9 ms | 13.5 ms | 0.73x |
-
-Correctness (per-batch embedding cosine similarity):
-
-| Scenario | Batches | Mean CosSim | Min CosSim | Result |
-|----------|--------:|------------:|-----------:|-------:|
-| default-res | 16 | 0.998 | 0.998 | PASS |
-| high-res | 16 | 0.998 | 0.997 | PASS |
-
-### DINOv3 (Vision Encoder)
-
-Run `tests/bench_timm.py --model facebook/dinov3-vit7b16-pretrain-lvd1689m` to reproduce. 3,000 unique images from ImageNet-1K validation, loaded via streaming and preprocessed with ImageNet normalization (mean=[0.485,0.456,0.406], std=[0.229,0.224,0.225]). Each image processed exactly once. Reference engine: timm (pytorch-image-models).
-
-**Hardware: NVIDIA H200**
-
-Throughput (images/sec, bf16):
-
-| Scenario | Resolution | Images | timm (img/s) | Ours (img/s) | Ratio |
-|----------|:----------:|-------:|-------------:|-------------:|------:|
-| default-res | 256x256 | 3,000 | 131 | 131 | **1.00x** |
-| high-res    | 512x512 | 3,000 |  32 |  32 | **1.00x** |
-
-Latency (median of 50 iterations, bf16):
+Latency (median of 30 iterations, bf16):
 
 | Scenario | Batch | timm p50 | Ours p50 | Ratio |
 |----------|------:|---------:|---------:|------:|
-| single-image | 1 | 14.6 ms | 15.8 ms | 0.92x |
-| batch-8 | 8 | 63.8 ms | 63.7 ms | **1.00x** |
+| single-image | 1 | 5.2 ms | 4.7 ms | **1.10x** |
+| batch-8 | 8 | 9.9 ms | 9.8 ms | **1.01x** |
 
 Correctness (per-batch embedding cosine similarity):
 
 | Scenario | Batches | Mean CosSim | Min CosSim | Result |
 |----------|--------:|------------:|-----------:|-------:|
 | default-res | 16 | 1.000 | 1.000 | PASS |
-| high-res | 16 | 1.000 | 1.000 | PASS |
+| high-res | 32 | 1.000 | 1.000 | PASS |
 
-DINOv3 produces bit-identical embeddings to timm (perfect 1.000 cosine similarity, zero MSE).
+### DINOv3 (Vision Encoder)
 
-### SwinV2 (Vision Encoder)
-
-Run `tests/bench_timm.py --model timm/swinv2_large_window12_192.ms_in22k` to reproduce. 10,000 unique images from ImageNet-1K validation (ILSVRC/imagenet-1k), loaded via streaming and preprocessed with ImageNet normalization (mean=[0.485,0.456,0.406], std=[0.229,0.224,0.225]). Each image processed exactly once. Reference engine: timm (pytorch-image-models).
+Run `tests/bench_timm.py --model facebook/dinov3-vit7b16-pretrain-lvd1689m` to reproduce. 1,500 unique images from ImageNet-1K validation, loaded via streaming and preprocessed with ImageNet normalization (mean=[0.485,0.456,0.406], std=[0.229,0.224,0.225]). Each image processed exactly once. Reference engine: timm (pytorch-image-models).
 
 **Hardware: NVIDIA H200**
 
@@ -760,15 +741,44 @@ Throughput (images/sec, bf16):
 
 | Scenario | Resolution | Images | timm (img/s) | Ours (img/s) | Ratio |
 |----------|:----------:|-------:|-------------:|-------------:|------:|
-| default-res | 192x192 | 10,000 | 1,830 | 1,844 | **1.01x** |
-| high-res    | 512x512 | 10,000 |   254 |   254 | **1.00x** |
+| default-res | 256x256 | 1,500 | 133 | 131 | 0.98x |
+| high-res    | 512x512 | 1,500 |  33 |  33 | 0.99x |
 
-Latency (median of 50 iterations, bf16):
+Latency (median of 30 iterations, bf16):
 
 | Scenario | Batch | timm p50 | Ours p50 | Ratio |
 |----------|------:|---------:|---------:|------:|
-| single-image | 1 | 13.5 ms | 13.1 ms | **1.03x** |
-| batch-8 | 8 | 14.0 ms | 13.7 ms | **1.02x** |
+| single-image | 1 | 16.4 ms | 14.0 ms | **1.17x** |
+| batch-8 | 8 | 64.5 ms | 64.3 ms | **1.00x** |
+
+Correctness (per-batch embedding cosine similarity):
+
+| Scenario | Batches | Mean CosSim | Min CosSim | Result |
+|----------|--------:|------------:|-----------:|-------:|
+| default-res | 16 | 1.000 | 1.000 | PASS |
+| high-res | 32 | 1.000 | 1.000 | PASS |
+
+DINOv3 produces bit-identical embeddings to timm (perfect 1.000 cosine similarity, zero MSE).
+
+### SwinV2 (Vision Encoder)
+
+Run `tests/bench_timm.py --model timm/swinv2_large_window12_192.ms_in22k` to reproduce. 5,000 unique images from ImageNet-1K validation (ILSVRC/imagenet-1k), loaded via streaming and preprocessed with ImageNet normalization (mean=[0.485,0.456,0.406], std=[0.229,0.224,0.225]). Each image processed exactly once. Reference engine: timm (pytorch-image-models).
+
+**Hardware: NVIDIA H200**
+
+Throughput (images/sec, bf16):
+
+| Scenario | Resolution | Images | timm (img/s) | Ours (img/s) | Ratio |
+|----------|:----------:|-------:|-------------:|-------------:|------:|
+| default-res | 192x192 | 5,000 | 1,287 | 1,763 | **1.37x** |
+| high-res    | 512x512 | 5,000 |   250 |   244 | 0.97x |
+
+Latency (median of 30 iterations, bf16):
+
+| Scenario | Batch | timm p50 | Ours p50 | Ratio |
+|----------|------:|---------:|---------:|------:|
+| single-image | 1 | 12.7 ms | 14.9 ms | 0.86x |
+| batch-8 | 8 | 13.3 ms | 14.9 ms | 0.89x |
 
 Correctness (per-batch embedding cosine similarity):
 
