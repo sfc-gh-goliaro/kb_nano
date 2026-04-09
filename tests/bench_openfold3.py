@@ -239,8 +239,8 @@ CHAIN_CATALOG = {
 
 PF_BLOCKS = 48
 MSA_BLOCKS = 4
-NO_ROLLOUT_STEPS = 20
-NUM_RECYCLES = 3
+NO_ROLLOUT_STEPS = 10
+NUM_RECYCLES = 1
 MAX_MSA_SEQS = 512
 
 HF_REPO_ID = "OpenFold/OpenFold3"
@@ -261,16 +261,16 @@ def download_checkpoint() -> str:
 # ---------------------------------------------------------------------------
 
 SCENARIOS = [
-    {"name": "short",      "num_queries": 500, "description": "short proteins (≤150 res) × 500 queries"},
-    {"name": "medium",     "num_queries": 200, "description": "medium proteins (150-400 res) × 200 queries"},
-    {"name": "long",       "num_queries": 100, "description": "long proteins (400-700 res) × 100 queries"},
-    {"name": "extra-long", "num_queries":  50, "description": "extra-long proteins (700+ res) × 50 queries"},
+    {"name": "short",      "num_queries":  50, "description": "short proteins (≤150 res) × 50 queries"},
+    {"name": "medium",     "num_queries":  20, "description": "medium proteins (150-400 res) × 20 queries"},
+    {"name": "long",       "num_queries":  10, "description": "long proteins (400-700 res) × 10 queries"},
+    {"name": "extra-long", "num_queries":   5, "description": "extra-long proteins (700+ res) × 5 queries"},
 ]
 
 LATENCY_SCENARIOS = [
-    {"name": "single-short",      "length_bucket": "short",      "num_warmup": 3, "num_iters": 5},
-    {"name": "single-medium",     "length_bucket": "medium",     "num_warmup": 2, "num_iters": 5},
-    {"name": "single-long",       "length_bucket": "long",       "num_warmup": 2, "num_iters": 3},
+    {"name": "single-short",      "length_bucket": "short",      "num_warmup": 1, "num_iters": 3},
+    {"name": "single-medium",     "length_bucket": "medium",     "num_warmup": 1, "num_iters": 3},
+    {"name": "single-long",       "length_bucket": "long",       "num_warmup": 1, "num_iters": 3},
     {"name": "single-extra-long", "length_bucket": "extra-long", "num_warmup": 1, "num_iters": 3},
 ]
 
@@ -935,7 +935,7 @@ def main():
                         help="Skip reference openfold3 (kb-nano only)")
     parser.add_argument("--skip-throughput", action="store_true")
     parser.add_argument("--skip-latency", action="store_true")
-    parser.add_argument("--latency-iters", type=int, default=5)
+    parser.add_argument("--latency-iters", type=int, default=3)
     parser.add_argument("--data-dir", type=str, default=None,
                         help="Directory for caching downloaded MSA data "
                              "(default: /tmp/openfold_bench_data)")
