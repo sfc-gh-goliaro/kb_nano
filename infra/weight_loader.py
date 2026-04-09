@@ -803,6 +803,12 @@ def load_model(
             "kb_nano.infra.tts_engine.TTSEngine, "
             "not the LLM load_model() path."
         )
+    if model_type == "pi0":
+        raise ValueError(
+            "Pi0 robotics VLA models should be loaded via "
+            "kb_nano.infra.pi0_engine.Pi0Engine, "
+            "not the LLM load_model() path."
+        )
     if model_type == "whisper":
         config = WhisperConfig.from_pretrained(model_name)
         config.dtype = dtype

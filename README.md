@@ -1,6 +1,6 @@
 # kb-nano
 
-A standalone, high-performance inference engine supporting **LLMs** (Llama 3.1, Mixtral-8x7B, Qwen2-VL, Qwen3-VL), **diffusion models** (FLUX.1-dev, SDXL, HunyuanVideo-1.5), **segmentation models** (SAM3.1), audio models (Whisper), and **TTS models** (CosyVoice3) with tensor parallelism. No vLLM dependency at runtime — just PyTorch, Triton, and Flash Attention.
+A standalone, high-performance inference engine supporting **LLMs** (Llama 3.1, Mixtral-8x7B, Qwen2-VL, Qwen3-VL), **diffusion models** (FLUX.1-dev, SDXL, HunyuanVideo-1.5), **segmentation models** (SAM3.1), audio models (Whisper), **TTS models** (CosyVoice3), and **robotics VLA models** (Pi0) with tensor parallelism. No vLLM dependency at runtime — just PyTorch, Triton, and Flash Attention.
 
 ## Features
 
@@ -13,6 +13,7 @@ A standalone, high-performance inference engine supporting **LLMs** (Llama 3.1, 
 - **SAM3.1** (facebook/sam3.1) image/video segmentation with ViT backbone, fusion encoder, detection decoder, and segmentation head
 - **Whisper** (large-v3) encoder-decoder speech-to-text with batched inference and paged cross-attention KV cache
 - **CosyVoice3** (Fun-CosyVoice3-0.5B-2512) text-to-speech with flow matching DiT + HiFi-GAN vocoder
+- **Pi0** (lerobot/pi0_base) vision-language-action robotics model with SigLIP vision encoder, PaliGemma VLM backbone, Gemma 300M action expert, and flow-matching action generation (10-step Euler ODE)
 - **Tensor parallelism** (TP) with custom IPC-based all-reduce for multi-GPU inference
 - **Paged KV cache** with Triton store kernels (LLM models)
 - **CUDA graph capture** for decode steps (LLM models)
@@ -118,6 +119,7 @@ A standalone, high-performance inference engine supporting **LLMs** (Llama 3.1, 
     ├── bench_vllm.py           # Multi-scenario throughput + latency + alignment benchmark vs vLLM
     ├── bench_vllm_omni.py     # Diffusion (FLUX / HunyuanVideo) and TTS (CosyVoice3) benchmark: kb-nano vs vllm-omni
     ├── bench_diffusers.py     # SDXL diffusion benchmark: kb-nano vs diffusers + torch.compile
+    ├── bench_openpi.py        # Pi0 robotics VLA benchmark: kb-nano vs HF Transformers PI0
     ├── test_sam.py            # SAM3 segmentation benchmark: kb-nano vs facebook/sam3 reference
     ├── utils/                  # Post-processing and visualization
     │   └── parse_vllm_bench_results.py  # Generate tables and plots from bench_vllm.py results
@@ -211,6 +213,22 @@ python tests/bench_diffusers.py --skip-diffusers
 
 # Save results to a specific directory
 python tests/bench_diffusers.py --output-dir tests/results/B200/stable-diffusion-xl-base-1.0
+```
+
+### Benchmarking vs OpenPI / HF Transformers (Pi0 Robotics VLA)
+
+```bash
+# Pi0: throughput + latency + correctness benchmark vs HF Transformers PI0
+python tests/bench_openpi.py --model lerobot/pi0_base
+
+# kb-nano only (skip openpi comparison)
+python tests/bench_openpi.py --skip-openpi
+
+# Quick test with fewer requests
+python tests/bench_openpi.py --num-requests 10 --num-steps 10
+
+# Save results to a specific directory
+python tests/bench_openpi.py --output-dir tests/results/B200/pi0_base
 ```
 
 ### Benchmarking vs facebook/sam3 (Segmentation)
