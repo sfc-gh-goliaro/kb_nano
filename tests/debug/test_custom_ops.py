@@ -30,7 +30,7 @@ def test_custom_ops(model_name: str, tp: int = 1):
         enable_custom_ops,
         disable_custom_ops,
     )
-    from kb_nano.infra.custom_ops import ensure_custom_ops_registered
+    from kb_nano.infra.compilation import ensure_custom_ops_registered
 
     print(f"Loading {model_name} (TP={tp}, enforce_eager=True)...")
     engine = LlamaEngine(

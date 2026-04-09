@@ -1858,8 +1858,7 @@ class ModelRunner:
         outside the compiled graph and passes it in, so the compiled
         graph only ever traces the inputs_embeds branch.
         """
-        from .compilation import compile_model
-        from .passes import configure_post_grad_passes
+        from .compilation import compile_model, configure_post_grad_passes
 
         configure_post_grad_passes()
         if self.is_qwen_vl:

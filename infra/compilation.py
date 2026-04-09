@@ -1,7 +1,9 @@
 """Standalone torch.compile integration adapted from vLLM's compilation stack.
 
-Implements the same compilation flow as vLLM's ``VllmBackend`` +
-``PiecewiseBackend``:
+Consolidates custom op registration, CUDA graph capture/replay, Inductor
+post-grad passes, and the piecewise compilation backend into a single module.
+
+Compilation flow:
 
 1. ``mark_dynamic`` marks batch dimensions as symbolic before the first
    ``torch.compile`` call.
@@ -27,23 +29,324 @@ import logging
 import operator
 from collections import defaultdict
 from collections.abc import Callable
-from contextlib import ExitStack
+from contextlib import ExitStack, nullcontext
 from typing import Any
 from unittest.mock import patch
 
 import torch
 import torch.fx as fx
+import torch._inductor.custom_graph_pass
 
-from .context import CUDAGraphMode, enable_custom_ops
-from .cuda_graph import CUDAGraphWrapper
-from .custom_ops import SPLITTING_OPS, ensure_custom_ops_registered
+from .context import CUDAGraphMode, enable_custom_ops, get_context, get_no_compile_layers
 
 logger = logging.getLogger(__name__)
 
 
-# ---------------------------------------------------------------------------
+# ===================================================================
+# Custom op registrations for torch.compile boundaries
+# ===================================================================
+#
+# Registers opaque custom ops for attention so that torch.compile
+# (Inductor) does not trace into paged-KV attention kernels.  At
+# runtime, the ops look up the actual nn.Module from the global
+# ``no_compile_layers`` registry and call its implementation.
+#
+# Matching vLLM's default for Qwen3-VL-235B-FP8: splitting_ops
+# contains only attention ops.  MoE is NOT a splitting op — the MoE
+# forward is transparent to Inductor (it appears as opaque nodes within
+# a compiled piece, not as a graph boundary).  This lets Inductor
+# optimize the code around MoE (norms, linears) within the same
+# compiled subgraph.
+#
+# MoE custom ops are still registered (for use when MoE needs to be
+# opaque, e.g. expert parallelism), but they are not in SPLITTING_OPS
+# by default.
+
+SPLITTING_OPS: list[str] = [
+    "kb_nano::unified_attention",
+]
+
+
+def _moe_forward_impl(
+    hidden_states: torch.Tensor,
+    layer_name: str,
+) -> torch.Tensor:
+    layer = get_no_compile_layers()[layer_name]
+    return layer.forward_impl(hidden_states)
+
+
+def _moe_forward_fake(
+    hidden_states: torch.Tensor,
+    layer_name: str,
+) -> torch.Tensor:
+    return torch.empty_like(hidden_states)
+
+
+def _unified_attention_impl(
+    query: torch.Tensor,
+    key: torch.Tensor,
+    value: torch.Tensor,
+    layer_name: str,
+) -> torch.Tensor:
+    layer = get_no_compile_layers()[layer_name]
+    return layer.forward_impl(query, key, value)
+
+
+def _unified_attention_fake(
+    query: torch.Tensor,
+    key: torch.Tensor,
+    value: torch.Tensor,
+    layer_name: str,
+) -> torch.Tensor:
+    return torch.empty_like(query)
+
+
+_registered = False
+
+
+def ensure_custom_ops_registered() -> None:
+    """Register the custom ops with torch.library (idempotent)."""
+    global _registered
+    if _registered:
+        return
+    _registered = True
+
+    lib = torch.library.Library("kb_nano", "DEF")
+
+    lib.define(
+        "moe_forward(Tensor hidden_states, str layer_name) -> Tensor"
+    )
+    lib.impl("moe_forward", _moe_forward_impl, "CUDA")
+    lib.impl("moe_forward", _moe_forward_impl, "CPU")
+
+    abstract_lib = torch.library.Library("kb_nano", "IMPL", "Meta")
+    abstract_lib.impl("moe_forward", _moe_forward_fake)
+
+    lib.define(
+        "unified_attention(Tensor query, Tensor key, Tensor value, "
+        "str layer_name) -> Tensor"
+    )
+    lib.impl("unified_attention", _unified_attention_impl, "CUDA")
+    lib.impl("unified_attention", _unified_attention_impl, "CPU")
+    abstract_lib.impl("unified_attention", _unified_attention_fake)
+
+    # Keep references alive for the lifetime of the process.
+    ensure_custom_ops_registered._lib = lib  # type: ignore[attr-defined]
+    ensure_custom_ops_registered._abstract_lib = abstract_lib  # type: ignore[attr-defined]
+
+
+# ===================================================================
+# CUDA graph capture and replay
+# ===================================================================
+#
+# ``CUDAGraphWrapper`` wraps a callable (typically a compiled subgraph)
+# and transparently captures / replays CUDA graphs keyed by batch size.
+# Dispatch is controlled by ``Context.cudagraph_runtime_mode`` and the
+# wrapper's own ``runtime_mode``:
+#
+#   - If context mode is ``NONE`` -> fall through (no graph).
+#   - If context mode **does not match** ``self.runtime_mode`` -> fall through.
+#   - If context mode **matches** -> capture (first time) or replay (cached).
+#
+# This mode-matching is critical for FULL_AND_PIECEWISE operation
+# (vLLM's default for decode): piecewise wrappers only activate for
+# PIECEWISE mode, while the engine's full-model graph only activates
+# for FULL mode.
+
+@dataclasses.dataclass
+class _CUDAGraphEntry:
+    cudagraph: torch.cuda.CUDAGraph
+    output: torch.Tensor
+
+
+class CUDAGraphWrapper(torch.nn.Module):
+    """Wrap a callable with per-batch-size CUDA graph capture/replay.
+
+    Inherits ``nn.Module`` so it can be assigned as a submodule of the
+    FX split graph (``setattr(split_gm, submod_name, wrapper)``).
+
+    Parameters
+    ----------
+    runnable : callable
+        The function to capture (e.g. compiled model forward).
+    runtime_mode : CUDAGraphMode
+        Which mode this wrapper responds to.  A PIECEWISE wrapper only
+        captures/replays when context says PIECEWISE; a FULL wrapper only
+        when context says FULL.  Defaults to PIECEWISE (for subgraph wrapping).
+    graph_pool : optional
+        Shared ``torch.cuda.graph_pool_handle()`` for memory reuse.
+    capture_context : optional
+        Context manager to enter during capture (e.g. ``custom_ar.capture()``).
+    """
+
+    def __init__(
+        self,
+        runnable,
+        runtime_mode: CUDAGraphMode = CUDAGraphMode.PIECEWISE,
+        graph_pool=None,
+        capture_context=None,
+    ):
+        super().__init__()
+        self.runnable = runnable
+        self.runtime_mode = runtime_mode
+        self.graph_pool = graph_pool
+        self.capture_context = capture_context
+        self._cache: dict[int, _CUDAGraphEntry] = {}
+
+    @property
+    def captured_sizes(self) -> list[int]:
+        return sorted(self._cache.keys())
+
+    def forward(self, *args, **kwargs) -> torch.Tensor:
+        ctx = get_context()
+        mode = ctx.cudagraph_runtime_mode
+
+        if mode == CUDAGraphMode.NONE or mode != self.runtime_mode:
+            return self.runnable(*args, **kwargs)
+
+        bs = ctx.batch_size_for_graph
+        entry = self._cache.get(bs)
+
+        if entry is None:
+            entry = self._capture(bs, *args, **kwargs)
+            return entry.output
+
+        entry.cudagraph.replay()
+        return entry.output
+
+    def _capture(self, bs: int, *args, **kwargs) -> _CUDAGraphEntry:
+        logger.debug("Capturing %s CUDA graph for batch_size=%d",
+                     self.runtime_mode.name, bs)
+        cap_ctx = self.capture_context or nullcontext()
+
+        with cap_ctx:
+            self.runnable(*args, **kwargs)
+
+            graph = torch.cuda.CUDAGraph()
+            with torch.cuda.graph(graph, pool=self.graph_pool):
+                output = self.runnable(*args, **kwargs)
+
+            if self.graph_pool is None:
+                self.graph_pool = graph.pool()
+
+        entry = _CUDAGraphEntry(cudagraph=graph, output=output)
+        self._cache[bs] = entry
+        torch.cuda.synchronize()
+        return entry
+
+
+# ===================================================================
+# Inductor post-grad passes
+# ===================================================================
+#
+# With the dual-dispatch architecture (forward_native for compiled
+# path, forward_cuda for eager), Inductor sees pure PyTorch code for
+# norms and activations.  This means Inductor's own fusion engine
+# handles most optimizations automatically (e.g., fusing RMSNorm with
+# adjacent quant, eliminating intermediate tensors).
+#
+# The pass manager provides:
+#   - ``NoopEliminationPass`` -- removes identity reshape/view/expand/
+#     slice ops that can block Inductor's automatic fusion
+#   - Infrastructure for custom passes when needed
+
+class InductorPass:
+    """Base class for post-grad Inductor passes."""
+
+    name: str = "base"
+
+    def __call__(self, graph: torch.fx.Graph) -> None:
+        raise NotImplementedError
+
+
+class NoopEliminationPass(InductorPass):
+    """Remove redundant reshape/view/expand/slice ops.
+
+    These identity ops are inserted by functionalization and prevent
+    Inductor's built-in fusion from matching adjacent ops.  Mirrors
+    vLLM's ``NoOpEliminationPass``.
+    """
+
+    name = "noop_elimination"
+
+    _IDENTITY_TARGETS = frozenset({
+        torch.ops.aten.reshape.default,
+        torch.ops.aten.view.default,
+        torch.ops.aten.expand.default,
+        torch.ops.aten.slice.Tensor,
+    })
+
+    def __call__(self, graph: torch.fx.Graph) -> None:
+        count = 0
+        for node in list(graph.nodes):
+            if node.op != "call_function":
+                continue
+            if node.target not in self._IDENTITY_TARGETS:
+                continue
+            if self._is_identity(node):
+                node.replace_all_uses_with(node.args[0])
+                graph.erase_node(node)
+                count += 1
+        if count > 0:
+            logger.debug("NoopElimination: removed %d identity ops", count)
+
+    @staticmethod
+    def _is_identity(node: torch.fx.Node) -> bool:
+        inp = node.args[0]
+        if not isinstance(inp, torch.fx.Node):
+            return False
+        out_val = node.meta.get("val")
+        inp_val = inp.meta.get("val")
+        if out_val is None or inp_val is None:
+            return False
+        if hasattr(out_val, "shape") and hasattr(inp_val, "shape"):
+            return (list(out_val.shape) == list(inp_val.shape)
+                    and out_val.dtype == inp_val.dtype)
+        return False
+
+
+class PostGradPassManager(torch._inductor.custom_graph_pass.CustomGraphPass):
+    """Orchestrates post-grad Inductor passes.
+
+    Wired into ``torch._inductor.config.post_grad_custom_post_pass`` to run
+    after Inductor's own optimizations.
+
+    Inherits ``CustomGraphPass`` so Inductor's cache machinery can type-check
+    and hash the pass correctly.
+    """
+
+    def __init__(self) -> None:
+        self.passes: list[InductorPass] = [
+            NoopEliminationPass(),
+        ]
+
+    def __call__(self, graph: torch.fx.Graph) -> None:
+        for p in self.passes:
+            p(graph)
+
+    def uuid(self):
+        return None
+
+    def add(self, pass_: InductorPass) -> None:
+        self.passes.append(pass_)
+
+
+def configure_post_grad_passes() -> None:
+    """Install the kb_nano post-grad pass manager into Inductor config."""
+    pm = PostGradPassManager()
+    torch._inductor.config.post_grad_custom_post_pass = pm
+    logger.info("Installed PostGradPassManager with passes: %s",
+                [p.name for p in pm.passes])
+
+
+def remove_post_grad_passes() -> None:
+    """Remove kb_nano post-grad passes from Inductor config."""
+    torch._inductor.config.post_grad_custom_post_pass = None
+
+
+# ===================================================================
 # FX graph splitting (adapted from vllm/compilation/backends.py)
-# ---------------------------------------------------------------------------
+# ===================================================================
 
 @dataclasses.dataclass
 class SplitItem:
@@ -165,9 +468,9 @@ def split_graph(
     return split_gm, outputs
 
 
-# ---------------------------------------------------------------------------
+# ===================================================================
 # AlwaysHitShapeEnv (from vLLM compiler_interface.py)
-# ---------------------------------------------------------------------------
+# ===================================================================
 
 class AlwaysHitShapeEnv:
     """Dummy shape environment that makes Inductor cache lookups always hit.
@@ -189,9 +492,9 @@ class AlwaysHitShapeEnv:
         return ""
 
 
-# ---------------------------------------------------------------------------
+# ===================================================================
 # Helpers for extracting fake args from graph (mirrors vLLM)
-# ---------------------------------------------------------------------------
+# ===================================================================
 
 def _get_fake_args(graph: fx.GraphModule) -> list:
     """Get fake/symbolic args from placeholder metadata.
@@ -213,9 +516,9 @@ def _get_fake_args(graph: fx.GraphModule) -> list:
     return fake_args
 
 
-# ---------------------------------------------------------------------------
+# ===================================================================
 # PiecewiseBackend (mirrors vLLM's PiecewiseBackend)
-# ---------------------------------------------------------------------------
+# ===================================================================
 
 class _StopCompiling(BaseException):
     pass
@@ -262,15 +565,8 @@ class PiecewiseBackend:
         if fake_args is None:
             fake_args = _get_fake_args(self.graph)
 
-        # Inductor can inplace-modify the graph, so deep-copy it.
         graph_copy = copy.deepcopy(self.graph)
 
-        # Detect the FakeTensorMode from our fake args. Dynamo creates
-        # a new `backend_fake_mode` right before calling the backend and
-        # sets it on the tracing context. But our fake args have the
-        # ORIGINAL FakeTensorMode from tracing. We need to patch the
-        # tracing context to use our fake args' mode so detect_fake_mode
-        # inside compile_fx doesn't see a mismatch.
         from torch._subclasses.fake_tensor import FakeTensor
         input_fake_mode = None
         for x in fake_args:
@@ -351,11 +647,6 @@ class PiecewiseBackend:
                 ctx = torch._dynamo.utils.get_metrics_context()
                 stack.enter_context(ctx)
 
-            # Patch the tracing context's fake_mode to match our fake args.
-            # Dynamo creates a new backend_fake_mode before calling the
-            # backend, but our FakeTensors were created with the original
-            # tracing FakeTensorMode. compile_fx calls detect_fake_mode
-            # which asserts they match.
             tracing_ctx = torch._guards.TracingContext.try_get()
             old_tracing_fake_mode = None
             if tracing_ctx is not None and input_fake_mode is not None:
@@ -400,9 +691,9 @@ class PiecewiseBackend:
         return graph_output[0]
 
 
-# ---------------------------------------------------------------------------
+# ===================================================================
 # PiecewiseCompileInterpreter (mirrors vLLM)
-# ---------------------------------------------------------------------------
+# ===================================================================
 
 class PiecewiseCompileInterpreter(torch.fx.Interpreter):
     """Interpreter that replaces compilable submodules with PiecewiseBackend
@@ -446,10 +737,6 @@ class PiecewiseCompileInterpreter(torch.fx.Interpreter):
 
             from torch._inductor.compile_fx import graph_returns_tuple
 
-            # Pass the interpreter's args as fake_args. These are in the
-            # same FakeTensorMode as the tracing context (they were
-            # propagated through the interpreter from the original graph's
-            # fake args). This avoids FakeTensorMode mismatches.
             piecewise = PiecewiseBackend(
                 submod,
                 index,
@@ -471,9 +758,9 @@ class PiecewiseCompileInterpreter(torch.fx.Interpreter):
         return output
 
 
-# ---------------------------------------------------------------------------
+# ===================================================================
 # KBNano Dynamo backend (mirrors vLLM's VllmBackend)
-# ---------------------------------------------------------------------------
+# ===================================================================
 
 class KBNanoBackend:
     """Custom Dynamo backend that mirrors vLLM's VllmBackend.
@@ -542,9 +829,9 @@ class KBNanoBackend:
         return split_gm
 
 
-# ---------------------------------------------------------------------------
+# ===================================================================
 # Model compilation entry point
-# ---------------------------------------------------------------------------
+# ===================================================================
 
 def compile_model(
     model: torch.nn.Module,
