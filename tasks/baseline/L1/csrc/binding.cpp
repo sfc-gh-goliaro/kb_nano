@@ -16,6 +16,11 @@ void moe_align_block_size(torch::Tensor topk_ids, int64_t num_experts, int64_t b
 void topk_softmax(torch::Tensor& topk_weights, torch::Tensor& topk_indices,
                   torch::Tensor& gating_output, bool renormalize, double moe_softcapping,
                   const c10::optional<torch::Tensor>& correction_bias);
+void rmsnorm_fp8_quant(torch::Tensor& output_fp8, torch::Tensor& output_scales,
+                       torch::Tensor& input, torch::Tensor& weight, double eps);
+void fused_add_rmsnorm_fp8_quant(torch::Tensor& output_fp8, torch::Tensor& output_scales,
+                                 torch::Tensor input, torch::Tensor residual,
+                                 torch::Tensor weight, double eps);
 
 PYBIND11_MODULE(TORCH_EXTENSION_NAME, m) {
   m.def("rmsnorm", &rmsnorm, "RMSNorm (CUDA)");
@@ -25,4 +30,6 @@ PYBIND11_MODULE(TORCH_EXTENSION_NAME, m) {
   m.def("moe_sum", &moe_sum, "MoE sum reduction (CUDA)");
   m.def("moe_align_block_size", &moe_align_block_size, "MoE align block size (CUDA)");
   m.def("topk_softmax", &topk_softmax, "Top-K softmax for MoE (CUDA)");
+  m.def("rmsnorm_fp8_quant", &rmsnorm_fp8_quant, "Fused RMSNorm + FP8 quant (CUDA)");
+  m.def("fused_add_rmsnorm_fp8_quant", &fused_add_rmsnorm_fp8_quant, "Fused add + RMSNorm + FP8 quant (CUDA)");
 }
