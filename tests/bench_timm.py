@@ -1,7 +1,7 @@
 #!/usr/bin/env python3
 """
 Throughput, latency, and correctness benchmark: kb-nano vs timm
-for vision encoder models (SigLIP-2, DINOv3).
+for vision encoder models (SigLIP-2, DINOv3, SwinV2).
 
 Runs standardized vision encoder workloads and compares:
   - Throughput: images/sec at default and high resolution
@@ -24,6 +24,7 @@ Each engine runs in a subprocess to avoid import contamination.
 Usage:
     python tests/bench_timm.py --model google/siglip2-so400m-patch16-naflex
     python tests/bench_timm.py --model facebook/dinov3-vit7b16-pretrain-lvd1689m
+    python tests/bench_timm.py --model timm/swinv2_large_window12_192.ms_in22k
     python tests/bench_timm.py --model google/siglip2-so400m-patch16-naflex --skip-timm
     python tests/bench_timm.py --model google/siglip2-so400m-patch16-naflex --dataset food101 --dataset-split validation
 """
@@ -79,6 +80,17 @@ MODEL_REGISTRY = {
         "image_std": [0.229, 0.224, 0.225],
         "default_num_images": 3000,
     },
+    "timm/swinv2_large_window12_192.ms_in22k": {
+        "timm_name": "swinv2_large_window12_192.ms_in22k",
+        "kb_module": "swinv2",
+        "kb_class": "SwinV2Model",
+        "default_resolution": 192,
+        "short_name": "swinv2-large",
+        "image_mean": [0.485, 0.456, 0.406],
+        "image_std": [0.229, 0.224, 0.225],
+        "default_num_images": 10000,
+        "strict_img_size": False,
+    },
 }
 
 
@@ -103,7 +115,6 @@ _WORKER_COMMON = r'''
 import json, os, sys, time, torch
 from tqdm import tqdm
 
-IMAGE_POOL_SIZE = 1000
 EMBED_SAVE_CAP = 500
 
 
@@ -112,9 +123,8 @@ def _load_pil_images(dataset_name, dataset_split, num_needed, seed):
     from datasets import load_dataset
     from PIL import Image
 
-    num_needed = min(num_needed, IMAGE_POOL_SIZE)
     print(
-        f"Loading {num_needed} images from {dataset_name} ({dataset_split})...",
+        f"Loading {num_needed} unique images from {dataset_name} ({dataset_split})...",
         file=sys.stderr, flush=True,
     )
     ds = load_dataset(dataset_name, split=dataset_split, streaming=True)
@@ -136,11 +146,11 @@ def _load_pil_images(dataset_name, dataset_split, num_needed, seed):
         images.append(img.convert("RGB"))
         if len(images) >= num_needed:
             break
-    print(f"  Loaded {len(images)} images", file=sys.stderr, flush=True)
+    print(f"  Loaded {len(images)} unique images", file=sys.stderr, flush=True)
     return images
 
 
-def _preprocess_pool(pil_images, resolution, image_mean, image_std, dtype):
+def _preprocess_batch(pil_images, resolution, image_mean, image_std, dtype):
     """Resize, center-crop, normalize, and stack PIL images into a GPU tensor."""
     from torchvision import transforms
 
@@ -188,24 +198,21 @@ def run_benchmark(model, cfg, label):
             seen_shapes.add(key)
             res, bs = key
             print(f"Warmup at {res}x{res} bs={bs}", file=sys.stderr, flush=True)
-            warm_pool = _preprocess_pool(
+            warm = _preprocess_batch(
                 raw_images[:bs], res, image_mean, image_std, dtype,
             )
             with torch.no_grad():
                 for _ in range(3):
-                    _ = model(warm_pool)
+                    _ = model(warm)
                 torch.cuda.synchronize()
-            del warm_pool
+            del warm
 
     all_results = []
     for scenario in scenarios:
         res = scenario["resolution"]
         batch_size = scenario["batch_size"]
-        num_images = scenario["num_images"]
+        num_images = min(scenario["num_images"], len(raw_images))
         num_batches = (num_images + batch_size - 1) // batch_size
-
-        pool = _preprocess_pool(raw_images, res, image_mean, image_std, dtype)
-        pool_size = len(pool)
         embed_max_batch = (EMBED_SAVE_CAP + batch_size - 1) // batch_size
 
         total_elapsed = 0.0
@@ -216,8 +223,10 @@ def run_benchmark(model, cfg, label):
             start = batch_idx * batch_size
             end = min(start + batch_size, num_images)
             actual_bs = end - start
-            indices = torch.arange(start, start + actual_bs) % pool_size
-            x = pool[indices]
+
+            x = _preprocess_batch(
+                raw_images[start:end], res, image_mean, image_std, dtype,
+            )
 
             torch.cuda.synchronize()
             t0 = time.perf_counter()
@@ -237,12 +246,12 @@ def run_benchmark(model, cfg, label):
                     ),
                 )
 
+            del x
             pbar.set_postfix(
                 imgs=total_images,
                 ips=f"{total_images / total_elapsed:.2f}",
             )
 
-        del pool
         all_results.append({
             "name": scenario["name"],
             "elapsed": total_elapsed,
@@ -259,7 +268,7 @@ def run_benchmark(model, cfg, label):
         num_warmup = ls.get("num_warmup", 3)
         num_iters = ls.get("num_iters", 10)
 
-        x = _preprocess_pool(
+        x = _preprocess_batch(
             raw_images[:batch_size], res, image_mean, image_std, dtype,
         )
 
@@ -310,8 +319,15 @@ def main():
     dtype = getattr(torch, cfg.get("dtype", "bfloat16"))
 
     print(f"Loading timm model: {timm_name}", file=sys.stderr, flush=True)
+
+    # Hierarchical models (SwinV2) need strict_img_size=False for variable
+    # resolution benchmarks; flat ViTs ignore this kwarg.
+    create_kwargs = {}
+    if cfg.get("strict_img_size") is False:
+        create_kwargs["strict_img_size"] = False
+
     model = timm.create_model(
-        timm_name, pretrained=True,
+        timm_name, pretrained=True, **create_kwargs,
     ).to(device="cuda", dtype=dtype).eval()
 
     results = run_benchmark(model, cfg, "timm")
@@ -665,6 +681,8 @@ def main():
         "dataset_name": dataset_name,
         "dataset_split": dataset_split,
     }
+    if "strict_img_size" in model_info:
+        base_config["strict_img_size"] = model_info["strict_img_size"]
 
     # --- kb-nano benchmark ---
     kb_config = {
