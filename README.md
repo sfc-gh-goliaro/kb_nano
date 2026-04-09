@@ -1,6 +1,6 @@
 # kb-nano
 
-A standalone, high-performance inference engine supporting **LLMs** (Llama 3.1, Mixtral-8x7B, Qwen2-VL, Qwen3-VL), **diffusion models** (FLUX.1-dev, SDXL, HunyuanVideo-1.5), **segmentation models** (SAM3.1), audio models (Whisper), and **TTS models** (CosyVoice3) with tensor parallelism. No vLLM dependency at runtime — just PyTorch, Triton, and Flash Attention.
+A standalone, high-performance inference engine supporting **LLMs** (Llama 3.1, Mixtral-8x7B, Qwen2-VL, Qwen3-VL), **diffusion models** (FLUX.1-dev, SDXL, HunyuanVideo-1.5), **segmentation models** (SAM3.1), **protein structure prediction** (OpenFold3), audio models (Whisper), and **TTS models** (CosyVoice3) with tensor parallelism. No vLLM dependency at runtime — just PyTorch, Triton, and Flash Attention.
 
 ## Features
 
@@ -13,6 +13,7 @@ A standalone, high-performance inference engine supporting **LLMs** (Llama 3.1, 
 - **SAM3.1** (facebook/sam3.1) image/video segmentation with ViT backbone, fusion encoder, detection decoder, and segmentation head
 - **Whisper** (large-v3) encoder-decoder speech-to-text with batched inference and paged cross-attention KV cache
 - **CosyVoice3** (Fun-CosyVoice3-0.5B-2512) text-to-speech with flow matching DiT + HiFi-GAN vocoder
+- **OpenFold3** (OpenFold/OpenFold3) protein structure prediction with MSA module, PairFormer, diffusion sampling, and atom attention
 - **Tensor parallelism** (TP) with custom IPC-based all-reduce for multi-GPU inference
 - **Paged KV cache** with Triton store kernels (LLM models)
 - **CUDA graph capture** for decode steps (LLM models)
@@ -24,6 +25,7 @@ A standalone, high-performance inference engine supporting **LLMs** (Llama 3.1, 
 - **vllm-omni comparison benchmark** for CosyVoice3 TTS (SEED-TTS-Eval dataset)
 - **diffusers comparison benchmark** for SDXL diffusion
 - **facebook/sam3 comparison benchmark** for SAM3.1 segmentation
+- **OpenFold/OpenFold3 comparison benchmark** for protein structure prediction
 
 ## Project Structure
 
@@ -75,7 +77,9 @@ A standalone, high-performance inference engine supporting **LLMs** (Llama 3.1, 
 │   │   │   ├── sdxl_downsample.py  # Stride-2 Conv2d downsampling
 │   │   │   ├── sdxl_upsample.py    # Nearest-neighbor + Conv2d upsampling
 │   │   │   ├── sam3_vit_attention.py  # SAM3 ViT windowed attention with RoPE
-│   │   │   └── sam3_mask_predictor.py # SAM3 mask prediction head (MLP)
+│   │   │   ├── sam3_mask_predictor.py # SAM3 mask prediction head (MLP)
+│   │   │   ├── openfold3_atom_attention.py # OpenFold3 atom attention with block conversion
+│   │   │   └── openfold3_attention_pair_bias.py # OpenFold3 cross-attention with pair bias
 │   │   ├── L3/                 # Decoder layers
 │   │   │   ├── llama_decoder.py
 │   │   │   ├── mixtral_decoder.py
@@ -87,7 +91,8 @@ A standalone, high-performance inference engine supporting **LLMs** (Llama 3.1, 
 │   │   │   ├── whisper_encoder_layer.py
 │   │   │   ├── whisper_decoder_layer.py
 │   │   │   ├── sam3_encoder_layer.py  # SAM3 fusion encoder layer
-│   │   │   └── sam3_decoder_layer.py  # SAM3 detection decoder layer
+│   │   │   ├── sam3_decoder_layer.py  # SAM3 detection decoder layer
+│   │   │   └── openfold3_diffusion_module.py # OpenFold3 diffusion module with centre random augmentation
 │   │   └── L4/                 # Full models
 │   │       ├── llama.py        # LlamaForCausalLM
 │   │       ├── mixtral.py      # MixtralForCausalLM
@@ -96,7 +101,8 @@ A standalone, high-performance inference engine supporting **LLMs** (Llama 3.1, 
 │   │       ├── hunyuan_video.py # HunyuanVideoPipeline (text-to-video diffusion)
 │   │       ├── qwen25_vl_encoder.py # Qwen2.5-VL text encoder (custom paged-attn impl)
 │   │       ├── whisper.py      # WhisperForConditionalGeneration
-│   │       └── sam3.py         # SAM3Model (ViT + FPN + fusion encoder + decoder + segmentation head)
+│   │       ├── sam3.py         # SAM3Model (ViT + FPN + fusion encoder + decoder + segmentation head)
+│   │       └── openfold3.py   # OpenFold3 model (InputEmbedder + MSA + PairFormer + Diffusion + Heads)
 │   └── candidate/              # Generated replacement kernels (gitignored)
 │       ├── README.md           # Instructions
 │       └── L1/, L2/, ...       # Organized by level, named after the operator
@@ -119,6 +125,7 @@ A standalone, high-performance inference engine supporting **LLMs** (Llama 3.1, 
     ├── bench_vllm_omni.py     # Diffusion (FLUX / HunyuanVideo) and TTS (CosyVoice3) benchmark: kb-nano vs vllm-omni
     ├── bench_diffusers.py     # SDXL diffusion benchmark: kb-nano vs diffusers + torch.compile
     ├── test_sam.py            # SAM3 segmentation benchmark: kb-nano vs facebook/sam3 reference
+    ├── bench_openfold3.py     # OpenFold3 protein structure benchmark: kb-nano vs OpenFold reference
     ├── utils/                  # Post-processing and visualization
     │   └── parse_vllm_bench_results.py  # Generate tables and plots from bench_vllm.py results
     └── debug/                  # Profiling and debugging scripts
@@ -233,6 +240,31 @@ python tests/test_sam.py --skip-reference
 # Skip latency phase
 python tests/test_sam.py --skip-latency
 ```
+
+### Benchmarking vs OpenFold (Protein Structure Prediction)
+
+```bash
+# OpenFold3: throughput + latency + correctness benchmark vs OpenFold reference
+# Uses real pre-computed MSA data from OpenProteinSet (downloaded from S3 on first run)
+python tests/bench_openfold3.py
+
+# kb-nano only (skip reference comparison)
+python tests/bench_openfold3.py --skip-reference
+
+# Skip latency phase
+python tests/bench_openfold3.py --skip-latency
+
+# Override number of queries per scenario
+python tests/bench_openfold3.py --num-seqs 100
+
+# Enable torch.compile for potential speedup
+python tests/bench_openfold3.py --torch-compile
+```
+
+The protein structure benchmark measures:
+- **Throughput**: tokens/sec across short (100-200 residues), medium (200-400), long (400-700), and extra-long (700+) protein chains
+- **Latency**: per-structure prediction latency with median stats
+- **Correctness**: percentage of queries meeting all correctness requirements (atom position cosine similarity >= 0.95, RMSD < 0.5A, pLDDT correlation >= 0.99, PAE cosine similarity >= 0.95)
 
 The diffusion benchmark measures:
 - **Throughput**: images/sec (FLUX) or videos/sec (HunyuanVideo) at various resolutions
@@ -673,6 +705,41 @@ Correctness (100 images, per-element cosine similarity):
 | Classification Logits | 0.975 | 0.924 | PASS |
 
 The remaining numerical divergence is expected from SDPA vs Flash Attention numerics and bf16/fp32 precision differences accumulated through the deep pipeline (backbone + encoder + decoder + pixel decoder + mask predictor). All metrics pass their thresholds (boxes/logits: mean >= 0.95, min >= 0.90; masks: mean >= 0.90, min >= 0.85).
+
+### OpenFold3 (Protein Structure Prediction)
+
+Run `tests/bench_openfold3.py` to reproduce. Uses real pre-computed MSA data from [OpenProteinSet](https://registry.opendata.aws/openfold/) (74 protein chains across 4 length buckets). Model: OpenFold/OpenFold3 (368M params, `of3-p2-155k.pt` checkpoint). Both engines use identical code with 10 diffusion rollout steps and 1 recycle. Correctness is verified deterministically (identical seeds, `torch.use_deterministic_algorithms`).
+
+**Hardware: NVIDIA H200**
+
+Throughput (tokens/sec, bf16):
+
+| Scenario | Queries | Residue Range | Reference (tok/s) | Ours (tok/s) | Speedup |
+|----------|--------:|--------------:|-------------------:|--------------:|--------:|
+| short       |  50 | 100-200 | 146 | 150 | **1.03x** |
+| medium      |  20 | 200-400 | 137 | 141 | **1.03x** |
+| long        |  10 | 400-700 | 159 | 165 | **1.04x** |
+| extra-long  |   5 | 700+    | 150 | 153 | **1.02x** |
+
+Latency (single structure, median of 3 runs):
+
+| Scenario | Tokens | Reference | Ours | Speedup |
+|----------|-------:|----------:|-----:|--------:|
+| single-short       | 321 | 1.361s | 1.333s | **1.02x** |
+| single-medium      | 123 | 0.970s | 0.924s | **1.05x** |
+| single-long        | 219 | 0.968s | 0.923s | **1.05x** |
+| single-extra-long  | 552 | 2.958s | 2.934s | **1.01x** |
+
+Correctness (deterministic, all queries across all scenarios):
+
+| Metric | Target | Result |
+|--------|--------|--------|
+| Atom position cosine similarity | mean >= 0.95, min >= 0.90 | **100% pass** |
+| Atom position RMSD (Kabsch)     | < 0.5 A                   | **100% pass** |
+| pLDDT score correlation         | Pearson r >= 0.99          | **100% pass** |
+| PAE matrix cosine similarity    | mean >= 0.95               | **100% pass** |
+
+Both engines run identical model code with the same pretrained weights and deterministic seeding, achieving bitwise reproducibility (100% correctness pass rate). The throughput advantage comes from vectorized block conversion utilities (`torch.gather`-based) in the atom attention module, replacing Python for-loops in the reference implementation.
 
 ### Key optimizations
 

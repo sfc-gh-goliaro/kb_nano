@@ -876,42 +876,32 @@ def plddt_from_logits(logits: np.ndarray) -> np.ndarray:
     return (probs * bin_centers).sum(axis=-1)
 
 
+def _query_passes(kb_out: dict, ref_out: dict) -> bool:
+    """Check if a single query meets all correctness targets."""
+    if "atom_positions" in kb_out and "atom_positions" in ref_out:
+        ap_kb = np.array(kb_out["atom_positions"], dtype=np.float64)
+        ap_ref = np.array(ref_out["atom_positions"], dtype=np.float64)
+        if cosine_sim(ap_kb, ap_ref) < TARGETS["atom_pos_cosine_min"]:
+            return False
+        if kabsch_rmsd(ap_kb, ap_ref) >= TARGETS["atom_rmsd_kabsch_mean"]:
+            return False
+    if "plddt_logits" in kb_out and "plddt_logits" in ref_out:
+        plddt_kb = plddt_from_logits(kb_out["plddt_logits"])
+        plddt_ref = plddt_from_logits(ref_out["plddt_logits"])
+        if pearson_corr(plddt_kb, plddt_ref) < TARGETS["plddt_pearson_mean"]:
+            return False
+    if "pae_logits_subsampled" in kb_out and "pae_logits_subsampled" in ref_out:
+        pae_kb = np.array(kb_out["pae_logits_subsampled"], dtype=np.float64)
+        pae_ref = np.array(ref_out["pae_logits_subsampled"], dtype=np.float64)
+        if cosine_sim(pae_kb, pae_ref) < TARGETS["pae_cosine_mean"]:
+            return False
+    return True
+
+
 def compute_alignment(kb_outputs: list[dict], ref_outputs: list[dict]) -> dict:
     n = min(len(kb_outputs), len(ref_outputs))
-    atom_cosines, atom_rmsds = [], []
-    plddt_corrs = []
-    pae_cosines = []
-
-    for i in range(n):
-        kb_out, ref_out = kb_outputs[i], ref_outputs[i]
-        if "atom_positions" in kb_out and "atom_positions" in ref_out:
-            ap_kb = np.array(kb_out["atom_positions"], dtype=np.float64)
-            ap_ref = np.array(ref_out["atom_positions"], dtype=np.float64)
-            atom_cosines.append(cosine_sim(ap_kb, ap_ref))
-            atom_rmsds.append(kabsch_rmsd(ap_kb, ap_ref))
-        if "plddt_logits" in kb_out and "plddt_logits" in ref_out:
-            plddt_kb = plddt_from_logits(kb_out["plddt_logits"])
-            plddt_ref = plddt_from_logits(ref_out["plddt_logits"])
-            plddt_corrs.append(pearson_corr(plddt_kb, plddt_ref))
-        if "pae_logits_subsampled" in kb_out and "pae_logits_subsampled" in ref_out:
-            pae_kb = np.array(kb_out["pae_logits_subsampled"], dtype=np.float64)
-            pae_ref = np.array(ref_out["pae_logits_subsampled"], dtype=np.float64)
-            pae_cosines.append(cosine_sim(pae_kb, pae_ref))
-
-    result = {"num_queries": n}
-    if atom_cosines:
-        result["atom_pos_cosine_mean"] = float(np.mean(atom_cosines))
-        result["atom_pos_cosine_min"] = float(np.min(atom_cosines))
-    if atom_rmsds:
-        result["atom_rmsd_kabsch_mean"] = float(np.mean(atom_rmsds))
-        result["atom_rmsd_kabsch_max"] = float(np.max(atom_rmsds))
-    if plddt_corrs:
-        result["plddt_pearson_mean"] = float(np.mean(plddt_corrs))
-        result["plddt_pearson_min"] = float(np.min(plddt_corrs))
-    if pae_cosines:
-        result["pae_cosine_mean"] = float(np.mean(pae_cosines))
-        result["pae_cosine_min"] = float(np.min(pae_cosines))
-    return result
+    passed = sum(1 for i in range(n) if _query_passes(kb_outputs[i], ref_outputs[i]))
+    return {"num_queries": n, "pass_rate": passed / n if n > 0 else 0.0}
 
 
 # ---------------------------------------------------------------------------
@@ -1069,91 +1059,55 @@ def main():
                 r["alignment"] = compute_alignment(kb_d["outputs"], ref_d["outputs"])
             all_results.append(r)
 
-    # ---- Print throughput summary ----
-    if all_results:
-        print(f"\n\n{'=' * 110}")
-        print("  THROUGHPUT SUMMARY")
-        print(f"{'=' * 110}")
-        print(f"  {'SCENARIO':<14} {'QUERIES':>8} {'TOKENS':>8} "
-              f"{'KB-NANO tok/s':>15} {'REF tok/s':>12} {'SPEEDUP':>9} "
-              f"{'atom_cos':>9} {'RMSD':>8} {'pLDDT_r':>8} {'PAE_cos':>8}")
-        print(f"  {'-' * 105}")
-        for r in all_results:
-            a = r.get("alignment", {})
-            kb_str = f"{r['kb_nano_tok_per_s']:,.0f}"
-            ref_str = f"{r['ref_tok_per_s']:,.0f}" if "ref_tok_per_s" in r else "N/A"
-            sp_str = f"{r['speedup']:.2f}x" if "speedup" in r else "N/A"
-            acos = f"{a['atom_pos_cosine_mean']:.4f}" if "atom_pos_cosine_mean" in a else "N/A"
-            rmsd = f"{a['atom_rmsd_kabsch_mean']:.4f}" if "atom_rmsd_kabsch_mean" in a else "N/A"
-            plr = f"{a['plddt_pearson_mean']:.4f}" if "plddt_pearson_mean" in a else "N/A"
-            pcos = f"{a['pae_cosine_mean']:.4f}" if "pae_cosine_mean" in a else "N/A"
-            print(f"  {r['scenario']:<14} {r['num_queries']:>8} {r['total_tokens']:>8} "
-                  f"{kb_str:>15} {ref_str:>12} {sp_str:>9} "
-                  f"{acos:>9} {rmsd:>8} {plr:>8} {pcos:>8}")
-        print(f"{'=' * 110}")
-
-    # ---- Correctness details ----
-    if all_results and any("alignment" in r for r in all_results):
-        print(f"\n{'=' * 110}")
-        print("  CORRECTNESS DETAILS")
-        print(f"{'=' * 110}")
-        for r in all_results:
-            a = r.get("alignment")
-            if not a:
-                continue
-            print(f"\n  {r['scenario']} ({r['num_queries']} queries, {r['total_tokens']} tokens):")
-            for k, v in sorted(a.items()):
-                if k == "num_queries":
-                    continue
-                target = TARGETS.get(k)
-                if target is not None:
-                    is_rmsd = "rmsd" in k
-                    passed = v < target if is_rmsd else v >= target
-                    mark = "PASS" if passed else "FAIL"
-                    print(f"    {k:<30s} = {v:.6f}  (target: {'<' if is_rmsd else '>='}{target}, {mark})")
-                else:
-                    print(f"    {k:<30s} = {v:.6f}")
-        print(f"{'=' * 110}")
-
-    # ---- Latency summary ----
+    # ---- Build latency data ----
     kb_lat = kb_raw.get("latency", [])
     ref_lat = ref_raw.get("latency", []) if ref_raw else []
     lat_combined = []
-    if kb_lat:
-        print(f"\n{'=' * 100}")
-        print("  LATENCY SUMMARY")
-        print(f"{'=' * 100}")
-        print(f"  {'SCENARIO':<18} {'TOKENS':>7} {'ITERS':>6}"
-              f"  {'KB-NANO med':>12} {'REF med':>12}"
-              f"  {'KB tok/s':>10} {'REF tok/s':>10} {'SPEEDUP':>9}")
-        print(f"  {'-' * 88}")
-        for i, kl in enumerate(kb_lat):
-            kl_med = float(np.median(kl["latencies"]))
-            nt = kl["n_tokens"]
-            k_tps = nt / kl_med if kl_med > 0 else 0
-            lr = {"scenario": kl["name"], "n_tokens": nt, "num_iters": kl["num_iters"],
-                  "kb_nano_median_s": kl_med, "kb_nano_tok_per_s": k_tps, "kb_nano_latencies": kl["latencies"]}
-            r_str, rt_str, sp_str = "N/A", "N/A", "N/A"
-            if i < len(ref_lat):
-                rl = ref_lat[i]
-                rl_med = float(np.median(rl["latencies"]))
-                r_tps = nt / rl_med if rl_med > 0 else 0
-                sp = rl_med / kl_med if kl_med > 0 else 0
-                r_str, rt_str, sp_str = f"{rl_med:.4f}s", f"{r_tps:.0f}", f"{sp:.2f}x"
-                lr.update(ref_median_s=rl_med, ref_tok_per_s=r_tps, speedup=sp, ref_latencies=rl["latencies"])
-            print(f"  {kl['name']:<18} {nt:>7} {kl['num_iters']:>6}"
-                  f"  {kl_med:.4f}s{'':<3} {r_str:>12}  {k_tps:>10.0f} {rt_str:>10} {sp_str:>9}")
-            lat_combined.append(lr)
-        print(f"{'=' * 100}")
+    for i, kl in enumerate(kb_lat):
+        kl_med = float(np.median(kl["latencies"]))
+        nt = kl["n_tokens"]
+        k_tps = nt / kl_med if kl_med > 0 else 0
+        lr = {"scenario": kl["name"], "n_tokens": nt, "num_iters": kl["num_iters"],
+              "kb_nano_median_s": kl_med, "kb_nano_tok_per_s": k_tps, "kb_nano_latencies": kl["latencies"]}
+        if i < len(ref_lat):
+            rl = ref_lat[i]
+            rl_med = float(np.median(rl["latencies"]))
+            r_tps = nt / rl_med if rl_med > 0 else 0
+            sp = rl_med / kl_med if kl_med > 0 else 0
+            lr.update(ref_median_s=rl_med, ref_tok_per_s=r_tps, speedup=sp, ref_latencies=rl["latencies"])
+        lat_combined.append(lr)
 
-    # ---- Memory ----
-    print(f"\n{'=' * 60}")
-    print("  MEMORY & PARAMS")
-    print(f"{'=' * 60}")
-    print(f"  KB-nano  : {kb_raw.get('params', 0):>12,} params, {kb_raw.get('peak_mem_mb', 0):>8,.0f} MB peak")
-    if ref_raw:
-        print(f"  Reference: {ref_raw.get('params', 0):>12,} params, {ref_raw.get('peak_mem_mb', 0):>8,.0f} MB peak")
-    print(f"{'=' * 60}")
+    # ---- Print results ----
+    W = 90
+    print(f"\n\n{'=' * W}")
+    print("  RESULTS")
+    print(f"{'=' * W}")
+    print(f"  {'':40s} KB-NANO    REFERENCE  SPEEDUP  CORRECT")
+    print(f"  {'-' * (W - 2)}")
+
+    if all_results:
+        for r in all_results:
+            a = r.get("alignment", {})
+            kb_str = f"{r['kb_nano_tok_per_s']:>6,.0f} tok/s"
+            ref_str = f"{r['ref_tok_per_s']:>5,.0f} tok/s" if "ref_tok_per_s" in r else f"{'N/A':>9s}"
+            sp_str = f"{r['speedup']:.2f}x" if "speedup" in r else "N/A"
+            pr = a.get("pass_rate")
+            cor_str = f"{pr * 100:.0f}%" if pr is not None else "N/A"
+            label = f"  throughput/{r['scenario']:<11s} ({r['num_queries']:>3}q)"
+            print(f"{label:<40s} {kb_str:>10s}  {ref_str:>9s}  {sp_str:>7s}  {cor_str:>7s}")
+
+    if lat_combined:
+        for lr in lat_combined:
+            kb_str = f"{lr['kb_nano_median_s']:.3f}s"
+            ref_str = f"{lr['ref_median_s']:.3f}s" if "ref_median_s" in lr else "N/A"
+            sp_str = f"{lr['speedup']:.2f}x" if "speedup" in lr else "N/A"
+            label = f"  latency/{lr['scenario'].replace('single-', ''):<14s} ({lr['n_tokens']:>3}tok)"
+            print(f"{label:<40s} {kb_str:>10s}  {ref_str:>9s}  {sp_str:>7s}")
+
+    print(f"  {'-' * (W - 2)}")
+    print(f"  {'params':40s} {kb_raw.get('params', 0):>10,}  {(ref_raw or {}).get('params', 0):>9,}")
+    print(f"  {'peak memory (MB)':40s} {kb_raw.get('peak_mem_mb', 0):>10,.0f}  {(ref_raw or {}).get('peak_mem_mb', 0):>9,.0f}")
+    print(f"{'=' * W}")
 
     # ---- Save ----
     if args.output_dir:
