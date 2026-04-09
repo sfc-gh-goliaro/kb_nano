@@ -224,7 +224,7 @@ class CrossAttentionPairBias(nn.Module):
         Returns:
             [*, N_atom, C_q] attention update
         """
-        from .openfold3_atom_attention import _convert_single_rep_to_blocks
+        from .openfold3_atom_attention import _convert_single_rep_to_blocks, _apply_block_indices
 
         batch_dims = a.shape[:-2]
         n_atom, n_dim = a.shape[-2:]
@@ -244,7 +244,7 @@ class CrossAttentionPairBias(nn.Module):
         biases.append(z_bias)
 
         if self.use_ada_layer_norm:
-            s_q, s_k, _ = _convert_single_rep_to_blocks(
+            s_q, s_k, _ = _apply_block_indices(
                 ql=s, n_query=self.n_query, n_key=self.n_key, atom_mask=mask,
             )
             a_q = self.layer_norm_a_q(a_query, s_q)

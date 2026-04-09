@@ -7,11 +7,51 @@ Reference: openfold3/core/model/layers/sequence_local_atom_attention.py
 
 from __future__ import annotations
 
+import math
+
 import torch
 import torch.nn as nn
 
 from ..L1.layer_norm import LayerNorm
 from ..L1.linear import Linear
+
+
+def _get_block_key_indices(
+    atom_mask: torch.Tensor, n_query: int, n_key: int,
+) -> tuple[torch.Tensor, torch.Tensor]:
+    """Vectorized computation of key-block gather indices.
+
+    Returns:
+        safe_indices: [*, N_blocks, n_key] clamped indices
+        invalid_mask: [*, N_blocks, n_key] True where index is out of range
+    """
+    batch_dims = atom_mask.shape[:-1]
+    n_atom = atom_mask.shape[-1]
+    num_blocks = math.ceil(n_atom / n_query)
+    device = atom_mask.device
+    offset = n_query // 2
+
+    subset_centers = offset + torch.arange(num_blocks, device=device) * n_query
+    subset_centers = subset_centers.reshape(*(1,) * len(batch_dims), num_blocks)
+    subset_centers = subset_centers.expand(*batch_dims, num_blocks)
+
+    n_real = atom_mask.sum(dim=-1, keepdim=True).expand(*batch_dims, num_blocks)
+
+    initial = (
+        subset_centers.unsqueeze(-1)
+        + torch.arange(-n_key // 2, n_key // 2, device=device)
+    ).int()
+
+    underflow = torch.relu(-initial[..., 0])
+    overflow = torch.relu(initial[..., -1] - (n_real - 1))
+    total_shift = torch.where(underflow > 0, underflow, -overflow)
+    final = initial + total_shift.unsqueeze(-1)
+
+    n_real_exp = n_real.unsqueeze(-1)
+    invalid = (final < 0) | (final >= n_real_exp)
+    safe = torch.clamp(final, torch.zeros_like(n_real_exp), (n_real_exp - 1).clamp(min=0))
+
+    return safe.long(), invalid
 
 
 def _convert_single_rep_to_blocks(
@@ -20,7 +60,7 @@ def _convert_single_rep_to_blocks(
     n_key: int,
     atom_mask: torch.Tensor | None = None,
 ) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor | None]:
-    """Convert flat atom representation to windowed block format.
+    """Convert flat atom representation to windowed block format (vectorized).
 
     Args:
         ql: [*, N_atom, C] atom features
@@ -29,43 +69,51 @@ def _convert_single_rep_to_blocks(
         atom_mask: [*, N_atom] mask
 
     Returns:
-        ql_blocks: [*, N_blocks, n_query, C]
-        qk_blocks: [*, N_blocks, n_key, C]
+        ql_query: [*, N_blocks, n_query, C]
+        ql_key:   [*, N_blocks, n_key, C]
         mask_blocks: [*, N_blocks, n_query, n_key] or None
     """
-    n_atoms = ql.shape[-2]
-    c = ql.shape[-1]
-    pad_to = ((n_atoms + n_query - 1) // n_query) * n_query
-    if pad_to > n_atoms:
-        ql = torch.nn.functional.pad(ql, (0, 0, 0, pad_to - n_atoms))
+    batch_dims = ql.shape[:-2]
+    n_atom, c = ql.shape[-2], ql.shape[-1]
+    num_blocks = math.ceil(n_atom / n_query)
+    pad_q = (-n_atom) % n_query
+
+    if pad_q > 0:
+        ql = torch.nn.functional.pad(ql, (0, 0, 0, pad_q))
         if atom_mask is not None:
-            atom_mask = torch.nn.functional.pad(atom_mask, (0, pad_to - n_atoms))
+            atom_mask = torch.nn.functional.pad(atom_mask, (0, pad_q))
 
-    n_blocks = pad_to // n_query
+    ql_query = ql.reshape(*batch_dims, num_blocks, n_query, c)
 
-    batch_shape = ql.shape[:-2]
-    ql_blocks = ql.reshape(*batch_shape, n_blocks, n_query, c)
+    if atom_mask is None:
+        atom_mask = ql.new_ones(*batch_dims, n_atom + pad_q)
 
-    half_key = (n_key - n_query) // 2
-    ql_padded = torch.nn.functional.pad(ql, (0, 0, half_key, half_key))
-    qk_list = []
-    for i in range(n_blocks):
-        start = i * n_query
-        qk_list.append(ql_padded[..., start:start + n_key, :])
-    qk_blocks = torch.stack(qk_list, dim=-3)
+    atom_mask = atom_mask.expand(*batch_dims, -1)
+    key_indices, invalid_mask = _get_block_key_indices(atom_mask, n_query, n_key)
 
-    mask_blocks = None
-    if atom_mask is not None:
-        mask_padded = torch.nn.functional.pad(atom_mask, (half_key, half_key))
-        mask_q = atom_mask.reshape(*batch_shape, n_blocks, n_query)
-        mask_list = []
-        for i in range(n_blocks):
-            start = i * n_query
-            mask_list.append(mask_padded[..., start:start + n_key])
-        mask_k = torch.stack(mask_list, dim=-2)
-        mask_blocks = mask_q[..., :, None] * mask_k[..., None, :]
+    flat_batch = int(math.prod(batch_dims)) if batch_dims else 1
+    ql_flat = ql.reshape(flat_batch, n_atom + pad_q, c)
+    idx_flat = key_indices.reshape(flat_batch, num_blocks * n_key)
+    idx_expanded = idx_flat.unsqueeze(-1).expand(-1, -1, c)
 
-    return ql_blocks, qk_blocks, mask_blocks
+    ql_key_flat = torch.gather(ql_flat, 1, idx_expanded)
+    mask_flat = invalid_mask.reshape(flat_batch, num_blocks * n_key).unsqueeze(-1).expand(-1, -1, c)
+    ql_key_flat.masked_fill_(mask_flat, 0.0)
+    ql_key = ql_key_flat.reshape(*batch_dims, num_blocks, n_key, c)
+
+    mask_q = atom_mask.reshape(*batch_dims, num_blocks, n_query)
+    mask_k_valid = (~invalid_mask).to(atom_mask.dtype)
+    atom_mask_at_keys = torch.gather(
+        atom_mask.reshape(flat_batch, -1), 1,
+        idx_flat,
+    ).reshape(*batch_dims, num_blocks, n_key)
+    mask_k_valid = mask_k_valid * atom_mask_at_keys
+    mask_blocks = mask_q.unsqueeze(-1) * mask_k_valid.unsqueeze(-2)
+
+    return ql_query, ql_key, mask_blocks
+
+
+_apply_block_indices = _convert_single_rep_to_blocks
 
 
 def _convert_pair_rep_to_blocks(
@@ -74,12 +122,10 @@ def _convert_pair_rep_to_blocks(
     n_query: int,
     n_key: int,
 ) -> torch.Tensor:
-    """Convert pair representation to block format for atom attention.
-
-    Broadcasts token-level pair rep to atom-level blocks.
+    """Convert pair representation to block format for atom attention (vectorized).
 
     Args:
-        batch: needs token_mask, num_atoms_per_token or atom_to_token_index
+        batch: needs atom_mask, atom_to_token_index
         zij_trunk: [*, N_token, N_token, C_z]
         n_query: block height
         n_key: block width
@@ -87,7 +133,9 @@ def _convert_pair_rep_to_blocks(
     Returns:
         [*, N_blocks, n_query, n_key, C_z]
     """
-    n_atoms = batch["atom_mask"].shape[-1]
+    atom_mask = batch["atom_mask"]
+    n_atoms = atom_mask.shape[-1]
+    batch_dims = zij_trunk.shape[:-3]
     c_z = zij_trunk.shape[-1]
 
     if "atom_to_token_index" in batch:
@@ -102,32 +150,67 @@ def _convert_pair_rep_to_blocks(
                 (n_atoms + n_token - 1) // n_token
             )[:n_atoms]
 
-    pad_to = ((n_atoms + n_query - 1) // n_query) * n_query
-    n_blocks = pad_to // n_query
+    num_blocks = math.ceil(n_atoms / n_query)
+    pad_q = (-n_atoms) % n_query
 
-    if pad_to > n_atoms:
-        pad_idx = atom_to_token.new_zeros(pad_to - n_atoms)
-        atom_to_token_padded = torch.cat([atom_to_token, pad_idx], dim=-1)
-    else:
-        atom_to_token_padded = atom_to_token
+    atk_padded = torch.nn.functional.pad(atom_to_token, (0, pad_q), value=0)
+    q_indices = atk_padded.reshape(num_blocks, n_query)
 
-    half_key = (n_key - n_query) // 2
-    atk_padded = torch.nn.functional.pad(atom_to_token_padded, (half_key, half_key))
+    atom_mask_exp = atom_mask.expand(*batch_dims, -1)
+    key_indices, invalid_mask = _get_block_key_indices(atom_mask_exp, n_query, n_key)
 
-    result = zij_trunk.new_zeros(
-        zij_trunk.shape[:-3] + (n_blocks, n_query, n_key, c_z)
+    flat_batch = int(math.prod(batch_dims)) if batch_dims else 1
+
+    atk_flat = atom_to_token.expand(flat_batch, -1)
+    key_idx_flat = key_indices.reshape(flat_batch, num_blocks * n_key)
+    k_token_flat = torch.gather(atk_flat, 1, key_idx_flat.clamp(min=0, max=n_atoms - 1))
+    k_indices = k_token_flat.reshape(flat_batch, num_blocks, n_key)
+
+    zij_flat = zij_trunk.reshape(flat_batch, *zij_trunk.shape[-3:])
+    batch_idx = torch.arange(flat_batch, device=zij_trunk.device).view(-1, 1, 1, 1)
+    q_idx = q_indices.long().unsqueeze(0).expand(flat_batch, -1, -1)
+
+    plm = zij_flat[batch_idx, q_idx.unsqueeze(-1), k_indices.unsqueeze(-2)]
+
+    inv_expanded = invalid_mask.reshape(flat_batch, num_blocks, n_key)
+    plm.masked_fill_(inv_expanded[:, :, None, :, None].expand_as(plm), 0.0)
+
+    pair_mask = _get_pair_atom_block_mask(
+        atom_mask=atom_mask_exp, num_blocks=num_blocks,
+        n_query=n_query, n_key=n_key, pad_q=pad_q,
+        key_indices=key_indices, invalid_mask=invalid_mask,
     )
+    plm = plm * pair_mask.reshape(flat_batch, num_blocks, n_query, n_key, 1)
+    plm = plm.reshape(*batch_dims, num_blocks, n_query, n_key, c_z)
 
-    for b in range(n_blocks):
-        q_start = b * n_query
-        q_indices = atom_to_token_padded[q_start:q_start + n_query]
+    return plm
 
-        k_start = b * n_query
-        k_indices = atk_padded[k_start:k_start + n_key]
 
-        result[..., b, :, :, :] = zij_trunk[..., q_indices[:, None], k_indices[None, :], :]
+def _get_pair_atom_block_mask(
+    atom_mask: torch.Tensor,
+    num_blocks: int,
+    n_query: int,
+    n_key: int,
+    pad_q: int,
+    key_indices: torch.Tensor,
+    invalid_mask: torch.Tensor,
+) -> torch.Tensor:
+    """Compute pair atom block mask."""
+    batch_dims = atom_mask.shape[:-1]
+    flat_batch = int(math.prod(batch_dims)) if batch_dims else 1
+    mask_flat = atom_mask.reshape(flat_batch, -1)
 
-    return result
+    mask_padded = torch.nn.functional.pad(mask_flat, (0, pad_q))
+    mask_q = mask_padded.reshape(flat_batch, num_blocks, n_query)
+
+    idx_flat = key_indices.reshape(flat_batch, num_blocks * n_key)
+    mask_k_vals = torch.gather(mask_flat, 1, idx_flat.clamp(min=0, max=mask_flat.shape[-1] - 1))
+    mask_k = mask_k_vals.reshape(flat_batch, num_blocks, n_key)
+    inv_flat = invalid_mask.reshape(flat_batch, num_blocks, n_key)
+    mask_k = mask_k * (~inv_flat).to(mask_k.dtype)
+
+    pair_mask = mask_q.unsqueeze(-1) * mask_k.unsqueeze(-2)
+    return pair_mask.reshape(*batch_dims, num_blocks, n_query, n_key)
 
 
 def _broadcast_token_feat_to_atoms(

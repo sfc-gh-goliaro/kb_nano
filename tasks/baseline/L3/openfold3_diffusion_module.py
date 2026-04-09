@@ -19,6 +19,44 @@ from ..L2.openfold3_diffusion_conditioning import DiffusionConditioning
 from .openfold3_diffusion_transformer import DiffusionTransformer
 
 
+def _quat_to_rot(quat: torch.Tensor) -> torch.Tensor:
+    """Convert quaternion [*, 4] to rotation matrix [*, 3, 3]."""
+    q = quat[..., None] * quat[..., None, :]
+    r00 = q[..., 0, 0] + q[..., 1, 1] - q[..., 2, 2] - q[..., 3, 3]
+    r01 = 2 * (q[..., 1, 2] - q[..., 0, 3])
+    r02 = 2 * (q[..., 1, 3] + q[..., 0, 2])
+    r10 = 2 * (q[..., 1, 2] + q[..., 0, 3])
+    r11 = q[..., 0, 0] - q[..., 1, 1] + q[..., 2, 2] - q[..., 3, 3]
+    r12 = 2 * (q[..., 2, 3] - q[..., 0, 1])
+    r20 = 2 * (q[..., 1, 3] - q[..., 0, 2])
+    r21 = 2 * (q[..., 2, 3] + q[..., 0, 1])
+    r22 = q[..., 0, 0] - q[..., 1, 1] - q[..., 2, 2] + q[..., 3, 3]
+    return torch.stack([
+        torch.stack([r00, r01, r02], dim=-1),
+        torch.stack([r10, r11, r12], dim=-1),
+        torch.stack([r20, r21, r22], dim=-1),
+    ], dim=-2)
+
+
+def centre_random_augmentation(
+    xl: torch.Tensor, atom_mask: torch.Tensor, scale_trans: float = 1.0,
+) -> torch.Tensor:
+    """AF3 Algorithm 19: random rotation + translation + centering."""
+    q = torch.randn(*xl.shape[:-2], 4, dtype=xl.dtype, device=xl.device)
+    q = q / torch.linalg.norm(q, dim=-1, keepdim=True)
+    rots = _quat_to_rot(q)
+
+    trans = scale_trans * torch.randn(
+        (*xl.shape[:-2], 3), dtype=xl.dtype, device=xl.device,
+    )
+
+    mask_sum = torch.sum(atom_mask[..., None], dim=-2, keepdim=True).clamp(min=1.0)
+    mean_xl = torch.sum(xl * atom_mask[..., None], dim=-2, keepdim=True) / mask_sum
+    pos_centered = xl - mean_xl
+    pos_out = pos_centered @ rots.transpose(-1, -2) + trans[..., None, :]
+    return pos_out * atom_mask[..., None]
+
+
 class DiffusionModule(nn.Module):
     """AF3 Algorithm 20: Diffusion module.
 
@@ -251,6 +289,8 @@ class SampleDiffusion(nn.Module):
         )
 
         for tau, c_tau in enumerate(noise_schedule[1:]):
+            xl = centre_random_augmentation(xl=xl, atom_mask=atom_mask)
+
             gamma = self.gamma_0 if c_tau > self.gamma_min else 0
             t = noise_schedule[tau] * (gamma + 1)
 

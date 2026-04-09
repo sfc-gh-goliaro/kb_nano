@@ -335,8 +335,12 @@ C_ATOM_REF_NAME_CHARS_DIM = 4
 C_ATOM_REF_NAME_CHARS_VOCAB = 64
 
 
-def load_and_featurize_chain(chain_info, max_msa_seqs=512, c_m=64, c_token=384):
+def load_and_featurize_chain(chain_info, max_msa_seqs=512, c_m=64, c_token=384, seed=None):
+    import hashlib
     aln_dir = chain_info["alignment_dir"]
+    if seed is None:
+        seed = int(hashlib.sha256(aln_dir.encode()).hexdigest(), 16) % (2**31)
+    chain_rng = np.random.RandomState(seed)
     all_sequences = []
     for fname in sorted(os.listdir(aln_dir)):
         fpath = os.path.join(aln_dir, fname)
@@ -393,7 +397,7 @@ def load_and_featurize_chain(chain_info, max_msa_seqs=512, c_m=64, c_token=384):
         n_heavy = 5
         for j in range(n_heavy):
             idx = base + j
-            ref_pos[idx] = np.random.randn(3).astype(np.float32) * 1.5
+            ref_pos[idx] = chain_rng.randn(3).astype(np.float32) * 1.5
             ref_mask[idx] = 1.0
             atom_mask_flat[idx] = 1.0
             elem_idx = min(5 + j, C_ATOM_REF_ELEMENT - 1)
@@ -458,15 +462,16 @@ def extract_outputs_for_comparison(outputs, aux_outputs):
     if s_trunk is not None:
         result["s_trunk"] = s_trunk.detach().float().cpu().numpy().tolist()
     if z_trunk is not None:
-        result["z_trunk_norm"] = float(z_trunk.detach().float().norm().cpu().item())
         n = z_trunk.shape[-2]
         stride = max(1, n // 64)
         result["z_trunk_subsampled"] = z_trunk[..., ::stride, ::stride, :].detach().float().cpu().numpy().tolist()
-    for key in ["plddt_logits", "distogram_logits", "pae_logits", "pde_logits"]:
-        if key in outputs:
-            t = outputs[key].detach().float().cpu()
-            result[key + "_norm"] = float(t.norm().item())
-            result[key + "_mean"] = float(t.mean().item())
+    if "plddt_logits" in outputs:
+        result["plddt_logits"] = outputs["plddt_logits"].detach().float().cpu().numpy().tolist()
+    if "pae_logits" in outputs:
+        pae = outputs["pae_logits"].detach().float().cpu()
+        n = pae.shape[-2]
+        stride = max(1, n // 64)
+        result["pae_logits_subsampled"] = pae[..., ::stride, ::stride, :].numpy().tolist()
     if "atom_positions_predicted" in outputs:
         result["atom_positions"] = outputs["atom_positions_predicted"].detach().float().cpu().numpy().tolist()
     return result
@@ -486,6 +491,17 @@ def main():
     sys.path.insert(0, cfg["project_root"])
     pkg = cfg["package_name"]
     engine_label = cfg.get("engine_label", "engine")
+
+    seed = cfg.get("seed", 42)
+    import random as _random
+    _random.seed(seed)
+    np.random.seed(seed)
+    torch.manual_seed(seed)
+    torch.cuda.manual_seed_all(seed)
+    torch.backends.cudnn.deterministic = True
+    torch.backends.cudnn.benchmark = False
+    os.environ.setdefault("CUBLAS_WORKSPACE_CONFIG", ":4096:8")
+    torch.use_deterministic_algorithms(True, warn_only=True)
 
     mod = __import__(
         f"{pkg}.tasks.baseline.L4.openfold3",
@@ -521,6 +537,9 @@ def main():
 
     model = model.to(device=device, dtype=dtype).eval()
     params = sum(p.numel() for p in model.parameters())
+    if cfg.get("use_torch_compile", False):
+        print(f"  [{engine_label}] Applying torch.compile ...", flush=True)
+        model = torch.compile(model, mode="reduce-overhead")
     print(f"  [{engine_label}] Model ready ({params:,} params, {dtype_str})", flush=True)
 
     # Warmup
@@ -552,7 +571,7 @@ def main():
 
         pbar = tqdm(chains, desc=f"  [{engine_label}] {name}",
                     unit="query", file=sys.stdout)
-        for chain_info in pbar:
+        for qi, chain_info in enumerate(pbar):
             batch = load_and_featurize_chain(
                 chain_info, max_msa_seqs=cfg.get("max_msa_seqs", 512),
                 c_m=model_cfg.c_m, c_token=model_cfg.c_token_embedder)
@@ -561,6 +580,8 @@ def main():
             n_tokens = batch.pop("n_tokens")
             total_tokens += n_tokens
             batch = batch_to_device(batch, device, dtype)
+            torch.manual_seed(seed + qi)
+            torch.cuda.manual_seed_all(seed + qi)
             with torch.no_grad():
                 outputs, aux_outputs = model(batch)
             query_outputs.append(extract_outputs_for_comparison(outputs, aux_outputs))
@@ -647,56 +668,110 @@ REF_OF3_WORKER = _WORKER_BODY
 # Correctness metrics
 # ---------------------------------------------------------------------------
 
-def cosine_sim_lists(a: list, b: list) -> float:
-    a_arr = np.array(a, dtype=np.float64).ravel()
-    b_arr = np.array(b, dtype=np.float64).ravel()
-    denom = np.linalg.norm(a_arr) * np.linalg.norm(b_arr)
+TARGETS = {
+    "atom_pos_cosine_mean": 0.95,
+    "atom_pos_cosine_min": 0.90,
+    "atom_rmsd_kabsch_mean": 0.5,
+    "plddt_pearson_mean": 0.99,
+    "pae_cosine_mean": 0.95,
+}
+
+
+def cosine_sim(a: np.ndarray, b: np.ndarray) -> float:
+    a = a.ravel().astype(np.float64)
+    b = b.ravel().astype(np.float64)
+    denom = np.linalg.norm(a) * np.linalg.norm(b)
     if denom < 1e-12:
         return 0.0
-    return float(np.dot(a_arr, b_arr) / denom)
+    return float(np.dot(a, b) / denom)
 
 
-def rmsd_positions(a: list, b: list) -> float:
-    a_arr = np.array(a, dtype=np.float64).reshape(-1, 3)
-    b_arr = np.array(b, dtype=np.float64).reshape(-1, 3)
-    n = min(len(a_arr), len(b_arr))
+def kabsch_rmsd(p: np.ndarray, q: np.ndarray) -> float:
+    """RMSD after optimal rigid superposition (Kabsch algorithm)."""
+    p = p.reshape(-1, 3).astype(np.float64)
+    q = q.reshape(-1, 3).astype(np.float64)
+    n = min(len(p), len(q))
     if n == 0:
         return float("inf")
-    diff = a_arr[:n] - b_arr[:n]
+    p, q = p[:n], q[:n]
+    p_c = p - p.mean(axis=0)
+    q_c = q - q.mean(axis=0)
+    H = p_c.T @ q_c
+    U, _, Vt = np.linalg.svd(H)
+    d = np.linalg.det(Vt.T @ U.T)
+    S = np.diag([1.0, 1.0, np.sign(d)])
+    R = Vt.T @ S @ U.T
+    p_aligned = p_c @ R.T
+    diff = p_aligned - q_c
     return float(np.sqrt(np.mean(np.sum(diff ** 2, axis=1))))
+
+
+def pearson_corr(a: np.ndarray, b: np.ndarray) -> float:
+    a = a.ravel().astype(np.float64)
+    b = b.ravel().astype(np.float64)
+    n = min(len(a), len(b))
+    if n < 2:
+        return 0.0
+    a, b = a[:n], b[:n]
+    a_m = a - a.mean()
+    b_m = b - b.mean()
+    num = np.dot(a_m, b_m)
+    den = np.sqrt(np.dot(a_m, a_m) * np.dot(b_m, b_m))
+    if den < 1e-12:
+        return 0.0
+    return float(num / den)
+
+
+def plddt_from_logits(logits: np.ndarray) -> np.ndarray:
+    """Convert pLDDT logits [*, N_token * max_atoms_per_token, n_bins] to per-residue scores."""
+    logits = np.array(logits, dtype=np.float64)
+    if logits.ndim < 2:
+        return logits
+    while logits.ndim > 2:
+        logits = logits[0]
+    exp = logits - logits.max(axis=-1, keepdims=True)
+    probs = np.exp(exp)
+    probs = probs / probs.sum(axis=-1, keepdims=True)
+    n_bins = probs.shape[-1]
+    bin_centers = np.linspace(1.0 / (2 * n_bins), 1.0 - 1.0 / (2 * n_bins), n_bins)
+    return (probs * bin_centers).sum(axis=-1)
 
 
 def compute_alignment(kb_outputs: list[dict], ref_outputs: list[dict]) -> dict:
     n = min(len(kb_outputs), len(ref_outputs))
-    s_cosines, z_cosines, pos_rmsds = [], [], []
-    head_diffs = {k: [] for k in ["plddt_logits", "distogram_logits", "pae_logits", "pde_logits"]}
+    atom_cosines, atom_rmsds = [], []
+    plddt_corrs = []
+    pae_cosines = []
 
     for i in range(n):
         kb_out, ref_out = kb_outputs[i], ref_outputs[i]
-        if "s_trunk" in kb_out and "s_trunk" in ref_out:
-            s_cosines.append(cosine_sim_lists(kb_out["s_trunk"], ref_out["s_trunk"]))
-        if "z_trunk_subsampled" in kb_out and "z_trunk_subsampled" in ref_out:
-            z_cosines.append(cosine_sim_lists(kb_out["z_trunk_subsampled"], ref_out["z_trunk_subsampled"]))
         if "atom_positions" in kb_out and "atom_positions" in ref_out:
-            pos_rmsds.append(rmsd_positions(kb_out["atom_positions"], ref_out["atom_positions"]))
-        for key in head_diffs:
-            kb_n, ref_n = kb_out.get(key + "_norm"), ref_out.get(key + "_norm")
-            if kb_n is not None and ref_n is not None:
-                head_diffs[key].append(abs(kb_n - ref_n) / max(abs(ref_n), 1e-8))
+            ap_kb = np.array(kb_out["atom_positions"], dtype=np.float64)
+            ap_ref = np.array(ref_out["atom_positions"], dtype=np.float64)
+            atom_cosines.append(cosine_sim(ap_kb, ap_ref))
+            atom_rmsds.append(kabsch_rmsd(ap_kb, ap_ref))
+        if "plddt_logits" in kb_out and "plddt_logits" in ref_out:
+            plddt_kb = plddt_from_logits(kb_out["plddt_logits"])
+            plddt_ref = plddt_from_logits(ref_out["plddt_logits"])
+            plddt_corrs.append(pearson_corr(plddt_kb, plddt_ref))
+        if "pae_logits_subsampled" in kb_out and "pae_logits_subsampled" in ref_out:
+            pae_kb = np.array(kb_out["pae_logits_subsampled"], dtype=np.float64)
+            pae_ref = np.array(ref_out["pae_logits_subsampled"], dtype=np.float64)
+            pae_cosines.append(cosine_sim(pae_kb, pae_ref))
 
     result = {"num_queries": n}
-    if s_cosines:
-        result["avg_s_trunk_cosine"] = float(np.mean(s_cosines))
-        result["min_s_trunk_cosine"] = float(np.min(s_cosines))
-    if z_cosines:
-        result["avg_z_trunk_cosine"] = float(np.mean(z_cosines))
-        result["min_z_trunk_cosine"] = float(np.min(z_cosines))
-    if pos_rmsds:
-        result["avg_atom_rmsd"] = float(np.mean(pos_rmsds))
-        result["max_atom_rmsd"] = float(np.max(pos_rmsds))
-    for key, diffs in head_diffs.items():
-        if diffs:
-            result[f"avg_{key}_rel_diff"] = float(np.mean(diffs))
+    if atom_cosines:
+        result["atom_pos_cosine_mean"] = float(np.mean(atom_cosines))
+        result["atom_pos_cosine_min"] = float(np.min(atom_cosines))
+    if atom_rmsds:
+        result["atom_rmsd_kabsch_mean"] = float(np.mean(atom_rmsds))
+        result["atom_rmsd_kabsch_max"] = float(np.max(atom_rmsds))
+    if plddt_corrs:
+        result["plddt_pearson_mean"] = float(np.mean(plddt_corrs))
+        result["plddt_pearson_min"] = float(np.min(plddt_corrs))
+    if pae_cosines:
+        result["pae_cosine_mean"] = float(np.mean(pae_cosines))
+        result["pae_cosine_min"] = float(np.min(pae_cosines))
     return result
 
 
@@ -724,6 +799,8 @@ def main():
                         help="Directory for caching downloaded MSA data "
                              "(default: /tmp/openfold_bench_data)")
     parser.add_argument("--output-dir", type=str, default=None)
+    parser.add_argument("--torch-compile", action="store_true",
+                        help="Apply torch.compile to the model (reduce-overhead mode)")
     args = parser.parse_args()
 
     gpu = _detect_gpu_name()
@@ -800,6 +877,7 @@ def main():
         "max_msa_seqs": MAX_MSA_SEQS,
         "checkpoint_path": checkpoint_path,
         "scenarios": scenario_configs, "latency_scenarios": latency_configs,
+        "use_torch_compile": args.torch_compile,
     }
 
     # ---- Run kb-nano ----
@@ -847,40 +925,49 @@ def main():
 
     # ---- Print throughput summary ----
     if all_results:
-        print(f"\n\n{'=' * 100}")
+        print(f"\n\n{'=' * 110}")
         print("  THROUGHPUT SUMMARY")
-        print(f"{'=' * 100}")
+        print(f"{'=' * 110}")
         print(f"  {'SCENARIO':<14} {'QUERIES':>8} {'TOKENS':>8} "
               f"{'KB-NANO tok/s':>15} {'REF tok/s':>12} {'SPEEDUP':>9} "
-              f"{'s_cos':>8} {'z_cos':>8} {'RMSD':>8}")
-        print(f"  {'-' * 95}")
+              f"{'atom_cos':>9} {'RMSD':>8} {'pLDDT_r':>8} {'PAE_cos':>8}")
+        print(f"  {'-' * 105}")
         for r in all_results:
             a = r.get("alignment", {})
             kb_str = f"{r['kb_nano_tok_per_s']:,.0f}"
             ref_str = f"{r['ref_tok_per_s']:,.0f}" if "ref_tok_per_s" in r else "N/A"
             sp_str = f"{r['speedup']:.2f}x" if "speedup" in r else "N/A"
-            s_cos = f"{a['avg_s_trunk_cosine']:.4f}" if "avg_s_trunk_cosine" in a else "N/A"
-            z_cos = f"{a['avg_z_trunk_cosine']:.4f}" if "avg_z_trunk_cosine" in a else "N/A"
-            rmsd = f"{a['avg_atom_rmsd']:.4f}" if "avg_atom_rmsd" in a else "N/A"
+            acos = f"{a['atom_pos_cosine_mean']:.4f}" if "atom_pos_cosine_mean" in a else "N/A"
+            rmsd = f"{a['atom_rmsd_kabsch_mean']:.4f}" if "atom_rmsd_kabsch_mean" in a else "N/A"
+            plr = f"{a['plddt_pearson_mean']:.4f}" if "plddt_pearson_mean" in a else "N/A"
+            pcos = f"{a['pae_cosine_mean']:.4f}" if "pae_cosine_mean" in a else "N/A"
             print(f"  {r['scenario']:<14} {r['num_queries']:>8} {r['total_tokens']:>8} "
                   f"{kb_str:>15} {ref_str:>12} {sp_str:>9} "
-                  f"{s_cos:>8} {z_cos:>8} {rmsd:>8}")
-        print(f"{'=' * 100}")
+                  f"{acos:>9} {rmsd:>8} {plr:>8} {pcos:>8}")
+        print(f"{'=' * 110}")
 
     # ---- Correctness details ----
     if all_results and any("alignment" in r for r in all_results):
-        print(f"\n{'=' * 100}")
+        print(f"\n{'=' * 110}")
         print("  CORRECTNESS DETAILS")
-        print(f"{'=' * 100}")
+        print(f"{'=' * 110}")
         for r in all_results:
             a = r.get("alignment")
             if not a:
                 continue
             print(f"\n  {r['scenario']} ({r['num_queries']} queries, {r['total_tokens']} tokens):")
             for k, v in sorted(a.items()):
-                if k != "num_queries":
+                if k == "num_queries":
+                    continue
+                target = TARGETS.get(k)
+                if target is not None:
+                    is_rmsd = "rmsd" in k
+                    passed = v < target if is_rmsd else v >= target
+                    mark = "PASS" if passed else "FAIL"
+                    print(f"    {k:<30s} = {v:.6f}  (target: {'<' if is_rmsd else '>='}{target}, {mark})")
+                else:
                     print(f"    {k:<30s} = {v:.6f}")
-        print(f"{'=' * 100}")
+        print(f"{'=' * 110}")
 
     # ---- Latency summary ----
     kb_lat = kb_raw.get("latency", [])
