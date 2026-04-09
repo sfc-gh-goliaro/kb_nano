@@ -345,12 +345,12 @@ class RoboticsLatencyWorkload:
 
 ROBOTICS_THROUGHPUT_WORKLOADS: list[RoboticsThroughputWorkload] = [
     RoboticsThroughputWorkload(
-        "droid-3cam", num_cameras=3, num_requests=100,
-        dataset_name="droid-dataset/droid",
+        "libero-1cam", num_cameras=1, num_requests=100,
+        dataset_name="lerobot/libero",
     ),
     RoboticsThroughputWorkload(
-        "libero-1cam", num_cameras=1, num_requests=100,
-        dataset_name="lerobot/libero_10_random_v0",
+        "libero-3cam", num_cameras=3, num_requests=100,
+        dataset_name="lerobot/libero",
     ),
 ]
 
