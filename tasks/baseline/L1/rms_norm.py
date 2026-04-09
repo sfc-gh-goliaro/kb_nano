@@ -1,10 +1,10 @@
 """RMSNorm with dual dispatch: CUDA custom op (eager) and pure-PyTorch (compiled).
 
 Mirrors vLLM's ``CustomOp`` dispatch pattern:
-  - ``forward_cuda``: calls the fast ``_C.rmsnorm`` / ``_C.fused_add_rmsnorm``
-    CUDA kernels, registered as ``torch.ops.kb_nano_norm.*`` for torch.compile
-    compatibility.  Used in eager mode and as the kernel backing CUDA graph
-    capture.
+  - ``forward_cuda``: calls vLLM's ``torch.ops._C.rms_norm`` /
+    ``torch.ops._C.fused_add_rms_norm`` CUDA kernels for bitwise-identical
+    numerics with vLLM.  Falls back to ``kb_nano_norm.*`` if vLLM ops
+    are not available.
   - ``forward_native``: pure PyTorch implementation (f32 promotion, variance,
     rsqrt, weight multiply).  Used when torch.compile is active so Inductor
     can inline, fuse, and optimise the norm with adjacent ops — this is the
@@ -20,6 +20,12 @@ import torch.nn as nn
 import torch.nn.functional as F
 
 from .csrc import _C
+
+try:
+    import vllm._C  # noqa: F401 — registers torch.ops._C.rms_norm etc.
+    _VLLM_NORM_AVAILABLE = True
+except ImportError:
+    _VLLM_NORM_AVAILABLE = False
 
 # ---------------------------------------------------------------------------
 # Register _C ops as torch.library custom ops for torch.compile compatibility.
@@ -94,6 +100,8 @@ class RMSNorm(nn.Module):
         return x, residual
 
     # -- CUDA kernel path (used in eager mode / CUDA graph replay) --
+    # Prefers vLLM's CUDA kernels for bitwise-identical numerics;
+    # falls back to kb-nano's own kernels when vLLM is unavailable.
 
     @staticmethod
     def forward_cuda(
@@ -103,15 +111,24 @@ class RMSNorm(nn.Module):
         residual: torch.Tensor | None = None,
     ) -> torch.Tensor | tuple[torch.Tensor, torch.Tensor]:
         if weight is not None:
-            if residual is None:
-                out = torch.empty_like(x)
-                torch.ops.kb_nano_norm.rmsnorm(out, x, weight, eps)
-                return out
+            if _VLLM_NORM_AVAILABLE:
+                if residual is None:
+                    out = torch.empty_like(x)
+                    torch.ops._C.rms_norm(out, x, weight, eps)
+                    return out
+                else:
+                    torch.ops._C.fused_add_rms_norm(x, residual, weight, eps)
+                    return x, residual
             else:
-                torch.ops.kb_nano_norm.fused_add_rmsnorm(
-                    x, residual, weight, eps,
-                )
-                return x, residual
+                if residual is None:
+                    out = torch.empty_like(x)
+                    torch.ops.kb_nano_norm.rmsnorm(out, x, weight, eps)
+                    return out
+                else:
+                    torch.ops.kb_nano_norm.fused_add_rmsnorm(
+                        x, residual, weight, eps,
+                    )
+                    return x, residual
         else:
             if residual is None:
                 return F.rms_norm(x, (x.size(-1),), eps=eps)

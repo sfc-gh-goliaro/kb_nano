@@ -653,14 +653,11 @@ def load_weights(model, model_path: str, model_type: str = "llama") -> None:
 
 
 def _postprocess_moe_fp8_weights(module) -> int:
-    """Post-process MoE expert FP8 weights for DeepGEMM UE8M0 format.
+    """Post-process MoE expert FP8 weights for DeepGEMM scale layout.
 
-    For each expert's w13 and w2: dequantize with old scales, requantize
-    with UE8M0 power-of-two scales. The requantized scales (still in the
-    original [E, rows, cols] layout) are kept in w13_scale / w2_scale for
-    the Triton fallback path. Additionally, DeepGEMM-layout transformed
-    scales are stored in w13_scale_dg / w2_scale_dg for the DeepGEMM path.
-    Matches vLLM's prepare_fp8_moe_layer_for_deepgemm.
+    Keeps original FP8 weights and scales from the checkpoint (no UE8M0
+    requantization) and creates DeepGEMM-layout transformed scale tensors
+    stored in w13_scale_dg / w2_scale_dg.
 
     Only runs when DeepGEMM is available on Hopper+ GPUs.
     """
@@ -677,10 +674,6 @@ def _postprocess_moe_fp8_weights(module) -> int:
 
     block_shape = getattr(module, 'block_shape', [128, 128])
     block_m, block_k = int(block_shape[0]), int(block_shape[1])
-    assert block_m == 128 and block_k == 128, (
-        f"deep_gemm.per_block_cast_to_fp8 only supports 128x128 blocks, "
-        f"got [{block_m}, {block_k}]"
-    )
 
     count = 0
     for wname, sname in [('w13', 'w13_scale'), ('w2', 'w2_scale')]:
@@ -688,34 +681,6 @@ def _postprocess_moe_fp8_weights(module) -> int:
         ws = getattr(module, sname).data
 
         E = wq.size(0)
-        # PyTorch 2.10+/CUDA 13.0 treats float8_e4m3fn 0x7F/0xFF as NaN
-        # (older spec mapped them to ±448). Remap to ±240 (current max) before
-        # the dequant→requant cycle so the values survive the float32 round-trip.
-        _fp8_max = torch.finfo(torch.float8_e4m3fn).max
-        _raw = wq.view(torch.uint8)
-        _mask_7f = _raw == 0x7F
-        _mask_ff = _raw == 0xFF
-        if _mask_7f.any() or _mask_ff.any():
-            _pos_max = torch.tensor([_fp8_max], dtype=torch.float8_e4m3fn, device=wq.device)
-            _neg_max = torch.tensor([-_fp8_max], dtype=torch.float8_e4m3fn, device=wq.device)
-            _raw_rw = wq.view(torch.uint8)
-            _raw_rw[_mask_7f] = _pos_max.view(torch.uint8).item()
-            _raw_rw[_mask_ff] = _neg_max.view(torch.uint8).item()
-
-        for idx in range(E):
-            w_slice = wq[idx]
-            s_slice = ws[idx]
-            m_cur, k_cur = w_slice.shape
-            s_float = s_slice.to(torch.float32)
-            s_exp_r = torch.repeat_interleave(s_float, block_m, dim=0)
-            s_exp = torch.repeat_interleave(s_exp_r, block_k, dim=1)
-            s_exp = s_exp[:m_cur, :k_cur]
-            w_dq = w_slice.to(torch.float32) * s_exp
-            w_requant, s_requant = deep_gemm.per_block_cast_to_fp8(
-                w_dq, use_ue8m0=True
-            )
-            wq[idx].copy_(w_requant)
-            ws[idx].copy_(s_requant)
 
         recipe = (1, block_m, block_k)
         dg_ws = deep_gemm.transform_sf_into_required_layout(
@@ -725,6 +690,7 @@ def _postprocess_moe_fp8_weights(module) -> int:
             recipe=recipe,
             num_groups=E,
             is_sfa=False,
+            disable_ue8m0_cast=True,
         )
         dg_sname = sname + "_dg"
         module.register_parameter(

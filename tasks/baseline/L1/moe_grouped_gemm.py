@@ -79,7 +79,7 @@ def m_grouped_fp8_gemm_nt_contiguous(a_and_scale, b_and_scale, output, expert_id
     """
     _dg.m_grouped_fp8_gemm_nt_contiguous(
         a_and_scale, b_and_scale, output, expert_ids,
-        disable_ue8m0_cast=False,
+        disable_ue8m0_cast=True,
     )
 
 

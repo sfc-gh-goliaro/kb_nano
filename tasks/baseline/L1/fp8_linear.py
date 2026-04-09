@@ -74,6 +74,7 @@ def _fp8_group_quant_kernel(
     num_cols,
     fp8_max: tl.constexpr,
     GROUP_SIZE: tl.constexpr,
+    USE_UE8M0: tl.constexpr = True,
 ):
     pid = tl.program_id(0)
     groups_per_row = num_cols // GROUP_SIZE
@@ -86,7 +87,8 @@ def _fp8_group_quant_kernel(
 
     absmax = tl.max(tl.abs(x))
     absmax = tl.maximum(absmax, 1e-10)
-    scale = tl.math.exp2(tl.math.ceil(tl.math.log2(absmax / fp8_max)))
+    scale_raw = absmax / fp8_max
+    scale = tl.math.exp2(tl.math.ceil(tl.math.log2(scale_raw))) if USE_UE8M0 else scale_raw
 
     x_scaled = x / scale
     x_clamped = tl.clamp(x_scaled, -fp8_max, fp8_max)
@@ -101,8 +103,14 @@ def _fp8_group_quant_kernel(
 
 def _per_token_group_quant_fp8(x: torch.Tensor,
                                out_fp8: torch.Tensor,
-                               out_scale: torch.Tensor) -> None:
-    """In-place per-token-group FP8 quantization with UE8M0 (power-of-two) scales.
+                               out_scale: torch.Tensor,
+                               use_ue8m0: bool = True) -> None:
+    """In-place per-token-group FP8 quantization.
+
+    When use_ue8m0=True (default), scales are rounded to powers of two
+    (UE8M0 format), matching DeepGEMM dense linear expectations.
+    When use_ue8m0=False, scales are plain float32 (absmax / fp8_max),
+    matching vLLM's Triton MoE activation quantization.
 
     Single Triton kernel launch, writes to pre-allocated buffers for
     CUDA-graph compatibility.
@@ -115,6 +123,7 @@ def _per_token_group_quant_fp8(x: torch.Tensor,
         K,
         fp8_max=_FP8_INFO.max,
         GROUP_SIZE=_GROUP_SIZE,
+        USE_UE8M0=use_ue8m0,
     )
 
 

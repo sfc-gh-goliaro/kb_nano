@@ -268,7 +268,7 @@ class FusedExperts(nn.Module):
             2, (M_sum, N), hidden_states.device, torch.float8_e4m3fn,
         )
         a2_fp8, a2_scale = silu_mul_per_token_group_quant_fp8_colmajor(
-            mm1_out, output=quant_out, use_ue8m0=True,
+            mm1_out, output=quant_out,
         )
 
         mm2_out = self._get_dg_workspace(1, (M_sum, K), hidden_states.device, hidden_states.dtype)

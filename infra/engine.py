@@ -994,26 +994,40 @@ class ModelRunner:
     def run_model(self, input_ids, positions, is_prefill, inputs_embeds=None,
                   deepstack_embeds=None, encoder_outputs=None):
         if is_prefill or self.enforce_eager or input_ids.size(0) > self.graph_bs_list[-1]:
+            # For compiled VL models, always compute inputs_embeds outside
+            # the compiled graph (matching vLLM).  The compiled inner
+            # Qwen3Model was traced with inputs_embeds, so it must always
+            # receive one.
+            if self.is_qwen_vl and self._compiled and inputs_embeds is None:
+                inputs_embeds = self.model.get_input_embeddings()(input_ids)
             if inputs_embeds is not None:
-                # Use the eager (uncompiled) model when inputs_embeds is
-                # provided.  The compiled graph was traced without
-                # inputs_embeds (during CUDA-graph warmup with text-only
-                # input_ids), and skip_all_guards_unsafe prevents Dynamo
-                # from re-tracing — so the compiled graph silently ignores
-                # inputs_embeds and routes through embed_tokens instead.
-                # vLLM avoids this by *always* passing inputs_embeds for VL
-                # models; here we fall back to eager for the multimodal
-                # prefill path, which is not performance-critical.
-                model = getattr(self, '_eager_model', self.model)
-                return model.compute_logits(
-                    model(input_ids, positions, inputs_embeds=inputs_embeds,
-                          deepstack_embeds=deepstack_embeds)
+                if deepstack_embeds is not None:
+                    # Multimodal prefill with actual vision features —
+                    # use the uncompiled inner model since the compiled
+                    # graph was traced without deepstack_embeds.
+                    inner = getattr(self, '_eager_inner_model', None)
+                    if inner is not None:
+                        hidden = inner(input_ids, positions,
+                                       inputs_embeds=inputs_embeds,
+                                       deepstack_embeds=deepstack_embeds)
+                        return self.model.compute_logits(hidden)
+                    return self.model.compute_logits(
+                        self.model(input_ids, positions,
+                                   inputs_embeds=inputs_embeds,
+                                   deepstack_embeds=deepstack_embeds)
+                    )
+                return self.model.compute_logits(
+                    self.model(input_ids, positions, inputs_embeds=inputs_embeds)
                 )
             if encoder_outputs is not None:
                 return self.model.compute_logits(
                     self.model(input_ids, positions, encoder_outputs=encoder_outputs)
                 )
             return self.model.compute_logits(self.model(input_ids, positions))
+        # Decode path: CUDA graph replay.
+        # For VL models, embed_fn is recorded inside the graph — updating
+        # input_ids in graph_vars is sufficient; the graph replays embed_fn
+        # on the new ids to produce inputs_embeds internally.
         bs = input_ids.size(0)
         ctx = get_context()
         graph_bs = self._graph_bs_for_n[bs]
@@ -1836,15 +1850,27 @@ class ModelRunner:
         ``capture_cudagraph`` call records the compiled kernels into
         per-batch-size CUDA graphs for decode replay.
 
-        The original model is kept as ``_eager_model`` as a reference.
-        All prefill paths (including multimodal) use the compiled model.
+        For VL models, only the inner Qwen3Model is compiled (not the
+        outer Qwen3VLForConditionalGeneration).  This keeps embed_tokens
+        and lm_head outside the compiled boundary, matching vLLM's
+        architecture where @support_torch_compile is applied only to the
+        inner LLM model.  The engine always computes inputs_embeds
+        outside the compiled graph and passes it in, so the compiled
+        graph only ever traces the inputs_embeds branch.
         """
         from .compilation import compile_model
         from .passes import configure_post_grad_passes
 
         configure_post_grad_passes()
-        self._eager_model = self.model
-        self.model = compile_model(self.model)
+        if self.is_qwen_vl:
+            # Save the uncompiled inner model for multimodal prefill
+            # (which needs deepstack_embeds that the compiled graph
+            # doesn't trace).
+            self._eager_inner_model = self.model.model
+            self.model.model = compile_model(self.model.model)
+        else:
+            self._eager_model = self.model
+            self.model = compile_model(self.model)
         self._compiled = True
         self._mark_dynamic_done = False
 
@@ -1872,6 +1898,20 @@ class ModelRunner:
 
         outputs = torch.zeros(max_bs, self.config.hidden_size)
 
+        # For VL models, allocate an inputs_embeds buffer so the compiled
+        # inner model is always traced with inputs_embeds (matching vLLM).
+        # deepstack_embeds is NOT passed here — it is only needed during
+        # multimodal prefill, which uses the eager model.  Keeping deepstack
+        # out of the compiled graph avoids unnecessary zero-tensor additions
+        # on every decode step.
+        vl_inputs_embeds = None
+        vl_embed_fn = None
+        if self.is_qwen_vl:
+            hidden_size = self.config.hidden_size
+            vl_inputs_embeds = torch.zeros(max_bs, hidden_size,
+                                           dtype=self.dtype)
+            vl_embed_fn = self.model.get_input_embeddings()
+
         lm_head = self.model.lm_head
         vocab_per_rank = lm_head.per_partition
         lm_logits = torch.zeros(max_bs, vocab_per_rank)
@@ -1894,21 +1934,47 @@ class ModelRunner:
                 else:
                     pos_slice = positions[:bs]
 
+                # For VL: create a slice reference ONCE and reuse for both
+                # mark_dynamic and the warmup call so the dynamic metadata
+                # stays on the exact tensor object Dynamo will trace.
+                ie_slice = (vl_inputs_embeds[:bs]
+                            if vl_inputs_embeds is not None else None)
+
                 if self._compiled and not self._mark_dynamic_done:
                     torch._dynamo.mark_dynamic(ids_slice, 0)
                     if self.is_qwen_vl:
-                        torch._dynamo.mark_dynamic(pos_slice, 0)
                         torch._dynamo.mark_dynamic(pos_slice, 1)
                     else:
                         torch._dynamo.mark_dynamic(pos_slice, 0)
+                    if ie_slice is not None:
+                        torch._dynamo.mark_dynamic(ie_slice, 0)
                     self._mark_dynamic_done = True
 
-                outputs[:bs] = self.model(ids_slice, pos_slice)
+                # Warmup forward: for VL, compute inputs_embeds outside and
+                # pass it so the compiled inner Qwen3Model traces the
+                # inputs_embeds branch (never embed_tokens).
+                # deepstack_embeds is intentionally omitted — the compiled
+                # graph traces without it, avoiding zero-add overhead on
+                # every decode step.
+                if ie_slice is not None:
+                    ie_slice.copy_(vl_embed_fn(ids_slice))
+                    outputs[:bs] = self.model(
+                        ids_slice, pos_slice,
+                        inputs_embeds=ie_slice,
+                    )
+                else:
+                    outputs[:bs] = self.model(ids_slice, pos_slice)
                 lm_logits[:bs] = lm_head.linear_op(outputs[:bs], lm_head.embedding_op.emb.weight).float()
                 lm_max_vals[:bs], lm_max_idxs[:bs] = lm_logits[:bs].max(dim=-1)
 
                 with torch.cuda.graph(graph, self.graph_pool):
-                    if self.is_qwen_vl:
+                    if vl_inputs_embeds is not None:
+                        vl_inputs_embeds[:bs] = vl_embed_fn(input_ids[:bs])
+                        outputs[:bs] = self.model(
+                            input_ids[:bs], positions[:, :bs],
+                            inputs_embeds=vl_inputs_embeds[:bs],
+                        )
+                    elif self.is_qwen_vl:
                         outputs[:bs] = self.model(input_ids[:bs], positions[:, :bs])
                     else:
                         outputs[:bs] = self.model(input_ids[:bs], positions[:bs])
@@ -1928,7 +1994,6 @@ class ModelRunner:
             lm_logits=lm_logits, lm_max_vals=lm_max_vals,
             lm_max_idxs=lm_max_idxs,
         )
-
         # Pre-compute lookup table: _graph_bs_for_n[n] = smallest graph_bs >= n
         self._graph_bs_for_n = [0] * (max_bs + 1)
         for n in range(max_bs + 1):
