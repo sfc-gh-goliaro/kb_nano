@@ -67,6 +67,7 @@ MODEL_REGISTRY = {
         "short_name": "siglip2-so400m",
         "image_mean": [0.5, 0.5, 0.5],
         "image_std": [0.5, 0.5, 0.5],
+        "default_num_images": 40000,
     },
     "facebook/dinov3-vit7b16-pretrain-lvd1689m": {
         "timm_name": "vit_7b_patch16_dinov3.lvd1689m",
@@ -76,6 +77,7 @@ MODEL_REGISTRY = {
         "short_name": "dinov3-7b",
         "image_mean": [0.485, 0.456, 0.406],
         "image_std": [0.229, 0.224, 0.225],
+        "default_num_images": 3000,
     },
 }
 
@@ -97,9 +99,12 @@ def _detect_gpu_name() -> str:
 # ---------------------------------------------------------------------------
 # timm subprocess worker
 # ---------------------------------------------------------------------------
-TIMM_WORKER = r'''
+_WORKER_COMMON = r'''
 import json, os, sys, time, torch
 from tqdm import tqdm
+
+IMAGE_POOL_SIZE = 1000
+EMBED_SAVE_CAP = 500
 
 
 def _load_pil_images(dataset_name, dataset_split, num_needed, seed):
@@ -107,6 +112,7 @@ def _load_pil_images(dataset_name, dataset_split, num_needed, seed):
     from datasets import load_dataset
     from PIL import Image
 
+    num_needed = min(num_needed, IMAGE_POOL_SIZE)
     print(
         f"Loading {num_needed} images from {dataset_name} ({dataset_split})...",
         file=sys.stderr, flush=True,
@@ -134,7 +140,7 @@ def _load_pil_images(dataset_name, dataset_split, num_needed, seed):
     return images
 
 
-def _preprocess_images(pil_images, resolution, image_mean, image_std, dtype):
+def _preprocess_pool(pil_images, resolution, image_mean, image_std, dtype):
     """Resize, center-crop, normalize, and stack PIL images into a GPU tensor."""
     from torchvision import transforms
 
@@ -151,24 +157,13 @@ def _preprocess_images(pil_images, resolution, image_mean, image_std, dtype):
     return torch.stack(tensors).to(device="cuda", dtype=dtype)
 
 
-def main():
-    with open(sys.argv[1]) as f:
-        cfg = json.load(f)
-
-    import timm
-
-    timm_name = cfg["timm_name"]
+def run_benchmark(model, cfg, label):
     seed = cfg["seed"]
     dtype = getattr(torch, cfg.get("dtype", "bfloat16"))
     image_mean = cfg["image_mean"]
     image_std = cfg["image_std"]
     dataset_name = cfg["dataset_name"]
     dataset_split = cfg["dataset_split"]
-
-    print(f"Loading timm model: {timm_name}", file=sys.stderr, flush=True)
-    model = timm.create_model(
-        timm_name, pretrained=True,
-    ).to(device="cuda", dtype=dtype).eval()
 
     embed_dir = cfg.get("embed_dir")
     if embed_dir:
@@ -177,13 +172,13 @@ def main():
     scenarios = cfg.get("scenarios", [])
     latency_scenarios = cfg.get("latency_scenarios", [])
 
-    max_images = 0
+    max_needed = 0
     for s in scenarios:
-        max_images = max(max_images, s["num_images"])
+        max_needed = max(max_needed, s["num_images"])
     for ls in latency_scenarios:
-        max_images = max(max_images, ls["batch_size"])
+        max_needed = max(max_needed, ls["batch_size"])
 
-    raw_images = _load_pil_images(dataset_name, dataset_split, max_images, seed)
+    raw_images = _load_pil_images(dataset_name, dataset_split, max_needed, seed)
 
     # Per-resolution warmup
     seen_shapes = set()
@@ -193,14 +188,14 @@ def main():
             seen_shapes.add(key)
             res, bs = key
             print(f"Warmup at {res}x{res} bs={bs}", file=sys.stderr, flush=True)
-            warm_imgs = _preprocess_images(
+            warm_pool = _preprocess_pool(
                 raw_images[:bs], res, image_mean, image_std, dtype,
             )
             with torch.no_grad():
                 for _ in range(3):
-                    _ = model(warm_imgs)
+                    _ = model(warm_pool)
                 torch.cuda.synchronize()
-            del warm_imgs
+            del warm_pool
 
     all_results = []
     for scenario in scenarios:
@@ -209,23 +204,20 @@ def main():
         num_images = scenario["num_images"]
         num_batches = (num_images + batch_size - 1) // batch_size
 
-        use_imgs = raw_images[:num_images]
-        if len(use_imgs) < num_images:
-            reps = (num_images + len(raw_images) - 1) // len(raw_images)
-            use_imgs = (raw_images * reps)[:num_images]
-
-        all_tensors = _preprocess_images(
-            use_imgs, res, image_mean, image_std, dtype,
-        )
+        pool = _preprocess_pool(raw_images, res, image_mean, image_std, dtype)
+        pool_size = len(pool)
+        embed_max_batch = (EMBED_SAVE_CAP + batch_size - 1) // batch_size
 
         total_elapsed = 0.0
         total_images = 0
-        desc = f"timm {scenario['name']} ({res}x{res} bs={batch_size})"
+        desc = f"{label} {scenario['name']} ({res}x{res} bs={batch_size})"
         pbar = tqdm(range(num_batches), desc=desc, unit="batch", file=sys.stderr)
         for batch_idx in pbar:
             start = batch_idx * batch_size
             end = min(start + batch_size, num_images)
-            x = all_tensors[start:end]
+            actual_bs = end - start
+            indices = torch.arange(start, start + actual_bs) % pool_size
+            x = pool[indices]
 
             torch.cuda.synchronize()
             t0 = time.perf_counter()
@@ -234,9 +226,9 @@ def main():
             torch.cuda.synchronize()
             batch_elapsed = time.perf_counter() - t0
             total_elapsed += batch_elapsed
-            total_images += (end - start)
+            total_images += actual_bs
 
-            if embed_dir:
+            if embed_dir and batch_idx < embed_max_batch:
                 torch.save(
                     out.detach().cpu(),
                     os.path.join(
@@ -250,7 +242,7 @@ def main():
                 ips=f"{total_images / total_elapsed:.2f}",
             )
 
-        del all_tensors
+        del pool
         all_results.append({
             "name": scenario["name"],
             "elapsed": total_elapsed,
@@ -267,12 +259,12 @@ def main():
         num_warmup = ls.get("num_warmup", 3)
         num_iters = ls.get("num_iters", 10)
 
-        x = _preprocess_images(
+        x = _preprocess_pool(
             raw_images[:batch_size], res, image_mean, image_std, dtype,
         )
 
         for _ in tqdm(
-            range(num_warmup), desc=f"timm warmup {ls['name']}",
+            range(num_warmup), desc=f"{label} warmup {ls['name']}",
             file=sys.stderr,
         ):
             with torch.no_grad():
@@ -282,7 +274,7 @@ def main():
 
         latencies = []
         for _ in tqdm(
-            range(num_iters), desc=f"timm latency {ls['name']}",
+            range(num_iters), desc=f"{label} latency {ls['name']}",
             file=sys.stderr,
         ):
             torch.cuda.synchronize()
@@ -303,9 +295,29 @@ def main():
 
     del model
     torch.cuda.empty_cache()
+    return {"throughput": all_results, "latency": latency_results}
+'''
+
+TIMM_WORKER = _WORKER_COMMON + r'''
+
+def main():
+    with open(sys.argv[1]) as f:
+        cfg = json.load(f)
+
+    import timm
+
+    timm_name = cfg["timm_name"]
+    dtype = getattr(torch, cfg.get("dtype", "bfloat16"))
+
+    print(f"Loading timm model: {timm_name}", file=sys.stderr, flush=True)
+    model = timm.create_model(
+        timm_name, pretrained=True,
+    ).to(device="cuda", dtype=dtype).eval()
+
+    results = run_benchmark(model, cfg, "timm")
 
     with open(cfg["output_file"], "w") as f:
-        json.dump({"throughput": all_results, "latency": latency_results}, f)
+        json.dump(results, f)
 
 if __name__ == "__main__":
     main()
@@ -315,59 +327,7 @@ if __name__ == "__main__":
 # ---------------------------------------------------------------------------
 # kb-nano subprocess worker
 # ---------------------------------------------------------------------------
-KB_NANO_WORKER = r'''
-import json, os, sys, time, torch
-from tqdm import tqdm
-
-
-def _load_pil_images(dataset_name, dataset_split, num_needed, seed):
-    """Load raw PIL images from a HuggingFace dataset via streaming."""
-    from datasets import load_dataset
-    from PIL import Image
-
-    print(
-        f"Loading {num_needed} images from {dataset_name} ({dataset_split})...",
-        file=sys.stderr, flush=True,
-    )
-    ds = load_dataset(dataset_name, split=dataset_split, streaming=True)
-    ds = ds.shuffle(seed=seed, buffer_size=5000)
-
-    images = []
-    for sample in ds:
-        img = sample.get("image") or sample.get("img")
-        if img is None:
-            for v in sample.values():
-                if hasattr(v, "convert"):
-                    img = v
-                    break
-        if img is None:
-            continue
-        if isinstance(img, dict) and "bytes" in img:
-            from io import BytesIO
-            img = Image.open(BytesIO(img["bytes"]))
-        images.append(img.convert("RGB"))
-        if len(images) >= num_needed:
-            break
-    print(f"  Loaded {len(images)} images", file=sys.stderr, flush=True)
-    return images
-
-
-def _preprocess_images(pil_images, resolution, image_mean, image_std, dtype):
-    """Resize, center-crop, normalize, and stack PIL images into a GPU tensor."""
-    from torchvision import transforms
-
-    transform = transforms.Compose([
-        transforms.Resize(
-            resolution,
-            interpolation=transforms.InterpolationMode.BICUBIC,
-        ),
-        transforms.CenterCrop(resolution),
-        transforms.ToTensor(),
-        transforms.Normalize(mean=image_mean, std=image_std),
-    ])
-    tensors = [transform(img) for img in pil_images]
-    return torch.stack(tensors).to(device="cuda", dtype=dtype)
-
+KB_NANO_WORKER = _WORKER_COMMON + r'''
 
 def main():
     with open(sys.argv[1]) as f:
@@ -378,12 +338,7 @@ def main():
     kb_module = cfg["kb_module"]
     kb_class = cfg["kb_class"]
     timm_name = cfg["timm_name"]
-    seed = cfg["seed"]
     dtype = getattr(torch, cfg.get("dtype", "bfloat16"))
-    image_mean = cfg["image_mean"]
-    image_std = cfg["image_std"]
-    dataset_name = cfg["dataset_name"]
-    dataset_split = cfg["dataset_split"]
 
     mod = __import__(
         f"{pkg}.tasks.baseline.L4.{kb_module}",
@@ -397,142 +352,10 @@ def main():
     )
     model = ModelClass.from_timm(timm_name).to(device="cuda", dtype=dtype).eval()
 
-    embed_dir = cfg.get("embed_dir")
-    if embed_dir:
-        os.makedirs(embed_dir, exist_ok=True)
-
-    scenarios = cfg.get("scenarios", [])
-    latency_scenarios = cfg.get("latency_scenarios", [])
-
-    max_images = 0
-    for s in scenarios:
-        max_images = max(max_images, s["num_images"])
-    for ls in latency_scenarios:
-        max_images = max(max_images, ls["batch_size"])
-
-    raw_images = _load_pil_images(dataset_name, dataset_split, max_images, seed)
-
-    # Per-resolution warmup
-    seen_shapes = set()
-    for s in scenarios + latency_scenarios:
-        key = (s["resolution"], s.get("batch_size", 1))
-        if key not in seen_shapes:
-            seen_shapes.add(key)
-            res, bs = key
-            print(f"Warmup at {res}x{res} bs={bs}", file=sys.stderr, flush=True)
-            warm_imgs = _preprocess_images(
-                raw_images[:bs], res, image_mean, image_std, dtype,
-            )
-            with torch.no_grad():
-                for _ in range(3):
-                    _ = model(warm_imgs)
-                torch.cuda.synchronize()
-            del warm_imgs
-
-    all_results = []
-    for scenario in scenarios:
-        res = scenario["resolution"]
-        batch_size = scenario["batch_size"]
-        num_images = scenario["num_images"]
-        num_batches = (num_images + batch_size - 1) // batch_size
-
-        use_imgs = raw_images[:num_images]
-        if len(use_imgs) < num_images:
-            reps = (num_images + len(raw_images) - 1) // len(raw_images)
-            use_imgs = (raw_images * reps)[:num_images]
-
-        all_tensors = _preprocess_images(
-            use_imgs, res, image_mean, image_std, dtype,
-        )
-
-        total_elapsed = 0.0
-        total_images = 0
-        desc = f"kb-nano {scenario['name']} ({res}x{res} bs={batch_size})"
-        pbar = tqdm(range(num_batches), desc=desc, unit="batch", file=sys.stderr)
-        for batch_idx in pbar:
-            start = batch_idx * batch_size
-            end = min(start + batch_size, num_images)
-            x = all_tensors[start:end]
-
-            torch.cuda.synchronize()
-            t0 = time.perf_counter()
-            with torch.no_grad():
-                out = model(x)
-            torch.cuda.synchronize()
-            batch_elapsed = time.perf_counter() - t0
-            total_elapsed += batch_elapsed
-            total_images += (end - start)
-
-            if embed_dir:
-                torch.save(
-                    out.detach().cpu(),
-                    os.path.join(
-                        embed_dir,
-                        f"{scenario['name']}_batch{batch_idx:04d}.pt",
-                    ),
-                )
-
-            pbar.set_postfix(
-                imgs=total_images,
-                ips=f"{total_images / total_elapsed:.2f}",
-            )
-
-        del all_tensors
-        all_results.append({
-            "name": scenario["name"],
-            "elapsed": total_elapsed,
-            "num_images": total_images,
-            "images_per_second": (
-                total_images / total_elapsed if total_elapsed > 0 else 0
-            ),
-        })
-
-    latency_results = []
-    for ls in latency_scenarios:
-        res = ls["resolution"]
-        batch_size = ls["batch_size"]
-        num_warmup = ls.get("num_warmup", 3)
-        num_iters = ls.get("num_iters", 10)
-
-        x = _preprocess_images(
-            raw_images[:batch_size], res, image_mean, image_std, dtype,
-        )
-
-        for _ in tqdm(
-            range(num_warmup), desc=f"kb-nano warmup {ls['name']}",
-            file=sys.stderr,
-        ):
-            with torch.no_grad():
-                torch.cuda.synchronize()
-                _ = model(x)
-                torch.cuda.synchronize()
-
-        latencies = []
-        for _ in tqdm(
-            range(num_iters), desc=f"kb-nano latency {ls['name']}",
-            file=sys.stderr,
-        ):
-            torch.cuda.synchronize()
-            t0 = time.perf_counter()
-            with torch.no_grad():
-                _ = model(x)
-            torch.cuda.synchronize()
-            latencies.append(time.perf_counter() - t0)
-
-        del x
-        latency_results.append({
-            "name": ls["name"],
-            "resolution": res,
-            "batch_size": batch_size,
-            "num_iters": num_iters,
-            "latencies": latencies,
-        })
-
-    del model
-    torch.cuda.empty_cache()
+    results = run_benchmark(model, cfg, "kb-nano")
 
     with open(cfg["output_file"], "w") as f:
-        json.dump({"throughput": all_results, "latency": latency_results}, f)
+        json.dump(results, f)
 
 if __name__ == "__main__":
     main()
@@ -811,10 +634,14 @@ def main():
     scenarios = _build_throughput_scenarios(default_res) if not args.skip_throughput else []
     latency_scenarios = _build_latency_scenarios(default_res) if not args.skip_latency else []
 
-    # Apply CLI overrides
+    # Apply model-specific default num_images, then CLI overrides
+    default_num_images = model_info.get("default_num_images")
     if args.num_images is not None:
         for s in scenarios:
             s["num_images"] = args.num_images
+    elif default_num_images is not None:
+        for s in scenarios:
+            s["num_images"] = default_num_images
     if args.batch_size is not None:
         for s in scenarios:
             s["batch_size"] = args.batch_size

@@ -398,13 +398,13 @@ class VisionEncoderLatencyWorkload:
 
 
 VISION_ENCODER_THROUGHPUT_WORKLOADS: list[VisionEncoderThroughputWorkload] = [
-    VisionEncoderThroughputWorkload("default-res", resolution=0, num_images=500, batch_size=32),
-    VisionEncoderThroughputWorkload("high-res",    resolution=512, num_images=200, batch_size=16),
+    VisionEncoderThroughputWorkload("default-res", resolution=0, num_images=10000, batch_size=32),
+    VisionEncoderThroughputWorkload("high-res",    resolution=512, num_images=5000, batch_size=16),
 ]
 
 VISION_ENCODER_LATENCY_WORKLOADS: list[VisionEncoderLatencyWorkload] = [
-    VisionEncoderLatencyWorkload("single-image", resolution=0, batch_size=1),
-    VisionEncoderLatencyWorkload("batch-8",      resolution=0, batch_size=8),
+    VisionEncoderLatencyWorkload("single-image", resolution=0, batch_size=1, num_warmup=5, num_iters=50),
+    VisionEncoderLatencyWorkload("batch-8",      resolution=0, batch_size=8, num_warmup=5, num_iters=50),
 ]
 
 ALL_VISION_ENCODER_WORKLOADS = {
