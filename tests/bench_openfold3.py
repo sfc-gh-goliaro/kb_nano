@@ -67,43 +67,180 @@ def _detect_gpu_name() -> str:
 # Representative PDB chains from OpenProteinSet, grouped by length
 # ---------------------------------------------------------------------------
 
-# Verified chains from OpenProteinSet (s3://openfold/pdb/).
+# Verified chains available in OpenProteinSet (s3://openfold/pdb/).
+# Lengths from RCSB PDB. Each bucket covers a distinct length range
+# to exercise different computational regimes (O(N) vs O(N²)).
 CHAIN_CATALOG = {
+    # ≤150 residues — fast inference, high query count
     "short": [
-        ("2q2k", "A", 70, "ParR DNA-binding"),
-        ("1hf9", "A", 42, "Ubiquitin-like"),
-        ("1crn", "A", 46, "Crambin"),
-        ("1kd8", "A", 37, "Barnase fragment"),
-        ("1cag", "A", 31, "Calmodulin fragment"),
-        ("2crb", "A", 98, "CRABP II"),
+        ("1l2y", "A",  20, "TC5b mini-protein"),
+        ("2jof", "A",  20, "Trp-cage"),
+        ("1le1", "A",  13, "Tryptophan zipper 2"),
+        ("1gcn", "A",  29, "Glucagon"),
+        ("1cag", "A",  31, "Calmodulin fragment"),
+        ("1vii", "A",  36, "Villin headpiece"),
+        ("1kd8", "A",  37, "Barnase fragment"),
+        ("1hf9", "A",  42, "Ubiquitin-like"),
+        ("1crn", "A",  46, "Crambin"),
+        ("3nir", "A",  46, "Crambin variant"),
+        ("1enh", "A",  54, "Engrailed homeodomain"),
+        ("1idy", "A",  54, "c-Myb DNA-binding repeat 3"),
+        ("1shf", "A",  59, "Fyn SH3 domain"),
+        ("1fas", "A",  61, "Fasciculin 1"),
+        ("1isu", "A",  62, "High-potential iron-sulfur"),
+        ("1nxb", "A",  62, "Neurotoxin B"),
+        ("1c9o", "A",  66, "Cold-shock protein"),
+        ("1csp", "A",  67, "Cold shock protein CspB"),
+        ("1b3a", "A",  67, "RANTES"),
+        ("1b67", "A",  68, "Histone HMfA"),
+        ("1mjc", "A",  69, "Major cold-shock protein"),
+        ("2q2k", "A",  70, "ParR DNA-binding"),
+        ("1msi", "A",  70, "Type III antifreeze protein"),
+        ("1a8o", "A",  70, "HIV capsid"),
+        ("1ctf", "A",  74, "Ribosomal protein L7/L12"),
+        ("1d3b", "A",  75, "snRNP-D"),
+        ("1pk4", "A",  79, "Plasminogen kringle 4"),
+        ("1hyp", "A",  80, "Hydrophobic protein soybean"),
+        ("1bdo", "A",  81, "Ferredoxin"),
+        ("1pgx", "A",  83, "Protein G"),
+        ("1pht", "A",  85, "PI3K p85-alpha SH3"),
+        ("1a43", "A",  87, "HIV-1 capsid"),
+        ("1gvp", "A",  87, "Gene V protein"),
+        ("1ptf", "A",  88, "HPr phosphocarrier"),
+        ("1ten", "A",  90, "Tenascin"),
+        ("1wit", "A",  93, "Twitchin IgSF module"),
+        ("1c5e", "A",  95, "Head decoration protein"),
+        ("1bym", "A",  97, "Diphtheria toxin repressor"),
+        ("2crb", "A",  98, "CRABP II"),
+        ("2acy", "A",  98, "Acylphosphatase"),
+        ("1tit", "A",  98, "Titin I27"),
+        ("1plc", "A",  99, "Plastocyanin"),
+        ("1aac", "A", 105, "Amicyanin"),
+        ("1ew4", "A", 106, "CyaY protein"),
+        ("1acx", "A", 108, "Actinoxanthin"),
+        ("1bkr", "A", 109, "Spectrin beta chain"),
+        ("1jpc", "A", 109, "Agglutinin"),
+        ("1i4j", "A", 110, "50S ribosomal protein L22"),
         ("1a2p", "A", 111, "Lysozyme"),
-        ("1bdo", "A", 81, "Ferredoxin"),
-        ("101m", "A", 154, "Myoglobin"),
-        ("3hhr", "A", 191, "Hemoglobin"),
+        ("1b0n", "A", 111, "SinR protein"),
+        ("1qau", "A", 112, "nNOS PDZ domain"),
+        ("1thx", "A", 115, "Thioredoxin"),
+        ("1dj7", "A", 117, "Ferredoxin-thioredoxin reductase"),
+        ("1dhn", "A", 121, "Dihydroneopterin aldolase"),
+        ("1alc", "A", 123, "Alpha-lactalbumin"),
+        ("1c44", "A", 123, "Sterol carrier protein 2"),
+        ("1bgf", "A", 124, "STAT-4"),
+        ("1bqk", "A", 124, "Pseudoazurin"),
+        ("1byf", "A", 125, "Polyandrocarpa lectin"),
+        ("1avd", "A", 128, "Avidin"),
+        ("1rie", "A", 129, "Rieske iron-sulfur protein"),
+        ("1nyn", "A", 131, "Hypothetical protein"),
+        ("1bbh", "A", 131, "Cytochrome c'"),
+        ("1c52", "A", 131, "Cytochrome c552"),
+        ("1jac", "A", 133, "Jacalin"),
+        ("1bkb", "A", 136, "Translation initiation factor 5A"),
+        ("1jer", "A", 138, "Cucumber stellacyanin"),
+        ("1lit", "A", 144, "Lithostathine"),
+        ("1bfg", "A", 146, "Basic fibroblast growth factor"),
+        ("1mba", "A", 147, "Myoglobin"),
+        ("1cdl", "A", 147, "Calmodulin"),
+        ("1dk8", "A", 147, "Axin"),
+        ("1ggz", "A", 148, "Calmodulin-related NB-1"),
     ],
+    # 150–400 residues — moderate inference cost
     "medium": [
-        ("1ake", "A", 214, "Adenylate kinase"),
-        ("1tim", "A", 247, "Triosephosphate isomerase"),
-        ("1f3g", "A", 162, "Cytochrome c"),
         ("101m", "A", 154, "Myoglobin"),
+        ("1bj7", "A", 156, "D2 domain"),
+        ("1tnf", "A", 157, "Tumor necrosis factor-alpha"),
+        ("1e7l", "A", 157, "Recombination endonuclease VII"),
+        ("1am7", "A", 158, "Lysozyme"),
+        ("1grj", "A", 158, "GreA protein"),
+        ("1aep", "A", 161, "Apolipophorin III"),
+        ("1f3g", "A", 162, "Cytochrome c"),
+        ("1c1y", "A", 167, "Ras-related protein Rap-1A"),
+        ("1cid", "A", 177, "T-cell CD4"),
+        ("1aqb", "A", 183, "Retinol-binding protein"),
+        ("1gky", "A", 187, "Guanylate kinase"),
         ("3hhr", "A", 191, "Hemoglobin"),
-        ("1a2p", "A", 111, "Lysozyme"),
-        ("1bdo", "A", 81, "Ferredoxin"),
-        ("2crb", "A", 98, "CRABP II"),
-    ],
-    "long": [
-        ("1aon", "A", 548, "GroEL chaperonin"),
+        ("2pth", "A", 193, "Peptidyl-tRNA hydrolase"),
+        ("1chd", "A", 203, "CheB methylesterase"),
+        ("1thv", "A", 207, "Thaumatin"),
+        ("1bam", "A", 213, "Endonuclease BamHI"),
         ("1ake", "A", 214, "Adenylate kinase"),
+        ("1cex", "A", 214, "Cutinase"),
+        ("1g3p", "A", 217, "Minor coat protein g3p"),
+        ("1dkx", "A", 219, "DnaK substrate-binding domain"),
+        ("1c3w", "A", 222, "Bacteriorhodopsin"),
+        ("1byq", "A", 228, "Heat shock protein 90"),
+        ("1gfl", "A", 238, "Green fluorescent protein"),
+        ("1bkj", "A", 240, "NADPH-flavin oxidoreductase"),
+        ("1e2x", "A", 243, "Fatty acid metabolism regulator"),
+        ("1rwz", "A", 245, "DNA polymerase sliding clamp"),
         ("1tim", "A", 247, "Triosephosphate isomerase"),
-        ("1f3g", "A", 162, "Cytochrome c"),
-        ("101m", "A", 154, "Myoglobin"),
+        ("1b9b", "A", 255, "Triosephosphate isomerase"),
+        ("1c90", "A", 265, "Endo-beta-N-acetylglucosamidase H"),
+        ("1mml", "A", 265, "MuLV reverse transcriptase"),
+        ("1arb", "A", 268, "Achromobacter protease I"),
+        ("1d2n", "A", 272, "NSF fusion protein"),
+        ("1amp", "A", 291, "Aminopeptidase"),
+        ("1c3d", "A", 294, "C3d complement"),
+        ("1gca", "A", 309, "Glucose/galactose-binding protein"),
+        ("1ads", "A", 315, "Aldose reductase"),
+        ("2pia", "A", 321, "Phthalate dioxygenase reductase"),
+        ("1bg2", "A", 325, "Kinesin"),
+        ("1elv", "A", 333, "Complement C1s"),
+        ("1lga", "A", 343, "Lignin peroxidase"),
+        ("1bx4", "A", 345, "Adenosine kinase"),
+        ("1a0i", "A", 348, "DNA ligase"),
+        ("1got", "A", 350, "Gt-alpha/Gi-alpha chimera"),
+        ("1czf", "A", 362, "Polygalacturonase II"),
+        ("1fnf", "A", 368, "Fibronectin"),
+        ("1atn", "A", 373, "Actin"),
+        ("1ova", "A", 386, "Ovalbumin"),
+        ("1hpm", "A", 386, "44K ATPase fragment"),
+    ],
+    # 400–700 residues — expensive pair representations
+    "long": [
+        ("1e5m", "A", 416, "Beta-ketoacyl ACP synthase"),
+        ("1gnd", "A", 447, "GDI"),
+        ("1b8j", "A", 449, "Alkaline phosphatase"),
+        ("1a8d", "A", 452, "Tetanus neurotoxin"),
+        ("1cjc", "A", 460, "Adrenodoxin reductase"),
+        ("1lam", "A", 484, "Leucine aminopeptidase"),
+        ("1b4v", "A", 504, "Cholesterol oxidase"),
+        ("1dpe", "A", 507, "Dipeptide-binding protein"),
+        ("1fcb", "A", 511, "Flavocytochrome b2"),
+        ("1ddt", "A", 535, "Diphtheria toxin"),
+        ("1aon", "A", 548, "GroEL chaperonin"),
+        ("1aoz", "A", 552, "Ascorbate oxidase"),
+        ("1dce", "A", 567, "Rab geranylgeranyltransferase"),
+        ("1gpe", "A", 587, "Glucose oxidase"),
+        ("1bcc", "A", 446, "Ubiquinol cytochrome c oxidoreductase"),
+        ("1byq", "A", 228, "Heat shock protein 90"),
+        ("1cdg", "A", 686, "Cyclodextrin glycosyltransferase"),
+    ],
+    # 700+ residues — stress test for O(N²) operations
+    "extra-long": [
+        ("1cdg", "A", 686, "Cyclodextrin glycosyltransferase"),
+        ("1gpe", "A", 587, "Glucose oxidase"),
+        ("1dce", "A", 567, "Rab geranylgeranyltransferase"),
+        ("1aon", "A", 548, "GroEL chaperonin"),
+        ("1ddt", "A", 535, "Diphtheria toxin"),
+        ("1fcb", "A", 511, "Flavocytochrome b2"),
+        ("1dpe", "A", 507, "Dipeptide-binding protein"),
+        ("1b4v", "A", 504, "Cholesterol oxidase"),
+        ("1lam", "A", 484, "Leucine aminopeptidase"),
+        ("1cjc", "A", 460, "Adrenodoxin reductase"),
+        ("1a8d", "A", 452, "Tetanus neurotoxin"),
+        ("1b8j", "A", 449, "Alkaline phosphatase"),
+        ("1bcc", "A", 446, "Ubiquinol cytochrome c oxidoreductase"),
     ],
 }
 
 PF_BLOCKS = 48
 MSA_BLOCKS = 4
-NO_ROLLOUT_STEPS = 5
-NUM_RECYCLES = 1
+NO_ROLLOUT_STEPS = 20
+NUM_RECYCLES = 3
 MAX_MSA_SEQS = 512
 
 HF_REPO_ID = "OpenFold/OpenFold3"
@@ -124,15 +261,17 @@ def download_checkpoint() -> str:
 # ---------------------------------------------------------------------------
 
 SCENARIOS = [
-    {"name": "short",  "num_queries": 50, "description": "short proteins (≤150 res) × 50 queries"},
-    {"name": "medium", "num_queries": 20, "description": "medium proteins (150-400 res) × 20 queries"},
-    {"name": "long",   "num_queries": 10, "description": "long proteins (400-800 res) × 10 queries"},
+    {"name": "short",      "num_queries": 500, "description": "short proteins (≤150 res) × 500 queries"},
+    {"name": "medium",     "num_queries": 200, "description": "medium proteins (150-400 res) × 200 queries"},
+    {"name": "long",       "num_queries": 100, "description": "long proteins (400-700 res) × 100 queries"},
+    {"name": "extra-long", "num_queries":  50, "description": "extra-long proteins (700+ res) × 50 queries"},
 ]
 
 LATENCY_SCENARIOS = [
-    {"name": "single-short",  "length_bucket": "short",  "num_warmup": 3, "num_iters": 5},
-    {"name": "single-medium", "length_bucket": "medium", "num_warmup": 2, "num_iters": 5},
-    {"name": "single-long",   "length_bucket": "long",   "num_warmup": 2, "num_iters": 3},
+    {"name": "single-short",      "length_bucket": "short",      "num_warmup": 3, "num_iters": 5},
+    {"name": "single-medium",     "length_bucket": "medium",     "num_warmup": 2, "num_iters": 5},
+    {"name": "single-long",       "length_bucket": "long",       "num_warmup": 2, "num_iters": 3},
+    {"name": "single-extra-long", "length_bucket": "extra-long", "num_warmup": 1, "num_iters": 3},
 ]
 
 
@@ -787,6 +926,8 @@ def main():
     parser.add_argument("--scenario", type=str, default=None,
                         choices=[s["name"] for s in SCENARIOS],
                         help="Run a single throughput scenario (default: all)")
+    parser.add_argument("--num-seqs", type=int, default=None,
+                        help="Override num_queries per scenario (default: scenario-specific)")
     parser.add_argument("--dtype", type=str, default="bfloat16",
                         choices=["bfloat16", "float16", "float32"])
     parser.add_argument("--seed", type=int, default=42)
@@ -810,13 +951,16 @@ def main():
     if args.data_dir is None:
         args.data_dir = "/tmp/openfold_bench_data"
 
-    throughput_scenarios = SCENARIOS
+    throughput_scenarios = [dict(s) for s in SCENARIOS]
     if args.scenario:
-        throughput_scenarios = [s for s in SCENARIOS if s["name"] == args.scenario]
+        throughput_scenarios = [s for s in throughput_scenarios if s["name"] == args.scenario]
+    if args.num_seqs is not None:
+        for s in throughput_scenarios:
+            s["num_queries"] = args.num_seqs
 
-    latency_scenarios = LATENCY_SCENARIOS
+    latency_scenarios = [dict(s) for s in LATENCY_SCENARIOS]
     if args.scenario:
-        latency_scenarios = [s for s in LATENCY_SCENARIOS if s["name"].endswith(args.scenario)]
+        latency_scenarios = [s for s in latency_scenarios if s["name"].endswith(args.scenario)]
 
     for ls in latency_scenarios:
         ls["num_iters"] = args.latency_iters
@@ -839,8 +983,10 @@ def main():
     print(f"  Recycles       : {NUM_RECYCLES}")
     print(f"  Max MSA seqs   : {MAX_MSA_SEQS}")
     print(f"  Data dir       : {args.data_dir}")
+    total_queries = sum(s["num_queries"] for s in throughput_scenarios)
     if not args.skip_throughput:
-        print(f"  Throughput     : {'; '.join(s['description'] for s in throughput_scenarios)}")
+        tp_desc = "; ".join(f"{s['name']}×{s['num_queries']}" for s in throughput_scenarios)
+        print(f"  Throughput     : {tp_desc} ({total_queries} total queries)")
     if not args.skip_latency:
         print(f"  Latency        : {', '.join(s['name'] for s in latency_scenarios)} "
               f"({args.latency_iters} iters)")
