@@ -62,34 +62,11 @@ def _detect_gpu_name() -> str:
 # ---------------------------------------------------------------------------
 
 _DATASET_PRELOAD = r'''
-import torch, random, os, io
+import torch, random, os, io, sys
 
 _IMAGE_TOKEN_ID = 257152
 _PAD_TOKEN_ID = 0
 _BOS_TOKEN_ID = 2
-
-_LIBERO_TASK_TEXTS = None
-
-
-def _load_libero_task_texts(dataset_name="lerobot/libero"):
-    """Load task descriptions from LIBERO meta/tasks.parquet."""
-    global _LIBERO_TASK_TEXTS
-    if _LIBERO_TASK_TEXTS is not None:
-        return _LIBERO_TASK_TEXTS
-
-    try:
-        from huggingface_hub import hf_hub_download
-        import pyarrow.parquet as pq
-        path = hf_hub_download(dataset_name, "meta/tasks.parquet", repo_type="dataset")
-        df = pq.read_table(path).to_pandas()
-        task_map = {}
-        for task_text, row in df.iterrows():
-            task_map[int(row["task_index"])] = str(task_text)
-        _LIBERO_TASK_TEXTS = task_map
-        return task_map
-    except Exception as e:
-        print(f"WARNING: Could not load task texts: {e}", file=sys.stderr)
-        return {}
 
 
 def _tokenize_instruction(text, tokenizer, num_image_tokens, num_cameras, max_length=48):
@@ -107,103 +84,92 @@ def _tokenize_instruction(text, tokenizer, num_image_tokens, num_cameras, max_le
     return ids
 
 
-def _decode_video_frame(video_bytes):
-    """Decode a single frame from LeRobot video bytes using torchvision."""
-    import torchvision.transforms.functional as TF
-    from PIL import Image
-    img = Image.open(io.BytesIO(video_bytes)).convert("RGB")
-    return TF.to_tensor(img)
-
-
 def load_libero_dataset(num_samples, num_cameras, image_size=224,
                         max_state_dim=32, max_action_dim=32, max_length=48,
                         device="cuda", dtype=torch.bfloat16, seed=42):
-    """Load real LIBERO observations and return list of ready-to-use batches.
+    """Load real LIBERO observations via LeRobotDataset (video decoding with pyav).
 
-    Each batch is a dict with the same keys as make_synthetic_batch().
-    Falls back to synthetic data if the dataset is unavailable.
+    Each returned element is a dict with the same keys as make_synthetic_batch(),
+    plus ``task_text`` and ``gt_action``.
+    Falls back to ``None`` (caller should use synthetic data) on failure.
     """
     from torchvision.transforms.functional import resize
     from transformers import AutoTokenizer
 
     rng = random.Random(seed)
     num_image_tokens = (image_size // 14) ** 2
-    dataset_name = "lerobot/libero"
 
     try:
         tokenizer = AutoTokenizer.from_pretrained("google/paligemma2-3b-mix-224")
     except Exception:
         tokenizer = None
 
-    task_texts = _load_libero_task_texts(dataset_name)
-
     try:
-        from datasets import load_dataset
-        ds = load_dataset(dataset_name, split="train", streaming=True)
-        raw_samples = []
-        for i, row in enumerate(ds):
-            if i >= num_samples * 3:
-                break
-            raw_samples.append(row)
-        rng.shuffle(raw_samples)
-        raw_samples = raw_samples[:num_samples]
-    except Exception as e:
-        print(f"WARNING: Could not load LIBERO dataset: {e}", file=sys.stderr)
-        print("Falling back to synthetic data.", file=sys.stderr)
+        from lerobot.datasets.lerobot_dataset import LeRobotDataset
+    except ImportError:
+        print("WARNING: lerobot not installed, falling back to synthetic data.", file=sys.stderr)
         return None
 
+    camera_keys = ["observation.images.image", "observation.images.image2"]
+    dataset_cameras = len(camera_keys)
+
+    try:
+        episode_ids = list(range(min(20, 1693)))
+        rng.shuffle(episode_ids)
+        ds = LeRobotDataset("lerobot/libero", episodes=episode_ids[:10], video_backend="pyav")
+    except Exception as e:
+        print(f"WARNING: Could not load LIBERO dataset: {e}", file=sys.stderr)
+        return None
+
+    frame_indices = list(range(len(ds)))
+    rng.shuffle(frame_indices)
+    frame_indices = frame_indices[:num_samples]
+
     batches = []
-    for row in raw_samples:
+    for idx in frame_indices:
         try:
-            img_data = row.get("observation.images.image")
-            if isinstance(img_data, dict) and "bytes" in img_data:
-                img_tensor = _decode_video_frame(img_data["bytes"])
-            elif isinstance(img_data, torch.Tensor):
-                img_tensor = img_data.float() / 255.0 if img_data.dtype == torch.uint8 else img_data.float()
-            else:
-                from PIL import Image
-                import torchvision.transforms.functional as TF
-                if hasattr(img_data, "convert"):
-                    img_tensor = TF.to_tensor(img_data.convert("RGB"))
+            row = ds[idx]
+
+            cam_tensors = []
+            for cam_key in camera_keys[:num_cameras]:
+                img = row[cam_key]
+                if img.dtype == torch.uint8:
+                    img = img.float() / 255.0
                 else:
-                    continue
+                    img = img.float()
+                img = resize(img, [image_size, image_size], antialias=True)
+                cam_tensors.append(img)
 
-            img_tensor = resize(img_tensor, [image_size, image_size], antialias=True)
-            images = img_tensor.unsqueeze(0).repeat(num_cameras, 1, 1, 1)
+            if num_cameras > dataset_cameras:
+                for _ in range(num_cameras - dataset_cameras):
+                    cam_tensors.append(cam_tensors[-1].clone())
 
-            raw_state = row.get("observation.state")
-            if isinstance(raw_state, torch.Tensor):
-                state_vec = raw_state.float()
-            elif isinstance(raw_state, (list, tuple)):
-                state_vec = torch.tensor(raw_state, dtype=torch.float32)
-            else:
-                state_vec = torch.zeros(max_state_dim, dtype=torch.float32)
+            images = torch.stack(cam_tensors, dim=0)
 
+            state_vec = row["observation.state"].float()
             if state_vec.numel() < max_state_dim:
                 state_vec = torch.nn.functional.pad(state_vec, (0, max_state_dim - state_vec.numel()))
             else:
                 state_vec = state_vec[:max_state_dim]
 
-            task_idx = row.get("task_index", 0)
-            task_text = task_texts.get(task_idx, "pick up the object")
+            task_text = row.get("task", "pick up the object")
+            if isinstance(task_text, torch.Tensor):
+                task_text = "pick up the object"
 
             if tokenizer is not None:
                 ids = _tokenize_instruction(task_text, tokenizer, num_image_tokens, num_cameras, max_length)
             else:
                 total_img_tok = num_image_tokens * num_cameras
-                ids = [_BOS_TOKEN_ID] + [_IMAGE_TOKEN_ID] * total_img_tok + [_PAD_TOKEN_ID] * (max_length - 1 - total_img_tok)
+                ids = ([_BOS_TOKEN_ID] + [_IMAGE_TOKEN_ID] * total_img_tok
+                       + [_PAD_TOKEN_ID] * (max_length - 1 - total_img_tok))
                 ids = ids[:max_length]
 
             input_ids = torch.tensor([ids], dtype=torch.long, device=device)
             attention_mask = (input_ids != _PAD_TOKEN_ID).long()
 
-            raw_action = row.get("action")
-            if isinstance(raw_action, torch.Tensor):
-                gt_action = raw_action.float()
-            elif isinstance(raw_action, (list, tuple)):
-                gt_action = torch.tensor(raw_action, dtype=torch.float32)
-            else:
-                gt_action = None
+            gt_action = row.get("action")
+            if isinstance(gt_action, (list, tuple)):
+                gt_action = torch.tensor(gt_action, dtype=torch.float32)
 
             batches.append({
                 "state": state_vec.unsqueeze(0).to(device=device, dtype=dtype),
@@ -211,18 +177,19 @@ def load_libero_dataset(num_samples, num_cameras, image_size=224,
                 "pixel_values": images.unsqueeze(0).to(device=device, dtype=dtype),
                 "pixel_attention_mask": torch.ones(1, num_cameras, device=device, dtype=torch.bool),
                 "attention_mask": attention_mask,
+                "num_cameras": num_cameras,
                 "task_text": task_text,
                 "gt_action": gt_action,
             })
         except Exception as e:
-            print(f"WARNING: Skipped sample: {e}", file=sys.stderr)
+            print(f"WARNING: Skipped frame {idx}: {e}", file=sys.stderr)
             continue
 
     if len(batches) == 0:
         print("WARNING: No samples loaded, falling back to synthetic data.", file=sys.stderr)
         return None
 
-    print(f"Loaded {len(batches)} LIBERO samples with real observations.", file=sys.stderr)
+    print(f"Loaded {len(batches)} LIBERO samples ({num_cameras} cameras, {image_size}px).", file=sys.stderr)
     return batches
 
 
@@ -306,25 +273,13 @@ def main():
     )
     model.eval()
 
-    num_cameras = cfg.get("num_cameras", 1)
     image_size = cfg.get("image_size", 224)
     chunk_size = cfg.get("chunk_size", 50)
     max_action_dim = cfg.get("max_action_dim", 32)
     use_real_data = cfg.get("use_real_data", True)
 
-    max_samples = max(
-        sum(s["num_requests"] for s in cfg.get("scenarios", [])),
-        10,
-    )
-    dataset_batches = None
-    if use_real_data:
-        dataset_batches = load_libero_dataset(
-            num_samples=max_samples, num_cameras=num_cameras,
-            image_size=image_size, seed=seed,
-        )
-
-    # Warmup
-    warmup_batch = make_synthetic_batch(1, num_cameras, image_size=image_size, seed=seed)
+    # Warmup with 1-camera synthetic batch
+    warmup_batch = make_synthetic_batch(1, 1, image_size=image_size, seed=seed)
     for _ in range(2):
         torch.cuda.synchronize()
         with torch.inference_mode():
@@ -337,18 +292,26 @@ def main():
             )
         torch.cuda.synchronize()
 
-    # Throughput
+    # Throughput — load real data per-scenario so camera counts match
     throughput_results = []
     sample_offset = 0
     for scenario in cfg.get("scenarios", []):
+        num_cameras = scenario["num_cameras"]
         num_requests = scenario["num_requests"]
         total_elapsed = 0.0
         all_actions = []
 
+        dataset_batches = None
+        if use_real_data:
+            dataset_batches = load_libero_dataset(
+                num_samples=num_requests, num_cameras=num_cameras,
+                image_size=image_size, seed=seed,
+            )
+
         pbar = tqdm(range(num_requests), desc=f"openpi {scenario['name']}", file=sys.stderr)
         for req_idx in pbar:
-            batch = _get_batch(dataset_batches, sample_offset + req_idx,
-                               scenario["num_cameras"], image_size, seed)
+            batch = _get_batch(dataset_batches, req_idx,
+                               num_cameras, image_size, seed + sample_offset)
             dev = batch["state"].device
             dt = batch["state"].dtype
             noise_seed = seed + 10000 * (sample_offset + req_idx) + 424242
@@ -472,7 +435,6 @@ def main():
 
     seed = cfg["seed"]
     num_steps = cfg["num_steps"]
-    num_cameras = cfg.get("num_cameras", 1)
     image_size = cfg.get("image_size", 224)
     chunk_size = cfg.get("chunk_size", 50)
     max_action_dim = cfg.get("max_action_dim", 32)
@@ -484,19 +446,8 @@ def main():
         enforce_eager=cfg.get("enforce_eager", False),
     )
 
-    max_samples = max(
-        sum(s["num_requests"] for s in cfg.get("scenarios", [])),
-        10,
-    )
-    dataset_batches = None
-    if use_real_data:
-        dataset_batches = load_libero_dataset(
-            num_samples=max_samples, num_cameras=num_cameras,
-            image_size=image_size, seed=seed,
-        )
-
-    # Warmup
-    warmup_batch = make_synthetic_batch(1, num_cameras, image_size=image_size, seed=seed)
+    # Warmup with 1-camera synthetic batch
+    warmup_batch = make_synthetic_batch(1, 1, image_size=image_size, seed=seed)
     params = Pi0SamplingParams(num_inference_steps=2)
     for _ in range(2):
         torch.cuda.synchronize()
@@ -509,20 +460,28 @@ def main():
         )
         torch.cuda.synchronize()
 
-    # Throughput
+    # Throughput — load real data per-scenario so camera counts match
     throughput_results = []
     params = Pi0SamplingParams(num_inference_steps=num_steps, seed=seed)
     sample_offset = 0
 
     for scenario in cfg.get("scenarios", []):
+        num_cameras = scenario["num_cameras"]
         num_requests = scenario["num_requests"]
         total_elapsed = 0.0
         all_actions = []
 
+        dataset_batches = None
+        if use_real_data:
+            dataset_batches = load_libero_dataset(
+                num_samples=num_requests, num_cameras=num_cameras,
+                image_size=image_size, seed=seed,
+            )
+
         pbar = tqdm(range(num_requests), desc=f"kb-nano {scenario['name']}", file=sys.stderr)
         for req_idx in pbar:
-            batch = _get_batch(dataset_batches, sample_offset + req_idx,
-                               scenario["num_cameras"], image_size, seed)
+            batch = _get_batch(dataset_batches, req_idx,
+                               num_cameras, image_size, seed + sample_offset)
             dev = batch["state"].device
             dt = batch["state"].dtype
             noise_seed = seed + 10000 * (sample_offset + req_idx) + 424242
@@ -620,8 +579,8 @@ def _build_scenarios(cfg: dict) -> list[dict]:
     num_requests = cfg.get("num_requests", 100)
     return [
         {
-            "name": "3cam",
-            "num_cameras": 3,
+            "name": "2cam",
+            "num_cameras": 2,
             "num_requests": num_requests,
         },
         {
@@ -634,7 +593,7 @@ def _build_scenarios(cfg: dict) -> list[dict]:
 
 def _build_latency_scenarios() -> list[dict]:
     return [
-        {"name": "single-3cam", "num_cameras": 3, "batch_size": 1,
+        {"name": "single-2cam", "num_cameras": 2, "batch_size": 1,
          "num_warmup": 3, "num_iters": 10},
         {"name": "single-1cam", "num_cameras": 1, "batch_size": 1,
          "num_warmup": 3, "num_iters": 10},
