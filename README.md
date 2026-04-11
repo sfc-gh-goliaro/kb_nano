@@ -119,7 +119,7 @@ A standalone, high-performance inference engine supporting **LLMs** (Llama 3.1, 
     ├── bench_vllm.py           # Multi-scenario throughput + latency + alignment benchmark vs vLLM
     ├── bench_vllm_omni.py     # Diffusion (FLUX / HunyuanVideo) and TTS (CosyVoice3) benchmark: kb-nano vs vllm-omni
     ├── bench_diffusers.py     # SDXL diffusion benchmark: kb-nano vs diffusers + torch.compile
-    ├── bench_openpi.py        # Pi0 robotics VLA benchmark: kb-nano vs HF Transformers PI0
+    ├── bench_openpi.py        # Pi0 VLA benchmark: kb-nano vs OpenPI (Policy) or HF Transformers
     ├── test_sam.py            # SAM3 segmentation benchmark: kb-nano vs facebook/sam3 reference
     ├── utils/                  # Post-processing and visualization
     │   └── parse_vllm_bench_results.py  # Generate tables and plots from bench_vllm.py results
@@ -217,18 +217,45 @@ python tests/bench_diffusers.py --output-dir tests/results/B200/stable-diffusion
 
 ### Benchmarking vs OpenPI / HF Transformers (Pi0 Robotics VLA)
 
+Default runs use **real ALOHA pen_uncap** data (`physical-intelligence/aloha_pen_uncap_diverse`). Use `--synthetic-only` only for debugging.
+
+**Like-with-like comparison:** both kb-nano and OpenPI load the **same fine-tuned Pi0 checkpoint** (`pi0_aloha_pen_uncap`, converted to PyTorch) with `action_horizon=50`, `action_dim=32`. Both sides apply matching ALOHA transforms (joint flip, gripper encoding, z-score normalization) and use pre-generated shared noise for deterministic flow-matching. Correctness is measured on the 14-dim robot-space actions after full output post-processing. ALOHA is used because OpenPI publishes a real fine-tuned Pi0 checkpoint for it (unlike LIBERO, which only has Pi0.5).
+
+**Install OpenPI** (upstream uses `uv sync` in a clone; do not install into the kb-nano venv — dependency pins conflict). Example: clone to `/raid/user_data/olu/openpi`, run `GIT_LFS_SKIP_SMUDGE=1 uv sync`, copy `src/openpi/models_pytorch/transformers_replace/*` into `.venv/lib/python3.11/site-packages/transformers/` per OpenPI README, then use `--reference-python /raid/user_data/olu/openpi/.venv/bin/python`.
+
+**One-time checkpoint conversion** (PyTorch weights from JAX):
 ```bash
-# Pi0: throughput + latency + correctness benchmark vs HF Transformers PI0
-python tests/bench_openpi.py --model lerobot/pi0_base
+cd /raid/user_data/olu/openpi
+.venv/bin/python examples/convert_jax_model_to_pytorch.py \
+  --checkpoint-dir ~/.cache/openpi/openpi-assets/checkpoints/pi0_aloha_pen_uncap \
+  --config-name pi0_aloha_pen_uncap \
+  --output-path /raid/user_data/olu/pi0_aloha_pen_uncap_pytorch
 
-# kb-nano only (skip openpi comparison)
-python tests/bench_openpi.py --skip-openpi
+# Copy assets (norm_stats required for OpenPI AlohaInputs/Outputs transforms)
+cp -a ~/.cache/openpi/openpi-assets/checkpoints/pi0_aloha_pen_uncap/assets \
+  /raid/user_data/olu/pi0_aloha_pen_uncap_pytorch/
+```
 
-# Quick test with fewer requests
-python tests/bench_openpi.py --num-requests 10 --num-steps 10
+The **OpenPI** reference uses `create_trained_policy` + `Policy.infer`. **Default is PyTorch** (`--openpi-backend pytorch`): the checkpoint must include **`model.safetensors`**. If PyTorch weights are missing, the benchmark **stops** (no automatic JAX fallback). Use **`--openpi-backend jax`** only when you explicitly want the JAX stack.
+
+On shared GPUs, set `CUDA_VISIBLE_DEVICES` to an idle GPU (`nvidia-smi`).
+
+```bash
+# kb-nano vs OpenPI PyTorch (same fine-tuned Pi0, pi0_aloha_pen_uncap config)
+CUDA_VISIBLE_DEVICES=3 python tests/bench_openpi.py \
+  --reference-python /raid/user_data/olu/openpi/.venv/bin/python
+
+# kb-nano only
+python tests/bench_openpi.py --skip-reference
+
+# Same Pi0 weights as kb-nano (HF reference — same-pipeline parity)
+python tests/bench_openpi.py --reference hf
+
+# Synthetic tensors (debug only — not for reported benchmarks)
+python tests/bench_openpi.py --synthetic-only --num-requests 10 --num-steps 10
 
 # Save results to a specific directory
-python tests/bench_openpi.py --output-dir tests/results/B200/pi0_base
+python tests/bench_openpi.py --output-dir tests/results/B200/pi0_aloha
 ```
 
 ### Benchmarking vs facebook/sam3 (Segmentation)
@@ -698,6 +725,35 @@ Correctness (100 images, per-element cosine similarity):
 | Classification Logits | 0.975 | 0.924 | PASS |
 
 The remaining numerical divergence is expected from SDPA vs Flash Attention numerics and bf16/fp32 precision differences accumulated through the deep pipeline (backbone + encoder + decoder + pixel decoder + mask predictor). All metrics pass their thresholds (boxes/logits: mean >= 0.95, min >= 0.90; masks: mean >= 0.90, min >= 0.85).
+
+### Pi0 (Robotics VLA)
+
+Run `tests/bench_openpi.py` to reproduce. Both engines load the same fine-tuned Pi0 checkpoint (`pi0_aloha_pen_uncap`, converted to PyTorch). Both sides apply matching ALOHA transforms (joint flip, gripper encoding, z-score normalization on input; un-normalize + AbsoluteActions + AlohaOutputs on output) and use pre-generated shared noise for identical flow-matching initialisation. OpenPI uses the `pi0_aloha_pen_uncap` config with PyTorch backend. 100 real ALOHA pen_uncap samples per scenario, 10 denoising steps.
+
+**Hardware: NVIDIA B200**
+
+Throughput (inferences/sec, real ALOHA data):
+
+| Scenario | Requests | OpenPI (inf/s) | Ours (inf/s) | Speedup |
+|----------|--------:|-----------:|-----------:|--------:|
+| 3-camera | 100 | 34.06 | 43.50 | **1.28x** |
+| 1-camera | 100 | 38.91 | 43.54 | **1.12x** |
+
+Latency (single inference, median of 10 runs):
+
+| Scenario | OpenPI p50 | Ours p50 | Speedup |
+|----------|----------:|--------:|--------:|
+| single-3cam | 0.026s | 0.023s | **1.13x** |
+| single-1cam | 0.026s | 0.023s | **1.12x** |
+
+Correctness (action-space cosine similarity, 14-dim ALOHA robot actions):
+
+| Scenario | Samples | Mean CosSim | Mean MSE | Result |
+|----------|--------:|------------:|---------:|-------:|
+| 3-camera | 100 | 0.989 | 0.005 | PASS |
+| 1-camera | 100 | 0.986 | 0.007 | PASS |
+
+Both engines produce 14-dim robot-space actions after applying matching ALOHA transforms. The remaining numerical divergence (~1% CosSim gap) is from bf16 accumulation differences in the 10-step flow-matching Euler loop across two different Gemma implementations.
 
 ### Key optimizations
 

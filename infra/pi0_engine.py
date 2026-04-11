@@ -28,7 +28,9 @@ logger = logging.getLogger(__name__)
 
 
 def _download_pi0_model(model_name: str) -> str:
-    """Download Pi0 model weights from HuggingFace."""
+    """Download Pi0 model weights from HuggingFace, or use a local directory."""
+    if os.path.isdir(model_name):
+        return model_name
     return snapshot_download(
         model_name,
         allow_patterns=["*.safetensors", "*.json", "*.txt", "*.model"],
