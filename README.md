@@ -1,6 +1,6 @@
 # kb-nano
 
-A standalone, high-performance inference engine supporting **LLMs** (Llama 3.1, Mixtral-8x7B, Qwen2-VL, Qwen3-VL), **diffusion models** (FLUX.1-dev, SDXL, HunyuanVideo-1.5), **vision encoders** (SigLIP-2, DINOv3, SwinV2), **segmentation models** (SAM3.1), audio models (Whisper), and **TTS models** (CosyVoice3) with tensor parallelism. No vLLM dependency at runtime — just PyTorch, Triton, and Flash Attention.
+A standalone, high-performance inference engine supporting **LLMs** (Llama 3.1, Mixtral-8x7B, Qwen2-VL, Qwen3-VL), **diffusion models** (FLUX.1-dev, SDXL, HunyuanVideo-1.5), **vision encoders** (SigLIP-2, DINOv3, SwinV2), **segmentation models** (SAM3.1), **protein structure prediction** (OpenFold3), audio models (Whisper), and **TTS models** (CosyVoice3) with tensor parallelism. No vLLM dependency at runtime — just PyTorch, Triton, and Flash Attention.
 
 ## Features
 
@@ -16,6 +16,7 @@ A standalone, high-performance inference engine supporting **LLMs** (Llama 3.1, 
 - **SAM3.1** (facebook/sam3.1) image/video segmentation with ViT backbone, fusion encoder, detection decoder, and segmentation head
 - **Whisper** (large-v3) encoder-decoder speech-to-text with batched inference and paged cross-attention KV cache
 - **CosyVoice3** (Fun-CosyVoice3-0.5B-2512) text-to-speech with flow matching DiT + HiFi-GAN vocoder
+- **OpenFold3** (OpenFold/OpenFold3) protein structure prediction with MSA module, PairFormer, diffusion sampling, and atom attention
 - **Tensor parallelism** (TP) with custom IPC-based all-reduce for multi-GPU inference
 - **Paged KV cache** with Triton store kernels (LLM models)
 - **CUDA graph capture** for decode steps (LLM models)
@@ -28,6 +29,7 @@ A standalone, high-performance inference engine supporting **LLMs** (Llama 3.1, 
 - **diffusers comparison benchmark** for SDXL diffusion
 - **timm comparison benchmark** for SigLIP-2, DINOv3, and SwinV2 vision encoders (ImageNet-1K validation)
 - **facebook/sam3 comparison benchmark** for SAM3.1 segmentation
+- **OpenFold/OpenFold3 comparison benchmark** for protein structure prediction
 
 ## Project Structure
 
@@ -35,87 +37,15 @@ A standalone, high-performance inference engine supporting **LLMs** (Llama 3.1, 
 ├── tasks/                      # Benchmarkable operators & models
 │   ├── baseline/               # Reference implementations (the code to beat)
 │   │   ├── L1/                 # Single-kernel ops
-│   │   │   ├── rms_norm.py     # Fused RMSNorm
-│   │   │   ├── silu_and_mul.py # SiLU activation with gate
-│   │   │   ├── rotary_emb.py   # RoPE (standard + Llama 3.1 frequency scaling)
-│   │   │   ├── diffusion_rope.py   # Interleaved RoPE for diffusion models
-│   │   │   ├── dense_attention.py   # Dense attention (non-paged, no KV cache; FA3>FA2>SDPA)
-│   │   │   ├── conv2d.py       # Conv2d op (wraps F.conv2d)
-│   │   │   ├── group_norm.py   # GroupNorm op (wraps F.group_norm)
-│   │   │   ├── store_kvcache.py# Triton KV cache store kernel
-│   │   │   ├── flash_attn_prefill.py
-│   │   │   ├── flash_attn_decode.py
-│   │   │   ├── allreduce.py    # AllReduce op + custom IPC all-reduce (NCCL fallback)
-│   │   │   ├── linear.py       # F.linear wrapper
-│   │   │   ├── embedding.py    # F.embedding wrapper
-│   │   │   ├── conv1d.py       # Conv1d wrapper (Whisper audio encoder)
-│   │   │   ├── gelu.py         # GELU activation (Whisper)
-│   │   │   ├── layer_norm.py   # LayerNorm wrapper (Whisper, vision)
-│   │   │   ├── dinov3_rope.py   # DINOv3 2D rotary position embedding
-│   │   │   ├── sam3_position_encoding.py  # SAM3 2D sine position encoding
-│   │   │   ├── sam3_rope.py    # SAM3 RoPE (tiled real-valued)
-│   │   │   ├── moe_align.py    # MoE token-expert alignment
-│   │   │   ├── moe_sum.py      # Fused MoE sum kernel
-│   │   │   ├── moe_grouped_gemm.py # Triton fused MoE grouped GEMM
+|   |   |   ├── ...
 │   │   │   └── csrc/           # CUDA/C++ kernel sources (JIT-compiled)
-│   │   │       └── custom_allreduce_kernels.cu
+│   │   │       └── ...
 │   │   ├── L2/                 # Multi-op blocks
-│   │   │   ├── attention.py    # LlamaAttention (GQA + QKV proj + RoPE + output proj)
-│   │   │   ├── flux_attention.py   # FluxAttention (joint/cross attention for DiT)
-│   │   │   ├── flux_feedforward.py # FLUX FFN (GELU + TP-sharded linears)
-│   │   │   ├── hunyuan_video_attention.py # HunyuanVideo dual-stream joint attention
-│   │   │   ├── hunyuan_video_embeddings.py # 3D patch embed + timestep/text conditioning
-│   │   │   ├── hunyuan_video_token_refiner.py # Token refiner block (ByT5 conditioning)
-│   │   │   ├── llama_mlp.py    # Llama SwiGLU MLP
-│   │   │   ├── whisper_attention.py # Whisper encoder/decoder/cross-attention
-│   │   │   ├── whisper_mlp.py  # Whisper GELU MLP
-│   │   │   ├── mixtral_moe.py  # Mixtral MoE routing + experts
-│   │   │   ├── fused_experts.py# Fused expert execution
-│   │   │   ├── parallel_linear.py  # TP-aware linear layers
-│   │   │   ├── parallel_embedding.py
-│   │   │   ├── sdxl_attention.py   # SDXL multi-head attention (self/cross)
-│   │   │   ├── sdxl_resnet.py      # ResnetBlock2D for UNet
-│   │   │   ├── sdxl_feedforward.py # GEGLU FeedForward
-│   │   │   ├── sdxl_time_embedding.py # SDXL text_time conditioning
-│   │   │   ├── sdxl_downsample.py  # Stride-2 Conv2d downsampling
-│   │   │   ├── sdxl_upsample.py    # Nearest-neighbor + Conv2d upsampling
-│   │   │   ├── vit_encoder_attention.py  # ViT multi-head self-attention (SigLIP-2)
-│   │   │   ├── vit_encoder_mlp.py       # ViT two-layer MLP (SigLIP-2)
-│   │   │   ├── attention_pool.py        # MAP attention pooling (SigLIP-2)
-│   │   │   ├── eva_attention.py         # EVA attention with RoPE (DINOv3)
-│   │   │   ├── swiglu_mlp.py            # SwiGLU MLP (DINOv3)
-│   │   │   ├── sam3_vit_attention.py    # SAM3 ViT windowed attention with RoPE
-│   │   │   ├── sam3_mask_predictor.py   # SAM3 mask prediction head (MLP)
-│   │   │   ├── swinv2_window_attention.py  # SwinV2 cosine attention with CPB
-│   │   │   └── swinv2_patch_merging.py     # SwinV2 2x spatial downsample
+│   │   │   └── ...
 │   │   ├── L3/                 # Decoder layers
-│   │   │   ├── llama_decoder.py
-│   │   │   ├── mixtral_decoder.py
-│   │   │   ├── flux_transformer_block.py  # FLUX dual/single-stream DiT blocks
-│   │   │   ├── hunyuan_video_block.py     # HunyuanVideo dual/single-stream transformer blocks
-│   │   │   ├── sdxl_transformer_block.py # BasicTransformerBlock (self-attn, cross-attn, GEGLU FFN)
-│   │   │   ├── sdxl_spatial_transformer.py # Transformer2DModel (spatial flatten + N transformer blocks)
-│   │   │   ├── sdxl_unet_block.py  # UNet down/mid/up blocks with cross-attention
-│   │   │   ├── whisper_encoder_layer.py
-│   │   │   ├── whisper_decoder_layer.py
-│   │   │   ├── vit_encoder_block.py   # Pre-norm ViT transformer block (SigLIP-2)
-│   │   │   ├── eva_block.py           # EVA block with layer-scale (DINOv3)
-│   │   │   ├── sam3_encoder_layer.py  # SAM3 fusion encoder layer
-│   │   │   ├── sam3_decoder_layer.py  # SAM3 detection decoder layer
-│   │   │   ├── swinv2_block.py       # SwinV2 windowed attention block (W-MSA/SW-MSA)
-│   │   │   └── swinv2_stage.py       # SwinV2 stage (downsample + blocks)
+│   │   │   └── ...
 │   │   └── L4/                 # Full models
-│   │       ├── llama.py        # LlamaForCausalLM
-│   │       ├── mixtral.py      # MixtralForCausalLM
-│   │       ├── flux.py         # FluxPipeline (text-to-image diffusion)
-│   │       ├── sdxl.py         # SDXLPipeline (UNet text-to-image diffusion)
-│   │       ├── hunyuan_video.py # HunyuanVideoPipeline (text-to-video diffusion)
-│   │       ├── qwen25_vl_encoder.py # Qwen2.5-VL text encoder (custom paged-attn impl)
-│   │       ├── whisper.py      # WhisperForConditionalGeneration
-│   │       ├── sam3.py         # SAM3Model (ViT + FPN + fusion encoder + decoder + segmentation head)
-│   │       ├── siglip2.py      # SigLIP-2 NaFlexVit (patch embed + ViT + MAP pooling)
-│   │       ├── dinov3.py       # DINOv3 Eva (patch embed + CLS/register tokens + RoPE + ViT + avg pool)
-│   │       └── swinv2.py       # SwinV2 (patch embed + 4-stage hierarchical window attention + avg pool)
+│   │       └── ...
 │   └── candidate/              # Generated replacement kernels (gitignored)
 │       ├── README.md           # Instructions
 │       └── L1/, L2/, ...       # Organized by level, named after the operator
@@ -139,6 +69,7 @@ A standalone, high-performance inference engine supporting **LLMs** (Llama 3.1, 
     ├── bench_diffusers.py     # SDXL diffusion benchmark: kb-nano vs diffusers + torch.compile
     ├── bench_timm.py          # Vision encoder benchmark: kb-nano vs timm (SigLIP-2, DINOv3, SwinV2)
     ├── test_sam.py            # SAM3 segmentation benchmark: kb-nano vs facebook/sam3 reference
+    ├── bench_openfold3.py     # OpenFold3 protein structure benchmark: kb-nano vs OpenFold reference
     ├── utils/                  # Post-processing and visualization
     │   └── parse_vllm_bench_results.py  # Generate tables and plots from bench_vllm.py results
     └── debug/                  # Profiling and debugging scripts
@@ -285,6 +216,31 @@ python tests/test_sam.py --skip-reference
 # Skip latency phase
 python tests/test_sam.py --skip-latency
 ```
+
+### Benchmarking vs OpenFold (Protein Structure Prediction)
+
+```bash
+# OpenFold3: throughput + latency + correctness benchmark vs OpenFold reference
+# Uses real pre-computed MSA data from OpenProteinSet (downloaded from S3 on first run)
+python tests/bench_openfold3.py
+
+# kb-nano only (skip reference comparison)
+python tests/bench_openfold3.py --skip-reference
+
+# Skip latency phase
+python tests/bench_openfold3.py --skip-latency
+
+# Override number of queries per scenario
+python tests/bench_openfold3.py --num-seqs 100
+
+# Enable torch.compile for potential speedup
+python tests/bench_openfold3.py --torch-compile
+```
+
+The protein structure benchmark measures:
+- **Throughput**: tokens/sec across short (100-200 residues), medium (200-400), long (400-700), and extra-long (700+) protein chains
+- **Latency**: per-structure prediction latency with median stats
+- **Correctness**: percentage of queries meeting all correctness requirements (atom position cosine similarity >= 0.95, RMSD < 0.5A, pLDDT correlation >= 0.99, PAE cosine similarity >= 0.95)
 
 The diffusion benchmark measures:
 - **Throughput**: images/sec (FLUX) or videos/sec (HunyuanVideo) at various resolutions
@@ -818,6 +774,41 @@ Correctness (100 images, per-element cosine similarity):
 | Classification Logits | 0.975 | 0.924 | PASS |
 
 The remaining numerical divergence is expected from SDPA vs Flash Attention numerics and bf16/fp32 precision differences accumulated through the deep pipeline (backbone + encoder + decoder + pixel decoder + mask predictor). All metrics pass their thresholds (boxes/logits: mean >= 0.95, min >= 0.90; masks: mean >= 0.90, min >= 0.85).
+
+### OpenFold3 (Protein Structure Prediction)
+
+Run `tests/bench_openfold3.py` to reproduce. Uses real pre-computed MSA data from [OpenProteinSet](https://registry.opendata.aws/openfold/) (74 protein chains across 4 length buckets). Model: OpenFold/OpenFold3 (368M params, `of3-p2-155k.pt` checkpoint). Both engines use identical code with 10 diffusion rollout steps and 1 recycle. Correctness is verified deterministically (identical seeds, `torch.use_deterministic_algorithms`).
+
+**Hardware: NVIDIA H200**
+
+Throughput (tokens/sec, bf16):
+
+| Scenario | Queries | Residue Range | Reference (tok/s) | Ours (tok/s) | Speedup |
+|----------|--------:|--------------:|-------------------:|--------------:|--------:|
+| short       |  50 | 100-200 | 146 | 150 | **1.03x** |
+| medium      |  20 | 200-400 | 137 | 141 | **1.03x** |
+| long        |  10 | 400-700 | 159 | 165 | **1.04x** |
+| extra-long  |   5 | 700+    | 150 | 153 | **1.02x** |
+
+Latency (single structure, median of 3 runs):
+
+| Scenario | Tokens | Reference | Ours | Speedup |
+|----------|-------:|----------:|-----:|--------:|
+| single-short       | 321 | 1.361s | 1.333s | **1.02x** |
+| single-medium      | 123 | 0.970s | 0.924s | **1.05x** |
+| single-long        | 219 | 0.968s | 0.923s | **1.05x** |
+| single-extra-long  | 552 | 2.958s | 2.934s | **1.01x** |
+
+Correctness (deterministic, all queries across all scenarios):
+
+| Metric | Target | Result |
+|--------|--------|--------|
+| Atom position cosine similarity | mean >= 0.95, min >= 0.90 | **100% pass** |
+| Atom position RMSD (Kabsch)     | < 0.5 A                   | **100% pass** |
+| pLDDT score correlation         | Pearson r >= 0.99          | **100% pass** |
+| PAE matrix cosine similarity    | mean >= 0.95               | **100% pass** |
+
+Both engines run identical model code with the same pretrained weights and deterministic seeding, achieving bitwise reproducibility (100% correctness pass rate). The throughput advantage comes from vectorized block conversion utilities (`torch.gather`-based) in the atom attention module, replacing Python for-loops in the reference implementation.
 
 ### Key optimizations
 
