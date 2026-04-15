@@ -14,7 +14,7 @@ import torch.nn as nn
 
 from ..L1.layer_norm import LayerNorm
 from ..L1.linear import Linear
-from .openfold3_of3_attention import OF3Attention
+from .alphafold3_of3_attention import OF3Attention
 
 
 def _permute_final_dims(tensor: torch.Tensor, inds: tuple[int, ...]) -> torch.Tensor:

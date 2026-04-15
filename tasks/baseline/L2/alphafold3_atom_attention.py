@@ -17,8 +17,6 @@ from ..L1.layer_norm import LayerNorm
 from ..L1.linear import Linear
 from ..L1.tensor_ops import Pad
 
-_pad_op = Pad()
-
 
 def _get_block_key_indices(
     atom_mask: torch.Tensor, n_query: int, n_key: int,
@@ -83,9 +81,9 @@ def _convert_single_rep_to_blocks(
     pad_q = (-n_atom) % n_query
 
     if pad_q > 0:
-        ql = _pad_op(ql, (0, 0, 0, pad_q))
+        ql = Pad()(ql, (0, 0, 0, pad_q))
         if atom_mask is not None:
-            atom_mask = _pad_op(atom_mask, (0, pad_q))
+            atom_mask = Pad()(atom_mask, (0, pad_q))
 
     ql_query = ql.reshape(*batch_dims, num_blocks, n_query, c)
 
@@ -157,7 +155,7 @@ def _convert_pair_rep_to_blocks(
     num_blocks = math.ceil(n_atoms / n_query)
     pad_q = (-n_atoms) % n_query
 
-    atk_padded = _pad_op(atom_to_token, (0, pad_q))
+    atk_padded = Pad()(atom_to_token, (0, pad_q))
     q_indices = atk_padded.reshape(num_blocks, n_query)
 
     atom_mask_exp = atom_mask.expand(*batch_dims, -1)
@@ -204,7 +202,7 @@ def _get_pair_atom_block_mask(
     flat_batch = int(math.prod(batch_dims)) if batch_dims else 1
     mask_flat = atom_mask.reshape(flat_batch, -1)
 
-    mask_padded = _pad_op(mask_flat, (0, pad_q))
+    mask_padded = Pad()(mask_flat, (0, pad_q))
     mask_q = mask_padded.reshape(flat_batch, num_blocks, n_query)
 
     idx_flat = key_indices.reshape(flat_batch, num_blocks * n_key)
@@ -456,7 +454,7 @@ class AtomAttentionEncoder(nn.Module):
     ):
         super().__init__()
         if transformer_cls is None:
-            from ..L3.openfold3_diffusion_transformer import DiffusionTransformer
+            from ..L3.alphafold3_diffusion_transformer import DiffusionTransformer
             transformer_cls = DiffusionTransformer
 
         self.n_query = n_query
@@ -601,7 +599,7 @@ class AtomAttentionDecoder(nn.Module):
     ):
         super().__init__()
         if transformer_cls is None:
-            from ..L3.openfold3_diffusion_transformer import DiffusionTransformer
+            from ..L3.alphafold3_diffusion_transformer import DiffusionTransformer
             transformer_cls = DiffusionTransformer
 
         self.linear_q_in = Linear(c_token, c_atom, bias=False)

@@ -15,7 +15,7 @@ import torch.nn as nn
 from ..L1.layer_norm import LayerNorm
 from ..L1.linear import Linear
 from ..L1.tensor_ops import OneHot, Pad
-from .openfold3_atom_attention import AtomAttentionEncoder
+from .alphafold3_atom_attention import AtomAttentionEncoder
 
 
 def _binned_one_hot(

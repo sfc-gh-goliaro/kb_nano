@@ -10,10 +10,10 @@ from __future__ import annotations
 import torch
 import torch.nn as nn
 
-from ..L2.openfold3_msa_attention import MSARowAttentionWithPairBias
-from ..L2.openfold3_outer_product_mean import OuterProductMean
-from ..L2.openfold3_pair_block import PairBlock
-from ..L2.openfold3_swiglu_transition import SwiGLUTransition
+from ..L2.alphafold3_msa_attention import MSARowAttentionWithPairBias
+from ..L2.alphafold3_outer_product_mean import OuterProductMean
+from ..L2.alphafold3_pair_block import PairBlock
+from ..L2.alphafold3_swiglu_transition import SwiGLUTransition
 
 
 class MSAModuleBlock(nn.Module):

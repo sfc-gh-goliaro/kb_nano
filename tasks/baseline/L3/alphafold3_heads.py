@@ -145,7 +145,7 @@ class PairformerEmbedding(nn.Module):
         pairformer_pair_dropout: float = 0.0,
     ):
         super().__init__()
-        from ..L3.openfold3_pairformer import PairFormerStack
+        from ..L3.alphafold3_pairformer import PairFormerStack
 
         self.linear_i = Linear(c_s_input, c_z, bias=False)
         self.linear_j = Linear(c_s_input, c_z, bias=False)

@@ -16,8 +16,8 @@ import torch.nn as nn
 
 from ..L1.layer_norm import LayerNorm
 from ..L1.linear import Linear
-from .openfold3_input_embedder import relpos_complex
-from .openfold3_swiglu_transition import SwiGLUTransition
+from .alphafold3_input_embedder import relpos_complex
+from .alphafold3_swiglu_transition import SwiGLUTransition
 
 
 class FourierEmbedding(nn.Module):

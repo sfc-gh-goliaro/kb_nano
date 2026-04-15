@@ -11,9 +11,9 @@ from __future__ import annotations
 import torch
 import torch.nn as nn
 
-from ..L2.openfold3_attention_pair_bias import AttentionPairBias
-from ..L2.openfold3_pair_block import PairBlock
-from ..L2.openfold3_swiglu_transition import SwiGLUTransition
+from ..L2.alphafold3_attention_pair_bias import AttentionPairBias
+from ..L2.alphafold3_pair_block import PairBlock
+from ..L2.alphafold3_swiglu_transition import SwiGLUTransition
 
 
 class PairFormerBlock(nn.Module):

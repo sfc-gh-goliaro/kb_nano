@@ -14,9 +14,9 @@ import torch.nn as nn
 
 from ..L1.layer_norm import LayerNorm
 from ..L1.linear import Linear
-from ..L2.openfold3_atom_attention import AtomAttentionDecoder, AtomAttentionEncoder
-from ..L2.openfold3_diffusion_conditioning import DiffusionConditioning
-from .openfold3_diffusion_transformer import DiffusionTransformer
+from ..L2.alphafold3_atom_attention import AtomAttentionDecoder, AtomAttentionEncoder
+from ..L2.alphafold3_diffusion_conditioning import DiffusionConditioning
+from .alphafold3_diffusion_transformer import DiffusionTransformer
 
 
 def _quat_to_rot(quat: torch.Tensor) -> torch.Tensor:

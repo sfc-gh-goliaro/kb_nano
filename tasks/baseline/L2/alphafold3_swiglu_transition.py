@@ -15,7 +15,7 @@ import torch.nn as nn
 from ..L1.sigmoid import Sigmoid
 from ..L1.layer_norm import LayerNorm
 from ..L1.linear import Linear
-from .openfold3_swiglu import AdaLN, SwiGLU
+from .alphafold3_swiglu import AdaLN, SwiGLU
 
 
 class SwiGLUTransition(nn.Module):

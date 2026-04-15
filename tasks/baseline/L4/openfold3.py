@@ -22,13 +22,13 @@ import torch.nn as nn
 
 from ..L1.layer_norm import LayerNorm
 from ..L1.linear import Linear
-from ..L2.openfold3_input_embedder import InputEmbedder
-from ..L2.openfold3_msa_module_embedder import MSAModuleEmbedder
-from ..L2.openfold3_template_embedder import TemplateEmbedder
-from ..L3.openfold3_diffusion_module import DiffusionModule, SampleDiffusion
-from ..L3.openfold3_heads import AuxiliaryHeads
-from ..L3.openfold3_msa_module import MSAModuleStack
-from ..L3.openfold3_pairformer import PairFormerStack
+from ..L2.alphafold3_input_embedder import InputEmbedder
+from ..L2.alphafold3_msa_module_embedder import MSAModuleEmbedder
+from ..L2.alphafold3_template_embedder import TemplateEmbedder
+from ..L3.alphafold3_diffusion_module import DiffusionModule, SampleDiffusion
+from ..L3.alphafold3_heads import AuxiliaryHeads
+from ..L3.alphafold3_msa_module import MSAModuleStack
+from ..L3.alphafold3_pairformer import PairFormerStack
 
 
 @dataclass

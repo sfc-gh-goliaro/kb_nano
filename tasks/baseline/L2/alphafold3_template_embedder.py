@@ -14,8 +14,8 @@ import torch.nn as nn
 from ..L1.relu import ReLU
 from ..L1.layer_norm import LayerNorm
 from ..L1.linear import Linear
-from .openfold3_pair_block import PairBlock
-from .openfold3_swiglu_transition import SwiGLUTransition
+from .alphafold3_pair_block import PairBlock
+from .alphafold3_swiglu_transition import SwiGLUTransition
 
 
 class TemplatePairEmbedder(nn.Module):

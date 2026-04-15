@@ -16,8 +16,8 @@ import torch.nn as nn
 from ..L1.sigmoid import Sigmoid
 from ..L1.layer_norm import LayerNorm
 from ..L1.linear import Linear
-from .openfold3_swiglu import AdaLN
-from .openfold3_of3_attention import OF3Attention
+from .alphafold3_swiglu import AdaLN
+from .alphafold3_of3_attention import OF3Attention
 
 
 def _permute_final_dims(tensor: torch.Tensor, inds: list[int]) -> torch.Tensor:
@@ -225,7 +225,7 @@ class CrossAttentionPairBias(nn.Module):
         Returns:
             [*, N_atom, C_q] attention update
         """
-        from .openfold3_atom_attention import _convert_single_rep_to_blocks, _apply_block_indices
+        from .alphafold3_atom_attention import _convert_single_rep_to_blocks, _apply_block_indices
 
         batch_dims = a.shape[:-2]
         n_atom, n_dim = a.shape[-2:]
