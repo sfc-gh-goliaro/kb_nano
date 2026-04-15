@@ -22,8 +22,9 @@ dependencies = [
     "datasets",
     "diffusers>=0.37",
     "peft>=0.17.0",
-    "sam3 @ git+https://github.com/facebookresearch/sam3.git",
+    "sam3 @ git+https://github.com/sfc-gh-goliaro/sam3.git",
     "pycocotools",
+    "timm",
     "fastsafetensors",
 ]
 

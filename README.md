@@ -1,6 +1,6 @@
 # kb-nano
 
-A standalone, high-performance inference engine supporting **LLMs** (Llama 3.1, Mixtral-8x7B, Qwen2-VL, Qwen3-VL), **diffusion models** (FLUX.1-dev, SDXL, HunyuanVideo-1.5), **segmentation models** (SAM3.1), audio models (Whisper), and **TTS models** (CosyVoice3) with tensor parallelism. No vLLM dependency at runtime — just PyTorch, Triton, and Flash Attention.
+A standalone, high-performance inference engine supporting **LLMs** (Llama 3.1, Mixtral-8x7B, Qwen2-VL, Qwen3-VL), **diffusion models** (FLUX.1-dev, SDXL, HunyuanVideo-1.5), **vision encoders** (SigLIP-2, DINOv3, SwinV2), **segmentation models** (SAM3.1), audio models (Whisper), and **TTS models** (CosyVoice3) with tensor parallelism. No vLLM dependency at runtime — just PyTorch, Triton, and Flash Attention.
 
 ## Features
 
@@ -10,6 +10,9 @@ A standalone, high-performance inference engine supporting **LLMs** (Llama 3.1, 
 - **SDXL** (Stable Diffusion XL) UNet-based text-to-image with dual CLIP text encoders
 - **HunyuanVideo-1.5** 3D video diffusion transformer (text-to-video) with dual-stream joint attention, M-RoPE, and Qwen2.5-VL text encoder
 - **Qwen2-VL / Qwen3-VL** vision-language models with image and video support
+- **SigLIP-2** (google/siglip2-so400m-patch16-naflex) NaFlexVit vision encoder with MAP attention pooling
+- **DINOv3** (facebook/dinov3-vit7b16-pretrain-lvd1689m) Eva vision encoder with 2D RoPE, SwiGLU MLP, and register tokens
+- **SwinV2** (timm/swinv2_large_window12_192.ms_in22k) hierarchical vision transformer with shifted-window cosine attention and continuous position bias
 - **SAM3.1** (facebook/sam3.1) image/video segmentation with ViT backbone, fusion encoder, detection decoder, and segmentation head
 - **Whisper** (large-v3) encoder-decoder speech-to-text with batched inference and paged cross-attention KV cache
 - **CosyVoice3** (Fun-CosyVoice3-0.5B-2512) text-to-speech with flow matching DiT + HiFi-GAN vocoder
@@ -23,6 +26,7 @@ A standalone, high-performance inference engine supporting **LLMs** (Llama 3.1, 
 - **vllm-omni comparison benchmark** for FLUX diffusion and HunyuanVideo-1.5 video diffusion
 - **vllm-omni comparison benchmark** for CosyVoice3 TTS (SEED-TTS-Eval dataset)
 - **diffusers comparison benchmark** for SDXL diffusion
+- **timm comparison benchmark** for SigLIP-2, DINOv3, and SwinV2 vision encoders (ImageNet-1K validation)
 - **facebook/sam3 comparison benchmark** for SAM3.1 segmentation
 
 ## Project Structure
@@ -47,6 +51,7 @@ A standalone, high-performance inference engine supporting **LLMs** (Llama 3.1, 
 │   │   │   ├── conv1d.py       # Conv1d wrapper (Whisper audio encoder)
 │   │   │   ├── gelu.py         # GELU activation (Whisper)
 │   │   │   ├── layer_norm.py   # LayerNorm wrapper (Whisper, vision)
+│   │   │   ├── dinov3_rope.py   # DINOv3 2D rotary position embedding
 │   │   │   ├── sam3_position_encoding.py  # SAM3 2D sine position encoding
 │   │   │   ├── sam3_rope.py    # SAM3 RoPE (tiled real-valued)
 │   │   │   ├── moe_align.py    # MoE token-expert alignment
@@ -74,8 +79,15 @@ A standalone, high-performance inference engine supporting **LLMs** (Llama 3.1, 
 │   │   │   ├── sdxl_time_embedding.py # SDXL text_time conditioning
 │   │   │   ├── sdxl_downsample.py  # Stride-2 Conv2d downsampling
 │   │   │   ├── sdxl_upsample.py    # Nearest-neighbor + Conv2d upsampling
-│   │   │   ├── sam3_vit_attention.py  # SAM3 ViT windowed attention with RoPE
-│   │   │   └── sam3_mask_predictor.py # SAM3 mask prediction head (MLP)
+│   │   │   ├── vit_encoder_attention.py  # ViT multi-head self-attention (SigLIP-2)
+│   │   │   ├── vit_encoder_mlp.py       # ViT two-layer MLP (SigLIP-2)
+│   │   │   ├── attention_pool.py        # MAP attention pooling (SigLIP-2)
+│   │   │   ├── eva_attention.py         # EVA attention with RoPE (DINOv3)
+│   │   │   ├── swiglu_mlp.py            # SwiGLU MLP (DINOv3)
+│   │   │   ├── sam3_vit_attention.py    # SAM3 ViT windowed attention with RoPE
+│   │   │   ├── sam3_mask_predictor.py   # SAM3 mask prediction head (MLP)
+│   │   │   ├── swinv2_window_attention.py  # SwinV2 cosine attention with CPB
+│   │   │   └── swinv2_patch_merging.py     # SwinV2 2x spatial downsample
 │   │   ├── L3/                 # Decoder layers
 │   │   │   ├── llama_decoder.py
 │   │   │   ├── mixtral_decoder.py
@@ -86,8 +98,12 @@ A standalone, high-performance inference engine supporting **LLMs** (Llama 3.1, 
 │   │   │   ├── sdxl_unet_block.py  # UNet down/mid/up blocks with cross-attention
 │   │   │   ├── whisper_encoder_layer.py
 │   │   │   ├── whisper_decoder_layer.py
+│   │   │   ├── vit_encoder_block.py   # Pre-norm ViT transformer block (SigLIP-2)
+│   │   │   ├── eva_block.py           # EVA block with layer-scale (DINOv3)
 │   │   │   ├── sam3_encoder_layer.py  # SAM3 fusion encoder layer
-│   │   │   └── sam3_decoder_layer.py  # SAM3 detection decoder layer
+│   │   │   ├── sam3_decoder_layer.py  # SAM3 detection decoder layer
+│   │   │   ├── swinv2_block.py       # SwinV2 windowed attention block (W-MSA/SW-MSA)
+│   │   │   └── swinv2_stage.py       # SwinV2 stage (downsample + blocks)
 │   │   └── L4/                 # Full models
 │   │       ├── llama.py        # LlamaForCausalLM
 │   │       ├── mixtral.py      # MixtralForCausalLM
@@ -96,7 +112,10 @@ A standalone, high-performance inference engine supporting **LLMs** (Llama 3.1, 
 │   │       ├── hunyuan_video.py # HunyuanVideoPipeline (text-to-video diffusion)
 │   │       ├── qwen25_vl_encoder.py # Qwen2.5-VL text encoder (custom paged-attn impl)
 │   │       ├── whisper.py      # WhisperForConditionalGeneration
-│   │       └── sam3.py         # SAM3Model (ViT + FPN + fusion encoder + decoder + segmentation head)
+│   │       ├── sam3.py         # SAM3Model (ViT + FPN + fusion encoder + decoder + segmentation head)
+│   │       ├── siglip2.py      # SigLIP-2 NaFlexVit (patch embed + ViT + MAP pooling)
+│   │       ├── dinov3.py       # DINOv3 Eva (patch embed + CLS/register tokens + RoPE + ViT + avg pool)
+│   │       └── swinv2.py       # SwinV2 (patch embed + 4-stage hierarchical window attention + avg pool)
 │   └── candidate/              # Generated replacement kernels (gitignored)
 │       ├── README.md           # Instructions
 │       └── L1/, L2/, ...       # Organized by level, named after the operator
@@ -118,6 +137,7 @@ A standalone, high-performance inference engine supporting **LLMs** (Llama 3.1, 
     ├── bench_vllm.py           # Multi-scenario throughput + latency + alignment benchmark vs vLLM
     ├── bench_vllm_omni.py     # Diffusion (FLUX / HunyuanVideo) and TTS (CosyVoice3) benchmark: kb-nano vs vllm-omni
     ├── bench_diffusers.py     # SDXL diffusion benchmark: kb-nano vs diffusers + torch.compile
+    ├── bench_timm.py          # Vision encoder benchmark: kb-nano vs timm (SigLIP-2, DINOv3, SwinV2)
     ├── test_sam.py            # SAM3 segmentation benchmark: kb-nano vs facebook/sam3 reference
     ├── utils/                  # Post-processing and visualization
     │   └── parse_vllm_bench_results.py  # Generate tables and plots from bench_vllm.py results
@@ -211,6 +231,38 @@ python tests/bench_diffusers.py --skip-diffusers
 
 # Save results to a specific directory
 python tests/bench_diffusers.py --output-dir tests/results/B200/stable-diffusion-xl-base-1.0
+```
+
+### Benchmarking vs timm (Vision Encoders)
+
+Supported models:
+
+| Short Name | Model ID |
+|------------|----------|
+| SigLIP-2 | `google/siglip2-so400m-patch16-naflex` |
+| DINOv3 | `facebook/dinov3-vit7b16-pretrain-lvd1689m` |
+| SwinV2 | `timm/swinv2_large_window12_192.ms_in22k` |
+
+```bash
+# Run a single model benchmark (throughput + latency + correctness vs timm)
+python tests/bench_timm.py --model google/siglip2-so400m-patch16-naflex
+python tests/bench_timm.py --model facebook/dinov3-vit7b16-pretrain-lvd1689m
+python tests/bench_timm.py --model timm/swinv2_large_window12_192.ms_in22k
+
+# Run all three in parallel on separate GPUs
+CUDA_VISIBLE_DEVICES=0 python tests/bench_timm.py --model timm/swinv2_large_window12_192.ms_in22k &
+CUDA_VISIBLE_DEVICES=1 python tests/bench_timm.py --model facebook/dinov3-vit7b16-pretrain-lvd1689m &
+CUDA_VISIBLE_DEVICES=2 python tests/bench_timm.py --model google/siglip2-so400m-patch16-naflex &
+wait
+
+# kb-nano only (skip timm comparison)
+python tests/bench_timm.py --model google/siglip2-so400m-patch16-naflex --skip-timm
+
+# Use a different dataset (default: ILSVRC/imagenet-1k validation)
+python tests/bench_timm.py --model google/siglip2-so400m-patch16-naflex --dataset food101 --dataset-split validation
+
+# Override number of images or resolution
+python tests/bench_timm.py --model google/siglip2-so400m-patch16-naflex --num-images 1000 --resolution 512
 ```
 
 ### Benchmarking vs facebook/sam3 (Segmentation)
@@ -392,6 +444,7 @@ Each run is tagged with a `tier` (`agent`, `kernel`, `eval`, or `e2e`) indicatin
 - Hugging Face (`transformers`, `huggingface_hub`, `safetensors`)
 - aiohttp (for the LLM kernel agent)
 - MLflow (experiment tracking — gracefully skipped if not installed)
+- timm (pytorch-image-models — only needed for vision encoder comparison tests)
 - vLLM (only needed for running comparison tests)
 - matplotlib (only needed for benchmark plotting)
 
@@ -650,6 +703,91 @@ Correctness (eager mode, latent space, per-batch cosine similarity):
 | 512x512, 50 steps   | 0.969 | 0.952 |
 
 Correctness is measured in eager mode with bf16 precision. Both engines use identical model weights (diffusers checkpoint) and the same EulerDiscreteScheduler. The remaining cosine divergence is expected from bf16 accumulation differences across 28-50 denoising steps with CFG guidance_scale=5.0.
+
+### SigLIP-2 (Vision Encoder)
+
+Run `tests/bench_timm.py --model google/siglip2-so400m-patch16-naflex` to reproduce. 10,000 unique images from ImageNet-1K validation (ILSVRC/imagenet-1k), loaded via streaming and preprocessed with Inception normalization (mean/std=0.5). Each image processed exactly once. Reference engine: timm (pytorch-image-models).
+
+**Hardware: NVIDIA H200**
+
+Throughput (images/sec, bf16):
+
+| Scenario | Resolution | Images | timm (img/s) | Ours (img/s) | Ratio |
+|----------|:----------:|-------:|-------------:|-------------:|------:|
+| default-res | 384x384 | 10,000 | 927 | 832 | 0.90x |
+| high-res    | 512x512 | 10,000 | 512 | 494 | 0.96x |
+
+Latency (median of 30 iterations, bf16):
+
+| Scenario | Batch | timm p50 | Ours p50 | Ratio |
+|----------|------:|---------:|---------:|------:|
+| single-image | 1 | 5.2 ms | 4.7 ms | **1.10x** |
+| batch-8 | 8 | 9.9 ms | 9.8 ms | **1.01x** |
+
+Correctness (per-batch embedding cosine similarity):
+
+| Scenario | Batches | Mean CosSim | Min CosSim | Result |
+|----------|--------:|------------:|-----------:|-------:|
+| default-res | 16 | 1.000 | 1.000 | PASS |
+| high-res | 32 | 1.000 | 1.000 | PASS |
+
+### DINOv3 (Vision Encoder)
+
+Run `tests/bench_timm.py --model facebook/dinov3-vit7b16-pretrain-lvd1689m` to reproduce. 1,500 unique images from ImageNet-1K validation, loaded via streaming and preprocessed with ImageNet normalization (mean=[0.485,0.456,0.406], std=[0.229,0.224,0.225]). Each image processed exactly once. Reference engine: timm (pytorch-image-models).
+
+**Hardware: NVIDIA H200**
+
+Throughput (images/sec, bf16):
+
+| Scenario | Resolution | Images | timm (img/s) | Ours (img/s) | Ratio |
+|----------|:----------:|-------:|-------------:|-------------:|------:|
+| default-res | 256x256 | 1,500 | 133 | 131 | 0.98x |
+| high-res    | 512x512 | 1,500 |  33 |  33 | 0.99x |
+
+Latency (median of 30 iterations, bf16):
+
+| Scenario | Batch | timm p50 | Ours p50 | Ratio |
+|----------|------:|---------:|---------:|------:|
+| single-image | 1 | 16.4 ms | 14.0 ms | **1.17x** |
+| batch-8 | 8 | 64.5 ms | 64.3 ms | **1.00x** |
+
+Correctness (per-batch embedding cosine similarity):
+
+| Scenario | Batches | Mean CosSim | Min CosSim | Result |
+|----------|--------:|------------:|-----------:|-------:|
+| default-res | 16 | 1.000 | 1.000 | PASS |
+| high-res | 32 | 1.000 | 1.000 | PASS |
+
+DINOv3 produces bit-identical embeddings to timm (perfect 1.000 cosine similarity, zero MSE).
+
+### SwinV2 (Vision Encoder)
+
+Run `tests/bench_timm.py --model timm/swinv2_large_window12_192.ms_in22k` to reproduce. 5,000 unique images from ImageNet-1K validation (ILSVRC/imagenet-1k), loaded via streaming and preprocessed with ImageNet normalization (mean=[0.485,0.456,0.406], std=[0.229,0.224,0.225]). Each image processed exactly once. Reference engine: timm (pytorch-image-models).
+
+**Hardware: NVIDIA H200**
+
+Throughput (images/sec, bf16):
+
+| Scenario | Resolution | Images | timm (img/s) | Ours (img/s) | Ratio |
+|----------|:----------:|-------:|-------------:|-------------:|------:|
+| default-res | 192x192 | 5,000 | 1,287 | 1,763 | **1.37x** |
+| high-res    | 512x512 | 5,000 |   250 |   244 | 0.97x |
+
+Latency (median of 30 iterations, bf16):
+
+| Scenario | Batch | timm p50 | Ours p50 | Ratio |
+|----------|------:|---------:|---------:|------:|
+| single-image | 1 | 12.7 ms | 14.9 ms | 0.86x |
+| batch-8 | 8 | 13.3 ms | 14.9 ms | 0.89x |
+
+Correctness (per-batch embedding cosine similarity):
+
+| Scenario | Batches | Mean CosSim | Min CosSim | Result |
+|----------|--------:|------------:|-----------:|-------:|
+| default-res | 16 | 1.000 | 1.000 | PASS |
+| high-res | 32 | 1.000 | 1.000 | PASS |
+
+SwinV2 produces bit-identical embeddings to timm (perfect 1.000 cosine similarity, zero MSE).
 
 ### SAM3.1 (Segmentation)
 
