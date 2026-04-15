@@ -12,12 +12,12 @@ from __future__ import annotations
 import torch
 import torch.nn as nn
 
-from ..L1.openfold3_triangle_multiplication import (
+from .openfold3_triangle_multiplication import (
     TriangleMultiplicationIncoming,
     TriangleMultiplicationOutgoing,
 )
-from ..L1.openfold3_triangle_attention import TriangleAttention
-from ..L1.openfold3_swiglu import SwiGLUTransition
+from .openfold3_triangle_attention import TriangleAttention
+from .openfold3_swiglu_transition import SwiGLUTransition
 
 
 class PairBlock(nn.Module):

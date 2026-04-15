@@ -1,8 +1,6 @@
-"""Multi-head attention with bias list support for AlphaFold3.
+"""Multi-head attention with bias list support for AlphaFold3 (L2).
 
-Implements the core MHA primitive from AF3 with support for arbitrary
-additive bias terms (mask bias, pair bias, triangle bias). Gated output
-is standard in AF3.
+Composes QKV projections + SDPA + gated output.
 
 Reference: openfold3/core/model/primitives/attention.py Attention
 """
@@ -13,9 +11,10 @@ import math
 
 import torch
 import torch.nn as nn
+import torch.nn.functional as F
 
-from .layer_norm import LayerNorm
-from .linear import Linear
+from ..L1.linear import Linear
+from ..L1.softmax import Softmax
 
 
 def _attention(
@@ -24,7 +23,7 @@ def _attention(
     value: torch.Tensor,
     biases: list[torch.Tensor],
 ) -> torch.Tensor:
-    """Core attention: scores = softmax(Q K^T + biases) V.
+    """Core SDPA: scores = softmax(Q K^T + biases) V.
 
     Args:
         query: [*, H, Q, C_hidden]
@@ -40,7 +39,7 @@ def _attention(
     for b in biases:
         scores = scores + b
 
-    scores = torch.nn.functional.softmax(scores, dim=-1)
+    scores = F.softmax(scores, dim=-1)
 
     return torch.einsum("...qk,...kc->...qc", scores.to(dtype=value.dtype), value)
 

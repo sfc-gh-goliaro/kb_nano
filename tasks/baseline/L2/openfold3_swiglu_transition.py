@@ -1,12 +1,9 @@
-"""SwiGLU activation and transition for AlphaFold3.
+"""SwiGLU transition composites for AlphaFold3 (L2).
 
-SwiGLU: SiLU(linear_a(x)) * linear_b(x)
 SwiGLUTransition: LayerNorm -> SwiGLU -> Linear (AF3 Algorithm 11)
 ConditionedTransitionBlock: AdaLN -> SwiGLU -> gated output (AF3 Algorithm 25)
 
-Reference: openfold3/core/model/primitives/activations.py SwiGLU
-           openfold3/core/model/primitives/normalization.py AdaLN
-           openfold3/core/model/layers/transition.py SwiGLUTransition
+Reference: openfold3/core/model/layers/transition.py SwiGLUTransition
            openfold3/core/model/layers/transition.py ConditionedTransitionBlock
 """
 
@@ -15,58 +12,10 @@ from __future__ import annotations
 import torch
 import torch.nn as nn
 
-from .layer_norm import LayerNorm
-from .linear import Linear
-
-
-class SwiGLU(nn.Module):
-    """SwiGLU activation: SiLU(Wa x) * Wb x.
-
-    Args:
-        c_in: Number of input channels
-        c_out: Number of output channels
-    """
-
-    def __init__(self, c_in: int, c_out: int):
-        super().__init__()
-        self.linear_a = Linear(c_in, c_out, bias=False)
-        self.linear_b = Linear(c_in, c_out, bias=False)
-
-    def forward(self, x: torch.Tensor) -> torch.Tensor:
-        return torch.nn.functional.silu(self.linear_a(x)) * self.linear_b(x)
-
-
-class AdaLN(nn.Module):
-    """Adaptive Layer Normalization matching the reference AdaLN.
-
-    Submodule structure matches checkpoint keys:
-    - layer_norm_s: LayerNorm(c_s), weight-only
-    - linear_g: Linear(c_s, c_a, bias=True) — gating
-    - linear_s: Linear(c_s, c_a, bias=False) — additive conditioning
-
-    Reference: openfold3/core/model/primitives/normalization.py AdaLN
-
-    Args:
-        c_a: Activation channel dimension
-        c_s: Conditioning channel dimension
-    """
-
-    def __init__(self, c_a: int, c_s: int):
-        super().__init__()
-        self.c_a = c_a
-        self.c_s = c_s
-
-        self.layer_norm_a = LayerNorm(c_a, create_scale=False, create_offset=False)
-        self.layer_norm_s = LayerNorm(c_s, create_offset=False)
-        self.sigmoid = nn.Sigmoid()
-        self.linear_g = Linear(c_s, c_a, bias=True)
-        self.linear_s = Linear(c_s, c_a, bias=False)
-
-    def forward(self, a: torch.Tensor, s: torch.Tensor) -> torch.Tensor:
-        s_norm = self.layer_norm_s(s)
-        g = self.sigmoid(self.linear_g(s_norm))
-        a_norm = self.layer_norm_a(a)
-        return g * (a_norm + self.linear_s(s_norm))
+from ..L1.sigmoid import Sigmoid
+from ..L1.layer_norm import LayerNorm
+from ..L1.linear import Linear
+from .openfold3_swiglu import AdaLN, SwiGLU
 
 
 class SwiGLUTransition(nn.Module):
@@ -127,7 +76,7 @@ class ConditionedTransitionBlock(nn.Module):
         super().__init__()
         self.layer_norm = AdaLN(c_a=c_a, c_s=c_s)
         self.swiglu = SwiGLU(c_a, n * c_a)
-        self.sigmoid = nn.Sigmoid()
+        self.sigmoid = Sigmoid()
         self.linear_g = Linear(c_s, c_a, bias=True)
         self.linear_out = Linear(n * c_a, c_a, bias=False)
 

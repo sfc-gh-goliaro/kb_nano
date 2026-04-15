@@ -11,8 +11,8 @@ from __future__ import annotations
 import torch
 import torch.nn as nn
 
-from ..L1.openfold3_swiglu import ConditionedTransitionBlock
 from ..L2.openfold3_attention_pair_bias import AttentionPairBias, CrossAttentionPairBias
+from ..L2.openfold3_swiglu_transition import ConditionedTransitionBlock
 
 
 class DiffusionTransformerBlock(nn.Module):

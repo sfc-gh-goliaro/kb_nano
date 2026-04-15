@@ -14,6 +14,7 @@ import torch.nn as nn
 
 from ..L1.layer_norm import LayerNorm
 from ..L1.linear import Linear
+from ..L1.tensor_ops import OneHot, Pad
 from .openfold3_atom_attention import AtomAttentionEncoder
 
 
@@ -110,6 +111,8 @@ class InputEmbedder(nn.Module):
         self.c_z = c_z
         self.relpos_k = relpos_k
         self.max_relative_chain = max_relative_chain
+        self._one_hot = OneHot()
+        self._pad = Pad()
 
         if c_token is None:
             c_token = c_s
@@ -189,13 +192,13 @@ class InputEmbedder(nn.Module):
             d = residue_index[..., :, None] - residue_index[..., None, :]
             d = d.clamp(-self.relpos_k, self.relpos_k) + self.relpos_k
             n_bins = 2 * self.relpos_k + 2
-            relpos_feats = torch.nn.functional.one_hot(d.long(), n_bins).to(
+            relpos_feats = self._one_hot(d.long(), n_bins).to(
                 dtype=z.dtype,
             )
             n_relpos_in = self.linear_relpos.weight.shape[-1]
             if relpos_feats.shape[-1] < n_relpos_in:
-                pad = n_relpos_in - relpos_feats.shape[-1]
-                relpos_feats = torch.nn.functional.pad(relpos_feats, (0, pad))
+                pad_size = n_relpos_in - relpos_feats.shape[-1]
+                relpos_feats = self._pad(relpos_feats, (0, pad_size))
 
         z = z + self.linear_relpos(relpos_feats)
 

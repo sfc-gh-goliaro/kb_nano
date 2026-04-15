@@ -11,6 +11,8 @@ from __future__ import annotations
 import torch
 import torch.nn as nn
 
+from ..L1.sigmoid import Sigmoid
+from ..L1.softmax import Softmax
 from ..L1.layer_norm import LayerNorm
 from ..L1.linear import Linear
 
@@ -59,7 +61,8 @@ class MSARowAttentionWithPairBias(nn.Module):
         self.linear_g = Linear(c_m, c_hidden * no_heads, bias=False)
         self.linear_o = Linear(c_hidden * no_heads, c_m, bias=False)
 
-        self.sigmoid = nn.Sigmoid()
+        self.sigmoid = Sigmoid()
+        self.softmax = Softmax(dim=-1)
 
     def forward(
         self,
@@ -95,7 +98,7 @@ class MSARowAttentionWithPairBias(nn.Module):
         z_proj = self.linear_z(z_norm)
         z_weights = _permute_final_dims(z_proj, (2, 0, 1)).unsqueeze(-4)
         z_weights = z_weights + mask_bias
-        z_weights = torch.softmax(z_weights, dim=-1)
+        z_weights = self.softmax(z_weights)
 
         m = self.layer_norm_m(m)
 

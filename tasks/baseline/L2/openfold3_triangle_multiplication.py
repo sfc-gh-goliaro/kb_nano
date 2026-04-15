@@ -1,4 +1,4 @@
-"""Triangle multiplicative update for AlphaFold3.
+"""Triangle multiplicative update for AlphaFold3 (L2).
 
 Implements AF3 Algorithms 12 (outgoing) and 13 (incoming).
 Core operation: gated einsum("...ij,...jk->...ik") on pair representations
@@ -13,8 +13,8 @@ from __future__ import annotations
 import torch
 import torch.nn as nn
 
-from .layer_norm import LayerNorm
-from .linear import Linear
+from ..L1.layer_norm import LayerNorm
+from ..L1.linear import Linear
 
 
 def _permute_final_dims(tensor: torch.Tensor, inds: tuple[int, ...]) -> torch.Tensor:

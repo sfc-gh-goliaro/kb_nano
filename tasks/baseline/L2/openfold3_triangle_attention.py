@@ -1,4 +1,4 @@
-"""Triangle attention for AlphaFold3.
+"""Triangle attention for AlphaFold3 (L2).
 
 Implements AF3 Algorithms 14 (starting node) and 15 (ending node).
 Self-attention over one dimension of the pair representation with a
@@ -12,9 +12,9 @@ from __future__ import annotations
 import torch
 import torch.nn as nn
 
-from .layer_norm import LayerNorm
-from .linear import Linear
-from .openfold3_attention import OF3Attention
+from ..L1.layer_norm import LayerNorm
+from ..L1.linear import Linear
+from .openfold3_of3_attention import OF3Attention
 
 
 def _permute_final_dims(tensor: torch.Tensor, inds: tuple[int, ...]) -> torch.Tensor:

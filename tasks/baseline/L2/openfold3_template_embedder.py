@@ -11,10 +11,11 @@ from __future__ import annotations
 import torch
 import torch.nn as nn
 
+from ..L1.relu import ReLU
 from ..L1.layer_norm import LayerNorm
 from ..L1.linear import Linear
-from ..L1.openfold3_swiglu import SwiGLUTransition
-from ..L2.openfold3_pair_block import PairBlock
+from .openfold3_pair_block import PairBlock
+from .openfold3_swiglu_transition import SwiGLUTransition
 
 
 class TemplatePairEmbedder(nn.Module):
@@ -239,6 +240,7 @@ class TemplateEmbedder(nn.Module):
         inf: float = 1e9,
     ):
         super().__init__()
+        self.relu = ReLU()
         self.template_pair_embedder = TemplatePairEmbedder(
             c_in=c_z, c_dgram=c_dgram, c_aatype=c_aatype, c_out=c_t,
         )
@@ -281,7 +283,7 @@ class TemplateEmbedder(nn.Module):
         )
 
         t = torch.sum(t, dim=-4) / n_templ
-        t = torch.nn.functional.relu(t)
+        t = self.relu(t)
         t = self.linear_t(t)
 
         return t

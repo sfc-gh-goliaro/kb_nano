@@ -1,4 +1,4 @@
-"""Outer product mean for AlphaFold3.
+"""Outer product mean for AlphaFold3 (L2).
 
 Implements AF3 Algorithm 9. Computes an outer product of MSA
 representations and averages over the MSA dimension to produce
@@ -12,8 +12,8 @@ from __future__ import annotations
 import torch
 import torch.nn as nn
 
-from .layer_norm import LayerNorm
-from .linear import Linear
+from ..L1.layer_norm import LayerNorm
+from ..L1.linear import Linear
 
 
 class OuterProductMean(nn.Module):

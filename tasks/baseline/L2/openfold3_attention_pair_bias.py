@@ -13,10 +13,11 @@ from __future__ import annotations
 import torch
 import torch.nn as nn
 
+from ..L1.sigmoid import Sigmoid
 from ..L1.layer_norm import LayerNorm
 from ..L1.linear import Linear
-from ..L1.openfold3_attention import OF3Attention
-from ..L1.openfold3_swiglu import AdaLN
+from .openfold3_swiglu import AdaLN
+from .openfold3_of3_attention import OF3Attention
 
 
 def _permute_final_dims(tensor: torch.Tensor, inds: list[int]) -> torch.Tensor:
@@ -79,7 +80,7 @@ class AttentionPairBias(nn.Module):
         )
         self.linear_z = Linear(c_z, no_heads, bias=False)
 
-        self.sigmoid = nn.Sigmoid()
+        self.sigmoid = Sigmoid()
 
         self.mha = OF3Attention(
             c_q=c_q, c_k=c_k, c_v=c_v,
@@ -198,7 +199,7 @@ class CrossAttentionPairBias(nn.Module):
 
         self.linear_z = Linear(c_z, no_heads, bias=False)
 
-        self.sigmoid = nn.Sigmoid()
+        self.sigmoid = Sigmoid()
 
         self.mha = OF3Attention(
             c_q=c_q, c_k=c_k, c_v=c_v,

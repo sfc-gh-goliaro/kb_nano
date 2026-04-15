@@ -59,7 +59,7 @@ def test_triangle_multiplication(device="cuda", dtype=torch.bfloat16):
     from openfold3.core.model.layers.triangular_multiplicative_update import (
         TriangleMultiplicationOutgoing as RefTriMulOut,
     )
-    from kb_nano.tasks.baseline.L1.openfold3_triangle_multiplication import (
+    from kb_nano.tasks.baseline.L2.openfold3_triangle_multiplication import (
         TriangleMultiplicationOutgoing as KBTriMulOut,
     )
 
@@ -93,7 +93,7 @@ def test_triangle_attention(device="cuda", dtype=torch.bfloat16):
     from openfold3.core.model.layers.triangular_attention import (
         TriangleAttention as RefTriAtt,
     )
-    from kb_nano.tasks.baseline.L1.openfold3_triangle_attention import (
+    from kb_nano.tasks.baseline.L2.openfold3_triangle_attention import (
         TriangleAttention as KBTriAtt,
     )
 
@@ -127,7 +127,7 @@ def test_outer_product_mean(device="cuda", dtype=torch.bfloat16):
     from openfold3.core.model.layers.outer_product_mean import (
         OuterProductMean as RefOPM,
     )
-    from kb_nano.tasks.baseline.L1.openfold3_outer_product_mean import (
+    from kb_nano.tasks.baseline.L2.openfold3_outer_product_mean import (
         OuterProductMean as KBOPM,
     )
 
@@ -159,7 +159,7 @@ def test_outer_product_mean(device="cuda", dtype=torch.bfloat16):
 def test_swiglu(device="cuda", dtype=torch.bfloat16):
     print("\n=== SwiGLU ===")
     from openfold3.core.model.primitives.activations import SwiGLU as RefSwiGLU
-    from kb_nano.tasks.baseline.L1.openfold3_swiglu import SwiGLU as KBSwiGLU
+    from kb_nano.tasks.baseline.L2.openfold3_swiglu import SwiGLU as KBSwiGLU
 
     c_in, c_out = 384, 1536
 
@@ -187,7 +187,7 @@ def test_swiglu(device="cuda", dtype=torch.bfloat16):
 def test_swiglu_transition(device="cuda", dtype=torch.bfloat16):
     print("\n=== SwiGLUTransition ===")
     from openfold3.core.model.layers.transition import SwiGLUTransition as RefTrans
-    from kb_nano.tasks.baseline.L1.openfold3_swiglu import SwiGLUTransition as KBTrans
+    from kb_nano.tasks.baseline.L2.openfold3_swiglu_transition import SwiGLUTransition as KBTrans
 
     c_in, n = 128, 4
 
@@ -216,7 +216,7 @@ def test_swiglu_transition(device="cuda", dtype=torch.bfloat16):
 def test_attention(device="cuda", dtype=torch.bfloat16):
     print("\n=== Attention (MHA with biases) ===")
     from openfold3.core.model.primitives.attention import Attention as RefAttn
-    from kb_nano.tasks.baseline.L1.openfold3_attention import OF3Attention as KBAttn
+    from kb_nano.tasks.baseline.L2.openfold3_of3_attention import OF3Attention as KBAttn
 
     c_q, c_hidden, no_heads = 384, 32, 16
     N = 48
