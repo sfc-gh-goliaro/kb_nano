@@ -2,54 +2,38 @@
 
 from __future__ import annotations
 
+import os
 import re
-import sys
-from pathlib import Path
 
 import torch
 import torch.nn as nn
+from huggingface_hub import snapshot_download
+from safetensors.torch import load_file
 
 from ..L2.yolov10_conv import fuse_module
 from ..L3.yolov10_backbone import YOLOv10Backbone
 from ..L3.yolov10_head import YOLOv10DetectHead
 from ..L3.yolov10_neck import YOLOv10Neck
 
-
-def _repo_root() -> Path:
-    return Path(__file__).resolve().parents[3]
-
-
-def _ensure_yolov10_repo_on_path() -> None:
-    repo_root = _repo_root() / "third_party" / "yolov10"
-    if not repo_root.exists():
-        raise FileNotFoundError(
-            f"Missing YOLOv10 repo at {repo_root}. "
-            "Clone https://github.com/THU-MIG/yolov10 into third_party/yolov10."
-        )
-    repo_str = str(repo_root)
-    if repo_str not in sys.path:
-        sys.path.insert(0, repo_str)
-
-
 _PREFIX_MAP = [
-    ("model.0.", "backbone.stem1."),
-    ("model.1.", "backbone.stem2."),
-    ("model.2.", "backbone.stage2."),
-    ("model.3.", "backbone.down3."),
-    ("model.4.", "backbone.stage3."),
-    ("model.5.", "backbone.down4."),
-    ("model.6.", "backbone.stage4."),
-    ("model.7.", "backbone.down5."),
-    ("model.8.", "backbone.stage5."),
-    ("model.9.", "backbone.sppf."),
-    ("model.10.", "backbone.psa."),
-    ("model.13.", "neck.c2f_p4."),
-    ("model.16.", "neck.c2f_p3."),
-    ("model.17.", "neck.down_p3."),
-    ("model.19.", "neck.c2f_n4."),
-    ("model.20.", "neck.down_n4."),
-    ("model.22.", "neck.c2fcib_n5."),
-    ("model.23.", "detect."),
+    ("model.model.0.", "backbone.stem1."),
+    ("model.model.1.", "backbone.stem2."),
+    ("model.model.2.", "backbone.stage2."),
+    ("model.model.3.", "backbone.down3."),
+    ("model.model.4.", "backbone.stage3."),
+    ("model.model.5.", "backbone.down4."),
+    ("model.model.6.", "backbone.stage4."),
+    ("model.model.7.", "backbone.down5."),
+    ("model.model.8.", "backbone.stage5."),
+    ("model.model.9.", "backbone.sppf."),
+    ("model.model.10.", "backbone.psa."),
+    ("model.model.13.", "neck.c2f_p4."),
+    ("model.model.16.", "neck.c2f_p3."),
+    ("model.model.17.", "neck.down_p3."),
+    ("model.model.19.", "neck.c2f_n4."),
+    ("model.model.20.", "neck.down_n4."),
+    ("model.model.22.", "neck.c2fcib_n5."),
+    ("model.model.23.", "detect."),
 ]
 
 
@@ -69,21 +53,28 @@ class YOLOv10ForObjectDetection(nn.Module):
         dtype: torch.dtype = torch.float16,
         conf_threshold: float = 0.25,
     ) -> "YOLOv10ForObjectDetection":
-        _ensure_yolov10_repo_on_path()
-        from ultralytics import YOLOv10
-
-        official = YOLOv10.from_pretrained(model_name).model.float().eval()
         model = cls(conf_threshold=conf_threshold)
+        model_dir = snapshot_download(model_name, allow_patterns=["*.safetensors", "*.bin", "*.json"])
+        state_dict = {}
+        safetensor_path = os.path.join(model_dir, "model.safetensors")
+        bin_path = os.path.join(model_dir, "pytorch_model.bin")
+        if os.path.exists(safetensor_path):
+            state_dict.update(load_file(safetensor_path))
+        elif os.path.exists(bin_path):
+            loaded = torch.load(bin_path, map_location="cpu")
+            state_dict.update(loaded.get("state_dict", loaded))
+        else:
+            raise FileNotFoundError(f"No YOLOv10 checkpoint found in {model_dir}")
 
         remapped = {}
-        for key, value in official.state_dict().items():
-            if re.match(r"model\.(11|12|14|15|18|21)\.", key):
-                continue
+        for key, value in state_dict.items():
             replaced = key
             for src, dst in _PREFIX_MAP:
                 if key.startswith(src):
                     replaced = dst + key[len(src):]
                     break
+            else:
+                continue
             remapped[replaced] = value
 
         missing, unexpected = model.load_state_dict(remapped, strict=False)

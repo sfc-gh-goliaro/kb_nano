@@ -2,9 +2,6 @@
 
 from __future__ import annotations
 
-import sys
-from pathlib import Path
-
 import torch
 
 
@@ -23,24 +20,12 @@ def infer_image_size(model_name: str) -> int:
     raise ValueError(f"Unsupported detection model: {model_name}")
 
 
-def _project_root() -> Path:
-    return Path(__file__).resolve().parent.parent
-
-
-def _yolov10_repo_root() -> Path:
-    return _project_root() / "third_party" / "yolov10"
-
-
-def _ensure_yolov10_repo_on_path() -> None:
-    repo_root = _yolov10_repo_root()
-    if not repo_root.exists():
-        raise FileNotFoundError(
-            f"Missing YOLOv10 baseline repo at {repo_root}. "
-            "Clone https://github.com/THU-MIG/yolov10 into third_party/yolov10."
-        )
-    repo_str = str(repo_root)
-    if repo_str not in sys.path:
-        sys.path.insert(0, repo_str)
+def _hf_name_to_ultralytics_pt(model_name: str) -> str:
+    """Map a HuggingFace model id like 'jameslahm/yolov10n' to 'yolov10n.pt'."""
+    base = model_name.split("/")[-1]
+    if not base.endswith(".pt"):
+        base += ".pt"
+    return base
 
 
 def _ultralytics_device(device: str) -> str:
@@ -157,10 +142,10 @@ def _standardize_rtdetrv2_outputs(outputs, image_size: int, max_detections: int)
 
 def load_reference_detector(model_name: str, device: str = "cuda", dtype: torch.dtype = torch.float16):
     if is_yolov10_model(model_name):
-        _ensure_yolov10_repo_on_path()
-        from ultralytics import YOLOv10
+        from ultralytics import YOLO
 
-        model = YOLOv10.from_pretrained(model_name)
+        pt_name = _hf_name_to_ultralytics_pt(model_name)
+        model = YOLO(pt_name)
         core = model.model.float().eval().fuse(verbose=False)
         detect_head = core.model[-1]
         detect_head.export = True
