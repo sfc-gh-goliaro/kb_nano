@@ -6,9 +6,11 @@ from types import SimpleNamespace
 
 import torch
 import torch.nn as nn
-import torch.nn.functional as F
 
-from ..L2.rtdetrv2_layers import RTDetrV2ConvNormLayer, RTDetrV2CSPRepLayer, RTDetrV2EncoderLayer
+from ..L1.interpolate import Interpolate
+from ..L2.rtdetrv2_conv_norm import RTDetrV2ConvNormLayer
+from ..L2.rtdetrv2_csp_rep_layer import RTDetrV2CSPRepLayer
+from ..L2.rtdetrv2_encoder_layer import RTDetrV2EncoderLayer
 
 
 class RTDetrV2Encoder(nn.Module):
@@ -48,6 +50,7 @@ class RTDetrV2HybridEncoder(nn.Module):
         self.num_pan_stages = len(self.in_channels) - 1
         activation = config.activation_function
 
+        self._upsample = Interpolate()
         self.encoder = nn.ModuleList([RTDetrV2Encoder(config) for _ in range(len(self.encode_proj_layers))])
         self.lateral_convs = nn.ModuleList()
         self.fpn_blocks = nn.ModuleList()
@@ -143,7 +146,7 @@ class RTDetrV2HybridEncoder(nn.Module):
             backbone_feature_map = hidden_states[self.num_fpn_stages - idx - 1]
             top_fpn_feature_map = lateral_conv(fpn_feature_maps[-1])
             fpn_feature_maps[-1] = top_fpn_feature_map
-            top_fpn_feature_map = F.interpolate(top_fpn_feature_map, scale_factor=2.0, mode="nearest")
+            top_fpn_feature_map = self._upsample(top_fpn_feature_map, scale_factor=2.0, mode="nearest")
             fused_feature_map = torch.concat([top_fpn_feature_map, backbone_feature_map], dim=1)
             fpn_feature_maps.append(fpn_block(fused_feature_map))
         fpn_feature_maps = fpn_feature_maps[::-1]

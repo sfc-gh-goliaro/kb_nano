@@ -6,8 +6,8 @@ from types import SimpleNamespace
 
 import torch
 import torch.nn as nn
-import torch.nn.functional as F
 
+from ..L1.interpolate import Interpolate
 from ..L2.rtdetrv2_resnet import RTDetrV2ResNetEmbeddings, RTDetrV2ResNetStage
 
 
@@ -79,11 +79,12 @@ class RTDetrV2ConvEncoder(nn.Module):
             frozen_batch_norm=bool(config.freeze_backbone_batch_norms),
         )
         self.intermediate_channel_sizes = self.model.channels
+        self._interpolate = Interpolate()
 
     def forward(self, pixel_values: torch.Tensor, pixel_mask: torch.Tensor):
         features = self.model(pixel_values).feature_maps
         out = []
         for feature_map in features:
-            mask = F.interpolate(pixel_mask[None].float(), size=feature_map.shape[-2:]).to(torch.bool)[0]
+            mask = self._interpolate(pixel_mask[None].float(), size=feature_map.shape[-2:]).to(torch.bool)[0]
             out.append((feature_map, mask))
         return out

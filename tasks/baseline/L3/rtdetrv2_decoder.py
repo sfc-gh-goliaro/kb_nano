@@ -6,10 +6,23 @@ from types import SimpleNamespace
 
 import torch
 import torch.nn as nn
-import torch.nn.functional as F
 
-from ..L1.rtdetrv2_deformable_attention import RTDetrV2MultiscaleDeformableAttention
-from ..L2.rtdetrv2_layers import RTDetrV2MLPPredictionHead, RTDetrV2MultiheadAttention, _activation_fn
+from ..L1.dropout import Dropout
+from ..L1.gelu import GELU
+from ..L1.layer_norm import LayerNorm
+from ..L1.linear import Linear
+from ..L1.relu import ReLU
+from ..L1.sigmoid import Sigmoid
+from ..L1.silu import SiLU
+from ..L2.rtdetrv2_deformable_attention import RTDetrV2MultiscaleDeformableAttention
+from ..L2.rtdetrv2_mlp_head import RTDetrV2MLPPredictionHead
+from ..L2.rtdetrv2_multihead_attention import RTDetrV2MultiheadAttention
+
+_ACTIVATIONS = {"relu": ReLU, "gelu": GELU, "silu": SiLU}
+
+
+def _get_activation(name: str) -> nn.Module:
+    return _ACTIVATIONS[name.lower()]()
 
 
 def inverse_sigmoid(x, eps=1e-5):
@@ -27,15 +40,15 @@ class RTDetrV2DecoderLayer(nn.Module):
             num_heads=config.decoder_attention_heads,
             dropout=config.attention_dropout,
         )
-        self.dropout = config.dropout
-        self.activation_fn = _activation_fn(config.decoder_activation_function)
-        self.activation_dropout = config.activation_dropout
-        self.self_attn_layer_norm = nn.LayerNorm(config.d_model, eps=config.layer_norm_eps)
+        self._dropout = Dropout(p=config.dropout)
+        self._activation_dropout = Dropout(p=config.activation_dropout)
+        self.activation_fn = _get_activation(config.decoder_activation_function)
+        self.self_attn_layer_norm = LayerNorm(config.d_model, eps=config.layer_norm_eps)
         self.encoder_attn = RTDetrV2MultiscaleDeformableAttention(config)
-        self.encoder_attn_layer_norm = nn.LayerNorm(config.d_model, eps=config.layer_norm_eps)
-        self.fc1 = nn.Linear(config.d_model, config.decoder_ffn_dim)
-        self.fc2 = nn.Linear(config.decoder_ffn_dim, config.d_model)
-        self.final_layer_norm = nn.LayerNorm(config.d_model, eps=config.layer_norm_eps)
+        self.encoder_attn_layer_norm = LayerNorm(config.d_model, eps=config.layer_norm_eps)
+        self.fc1 = Linear(config.d_model, config.decoder_ffn_dim)
+        self.fc2 = Linear(config.decoder_ffn_dim, config.d_model)
+        self.final_layer_norm = LayerNorm(config.d_model, eps=config.layer_norm_eps)
 
     def forward(
         self,
@@ -56,7 +69,7 @@ class RTDetrV2DecoderLayer(nn.Module):
             position_embeddings=position_embeddings,
             output_attentions=output_attentions,
         )
-        hidden_states = F.dropout(hidden_states, p=self.dropout, training=self.training)
+        hidden_states = self._dropout(hidden_states)
         hidden_states = residual + hidden_states
         hidden_states = self.self_attn_layer_norm(hidden_states)
 
@@ -71,15 +84,15 @@ class RTDetrV2DecoderLayer(nn.Module):
             level_start_index=level_start_index,
             output_attentions=output_attentions,
         )
-        hidden_states = F.dropout(hidden_states, p=self.dropout, training=self.training)
+        hidden_states = self._dropout(hidden_states)
         hidden_states = second_residual + hidden_states
         hidden_states = self.encoder_attn_layer_norm(hidden_states)
 
         residual = hidden_states
         hidden_states = self.activation_fn(self.fc1(hidden_states))
-        hidden_states = F.dropout(hidden_states, p=self.activation_dropout, training=self.training)
+        hidden_states = self._activation_dropout(hidden_states)
         hidden_states = self.fc2(hidden_states)
-        hidden_states = F.dropout(hidden_states, p=self.dropout, training=self.training)
+        hidden_states = self._dropout(hidden_states)
         hidden_states = residual + hidden_states
         hidden_states = self.final_layer_norm(hidden_states)
 
@@ -93,13 +106,13 @@ class RTDetrV2Decoder(nn.Module):
     def __init__(self, config):
         super().__init__()
         self.config = config
-        self.dropout = config.dropout
         self.layers = nn.ModuleList([RTDetrV2DecoderLayer(config) for _ in range(config.decoder_layers)])
         self.query_pos_head = RTDetrV2MLPPredictionHead(config, 4, 2 * config.d_model, config.d_model, num_layers=2)
-        self.class_embed = nn.ModuleList([nn.Linear(config.d_model, config.num_labels) for _ in range(config.decoder_layers)])
+        self.class_embed = nn.ModuleList([Linear(config.d_model, config.num_labels) for _ in range(config.decoder_layers)])
         self.bbox_embed = nn.ModuleList(
             [RTDetrV2MLPPredictionHead(config, config.d_model, config.d_model, 4, num_layers=3) for _ in range(config.decoder_layers)]
         )
+        self._sigmoid = Sigmoid()
 
     def forward(
         self,
@@ -127,7 +140,7 @@ class RTDetrV2Decoder(nn.Module):
         intermediate = ()
         intermediate_reference_points = ()
         intermediate_logits = ()
-        reference_points = F.sigmoid(reference_points)
+        reference_points = self._sigmoid(reference_points)
 
         for idx, decoder_layer in enumerate(self.layers):
             reference_points_input = reference_points.unsqueeze(2)
@@ -148,7 +161,7 @@ class RTDetrV2Decoder(nn.Module):
             )
             hidden_states = layer_outputs[0]
             predicted_corners = self.bbox_embed[idx](hidden_states)
-            new_reference_points = F.sigmoid(predicted_corners + inverse_sigmoid(reference_points))
+            new_reference_points = self._sigmoid(predicted_corners + inverse_sigmoid(reference_points))
             reference_points = new_reference_points.detach()
             intermediate += (hidden_states,)
             intermediate_reference_points += (new_reference_points,)

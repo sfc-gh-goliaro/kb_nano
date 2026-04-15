@@ -5,7 +5,11 @@ from __future__ import annotations
 import torch
 import torch.nn as nn
 
-from ..L2.yolov10_blocks import YOLOConv, YOLOC2f, YOLOPSA, YOLOSCDown, YOLOSPPF
+from ..L2.yolov10_c2f import YOLOC2f
+from ..L2.yolov10_conv import YOLOConv
+from ..L2.yolov10_psa import YOLOPSA
+from ..L2.yolov10_scdown import YOLOSCDown
+from ..L2.yolov10_sppf import YOLOSPPF
 
 
 class YOLOv10Backbone(nn.Module):

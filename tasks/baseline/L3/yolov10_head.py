@@ -1,4 +1,4 @@
-"""Native YOLOv10 detection head."""
+"""YOLOv10 detection head (L3 composite)."""
 
 from __future__ import annotations
 
@@ -8,7 +8,10 @@ import copy
 import torch
 import torch.nn as nn
 
-from .yolov10_blocks import YOLOConv
+from ..L1.conv2d import Conv2d
+from ..L1.sigmoid import Sigmoid
+from ..L2.yolov10_conv import YOLOConv
+from ..L2.yolov10_dfl import YOLODFL
 
 
 def make_anchors(feats: list[torch.Tensor], strides: torch.Tensor, grid_cell_offset: float = 0.5):
@@ -59,19 +62,6 @@ def v10postprocess(preds: torch.Tensor, max_det: int, nc: int = 80):
     return boxes, scores, labels
 
 
-class YOLODFL(nn.Module):
-    def __init__(self, c1: int = 16):
-        super().__init__()
-        self.conv = nn.Conv2d(c1, 1, 1, bias=False).requires_grad_(False)
-        x = torch.arange(c1, dtype=torch.float)
-        self.conv.weight.data[:] = nn.Parameter(x.view(1, c1, 1, 1))
-        self.c1 = c1
-
-    def forward(self, x: torch.Tensor) -> torch.Tensor:
-        b, _, a = x.shape
-        return self.conv(x.view(b, 4, self.c1, a).transpose(2, 1).softmax(1)).view(b, 4, a)
-
-
 class YOLOv10DetectHead(nn.Module):
     dynamic = False
     export = True
@@ -91,7 +81,7 @@ class YOLOv10DetectHead(nn.Module):
             nn.Sequential(
                 YOLOConv(x, c2, 3),
                 YOLOConv(c2, c2, 3),
-                nn.Conv2d(c2, 4 * self.reg_max, 1),
+                Conv2d(c2, 4 * self.reg_max, 1),
             )
             for x in ch
         )
@@ -99,11 +89,12 @@ class YOLOv10DetectHead(nn.Module):
             nn.Sequential(
                 nn.Sequential(YOLOConv(x, x, 3, g=x), YOLOConv(x, c3, 1)),
                 nn.Sequential(YOLOConv(c3, c3, 3, g=c3), YOLOConv(c3, c3, 1)),
-                nn.Conv2d(c3, self.nc, 1),
+                Conv2d(c3, self.nc, 1),
             )
             for x in ch
         )
         self.dfl = YOLODFL(self.reg_max)
+        self._sigmoid = Sigmoid()
         self.one2one_cv2 = copy.deepcopy(self.cv2)
         self.one2one_cv3 = copy.deepcopy(self.cv3)
         self.register_buffer("anchors", torch.empty(0))
@@ -123,7 +114,7 @@ class YOLOv10DetectHead(nn.Module):
             self.shape = shape
         box, cls = x_cat.split((self.reg_max * 4, self.nc), 1)
         dbox = dist2bbox(self.dfl(box), self.anchors.unsqueeze(0), xywh=True, dim=1) * self.strides
-        return torch.cat((dbox, cls.sigmoid()), 1)
+        return torch.cat((dbox, self._sigmoid(cls)), 1)
 
     def forward(self, x: list[torch.Tensor]):
         one2one = self.forward_feat([xi.detach() for xi in x], self.one2one_cv2, self.one2one_cv3)

@@ -4,14 +4,18 @@ from __future__ import annotations
 
 import torch
 import torch.nn as nn
-import torch.nn.functional as F
 
-from ..L2.yolov10_blocks import YOLOConcat, YOLOConv, YOLOC2f, YOLOC2fCIB, YOLOSCDown
+from ..L1.interpolate import Interpolate
+from ..L2.yolov10_c2f import YOLOC2f, YOLOC2fCIB
+from ..L2.yolov10_concat import YOLOConcat
+from ..L2.yolov10_conv import YOLOConv
+from ..L2.yolov10_scdown import YOLOSCDown
 
 
 class YOLOv10Neck(nn.Module):
     def __init__(self):
         super().__init__()
+        self._upsample = Interpolate()
         self.cat1 = YOLOConcat(1)
         self.c2f_p4 = YOLOC2f(384, 128, n=1, shortcut=False)
         self.cat2 = YOLOConcat(1)
@@ -28,11 +32,11 @@ class YOLOv10Neck(nn.Module):
         p4_backbone = feats["p4_backbone"]
         p5_backbone = feats["p5_backbone"]
 
-        x = F.interpolate(p5_backbone, scale_factor=2.0, mode="nearest")
+        x = self._upsample(p5_backbone, scale_factor=2.0, mode="nearest")
         x = self.cat1([x, p4_backbone])
         p4 = self.c2f_p4(x)
 
-        x = F.interpolate(p4, scale_factor=2.0, mode="nearest")
+        x = self._upsample(p4, scale_factor=2.0, mode="nearest")
         x = self.cat2([x, p3_backbone])
         p3 = self.c2f_p3(x)
 

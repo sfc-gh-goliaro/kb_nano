@@ -9,9 +9,9 @@ from pathlib import Path
 import torch
 import torch.nn as nn
 
-from ..L2.yolov10_blocks import fuse_module
-from ..L2.yolov10_head import YOLOv10DetectHead
+from ..L2.yolov10_conv import fuse_module
 from ..L3.yolov10_backbone import YOLOv10Backbone
+from ..L3.yolov10_head import YOLOv10DetectHead
 from ..L3.yolov10_neck import YOLOv10Neck
 
 
