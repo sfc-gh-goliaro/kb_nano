@@ -25,6 +25,8 @@ dependencies = [
     "sam3 @ git+https://github.com/sfc-gh-goliaro/sam3.git",
     "openfold3 @ git+https://github.com/aqlaboratory/openfold-3.git",
     "pycocotools",
+    "timm",
+    "fastsafetensors",
 ]
 
 [project.optional-dependencies]

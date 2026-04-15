@@ -42,7 +42,10 @@ class LlamaAttention(nn.Module):
         super().__init__()
         tp = _tp_size()
         self.num_heads = num_attention_heads // tp
-        self.num_kv_heads = num_key_value_heads // tp
+        if num_key_value_heads >= tp:
+            self.num_kv_heads = num_key_value_heads // tp
+        else:
+            self.num_kv_heads = 1
         self.head_dim = head_dim
         self.rotary_emb = rotary_emb
         self.nope = nope

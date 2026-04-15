@@ -1,6 +1,6 @@
 # kb-nano
 
-A standalone, high-performance inference engine supporting **LLMs** (Llama 3.1, Mixtral-8x7B, Qwen2-VL, Qwen3-VL), **diffusion models** (FLUX.1-dev, SDXL, HunyuanVideo-1.5), **segmentation models** (SAM3.1), **protein structure prediction** (OpenFold3), audio models (Whisper), and **TTS models** (CosyVoice3) with tensor parallelism. No vLLM dependency at runtime — just PyTorch, Triton, and Flash Attention.
+A standalone, high-performance inference engine supporting **LLMs** (Llama 3.1, Mixtral-8x7B, Qwen2-VL, Qwen3-VL), **diffusion models** (FLUX.1-dev, SDXL, HunyuanVideo-1.5), **vision encoders** (SigLIP-2, DINOv3, SwinV2), **segmentation models** (SAM3.1), **protein structure prediction** (OpenFold3), audio models (Whisper), and **TTS models** (CosyVoice3) with tensor parallelism. No vLLM dependency at runtime — just PyTorch, Triton, and Flash Attention.
 
 ## Features
 
@@ -10,6 +10,9 @@ A standalone, high-performance inference engine supporting **LLMs** (Llama 3.1, 
 - **SDXL** (Stable Diffusion XL) UNet-based text-to-image with dual CLIP text encoders
 - **HunyuanVideo-1.5** 3D video diffusion transformer (text-to-video) with dual-stream joint attention, M-RoPE, and Qwen2.5-VL text encoder
 - **Qwen2-VL / Qwen3-VL** vision-language models with image and video support
+- **SigLIP-2** (google/siglip2-so400m-patch16-naflex) NaFlexVit vision encoder with MAP attention pooling
+- **DINOv3** (facebook/dinov3-vit7b16-pretrain-lvd1689m) Eva vision encoder with 2D RoPE, SwiGLU MLP, and register tokens
+- **SwinV2** (timm/swinv2_large_window12_192.ms_in22k) hierarchical vision transformer with shifted-window cosine attention and continuous position bias
 - **SAM3.1** (facebook/sam3.1) image/video segmentation with ViT backbone, fusion encoder, detection decoder, and segmentation head
 - **Whisper** (large-v3) encoder-decoder speech-to-text with batched inference and paged cross-attention KV cache
 - **CosyVoice3** (Fun-CosyVoice3-0.5B-2512) text-to-speech with flow matching DiT + HiFi-GAN vocoder
@@ -24,6 +27,7 @@ A standalone, high-performance inference engine supporting **LLMs** (Llama 3.1, 
 - **vllm-omni comparison benchmark** for FLUX diffusion and HunyuanVideo-1.5 video diffusion
 - **vllm-omni comparison benchmark** for CosyVoice3 TTS (SEED-TTS-Eval dataset)
 - **diffusers comparison benchmark** for SDXL diffusion
+- **timm comparison benchmark** for SigLIP-2, DINOv3, and SwinV2 vision encoders (ImageNet-1K validation)
 - **facebook/sam3 comparison benchmark** for SAM3.1 segmentation
 - **OpenFold/OpenFold3 comparison benchmark** for protein structure prediction
 
@@ -33,76 +37,15 @@ A standalone, high-performance inference engine supporting **LLMs** (Llama 3.1, 
 ├── tasks/                      # Benchmarkable operators & models
 │   ├── baseline/               # Reference implementations (the code to beat)
 │   │   ├── L1/                 # Single-kernel ops
-│   │   │   ├── rms_norm.py     # Fused RMSNorm
-│   │   │   ├── silu_and_mul.py # SiLU activation with gate
-│   │   │   ├── rotary_emb.py   # RoPE (standard + Llama 3.1 frequency scaling)
-│   │   │   ├── diffusion_rope.py   # Interleaved RoPE for diffusion models
-│   │   │   ├── dense_attention.py   # Dense attention (non-paged, no KV cache; FA3>FA2>SDPA)
-│   │   │   ├── conv2d.py       # Conv2d op (wraps F.conv2d)
-│   │   │   ├── group_norm.py   # GroupNorm op (wraps F.group_norm)
-│   │   │   ├── store_kvcache.py# Triton KV cache store kernel
-│   │   │   ├── flash_attn_prefill.py
-│   │   │   ├── flash_attn_decode.py
-│   │   │   ├── allreduce.py    # AllReduce op + custom IPC all-reduce (NCCL fallback)
-│   │   │   ├── linear.py       # F.linear wrapper
-│   │   │   ├── embedding.py    # F.embedding wrapper
-│   │   │   ├── conv1d.py       # Conv1d wrapper (Whisper audio encoder)
-│   │   │   ├── gelu.py         # GELU activation (Whisper)
-│   │   │   ├── layer_norm.py   # LayerNorm wrapper (Whisper, vision)
-│   │   │   ├── sam3_position_encoding.py  # SAM3 2D sine position encoding
-│   │   │   ├── sam3_rope.py    # SAM3 RoPE (tiled real-valued)
-│   │   │   ├── moe_align.py    # MoE token-expert alignment
-│   │   │   ├── moe_sum.py      # Fused MoE sum kernel
-│   │   │   ├── moe_grouped_gemm.py # Triton fused MoE grouped GEMM
+|   |   |   ├── ...
 │   │   │   └── csrc/           # CUDA/C++ kernel sources (JIT-compiled)
-│   │   │       └── custom_allreduce_kernels.cu
+│   │   │       └── ...
 │   │   ├── L2/                 # Multi-op blocks
-│   │   │   ├── attention.py    # LlamaAttention (GQA + QKV proj + RoPE + output proj)
-│   │   │   ├── flux_attention.py   # FluxAttention (joint/cross attention for DiT)
-│   │   │   ├── flux_feedforward.py # FLUX FFN (GELU + TP-sharded linears)
-│   │   │   ├── hunyuan_video_attention.py # HunyuanVideo dual-stream joint attention
-│   │   │   ├── hunyuan_video_embeddings.py # 3D patch embed + timestep/text conditioning
-│   │   │   ├── hunyuan_video_token_refiner.py # Token refiner block (ByT5 conditioning)
-│   │   │   ├── llama_mlp.py    # Llama SwiGLU MLP
-│   │   │   ├── whisper_attention.py # Whisper encoder/decoder/cross-attention
-│   │   │   ├── whisper_mlp.py  # Whisper GELU MLP
-│   │   │   ├── mixtral_moe.py  # Mixtral MoE routing + experts
-│   │   │   ├── fused_experts.py# Fused expert execution
-│   │   │   ├── parallel_linear.py  # TP-aware linear layers
-│   │   │   ├── parallel_embedding.py
-│   │   │   ├── sdxl_attention.py   # SDXL multi-head attention (self/cross)
-│   │   │   ├── sdxl_resnet.py      # ResnetBlock2D for UNet
-│   │   │   ├── sdxl_feedforward.py # GEGLU FeedForward
-│   │   │   ├── sdxl_time_embedding.py # SDXL text_time conditioning
-│   │   │   ├── sdxl_downsample.py  # Stride-2 Conv2d downsampling
-│   │   │   ├── sdxl_upsample.py    # Nearest-neighbor + Conv2d upsampling
-│   │   │   ├── sam3_vit_attention.py  # SAM3 ViT windowed attention with RoPE
-│   │   │   ├── sam3_mask_predictor.py # SAM3 mask prediction head (MLP)
-│   │   │   ├── openfold3_atom_attention.py # OpenFold3 atom attention with block conversion
-│   │   │   └── openfold3_attention_pair_bias.py # OpenFold3 cross-attention with pair bias
+│   │   │   └── ...
 │   │   ├── L3/                 # Decoder layers
-│   │   │   ├── llama_decoder.py
-│   │   │   ├── mixtral_decoder.py
-│   │   │   ├── flux_transformer_block.py  # FLUX dual/single-stream DiT blocks
-│   │   │   ├── hunyuan_video_block.py     # HunyuanVideo dual/single-stream transformer blocks
-│   │   │   ├── sdxl_transformer_block.py # BasicTransformerBlock (self-attn, cross-attn, GEGLU FFN)
-│   │   │   ├── sdxl_spatial_transformer.py # Transformer2DModel (spatial flatten + N transformer blocks)
-│   │   │   ├── sdxl_unet_block.py  # UNet down/mid/up blocks with cross-attention
-│   │   │   ├── whisper_encoder_layer.py
-│   │   │   ├── whisper_decoder_layer.py
-│   │   │   ├── sam3_encoder_layer.py  # SAM3 fusion encoder layer
-│   │   │   ├── sam3_decoder_layer.py  # SAM3 detection decoder layer
-│   │   │   └── openfold3_diffusion_module.py # OpenFold3 diffusion module with centre random augmentation
+│   │   │   └── ...
 │   │   └── L4/                 # Full models
-│   │       ├── llama.py        # LlamaForCausalLM
-│   │       ├── mixtral.py      # MixtralForCausalLM
-│   │       ├── flux.py         # FluxPipeline (text-to-image diffusion)
-│   │       ├── sdxl.py         # SDXLPipeline (UNet text-to-image diffusion)
-│   │       ├── hunyuan_video.py # HunyuanVideoPipeline (text-to-video diffusion)
-│   │       ├── qwen25_vl_encoder.py # Qwen2.5-VL text encoder (custom paged-attn impl)
-│   │       ├── whisper.py      # WhisperForConditionalGeneration
-│   │       ├── sam3.py         # SAM3Model (ViT + FPN + fusion encoder + decoder + segmentation head)
-│   │       └── openfold3.py   # OpenFold3 model (InputEmbedder + MSA + PairFormer + Diffusion + Heads)
+│   │       └── ...
 │   └── candidate/              # Generated replacement kernels (gitignored)
 │       ├── README.md           # Instructions
 │       └── L1/, L2/, ...       # Organized by level, named after the operator
@@ -124,6 +67,7 @@ A standalone, high-performance inference engine supporting **LLMs** (Llama 3.1, 
     ├── bench_vllm.py           # Multi-scenario throughput + latency + alignment benchmark vs vLLM
     ├── bench_vllm_omni.py     # Diffusion (FLUX / HunyuanVideo) and TTS (CosyVoice3) benchmark: kb-nano vs vllm-omni
     ├── bench_diffusers.py     # SDXL diffusion benchmark: kb-nano vs diffusers + torch.compile
+    ├── bench_timm.py          # Vision encoder benchmark: kb-nano vs timm (SigLIP-2, DINOv3, SwinV2)
     ├── test_sam.py            # SAM3 segmentation benchmark: kb-nano vs facebook/sam3 reference
     ├── bench_openfold3.py     # OpenFold3 protein structure benchmark: kb-nano vs OpenFold reference
     ├── utils/                  # Post-processing and visualization
@@ -218,6 +162,38 @@ python tests/bench_diffusers.py --skip-diffusers
 
 # Save results to a specific directory
 python tests/bench_diffusers.py --output-dir tests/results/B200/stable-diffusion-xl-base-1.0
+```
+
+### Benchmarking vs timm (Vision Encoders)
+
+Supported models:
+
+| Short Name | Model ID |
+|------------|----------|
+| SigLIP-2 | `google/siglip2-so400m-patch16-naflex` |
+| DINOv3 | `facebook/dinov3-vit7b16-pretrain-lvd1689m` |
+| SwinV2 | `timm/swinv2_large_window12_192.ms_in22k` |
+
+```bash
+# Run a single model benchmark (throughput + latency + correctness vs timm)
+python tests/bench_timm.py --model google/siglip2-so400m-patch16-naflex
+python tests/bench_timm.py --model facebook/dinov3-vit7b16-pretrain-lvd1689m
+python tests/bench_timm.py --model timm/swinv2_large_window12_192.ms_in22k
+
+# Run all three in parallel on separate GPUs
+CUDA_VISIBLE_DEVICES=0 python tests/bench_timm.py --model timm/swinv2_large_window12_192.ms_in22k &
+CUDA_VISIBLE_DEVICES=1 python tests/bench_timm.py --model facebook/dinov3-vit7b16-pretrain-lvd1689m &
+CUDA_VISIBLE_DEVICES=2 python tests/bench_timm.py --model google/siglip2-so400m-patch16-naflex &
+wait
+
+# kb-nano only (skip timm comparison)
+python tests/bench_timm.py --model google/siglip2-so400m-patch16-naflex --skip-timm
+
+# Use a different dataset (default: ILSVRC/imagenet-1k validation)
+python tests/bench_timm.py --model google/siglip2-so400m-patch16-naflex --dataset food101 --dataset-split validation
+
+# Override number of images or resolution
+python tests/bench_timm.py --model google/siglip2-so400m-patch16-naflex --num-images 1000 --resolution 512
 ```
 
 ### Benchmarking vs facebook/sam3 (Segmentation)
@@ -424,6 +400,7 @@ Each run is tagged with a `tier` (`agent`, `kernel`, `eval`, or `e2e`) indicatin
 - Hugging Face (`transformers`, `huggingface_hub`, `safetensors`)
 - aiohttp (for the LLM kernel agent)
 - MLflow (experiment tracking — gracefully skipped if not installed)
+- timm (pytorch-image-models — only needed for vision encoder comparison tests)
 - vLLM (only needed for running comparison tests)
 - matplotlib (only needed for benchmark plotting)
 
@@ -535,22 +512,29 @@ Latency (448 output tokens, 5 iterations):
 
 ### Qwen3-VL FP8 (W8A8 block-quantized)
 
-FP8 support uses `Qwen/Qwen3-VL-8B-Instruct-FP8` with block-scaled FP8 GEMM via DeepGEMM. Vision encoder and lm_head remain in BF16; only LLM decoder layers use FP8.
+FP8 support uses block-scaled FP8 GEMM via DeepGEMM. Vision encoder and lm_head remain in BF16; only LLM decoder layers use FP8.
 
 Throughput (1000 sequences per scenario, `temperature=0`, `max_model_len=16896`):
 
 | Model | TP | Scenario | Output | vLLM (tok/s) | Ours (tok/s) | Ratio | Avg Match Tokens |
 |-------|---:|----------|-------:|-------------:|-------------:|------:|-----------------:|
-| Qwen3-VL-8B-FP8 | 1 | text-only | 1024 | 22,921 | 19,951 | **0.87x** | 765.3/1024 |
-| Qwen3-VL-8B-FP8 | 1 | image     |  512 | 15,963 | 13,308 | **0.83x** |   73.2/512 |
-| Qwen3-VL-8B-FP8 | 1 | video     |  512 |  4,148 |  8,842 | **2.13x** | 102.1/512 |
+| Qwen3-VL-8B-FP8 | 1 | text-only | 1024 |  8,138 | 10,350 | **1.27x** | 795.6/1024 |
+| Qwen3-VL-8B-FP8 | 1 | image     |  512 |  7,761 |  7,863 | **1.01x** |  16.2/512 |
+| Qwen3-VL-8B-FP8 | 1 | video     |  512 |  2,195 |  6,071 | **2.77x** |  57.7/512 |
+| Qwen3-VL-30B-FP8 (MoE) | 1 | image |  512 | 10,598 |  7,612 | 0.72x |  60.8/512 |
+| Qwen3-VL-235B-FP8 (MoE) | 4 | text-only | 1024 | 8,262 | 8,213 | 0.99x | 418.5/1024 |
+| Qwen3-VL-235B-FP8 (MoE) | 4 | image     |  512 | 6,578 | 4,809 | 0.73x |  94.8/512 |
+| Qwen3-VL-235B-FP8 (MoE) | 4 | video     |  512 | 1,581 | 4,675 | **2.96x** |  77.1/512 |
 
 Latency (batch size 1, 128 output tokens, 5 iterations):
 
 | Model | TP | Scenario | vLLM median | Ours median | Ratio |
 |-------|---:|----------|------------:|------------:|------:|
-| Qwen3-VL-8B-FP8 | 1 | single-image | 0.516s | 0.528s | **0.98x** |
-| Qwen3-VL-8B-FP8 | 1 | single-video | 0.557s | 0.541s | **1.03x** |
+| Qwen3-VL-8B-FP8 | 1 | single-image | 0.560s | 0.728s | 0.77x |
+| Qwen3-VL-8B-FP8 | 1 | single-video | 0.724s | 0.731s | 0.99x |
+| Qwen3-VL-30B-FP8 (MoE) | 1 | single-image | 0.682s | 0.777s | 0.88x |
+| Qwen3-VL-235B-FP8 (MoE) | 4 | single-image | 1.433s | 1.808s | 0.79x |
+| Qwen3-VL-235B-FP8 (MoE) | 4 | single-video | 1.882s | 1.768s | **1.06x** |
 
 FP8 activation quantization uses a custom Triton kernel for single-launch per-token-group UE8M0 quantization. Pre-allocated shared prefill buffers eliminate dynamic allocation during FP8 prefill, and DeepGEMM is JIT-warmed for both decode and prefill batch sizes. The remaining throughput gap vs vLLM is primarily from vLLM's `torch.compile` + Inductor fusion passes (RMSNorm+quant, SiLU+quant).
 
@@ -675,6 +659,91 @@ Correctness (eager mode, latent space, per-batch cosine similarity):
 | 512x512, 50 steps   | 0.969 | 0.952 |
 
 Correctness is measured in eager mode with bf16 precision. Both engines use identical model weights (diffusers checkpoint) and the same EulerDiscreteScheduler. The remaining cosine divergence is expected from bf16 accumulation differences across 28-50 denoising steps with CFG guidance_scale=5.0.
+
+### SigLIP-2 (Vision Encoder)
+
+Run `tests/bench_timm.py --model google/siglip2-so400m-patch16-naflex` to reproduce. 10,000 unique images from ImageNet-1K validation (ILSVRC/imagenet-1k), loaded via streaming and preprocessed with Inception normalization (mean/std=0.5). Each image processed exactly once. Reference engine: timm (pytorch-image-models).
+
+**Hardware: NVIDIA H200**
+
+Throughput (images/sec, bf16):
+
+| Scenario | Resolution | Images | timm (img/s) | Ours (img/s) | Ratio |
+|----------|:----------:|-------:|-------------:|-------------:|------:|
+| default-res | 384x384 | 10,000 | 927 | 832 | 0.90x |
+| high-res    | 512x512 | 10,000 | 512 | 494 | 0.96x |
+
+Latency (median of 30 iterations, bf16):
+
+| Scenario | Batch | timm p50 | Ours p50 | Ratio |
+|----------|------:|---------:|---------:|------:|
+| single-image | 1 | 5.2 ms | 4.7 ms | **1.10x** |
+| batch-8 | 8 | 9.9 ms | 9.8 ms | **1.01x** |
+
+Correctness (per-batch embedding cosine similarity):
+
+| Scenario | Batches | Mean CosSim | Min CosSim | Result |
+|----------|--------:|------------:|-----------:|-------:|
+| default-res | 16 | 1.000 | 1.000 | PASS |
+| high-res | 32 | 1.000 | 1.000 | PASS |
+
+### DINOv3 (Vision Encoder)
+
+Run `tests/bench_timm.py --model facebook/dinov3-vit7b16-pretrain-lvd1689m` to reproduce. 1,500 unique images from ImageNet-1K validation, loaded via streaming and preprocessed with ImageNet normalization (mean=[0.485,0.456,0.406], std=[0.229,0.224,0.225]). Each image processed exactly once. Reference engine: timm (pytorch-image-models).
+
+**Hardware: NVIDIA H200**
+
+Throughput (images/sec, bf16):
+
+| Scenario | Resolution | Images | timm (img/s) | Ours (img/s) | Ratio |
+|----------|:----------:|-------:|-------------:|-------------:|------:|
+| default-res | 256x256 | 1,500 | 133 | 131 | 0.98x |
+| high-res    | 512x512 | 1,500 |  33 |  33 | 0.99x |
+
+Latency (median of 30 iterations, bf16):
+
+| Scenario | Batch | timm p50 | Ours p50 | Ratio |
+|----------|------:|---------:|---------:|------:|
+| single-image | 1 | 16.4 ms | 14.0 ms | **1.17x** |
+| batch-8 | 8 | 64.5 ms | 64.3 ms | **1.00x** |
+
+Correctness (per-batch embedding cosine similarity):
+
+| Scenario | Batches | Mean CosSim | Min CosSim | Result |
+|----------|--------:|------------:|-----------:|-------:|
+| default-res | 16 | 1.000 | 1.000 | PASS |
+| high-res | 32 | 1.000 | 1.000 | PASS |
+
+DINOv3 produces bit-identical embeddings to timm (perfect 1.000 cosine similarity, zero MSE).
+
+### SwinV2 (Vision Encoder)
+
+Run `tests/bench_timm.py --model timm/swinv2_large_window12_192.ms_in22k` to reproduce. 5,000 unique images from ImageNet-1K validation (ILSVRC/imagenet-1k), loaded via streaming and preprocessed with ImageNet normalization (mean=[0.485,0.456,0.406], std=[0.229,0.224,0.225]). Each image processed exactly once. Reference engine: timm (pytorch-image-models).
+
+**Hardware: NVIDIA H200**
+
+Throughput (images/sec, bf16):
+
+| Scenario | Resolution | Images | timm (img/s) | Ours (img/s) | Ratio |
+|----------|:----------:|-------:|-------------:|-------------:|------:|
+| default-res | 192x192 | 5,000 | 1,287 | 1,763 | **1.37x** |
+| high-res    | 512x512 | 5,000 |   250 |   244 | 0.97x |
+
+Latency (median of 30 iterations, bf16):
+
+| Scenario | Batch | timm p50 | Ours p50 | Ratio |
+|----------|------:|---------:|---------:|------:|
+| single-image | 1 | 12.7 ms | 14.9 ms | 0.86x |
+| batch-8 | 8 | 13.3 ms | 14.9 ms | 0.89x |
+
+Correctness (per-batch embedding cosine similarity):
+
+| Scenario | Batches | Mean CosSim | Min CosSim | Result |
+|----------|--------:|------------:|-----------:|-------:|
+| default-res | 16 | 1.000 | 1.000 | PASS |
+| high-res | 32 | 1.000 | 1.000 | PASS |
+
+SwinV2 produces bit-identical embeddings to timm (perfect 1.000 cosine similarity, zero MSE).
 
 ### SAM3.1 (Segmentation)
 
