@@ -21,11 +21,16 @@ def infer_image_size(model_name: str) -> int:
 
 
 def _hf_name_to_ultralytics_pt(model_name: str) -> str:
-    """Map a HuggingFace model id like 'jameslahm/yolov10n' to 'yolov10n.pt'."""
+    """Map a HuggingFace model id like 'jameslahm/yolov10n' to a temp path."""
+    import tempfile
+    from pathlib import Path
+
     base = model_name.split("/")[-1]
     if not base.endswith(".pt"):
         base += ".pt"
-    return base
+    cache_dir = Path(tempfile.gettempdir()) / "kb_nano" / "ultralytics"
+    cache_dir.mkdir(parents=True, exist_ok=True)
+    return str(cache_dir / base)
 
 
 def _ultralytics_device(device: str) -> str:
