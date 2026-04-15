@@ -12,7 +12,8 @@ _DIR = os.path.dirname(os.path.abspath(__file__))
 _C = _load_ext(
     name="kb_nano_L1_ops",
     sources=[os.path.join(_DIR, f) for f in [
-        "binding.cpp", "rmsnorm.cu", "activation.cu", "pos_enc.cu",
+        "binding.cpp", "rmsnorm.cu", "rmsnorm_quant.cu",
+        "activation.cu", "pos_enc.cu",
         "moe_sum.cu", "moe_align.cu", "moe_topk_softmax.cu",
     ]],
     extra_cuda_cflags=["-O3", "--use_fast_math",
