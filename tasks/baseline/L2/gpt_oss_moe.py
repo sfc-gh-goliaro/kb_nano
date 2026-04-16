@@ -117,41 +117,30 @@ class GptOssMoE(nn.Module):
 
         Checkpoint shape: [E, 2*I_full, num_blocks, 16] (4D blocks) or
                           [E, 2*I_full, H//2] (pre-flattened).
-        Gate/up rows are interleaved: we de-interleave to [gate; up].
+        Gate/up rows are interleaved (gate_0, up_0, gate_1, up_1, ...);
+        we keep them interleaved, matching vLLM's Triton kernel expectation.
         """
         if loaded_weight.ndim == 4:
             E, N, nb, bs = loaded_weight.shape
             loaded_weight = loaded_weight.reshape(E, N, nb * bs)
-        tp, rank = _tp_size(), _tp_rank()
+        rank = _tp_rank()
         I = self.intermediate_per_tp
-        gate_all = loaded_weight[:, 0::2, :]
-        up_all = loaded_weight[:, 1::2, :]
-        gate_shard = gate_all[:, rank * I : rank * I + I, :]
-        up_shard = up_all[:, rank * I : rank * I + I, :]
-        param.data[:, :I, :].copy_(gate_shard)
-        param.data[:, I:2*I, :].copy_(up_shard)
+        start = 2 * rank * I
+        param.data[:, :2*I, :].copy_(loaded_weight[:, start : start + 2*I, :])
 
     def _w13_scale_loader(self, param, loaded_weight):
-        """Load w13 scales with same de-interleave + TP shard."""
-        tp, rank = _tp_size(), _tp_rank()
+        """Load w13 scales with TP shard, keeping interleaved layout."""
+        rank = _tp_rank()
         I = self.intermediate_per_tp
-        gate_all = loaded_weight[:, 0::2, :]
-        up_all = loaded_weight[:, 1::2, :]
-        gate_shard = gate_all[:, rank * I : rank * I + I, :]
-        up_shard = up_all[:, rank * I : rank * I + I, :]
-        param.data[:, :I, :].copy_(gate_shard)
-        param.data[:, I:2*I, :].copy_(up_shard)
+        start = 2 * rank * I
+        param.data[:, :2*I, :].copy_(loaded_weight[:, start : start + 2*I, :])
 
     def _w13_bias_loader(self, param, loaded_weight):
-        """Load w13 bias [E, 2*I] with de-interleave + TP shard."""
-        tp, rank = _tp_size(), _tp_rank()
+        """Load w13 bias [E, 2*I] with TP shard, keeping interleaved layout."""
+        rank = _tp_rank()
         I = self.intermediate_per_tp
-        gate_all = loaded_weight[:, 0::2]
-        up_all = loaded_weight[:, 1::2]
-        gate_shard = gate_all[:, rank * I : rank * I + I]
-        up_shard = up_all[:, rank * I : rank * I + I]
-        param.data[:, :I].copy_(gate_shard)
-        param.data[:, I:2*I].copy_(up_shard)
+        start = 2 * rank * I
+        param.data[:, :2*I].copy_(loaded_weight[:, start : start + 2*I])
 
     def _w2_weight_loader(self, param, loaded_weight):
         """Load w2 MXFP4 packed weight with TP shard.

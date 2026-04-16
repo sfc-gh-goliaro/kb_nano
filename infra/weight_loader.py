@@ -269,8 +269,19 @@ def _load_gpt_oss_weights(model, model_path: str) -> None:
                 if "rotary_emb" in weight_name:
                     continue
 
+                # Remap checkpoint names to model parameter names where
+                # the module hierarchy differs (VocabParallelEmbedding
+                # wraps the weight inside embedding_op.emb).
+                mapped_name = weight_name
+                _PARAM_REMAP = {
+                    "model.embed_tokens.weight": "model.embed_tokens.embedding_op.emb.weight",
+                    "lm_head.weight": "lm_head.embedding_op.emb.weight",
+                }
+                if weight_name in _PARAM_REMAP:
+                    mapped_name = _PARAM_REMAP[weight_name]
+
                 try:
-                    param = model.get_parameter(weight_name)
+                    param = model.get_parameter(mapped_name)
                 except AttributeError:
                     continue
                 weight_loader = getattr(param, "weight_loader", default_weight_loader)
