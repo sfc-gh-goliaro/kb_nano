@@ -112,6 +112,10 @@ class GptOssMoE(nn.Module):
         self._quant_config = None
         self._processed = False
 
+        # Custom-op dispatch for torch.compile (set by engine after model init)
+        self._use_custom_op = False
+        self._layer_name = ""
+
     def _w13_weight_loader(self, param, loaded_weight):
         """Load w13 MXFP4 packed weight with TP sharding.
 
@@ -221,7 +225,7 @@ class GptOssMoE(nn.Module):
         )
         self._processed = True
 
-    def forward(self, hidden_states: torch.Tensor) -> torch.Tensor:
+    def forward_impl(self, hidden_states: torch.Tensor) -> torch.Tensor:
         if not self._processed:
             self.process_weights_after_loading()
 
@@ -248,3 +252,8 @@ class GptOssMoE(nn.Module):
             output = self.allreduce(output)
 
         return output.view(orig_shape)
+
+    def forward(self, hidden_states: torch.Tensor) -> torch.Tensor:
+        if self._use_custom_op:
+            return torch.ops.kb_nano.moe_forward(hidden_states, self._layer_name)
+        return self.forward_impl(hidden_states)

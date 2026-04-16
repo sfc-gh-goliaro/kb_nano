@@ -66,12 +66,6 @@ def _compute_scaled_inv_freq(
     )
 
 
-def _rotate_half(x: torch.Tensor) -> torch.Tensor:
-    x1 = x[..., :x.shape[-1] // 2]
-    x2 = x[..., x.shape[-1] // 2:]
-    return torch.cat((-x2, x1), dim=-1)
-
-
 class RotaryEmbedding(nn.Module):
     """RoPE with optional Llama 3.1-style frequency scaling.
 
@@ -110,29 +104,34 @@ class RotaryEmbedding(nn.Module):
 
     @staticmethod
     def forward_native(positions, query, key, head_dim, cos_sin_cache):
-        """Pure PyTorch RoPE — visible to Inductor for optimization."""
-        cos_sin = cos_sin_cache[positions]
-        cos = cos_sin[..., :cos_sin.shape[-1] // 2]
-        sin = cos_sin[..., cos_sin.shape[-1] // 2:]
+        """Pure PyTorch NeOX-style RoPE matching the CUDA kernel.
 
-        rot_dim = cos.shape[-1]
+        The cache stores [cos, sin] each with embed_dim = head_dim/2 entries.
+        Rotation pairs elements (i, i + embed_dim) across the full head,
+        exactly matching the CUDA kernel's IS_NEOX=true path:
+          out[i]            = x[i]*cos[i] - x[i+embed_dim]*sin[i]
+          out[i+embed_dim]  = x[i+embed_dim]*cos[i] + x[i]*sin[i]
+        """
+        cos_sin = cos_sin_cache[positions]
+        embed_dim = cos_sin.shape[-1] // 2
+        cos = cos_sin[..., :embed_dim]
+        sin = cos_sin[..., embed_dim:]
+
         q_shape = query.shape
         k_shape = key.shape
-
         q = query.view(q_shape[0], -1, head_dim)
         k = key.view(k_shape[0], -1, head_dim)
-
-        q_rot, q_pass = q[..., :rot_dim], q[..., rot_dim:]
-        k_rot, k_pass = k[..., :rot_dim], k[..., rot_dim:]
 
         cos = cos.unsqueeze(1)
         sin = sin.unsqueeze(1)
 
-        q_rot = q_rot * cos + _rotate_half(q_rot) * sin
-        k_rot = k_rot * cos + _rotate_half(k_rot) * sin
+        q1, q2 = q[..., :embed_dim], q[..., embed_dim:]
+        k1, k2 = k[..., :embed_dim], k[..., embed_dim:]
 
-        query = torch.cat([q_rot, q_pass], dim=-1).view(q_shape)
-        key = torch.cat([k_rot, k_pass], dim=-1).view(k_shape)
+        query = torch.cat([q1 * cos - q2 * sin,
+                           q2 * cos + q1 * sin], dim=-1).view(q_shape)
+        key = torch.cat([k1 * cos - k2 * sin,
+                         k2 * cos + k1 * sin], dim=-1).view(k_shape)
         return query, key
 
     def forward_cuda(self, positions, query, key):
