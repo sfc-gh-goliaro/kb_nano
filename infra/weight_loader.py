@@ -5,8 +5,8 @@ GPT-OSS, and Whisper with tensor parallelism.
 Loads weights from HuggingFace safetensors and distributes them
 across TP shards using the weight_loader callbacks on each parameter.
 
-GPT-OSS uses a dedicated loader (_load_gpt_oss_weights) that handles
-MXFP4-quantized expert weights (dequantized to BF16 at load time).
+GPT-OSS uses a dedicated loader (_load_gpt_oss_weights) that keeps
+expert weights in native MXFP4 packed uint8 format for Triton inference.
 """
 
 from __future__ import annotations
@@ -170,13 +170,11 @@ _FP4_E2M1_LUT = torch.tensor([
 
 def _dequant_mxfp4(blocks: torch.Tensor, scales: torch.Tensor,
                      dtype: torch.dtype = torch.bfloat16) -> torch.Tensor:
-    """Dequantize MXFP4 weights.
+    """Dequantize MXFP4 weights to dense dtype (legacy fallback).
 
-    Args:
-        blocks: [..., num_blocks, 16] uint8 -- 32 FP4 values packed (2 per byte)
-        scales: [..., num_blocks] uint8 -- E8M0 scale per block
-    Returns:
-        [..., num_blocks * 32] dequantized tensor
+    For GPT-OSS, prefer keeping weights in MXFP4 format and using the
+    native Triton MXFP4 MoE kernel. This function is only used by models
+    that don't support native MXFP4 inference.
     """
     low = (blocks & 0x0F).long()
     high = ((blocks >> 4) & 0x0F).long()
@@ -200,7 +198,11 @@ _GPT_OSS_EXPERT_RE = re.compile(
 
 
 def _load_gpt_oss_weights(model, model_path: str) -> None:
-    """Load GPT-OSS weights with MXFP4 dequantization for expert weights."""
+    """Load GPT-OSS weights keeping expert weights in native MXFP4 format.
+
+    Expert blocks/scales are loaded directly as packed uint8 tensors into
+    the model's MXFP4 parameters. No dequantization is performed.
+    """
     import gc
 
     packed = getattr(model, "packed_modules_mapping", {})
@@ -210,8 +212,23 @@ def _load_gpt_oss_weights(model, model_path: str) -> None:
 
     print(f"  Loading GPT-OSS weights from {len(safetensor_files)} safetensors file(s)...")
 
-    mxfp4_data: dict[tuple[str, str], dict[str, torch.Tensor]] = {}
-    other_weights: list[tuple[str, str, str]] = []
+    # Map checkpoint names to model parameter names:
+    #   model.layers.{i}.mlp.experts.gate_up_proj_blocks -> ...mlp.w13_weight
+    #   model.layers.{i}.mlp.experts.gate_up_proj_scales -> ...mlp.w13_weight_scale
+    #   model.layers.{i}.mlp.experts.gate_up_proj_bias   -> ...mlp.w13_bias
+    #   model.layers.{i}.mlp.experts.down_proj_blocks    -> ...mlp.w2_weight
+    #   model.layers.{i}.mlp.experts.down_proj_scales    -> ...mlp.w2_weight_scale
+    #   model.layers.{i}.mlp.experts.down_proj_bias      -> ...mlp.w2_bias
+    _EXPERT_MAP = {
+        ("gate_up_proj", "blocks"): "w13_weight",
+        ("gate_up_proj", "scales"): "w13_weight_scale",
+        ("gate_up_proj", "bias"): "w13_bias",
+        ("down_proj", "blocks"): "w2_weight",
+        ("down_proj", "scales"): "w2_weight_scale",
+        ("down_proj", "bias"): "w2_bias",
+    }
+
+    loaded = 0
 
     for sf_file in safetensor_files:
         with safe_open(sf_file, "pt", "cpu") as f:
@@ -219,80 +236,47 @@ def _load_gpt_oss_weights(model, model_path: str) -> None:
                 m = _GPT_OSS_EXPERT_RE.match(weight_name)
                 if m:
                     prefix, proj, part = m.groups()
-                    key = (prefix, proj)
-                    if key not in mxfp4_data:
-                        mxfp4_data[key] = {}
-                    mxfp4_data[key][part] = f.get_tensor(weight_name)
-                else:
-                    other_weights.append((sf_file, weight_name, weight_name))
-
-    loaded = 0
-
-    for (prefix, proj), data in mxfp4_data.items():
-        if "blocks" in data and "scales" in data:
-            dequantized = _dequant_mxfp4(data["blocks"], data["scales"])
-            if proj == "gate_up_proj":
-                param_name = f"{prefix.replace('mlp.experts', 'mlp')}.w13"
-                try:
-                    param = model.get_parameter(param_name)
-                except AttributeError:
-                    continue
-                param.weight_loader(param, dequantized)
-                loaded += 1
-            elif proj == "down_proj":
-                param_name = f"{prefix.replace('mlp.experts', 'mlp')}.w2"
-                try:
-                    param = model.get_parameter(param_name)
-                except AttributeError:
-                    continue
-                param.weight_loader(param, dequantized)
-                loaded += 1
-
-        if "bias" in data:
-            if proj == "gate_up_proj":
-                param_name = f"{prefix.replace('mlp.experts', 'mlp')}.w13_bias"
-            else:
-                param_name = f"{prefix.replace('mlp.experts', 'mlp')}.w2_bias"
-            try:
-                param = model.get_parameter(param_name)
-            except AttributeError:
-                continue
-            param.weight_loader(param, data["bias"])
-            loaded += 1
-
-    for sf_file, weight_name, mapped_name in other_weights:
-        with safe_open(sf_file, "pt", "cpu") as f:
-            if weight_name not in f.keys():
-                continue
-            tensor = f.get_tensor(weight_name)
-
-            matched = False
-            for orig_key, (packed_name, shard_id) in packed.items():
-                if orig_key in mapped_name:
-                    param_name = mapped_name.replace(orig_key, packed_name)
+                    param_suffix = _EXPERT_MAP.get((proj, part))
+                    if param_suffix is None:
+                        continue
+                    param_name = f"{prefix.replace('mlp.experts', 'mlp')}.{param_suffix}"
                     try:
                         param = model.get_parameter(param_name)
                     except AttributeError:
-                        break
-                    param.weight_loader(param, tensor, shard_id)
+                        continue
+                    tensor = f.get_tensor(weight_name)
+                    param.weight_loader(param, tensor)
                     loaded += 1
-                    matched = True
-                    break
-            if matched:
-                continue
+                    continue
 
-            if "rotary_emb" in mapped_name:
-                continue
+                # Non-expert weights
+                tensor = f.get_tensor(weight_name)
+                matched = False
+                for orig_key, (packed_name, shard_id) in packed.items():
+                    if orig_key in weight_name:
+                        param_name = weight_name.replace(orig_key, packed_name)
+                        try:
+                            param = model.get_parameter(param_name)
+                        except AttributeError:
+                            break
+                        param.weight_loader(param, tensor, shard_id)
+                        loaded += 1
+                        matched = True
+                        break
+                if matched:
+                    continue
 
-            try:
-                param = model.get_parameter(mapped_name)
-            except AttributeError:
-                continue
-            weight_loader = getattr(param, "weight_loader", default_weight_loader)
-            weight_loader(param, tensor)
-            loaded += 1
+                if "rotary_emb" in weight_name:
+                    continue
 
-    del mxfp4_data
+                try:
+                    param = model.get_parameter(weight_name)
+                except AttributeError:
+                    continue
+                weight_loader = getattr(param, "weight_loader", default_weight_loader)
+                weight_loader(param, tensor)
+                loaded += 1
+
     gc.collect()
     print(f"  Loaded {loaded} weight shards.")
 
@@ -999,6 +983,21 @@ def load_model(
 
     if model_type == "gpt_oss":
         _load_gpt_oss_weights(model, model_path)
+        # GPT-OSS has mixed dtypes: uint8 MXFP4 expert weights must not be cast
+        for name, param in model.named_parameters():
+            if param.dtype == torch.uint8:
+                if param.data.device != device:
+                    param.data = param.data.to(device=device)
+            elif param.data.device != device or param.dtype != dtype:
+                param.data = param.data.to(device=device, dtype=dtype)
+        for name, buf in model.named_buffers():
+            if buf.device != device:
+                buf.data = buf.data.to(device=device)
+        # Swizzle MXFP4 weights for Triton kernels after GPU transfer
+        from ..tasks.baseline.L2.gpt_oss_moe import GptOssMoE
+        for mod in model.modules():
+            if isinstance(mod, GptOssMoE):
+                mod.process_weights_after_loading()
     else:
         load_weights(model, model_path, model_type)
 
@@ -1015,7 +1014,7 @@ def load_model(
             if buf.device != device:
                 buf.data = buf.data.to(device=device)
         _postprocess_fp8_weights(model)
-    else:
+    elif model_type != "gpt_oss":
         model = model.to(device=device, dtype=dtype)
 
     model.eval()

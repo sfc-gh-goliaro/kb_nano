@@ -3,6 +3,9 @@
 Extends RoPE with frequency scaling and magnitude correction for
 long-context models. Used by gpt-oss.
 
+Reuses the same L1 CUDA kernel (pos_enc.cu) as RotaryEmbedding; only the
+cos/sin cache computation differs (YaRN scaling + mscale correction).
+
 References:
   - Peng et al., "YaRN: Efficient Context Window Extension of Large Language Models"
   - vLLM: vllm/model_executor/layers/rotary_embedding/yarn_scaling_rope.py
@@ -15,7 +18,7 @@ import math
 import torch
 import torch.nn as nn
 
-from sgl_kernel import apply_rope_with_cos_sin_cache_inplace as _sgl_rope
+from .rotary_emb import RotaryEmbedding
 
 
 def _yarn_find_correction_dim(
@@ -54,7 +57,10 @@ def _yarn_get_mscale(scale: float) -> float:
 
 
 class YaRNRotaryEmbedding(nn.Module):
-    """YaRN RoPE with precomputed cos/sin cache and sgl_kernel application."""
+    """YaRN RoPE with precomputed cos/sin cache.
+
+    Uses the same L1 CUDA kernel as RotaryEmbedding for the rotation step.
+    """
 
     def __init__(
         self,
@@ -69,9 +75,8 @@ class YaRNRotaryEmbedding(nn.Module):
     ):
         super().__init__()
         self.head_dim = head_dim
-        rotary_dim = head_dim  # full head is rotated for gpt-oss
+        rotary_dim = head_dim
 
-        # Compute YaRN-scaled inv_freq
         pos_freqs = rope_theta ** (
             torch.arange(0, rotary_dim, 2, dtype=torch.float) / rotary_dim
         )
@@ -90,10 +95,8 @@ class YaRNRotaryEmbedding(nn.Module):
             + inv_freq_extrapolation * inv_freq_mask
         )
 
-        # Magnitude scaling
         mscale = _yarn_get_mscale(scaling_factor)
 
-        # Build cos/sin cache over the extended range
         max_t = int(max_position_embeddings * scaling_factor)
         t = torch.arange(max_t, dtype=torch.float32)
         freqs = torch.einsum("i,j -> ij", t, inv_freq)
@@ -104,8 +107,13 @@ class YaRNRotaryEmbedding(nn.Module):
 
     def forward(self, positions, query, key):
         cache = self.cos_sin_cache
-        if cache.dtype != torch.float32:
-            cache = cache.float()
-            self.cos_sin_cache = cache
-        _sgl_rope(positions, query, key, self.head_dim, cache)
+        if cache.dtype != query.dtype:
+            cache = cache.to(query.dtype)
+        if torch.compiler.is_compiling():
+            return RotaryEmbedding.forward_native(
+                positions, query, key, self.head_dim, cache,
+            )
+        torch.ops.kb_nano_rope.rotary_embedding(
+            positions, query, key, self.head_dim, cache, True,
+        )
         return query, key

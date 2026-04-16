@@ -9,7 +9,7 @@ Matches openai/gpt-oss-20b architecture:
     - Sliding window=128 on even layers
     - Attention sinks (learnable per-head biases)
     - Bias on QKV, O, router, and expert projections
-    - MXFP4 quantized expert weights (dequantized at load time)
+    - MXFP4 quantized expert weights (native MXFP4 Triton inference)
     - vocab_size=201088
 
 Weight names match HuggingFace checkpoint convention:

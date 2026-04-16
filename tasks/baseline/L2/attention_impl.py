@@ -182,15 +182,19 @@ class Attention(nn.Module):
 
         attn_cfg = get_attn_backend_config()
         self._use_trtllm = attn_cfg.use_trtllm
-        self._use_sdpa = sinks is not None
+        self._use_sdpa = False
         self._block_size = attn_cfg.block_size
+
+        # FA3 native sinks: pass sinks as s_aux, sliding window as window_size
+        self._fa3_sinks = sinks
+        self._fa3_window_size = (
+            (sliding_window - 1, 0) if sliding_window is not None else (-1, -1)
+        )
 
         self._use_custom_op = False
         self._layer_name = ""
 
-        if self._use_sdpa:
-            self.store_kvcache = StoreKVCache()
-        elif self._use_trtllm:
+        if self._use_trtllm:
             self.store_kvcache = StoreKVCacheHND(page_size=attn_cfg.block_size)
             from ..L1.flashinfer_prefill import TRTLLMPrefill
             from ..L1.flashinfer_decode import TRTLLMDecode
@@ -211,6 +215,8 @@ class Attention(nn.Module):
                 self.num_heads, self.num_kv_heads, head_size,
             )
 
+        # FlashAttn path now handles sinks via s_aux, no SDPA fallback needed
+
     def set_trtllm_workspace(self, workspace: torch.Tensor):
         if self._use_trtllm:
             self.decode_op._workspace = workspace
@@ -230,9 +236,7 @@ class Attention(nn.Module):
         if k_cache.numel() and v_cache.numel():
             self.store_kvcache(k, v, k_cache, v_cache, ctx.slot_mapping)
 
-        if self._use_sdpa:
-            o = self._forward_sdpa(q, k, v, k_cache, v_cache, ctx)
-        elif ctx.is_mixed:
+        if ctx.is_mixed:
             o = self._forward_mixed(q, k_cache, v_cache, ctx)
         else:
             o = self._forward_pure(q, k, v, k_cache, v_cache, ctx)
@@ -251,9 +255,87 @@ class Attention(nn.Module):
 
     def _forward_sdpa(self, q, k, v, k_cache, v_cache, ctx):
         """SDPA-based forward path for attention with sinks and/or sliding window."""
+        if ctx.is_mixed:
+            return self._forward_sdpa_mixed(q, k_cache, v_cache, ctx)
         if ctx.is_prefill:
             return self._forward_sdpa_prefill(q, k, v, ctx)
         return self._forward_sdpa_decode(q, k_cache, v_cache, ctx)
+
+    def _forward_sdpa_mixed(self, q, k_cache, v_cache, ctx):
+        """Handle mixed prefill+decode batch for SDPA path."""
+        np_ = ctx.num_prefill_tokens
+        nd = ctx.num_decode_tokens
+        out = torch.empty_like(q)
+
+        if np_ > 0:
+            cu_q = ctx.prefill_cu_seqlens_q
+            B_pf = cu_q.shape[0] - 1
+            outputs = []
+            for b in range(B_pf):
+                start = int(cu_q[b].item())
+                end = int(cu_q[b + 1].item())
+                T = end - start
+                q_b = q[start:end]
+
+                seq_len = int(ctx.prefill_cu_seqlens_k[b + 1].item() - ctx.prefill_cu_seqlens_k[b].item())
+                k_b, v_b = self._gather_kv_from_cache(
+                    k_cache, v_cache, ctx.prefill_block_tables[b], seq_len,
+                )
+
+                if self.num_kv_heads != self.num_heads:
+                    rep = self.num_heads // self.num_kv_heads
+                    k_b = k_b.repeat_interleave(rep, dim=1)
+                    v_b = v_b.repeat_interleave(rep, dim=1)
+
+                if self.sinks is not None:
+                    zero_kv = torch.zeros(1, self.num_heads, self.head_size,
+                                          device=q.device, dtype=q.dtype)
+                    k_ext = torch.cat([k_b, zero_kv], dim=0)
+                    v_ext = torch.cat([v_b, zero_kv], dim=0)
+                    q_4d = q_b.transpose(0, 1).unsqueeze(0)
+                    k_4d = k_ext.transpose(0, 1).unsqueeze(0)
+                    v_4d = v_ext.transpose(0, 1).unsqueeze(0)
+                    attn_bias = self._make_prefill_bias(T, seq_len, q.device, q.dtype)
+                    o_b = F.scaled_dot_product_attention(
+                        q_4d, k_4d, v_4d, attn_mask=attn_bias.unsqueeze(0),
+                        scale=self.scale,
+                    )
+                    outputs.append(o_b.squeeze(0).transpose(0, 1))
+                else:
+                    q_4d = q_b.transpose(0, 1).unsqueeze(0)
+                    k_4d = k_b.transpose(0, 1).unsqueeze(0)
+                    v_4d = v_b.transpose(0, 1).unsqueeze(0)
+                    o_b = F.scaled_dot_product_attention(
+                        q_4d, k_4d, v_4d, is_causal=(T == seq_len), scale=self.scale,
+                    )
+                    outputs.append(o_b.squeeze(0).transpose(0, 1))
+            out[:np_] = torch.cat(outputs, dim=0)
+
+        if nd > 0:
+            decode_ctx_wrapper = type(ctx)(
+                block_tables=ctx.decode_block_tables,
+                context_lens=ctx.decode_context_lens,
+                max_context_len=ctx.decode_max_context_len,
+            )
+            out[np_:] = self._forward_sdpa_decode(q[np_:], k_cache, v_cache, decode_ctx_wrapper)
+
+        return out
+
+    def _gather_kv_from_cache(self, k_cache, v_cache, block_table, seq_len):
+        """Gather K/V from paged cache for a single sequence."""
+        block_size = k_cache.shape[1]
+        num_blocks = (seq_len + block_size - 1) // block_size
+        k_out = torch.zeros(seq_len, self.num_kv_heads, self.head_size,
+                            device=k_cache.device, dtype=k_cache.dtype)
+        v_out = torch.zeros_like(k_out)
+        for blk_idx in range(num_blocks):
+            block_id = block_table[blk_idx]
+            start = blk_idx * block_size
+            end = min(start + block_size, seq_len)
+            length = end - start
+            k_out[start:end] = k_cache[block_id, :length]
+            v_out[start:end] = v_cache[block_id, :length]
+        return k_out, v_out
 
     def _forward_sdpa_prefill(self, q, k, v, ctx):
         cu_q = ctx.cu_seqlens_q
@@ -376,6 +458,12 @@ class Attention(nn.Module):
     # ---- FlashAttn / TRTLLM paths ----
 
     def _forward_pure(self, q, k, v, k_cache, v_cache, ctx):
+        fa_extra = {}
+        if self._fa3_sinks is not None:
+            fa_extra["s_aux"] = self._fa3_sinks
+        if self._fa3_window_size != (-1, -1):
+            fa_extra["window_size"] = self._fa3_window_size
+
         if ctx.is_prefill:
             cu_q = ctx.cu_seqlens_q
             cu_k = ctx.cu_seqlens_k
@@ -394,13 +482,14 @@ class Attention(nn.Module):
                     cu_seqlens_q=cu_q, cu_seqlens_k=cu_k,
                     max_seqlen_q=msq, max_seqlen_k=msk,
                     softmax_scale=self.scale, causal=True,
-                    block_table=bt,
+                    block_table=bt, **fa_extra,
                 )
             return self.prefill_op(
                 q, k, v,
                 cu_seqlens_q=cu_q, cu_seqlens_k=cu_k,
                 max_seqlen_q=msq, max_seqlen_k=msk,
                 softmax_scale=self.scale, causal=True,
+                **fa_extra,
             )
 
         cache_seqlens = ctx.context_lens
@@ -416,10 +505,16 @@ class Attention(nn.Module):
             q, k_cache, v_cache,
             cache_seqlens=cache_seqlens, block_table=bt,
             softmax_scale=self.scale, causal=True,
-            max_seq_len=max_ctx,
+            max_seq_len=max_ctx, **fa_extra,
         )
 
     def _forward_mixed(self, q, k_cache, v_cache, ctx):
+        fa_extra = {}
+        if self._fa3_sinks is not None:
+            fa_extra["s_aux"] = self._fa3_sinks
+        if self._fa3_window_size != (-1, -1):
+            fa_extra["window_size"] = self._fa3_window_size
+
         np_ = ctx.num_prefill_tokens
         nd = ctx.num_decode_tokens
         out = torch.empty_like(q)
@@ -442,7 +537,7 @@ class Attention(nn.Module):
                 cu_seqlens_q=cu_q, cu_seqlens_k=cu_k,
                 max_seqlen_q=msq, max_seqlen_k=msk,
                 softmax_scale=self.scale, causal=True,
-                block_table=bt,
+                block_table=bt, **fa_extra,
             )
 
         if nd > 0:
@@ -460,6 +555,6 @@ class Attention(nn.Module):
                 q[np_:], k_cache, v_cache,
                 cache_seqlens=cache_seqlens, block_table=bt,
                 softmax_scale=self.scale, causal=True,
-                max_seq_len=max_ctx,
+                max_seq_len=max_ctx, **fa_extra,
             )
         return out
