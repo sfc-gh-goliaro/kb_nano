@@ -21,6 +21,7 @@ MODEL_KEY_TO_DEFAULT_HF: dict[str, str] = {
 
 MODEL_CATEGORY: dict[str, str] = {
     "openai/gpt-oss-20b": "llm",
+    "openai/gpt-oss-120b": "llm",
     "meta-llama/Llama-3.1-8B-Instruct": "llm",
     "meta-llama/Llama-3.1-70B-Instruct": "llm",
     "meta-llama/Llama-4-Scout-17B-16E-Instruct": "llm",
