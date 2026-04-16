@@ -57,7 +57,7 @@ class FlashAttnDecode(nn.Module):
             else:
                 max_seqlen_k = int(cache_seqlens.max().item()) if cache_seqlens.numel() > 0 else 0
 
-            out = _fa3_varlen_func(
+            fa3_kw = dict(
                 q=q,
                 k=k_cache,
                 v=v_cache,
@@ -70,7 +70,8 @@ class FlashAttnDecode(nn.Module):
                 block_table=block_table,
                 fa_version=3,
             )
-            return out
+            fa3_kw.update(kwargs)
+            return _fa3_varlen_func(**fa3_kw)
 
         return flash_attn_with_kvcache(
             q.unsqueeze(1), k_cache, v_cache,
