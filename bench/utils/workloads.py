@@ -299,6 +299,44 @@ ALL_TTS_WORKLOADS = {
 }
 
 
+# ---------------------------------------------------------------------------
+# Object detection workloads (COCO val2017)
+# ---------------------------------------------------------------------------
+
+@dataclass(frozen=True)
+class DetectionThroughputWorkload:
+    name: str
+    image_size: int
+    num_images: int
+    batch_size: int
+    dataset_name: str = "detection-datasets/coco"
+    dataset_split: str = "val"
+
+@dataclass(frozen=True)
+class DetectionLatencyWorkload:
+    name: str
+    image_size: int
+    batch_size: int
+    dataset_name: str = "detection-datasets/coco"
+    dataset_split: str = "val"
+    num_warmup: int = 3
+    num_iters: int = 20
+
+DETECTION_THROUGHPUT_WORKLOADS: list[DetectionThroughputWorkload] = [
+    DetectionThroughputWorkload("coco-val", image_size=640, num_images=5000, batch_size=32),
+]
+
+DETECTION_LATENCY_WORKLOADS: list[DetectionLatencyWorkload] = [
+    DetectionLatencyWorkload("single-image", image_size=640, batch_size=1),
+    DetectionLatencyWorkload("batch-4", image_size=640, batch_size=4),
+]
+
+ALL_DETECTION_WORKLOADS = {
+    "throughput": DETECTION_THROUGHPUT_WORKLOADS,
+    "latency": DETECTION_LATENCY_WORKLOADS,
+}
+
+
 def get_max_seq_len() -> int:
     """Return the maximum sequence length across all standardized LLM workloads."""
     max_len = 0
