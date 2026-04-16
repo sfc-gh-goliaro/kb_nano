@@ -1,10 +1,12 @@
-"""Fused SiLU+Mul+FP8 quantization kernel.
+"""Fused SiLU-mul + per-token-group FP8 quantization with column-major scales.
 
-Single Triton kernel that applies SiLU activation, element-wise multiply, and
-per-token-group FP8 quantization with UE8M0 (power-of-two) scales. Replaces
-three separate kernel launches (SiLU+Mul, gather, FP8 quant) with one.
+Single Triton kernel that:
+1. Reads the gate/up pair from the first MoE GEMM output [M, 2*N]
+2. Computes SiLU(gate) * up -> [M, N]
+3. Quantizes each group of 128 elements to FP8 with UE8M0 power-of-two scales
+4. Writes FP8 output and column-major scales
 
-Matches vllm's ``silu_mul_per_token_group_quant_fp8_colmajor``.
+Matches vLLM's ``silu_mul_per_token_group_quant_fp8_colmajor`` exactly.
 """
 
 from __future__ import annotations
@@ -14,21 +16,22 @@ import torch.nn as nn
 import triton
 import triton.language as tl
 
-
 _FP8_INFO = torch.finfo(torch.float8_e4m3fn)
-_GROUP_SIZE: tl.constexpr = 128
+_GROUP_SIZE = 128
 
 
 @triton.jit
-def _silu_mul_quant_fp8_kernel(
+def _silu_mul_per_token_group_quant_fp8_colmajor(
     y_ptr,
     y_q_ptr,
     y_s_ptr,
     M,
     N,
     y_s_col_stride: tl.int64,
-    fp8_max: tl.constexpr,
-    fp8_min: tl.constexpr,
+    eps,
+    fp8_min,
+    fp8_max,
+    use_ue8m0: tl.constexpr,
     GROUP_SIZE: tl.constexpr,
     BLOCK_M: tl.constexpr,
     BLOCK_N: tl.constexpr,
@@ -56,10 +59,9 @@ def _silu_mul_quant_fp8_kernel(
     silu_out = (act_in / (one_f32 + tl.exp(-act_in))).to(y_ptr.dtype.element_ty)
     y = (silu_out * mul_in).to(tl.float32)
 
-    eps = tl.cast(1e-12, tl.float32)
     _absmax = tl.maximum(tl.max(tl.abs(y), axis=1), eps)
     scale_raw = _absmax / fp8_max
-    y_s = tl.math.exp2(tl.ceil(tl.log2(scale_raw)))
+    y_s = tl.math.exp2(tl.ceil(tl.log2(scale_raw))) if use_ue8m0 else scale_raw
     y_s = tl.reshape(y_s, (BLOCK_M, 1))
     y_q = tl.clamp(y / y_s, fp8_min, fp8_max).to(y_q_ptr.dtype.element_ty)
 
@@ -74,49 +76,73 @@ def _silu_mul_quant_fp8_kernel(
     tl.store(y_s_ptrs, y_s)
 
 
-class SiluMulQuantFp8(nn.Module):
-    """Fused SiLU+Mul+FP8 quantization.
+def silu_mul_per_token_group_quant_fp8_colmajor(
+    input: torch.Tensor,
+    output: torch.Tensor | None = None,
+    use_ue8m0: bool = True,
+    eps: float = 1e-10,
+) -> tuple[torch.Tensor, torch.Tensor]:
+    """Fused SiLU-mul + per-token-group FP8 quantization.
 
-    Takes gate_up output [M, 2*N] and produces FP8 intermediate [M, N]
-    with per-group UE8M0 scales, in a single kernel launch.
+    Args:
+        input: [M, N] where N = 2 * intermediate_size (gate/up concatenated)
+        output: Optional pre-allocated [M, N//2] FP8 output buffer
+        use_ue8m0: Use power-of-two (UE8M0) scales for DeepGEMM
+        eps: Minimum absmax to avoid division by zero
+
+    Returns:
+        (output_fp8, output_scales) where output_fp8 is [M, N//2] in float8_e4m3fn
+        and output_scales is [M, (N//2)//128] in float32 (column-major layout)
+    """
+    assert input.ndim == 2
+    M, N = input.size()
+    N_2 = N // 2
+
+    assert M % _GROUP_SIZE == 0, f"M={M} must be divisible by {_GROUP_SIZE}"
+    assert N_2 % _GROUP_SIZE == 0, f"N//2={N_2} must be divisible by {_GROUP_SIZE}"
+
+    if output is None:
+        output = torch.empty((M, N_2), dtype=torch.float8_e4m3fn, device=input.device)
+
+    output_scales = torch.empty(
+        (N_2 // _GROUP_SIZE, M), dtype=torch.float32, device=input.device
+    ).transpose(0, 1)
+
+    BLOCK_M = 8
+    BLOCK_N = _GROUP_SIZE
+    assert M % BLOCK_M == 0
+    assert N_2 % BLOCK_N == 0
+
+    fp8_min = _FP8_INFO.min
+    fp8_max = _FP8_INFO.max
+
+    grid = (M // BLOCK_M, N_2 // BLOCK_N)
+
+    _silu_mul_per_token_group_quant_fp8_colmajor[grid](
+        input, output, output_scales,
+        M, N,
+        output_scales.stride(-1),
+        eps,
+        fp8_min, fp8_max,
+        use_ue8m0,
+        _GROUP_SIZE, BLOCK_M, BLOCK_N,
+    )
+
+    return output, output_scales
+
+
+class SiluMulQuantFp8(nn.Module):
+    """Module wrapper around :func:`silu_mul_per_token_group_quant_fp8_colmajor`.
+
+    Takes gate_up output ``[M, 2*N]`` and produces FP8 intermediate ``[M, N]``
+    with per-group UE8M0 scales, in a single kernel launch.  Used by the
+    DeepSeek-V3 MoE which expects an `nn.Module`-style operator.
     """
 
     def forward(
         self,
         gate_up: torch.Tensor,
     ) -> tuple[torch.Tensor, torch.Tensor]:
-        """
-        Args:
-            gate_up: [M, 2*N] bf16/fp16 — concatenated gate and up projections.
-
-        Returns:
-            (fp8_out, scales): fp8_out is [M, N] float8_e4m3fn,
-                               scales is [M, N // 128] float32.
-        """
-        assert gate_up.ndim == 2
-        M, N_full = gate_up.shape
-        N = N_full // 2
-
-        fp8_out = torch.empty(M, N, dtype=torch.float8_e4m3fn,
-                              device=gate_up.device)
-        scales = torch.empty(
-            (N // _GROUP_SIZE, M), dtype=torch.float32, device=gate_up.device,
-        ).transpose(0, 1)
-
-        BLOCK_M = 8
-        BLOCK_N = _GROUP_SIZE
-        grid = (triton.cdiv(M, BLOCK_M), N // BLOCK_N)
-
-        _silu_mul_quant_fp8_kernel[grid](
-            gate_up,
-            fp8_out,
-            scales,
-            M, N_full,
-            scales.stride(-1),
-            fp8_max=_FP8_INFO.max,
-            fp8_min=_FP8_INFO.min,
-            GROUP_SIZE=_GROUP_SIZE,
-            BLOCK_M=BLOCK_M,
-            BLOCK_N=BLOCK_N,
+        return silu_mul_per_token_group_quant_fp8_colmajor(
+            gate_up, output=None, use_ue8m0=True,
         )
-        return fp8_out, scales

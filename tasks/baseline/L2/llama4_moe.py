@@ -48,10 +48,7 @@ class Llama4MoE(nn.Module):
         self.intermediate_per_tp = config.intermediate_size // tp
 
         # Router: replicated across TP ranks
-        self.router_weight = nn.Parameter(
-            torch.empty(config.num_local_experts, config.hidden_size),
-        )
-        self.router_weight.weight_loader = lambda p, w: p.data.copy_(w)
+        self.router = Linear(config.hidden_size, config.num_local_experts, bias=False)
 
         # Shared expert: standard SwiGLU MLP (skip its internal all-reduce;
         # we do a single all-reduce on shared + routed together)
@@ -71,7 +68,6 @@ class Llama4MoE(nn.Module):
         ))
         self.w2.weight_loader = self._w2_weight_loader
 
-        self.linear_op = Linear()
         self.sigmoid_topk = SigmoidTopK()
         self.fused_experts = FusedExperts()
         self.allreduce = AllReduce()
@@ -117,7 +113,7 @@ class Llama4MoE(nn.Module):
         shared_out = self.shared_expert(hidden_states)
 
         # Sigmoid top-k routing
-        router_logits = self.linear_op(hidden_states, self.router_weight)
+        router_logits = self.router(hidden_states)
         topk_weights, topk_ids = self.sigmoid_topk(router_logits, self.top_k)
         # Apply routing weight on input (matches vLLM's apply_router_weight_on_input=True).
         # SiLU is nonlinear so w*expert(x) != expert(w*x); Llama4 uses the latter.

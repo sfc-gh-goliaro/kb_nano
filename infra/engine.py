@@ -30,8 +30,9 @@ import torch.multiprocessing as mp
 from transformers import AutoTokenizer
 
 from .context import (
-    AttnBackendConfig, get_attn_backend_config, get_context,
-    reset_context, set_context, set_mixed_context,
+    AttnBackendConfig, CUDAGraphMode, auto_register_no_compile_layers,
+    get_attn_backend_config, get_context,
+    reset_context, set_context, set_forward_context, set_mixed_context,
 )
 from ..tasks.baseline.L1.allreduce import set_custom_ar
 from .weight_loader import load_model
@@ -122,6 +123,11 @@ class Sequence:
         self.video_grid_thw = None
         self.mrope_position_delta: int = 0
         self.mrope_positions = None  # (3, seq_len) tensor computed at prefill
+        # Encoder-decoder fields (Whisper)
+        self.encoder_features: torch.Tensor | None = None  # [num_mel_bins, T] log-mel
+        self.encoder_seq_len: int = 0  # num encoder tokens (after conv)
+        self.cross_block_table: list[int] = []  # paged KV blocks for cross-attn
+        self.encoder_computed: bool = False  # True after encoder has run
 
     def __len__(self):
         if self.token_ids is not None:
@@ -162,7 +168,9 @@ class Sequence:
         self.token_ids = list(self.prompt_ids)
         self.generated_ids.clear()
         self.block_table.clear()
+        self.cross_block_table.clear()
         self.num_computed_tokens = 0
+        self.encoder_computed = False
         self.status = SeqStatus.WAITING
 
     def append_token(self, token_id):
@@ -197,6 +205,8 @@ class BlockManager:
     def reset(self):
         """Return all blocks to the free pool."""
         self.free_block_ids = deque(range(self._num_blocks))
+        if hasattr(self, '_num_cross_blocks'):
+            self.cross_free_block_ids = deque(range(self._num_cross_blocks))
 
     def can_allocate(self, seq):
         return len(self.free_block_ids) >= seq.num_blocks
@@ -223,13 +233,19 @@ class BlockManager:
         self.free_block_ids.extend(seq.block_table)
         seq.block_table.clear()
 
+    def deallocate_cross(self, seq):
+        """Return cross-attention KV blocks to the cross-attn free pool."""
+        if hasattr(self, 'cross_free_block_ids') and seq.cross_block_table:
+            self.cross_free_block_ids.extend(seq.cross_block_table)
+            seq.cross_block_table.clear()
+
 
 # ---------------------------------------------------------------------------
 # ModelRunner — runs on EACH TP rank
 # ---------------------------------------------------------------------------
 class ModelRunner:
     def __init__(self, model_name: str, rank: int, world_size: int,
-                 dtype: torch.dtype, enforce_eager: bool,
+                 dtype: torch.dtype | None, enforce_eager: bool,
                  event, shm_name: str,
                  gpu_memory_utilization: float = 0.9,
                  max_model_len: int = MAX_MODEL_LEN,
@@ -263,6 +279,14 @@ class ModelRunner:
                 )
                 set_custom_ar(self.custom_ar)
 
+        if dtype is None:
+            from transformers import AutoConfig
+            _cfg = AutoConfig.from_pretrained(model_name)
+            cfg_dtype = getattr(_cfg, "torch_dtype", None)
+            if cfg_dtype is not None and isinstance(cfg_dtype, torch.dtype):
+                dtype = cfg_dtype
+            else:
+                dtype = torch.bfloat16
         self.dtype = dtype
         default_dtype = torch.get_default_dtype()
         torch.set_default_dtype(dtype)
@@ -275,9 +299,23 @@ class ModelRunner:
         self.model, self.config = load_model(
             model_name, torch.device(f"cuda:{rank}"), dtype,
         )
-        self.is_moe = hasattr(self.config, "num_local_experts")
+        self.is_moe = hasattr(self.config, "num_local_experts") or getattr(self.config, "is_moe", False)
         self.is_qwen_vl = hasattr(self.config, "mrope_section")
+        self.is_qwen3_vl = self.is_qwen_vl and hasattr(
+            getattr(self.config, "vision", None), "deepstack_visual_indexes"
+        )
+        self.is_whisper = getattr(self.config, "is_encoder_decoder", False)
         self.is_deepseek_mla = hasattr(self.config, "kv_lora_rank")
+        if self.is_whisper:
+            self.enforce_eager = True
+            self.max_model_len = min(
+                self.max_model_len,
+                getattr(self.config, "max_target_positions", self.max_model_len),
+            )
+
+        auto_register_no_compile_layers(self.model)
+
+        self._compiled = False
         if rank == 0:
             print(f"  [1/6] Model loaded in {_time.perf_counter()-_t0:.1f}s", flush=True)
         self._share_trtllm_workspace()
@@ -297,12 +335,14 @@ class ModelRunner:
             print(f"  [4/6] Allocating KV cache...", flush=True)
         _t3 = _time.perf_counter()
         self.allocate_kv_cache()
+        self._init_fa3_decode_buffers()
         if rank == 0:
             print(f"  [4/6] KV cache done in {_time.perf_counter()-_t3:.1f}s", flush=True)
         if not self.enforce_eager:
             if rank == 0:
-                print(f"  [5/6] Capturing CUDA graphs...", flush=True)
+                print(f"  [5/6] Compiling + capturing CUDA graphs...", flush=True)
             _t4 = _time.perf_counter()
+            self._compile_model()
             self.capture_cudagraph()
             if rank == 0:
                 print(f"  [5/6] CUDA graphs done in {_time.perf_counter()-_t4:.1f}s", flush=True)
@@ -394,9 +434,13 @@ class ModelRunner:
         if not ATTN_BACKEND_CONFIG.use_trtllm:
             return
         self._attn_layers = []
+        self._cross_attn_layers = []
         for module in self.model.modules():
             if hasattr(module, "k_cache") and hasattr(module, "v_cache"):
-                self._attn_layers.append(module)
+                if getattr(module, "is_cross_attn", False):
+                    self._cross_attn_layers.append(module)
+                else:
+                    self._attn_layers.append(module)
         trtllm_workspace = torch.zeros(
             512 * 1024 * 1024, dtype=torch.uint8, device=f"cuda:{self.rank}"
         )
@@ -405,9 +449,9 @@ class ModelRunner:
         torch.cuda.empty_cache()
 
     def _share_activation_buffers(self):
-        """Share a single SiluAndMul activation buffer across all layers.
+        """Share activation buffers across layers.
 
-        Layers execute sequentially so the buffer is safe to reuse.
+        Layers execute sequentially so buffers are safe to reuse.
         Must be called before warmup so only one buffer grows to max size
         instead of one per layer (saves ~14 GiB for 32-layer models).
         """
@@ -415,11 +459,10 @@ class ModelRunner:
         silu_modules = [
             m for m in self.model.modules() if isinstance(m, SiluAndMul)
         ]
-        if len(silu_modules) <= 1:
-            return
-        shared = silu_modules[0]._act_buf
-        for m in silu_modules[1:]:
-            m.set_shared_buffer(shared)
+        if len(silu_modules) > 1:
+            shared = silu_modules[0]._act_buf
+            for m in silu_modules[1:]:
+                m.set_shared_buffer(shared)
 
     def _share_moe_workspaces(self):
         """Pre-allocate and share MoE FP8 expert workspace buffers across layers.
@@ -473,10 +516,13 @@ class ModelRunner:
         if self.is_qwen_vl:
             self._warmup_vision_encoder()
 
-        warmup_len = min(self.max_model_len, self.max_num_batched_tokens)
-        num_seqs = min(self.max_num_batched_tokens // warmup_len, self.max_num_seqs)
-        seqs = [Sequence([0] * warmup_len) for _ in range(num_seqs)]
-        self.run(seqs, True)
+        if self.is_whisper:
+            self._warmup_whisper()
+        else:
+            warmup_len = min(self.max_model_len, self.max_num_batched_tokens)
+            num_seqs = min(self.max_num_batched_tokens // warmup_len, self.max_num_seqs)
+            seqs = [Sequence([0] * warmup_len) for _ in range(num_seqs)]
+            self.run(seqs, True)
 
         torch.cuda.empty_cache()
 
@@ -489,8 +535,10 @@ class ModelRunner:
         (buffers are still allocated), "relax"/"full" run warmup normally.
         """
         import os
-        from ..tasks.baseline.L1.fp8_linear import Fp8Linear, _Fp8PrefillBufs
-        import deep_gemm
+        try:
+            from ..tasks.baseline.L1.fp8_linear import Fp8Linear, _Fp8PrefillBufs
+        except ImportError:
+            return
 
         skip_jit = os.environ.get("VLLM_DEEP_GEMM_WARMUP", "").lower() == "skip"
 
@@ -502,6 +550,8 @@ class ModelRunner:
 
         if not fp8_modules:
             return
+
+        import deep_gemm
 
         max_decode = self.max_num_seqs
         max_prefill = self.max_num_batched_tokens
@@ -559,6 +609,34 @@ class ModelRunner:
                       f"{len(seen_shapes)} shapes buffered")
             else:
                 print(f"  DeepGEMM warmup: {len(seen_shapes)} unique FP8 weight shapes")
+
+    def _warmup_whisper(self):
+        """Warmup Whisper encoder + decoder with dummy audio input.
+
+        Exercises the full forward path: encoder -> cross-attn KV write ->
+        decoder prefill with cross-attn read.
+        """
+        config = self.config
+        num_mel_bins = config.num_mel_bins
+        max_source_positions = config.max_source_positions
+        max_target_positions = config.max_target_positions
+
+        T_mel = max_source_positions * 2
+        dummy_features = torch.randn(
+            1, num_mel_bins, T_mel,
+            device=f"cuda:{self.rank}", dtype=torch.get_default_dtype(),
+        )
+        with torch.inference_mode():
+            encoder_outputs = self.model.get_multimodal_embeddings(dummy_features)
+
+        warmup_len = min(max_target_positions, self.max_num_batched_tokens)
+        num_seqs = min(self.max_num_batched_tokens // warmup_len, self.max_num_seqs)
+        seqs = [Sequence([0] * warmup_len) for _ in range(num_seqs)]
+        self.run(seqs, True)
+
+        if self.rank == 0:
+            print(f"  Whisper warmup: encoder T_mel={T_mel}, "
+                  f"decoder warmup_len={warmup_len}")
 
     def _warmup_vision_encoder(self):
         """Run vision encoder with worst-case dummy inputs to capture peak
@@ -657,12 +735,33 @@ class ModelRunner:
         del processor, dummy_img, dummy_vid, vid_frames_pil, pv, vpv
         del inputs, messages, text
 
+    def _init_fa3_decode_buffers(self):
+        """Pre-allocate cu_seqlens_q buffers for FA3 decode to avoid
+        allocations during CUDA graph capture."""
+        try:
+            from ..tasks.baseline.L1.flash_attn_decode import _FA3_AVAILABLE
+        except ImportError:
+            return
+        if not _FA3_AVAILABLE:
+            return
+        max_bs = self.max_num_seqs
+        for module in self.model.modules():
+            if hasattr(module, '_cu_seqlens_q'):
+                module._cu_seqlens_q = torch.arange(
+                    max_bs + 1, dtype=torch.int32,
+                    device=f"cuda:{self.rank}",
+                )
+
     def allocate_kv_cache(self):
         if not hasattr(self, '_attn_layers') or not self._attn_layers:
             self._attn_layers = []
+            self._cross_attn_layers = []
             for module in self.model.modules():
                 if hasattr(module, "k_cache") and hasattr(module, "v_cache"):
-                    self._attn_layers.append(module)
+                    if getattr(module, "is_cross_attn", False):
+                        self._cross_attn_layers.append(module)
+                    else:
+                        self._attn_layers.append(module)
 
         if self.is_deepseek_mla:
             self._allocate_mla_kv_cache()
@@ -674,10 +773,56 @@ class ModelRunner:
         current = torch.cuda.memory_stats()["allocated_bytes.all.current"]
         num_kv_heads = self.config.num_key_value_heads // self.world_size
         head_dim = self.config.head_dim
-        num_layers = self.config.num_hidden_layers
+        num_self_attn_layers = len(self._attn_layers)
+        num_cross_attn_layers = len(self._cross_attn_layers)
         elem_size = torch.finfo(torch.get_default_dtype()).bits // 8
-        block_bytes = 2 * num_layers * BLOCK_SIZE * num_kv_heads * head_dim * elem_size
-        num_blocks = int(total * self.gpu_memory_utilization - used - peak + current) // block_bytes
+
+        available_bytes = int(total * self.gpu_memory_utilization - used - peak + current)
+
+        if num_cross_attn_layers > 0:
+            max_encoder_tokens = getattr(self.config, 'max_source_positions', 1500)
+            cross_blocks_per_seq = (max_encoder_tokens + BLOCK_SIZE - 1) // BLOCK_SIZE
+            cross_block_bytes = (
+                2 * num_cross_attn_layers * BLOCK_SIZE * num_kv_heads * head_dim * elem_size
+            )
+            cross_bytes_per_seq = cross_blocks_per_seq * cross_block_bytes
+            max_cross_seqs = min(
+                self.max_num_seqs,
+                max(1, int(available_bytes * 0.5) // cross_bytes_per_seq),
+            )
+            self.max_num_seqs = max_cross_seqs
+            num_cross_blocks = cross_blocks_per_seq * max_cross_seqs
+            cross_cache_bytes = num_cross_blocks * cross_block_bytes
+            available_bytes -= cross_cache_bytes
+
+            self.num_cross_blocks = num_cross_blocks
+            self.cross_blocks_per_seq = cross_blocks_per_seq
+            self.max_encoder_tokens = max_encoder_tokens
+
+            if ATTN_BACKEND_CONFIG.kv_layout == "HND":
+                self.cross_kv_cache = torch.empty(
+                    2, num_cross_attn_layers, num_cross_blocks,
+                    num_kv_heads, BLOCK_SIZE, head_dim,
+                )
+            else:
+                self.cross_kv_cache = torch.empty(
+                    2, num_cross_attn_layers, num_cross_blocks,
+                    BLOCK_SIZE, num_kv_heads, head_dim,
+                )
+            for i, module in enumerate(self._cross_attn_layers):
+                module.k_cache = self.cross_kv_cache[0, i]
+                module.v_cache = self.cross_kv_cache[1, i]
+
+            self._cross_free_block_ids_init = num_cross_blocks
+            if self.rank == 0:
+                print(f"  Cross-attn KV cache: {num_cross_blocks} blocks "
+                      f"({cross_blocks_per_seq} per seq x {max_cross_seqs} seqs, "
+                      f"capped from {_DEFAULT_MAX_NUM_SEQS})")
+
+        self_attn_block_bytes = (
+            2 * num_self_attn_layers * BLOCK_SIZE * num_kv_heads * head_dim * elem_size
+        )
+        num_blocks = available_bytes // self_attn_block_bytes
         if self.is_qwen_vl:
             num_blocks = int(num_blocks * 0.95)
         assert num_blocks > 0, f"Not enough GPU memory for KV cache on rank {self.rank}"
@@ -687,17 +832,15 @@ class ModelRunner:
 
         if ATTN_BACKEND_CONFIG.kv_layout == "HND":
             self.kv_cache = torch.empty(
-                2, num_layers, num_blocks, num_kv_heads, BLOCK_SIZE, head_dim,
+                2, num_self_attn_layers, num_blocks, num_kv_heads, BLOCK_SIZE, head_dim,
             )
         else:
             self.kv_cache = torch.empty(
-                2, num_layers, num_blocks, BLOCK_SIZE, num_kv_heads, head_dim,
+                2, num_self_attn_layers, num_blocks, BLOCK_SIZE, num_kv_heads, head_dim,
             )
-        layer_id = 0
-        for module in self._attn_layers:
-            module.k_cache = self.kv_cache[0, layer_id]
-            module.v_cache = self.kv_cache[1, layer_id]
-            layer_id += 1
+        for i, module in enumerate(self._attn_layers):
+            module.k_cache = self.kv_cache[0, i]
+            module.v_cache = self.kv_cache[1, i]
 
         if self.rank == 0:
             cfg = ATTN_BACKEND_CONFIG
@@ -873,19 +1016,19 @@ class ModelRunner:
         slot_mapping = []
         max_bt = 0
         has_block_tables = False
-        use_mrope = self.is_qwen_vl and any(s.mrope_positions is not None for s in seqs)
+        use_mrope = self.is_qwen_vl
         mrope_pos_list = [] if use_mrope else None
 
         for seq in seqs:
             sl = len(seq)
             input_ids.extend(seq.token_ids)
-            if use_mrope and seq.mrope_positions is not None:
+            if use_mrope and getattr(seq, 'mrope_positions', None) is not None:
                 mrope_pos_list.append(seq.mrope_positions)
             else:
                 positions.extend(range(sl))
                 if use_mrope:
                     mrope_pos_list.append(
-                        torch.arange(sl, dtype=torch.int64).unsqueeze(0).expand(3, -1)
+                        torch.arange(sl, dtype=torch.int64, device="cpu").unsqueeze(0).expand(3, -1)
                     )
             cu_seqlens_q.append(cu_seqlens_q[-1] + sl)
             cu_seqlens_k.append(cu_seqlens_k[-1] + sl)
@@ -918,7 +1061,8 @@ class ModelRunner:
             torch.tensor(cu_seqlens_q, dtype=torch.int32, pin_memory=True).cuda(non_blocking=True),
             torch.tensor(cu_seqlens_k, dtype=torch.int32, pin_memory=True).cuda(non_blocking=True),
             max_sq, max_sk,
-            torch.tensor(slot_mapping, dtype=torch.int64, pin_memory=True).cuda(non_blocking=True),
+            torch.tensor(slot_mapping, dtype=(torch.int64 if self.is_deepseek_mla else torch.int32),
+                         pin_memory=True).cuda(non_blocking=True),
             block_tables=block_tables,
         )
 
@@ -968,6 +1112,7 @@ class ModelRunner:
             block_tables=torch.from_numpy(bt).pin_memory().cuda(non_blocking=True),
             max_context_len=max_cl,
         )
+        self._apply_pending_cross_ctx()
         if use_mrope:
             positions_t = torch.from_numpy(mrope_pos).pin_memory().cuda(non_blocking=True)
         else:
@@ -988,8 +1133,7 @@ class ModelRunner:
         slot_mapping = []
         block_size = self.block_size
 
-        use_mrope = self.is_qwen_vl and any(
-            getattr(s, 'mrope_positions', None) is not None for s in prefill_seqs)
+        use_mrope = self.is_qwen_vl
         mrope_pos_list = [] if use_mrope else None
 
         # --- Prefill portion ---
@@ -1001,14 +1145,14 @@ class ModelRunner:
             start_pos = seq.num_computed_tokens
             chunk_ids = seq.token_ids[start_pos:start_pos + chunk_size]
             input_ids.extend(chunk_ids)
-            if use_mrope and seq.mrope_positions is not None:
+            if use_mrope and getattr(seq, 'mrope_positions', None) is not None:
                 mrope_pos_list.append(seq.mrope_positions[:, start_pos:start_pos + chunk_size])
             else:
                 positions.extend(range(start_pos, start_pos + chunk_size))
                 if use_mrope:
                     mrope_pos_list.append(
                         torch.arange(start_pos, start_pos + chunk_size,
-                                     dtype=torch.int64).unsqueeze(0).expand(3, -1)
+                                     dtype=torch.int64, device="cpu").unsqueeze(0).expand(3, -1)
                     )
 
             kv_len = start_pos + chunk_size
@@ -1048,7 +1192,7 @@ class ModelRunner:
                 delta = getattr(seq, 'mrope_position_delta', 0)
                 p = pos + delta
                 mrope_pos_list.append(
-                    torch.tensor([[p], [p], [p]], dtype=torch.int64))
+                    torch.tensor([[p], [p], [p]], dtype=torch.int64, device="cpu"))
             else:
                 positions.append(pos)
             dc_cl[i] = len(seq)
@@ -1079,7 +1223,9 @@ class ModelRunner:
             )
 
         set_mixed_context(
-            slot_mapping=torch.tensor(slot_mapping, dtype=torch.int64, pin_memory=True).cuda(non_blocking=True),
+            slot_mapping=torch.tensor(slot_mapping,
+                                      dtype=(torch.int64 if self.is_deepseek_mla else torch.int32),
+                                      pin_memory=True).cuda(non_blocking=True),
             num_prefill_tokens=num_prefill_tokens,
             num_decode_tokens=nd,
             num_prefill_seqs=num_prefill_seqs,
@@ -1104,20 +1250,51 @@ class ModelRunner:
 
     @torch.inference_mode()
     def run_model(self, input_ids, positions, is_prefill, inputs_embeds=None,
-                  deepstack_embeds=None):
+                  deepstack_embeds=None, encoder_outputs=None):
         if is_prefill or self.enforce_eager or input_ids.size(0) > self.graph_bs_list[-1]:
+            # For compiled VL models, always compute inputs_embeds outside
+            # the compiled graph (matching vLLM).  The compiled inner
+            # Qwen3Model was traced with inputs_embeds, so it must always
+            # receive one.
+            if self.is_qwen_vl and self._compiled and inputs_embeds is None:
+                inputs_embeds = self.model.get_input_embeddings()(input_ids)
             if inputs_embeds is not None:
+                if deepstack_embeds is not None:
+                    # Multimodal prefill with actual vision features —
+                    # use the uncompiled inner model since the compiled
+                    # graph was traced without deepstack_embeds.
+                    inner = getattr(self, '_eager_inner_model', None)
+                    if inner is not None:
+                        hidden = inner(input_ids, positions,
+                                       inputs_embeds=inputs_embeds,
+                                       deepstack_embeds=deepstack_embeds)
+                        return self.model.compute_logits(hidden)
+                    return self.model.compute_logits(
+                        self.model(input_ids, positions,
+                                   inputs_embeds=inputs_embeds,
+                                   deepstack_embeds=deepstack_embeds)
+                    )
                 return self.model.compute_logits(
-                    self.model(input_ids, positions, inputs_embeds=inputs_embeds,
-                               deepstack_embeds=deepstack_embeds)
+                    self.model(input_ids, positions, inputs_embeds=inputs_embeds)
+                )
+            if encoder_outputs is not None:
+                return self.model.compute_logits(
+                    self.model(input_ids, positions, encoder_outputs=encoder_outputs)
                 )
             return self.model.compute_logits(self.model(input_ids, positions))
+        # Decode path: CUDA graph replay.
+        # For VL models, embed_fn is recorded inside the graph — updating
+        # input_ids in graph_vars is sufficient; the graph replays embed_fn
+        # on the new ids to produce inputs_embeds internally.
         bs = input_ids.size(0)
         ctx = get_context()
         graph_bs = self._graph_bs_for_n[bs]
         gv = self.graph_vars
         gv["input_ids"][:bs] = input_ids
-        gv["positions"][:bs] = positions
+        if self.is_qwen_vl:
+            gv["positions"][:, :bs] = positions
+        else:
+            gv["positions"][:bs] = positions
         gv["slot_mapping"][:bs] = ctx.slot_mapping
         if bs < graph_bs:
             gv["slot_mapping"][bs:graph_bs].fill_(-1)
@@ -1158,7 +1335,10 @@ class ModelRunner:
         prev_n = getattr(self, '_prev_decode_n', -1)
 
         gv["input_ids"][:n].copy_(torch.from_numpy(ids_np), non_blocking=True)
-        gv["positions"][:n].copy_(torch.from_numpy(pos_np), non_blocking=True)
+        if self.is_qwen_vl:
+            gv["positions"][:, :n].copy_(torch.from_numpy(pos_np), non_blocking=True)
+        else:
+            gv["positions"][:n].copy_(torch.from_numpy(pos_np), non_blocking=True)
         gv["slot_mapping"][:n].copy_(torch.from_numpy(sm_np), non_blocking=True)
         if n < graph_bs and n != prev_n:
             gv["slot_mapping"][n:graph_bs].fill_(-1)
@@ -1198,7 +1378,10 @@ class ModelRunner:
     def _run_decode_greedy_eager(self, n, ids_np, pos_np, sm_np, cl_np, bt_np):
         """Eager decode path for greedy sampling with TP (no CUDA graphs)."""
         self._eager_input_ids[:n].copy_(torch.from_numpy(ids_np), non_blocking=True)
-        self._eager_positions[:n].copy_(torch.from_numpy(pos_np), non_blocking=True)
+        if self.is_qwen_vl:
+            self._eager_positions[:, :n].copy_(torch.from_numpy(pos_np), non_blocking=True)
+        else:
+            self._eager_positions[:n].copy_(torch.from_numpy(pos_np), non_blocking=True)
         bt_cols = bt_np.shape[1]
         self._eager_slot_mapping[:n].copy_(torch.from_numpy(sm_np), non_blocking=True)
         self._eager_context_lens[:n].copy_(torch.from_numpy(cl_np), non_blocking=True)
@@ -1206,7 +1389,10 @@ class ModelRunner:
             torch.from_numpy(bt_np), non_blocking=True)
 
         input_ids = self._eager_input_ids[:n]
-        positions = self._eager_positions[:n]
+        if self.is_qwen_vl:
+            positions = self._eager_positions[:, :n]
+        else:
+            positions = self._eager_positions[:n]
         slot_mapping = self._eager_slot_mapping[:n]
         context_lens = self._eager_context_lens[:n]
         block_tables = self._eager_block_tables[:n, :bt_cols]
@@ -1218,9 +1404,10 @@ class ModelRunner:
             block_tables=block_tables,
             max_context_len=int(cl_np.max()),
         )
+        self._apply_pending_cross_ctx()
         hidden = self.model(input_ids, positions)
         lm_head = self.model.lm_head
-        logits = lm_head.linear_op(hidden, lm_head.weight).float()
+        logits = lm_head.linear_op(hidden, lm_head.embedding_op.emb.weight).float()
         max_vals, max_idxs = logits.max(dim=-1)
         reset_context()
 
@@ -1252,14 +1439,24 @@ class ModelRunner:
 
         max_num_blocks = (self.max_model_len + BLOCK_SIZE - 1) // BLOCK_SIZE
         self._np_ids = np.empty(max_bs, dtype=np.int64)
-        self._np_pos = np.empty(max_bs, dtype=np.int64)
-        self._np_sm = np.empty(max_bs, dtype=np.int64)
+        if self.is_qwen_vl:
+            self._np_pos = np.empty((3, max_bs), dtype=np.int64)
+        else:
+            self._np_pos = np.empty(max_bs, dtype=np.int64)
+        # DeepSeek MLA FP8 KV cache stores require int64 slot_mapping;
+        # the FA3 path only needs int32.
+        sm_np_dtype = np.int64 if self.is_deepseek_mla else np.int32
+        sm_torch_dtype = torch.int64 if self.is_deepseek_mla else torch.int32
+        self._np_sm = np.empty(max_bs, dtype=sm_np_dtype)
         self._np_cl = np.empty(max_bs, dtype=np.int32)
         self._np_bt = np.full((max_bs, max_num_blocks), -1, dtype=np.int32)
 
         self._eager_input_ids = torch.zeros(max_bs, dtype=torch.int64, device=dev)
-        self._eager_positions = torch.zeros(max_bs, dtype=torch.int64, device=dev)
-        self._eager_slot_mapping = torch.zeros(max_bs, dtype=torch.int64, device=dev)
+        if self.is_qwen_vl:
+            self._eager_positions = torch.zeros(3, max_bs, dtype=torch.int64, device=dev)
+        else:
+            self._eager_positions = torch.zeros(max_bs, dtype=torch.int64, device=dev)
+        self._eager_slot_mapping = torch.zeros(max_bs, dtype=sm_torch_dtype, device=dev)
         self._eager_context_lens = torch.zeros(max_bs, dtype=torch.int32, device=dev)
         self._eager_block_tables = torch.zeros(max_bs, max_num_blocks, dtype=torch.int32, device=dev)
 
@@ -1290,12 +1487,10 @@ class ModelRunner:
         gathered = [g[:n] for g in self._greedy_gathered]
         dist.all_gather(gathered, info)
 
-        for i, g in enumerate(gathered):
-            self._greedy_all_info[i, :n] = g
-        all_vals = self._greedy_all_info[:, :n, 0]
-        all_idxs = self._greedy_all_info[:, :n, 1].long()
-        best_rank = all_vals.argmax(dim=0)
-        token_ids = all_idxs[best_rank, self._greedy_arange[:n]]
+        all_info = self._greedy_all_info
+        torch.stack(gathered, out=all_info[:, :n])
+        best_rank = all_info[:, :n, 0].argmax(dim=0)
+        token_ids = all_info[:, :n, 1].long()[best_rank, self._greedy_arange[:n]]
 
         if self.rank == 0:
             return token_ids
@@ -1341,7 +1536,8 @@ class ModelRunner:
                 slen = seq._num_tokens
                 ids_np[i] = seq._last_token
             if self.is_qwen_vl:
-                pos_np[i] = slen - 1 + seq.mrope_position_delta
+                decode_pos = slen - 1 + seq.mrope_position_delta
+                pos_np[:, i] = decode_pos
             else:
                 pos_np[i] = slen - 1
             cl_np[i] = slen
@@ -1359,6 +1555,8 @@ class ModelRunner:
             if blen < max_bt:
                 bt_np[i, blen:max_bt] = -1
         self._prev_max_bt = max_bt
+        if self.is_qwen_vl:
+            return (n, ids_np[:n], pos_np[:, :n], sm_np[:n], cl_np[:n], bt_np[:n, :max_bt])
         return (n, ids_np[:n], pos_np[:n], sm_np[:n], cl_np[:n], bt_np[:n, :max_bt])
 
     def _update_decode_arrays_incremental(self, n, token_ids, decode_seqs):
@@ -1375,7 +1573,10 @@ class ModelRunner:
         bs = BLOCK_SIZE
 
         ids_np[:n] = token_ids
-        pos_np[:n] += 1
+        if self.is_qwen_vl:
+            pos_np[:, :n] += 1
+        else:
+            pos_np[:n] += 1
         cl_np[:n] += 1
         sm_np[:n] += 1
 
@@ -1400,20 +1601,24 @@ class ModelRunner:
                 self._prev_max_bt = max_bt
         else:
             max_bt = self._prev_max_bt
+        if self.is_qwen_vl:
+            return (n, ids_np[:n], pos_np[:, :n], sm_np[:n], cl_np[:n],
+                    bt_np[:n, :max_bt])
         return (n, ids_np[:n], pos_np[:n], sm_np[:n], cl_np[:n],
                 bt_np[:n, :max_bt])
 
     def _write_decode_shm(self, n, ids_np, pos_np, sm_np, cl_np, bt_np):
         """Write decode arrays directly into SHM with binary layout.
         
-        Layout: [n(2)][max_bt(2)][ids(n*8)][pos(n*8)][sm(n*4)][cl(n*4)][bt(n*max_bt*4)]
+        Layout: [n(2)][max_bt(2)][ids(n*8)][pos(n*8 or 3*n*8)][sm(n*4)][cl(n*4)][bt(n*max_bt*4)]
+        pos_np is (n,) for standard models or (3, n) for MRoPE models.
         """
         max_bt = bt_np.shape[1]
         buf = self.shm.buf
         buf[0:2] = n.to_bytes(2, "little")
         buf[2:4] = max_bt.to_bytes(2, "little")
         off = 4
-        for arr in (ids_np, pos_np, sm_np, cl_np, bt_np):
+        for arr in (ids_np, pos_np.ravel(), sm_np, cl_np, bt_np):
             nb = arr.nbytes
             buf[off:off+nb] = arr.tobytes()
             off += nb
@@ -1425,7 +1630,10 @@ class ModelRunner:
         max_bt = int.from_bytes(buf[2:4], "little")
         off = 4
         ids_np = np.frombuffer(buf, dtype=np.int64, count=n, offset=off).copy(); off += n * 8
-        pos_np = np.frombuffer(buf, dtype=np.int64, count=n, offset=off).copy(); off += n * 8
+        if self.is_qwen_vl:
+            pos_np = np.frombuffer(buf, dtype=np.int64, count=3*n, offset=off).copy().reshape(3, n); off += 3 * n * 8
+        else:
+            pos_np = np.frombuffer(buf, dtype=np.int64, count=n, offset=off).copy(); off += n * 8
         sm_np = np.frombuffer(buf, dtype=np.int32, count=n, offset=off).copy(); off += n * 4
         cl_np = np.frombuffer(buf, dtype=np.int32, count=n, offset=off).copy(); off += n * 4
         bt_np = np.frombuffer(buf, dtype=np.int32, count=n*max_bt, offset=off).copy().reshape(n, max_bt)
@@ -1494,15 +1702,451 @@ class ModelRunner:
         reset_context()
         return result
 
+    @staticmethod
+    def _strip_mm_tensors(seqs):
+        """Return lightweight copies of sequences for SHM dispatch (no large tensors)."""
+        stripped = []
+        for s in seqs:
+            c = Sequence.__new__(Sequence)
+            c.__dict__.update(s.__dict__)
+            c.pixel_values = None
+            c.video_pixel_values = None
+            c.encoder_features = None
+            stripped.append(c)
+        return stripped
+
+    def _run_mm_lm(self, prefill_seqs, prefill_chunk_sizes, decode_seqs,
+                   vis_cache_map):
+        """Run LM forward with vision embeddings from _vis_cache.
+
+        All ranks have vision outputs in self._vis_cache from prior
+        _broadcast_visual calls. This method:
+        1. Computes text embeddings via embed_fn (TP allreduce)
+        2. Merges cached vision embeddings into text embeddings
+        3. Runs LM forward pass
+
+        vis_cache_map: list of dicts per prefill seq:
+          [{"cache_idx": int, "modality": str, "thw": [[t,h,w],...]}]
+          None entries mean no vision for that seq.
+        """
+        input_ids, positions = self.prepare_mixed_batch(
+            prefill_seqs, prefill_chunk_sizes, decode_seqs,
+        )
+
+        if self.is_qwen_vl and self.world_size > 1:
+            if self.rank == 0:
+                if positions.ndim == 1:
+                    shape_flag = torch.zeros(1, dtype=torch.int64, device="cuda")
+                else:
+                    shape_flag = torch.tensor([positions.shape[0]], dtype=torch.int64, device="cuda")
+                dist.broadcast(shape_flag, src=0)
+                pos_gpu = positions.cuda() if not positions.is_cuda else positions
+                dist.broadcast(pos_gpu, src=0)
+                positions = pos_gpu
+            else:
+                shape_flag = torch.zeros(1, dtype=torch.int64, device="cuda")
+                dist.broadcast(shape_flag, src=0)
+                ndim0 = shape_flag.item()
+                if ndim0 > 0:
+                    n_tokens = input_ids.shape[0]
+                    positions = torch.empty(int(ndim0), n_tokens, dtype=torch.int64, device="cuda")
+                    dist.broadcast(positions, src=0)
+                else:
+                    pos_gpu = positions.cuda() if not positions.is_cuda else positions
+                    dist.broadcast(pos_gpu, src=0)
+                    positions = pos_gpu
+        device = input_ids.device
+        model = self.model
+        embed_fn = model.get_input_embeddings()
+
+        has_deepstack = hasattr(model.visual, 'deepstack_merger_list')
+        if has_deepstack:
+            visual_dim = model.config.vision.out_hidden_size
+        merge_size = model.config.vision.spatial_merge_size
+        image_token_id = self.config.image_token_id
+        video_token_id = self.config.video_token_id
+
+        all_inputs_embeds = []
+        all_deepstack = [] if has_deepstack else None
+
+        for seq_idx, seq in enumerate(prefill_seqs):
+            full_ids = torch.tensor(seq.token_ids, dtype=torch.int64, device=device)
+            if prefill_chunk_sizes is not None:
+                start = seq.num_computed_tokens
+                end = start + prefill_chunk_sizes[seq_idx]
+                chunk_ids = full_ids[start:end]
+            else:
+                chunk_ids = full_ids
+                start = 0
+                end = len(full_ids)
+
+            text_embeds = embed_fn(chunk_ids)
+            seq_deepstack = [] if has_deepstack else None
+
+            info = vis_cache_map[seq_idx] if seq_idx < len(vis_cache_map) else None
+            if os.environ.get("KB_DIAG_MM") and self.rank == 0:
+                _dc2 = getattr(self, '_diag_mm_count', 0)
+                if _dc2 < 2:
+                    print(f"  [DIAG_MM seq_idx={seq_idx}] info={info} "
+                          f"chunk_ids_len={len(chunk_ids)} "
+                          f"has_img_tokens={(chunk_ids == image_token_id).sum().item()}")
+            if info is not None:
+                vis_out = self._vis_cache[info["cache_idx"]]
+                modality = info["modality"]
+                tok_id = image_token_id if modality == "image" else video_token_id
+
+                if has_deepstack:
+                    all_vis_embeds = vis_out[:, :visual_dim]
+                    ds_cat = vis_out[:, visual_dim:]
+                    all_ds_features = list(ds_cat.split(visual_dim, dim=1))
+                else:
+                    all_vis_embeds = vis_out
+                    all_ds_features = []
+
+                if "embed_start" in info:
+                    es = info["embed_start"]
+                    ec = info["embed_count"]
+                    embeds = all_vis_embeds[es:es+ec]
+                    ds_features = [d[es:es+ec] for d in all_ds_features]
+                else:
+                    embeds = all_vis_embeds
+                    ds_features = all_ds_features
+
+                mask = chunk_ids == tok_id
+                if mask.any():
+                    if os.environ.get("KB_DIAG_MM") and self.rank == 0:
+                        _dc = getattr(self, '_diag_mm_count', 0)
+                        if _dc < 2:
+                            n_m = mask.sum().item()
+                            print(f"  [DIAG_MM seq={seq_idx}] vis_out={vis_out.shape} "
+                                  f"modality={modality} "
+                                  f"embeds={embeds.shape} mask_count={n_m} "
+                                  f"vis_norm={embeds.norm().item():.4f} "
+                                  f"text_norm_before={text_embeds.norm().item():.4f} "
+                                  f"chunk_ids_len={len(chunk_ids)} "
+                                  f"ds_features={len(ds_features)}")
+                    if prefill_chunk_sizes is not None:
+                        full_mask = full_ids == tok_id
+                        chunk_vis_start = full_mask[:start].sum().item()
+                        n_vis = mask.sum().item()
+                        text_embeds[mask] = embeds[chunk_vis_start:chunk_vis_start+n_vis].to(text_embeds.dtype)
+                    else:
+                        text_embeds[mask] = embeds.to(text_embeds.dtype)
+
+                if has_deepstack and ds_features:
+                    for ds_feat in ds_features:
+                        ds_e = torch.zeros_like(text_embeds)
+                        if mask.any():
+                            if prefill_chunk_sizes is not None:
+                                ds_e[mask] = ds_feat[chunk_vis_start:chunk_vis_start+n_vis].to(text_embeds.dtype)
+                            else:
+                                ds_e[mask] = ds_feat.to(text_embeds.dtype)
+                        seq_deepstack.append(ds_e)
+
+            all_inputs_embeds.append(text_embeds)
+            if has_deepstack:
+                all_deepstack.append(seq_deepstack if seq_deepstack else [])
+
+        for seq in decode_seqs:
+            dc_id = torch.tensor([seq.last_token], dtype=torch.int64, device=device)
+            dc_embed = embed_fn(dc_id)
+            all_inputs_embeds.append(dc_embed)
+            if has_deepstack:
+                all_deepstack.append([])
+
+        inputs_embeds = torch.cat(all_inputs_embeds, dim=0)
+
+        deepstack_embeds = None
+        if has_deepstack and all_deepstack:
+            num_levels = max((len(ds) for ds in all_deepstack), default=0)
+            if num_levels > 0:
+                deepstack_embeds = []
+                hidden_dim = inputs_embeds.shape[-1]
+                for level in range(num_levels):
+                    level_parts = []
+                    for ds_idx, ds in enumerate(all_deepstack):
+                        if level < len(ds):
+                            level_parts.append(ds[level])
+                        else:
+                            n_tokens = all_inputs_embeds[ds_idx].shape[0]
+                            level_parts.append(torch.zeros(n_tokens, hidden_dim,
+                                                           device=device, dtype=inputs_embeds.dtype))
+                    deepstack_embeds.append(torch.cat(level_parts, dim=0))
+
+        self._vis_cache = []
+
+        if os.environ.get("KB_DIAG_MM") and self.rank == 0:
+            _diag_count = getattr(self, '_diag_mm_count', 0)
+            if _diag_count < 2:
+                print(f"\n[DIAG_MM seq_count={len(prefill_seqs)}] "
+                      f"inputs_embeds={inputs_embeds.shape} "
+                      f"norm={inputs_embeds.norm().item():.4f} "
+                      f"positions={'x'.join(str(d) for d in positions.shape)} "
+                      f"pos_range=[{positions.min().item()},{positions.max().item()}]")
+                if deepstack_embeds:
+                    for i, ds in enumerate(deepstack_embeds):
+                        print(f"  deepstack[{i}]: shape={ds.shape} "
+                              f"norm={ds.norm().item():.4f} "
+                              f"nonzero={ds.abs().sum(dim=-1).gt(0).sum().item()}")
+                # Print per-seq position info
+                offset = 0
+                for si, seq in enumerate(prefill_seqs):
+                    sl = len(seq) if prefill_chunk_sizes is None else prefill_chunk_sizes[si]
+                    seq_pos = positions[:, offset:offset+sl]
+                    print(f"  seq[{si}] len={sl} pos_range=["
+                          f"t:{seq_pos[0].min().item()}-{seq_pos[0].max().item()}, "
+                          f"h:{seq_pos[1].min().item()}-{seq_pos[1].max().item()}, "
+                          f"w:{seq_pos[2].min().item()}-{seq_pos[2].max().item()}] "
+                          f"mrope_delta={getattr(seq, 'mrope_position_delta', 'N/A')}")
+                    offset += sl
+                self._diag_mm_count = _diag_count + 1
+
+        result = self.run_model(input_ids, positions, True,
+                                inputs_embeds=inputs_embeds,
+                                deepstack_embeds=deepstack_embeds)
+        reset_context()
+        return result
+
+    def _broadcast_visual(self, pv_shape, thw_shape):
+        """Broadcast pixel values and run vision encoder on all ranks.
+
+        Rank 0 must set self._mm_pv and self._mm_thw before calling.
+        Other ranks receive via NCCL broadcast.
+        All ranks participate in model.visual() which uses TP allreduce.
+        Returns the vision encoder output tensor.
+        """
+        device = torch.device("cuda")
+        vis_dtype = self.model.visual.patch_embed.proj.weight.dtype
+        if self.rank == 0:
+            bpv = self._mm_pv.to(device=device, dtype=vis_dtype)
+            bthw = (self._mm_thw.clone() if isinstance(self._mm_thw, torch.Tensor)
+                    else torch.tensor(self._mm_thw, dtype=torch.long)).to(device)
+            self._mm_pv = None
+            self._mm_thw = None
+        else:
+            bpv = torch.empty(pv_shape, dtype=vis_dtype, device=device)
+            bthw = torch.empty(thw_shape, dtype=torch.long, device=device)
+        dist.broadcast(bpv, src=0)
+        dist.broadcast(bthw, src=0)
+        vis_out = self.model.visual(bpv, grid_thw=bthw.cpu())
+        del bpv
+        if not hasattr(self, '_vis_cache'):
+            self._vis_cache = []
+        self._vis_cache.append(vis_out)
+        return vis_out
+
+    # ------------------------------------------------------------------
+    # Whisper cross-attention context helpers
+    # ------------------------------------------------------------------
+
+    def _set_cross_attn_context_prefill(self, prefill_seqs, prefill_chunk_sizes,
+                                        encoder_seqs):
+        """Set cross-attention metadata on the global Context for prefill.
+
+        For sequences with new encoder outputs: builds slot_mapping for
+        writing encoder K/V to paged cache, and cu_seqlens for Q (decoder
+        tokens) x K (encoder tokens) non-causal attention.
+
+        For decode sequences in a mixed batch, cross-attn context is also
+        needed (handled by the mixed path caller).
+        """
+        ctx = get_context()
+        block_size = BLOCK_SIZE
+
+        # Cross-attn slot mapping: for NEW encoder outputs being written to cache
+        cross_slot_mapping = []
+        for seq in encoder_seqs:
+            enc_len = seq.encoder_seq_len
+            for p in range(enc_len):
+                block_idx = seq.cross_block_table[p // block_size]
+                cross_slot_mapping.append(block_idx * block_size + (p % block_size))
+
+        # Q = decoder tokens (for each prefill seq, chunk_size tokens)
+        # K = encoder tokens (encoder_seq_len per seq)
+        cross_cu_q, cross_cu_k = [0], [0]
+        cross_max_sq, cross_max_sk = 0, 0
+        cross_max_bt = 0
+        for seq, chunk in zip(prefill_seqs, prefill_chunk_sizes):
+            cross_cu_q.append(cross_cu_q[-1] + chunk)
+            enc_len = seq.encoder_seq_len
+            cross_cu_k.append(cross_cu_k[-1] + enc_len)
+            cross_max_sq = max(chunk, cross_max_sq)
+            cross_max_sk = max(enc_len, cross_max_sk)
+            blen = len(seq.cross_block_table)
+            if blen > cross_max_bt:
+                cross_max_bt = blen
+
+        cross_bt = None
+        if cross_max_bt > 0:
+            n = len(prefill_seqs)
+            bt_arr = np.full((n, cross_max_bt), -1, dtype=np.int32)
+            for i, seq in enumerate(prefill_seqs):
+                b = seq.cross_block_table
+                bt_arr[i, :len(b)] = b
+            cross_bt = torch.from_numpy(bt_arr).pin_memory().cuda(non_blocking=True)
+
+        ctx.cross_slot_mapping = (
+            torch.tensor(cross_slot_mapping, dtype=torch.int32, pin_memory=True).cuda(non_blocking=True)
+            if cross_slot_mapping else None
+        )
+        ctx.cross_cu_seqlens_q = torch.tensor(
+            cross_cu_q, dtype=torch.int32, pin_memory=True).cuda(non_blocking=True)
+        ctx.cross_cu_seqlens_k = torch.tensor(
+            cross_cu_k, dtype=torch.int32, pin_memory=True).cuda(non_blocking=True)
+        ctx.cross_max_seqlen_q = cross_max_sq
+        ctx.cross_max_seqlen_k = cross_max_sk
+        ctx.cross_block_tables = cross_bt
+
+    def _set_cross_attn_context_decode(self, decode_seqs):
+        """Set cross-attention metadata on the global Context for decode.
+
+        Each decode token attends to the full encoder output via paged cache.
+        Also stores the tensors as instance state so they can be applied to
+        any Context created later (e.g., by the greedy eager decode path).
+        """
+        n = len(decode_seqs)
+        cross_cl = np.empty(n, dtype=np.int32)
+        cross_max_bt = 0
+        for i, seq in enumerate(decode_seqs):
+            cross_cl[i] = seq.encoder_seq_len
+            blen = len(seq.cross_block_table)
+            if blen > cross_max_bt:
+                cross_max_bt = blen
+
+        cross_bt = np.full((n, cross_max_bt), -1, dtype=np.int32)
+        for i, seq in enumerate(decode_seqs):
+            b = seq.cross_block_table
+            cross_bt[i, :len(b)] = b
+
+        self._pending_cross_ctx = {
+            "cross_context_lens": torch.from_numpy(cross_cl).pin_memory().cuda(non_blocking=True),
+            "cross_block_tables": torch.from_numpy(cross_bt).pin_memory().cuda(non_blocking=True),
+            "cross_max_context_len": int(cross_cl.max()) if n > 0 else 0,
+        }
+        self._apply_pending_cross_ctx()
+
+    def _apply_pending_cross_ctx(self):
+        """Apply pending cross-attention context to the current global Context."""
+        pending = getattr(self, '_pending_cross_ctx', None)
+        if pending is None:
+            return
+        ctx = get_context()
+        ctx.cross_slot_mapping = None
+        ctx.cross_context_lens = pending["cross_context_lens"]
+        ctx.cross_block_tables = pending["cross_block_tables"]
+        ctx.cross_max_context_len = pending["cross_max_context_len"]
+
+    def _clear_pending_cross_ctx(self):
+        self._pending_cross_ctx = None
+
+    def _set_cross_attn_context_mixed(self, prefill_seqs, prefill_chunk_sizes,
+                                      decode_seqs, encoder_seqs):
+        """Set cross-attention metadata for mixed prefill+decode batch.
+
+        Prefill seqs: Q = chunked decoder tokens, K = encoder tokens (from paged cache).
+        Decode seqs: Q = 1 token each, K = encoder tokens (from paged cache).
+        Both use non-causal attention via the prefill kernel with block tables.
+        """
+        ctx = get_context()
+        block_size = BLOCK_SIZE
+
+        # Cross-attn slot mapping for NEW encoder outputs
+        cross_slot_mapping = []
+        for seq in encoder_seqs:
+            enc_len = seq.encoder_seq_len
+            for p in range(enc_len):
+                block_idx = seq.cross_block_table[p // block_size]
+                cross_slot_mapping.append(block_idx * block_size + (p % block_size))
+
+        # Build unified cu_seqlens: prefill seqs first, then decode seqs
+        all_seqs = list(prefill_seqs) + list(decode_seqs)
+        cross_cu_q, cross_cu_k = [0], [0]
+        cross_max_sq, cross_max_sk = 0, 0
+        cross_max_bt = 0
+
+        for idx, seq in enumerate(all_seqs):
+            if idx < len(prefill_seqs):
+                q_tokens = prefill_chunk_sizes[idx]
+            else:
+                q_tokens = 1
+            enc_len = seq.encoder_seq_len
+            cross_cu_q.append(cross_cu_q[-1] + q_tokens)
+            cross_cu_k.append(cross_cu_k[-1] + enc_len)
+            cross_max_sq = max(q_tokens, cross_max_sq)
+            cross_max_sk = max(enc_len, cross_max_sk)
+            blen = len(seq.cross_block_table)
+            if blen > cross_max_bt:
+                cross_max_bt = blen
+
+        cross_bt = None
+        if cross_max_bt > 0:
+            n = len(all_seqs)
+            bt_arr = np.full((n, cross_max_bt), -1, dtype=np.int32)
+            for i, seq in enumerate(all_seqs):
+                b = seq.cross_block_table
+                bt_arr[i, :len(b)] = b
+            cross_bt = torch.from_numpy(bt_arr).pin_memory().cuda(non_blocking=True)
+
+        ctx.cross_slot_mapping = (
+            torch.tensor(cross_slot_mapping, dtype=torch.int32, pin_memory=True).cuda(non_blocking=True)
+            if cross_slot_mapping else None
+        )
+        ctx.cross_cu_seqlens_q = torch.tensor(
+            cross_cu_q, dtype=torch.int32, pin_memory=True).cuda(non_blocking=True)
+        ctx.cross_cu_seqlens_k = torch.tensor(
+            cross_cu_k, dtype=torch.int32, pin_memory=True).cuda(non_blocking=True)
+        ctx.cross_max_seqlen_q = cross_max_sq
+        ctx.cross_max_seqlen_k = cross_max_sk
+        ctx.cross_block_tables = cross_bt
+
+    def _compile_model(self):
+        """Apply torch.compile with KBNanoBackend (mirrors vLLM).
+
+        The backend:
+        1. Splits the graph at attention custom-op boundaries
+        2. Compiles each subgraph with symbolic shapes (one compile per
+           unique subgraph structure, not per batch size)
+        3. Drops all Dynamo guards so no re-tracing occurs
+
+        After this, the model works for any batch size.  The subsequent
+        ``capture_cudagraph`` call records the compiled kernels into
+        per-batch-size CUDA graphs for decode replay.
+
+        For VL models, only the inner Qwen3Model is compiled (not the
+        outer Qwen3VLForConditionalGeneration).  This keeps embed_tokens
+        and lm_head outside the compiled boundary, matching vLLM's
+        architecture where @support_torch_compile is applied only to the
+        inner LLM model.  The engine always computes inputs_embeds
+        outside the compiled graph and passes it in, so the compiled
+        graph only ever traces the inputs_embeds branch.
+        """
+        from .compilation import compile_model, configure_post_grad_passes
+
+        configure_post_grad_passes()
+        if self.is_qwen_vl:
+            # Save the uncompiled inner model for multimodal prefill
+            # (which needs deepstack_embeds that the compiled graph
+            # doesn't trace).
+            self._eager_inner_model = self.model.model
+            self.model.model = compile_model(self.model.model)
+        else:
+            self._eager_model = self.model
+            self.model = compile_model(self.model)
+        self._compiled = True
+        self._mark_dynamic_done = False
+
     @torch.inference_mode()
     def capture_cudagraph(self):
         import gc
         from contextlib import nullcontext
         max_bs = self.max_num_seqs
         max_num_blocks = (self.max_model_len + BLOCK_SIZE - 1) // BLOCK_SIZE
-        input_ids = torch.zeros(max_bs, dtype=torch.int64)
-        positions = torch.zeros(max_bs, dtype=torch.int64)
-        slot_mapping = torch.full((max_bs,), -1, dtype=torch.int64)
+        if self.is_qwen_vl:
+            positions = torch.zeros(3, max_bs + 1, dtype=torch.int64)
+        else:
+            positions = torch.zeros(max_bs, dtype=torch.int64)
+        sm_torch_dtype = torch.int64 if self.is_deepseek_mla else torch.int32
+        slot_mapping = torch.full((max_bs,), -1, dtype=sm_torch_dtype)
         context_lens = torch.zeros(max_bs, dtype=torch.int32)
         block_tables = torch.zeros(max_bs, max_num_blocks, dtype=torch.int32)
 
@@ -1518,6 +2162,20 @@ class ModelRunner:
         self.graph_pool = None
 
         outputs = torch.zeros(max_bs, self.config.hidden_size)
+
+        # For VL models, allocate an inputs_embeds buffer so the compiled
+        # inner model is always traced with inputs_embeds (matching vLLM).
+        # deepstack_embeds is NOT passed here — it is only needed during
+        # multimodal prefill, which uses the eager model.  Keeping deepstack
+        # out of the compiled graph avoids unnecessary zero-tensor additions
+        # on every decode step.
+        vl_inputs_embeds = None
+        vl_embed_fn = None
+        if self.is_qwen_vl:
+            hidden_size = self.config.hidden_size
+            vl_inputs_embeds = torch.zeros(max_bs, hidden_size,
+                                           dtype=self.dtype)
+            vl_embed_fn = self.model.get_input_embeddings()
 
         lm_head = self.model.lm_head
         vocab_per_rank = lm_head.per_partition
@@ -1537,9 +2195,14 @@ class ModelRunner:
             block_tables=block_tables[:largest_bs],
             max_context_len=self.max_model_len,
         )
-        outputs[:largest_bs] = self.model(input_ids[:largest_bs], positions[:largest_bs])
+        if self.is_qwen_vl:
+            outputs[:largest_bs] = self.model(
+                input_ids[:largest_bs], positions[:, :largest_bs])
+        else:
+            outputs[:largest_bs] = self.model(
+                input_ids[:largest_bs], positions[:largest_bs])
         lm_logits[:largest_bs] = lm_head.linear_op(
-            outputs[:largest_bs], lm_head.weight).float()
+            outputs[:largest_bs], lm_head.embedding_op.emb.weight).float()
         lm_max_vals[:largest_bs], lm_max_idxs[:largest_bs] = \
             lm_logits[:largest_bs].max(dim=-1)
         reset_context()
@@ -1562,9 +2225,54 @@ class ModelRunner:
                     max_context_len=self.max_model_len,
                 )
 
+                ids_slice = input_ids[:bs]
+                if self.is_qwen_vl:
+                    pos_slice = positions[:, :bs]
+                else:
+                    pos_slice = positions[:bs]
+
+                # For VL: create a slice reference ONCE and reuse for both
+                # mark_dynamic and the warmup call so the dynamic metadata
+                # stays on the exact tensor object Dynamo will trace.
+                ie_slice = (vl_inputs_embeds[:bs]
+                            if vl_inputs_embeds is not None else None)
+
+                if self._compiled and not self._mark_dynamic_done:
+                    torch._dynamo.mark_dynamic(ids_slice, 0)
+                    if self.is_qwen_vl:
+                        torch._dynamo.mark_dynamic(pos_slice, 1)
+                    else:
+                        torch._dynamo.mark_dynamic(pos_slice, 0)
+                    if ie_slice is not None:
+                        torch._dynamo.mark_dynamic(ie_slice, 0)
+                    self._mark_dynamic_done = True
+
+                # Warmup forward: for VL, compute inputs_embeds outside and
+                # pass it so the compiled inner model traces the
+                # inputs_embeds branch (never embed_tokens).
+                if ie_slice is not None:
+                    ie_slice.copy_(vl_embed_fn(ids_slice))
+                    outputs[:bs] = self.model(
+                        ids_slice, pos_slice,
+                        inputs_embeds=ie_slice,
+                    )
+                else:
+                    outputs[:bs] = self.model(ids_slice, pos_slice)
+                lm_logits[:bs] = lm_head.linear_op(
+                    outputs[:bs], lm_head.embedding_op.emb.weight).float()
+                lm_max_vals[:bs], lm_max_idxs[:bs] = lm_logits[:bs].max(dim=-1)
+
                 with torch.cuda.graph(graph, self.graph_pool):
-                    outputs[:bs] = self.model(input_ids[:bs], positions[:bs])
-                    lm_logits[:bs] = lm_head.linear_op(outputs[:bs], lm_head.weight).float()
+                    if ie_slice is not None:
+                        ie_slice.copy_(vl_embed_fn(ids_slice))
+                        outputs[:bs] = self.model(
+                            ids_slice, pos_slice,
+                            inputs_embeds=ie_slice,
+                        )
+                    else:
+                        outputs[:bs] = self.model(ids_slice, pos_slice)
+                    lm_logits[:bs] = lm_head.linear_op(
+                        outputs[:bs], lm_head.embedding_op.emb.weight).float()
                     lm_max_vals[:bs], lm_max_idxs[:bs] = lm_logits[:bs].max(dim=-1)
 
                 if self.graph_pool is None:
@@ -1583,7 +2291,6 @@ class ModelRunner:
             lm_logits=lm_logits, lm_max_vals=lm_max_vals,
             lm_max_idxs=lm_max_idxs,
         )
-
         # Pre-compute lookup table: _graph_bs_for_n[n] = smallest graph_bs >= n
         self._graph_bs_for_n = [0] * (max_bs + 1)
         for n in range(max_bs + 1):
@@ -1603,7 +2310,7 @@ class LlamaEngine:
         self,
         model_name: str = "meta-llama/Llama-3.1-8B-Instruct",
         device: str = "cuda",
-        dtype: torch.dtype = torch.bfloat16,
+        dtype: torch.dtype | None = None,
         seed: int = 42,
         enforce_eager: bool = False,
         tensor_parallel_size: int = 1,
@@ -1651,6 +2358,13 @@ class LlamaEngine:
             **mr_kwargs,
         )
         self.block_manager = BlockManager(self.model_runner.num_blocks)
+        if hasattr(self.model_runner, '_cross_free_block_ids_init'):
+            n = self.model_runner._cross_free_block_ids_init
+            self.block_manager.cross_free_block_ids = deque(range(n))
+            self.block_manager._num_cross_blocks = n
+        if hasattr(self.model_runner, 'cross_blocks_per_seq'):
+            self.cross_blocks_per_seq = self.model_runner.cross_blocks_per_seq
+        self.max_num_seqs = self.model_runner.max_num_seqs
         print(f"  Scheduling: max_num_seqs={self.max_num_seqs}, "
               f"max_num_batched_tokens={self.max_num_batched_tokens}")
 
@@ -1659,12 +2373,18 @@ class LlamaEngine:
             self.tokenizer.pad_token_id = self.tokenizer.eos_token_id
 
         self.is_qwen_vl = self.model_runner.is_qwen_vl
+        self.is_qwen3_vl = self.model_runner.is_qwen3_vl
+        self.is_whisper = self.model_runner.is_whisper
         self.processor = None
         if self.is_qwen_vl:
             from transformers import AutoProcessor
             self.processor = AutoProcessor.from_pretrained(model_name)
 
         self.encoder_cache: dict[int, tuple] = {}
+
+        if self.is_whisper:
+            from transformers import WhisperProcessor
+            self.whisper_processor = WhisperProcessor.from_pretrained(model_name)
 
         atexit.register(self._cleanup)
 
@@ -1734,6 +2454,82 @@ class LlamaEngine:
         return (token_ids, pixel_values, image_grid_thw,
                 video_pixel_values, video_grid_thw)
 
+    def _dispatch_vision_encoder(self, seqs):
+        """Dispatch vision encoder to all TP ranks and build vis_cache_map.
+
+        For each sequence with images/videos, broadcasts pixel values via NCCL
+        and runs the vision encoder on all ranks (required for TP allreduce).
+
+        Returns (vis_cache_map, cache_count) where vis_cache_map is a list
+        with one entry per seq: None for text-only seqs, or a dict with
+        cache_idx/modality for vision seqs.
+        """
+        mr = self.model_runner
+        model = mr.model
+        merge_size = model.config.vision.spatial_merge_size
+
+        mr._vis_cache = []
+        vis_cache_map = []
+        cache_idx = 0
+
+        seq_entries = []
+        img_thw_list = []
+        for i, seq in enumerate(seqs):
+            if seq.pixel_values is not None:
+                pv = seq.pixel_values.cuda()
+                thw = seq.image_grid_thw
+                if not isinstance(thw, torch.Tensor):
+                    thw = torch.tensor(thw, dtype=torch.long)
+                img_thw_list.append(thw)
+                pv_shape = list(pv.shape)
+                thw_shape = list(thw.shape)
+                mr._mm_pv = pv
+                mr._mm_thw = thw
+                mr.call("_broadcast_visual", pv_shape, thw_shape)
+                seq_entries.append((i, cache_idx, "image"))
+                cache_idx += 1
+                del pv
+
+        for i, seq in enumerate(seqs):
+            if seq.video_pixel_values is not None:
+                video_pv = seq.video_pixel_values.cuda()
+                grid_thw = seq.video_grid_thw
+                if not isinstance(grid_thw, torch.Tensor):
+                    grid_thw = torch.tensor(grid_thw, dtype=torch.long)
+                grid_thw = grid_thw.cpu()
+                vpv_shape = list(video_pv.shape)
+                vthw_shape = list(grid_thw.shape)
+                mr._mm_pv = video_pv
+                mr._mm_thw = grid_thw
+                mr.call("_broadcast_visual", vpv_shape, vthw_shape)
+                seq_entries.append((i, cache_idx, "video"))
+                cache_idx += 1
+                del video_pv
+
+        per_seq_map = [None] * len(seqs)
+        for si, ci, modality in seq_entries:
+            seq = seqs[si]
+            if modality == "image":
+                thw_list = seq.image_grid_thw
+                if isinstance(thw_list, list):
+                    thw_t = torch.tensor(thw_list, dtype=torch.long)
+                else:
+                    thw_t = thw_list if isinstance(thw_list, torch.Tensor) else torch.tensor(thw_list, dtype=torch.long)
+                sizes = (thw_t.prod(-1) // (merge_size ** 2)).tolist()
+                per_seq_map[si] = {
+                    "cache_idx": ci,
+                    "modality": "image",
+                    "embed_start": 0,
+                    "embed_count": sum(sizes),
+                }
+            else:
+                per_seq_map[si] = {
+                    "cache_idx": ci,
+                    "modality": "video",
+                }
+
+        return per_seq_map, cache_idx
+
     @torch.inference_mode()
     def _run_vision_encoder(self, seqs, chunk_sizes=None):
         """Run vision encoder with batching and caching.
@@ -1751,6 +2547,9 @@ class LlamaEngine:
         """
         model = self.model_runner.model
         has_deepstack = hasattr(model.visual, 'deepstack_merger_list')
+        if has_deepstack:
+            visual_dim = model.config.vision.out_hidden_size
+            deepstack_num_levels = len(model.visual.deepstack_visual_indexes)
         merge_size = model.config.vision.spatial_merge_size
         image_token_id = self.model_runner.config.image_token_id
         video_token_id = self.model_runner.config.video_token_id
@@ -1771,15 +2570,23 @@ class LlamaEngine:
         if img_seqs:
             batched_pv = torch.cat(img_pv_list, dim=0)
             batched_thw = torch.cat(img_thw_list, dim=0).cpu()
-            vis_out = model.visual(batched_pv, grid_thw=batched_thw)
+            pv_shape = list(batched_pv.shape)
+            thw_shape = list(batched_thw.shape)
+            self.model_runner._mm_pv = batched_pv
+            self.model_runner._mm_thw = batched_thw
+            vis_out = self.model_runner.call(
+                "_broadcast_visual", pv_shape, thw_shape,
+            )
 
-            if has_deepstack:
-                all_img_embeds, all_ds_features = vis_out
+            sizes = (batched_thw.prod(-1) // (merge_size ** 2)).tolist()
+            if has_deepstack and deepstack_num_levels > 0:
+                all_img_embeds = vis_out[:, :visual_dim]
+                ds_cat = vis_out[:, visual_dim:]
+                all_ds_features = list(ds_cat.split(visual_dim, dim=1))
             else:
                 all_img_embeds = vis_out
                 all_ds_features = None
 
-            sizes = (batched_thw.prod(-1) // (merge_size ** 2)).tolist()
             per_seq_embeds = all_img_embeds.split(sizes)
             if all_ds_features is not None:
                 per_seq_ds = [ds.split(sizes) for ds in all_ds_features]
@@ -1813,10 +2620,18 @@ class LlamaEngine:
                 if not isinstance(grid_thw, torch.Tensor):
                     grid_thw = torch.tensor(grid_thw, dtype=torch.long)
                 grid_thw = grid_thw.cpu()
-                vis_out = model.visual(video_pv, grid_thw=grid_thw)
+                vpv_shape = list(video_pv.shape)
+                vthw_shape = list(grid_thw.shape)
+                self.model_runner._mm_pv = video_pv
+                self.model_runner._mm_thw = grid_thw
+                vis_out = self.model_runner.call(
+                    "_broadcast_visual", vpv_shape, vthw_shape,
+                )
 
-                if has_deepstack:
-                    video_embeds, ds_features = vis_out
+                if has_deepstack and deepstack_num_levels > 0:
+                    video_embeds = vis_out[:, :visual_dim]
+                    ds_cat = vis_out[:, visual_dim:]
+                    ds_features = list(ds_cat.split(visual_dim, dim=1))
                 else:
                     video_embeds = vis_out
                     ds_features = []
@@ -1897,13 +2712,20 @@ class LlamaEngine:
 
     @torch.inference_mode()
     def generate(self, prompts, sampling_params, collect_logits: bool = False,
-                 images=None, videos=None, use_tqdm: bool = False):
+                 images=None, videos=None, audio_features=None,
+                 use_tqdm: bool = False):
         """Generate completions for a batch of prompts.
 
         Uses unified chunked-prefill scheduling: every GPU step processes
         both decode tokens (for running seqs) and prefill chunks (for
         new/continuing seqs) in a single forward pass, matching vLLM's
         approach.
+
+        For Whisper (encoder-decoder), audio_features is a list of
+        [num_mel_bins, T] log-mel spectrogram tensors. The encoder runs
+        during the first prefill step and cross-attention KV is written
+        to paged cache. No chunked prefill for encoder-decoder (matching
+        vLLM).
         """
         if isinstance(sampling_params, list):
             sp_list = sampling_params
@@ -1926,16 +2748,37 @@ class LlamaEngine:
             images = [None] * len(prompts)
         if videos is None:
             videos = [None] * len(prompts)
+        if audio_features is None:
+            audio_features = [None] * len(prompts)
 
         _preprocess_t0 = time.perf_counter()
+
+        # Whisper: compute encoder output length from mel spectrogram length.
+        # Two conv layers with stride 2 => T_enc = T_mel // 4 (rounded down
+        # by convolutions, but padding ensures it's close to T_mel // 2 per layer).
+        # More precisely: after conv1 with kernel=3, stride=1, padding=1: T_out = T_mel
+        # after conv2 with kernel=3, stride=2, padding=1: T_out = (T_mel + 1) // 2
+        # Then the max is clamped to max_source_positions (1500).
+        def _whisper_encoder_tokens(mel_T):
+            return min((mel_T + 1) // 2, getattr(self.model_runner.config, 'max_source_positions', 1500))
 
         def _make_seq(i):
             prompt = prompts[i]
             sp = sp_list[i]
             img = images[i] if i < len(images) else None
             vid = videos[i] if i < len(videos) else None
+            aud = audio_features[i] if i < len(audio_features) else None
 
-            if self.is_qwen_vl and (img is not None or vid is not None):
+            if self.is_whisper and aud is not None:
+                ids = prompt if isinstance(prompt, list) else self.tokenizer.encode(prompt)
+                max_toks = min(sp.max_tokens,
+                               self.model_runner.max_model_len - len(ids))
+                seq = Sequence(ids, max_tokens=max_toks, ignore_eos=sp.ignore_eos)
+                seq.encoder_features = aud
+                mel_T = aud.shape[-1]
+                seq.encoder_seq_len = _whisper_encoder_tokens(mel_T)
+                return seq
+            elif self.is_qwen_vl and (img is not None or vid is not None):
                 (ids, pixel_values, image_grid_thw,
                  video_pv, video_grid_thw) = self._preprocess_multimodal(
                     prompt, images=img, videos=vid,
@@ -1948,6 +2791,8 @@ class LlamaEngine:
 
                 model = self.model_runner.model
                 merge_size = model.config.vision.spatial_merge_size
+                image_token_id = self.model_runner.config.image_token_id
+                video_token_id = self.model_runner.config.video_token_id
                 image_offsets = []
                 video_offsets = []
                 img_idx = 0
@@ -1955,18 +2800,32 @@ class LlamaEngine:
                 i_tok = 0
                 while i_tok < len(ids):
                     tid = ids[i_tok]
-                    if tid == self.model_runner.config.image_token_id and seq.image_grid_thw and img_idx < len(seq.image_grid_thw):
+                    if tid == image_token_id and seq.image_grid_thw and img_idx < len(seq.image_grid_thw):
                         image_offsets.append(i_tok)
                         t, h, w = seq.image_grid_thw[img_idx]
                         num_tokens = t * (h // merge_size) * (w // merge_size)
                         i_tok += num_tokens
                         img_idx += 1
-                    elif tid == self.model_runner.config.video_token_id and seq.video_grid_thw and vid_idx < len(seq.video_grid_thw):
-                        video_offsets.append(i_tok)
+                    elif tid == video_token_id and seq.video_grid_thw and vid_idx < len(seq.video_grid_thw):
                         t, h, w = seq.video_grid_thw[vid_idx]
-                        num_tokens = t * (h // merge_size) * (w // merge_size)
-                        i_tok += num_tokens
-                        vid_idx += 1
+                        tokens_per_frame = (h // merge_size) * (w // merge_size)
+                        if self.is_qwen3_vl:
+                            frames_found = 0
+                            j = i_tok
+                            while j < len(ids) and frames_found < t:
+                                if ids[j] == video_token_id:
+                                    video_offsets.append(j)
+                                    j += tokens_per_frame
+                                    frames_found += 1
+                                else:
+                                    j += 1
+                            vid_idx += 1
+                            i_tok = j
+                        else:
+                            video_offsets.append(i_tok)
+                            num_tokens = t * tokens_per_frame
+                            i_tok += num_tokens
+                            vid_idx += 1
                     else:
                         i_tok += 1
 
@@ -2039,6 +2898,7 @@ class LlamaEngine:
             nonlocal _pbar_pending, _pbar_pending_in, _pbar_pending_out
             seq.status = SeqStatus.FINISHED
             bm.deallocate(seq)
+            bm.deallocate_cross(seq)
             self.encoder_cache.pop(id(seq), None)
             if pbar is not None:
                 _pbar_pending += 1
@@ -2089,6 +2949,8 @@ class LlamaEngine:
 
                     mr = self.model_runner
                     n_dc = len(decode_seqs)
+                    if self.is_whisper:
+                        mr._set_cross_attn_context_decode(decode_seqs)
                     decode_data = mr._prepare_decode_arrays(decode_seqs)
                     if _PROFILE:
                         _fp_t1 = time.perf_counter()
@@ -2096,11 +2958,11 @@ class LlamaEngine:
                         mr._write_decode_shm(*decode_data)
                         mr.shm.buf[mr._SHM_FLAG_OFFSET] = 1
                         mr._signal_workers()
-                    gpu_result = mr.run_decode_greedy_fast(decode_data)
+                    has_result, _async_n = mr.run_decode_greedy_fast_async(decode_data)
                     if _PROFILE:
                         _fp_t2 = time.perf_counter()
-                    if gpu_result is not None:
-                        token_ids = gpu_result.tolist()
+                    if has_result:
+                        token_ids = mr._wait_async_tokens(_async_n)
                         if _PROFILE:
                             _fp_t3 = time.perf_counter()
                         any_finished = False
@@ -2128,6 +2990,7 @@ class LlamaEngine:
                             _fp['post'] += _fp_t4 - _fp_t3
                             _fp['n'] += 1
 
+                        _whisper_fast = self.is_whisper
                         use_incr = True
                         while running and not waiting and not prefilling:
                             if any_finished:
@@ -2135,6 +2998,8 @@ class LlamaEngine:
                                 n_dc = len(decode_seqs)
                                 any_finished = False
                                 use_incr = False
+                                if _whisper_fast:
+                                    mr._set_cross_attn_context_decode(decode_seqs)
 
                             need_blocks = 0
                             for seq in decode_seqs:
@@ -2149,7 +3014,6 @@ class LlamaEngine:
                                 if len(seq) % block_size == 1:
                                     seq.block_table.append(
                                         bm.free_block_ids.popleft())
-
                             if _PROFILE:
                                 _fp_t0 = time.perf_counter()
                             if use_incr:
@@ -2166,11 +3030,11 @@ class LlamaEngine:
                                 mr._write_decode_shm(*decode_data)
                                 mr.shm.buf[mr._SHM_FLAG_OFFSET] = 1
                                 mr._signal_workers()
-                            gpu_result = mr.run_decode_greedy_fast(decode_data)
+                            has_result, _async_n = mr.run_decode_greedy_fast_async(decode_data)
                             if _PROFILE:
                                 _fp_t2 = time.perf_counter()
-                            if gpu_result is not None:
-                                token_ids = gpu_result.tolist()
+                            if has_result:
+                                token_ids = mr._wait_async_tokens(_async_n)
                                 if _PROFILE:
                                     _fp_t3 = time.perf_counter()
                                 for seq, tid in zip(decode_seqs, token_ids):
@@ -2207,6 +3071,8 @@ class LlamaEngine:
                     for seq in decode_seqs:
                         if len(seq) % block_size == 1:
                             seq.block_table.append(bm.free_block_ids.popleft())
+                    if self.is_whisper:
+                        self.model_runner._set_cross_attn_context_decode(decode_seqs)
                     result = self.model_runner.call("run", decode_seqs, False)
                     if result is not None:
                         if collect_logits:
@@ -2243,6 +3109,7 @@ class LlamaEngine:
                 if needs_block:
                     if not bm.free_block_ids:
                         bm.deallocate(seq)
+                        bm.deallocate_cross(seq)
                         seq.preempt()
                         waiting.appendleft(seq)
                         continue
@@ -2292,7 +3159,19 @@ class LlamaEngine:
                     getattr(seq, 'pixel_values', None) is not None
                     or getattr(seq, 'video_pixel_values', None) is not None)
 
-                if has_mm:
+                is_whisper_seq = (seq.encoder_features is not None)
+
+                if is_whisper_seq:
+                    # No chunked prefill for encoder-decoder (matching vLLM).
+                    chunk = prompt_len
+                    if chunk > token_budget:
+                        break
+                    # Check cross-attn block availability
+                    cross_blocks_needed = getattr(self, 'cross_blocks_per_seq', 0)
+                    cross_free = len(getattr(bm, 'cross_free_block_ids', []))
+                    if cross_blocks_needed > 0 and cross_free < cross_blocks_needed:
+                        break
+                elif has_mm:
                     chunk = min(prompt_len, token_budget)
                     if chunk > encoder_budget:
                         break
@@ -2311,6 +3190,9 @@ class LlamaEngine:
                     break
                 waiting.popleft()
                 bm.allocate_n(seq, blocks_needed)
+                if is_whisper_seq and cross_blocks_needed > 0:
+                    for _ in range(cross_blocks_needed):
+                        seq.cross_block_table.append(bm.cross_free_block_ids.popleft())
                 seq.status = SeqStatus.PREFILLING
                 prefill_seqs.append(seq)
                 prefill_chunk_sizes.append(chunk)
@@ -2357,8 +3239,29 @@ class LlamaEngine:
                     _sp["mixed_text_pf_tokens"] += sum(prefill_chunk_sizes)
                     _sp["mixed_text_dc_tokens"] += n_dc
 
+            # ----- Whisper: run encoder for new prefill seqs -----
+            encoder_outputs = None
+            encoder_seqs = []
+            if self.is_whisper and n_pf > 0:
+                encoder_seqs = [s for s in prefill_seqs
+                                if s.encoder_features is not None and not s.encoder_computed]
+                if encoder_seqs:
+                    model = self.model_runner.model
+                    features_batch = torch.stack([
+                        s.encoder_features.to(
+                            device=f"cuda:{self.model_runner.rank}",
+                            dtype=self.model_runner.dtype,
+                        ) for s in encoder_seqs
+                    ], dim=0)
+                    encoder_outputs = model.get_multimodal_embeddings(features_batch)
+                    for seq, enc_out in zip(encoder_seqs, encoder_outputs):
+                        seq.encoder_computed = True
+                        seq.encoder_seq_len = enc_out.shape[0]
+
             if n_pf == 0 and use_greedy:
                 # Pure decode with CUDA graphs (fast path)
+                if self.is_whisper:
+                    self.model_runner._set_cross_attn_context_decode(decode_seqs)
                 gpu_result = self.model_runner.call_decode_greedy(decode_seqs)
                 if gpu_result is not None:
                     token_ids = gpu_result.tolist()
@@ -2379,6 +3282,8 @@ class LlamaEngine:
                     running.extend(decode_seqs)
             elif n_pf == 0:
                 # Pure decode, non-greedy
+                if self.is_whisper:
+                    self.model_runner._set_cross_attn_context_decode(decode_seqs)
                 result = self.model_runner.call("run", decode_seqs, False)
                 if result is not None:
                     if collect_logits:
@@ -2407,20 +3312,26 @@ class LlamaEngine:
                     for s in prefill_seqs
                 )
                 if has_mm:
-                    inputs_embeds, deepstack_embeds = self._run_vision_encoder(
-                        prefill_seqs, chunk_sizes=prefill_chunk_sizes)
-                    input_ids_t, positions_t = self.model_runner.prepare_mixed_batch(
-                        prefill_seqs, prefill_chunk_sizes, [],
+                    vis_cache_map, _ = self._dispatch_vision_encoder(prefill_seqs)
+                    _stripped_pf = self.model_runner._strip_mm_tensors(prefill_seqs)
+                    logits = self.model_runner.call(
+                        "_run_mm_lm", _stripped_pf, prefill_chunk_sizes, [],
+                        vis_cache_map,
                     )
-                    logits = self.model_runner.run_model(
-                        input_ids_t, positions_t, True,
-                        inputs_embeds=inputs_embeds,
-                        deepstack_embeds=deepstack_embeds,
-                    )
-                    reset_context()
                     if _step_profile_active:
                         torch.cuda.synchronize()
                         step_profile["mm_prefill_time"] += time.perf_counter() - _spt0
+                elif self.is_whisper and encoder_outputs:
+                    input_ids_t, positions_t = self.model_runner.prepare_mixed_batch(
+                        prefill_seqs, prefill_chunk_sizes, [],
+                    )
+                    self.model_runner._set_cross_attn_context_prefill(
+                        prefill_seqs, prefill_chunk_sizes, encoder_seqs)
+                    logits = self.model_runner.run_model(
+                        input_ids_t, positions_t, True,
+                        encoder_outputs=encoder_outputs,
+                    )
+                    reset_context()
                 else:
                     logits = self.model_runner.call(
                         "run_mixed", prefill_seqs, prefill_chunk_sizes, [],
@@ -2439,34 +3350,28 @@ class LlamaEngine:
                     for s in prefill_seqs
                 )
                 if has_mm:
-                    pf_embeds, deepstack_embeds = self._run_vision_encoder(
-                        prefill_seqs, chunk_sizes=prefill_chunk_sizes)
-                    embed_fn = self.model_runner.model.get_input_embeddings()
-                    dc_ids = torch.tensor(
-                        [s.last_token for s in decode_seqs],
-                        dtype=torch.int64, device="cuda",
+                    vis_cache_map, _ = self._dispatch_vision_encoder(prefill_seqs)
+                    _stripped_pf = self.model_runner._strip_mm_tensors(prefill_seqs)
+                    _stripped_dc = self.model_runner._strip_mm_tensors(decode_seqs)
+                    logits = self.model_runner.call(
+                        "_run_mm_lm", _stripped_pf, prefill_chunk_sizes,
+                        _stripped_dc, vis_cache_map,
                     )
-                    dc_embeds = embed_fn(dc_ids)
-                    inputs_embeds = torch.cat([pf_embeds, dc_embeds], dim=0)
-                    if deepstack_embeds is not None:
-                        dc_zeros = torch.zeros_like(dc_embeds).unsqueeze(0).expand(
-                            len(deepstack_embeds), -1, -1)
-                        deepstack_embeds = [
-                            torch.cat([ds, dc_zeros[i]], dim=0)
-                            for i, ds in enumerate(deepstack_embeds)
-                        ]
-                    input_ids_t, positions_t = self.model_runner.prepare_mixed_batch(
-                        prefill_seqs, prefill_chunk_sizes, decode_seqs,
-                    )
-                    logits = self.model_runner.run_model(
-                        input_ids_t, positions_t, True,
-                        inputs_embeds=inputs_embeds,
-                        deepstack_embeds=deepstack_embeds,
-                    )
-                    reset_context()
                     if _step_profile_active:
                         torch.cuda.synchronize()
                         step_profile["mixed_mm_time"] += time.perf_counter() - _spt0
+                elif self.is_whisper:
+                    input_ids_t, positions_t = self.model_runner.prepare_mixed_batch(
+                        prefill_seqs, prefill_chunk_sizes, decode_seqs,
+                    )
+                    self.model_runner._set_cross_attn_context_mixed(
+                        prefill_seqs, prefill_chunk_sizes, decode_seqs,
+                        encoder_seqs)
+                    logits = self.model_runner.run_model(
+                        input_ids_t, positions_t, True,
+                        encoder_outputs=encoder_outputs if encoder_outputs else [],
+                    )
+                    reset_context()
                 else:
                     logits = self.model_runner.call(
                         "run_mixed", prefill_seqs, prefill_chunk_sizes, decode_seqs,
@@ -2583,3 +3488,4 @@ class LlamaEngine:
                     bm.deallocate(seq)
             else:
                 running.append(seq)
+

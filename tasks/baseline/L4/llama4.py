@@ -135,7 +135,7 @@ class Llama4ForCausalLM(nn.Module):
         self.model = Llama4Model(config)
         self.lm_head = ParallelLMHead(config.vocab_size, config.hidden_size)
         if config.tie_word_embeddings:
-            self.lm_head.weight = self.model.embed_tokens.weight
+            self.lm_head.embedding_op.emb.weight = self.model.embed_tokens.embedding_op.emb.weight
 
     def forward(self, input_ids, positions):
         return self.model(input_ids, positions)

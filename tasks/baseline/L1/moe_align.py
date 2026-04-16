@@ -1,6 +1,6 @@
 """MoE token-to-expert alignment with block padding.
 
-Uses sgl_kernel.moe_align_block_size for high-performance, CUDA-graph-compatible
+Uses a custom CUDA kernel for high-performance, CUDA-graph-compatible
 token-to-expert alignment. Supports a naive fast path that skips the full sort
 when the number of tokens is very small relative to the number of experts.
 """
@@ -11,7 +11,7 @@ import torch
 import torch.nn as nn
 import triton
 
-from sgl_kernel import moe_align_block_size as _sgl_moe_align
+from .csrc import _C
 
 
 class MoeAlign(nn.Module):
@@ -45,9 +45,9 @@ class MoeAlign(nn.Module):
                 1, dtype=torch.int32, device=device,
             )
         if (self._cumsum_buffer is None
-                or self._cumsum_buffer.size(0) < num_experts + 2):
+                or self._cumsum_buffer.size(0) < num_experts + 1):
             self._cumsum_buffer = torch.zeros(
-                num_experts + 2, dtype=torch.int32, device=device,
+                num_experts + 1, dtype=torch.int32, device=device,
             )
 
     def _naive_forward(
@@ -78,10 +78,10 @@ class MoeAlign(nn.Module):
             return self._naive_forward(topk_ids, block_size)
 
         numel = topk_ids.numel()
-        if numel < num_experts + 1:
+        if numel < num_experts:
             max_padded = numel * block_size
         else:
-            max_padded = numel + (num_experts + 1) * (block_size - 1)
+            max_padded = numel + num_experts * (block_size - 1)
         max_blocks = triton.cdiv(max_padded, block_size)
 
         self._ensure_buffers(max_padded, max_blocks, num_experts, topk_ids.device)
@@ -89,12 +89,12 @@ class MoeAlign(nn.Module):
         sorted_token_ids = self._sorted_token_ids[:max_padded]
         expert_ids = self._expert_ids[:max_blocks]
 
-        _sgl_moe_align(
+        _C.moe_align_block_size(
             topk_ids.view(-1).contiguous(),
-            num_experts + 1, block_size,
+            num_experts, block_size,
             sorted_token_ids, expert_ids,
             self._num_tokens_post_padded,
-            self._cumsum_buffer[:num_experts + 2],
+            self._cumsum_buffer[:num_experts + 1],
             True,
         )
 

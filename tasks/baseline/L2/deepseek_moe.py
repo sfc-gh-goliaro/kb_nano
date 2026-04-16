@@ -63,7 +63,7 @@ class DeepSeekMoE(nn.Module):
     - Router: replicated gate + e_score_correction_bias
     - Shared expert: DeepSeekSharedExpertMLP (reduce_results=False)
     - Routed experts: FP8 weights (w13, w2) + per-block scales
-    - Routing: GroupedTopK via sgl_kernel.moe.moe_fused_gate
+    - Routing: GroupedTopK (sigmoid + grouped top-k with bias, matches vLLM)
     - routed_scaling_factor applied post-experts (not in routing weights)
     """
 

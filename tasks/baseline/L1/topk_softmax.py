@@ -1,6 +1,6 @@
 """Fused top-k + softmax routing for Mixture-of-Experts.
 
-Uses sgl_kernel.moe.topk_softmax for fused top-k selection and softmax
+Uses a custom CUDA kernel for fused top-k selection and softmax
 normalization with optional renormalization. Pre-allocates output buffers
 for reuse and CUDA graph compatibility.
 """
@@ -10,7 +10,7 @@ from __future__ import annotations
 import torch
 import torch.nn as nn
 
-from sgl_kernel.moe import topk_softmax as _sgl_topk_softmax
+from .csrc import _C
 
 
 class TopKSoftmax(nn.Module):
@@ -55,6 +55,6 @@ class TopKSoftmax(nn.Module):
         self._ensure_buffers(M, top_k, router_logits.device)
         topk_weights = self._topk_weights[:M]
         topk_ids = self._topk_ids[:M]
-        _sgl_topk_softmax(topk_weights, topk_ids, router_logits,
-                          renormalize=renormalize)
+        _C.topk_softmax(topk_weights, topk_ids, router_logits,
+                        renormalize, 0.0, None)
         return topk_weights, topk_ids

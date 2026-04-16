@@ -29,10 +29,7 @@ class MixtralMoE(nn.Module):
         self.tp_size = tp
         self.intermediate_per_tp = config.intermediate_size // tp
 
-        self.gate_weight = nn.Parameter(
-            torch.empty(config.num_local_experts, config.hidden_size),
-        )
-        self.gate_weight.weight_loader = lambda p, w: p.data.copy_(w)
+        self.gate = Linear(config.hidden_size, config.num_local_experts, bias=False)
 
         self.w13 = nn.Parameter(torch.empty(
             config.num_local_experts, 2 * self.intermediate_per_tp, config.hidden_size,
@@ -44,10 +41,13 @@ class MixtralMoE(nn.Module):
         ))
         self.w2.weight_loader = self._w2_weight_loader
 
-        self.linear_op = Linear()
         self.topk_softmax = TopKSoftmax()
         self.fused_experts = FusedExperts()
         self.allreduce = AllReduce()
+
+        # Custom-op dispatch for torch.compile (set by engine after model init)
+        self._use_custom_op = False
+        self._layer_name = ""
 
     def _w13_weight_loader(self, param, loaded_weight, expert_id: int, is_w1: bool):
         tp, rank = _tp_size(), _tp_rank()
@@ -61,11 +61,12 @@ class MixtralMoE(nn.Module):
         N = self.intermediate_per_tp
         param.data[expert_id].copy_(loaded_weight.narrow(1, rank * N, N))
 
-    def forward(self, hidden_states: torch.Tensor) -> torch.Tensor:
+    def forward_impl(self, hidden_states: torch.Tensor) -> torch.Tensor:
+        """Core MoE logic, callable from both eager and custom-op paths."""
         orig_shape = hidden_states.shape
         hidden_states = hidden_states.view(-1, self.hidden_size)
 
-        router_logits = self.linear_op(hidden_states, self.gate_weight)
+        router_logits = self.gate(hidden_states)
         topk_weights, topk_ids = self.topk_softmax(
             router_logits, self.top_k, renormalize=True,
         )
@@ -80,3 +81,8 @@ class MixtralMoE(nn.Module):
             out = self.allreduce(out)
 
         return out.view(orig_shape)
+
+    def forward(self, hidden_states: torch.Tensor) -> torch.Tensor:
+        if self._use_custom_op:
+            return torch.ops.kb_nano.moe_forward(hidden_states, self._layer_name)
+        return self.forward_impl(hidden_states)

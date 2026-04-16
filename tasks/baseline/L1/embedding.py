@@ -1,9 +1,14 @@
-"""Embedding lookup kernel: F.embedding(input, weight, ...)."""
+"""Embedding lookup kernel: wraps nn.Embedding."""
 
 import torch.nn as nn
-import torch.nn.functional as F
 
 
 class Embedding(nn.Module):
-    def forward(self, input, weight):
-        return F.embedding(input, weight)
+    def __init__(self, num_embeddings: int, embedding_dim: int,
+                 padding_idx: int | None = None):
+        super().__init__()
+        self.emb = nn.Embedding(num_embeddings, embedding_dim,
+                                padding_idx=padding_idx)
+
+    def forward(self, input_ids):
+        return self.emb(input_ids)
