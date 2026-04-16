@@ -17,12 +17,10 @@ class VisionPosEmbedInterpolate(nn.Module):
     def __init__(self, num_position_embeddings: int, hidden_size: int,
                  spatial_merge_size: int):
         super().__init__()
-        self.pos_embed = nn.Parameter(torch.empty(num_position_embeddings, hidden_size))
-        nn.init.normal_(self.pos_embed)
+        self._embed = Embedding(num_position_embeddings, hidden_size)
         self.num_grid_per_side = int(num_position_embeddings ** 0.5)
         self.spatial_merge_size = spatial_merge_size
         self.hidden_size = hidden_size
-        self._embed = Embedding()
 
     def forward(
         self,
@@ -61,7 +59,7 @@ class VisionPosEmbedInterpolate(nn.Module):
             indices = (h_grid * num_grid + w_grid).reshape(4, -1)
             weights = torch.stack([w00, w01, w10, w11], dim=0).reshape(4, -1, 1).to(dtype=dtype)
 
-            embeds = self._embed(indices, self.pos_embed) * weights
+            embeds = self._embed(indices) * weights
             combined = embeds.sum(dim=0)
             combined = combined.reshape(
                 h // m_size, m_size, w // m_size, m_size, hidden_dim

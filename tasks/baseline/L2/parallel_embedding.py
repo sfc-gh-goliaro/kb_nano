@@ -8,7 +8,7 @@ import torch.nn as nn
 
 from ....infra.context import get_context
 from ....infra.tp import _tp_size, _tp_rank
-from ..L1.linear import Linear
+from ..L1.linear import Matmul
 from ..L1.embedding import Embedding
 from ..L1.allreduce import AllReduce
 
@@ -31,9 +31,8 @@ class VocabParallelEmbedding(nn.Module):
         self.tp_size = tp
         if params_dtype is None:
             params_dtype = torch.get_default_dtype()
-        self.weight = nn.Parameter(torch.empty(self.per_partition, embedding_dim, dtype=params_dtype))
-        self.weight.weight_loader = self._weight_loader
-        self.embedding_op = Embedding()
+        self.embedding_op = Embedding(self.per_partition, embedding_dim)
+        self.embedding_op.emb.weight.weight_loader = self._weight_loader
         self.allreduce = AllReduce()
 
     def _weight_loader(self, param, loaded_weight):
@@ -45,9 +44,9 @@ class VocabParallelEmbedding(nn.Module):
         if self.tp_size > 1:
             mask = (x >= self.vocab_start) & (x < self.vocab_end)
             x = mask * (x - self.vocab_start)
-        y = self.embedding_op(x, self.weight)
+        y = self.embedding_op(x)
         if self.tp_size > 1:
-            y = mask.unsqueeze(1) * y
+            y = mask.unsqueeze(-1) * y
             y = self.allreduce(y)
         return y
 
@@ -62,7 +61,7 @@ class ParallelLMHead(VocabParallelEmbedding):
                          params_dtype=params_dtype,
                          org_num_embeddings=org_num_embeddings,
                          padding_size=padding_size)
-        self.linear_op = Linear()
+        self.linear_op = Matmul()
 
     def project(self, x):
         """Linear projection only (no gather). Used inside CUDA graph."""
@@ -72,7 +71,7 @@ class ParallelLMHead(VocabParallelEmbedding):
         elif ctx.is_prefill:
             last_indices = ctx.cu_seqlens_q[1:] - 1
             x = x[last_indices].contiguous()
-        return self.linear_op(x, self.weight)
+        return self.linear_op(x, self.embedding_op.emb.weight)
 
     def gather_logits(self, logits):
         """Gather partial logits from all ranks. Used outside CUDA graph."""

@@ -48,10 +48,10 @@ def run_worker(script: str, config: dict, label: str, timeout: int = 3600) -> di
     try:
         print(f"\n{'─' * 70}")
         print(f"  {label}")
-        print(f"{'─' * 70}")
+        print(f"{'─' * 70}", flush=True)
 
         result = subprocess.run(
-            [sys.executable, script_path, config_path],
+            [sys.executable, "-u", script_path, config_path],
             timeout=timeout,
         )
         if result.returncode != 0:
