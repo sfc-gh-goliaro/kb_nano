@@ -1,7 +1,7 @@
 """Model-level multi-head attention (thin wrapper).
 
 Consolidates vLLM's ``LlamaAttention``, ``Llama4Attention``,
-``Qwen3Attention``, and ``GptOssAttention``:
+``Qwen3Attention``, and GPT-OSS attention:
 QKV projection, optional QK-norm, optional RoPE, then delegates to
 ``Attention`` for KV cache storage and kernel dispatch.
 

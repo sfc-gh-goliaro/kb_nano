@@ -24,7 +24,6 @@ from __future__ import annotations
 import numpy as np
 import torch
 import torch.nn as nn
-import torch.nn.functional as F
 
 from ....infra.context import get_context, get_attn_backend_config
 from ..L1.store_kvcache import StoreKVCache, StoreKVCacheHND
@@ -182,10 +181,9 @@ class Attention(nn.Module):
 
         attn_cfg = get_attn_backend_config()
         self._use_trtllm = attn_cfg.use_trtllm
-        self._use_sdpa = False
         self._block_size = attn_cfg.block_size
 
-        # FA3 native sinks: pass sinks as s_aux, sliding window as window_size
+        # Native FA3/TRTLLM path: sinks -> s_aux, sliding window -> window_size.
         self._fa3_sinks = sinks
         self._fa3_window_size = (
             (sliding_window - 1, 0) if sliding_window is not None else (-1, -1)
@@ -214,8 +212,6 @@ class Attention(nn.Module):
             self.decode_op = FlashAttnDecode(
                 self.num_heads, self.num_kv_heads, head_size,
             )
-
-        # FlashAttn path now handles sinks via s_aux, no SDPA fallback needed
 
     def set_trtllm_workspace(self, workspace: torch.Tensor):
         if self._use_trtllm:
@@ -250,212 +246,6 @@ class Attention(nn.Module):
                 query, key, value, self._layer_name,
             )
         return self.forward_impl(query, key, value)
-
-    # ---- SDPA path (for GPT-OSS attention sinks) ----
-
-    def _forward_sdpa(self, q, k, v, k_cache, v_cache, ctx):
-        """SDPA-based forward path for attention with sinks and/or sliding window."""
-        if ctx.is_mixed:
-            return self._forward_sdpa_mixed(q, k_cache, v_cache, ctx)
-        if ctx.is_prefill:
-            return self._forward_sdpa_prefill(q, k, v, ctx)
-        return self._forward_sdpa_decode(q, k_cache, v_cache, ctx)
-
-    def _forward_sdpa_mixed(self, q, k_cache, v_cache, ctx):
-        """Handle mixed prefill+decode batch for SDPA path."""
-        np_ = ctx.num_prefill_tokens
-        nd = ctx.num_decode_tokens
-        out = torch.empty_like(q)
-
-        if np_ > 0:
-            cu_q = ctx.prefill_cu_seqlens_q
-            B_pf = cu_q.shape[0] - 1
-            outputs = []
-            for b in range(B_pf):
-                start = int(cu_q[b].item())
-                end = int(cu_q[b + 1].item())
-                T = end - start
-                q_b = q[start:end]
-
-                seq_len = int(ctx.prefill_cu_seqlens_k[b + 1].item() - ctx.prefill_cu_seqlens_k[b].item())
-                k_b, v_b = self._gather_kv_from_cache(
-                    k_cache, v_cache, ctx.prefill_block_tables[b], seq_len,
-                )
-
-                if self.num_kv_heads != self.num_heads:
-                    rep = self.num_heads // self.num_kv_heads
-                    k_b = k_b.repeat_interleave(rep, dim=1)
-                    v_b = v_b.repeat_interleave(rep, dim=1)
-
-                if self.sinks is not None:
-                    zero_kv = torch.zeros(1, self.num_heads, self.head_size,
-                                          device=q.device, dtype=q.dtype)
-                    k_ext = torch.cat([k_b, zero_kv], dim=0)
-                    v_ext = torch.cat([v_b, zero_kv], dim=0)
-                    q_4d = q_b.transpose(0, 1).unsqueeze(0)
-                    k_4d = k_ext.transpose(0, 1).unsqueeze(0)
-                    v_4d = v_ext.transpose(0, 1).unsqueeze(0)
-                    attn_bias = self._make_prefill_bias(T, seq_len, q.device, q.dtype)
-                    o_b = F.scaled_dot_product_attention(
-                        q_4d, k_4d, v_4d, attn_mask=attn_bias.unsqueeze(0),
-                        scale=self.scale,
-                    )
-                    outputs.append(o_b.squeeze(0).transpose(0, 1))
-                else:
-                    q_4d = q_b.transpose(0, 1).unsqueeze(0)
-                    k_4d = k_b.transpose(0, 1).unsqueeze(0)
-                    v_4d = v_b.transpose(0, 1).unsqueeze(0)
-                    o_b = F.scaled_dot_product_attention(
-                        q_4d, k_4d, v_4d, is_causal=(T == seq_len), scale=self.scale,
-                    )
-                    outputs.append(o_b.squeeze(0).transpose(0, 1))
-            out[:np_] = torch.cat(outputs, dim=0)
-
-        if nd > 0:
-            decode_ctx_wrapper = type(ctx)(
-                block_tables=ctx.decode_block_tables,
-                context_lens=ctx.decode_context_lens,
-                max_context_len=ctx.decode_max_context_len,
-            )
-            out[np_:] = self._forward_sdpa_decode(q[np_:], k_cache, v_cache, decode_ctx_wrapper)
-
-        return out
-
-    def _gather_kv_from_cache(self, k_cache, v_cache, block_table, seq_len):
-        """Gather K/V from paged cache for a single sequence."""
-        block_size = k_cache.shape[1]
-        num_blocks = (seq_len + block_size - 1) // block_size
-        k_out = torch.zeros(seq_len, self.num_kv_heads, self.head_size,
-                            device=k_cache.device, dtype=k_cache.dtype)
-        v_out = torch.zeros_like(k_out)
-        for blk_idx in range(num_blocks):
-            block_id = block_table[blk_idx]
-            start = blk_idx * block_size
-            end = min(start + block_size, seq_len)
-            length = end - start
-            k_out[start:end] = k_cache[block_id, :length]
-            v_out[start:end] = v_cache[block_id, :length]
-        return k_out, v_out
-
-    def _forward_sdpa_prefill(self, q, k, v, ctx):
-        cu_q = ctx.cu_seqlens_q
-        B = cu_q.shape[0] - 1
-        outputs = []
-        for b in range(B):
-            start = int(cu_q[b].item())
-            end = int(cu_q[b + 1].item())
-            T = end - start
-            q_b = q[start:end]
-            k_b = k[start:end]
-            v_b = v[start:end]
-
-            if self.num_kv_heads != self.num_heads:
-                rep = self.num_heads // self.num_kv_heads
-                k_b = k_b.repeat_interleave(rep, dim=1)
-                v_b = v_b.repeat_interleave(rep, dim=1)
-
-            if self.sinks is not None:
-                zero_kv = torch.zeros(1, self.num_heads, self.head_size,
-                                      device=q.device, dtype=q.dtype)
-                k_ext = torch.cat([k_b, zero_kv], dim=0)
-                v_ext = torch.cat([v_b, zero_kv], dim=0)
-                q_4d = q_b.transpose(0, 1).unsqueeze(0)
-                k_4d = k_ext.transpose(0, 1).unsqueeze(0)
-                v_4d = v_ext.transpose(0, 1).unsqueeze(0)
-                attn_bias = self._make_prefill_bias(T, T, q.device, q.dtype)
-                o_b = F.scaled_dot_product_attention(
-                    q_4d, k_4d, v_4d, attn_mask=attn_bias.unsqueeze(0),
-                    scale=self.scale,
-                )
-                outputs.append(o_b.squeeze(0).transpose(0, 1))
-            else:
-                q_4d = q_b.transpose(0, 1).unsqueeze(0)
-                k_4d = k_b.transpose(0, 1).unsqueeze(0)
-                v_4d = v_b.transpose(0, 1).unsqueeze(0)
-                o_b = F.scaled_dot_product_attention(
-                    q_4d, k_4d, v_4d, is_causal=True, scale=self.scale,
-                )
-                outputs.append(o_b.squeeze(0).transpose(0, 1))
-        return torch.cat(outputs, dim=0)
-
-    def _forward_sdpa_decode(self, q, k_cache, v_cache, ctx):
-        B = ctx.block_tables.shape[0]
-        max_seq = int(ctx.context_lens.max().item())
-        block_size = k_cache.shape[1]
-
-        k_gathered = torch.zeros(B, max_seq, self.num_kv_heads, self.head_size,
-                                 device=k_cache.device, dtype=k_cache.dtype)
-        v_gathered = torch.zeros_like(k_gathered)
-        for b in range(B):
-            seq_len = int(ctx.context_lens[b].item())
-            num_blocks = (seq_len + block_size - 1) // block_size
-            for blk_idx in range(num_blocks):
-                block_id = ctx.block_tables[b, blk_idx]
-                start = blk_idx * block_size
-                end = min(start + block_size, seq_len)
-                length = end - start
-                k_gathered[b, start:end] = k_cache[block_id, :length]
-                v_gathered[b, start:end] = v_cache[block_id, :length]
-
-        q_4d = q.view(B, 1, self.num_heads, self.head_size).transpose(1, 2)
-        k_4d = k_gathered.transpose(1, 2)
-        v_4d = v_gathered.transpose(1, 2)
-
-        if self.num_kv_heads != self.num_heads:
-            rep = self.num_heads // self.num_kv_heads
-            k_4d = k_4d.repeat_interleave(rep, dim=1)
-            v_4d = v_4d.repeat_interleave(rep, dim=1)
-
-        if self.sinks is not None:
-            zero_kv = torch.zeros(B, self.num_heads, 1, self.head_size,
-                                  device=q.device, dtype=q.dtype)
-            k_4d = torch.cat([k_4d, zero_kv], dim=2)
-            v_4d = torch.cat([v_4d, zero_kv], dim=2)
-            attn_bias = torch.zeros(self.num_heads, 1, max_seq + 1,
-                                    device=q.device, dtype=q.dtype)
-            attn_bias[:, :, -1] = self.sinks.unsqueeze(1)
-            if self.sliding_window is not None:
-                for b_idx in range(B):
-                    seq_len = int(ctx.context_lens[b_idx].item())
-                    cutoff = seq_len - self.sliding_window
-                    if cutoff > 0:
-                        attn_bias[:, :, :cutoff] = float("-inf")
-            for b_idx in range(B):
-                seq_len = int(ctx.context_lens[b_idx].item())
-                if seq_len < max_seq:
-                    attn_bias[:, :, seq_len:max_seq] = float("-inf")
-            attn_bias = attn_bias.unsqueeze(0).expand(B, -1, -1, -1)
-            o = F.scaled_dot_product_attention(
-                q_4d, k_4d, v_4d, attn_mask=attn_bias, scale=self.scale,
-            )
-        else:
-            o = F.scaled_dot_product_attention(
-                q_4d, k_4d, v_4d, is_causal=False, scale=self.scale,
-            )
-        return o.transpose(1, 2).reshape(B, self.num_heads, self.head_size)
-
-    def _make_prefill_bias(self, T: int, S: int, device, dtype):
-        """Build attention bias: causal + sliding window + virtual sink column."""
-        bias = torch.zeros(T, S, device=device, dtype=dtype)
-        if T > 1:
-            causal = torch.triu(
-                torch.full((T, S), float("-inf"), device=device, dtype=dtype),
-                diagonal=S - T + 1,
-            )
-            bias = bias + causal
-        if self.sliding_window is not None and S > self.sliding_window:
-            sw_mask = torch.tril(
-                torch.full((T, S), float("-inf"), device=device, dtype=dtype),
-                diagonal=S - T - self.sliding_window,
-            )
-            bias = bias + sw_mask
-        bias = bias.unsqueeze(0).expand(self.num_heads, -1, -1).contiguous()
-        if self.sinks is not None:
-            sink_col = self.sinks.view(self.num_heads, 1, 1).expand(-1, T, 1)
-            bias = torch.cat([bias, sink_col], dim=-1)
-        return bias
-
-    # ---- FlashAttn / TRTLLM paths ----
 
     def _forward_pure(self, q, k, v, k_cache, v_cache, ctx):
         fa_extra = {}
