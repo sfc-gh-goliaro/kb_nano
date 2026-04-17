@@ -48,6 +48,14 @@ class DeepSeekV3Config:
     routed_scaling_factor: float = 2.5
     first_k_dense_replace: int = 1
     moe_layer_freq: int = 1
+    # Routing variant.  DeepSeek-V3/V3.2 ship ``scoring_func='sigmoid'`` and
+    # ``topk_method='noaux_tc'`` with ``norm_topk_prob=True``.  Older V2
+    # checkpoints used ``softmax``.  We default to V2's softmax for backwards
+    # compatibility and override from the HF config in ``from_pretrained``.
+    scoring_func: str = "softmax"
+    topk_method: str = "noaux_tc"
+    norm_topk_prob: bool = True
+    hidden_act: str = "silu"
 
     # DSA params (V3.2 only — None when not a V3.2 model)
     index_topk: Optional[int] = None
@@ -73,10 +81,14 @@ class DeepSeekV3Config:
         try:
             hf = AutoConfig.from_pretrained(model_name, trust_remote_code=True)
         except ValueError:
+            import os as _os
             from transformers import DeepseekV3Config as _HFDSConfig
-            from huggingface_hub import hf_hub_download
             import json
-            path = hf_hub_download(model_name, "config.json")
+            if _os.path.isdir(model_name):
+                path = _os.path.join(model_name, "config.json")
+            else:
+                from huggingface_hub import hf_hub_download
+                path = hf_hub_download(model_name, "config.json")
             with open(path) as f:
                 cfg = json.load(f)
             cfg["model_type"] = "deepseek_v3"
@@ -118,6 +130,10 @@ class DeepSeekV3Config:
             routed_scaling_factor=getattr(hf, 'routed_scaling_factor', 2.5),
             first_k_dense_replace=getattr(hf, 'first_k_dense_replace', 1),
             moe_layer_freq=getattr(hf, 'moe_layer_freq', 1),
+            scoring_func=getattr(hf, 'scoring_func', 'softmax'),
+            topk_method=getattr(hf, 'topk_method', 'noaux_tc'),
+            norm_topk_prob=getattr(hf, 'norm_topk_prob', True),
+            hidden_act=getattr(hf, 'hidden_act', 'silu'),
             index_topk=getattr(hf, 'index_topk', None),
             index_n_heads=getattr(hf, 'index_n_heads', None),
             index_head_dim=getattr(hf, 'index_head_dim', None),

@@ -24,6 +24,19 @@ import math
 import torch
 import torch.nn as nn
 
+# Detect FlashInfer rotary op once at import time.  vLLM registers
+# ``torch.ops.vllm.flashinfer_rotary_embedding`` only when the FlashInfer
+# package is installed and the platform supports it.  We mirror that check
+# without forcing a hard dependency.
+def _detect_flashinfer_rope() -> bool:
+    try:
+        import vllm.model_executor.layers.rotary_embedding.deepseek_scaling_rope  # noqa: F401 — registers op
+        return hasattr(torch.ops.vllm, "flashinfer_rotary_embedding")
+    except Exception:
+        return False
+
+_USE_FLASHINFER_ROPE = _detect_flashinfer_rope()
+
 from .rotary_emb import RotaryEmbedding
 
 
@@ -190,6 +203,18 @@ class YarnRotaryEmbedding(nn.Module):
         self.register_buffer("cos_sin_cache", cache, persistent=False)
 
     def forward(self, positions, query, key):
+        # vLLM's ``DeepseekScalingRotaryEmbedding.forward_cuda`` prefers the
+        # FlashInfer fused kernel when available (see
+        # ``vllm/model_executor/layers/rotary_embedding/deepseek_scaling_rope.py:181-198``).
+        # FlashInfer keeps ``cos_sin_cache`` in float32; only the kb_nano
+        # CUDA kernel needs the cache cast to query.dtype.
+        if _USE_FLASHINFER_ROPE and query.dtype in (torch.float16, torch.bfloat16) \
+                and self.head_dim in (64, 128, 256, 512):
+            torch.ops.vllm.flashinfer_rotary_embedding(
+                positions, query, key, self.head_dim, self.cos_sin_cache,
+                self.is_neox_style,
+            )
+            return query, key
         cache = self.cos_sin_cache
         if cache.dtype != query.dtype:
             cache = cache.to(query.dtype)

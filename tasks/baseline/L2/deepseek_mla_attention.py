@@ -95,10 +95,16 @@ class DeepSeekMLAAttention(nn.Module):
             kv_lora_rank=self.kv_lora_rank,
             is_sparse=self.is_v32,
         )
+        # Share the kv_b_proj module so ``MLAAttention.forward_impl`` (and
+        # the ``kb_nano::unified_mla_attention`` custom op) can project
+        # kv_c_normed -> kv without routing a non-tensor arg through the
+        # op schema. Bypass ``nn.Module.__setattr__`` to avoid double
+        # registration as a submodule.
+        object.__setattr__(self.attn, "_kv_b_proj", self.kv_b_proj)
 
         # DSA Indexer (V3.2 only)
         if self.is_v32:
-            _irp = getattr(config, "rope_parameters", None) or {}
+            _rp = getattr(config, "rope_parameters", None) or {}
             self.indexer = SparseAttnIndexer(
                 hidden_size=self.hidden_size,
                 q_lora_rank=self.q_lora_rank,
@@ -109,21 +115,31 @@ class DeepSeekMLAAttention(nn.Module):
                 quant_config=quant_config,
                 topk_indices_buffer=topk_indices_buffer,
             )
+            # Indexer RoPE is built from the *same* source as the main attention
+            # RoPE (matches ``vllm/model_executor/models/deepseek_v2.py:944-949``
+            # which calls ``get_rope(qk_rope_head_dim, max_position_embeddings,
+            # rope_parameters=config.rope_parameters, is_neox_style=...)``).
+            # The only divergence from main rope is ``is_neox_style``, which is
+            # ``not indexer_rope_interleave``.
             indexer_interleave = getattr(config, "indexer_rope_interleave", False)
             self.indexer_rope_emb = YarnRotaryEmbedding(
                 head_dim=self.qk_rope_head_dim,
-                max_position_embeddings=_irp.get(
+                max_position_embeddings=_rp.get(
                     'original_max_position_embeddings',
                     config.max_position_embeddings),
-                rope_theta=_irp.get("rope_theta", getattr(config, "rope_theta", 10000.0)),
-                scaling_factor=_irp.get("factor", 1.0),
-                attn_factor=_irp.get("attn_factor", 1.0),
-                beta_fast=_irp.get("beta_fast", 32),
-                beta_slow=_irp.get("beta_slow", 1),
-                mscale=_irp.get("mscale", 1.0),
-                mscale_all_dim=_irp.get("mscale_all_dim", 0.0),
+                rope_theta=getattr(config, "rope_theta", 10000.0),
+                scaling_factor=_rp.get("factor", 1.0),
+                attn_factor=_rp.get("attn_factor", 1.0),
+                beta_fast=_rp.get("beta_fast", 32),
+                beta_slow=_rp.get("beta_slow", 1),
+                mscale=_rp.get("mscale", 1.0),
+                mscale_all_dim=_rp.get("mscale_all_dim", 0.0),
                 is_neox_style=not indexer_interleave,
             )
+            # Share the rope_emb module with the indexer so its custom op
+            # doesn't need a non-tensor argument (same reasoning as
+            # ``self.attn._kv_b_proj`` above).
+            object.__setattr__(self.indexer, "_rope_emb", self.indexer_rope_emb)
         else:
             self.indexer = None
             self.indexer_rope_emb = None
@@ -194,15 +210,16 @@ class DeepSeekMLAAttention(nn.Module):
         q[..., self.qk_nope_head_dim:], k_pe = self.rotary_emb(
             positions, q[..., self.qk_nope_head_dim:], k_pe)
 
-        # DSA Indexer (V3.2)
+        # DSA Indexer (V3.2) — rope_emb is wired to self.indexer._rope_emb
+        # so the forward takes only tensor args (custom-op safe).
         topk_indices = None
         if self.indexer is not None and self.is_v32:
-            topk_indices = self.indexer(
-                hidden_states, q_c, positions, self.indexer_rope_emb)
+            topk_indices = self.indexer(hidden_states, q_c, positions)
 
-        # MLA attention
+        # MLA attention — kv_b_proj is wired to self.attn._kv_b_proj so
+        # the forward takes only tensor args (custom-op safe).
         attn_output = self.attn(
-            q, kv_c_normed, k_pe, self.kv_b_proj,
+            q, kv_c_normed, k_pe,
             topk_indices=topk_indices,
             output_shape=(N, self.num_local_heads * self.v_head_dim),
         )

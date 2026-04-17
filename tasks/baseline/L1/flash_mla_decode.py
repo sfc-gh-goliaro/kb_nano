@@ -1,20 +1,42 @@
-"""FlashMLA decode kernel for MLA (Multi-head Latent Attention)."""
+"""FlashMLA decode kernels for MLA (Multi-head Latent Attention).
+
+Mirrors vLLM's two distinct decode entry points:
+
+* ``flash_mla_with_kvcache`` — generic decode kernel. Used for BF16 KV cache
+  and for *sparse* FP8 decode (which routes FP8 through the generic kernel
+  with ``is_fp8_kvcache=True`` plus ``indices``).
+* ``flash_mla_with_kvcache_fp8`` — dedicated dense FP8 decode kernel. Takes
+  ``descale_q`` / ``descale_k`` per-layer scales and a ``num_splits`` tensor
+  produced by ``get_mla_metadata_dense_fp8``.
+
+vLLM's ``FlashMLAImpl.forward_mqa`` switches between the two on
+``self.kv_cache_dtype.startswith("fp8")``; we replicate that branching at the
+caller level (``MLAAttention._forward_dense_decode`` / ``_forward_mixed``).
+"""
 
 from __future__ import annotations
 
 import torch
 import torch.nn as nn
 
-from flash_mla import flash_mla_with_kvcache, get_mla_metadata
+from ._flashmla_backend import (
+    flash_mla_with_kvcache,
+    flash_mla_with_kvcache_fp8,
+    get_mla_metadata,
+    get_mla_metadata_dense_fp8,
+)
 
 
 class FlashMLADecode(nn.Module):
-    """Wraps flash_mla.flash_mla_with_kvcache for paged MLA decode.
+    """Wraps ``flash_mla_with_kvcache`` for paged MLA decode.
 
-    Supports:
-    - Dense decode against compressed KV cache
-    - FP8 KV cache via is_fp8_kvcache flag
-    - Sparse decode with indices parameter for DSA
+    Used for:
+    - BF16 dense decode (``is_fp8_kvcache=False``)
+    - Sparse FP8 decode with ``indices`` (DSA path)
+
+    Dense FP8 decode goes through :class:`FlashMLADecodeFP8` instead, which
+    matches vLLM's ``flash_mla_with_kvcache_fp8`` entry point with
+    ``descale_q`` / ``descale_k`` and ``num_splits``.
     """
 
     def forward(
@@ -26,6 +48,7 @@ class FlashMLADecode(nn.Module):
         head_dim_v: int,
         tile_scheduler_metadata: torch.Tensor,
         softmax_scale: float,
+        causal: bool = True,
         is_fp8_kvcache: bool = False,
         indices: torch.Tensor | None = None,
     ) -> tuple[torch.Tensor, torch.Tensor]:
@@ -37,8 +60,52 @@ class FlashMLADecode(nn.Module):
             head_dim_v=head_dim_v,
             tile_scheduler_metadata=tile_scheduler_metadata,
             softmax_scale=softmax_scale,
+            causal=causal,
             is_fp8_kvcache=is_fp8_kvcache,
             indices=indices,
+        )
+
+
+class FlashMLADecodeFP8(nn.Module):
+    """Dense FP8 decode wrapper matching vLLM's ``flash_mla_with_kvcache_fp8``.
+
+    Requires ``descale_q`` / ``descale_k`` (per-layer Q/K dequantization
+    scales) and a ``num_splits`` tensor produced by
+    :class:`FlashMLAGetMetadataDenseFP8`.
+    """
+
+    available: bool = flash_mla_with_kvcache_fp8 is not None
+
+    def forward(
+        self,
+        q: torch.Tensor,
+        k_cache: torch.Tensor,
+        block_table: torch.Tensor,
+        cache_seqlens: torch.Tensor,
+        head_dim_v: int,
+        tile_scheduler_metadata: torch.Tensor,
+        num_splits: torch.Tensor,
+        softmax_scale: float,
+        causal: bool = True,
+        descale_q: torch.Tensor | None = None,
+        descale_k: torch.Tensor | None = None,
+    ) -> tuple[torch.Tensor, torch.Tensor]:
+        assert flash_mla_with_kvcache_fp8 is not None, (
+            "flash_mla_with_kvcache_fp8 not available — "
+            "vLLM build must include _flashmla_extension_C"
+        )
+        return flash_mla_with_kvcache_fp8(
+            q=q,
+            k_cache=k_cache,
+            block_table=block_table,
+            cache_seqlens=cache_seqlens,
+            head_dim_v=head_dim_v,
+            tile_scheduler_metadata=tile_scheduler_metadata,
+            num_splits=num_splits,
+            softmax_scale=softmax_scale,
+            causal=causal,
+            descale_q=descale_q,
+            descale_k=descale_k,
         )
 
 
@@ -67,3 +134,28 @@ class FlashMLAGetMetadata(nn.Module):
                 **kwargs,
             )
         return get_mla_metadata(cache_seqlens, num_q_tokens_per_head_k, num_heads_k)
+
+
+class FlashMLAGetMetadataDenseFP8(nn.Module):
+    """Wraps ``get_mla_metadata_dense_fp8`` for the FP8 dense decode kernel.
+
+    Returns ``(tile_scheduler_metadata, num_splits)`` which both must be fed
+    into :class:`FlashMLADecodeFP8`. Matches the vLLM call site in
+    ``vllm/v1/attention/backends/mla/flashmla.py:171-178``.
+    """
+
+    available: bool = get_mla_metadata_dense_fp8 is not None
+
+    def forward(
+        self,
+        cache_seqlens: torch.Tensor,
+        num_q_tokens_per_head_k: int,
+        num_heads_k: int = 1,
+    ) -> tuple[torch.Tensor, torch.Tensor]:
+        assert get_mla_metadata_dense_fp8 is not None, (
+            "get_mla_metadata_dense_fp8 not available — "
+            "vLLM build must include _flashmla_extension_C"
+        )
+        return get_mla_metadata_dense_fp8(
+            cache_seqlens, num_q_tokens_per_head_k, num_heads_k,
+        )

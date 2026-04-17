@@ -1,56 +1,193 @@
 """Grouped top-k routing for DeepSeek-style MoE.
 
-Implements sigmoid-gated grouped-top-k with optional bias, matching
-vLLM's ``grouped_topk`` helper and sgl_kernel's ``moe_fused_gate``.  This
-is the pure-PyTorch reference used by DeepSeek V3: scores are obtained via
-``sigmoid(router_logits)``, groups are scored by the sum of their top-2
-experts, the top ``topk_group`` groups are selected, and top-``topk``
-experts are then picked from within those groups.
+Mirrors vLLM's reference ``grouped_topk`` implementation in
+``vllm/model_executor/layers/fused_moe/router/grouped_topk_router.py:84-165``
+with full parity for:
 
-Normalisation matches vLLM's pattern: if ``topk > 1`` the kept weights are
-renormalised to sum to 1 before returning.
+* ``scoring_func`` ("sigmoid" / "softmax")
+* ``e_score_correction_bias`` — when present, biased scores are used for
+  expert selection but original (unbiased) scores are used for routing
+  weights, and group score is "sum of top-2" within group; when absent,
+  group score is "max within group"
+* ``renormalize`` — only renormalize when explicitly requested, with no
+  epsilon (matches vLLM)
+* ``routed_scaling_factor`` — folded into routing weights when != 1.0
+* ``sorted`` — uses ``vllm_is_batch_invariant()`` to pick sorted vs unsorted
+  top-k (matches vLLM's batch-invariant mode)
+
+Returns FP32 ``topk_weights`` to match vLLM.
 """
 
 from __future__ import annotations
+
+import os
 
 import torch
 import torch.nn as nn
 
 
+def _is_batch_invariant() -> bool:
+    """Return True when running in batch-invariant mode (matches vLLM's
+    ``vllm_is_batch_invariant`` helper)."""
+    return os.environ.get("VLLM_BATCH_INVARIANT", "0") == "1"
+
+
+# Cache the resolved fused kernel reference so we only pay the import +
+# attribute lookup once per process (the lookup is on the hot per-MoE-layer,
+# per-token path).
+_FUSED_GROUPED_TOPK = None
+_FUSED_GROUPED_TOPK_RESOLVED = False
+
+
+def _maybe_get_fused_grouped_topk():
+    """Return ``vllm._custom_ops.grouped_topk`` if the fused CUDA kernel is
+    available on this build, otherwise ``None``.
+
+    Mirrors vLLM's enablement gate in
+    ``vllm/model_executor/layers/fused_moe/router/grouped_topk_router.py:95-101``:
+    ``VLLM_USE_FUSED_MOE_GROUPED_TOPK and is_cuda and num_expert_group<=32 and
+    topk<=32 and e_score_correction_bias is not None``. The first three
+    conditions are checked here; the latter two are checked at call-time.
+    """
+    global _FUSED_GROUPED_TOPK, _FUSED_GROUPED_TOPK_RESOLVED
+    if _FUSED_GROUPED_TOPK_RESOLVED:
+        return _FUSED_GROUPED_TOPK
+    _FUSED_GROUPED_TOPK_RESOLVED = True
+
+    if os.environ.get("VLLM_USE_FUSED_MOE_GROUPED_TOPK", "1") != "1":
+        return None
+    if not torch.cuda.is_available():
+        return None
+    try:
+        # ``vllm._custom_ops.grouped_topk`` wraps ``torch.ops._moe_C.grouped_topk``
+        # — vLLM's fully fused CUDA top-k kernel.
+        from vllm import _custom_ops as _vllm_ops
+        _FUSED_GROUPED_TOPK = _vllm_ops.grouped_topk
+    except Exception:
+        _FUSED_GROUPED_TOPK = None
+    return _FUSED_GROUPED_TOPK
+
+
 class GroupedTopK(nn.Module):
+    """Functional grouped top-k router.
+
+    Configuration that is fixed per-MoE layer (``scoring_func``,
+    ``renormalize``, ``routed_scaling_factor``) is passed at construction
+    so the forward signature stays close to vLLM's. ``e_score_correction_bias``
+    is passed at call-time because vLLM treats it as an optional tensor
+    argument (None for the no-aux-tc path).
+    """
+
+    def __init__(
+        self,
+        scoring_func: str = "sigmoid",
+        renormalize: bool = True,
+        routed_scaling_factor: float = 1.0,
+    ) -> None:
+        super().__init__()
+        if scoring_func not in ("sigmoid", "softmax"):
+            raise ValueError(f"Unsupported scoring function: {scoring_func}")
+        self.scoring_func = scoring_func
+        self.renormalize = renormalize
+        self.routed_scaling_factor = routed_scaling_factor
+
     def forward(
         self,
-        router_logits: torch.Tensor,
-        bias: torch.Tensor | None,
+        gating_output: torch.Tensor,
+        e_score_correction_bias: torch.Tensor | None,
         num_expert_group: int,
         topk_group: int,
         topk: int,
     ) -> tuple[torch.Tensor, torch.Tensor]:
-        scores = torch.sigmoid(router_logits.float())
-        num_tokens, num_experts = scores.shape
+        # Fast path: vLLM's fully fused CUDA kernel
+        # (``torch.ops._moe_C.grouped_topk``).  Conditions match
+        # ``grouped_topk_router.py:95-101``.  Saves ~10 separate Triton/PyTorch
+        # ops per MoE layer per token vs. the eager fallback.
+        if (
+            e_score_correction_bias is not None
+            and num_expert_group <= 32
+            and topk <= 32
+        ):
+            fused = _maybe_get_fused_grouped_topk()
+            if fused is not None:
+                if self.scoring_func == "sigmoid":
+                    # Kernel applies sigmoid internally.
+                    return fused(
+                        gating_output,
+                        num_expert_group,
+                        topk_group,
+                        topk,
+                        self.renormalize,
+                        self.routed_scaling_factor,
+                        e_score_correction_bias,
+                        1,  # scoring_func=1 (sigmoid)
+                    )
+                # Softmax: precompute scores (kernel doesn't have softmax).
+                scores = torch.softmax(gating_output, dim=-1)
+                return fused(
+                    scores,
+                    num_expert_group,
+                    topk_group,
+                    topk,
+                    self.renormalize,
+                    self.routed_scaling_factor,
+                    e_score_correction_bias,
+                    0,  # scoring_func=0 (no activation, scores precomputed)
+                )
 
-        if bias is not None:
-            scores_for_choice = scores + bias.float()
+        # Score computation in the *gating output* dtype (vLLM does *not*
+        # cast to FP32 first — see grouped_topk_router.py:117-119).
+        if self.scoring_func == "softmax":
+            scores = torch.softmax(gating_output, dim=-1)
+        else:  # sigmoid
+            scores = gating_output.sigmoid()
+
+        num_token = scores.size(0)
+
+        if e_score_correction_bias is not None:
+            # Biased scores for selection; original scores for routing weights.
+            original_scores = scores
+            scores = scores + e_score_correction_bias.unsqueeze(0)
+            group_scores = (
+                scores.view(num_token, num_expert_group, -1)
+                .topk(2, dim=-1)[0]
+                .sum(dim=-1)
+            )
         else:
-            scores_for_choice = scores
+            # No bias: vLLM uses *max* within group (not sum of top-2).
+            group_scores = (
+                scores.view(num_token, num_expert_group, -1)
+                .max(dim=-1)
+                .values
+            )
 
-        experts_per_group = num_experts // num_expert_group
-        grouped = scores_for_choice.view(num_tokens, num_expert_group, experts_per_group)
-        group_score = grouped.topk(2, dim=-1).values.sum(dim=-1)
-        top_group_idx = group_score.topk(topk_group, dim=-1, sorted=False).indices
-
-        group_mask = torch.zeros_like(group_score)
-        group_mask.scatter_(1, top_group_idx, 1.0)
-        expert_mask = (
+        use_sorted = _is_batch_invariant()
+        group_idx = torch.topk(
+            group_scores, k=topk_group, dim=-1, sorted=use_sorted,
+        )[1]
+        group_mask = torch.zeros_like(group_scores)
+        group_mask.scatter_(1, group_idx, 1)
+        score_mask = (
             group_mask.unsqueeze(-1)
-            .expand(num_tokens, num_expert_group, experts_per_group)
-            .reshape(num_tokens, num_experts)
+            .expand(num_token, num_expert_group, scores.size(-1) // num_expert_group)
+            .reshape(num_token, -1)
         )
-        masked_scores = scores_for_choice.masked_fill(expert_mask == 0, float("-inf"))
-        topk_ids = masked_scores.topk(topk, dim=-1, sorted=False).indices
-        topk_weights = scores.gather(1, topk_ids)
+        tmp_scores = scores.masked_fill(~score_mask.bool(), float("-inf"))
 
-        if topk > 1:
-            topk_weights = topk_weights / (topk_weights.sum(dim=-1, keepdim=True) + 1e-20)
+        if e_score_correction_bias is not None:
+            topk_ids = torch.topk(
+                tmp_scores, k=topk, dim=-1, sorted=use_sorted,
+            )[1]
+            topk_weights = original_scores.gather(1, topk_ids)
+        else:
+            topk_weights, topk_ids = torch.topk(
+                tmp_scores, k=topk, dim=-1, sorted=use_sorted,
+            )
 
-        return topk_weights.to(router_logits.dtype), topk_ids.to(torch.int32)
+        if self.renormalize:
+            topk_weights = topk_weights / topk_weights.sum(dim=-1, keepdim=True)
+
+        if self.routed_scaling_factor != 1.0:
+            topk_weights = topk_weights * self.routed_scaling_factor
+
+        return topk_weights.to(torch.float32), topk_ids.to(torch.int32)

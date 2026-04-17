@@ -15,10 +15,11 @@ import torch.nn as nn
 
 from ....infra.context import get_context
 from ..L1.layer_norm import LayerNorm
-from ..L1.fp8_linear import _per_token_group_quant_fp8
+from ..L1.fp8_linear import PerTokenGroupQuantFp8
 from ..L1.indexer_k_cache import IndexerKCacheStore, IndexerKCacheGather
 from ..L1.fp8_mqa_logits import Fp8MQALogits, Fp8PagedMQALogitsMetadata
 from ..L1.top_k_per_row import TopKPerRow
+from .parallel_linear import ReplicatedLinear
 
 
 def _kv_spans_from_batches(
@@ -62,45 +63,6 @@ def _kv_spans_from_batches(
     return start_tensor.int(), end_location.int()
 
 
-class ReplicatedLinear(nn.Module):
-    """Linear layer replicated across all TP ranks (no sharding)."""
-
-    def __init__(self, input_size: int, output_size: int, bias: bool = False,
-                 quant_config: dict | None = None):
-        super().__init__()
-        from ..L1.fp8_linear import Fp8Linear
-        from ..L1.linear import Linear
-        self.use_fp8 = quant_config is not None
-
-        if self.use_fp8:
-            import math
-            _FP8_BLOCK = 128
-            self.weight = nn.Parameter(
-                torch.empty(output_size, input_size, dtype=torch.float8_e4m3fn),
-                requires_grad=False,
-            )
-            self.weight_scale_inv = nn.Parameter(
-                torch.empty(math.ceil(output_size / _FP8_BLOCK),
-                              math.ceil(input_size / _FP8_BLOCK),
-                              dtype=torch.float32),
-                requires_grad=False,
-            )
-            self.weight.weight_loader = lambda p, w: p.data.copy_(w)
-            self.weight_scale_inv.weight_loader = lambda p, w: p.data.copy_(w)
-            self.linear_op = Fp8Linear()
-        else:
-            self.weight = nn.Parameter(torch.empty(output_size, input_size))
-            self.weight.weight_loader = lambda p, w: p.data.copy_(w)
-            self.linear_op = Linear()
-
-        self.bias = nn.Parameter(torch.empty(output_size)) if bias else None
-
-    def forward(self, x):
-        if self.use_fp8:
-            return self.linear_op(x, self.weight, self.weight_scale_inv, self.bias)
-        return self.linear_op(x, self.weight, self.bias)
-
-
 class SparseAttnIndexer(nn.Module):
     """DSA sparse attention indexer.
 
@@ -128,18 +90,25 @@ class SparseAttnIndexer(nn.Module):
         self.q_lora_rank = q_lora_rank
         self.softmax_scale = head_dim ** -0.5
 
-        self.wq_b = ReplicatedLinear(q_lora_rank, head_dim * n_head,
-                                     quant_config=quant_config)
-        self.wk = ReplicatedLinear(hidden_size, head_dim,
-                                   quant_config=quant_config)
+        self.wq_b = ReplicatedLinear(
+            q_lora_rank, head_dim * n_head,
+            bias=False, quant_config=quant_config,
+        )
+        self.wk = ReplicatedLinear(
+            hidden_size, head_dim,
+            bias=False, quant_config=quant_config,
+        )
         self.k_norm = LayerNorm(head_dim, eps=1e-6)
-        self.weights_proj = ReplicatedLinear(hidden_size, n_head)  # NO FP8
+        self.weights_proj = ReplicatedLinear(
+            hidden_size, n_head, bias=False,  # NO FP8
+        )
 
         self.k_cache_store = IndexerKCacheStore()
         self.k_cache_gather = IndexerKCacheGather()
         self.fp8_mqa_logits = Fp8MQALogits()
         self.paged_mqa_metadata = Fp8PagedMQALogitsMetadata()
         self.topk_per_row = TopKPerRow()
+        self.fp8_quant = PerTokenGroupQuantFp8()
 
         # Indexer K cache: [num_blocks, block_size, 132] uint8
         self.indexer_k_cache = torch.tensor([])
@@ -149,18 +118,41 @@ class SparseAttnIndexer(nn.Module):
         # Shared buffer to avoid per-step allocation (matches vllm)
         self.topk_indices_buffer = topk_indices_buffer
 
+        # Custom-op dispatch scaffolding (matches MLAAttention / Attention).
+        self._use_custom_op = False
+        self._layer_name = ""
+        # Reference to the enclosing ``YarnRotaryEmbedding`` for indexer RoPE.
+        # Wired up by the parent ``DeepSeekMLAAttention``; stored via
+        # ``object.__setattr__`` to avoid double-registration as a submodule.
+        self._rope_emb: nn.Module | None = None
+
     def forward(self, hidden_states: torch.Tensor, q_latent: torch.Tensor,
-                positions: torch.Tensor, rope_emb: nn.Module) -> torch.Tensor:
+                positions: torch.Tensor,
+                rope_emb: nn.Module | None = None) -> torch.Tensor:
         """
         Args:
             hidden_states: [M, hidden_size]
             q_latent: [M, q_lora_rank] - compressed query from fused_qkv_a_proj
             positions: [M] position ids
-            rope_emb: YarnRotaryEmbedding for indexer
+            rope_emb: YarnRotaryEmbedding for indexer (optional if already
+                     wired via ``self._rope_emb``).
 
         Returns:
             topk_indices: [M, topk_tokens] int32
         """
+        if rope_emb is not None and self._rope_emb is None:
+            object.__setattr__(self, "_rope_emb", rope_emb)
+
+        if self._use_custom_op:
+            return torch.ops.kb_nano.sparse_attn_indexer(
+                hidden_states, q_latent, positions, self._layer_name,
+            )
+        return self.forward_impl(hidden_states, q_latent, positions)
+
+    def forward_impl(self, hidden_states: torch.Tensor, q_latent: torch.Tensor,
+                     positions: torch.Tensor) -> torch.Tensor:
+        rope_emb = self._rope_emb
+        assert rope_emb is not None, "SparseAttnIndexer._rope_emb is not wired"
         ctx = get_context()
         M = hidden_states.shape[0]
 
@@ -185,12 +177,14 @@ class SparseAttnIndexer(nn.Module):
         q = torch.cat([q_pe, q_nope], dim=-1)  # [M, n_head, head_dim]
         k = torch.cat([k_pe_out.squeeze(1), k_nope], dim=-1)  # [M, head_dim]
 
-        # FP8 quantize Q
-        q_flat = q.reshape(-1, self.head_dim)
+        # FP8 quantize Q via the public L1 op
+        q_flat = q.reshape(-1, self.head_dim).contiguous()
         q_fp8 = torch.empty_like(q_flat, dtype=torch.float8_e4m3fn)
-        q_scale = torch.empty(q_flat.shape[0], self.head_dim // self._quant_block_size,
-                              dtype=torch.float32, device=q_flat.device)
-        _per_token_group_quant_fp8(q_flat, q_fp8, q_scale)
+        q_scale = torch.empty(
+            q_flat.shape[0], self.head_dim // self._quant_block_size,
+            dtype=torch.float32, device=q_flat.device,
+        )
+        self.fp8_quant(q_flat, q_fp8, q_scale)
         q_fp8 = q_fp8.view(M, self.n_head, self.head_dim)
         q_scale = q_scale.view(M, self.n_head, -1)
 

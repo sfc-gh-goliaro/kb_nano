@@ -5,7 +5,7 @@ from __future__ import annotations
 import torch
 import torch.nn as nn
 
-from flash_mla import flash_attn_varlen_func
+from ._flashmla_backend import flash_attn_varlen_func
 
 
 class FlashMLAPrefill(nn.Module):

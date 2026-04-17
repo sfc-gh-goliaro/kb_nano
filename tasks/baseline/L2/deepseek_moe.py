@@ -1,11 +1,18 @@
 """DeepSeek MoE with shared expert, grouped routing, and FP8 expert execution.
 
-Uses GroupedTopK for routing, FusedExperts (BF16) or fused DeepGEMM FP8 path
-for expert execution, and a shared expert (LlamaMLP) running on a separate stream.
+Uses GroupedTopK for routing, FusedExperts (BF16) or a fused DeepGEMM FP8
+path for expert execution, and a shared expert (``LlamaMLP`` with
+``reduce_results=False``) that runs on a separate CUDA stream for overlap.
 
 Matches vllm's DeepseekV2MoE: routed_scaling_factor is applied post-experts
-(not folded into routing weights), and shared expert uses
-moe_intermediate_size * n_shared_experts as its intermediate dimension.
+(not folded into routing weights), and the shared expert uses
+``moe_intermediate_size * n_shared_experts`` as its intermediate dimension.
+
+All compute-heavy ops are L1 primitives — :class:`PerTokenGroupQuantFp8`
+for activation quantization, :class:`Fp8GroupedGemmContiguous` for the
+two expert GEMMs, :class:`SiluMulQuantFp8` for the fused SiLU+Mul+FP8
+quant between them, and :class:`MoePermute` / :class:`MoeUnpermuteReduce`
+for scatter/gather.
 """
 
 from __future__ import annotations
@@ -17,14 +24,16 @@ import torch.nn as nn
 
 from ....infra.tp import _tp_rank, _tp_size
 from ..L1.allreduce import AllReduce
-from ..L1.linear import Linear
-from ..L1.silu_and_mul import SiluAndMul
+from ..L1.linear import Matmul
 from ..L1.grouped_topk import GroupedTopK
+from ..L1.gate_linear import gate_linear_forward
 from ..L1.moe_permute import MoePermute
 from ..L1.moe_unpermute_reduce import MoeUnpermuteReduce
 from ..L1.silu_mul_quant_fp8 import SiluMulQuantFp8
+from ..L1.fp8_linear import PerTokenGroupQuantFp8
+from ..L1.fp8_grouped_gemm_contiguous import Fp8GroupedGemmContiguous
 from .fused_experts import FusedExperts
-from .parallel_linear import MergedColumnParallelLinear, RowParallelLinear
+from .llama_mlp import LlamaMLP
 
 _FP8_BLOCK = 128
 
@@ -33,35 +42,12 @@ def _scale_shape(out_dim: int, in_dim: int) -> tuple[int, int]:
     return (math.ceil(out_dim / _FP8_BLOCK), math.ceil(in_dim / _FP8_BLOCK))
 
 
-class DeepSeekSharedExpertMLP(nn.Module):
-    """Shared expert MLP with reduce_results=False for external all-reduce."""
-
-    def __init__(self, hidden_size: int, intermediate_size: int,
-                 quant_config: dict | None = None):
-        super().__init__()
-        self.gate_up_proj = MergedColumnParallelLinear(
-            hidden_size, [intermediate_size] * 2,
-            quant_config=quant_config,
-        )
-        self.down_proj = RowParallelLinear(
-            intermediate_size, hidden_size,
-            quant_config=quant_config,
-            reduce_results=False,
-        )
-        self.act_fn = SiluAndMul()
-
-    def forward(self, x):
-        x = self.gate_up_proj(x)
-        x = self.act_fn(x)
-        return self.down_proj(x)
-
-
 class DeepSeekMoE(nn.Module):
     """DeepSeek Mixture-of-Experts with shared expert and grouped routing.
 
     Architecture:
     - Router: replicated gate + e_score_correction_bias
-    - Shared expert: DeepSeekSharedExpertMLP (reduce_results=False)
+    - Shared expert: LlamaMLP (reduce_results=False)
     - Routed experts: FP8 weights (w13, w2) + per-block scales
     - Routing: GroupedTopK (sigmoid + grouped top-k with bias, matches vLLM)
     - routed_scaling_factor applied post-experts (not in routing weights)
@@ -82,23 +68,40 @@ class DeepSeekMoE(nn.Module):
         topk_group = getattr(config, 'topk_group', 1)
         self.n_group = n_group
         self.topk_group = topk_group
+        self.scoring_func = getattr(config, 'scoring_func', 'softmax')
+        self.norm_topk_prob = getattr(config, 'norm_topk_prob', True)
+        self.topk_method = getattr(config, 'topk_method', 'noaux_tc')
 
         self.gate_weight = nn.Parameter(
             torch.empty(config.n_routed_experts, config.hidden_size),
         )
         self.gate_weight.weight_loader = lambda p, w: p.data.copy_(w)
 
-        self.e_score_correction_bias = nn.Parameter(
-            torch.zeros(config.n_routed_experts, dtype=torch.float32),
-        )
-        self.e_score_correction_bias.weight_loader = lambda p, w: p.data.copy_(w)
+        # ``e_score_correction_bias`` only exists for the ``noaux_tc`` topk
+        # method (matches vLLM's ``DeepseekV2MoE`` which only allocates it
+        # when ``config.topk_method == "noaux_tc"``). For other methods
+        # (e.g., ``greedy``), the bias is simply absent.
+        if self.topk_method == 'noaux_tc':
+            self.e_score_correction_bias = nn.Parameter(
+                torch.zeros(config.n_routed_experts, dtype=torch.float32),
+            )
+            self.e_score_correction_bias.weight_loader = (
+                lambda p, w: p.data.copy_(w)
+            )
+        else:
+            self.register_parameter('e_score_correction_bias', None)
 
         n_shared = getattr(config, 'n_shared_experts', 1)
         if n_shared is not None and n_shared > 0:
             shared_intermediate = config.moe_intermediate_size * n_shared
-            self.shared_expert = DeepSeekSharedExpertMLP(
-                config.hidden_size, shared_intermediate,
+            # LlamaMLP with reduce_results=False — the final all-reduce
+            # is deferred and runs after routed + shared expert are summed.
+            self.shared_expert = LlamaMLP(
+                config,
                 quant_config=quant_config,
+                hidden_size=config.hidden_size,
+                intermediate_size=shared_intermediate,
+                reduce_results=False,
             )
         else:
             self.shared_expert = None
@@ -136,19 +139,44 @@ class DeepSeekMoE(nn.Module):
             self.w13_weight_scale_inv.weight_loader = self._w13_scale_loader
             self.w2_weight_scale_inv.weight_loader = self._w2_scale_loader
 
-        self.linear_op = Linear()
-        self.grouped_topk = GroupedTopK()
+        self.linear_op = Matmul()
+        # Routing weights: vLLM always passes ``routed_scaling_factor=1.0``
+        # to ``grouped_topk`` and applies the factor *post-experts* (see
+        # ``vllm/model_executor/models/deepseek_v2.py:325`` and L378-379).
+        # We mirror that by leaving the factor at 1.0 here.
+        self.grouped_topk = GroupedTopK(
+            scoring_func=self.scoring_func,
+            renormalize=self.norm_topk_prob,
+            routed_scaling_factor=1.0,
+        )
         self.fused_experts = FusedExperts()
         if self.use_fp8:
             self.moe_permute = MoePermute()
             self.moe_unpermute_reduce = MoeUnpermuteReduce()
             self.silu_mul_quant_fp8 = SiluMulQuantFp8()
-        self.silu_and_mul = SiluAndMul()
+            self.fp8_quant = PerTokenGroupQuantFp8()
+            self.fp8_grouped_gemm = Fp8GroupedGemmContiguous()
         self.allreduce = AllReduce()
+        # Mirrors vLLM's ``VLLM_DISABLE_SHARED_EXPERTS_STREAM`` env knob
+        # (default: stream enabled). When disabled, the shared expert runs
+        # serially on the main stream, which is helpful for debugging and
+        # for arches where the secondary stream is harmful.
+        import os as _os
+        self._disable_shared_stream: bool = (
+            _os.environ.get("VLLM_DISABLE_SHARED_EXPERTS_STREAM", "0") != "0"
+        )
         self._shared_stream: torch.cuda.Stream | None = None
         self._ws13: torch.Tensor | None = None
         self._ws2: torch.Tensor | None = None
         self._out_buf: torch.Tensor | None = None
+
+        # Custom-op dispatch scaffolding (matches the other MoE L2 modules).
+        # ``_use_custom_op`` is flipped to True by ``enable_custom_ops`` so
+        # ``torch.compile`` sees the MoE block as an opaque
+        # ``kb_nano::moe_forward`` op (avoids tracing into CUDA stream and
+        # DeepGEMM pybind boundaries).
+        self._use_custom_op = False
+        self._layer_name = ""
 
     def _w13_weight_loader(self, param, loaded_weight, expert_id: int, is_w1: bool):
         tp, rank = _tp_size(), _tp_rank()
@@ -178,38 +206,89 @@ class DeepSeekMoE(nn.Module):
         param.data[expert_id].copy_(src)
 
     def forward(self, hidden_states: torch.Tensor) -> torch.Tensor:
+        if self._use_custom_op:
+            return torch.ops.kb_nano.moe_forward(hidden_states, self._layer_name)
+        return self.forward_impl(hidden_states)
+
+    def forward_impl(self, hidden_states: torch.Tensor) -> torch.Tensor:
         orig_shape = hidden_states.shape
         hidden_states = hidden_states.view(-1, self.hidden_size)
 
-        # Launch shared expert on a separate CUDA stream for overlap
+        # Launch shared expert on a separate CUDA stream for overlap.
+        # Matches vLLM's monolithic DeepSeekV2MoE behaviour
+        # (``DefaultMoeRunner`` in
+        # ``vllm/model_executor/layers/fused_moe/runner/default_moe_runner.py``).
         shared_out = None
-        if self.shared_expert is not None:
+        use_shared_stream = (
+            self.shared_expert is not None and not self._disable_shared_stream
+        )
+        if use_shared_stream:
             if self._shared_stream is None:
                 self._shared_stream = torch.cuda.Stream()
             self._shared_stream.wait_stream(torch.cuda.current_stream())
             with torch.cuda.stream(self._shared_stream):
                 shared_out = self.shared_expert(hidden_states)
+        elif self.shared_expert is not None:
+            shared_out = self.shared_expert(hidden_states)
 
-        router_logits = self.linear_op(hidden_states, self.gate_weight)
+        # Router gate with vLLM-parity dispatch. vLLM's GateLinear routes
+        # through three tiers (DSV3 specialised kernel → cuBLAS BF16→FP32 →
+        # PyTorch F.linear) and the accumulation order matters: a "promote
+        # both to FP32 then matmul" path produces a different bit pattern
+        # that flips near-tie group/expert selection in the noaux_tc
+        # grouped-topk path.
+        #
+        # vLLM chooses the router ``out_dtype`` in
+        # ``deepseek_v2.py:DeepseekV2MoE.__init__``:
+        #
+        #     self.gate.set_out_dtype(
+        #         torch.float32
+        #         if self.experts.quant_method.is_monolithic
+        #         and self.experts.routing_method_type ==
+        #             RoutingMethodType.DeepSeekV3
+        #         else torch.bfloat16
+        #     )
+        #
+        # For FP8 blockwise DeepSeek-V3 experts (our ``use_fp8`` path) the
+        # quant method is *not* ``is_monolithic``, so vLLM uses BF16 here
+        # — and the router_logits carry BF16 precision, which matters for
+        # near-tie top-k boundaries. For the BF16 / "unquantized" path vLLM
+        # is monolithic, so it keeps FP32. We mirror that choice exactly.
+        router_out_dtype = (
+            torch.float32 if not self.use_fp8 else torch.bfloat16
+        )
+        router_logits = gate_linear_forward(
+            hidden_states, self.gate_weight, out_dtype=router_out_dtype,
+        )
         topk_weights, topk_ids = self.grouped_topk(
             router_logits, self.e_score_correction_bias,
             self.n_group, self.topk_group, self.top_k,
         )
-        topk_weights = topk_weights.to(hidden_states.dtype)
-
+        # ``topk_weights`` is FP32 (matches vLLM). For the FP8 expert path
+        # we pass FP32 weights through verbatim so the Triton kernel reads
+        # them at the same precision vLLM does (vLLM's grouped_topk router
+        # returns FP32 — see
+        # ``vllm/model_executor/layers/fused_moe/router/grouped_topk_router.py:165``
+        # — and ``invoke_fused_moe_triton_kernel`` consumes them directly).
+        # Cast to activation dtype only for the BF16 / "unquantized" path,
+        # which still uses kb_nano's local FusedExperts wrapper.
         if self.use_fp8:
             out = self._forward_fp8_experts(
                 hidden_states, topk_weights, topk_ids)
         else:
+            topk_weights_act = topk_weights.to(hidden_states.dtype)
             out = self.fused_experts(
                 hidden_states, self.w13, self.w2,
-                topk_weights, topk_ids, self.num_experts,
+                topk_weights_act, topk_ids, self.num_experts,
             )
 
+        # ``routed_scaling_factor`` is applied *post-experts*, matching
+        # ``vllm/model_executor/models/deepseek_v2.py:378-379``.
         out = out * self.routed_scaling_factor
 
         if shared_out is not None:
-            torch.cuda.current_stream().wait_stream(self._shared_stream)
+            if use_shared_stream:
+                torch.cuda.current_stream().wait_stream(self._shared_stream)
             out = out + shared_out
 
         if self.tp_size > 1:
@@ -232,60 +311,51 @@ class DeepSeekMoE(nn.Module):
         topk_weights: torch.Tensor,
         topk_ids: torch.Tensor,
     ) -> torch.Tensor:
-        from ..L1.fp8_linear import _per_token_group_quant_fp8
-        import deep_gemm
+        """FP8 MoE expert forward, dispatching to whichever kernel vLLM would
+        pick for this configuration.
 
-        M = hidden_states.shape[0]
-        K = self.hidden_size
-        N_gate_up = 2 * self.intermediate_per_tp
-        N_inter = self.intermediate_per_tp
-        top_k = self.top_k
-        device = hidden_states.device
+        For DeepSeek-V3 on Hopper (SM90) with ``ep_size <= 1`` and FP8
+        block-quantization, vLLM's oracle (``select_fp8_moe_backend`` in
+        ``vllm/model_executor/layers/fused_moe/oracle/fp8.py`` →
+        ``_get_priority_backends``) **explicitly prioritises Triton over
+        DeepGEMM** for small batch sizes — even though DeepGEMM is
+        technically supported. The TP=1 small-prefill regime hits this
+        path. Using DeepGEMM here produces a 1-BF16-ULP drift in routed
+        expert outputs that cascades through subsequent MoE layers and
+        flips a handful of near-tie expert selections from layer ~5
+        onwards.
 
-        align = int(deep_gemm.get_mk_alignment_for_contiguous_layout())
-        m_sum_upper = (M * top_k) + self.num_experts * (align - 1)
-        m_sum = ((m_sum_upper + align - 1) // align) * align
+        To match vLLM bit-exactly we delegate the routed-expert kernel
+        to vLLM's standalone ``fused_experts`` (which routes through the
+        same ``invoke_fused_moe_triton_kernel`` as ``TritonExperts.apply``
+        for the FP8 W8A8 block path).
+        """
+        try:
+            from vllm.model_executor.layers.fused_moe.fused_moe import (
+                fused_experts as _vllm_fused_experts,
+            )
+            from vllm.model_executor.layers.fused_moe.config import (
+                fp8_w8a8_moe_quant_config,
+            )
+        except ImportError as e:
+            raise RuntimeError(
+                "kb_nano FP8 MoE requires vllm.model_executor.layers.fused_moe; "
+                f"import failed: {e}"
+            ) from e
 
-        # FP8 quant hidden_states
-        num_groups_k = K // _FP8_BLOCK
-        ws13 = self._get_workspace(
-            "_ws13", m_sum * max(K, N_gate_up) * 2, device)
-        a1_fp8 = ws13[:M * K].view(torch.float8_e4m3fn).view(M, K)
-        a1_scale = torch.empty(M, num_groups_k, dtype=torch.float32,
-                               device=device)
-        _per_token_group_quant_fp8(hidden_states, a1_fp8, a1_scale)
-
-        # Fused permute into expert-contiguous layout
-        a1_perm, s1_perm, expert_ids, inv_perm = self.moe_permute(
-            a1_fp8, a1_scale, topk_ids, self.num_experts, m_sum,
+        quant_config = fp8_w8a8_moe_quant_config(
+            w1_scale=self.w13_weight_scale_inv,
+            w2_scale=self.w2_weight_scale_inv,
+            block_shape=[_FP8_BLOCK, _FP8_BLOCK],
         )
-
-        # GEMM1: gate_up — reuse ws2 for output
-        ws2 = self._get_workspace(
-            "_ws2", m_sum * max(N_gate_up, K) * 2, device)
-        out1 = ws2[:m_sum * N_gate_up * 2].view(torch.bfloat16).view(
-            m_sum, N_gate_up)
-        deep_gemm.m_grouped_fp8_gemm_nt_contiguous(
-            (a1_perm, s1_perm), (self.w13, self.w13_weight_scale_inv),
-            out1, expert_ids,
+        return _vllm_fused_experts(
+            hidden_states=hidden_states,
+            w1=self.w13,
+            w2=self.w2,
+            topk_weights=topk_weights,
+            topk_ids=topk_ids,
+            inplace=False,
+            global_num_experts=self.num_experts,
+            expert_map=None,
+            quant_config=quant_config,
         )
-
-        # Fused SiLU+Mul+FP8Quant — single kernel, output stays in permuted order
-        a2_fp8, a2_scale = self.silu_mul_quant_fp8(out1)
-
-        # GEMM2: down — reuse ws2 for output
-        out2 = ws2[:m_sum * K * 2].view(torch.bfloat16).view(m_sum, K)
-        deep_gemm.m_grouped_fp8_gemm_nt_contiguous(
-            (a2_fp8, a2_scale), (self.w2, self.w2_weight_scale_inv),
-            out2, expert_ids,
-        )
-
-        # Fused unpermute + weighted reduce
-        if self._out_buf is None or self._out_buf.shape[0] < M:
-            self._out_buf = torch.empty(M, K, dtype=hidden_states.dtype,
-                                        device=device)
-        output = self._out_buf[:M]
-        self.moe_unpermute_reduce(
-            out2, topk_ids, topk_weights, inv_perm, output,
-        )
-        return output

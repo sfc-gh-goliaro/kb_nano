@@ -221,7 +221,6 @@ if __name__ == "__main__":
 KB_NANO_WORKER = r'''
 import json, os, sys, time
 os.environ.setdefault("VLLM_DEEP_GEMM_WARMUP", "skip")
-os.environ.setdefault("KB_NANO_DISABLE_CUSTOM_AR", "1")
 
 def main():
     with open(sys.argv[1]) as f:
@@ -684,7 +683,6 @@ if __name__ == "__main__":
 KB_NANO_VLM_WORKER = _MM_PRELOAD_FN + r'''
 import json, os, sys, time
 os.environ.setdefault("VLLM_DEEP_GEMM_WARMUP", "skip")
-os.environ.setdefault("KB_NANO_DISABLE_CUSTOM_AR", "1")
 
 
 def main():
@@ -1269,6 +1267,11 @@ def main():
         choices=["all", "text", "image", "video"],
         help="Run only scenarios matching this modality (VLM models only, default: all)",
     )
+    parser.add_argument(
+        "--scenario", type=str, default=None,
+        help="Run only the throughput scenario with this name (e.g. "
+             "'balanced'). Default: run all scenarios for the model type.",
+    )
     args = parser.parse_args()
 
     if args.num_seqs is None:
@@ -1302,6 +1305,16 @@ def main():
             s for s in latency_scenarios
             if s.get("modality", "text") == args.modality
         ]
+
+    if args.scenario is not None:
+        throughput_scenarios = [
+            s for s in throughput_scenarios if s["name"] == args.scenario
+        ]
+        if not throughput_scenarios:
+            raise SystemExit(
+                f"--scenario={args.scenario!r} did not match any throughput "
+                f"scenario for this model type."
+            )
 
     # Pre-generate all scenario data
     scenario_data = []

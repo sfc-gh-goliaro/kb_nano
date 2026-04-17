@@ -5,7 +5,7 @@ from __future__ import annotations
 import torch
 import torch.nn as nn
 
-from flash_mla import flash_mla_sparse_fwd
+from ._flashmla_backend import flash_mla_sparse_fwd
 
 
 class FlashMLASparsePrefill(nn.Module):

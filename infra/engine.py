@@ -280,13 +280,38 @@ class ModelRunner:
                 set_custom_ar(self.custom_ar)
 
         if dtype is None:
+            # DeepSeek V3.2 checkpoints use ``model_type: "deepseek_v32"`` which
+            # is not yet a registered AutoConfig key in transformers, so load
+            # with ``trust_remote_code=True`` and fall back to raw config.json
+            # parsing if AutoConfig still refuses.
             from transformers import AutoConfig
-            _cfg = AutoConfig.from_pretrained(model_name)
-            cfg_dtype = getattr(_cfg, "torch_dtype", None)
-            if cfg_dtype is not None and isinstance(cfg_dtype, torch.dtype):
-                dtype = cfg_dtype
-            else:
-                dtype = torch.bfloat16
+            _cfg = None
+            try:
+                _cfg = AutoConfig.from_pretrained(
+                    model_name, trust_remote_code=True,
+                )
+            except (ValueError, KeyError):
+                try:
+                    from huggingface_hub import hf_hub_download
+                    import json as _json
+                    if os.path.isdir(model_name):
+                        _cfg_path = os.path.join(model_name, "config.json")
+                    else:
+                        _cfg_path = hf_hub_download(model_name, "config.json")
+                    with open(_cfg_path) as _f:
+                        _cfg_dict = _json.load(_f)
+                    _td = _cfg_dict.get("torch_dtype", None)
+                    cfg_dtype = getattr(torch, _td) if isinstance(_td, str) else None
+                    if isinstance(cfg_dtype, torch.dtype):
+                        dtype = cfg_dtype
+                except Exception:
+                    pass
+            if dtype is None:
+                cfg_dtype = getattr(_cfg, "torch_dtype", None) if _cfg is not None else None
+                if cfg_dtype is not None and isinstance(cfg_dtype, torch.dtype):
+                    dtype = cfg_dtype
+                else:
+                    dtype = torch.bfloat16
         self.dtype = dtype
         default_dtype = torch.get_default_dtype()
         torch.set_default_dtype(dtype)
@@ -449,20 +474,22 @@ class ModelRunner:
         torch.cuda.empty_cache()
 
     def _share_activation_buffers(self):
-        """Share activation buffers across layers.
+        """No-op (was: share SiluAndMul output buffers across layers).
 
-        Layers execute sequentially so buffers are safe to reuse.
-        Must be called before warmup so only one buffer grows to max size
-        instead of one per layer (saves ~14 GiB for 32-layer models).
+        The previous implementation made all ``SiluAndMul`` instances point
+        to a single ``_ActivationBuffer`` so the output tensor would be
+        reused across layers (saving allocations).  However the underlying
+        CUDA kernel writes to ``out`` assuming a contiguous
+        ``[num_tokens, d]`` layout (row stride == ``d``), and the shared
+        buffer returned a non-contiguous slice ``buf[:rows, :cols]`` whose
+        row stride was the buffer's *full* width.  When two SiluAndMul
+        instances had different ``d`` (e.g. dense MLP at d=9216 and the
+        DeepSeek-V3 shared expert at d=2048), the shared-expert output
+        was silently corrupted — every row past row 0 wrote to the wrong
+        storage offset.  ``SiluAndMul.forward_cuda`` now allocates a
+        fresh contiguous output per call (matches vLLM exactly).
         """
-        from ..tasks.baseline.L1.silu_and_mul import SiluAndMul
-        silu_modules = [
-            m for m in self.model.modules() if isinstance(m, SiluAndMul)
-        ]
-        if len(silu_modules) > 1:
-            shared = silu_modules[0]._act_buf
-            for m in silu_modules[1:]:
-                m.set_shared_buffer(shared)
+        return
 
     def _share_moe_workspaces(self):
         """Pre-allocate and share MoE FP8 expert workspace buffers across layers.
@@ -854,13 +881,25 @@ class ModelRunner:
             torch.cuda.empty_cache()
 
     def _allocate_mla_kv_cache(self):
-        """Allocate FP8 MLA KV cache (uint8, 656 bytes/token) and indexer K cache (132 bytes/token)."""
+        """Allocate MLA KV cache + indexer K cache.
+
+        The KV cache layout follows ``MLAAttention.kv_cache_dtype`` (set
+        via ``KB_NANO_KV_CACHE_DTYPE``, default ``"auto"`` = BF16):
+
+        * ``"auto"`` (default): BF16 cache, shape
+          ``[num_blocks, block_size, kv_lora_rank + qk_rope_head_dim]``
+          (1152 bytes/token for DeepSeek-V3.2). Matches stock vLLM's
+          ``kv_cache_dtype=auto`` on DeepSeek-V3.2 so ``topk_indices``
+          and MoE expert ids are bit-comparable.
+        * ``"fp8_ds_mla"``: uint8 cache, shape
+          ``[num_blocks, block_size, 656]`` (656 bytes/token).
+        """
         from ..tasks.baseline.L2.mla_attention_impl import MLAAttention
         from ..tasks.baseline.L2.sparse_attn_indexer import SparseAttnIndexer
 
         _MLA_BLOCK_SIZE = 64  # FlashMLA uses block_size=64
-        _MLA_CACHE_BYTES = 656
         _INDEXER_CACHE_BYTES = 132
+        _FP8_CACHE_BYTES = 656
 
         mla_layers = []
         indexer_layers = []
@@ -873,12 +912,37 @@ class ModelRunner:
         num_layers = len(mla_layers)
         num_indexer_layers = len(indexer_layers)
 
+        # All MLA layers must agree on the cache layout.
+        if num_layers > 0:
+            kv_cache_dtype = mla_layers[0].kv_cache_dtype
+            for ml in mla_layers[1:]:
+                assert ml.kv_cache_dtype == kv_cache_dtype, (
+                    "Inconsistent kv_cache_dtype across MLA layers"
+                )
+        else:
+            kv_cache_dtype = "auto"
+
+        use_fp8_kv = kv_cache_dtype == "fp8_ds_mla"
+        if use_fp8_kv:
+            cache_last_dim = _FP8_CACHE_BYTES
+            cache_torch_dtype = torch.uint8
+            bytes_per_slot = _FP8_CACHE_BYTES
+            backend_desc = "FP8 KV cache"
+        else:
+            # BF16: shape = (num_blocks, block_size, kv_lora_rank + rope_dim)
+            kv_lora_rank = mla_layers[0].kv_lora_rank if num_layers else 512
+            rope_dim = mla_layers[0].qk_rope_head_dim if num_layers else 64
+            cache_last_dim = kv_lora_rank + rope_dim
+            cache_torch_dtype = torch.bfloat16
+            bytes_per_slot = cache_last_dim * 2  # BF16 = 2 bytes/element
+            backend_desc = "BF16 KV cache"
+
         free, total = torch.cuda.mem_get_info()
         used = total - free
         peak = torch.cuda.memory_stats()["allocated_bytes.all.peak"]
         current = torch.cuda.memory_stats()["allocated_bytes.all.current"]
 
-        kv_bytes_per_block = num_layers * _MLA_BLOCK_SIZE * _MLA_CACHE_BYTES
+        kv_bytes_per_block = num_layers * _MLA_BLOCK_SIZE * bytes_per_slot
         idx_bytes_per_block = num_indexer_layers * _MLA_BLOCK_SIZE * _INDEXER_CACHE_BYTES
         total_bytes_per_block = kv_bytes_per_block + idx_bytes_per_block
 
@@ -901,13 +965,13 @@ class ModelRunner:
         if self.rank == 0:
             print(f"  MLA KV cache: {num_blocks} blocks x {_MLA_BLOCK_SIZE} = "
                   f"{num_blocks * _MLA_BLOCK_SIZE} token slots ({num_layers} layers, "
-                  f"{_MLA_CACHE_BYTES} bytes/token)")
+                  f"{bytes_per_slot} bytes/token, dtype={kv_cache_dtype})")
 
         device = f"cuda:{self.rank}"
         for i, layer in enumerate(mla_layers):
             cache = torch.zeros(
-                num_blocks, _MLA_BLOCK_SIZE, _MLA_CACHE_BYTES,
-                dtype=torch.uint8, device=device,
+                num_blocks, _MLA_BLOCK_SIZE, cache_last_dim,
+                dtype=cache_torch_dtype, device=device,
             )
             layer.k_cache = cache
             layer.v_cache = cache
@@ -924,7 +988,7 @@ class ModelRunner:
                 )
 
         if self.rank == 0:
-            print(f"  MLA attention backend: FlashMLA (block_size={_MLA_BLOCK_SIZE}, FP8 KV cache)")
+            print(f"  MLA attention backend: FlashMLA (block_size={_MLA_BLOCK_SIZE}, {backend_desc})")
 
         # Pre-allocate chunked prefill workspace for MLA context gathering.
         # Matches vllm's MLACommonMetadataBuilder workspace sizing.
@@ -935,8 +999,12 @@ class ModelRunner:
         )
         workspace_tokens = max(workspace_tokens,
                                self.max_num_seqs * _MLA_BLOCK_SIZE)
+        # Workspace holds BF16 kv_c + k_pe (kv_lora_rank + qk_rope_head_dim
+        # elements per token), regardless of on-disk cache layout.
+        kv_lora_rank_ws = mla_layers[0].kv_lora_rank if num_layers else 512
+        rope_dim_ws = mla_layers[0].qk_rope_head_dim if num_layers else 64
         self._mla_chunked_prefill_workspace = torch.empty(
-            workspace_tokens, _MLA_CACHE_BYTES - 80,  # 576 = kv_lora_rank + qk_rope_head_dim
+            workspace_tokens, kv_lora_rank_ws + rope_dim_ws,
             dtype=torch.bfloat16, device=device,
         )
         self._mla_workspace_size = workspace_tokens
@@ -1624,7 +1692,15 @@ class ModelRunner:
             off += nb
 
     def _loop_decode_greedy(self):
-        """Worker fast path: read decode arrays from SHM without pickle."""
+        """Worker fast path: read decode arrays from SHM without pickle.
+
+        Must mirror :meth:`_write_decode_shm` exactly. In particular, MLA
+        models write ``slot_mapping`` as ``int64`` (8 bytes per element)
+        because the FP8 paged KV cache stores require it; non-MLA models
+        use ``int32``. Reading the wrong dtype here both garbles ``sm``
+        and shifts every following field, which produces inconsistent
+        decode metadata across ranks and deadlocks TP collectives.
+        """
         buf = self.shm.buf
         n = int.from_bytes(buf[0:2], "little")
         max_bt = int.from_bytes(buf[2:4], "little")
@@ -1634,7 +1710,10 @@ class ModelRunner:
             pos_np = np.frombuffer(buf, dtype=np.int64, count=3*n, offset=off).copy().reshape(3, n); off += 3 * n * 8
         else:
             pos_np = np.frombuffer(buf, dtype=np.int64, count=n, offset=off).copy(); off += n * 8
-        sm_np = np.frombuffer(buf, dtype=np.int32, count=n, offset=off).copy(); off += n * 4
+        if self.is_deepseek_mla:
+            sm_np = np.frombuffer(buf, dtype=np.int64, count=n, offset=off).copy(); off += n * 8
+        else:
+            sm_np = np.frombuffer(buf, dtype=np.int32, count=n, offset=off).copy(); off += n * 4
         cl_np = np.frombuffer(buf, dtype=np.int32, count=n, offset=off).copy(); off += n * 4
         bt_np = np.frombuffer(buf, dtype=np.int32, count=n*max_bt, offset=off).copy().reshape(n, max_bt)
         self.run_decode_greedy_fast((n, ids_np, pos_np, sm_np, cl_np, bt_np))
@@ -2141,6 +2220,7 @@ class ModelRunner:
         from contextlib import nullcontext
         max_bs = self.max_num_seqs
         max_num_blocks = (self.max_model_len + BLOCK_SIZE - 1) // BLOCK_SIZE
+        input_ids = torch.zeros(max_bs, dtype=torch.int64)
         if self.is_qwen_vl:
             positions = torch.zeros(3, max_bs + 1, dtype=torch.int64)
         else:
@@ -2150,14 +2230,21 @@ class ModelRunner:
         context_lens = torch.zeros(max_bs, dtype=torch.int32)
         block_tables = torch.zeros(max_bs, max_num_blocks, dtype=torch.int32)
 
-        # Match vllm's capture size selection: [1,2,4] + step 8 to 256 +
-        # step 16 above, capped at min(max_num_seqs, 512).
+        # Match vLLM's default ``cudagraph_capture_sizes`` for DeepSeek-V3.2:
+        # [1, 2, 4, 8, 16, 24, ..., 256, 272, ..., 512].  vLLM caps captures at
+        # ``max_cudagraph_capture_size=512`` (see logs); larger decode batches
+        # are dispatched to the largest captured graph or fall back to a
+        # piecewise/eager path.  Going past 512 here makes the compile time
+        # dominate (each graph at bs>512 takes seconds) without measurable
+        # decode wins, so we keep the same 512 cap.
         max_capture = min(max_bs, 512)
         self.graph_bs_list = [i for i in [1, 2, 4] if i <= max_capture]
         if max_capture >= 8:
             self.graph_bs_list += list(range(8, min(max_capture + 1, 256), 8))
         if max_capture >= 256:
             self.graph_bs_list += list(range(256, max_capture + 1, 16))
+        if self.graph_bs_list[-1] != max_capture:
+            self.graph_bs_list.append(max_capture)
         self.graphs = {}
         self.graph_pool = None
 
@@ -2195,12 +2282,26 @@ class ModelRunner:
             block_tables=block_tables[:largest_bs],
             max_context_len=self.max_model_len,
         )
+        # Mark batch dim as dynamic BEFORE the first compile-triggering forward
+        # so Dynamo / Inductor produce a single symbolic-shape compiled graph
+        # that works for every batch size we will subsequently capture, instead
+        # of hard-coding the warmup batch size into the compiled subgraphs
+        # (which under ``skip_all_guards_unsafe`` would silently get reused at
+        # the wrong size and trip Inductor's ``assert_size_stride`` checks).
+        warmup_ids = input_ids[:largest_bs]
+        warmup_pos = (positions[:, :largest_bs]
+                      if self.is_qwen_vl else positions[:largest_bs])
+        if self._compiled and not self._mark_dynamic_done:
+            torch._dynamo.mark_dynamic(warmup_ids, 0)
+            if self.is_qwen_vl:
+                torch._dynamo.mark_dynamic(warmup_pos, 1)
+            else:
+                torch._dynamo.mark_dynamic(warmup_pos, 0)
+            self._mark_dynamic_done = True
         if self.is_qwen_vl:
-            outputs[:largest_bs] = self.model(
-                input_ids[:largest_bs], positions[:, :largest_bs])
+            outputs[:largest_bs] = self.model(warmup_ids, warmup_pos)
         else:
-            outputs[:largest_bs] = self.model(
-                input_ids[:largest_bs], positions[:largest_bs])
+            outputs[:largest_bs] = self.model(warmup_ids, warmup_pos)
         lm_logits[:largest_bs] = lm_head.linear_op(
             outputs[:largest_bs], lm_head.embedding_op.emb.weight).float()
         lm_max_vals[:largest_bs], lm_max_idxs[:largest_bs] = \

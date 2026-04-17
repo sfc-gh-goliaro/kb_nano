@@ -179,7 +179,10 @@ def auto_register_no_compile_layers(model: "nn.Module") -> None:
     Also sets ``_layer_name`` on each module so it knows its own key.
     ``_use_custom_op`` remains ``False`` until compilation is enabled.
     """
-    _TARGET_NAMES = {"Qwen3MoE", "MixtralMoE", "GptOssMoE", "DeepSeekMoE", "Attention"}
+    _TARGET_NAMES = {
+        "Qwen3MoE", "MixtralMoE", "GptOssMoE", "DeepSeekMoE",
+        "Attention", "MLAAttention", "SparseAttnIndexer",
+    }
     layers: dict[str, "nn.Module"] = {}
     for name, mod in model.named_modules():
         if type(mod).__name__ in _TARGET_NAMES:
@@ -214,12 +217,25 @@ def set_context(is_prefill, cu_seqlens_q=None, cu_seqlens_k=None,
                 max_context_len=0, chunked_context=None,
                 req_id_per_token=None):
     global _CONTEXT
+    # For pure-decode batches (``is_prefill=False`` with no mixed fields),
+    # mirror the generic ``context_lens`` / ``block_tables`` / ``max_context_len``
+    # into the decode-specific fields so that DSA indexer and other
+    # decode-specialised paths (which consult ``decode_context_lens`` /
+    # ``decode_block_tables`` — matching vLLM's FlashInfer metadata) can
+    # find them.  Without this, ``SparseAttnIndexer._decode_topk`` would
+    # early-return all -1 indices and attention would degenerate.
+    dc_cl = context_lens if not is_prefill else None
+    dc_bt = block_tables if not is_prefill else None
+    dc_max = max_context_len if not is_prefill else 0
     _CONTEXT = Context(is_prefill, cu_seqlens_q, cu_seqlens_k,
                        max_seqlen_q, max_seqlen_k, slot_mapping,
                        context_lens, block_tables, max_context_len,
                        chunked_context=chunked_context,
                        req_id_per_token=req_id_per_token,
-                       no_compile_layers=_STATIC_NO_COMPILE_LAYERS)
+                       no_compile_layers=_STATIC_NO_COMPILE_LAYERS,
+                       decode_context_lens=dc_cl,
+                       decode_block_tables=dc_bt,
+                       decode_max_context_len=dc_max)
 
 
 def set_mixed_context(

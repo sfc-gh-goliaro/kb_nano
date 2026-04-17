@@ -16,6 +16,8 @@ import torch.nn as nn
 import triton
 import triton.language as tl
 
+from .fp8_grouped_gemm_contiguous import _is_deep_gemm_e8m0_used
+
 _FP8_INFO = torch.finfo(torch.float8_e4m3fn)
 _GROUP_SIZE = 128
 
@@ -137,12 +139,24 @@ class SiluMulQuantFp8(nn.Module):
     Takes gate_up output ``[M, 2*N]`` and produces FP8 intermediate ``[M, N]``
     with per-group UE8M0 scales, in a single kernel launch.  Used by the
     DeepSeek-V3 MoE which expects an `nn.Module`-style operator.
+
+    ``use_ue8m0`` is selected by the same DeepGEMM oracle vLLM uses: it is
+    ``True`` when ``is_deep_gemm_e8m0_used()`` (Hopper/Blackwell + the
+    ``VLLM_USE_DEEP_GEMM_E8M0`` env flag is on, default), else ``False``.
+    Mirrors the dispatch in
+    ``vllm/model_executor/layers/fused_moe/fused_moe_modular_method.py``
+    where the colmajor kernel is invoked with the same flag.
     """
+
+    def __init__(self) -> None:
+        super().__init__()
+        # Capture the oracle once (it is process-wide).
+        self._use_ue8m0: bool = _is_deep_gemm_e8m0_used()
 
     def forward(
         self,
         gate_up: torch.Tensor,
     ) -> tuple[torch.Tensor, torch.Tensor]:
         return silu_mul_per_token_group_quant_fp8_colmajor(
-            gate_up, output=None, use_ue8m0=True,
+            gate_up, output=None, use_ue8m0=self._use_ue8m0,
         )

@@ -47,6 +47,14 @@ def default_weight_loader(param: torch.nn.Parameter, loaded_weight: torch.Tensor
 
 
 def download_model(model_name: str) -> str:
+    # Accept an already-staged local directory (used by the
+    # ``diff_deepseek_layers`` diagnostic and other fixtures that feed a
+    # truncated checkpoint to the engine).  Without this short-circuit,
+    # ``snapshot_download`` rejects the absolute path as an invalid
+    # ``org/repo`` id, which makes TP>1 worker processes fail on import
+    # since they do not inherit any parent-side monkey-patches.
+    if os.path.isdir(model_name):
+        return model_name
     return snapshot_download(
         model_name, allow_patterns=["*.safetensors", "*.json"],
     )
@@ -375,14 +383,36 @@ def _threaded_safetensors_iterator(safetensor_files):
 
 
 def _fastsafetensors_iterator(safetensor_files):
-    """Yield (weight_name, tensor) using fastsafetensors GPU-direct loading."""
-    device = torch.device(f"cuda:{torch.cuda.current_device()}")
-    pg = SingleGroup()
-    sorted_files = sorted(safetensor_files)
+    """Yield (weight_name, tensor) using fastsafetensors GPU-direct loading.
 
-    for f_path in sorted_files:
-        loader = SafeTensorsFileLoader(pg, device, nogds=True)
-        loader.add_filenames({0: [f_path]})
+    Mirrors vLLM's ``fastsafetensors_weights_iterator``
+    (vllm/model_executor/model_loader/weight_utils.py:942) which loads
+    ``pg.size()`` files in parallel across the TP process group.  Each
+    rank reads one file at a time, then broadcasts/redistributes via
+    fastsafetensors' internal collectives.  With TP=8 and 21 shards this
+    is 8x faster than the previous SingleGroup loop that made every rank
+    sequentially read every file.
+    """
+    if torch.distributed.is_initialized():
+        pg = torch.distributed.group.WORLD
+    else:
+        pg = SingleGroup()
+
+    device = torch.device(f"cuda:{torch.cuda.current_device()}")
+    sorted_files = sorted(safetensor_files)
+    world_size = pg.size()
+    file_sub_lists = [
+        sorted_files[i:i + world_size]
+        for i in range(0, len(sorted_files), world_size)
+    ]
+    # vLLM disables GDS for TP>1 to avoid creating CUDA contexts on every
+    # visible GPU (cuFileDriverOpen side-effect).  Match that.
+    nogds = world_size > 1
+
+    for f_list in file_sub_lists:
+        loader = SafeTensorsFileLoader(pg, device, nogds=nogds)
+        rank_file_map = {i: [f] for i, f in enumerate(f_list)}
+        loader.add_filenames(rank_file_map)
         try:
             fb = loader.copy_files_to_device()
             try:
@@ -592,6 +622,12 @@ def load_weights(model, model_path: str, model_type: str = "llama") -> None:
                 ".shared_experts.", ".shared_expert.")
             mapped_name = mapped_name.replace(
                 ".mlp.gate.weight", ".mlp.gate_weight")
+            # The router's ``e_score_correction_bias`` lives directly on the
+            # ``DeepSeekMoE`` module (not under a ``.gate`` submodule as in
+            # the HuggingFace checkpoint), so strip the ``.gate`` segment.
+            mapped_name = mapped_name.replace(
+                ".mlp.gate.e_score_correction_bias",
+                ".mlp.e_score_correction_bias")
 
         # Whisper: remap checkpoint names
         if is_whisper:
@@ -1048,6 +1084,18 @@ def _detect_diffusion_type(model_name: str) -> str:
     return "flux"
 
 
+def _load_config_dict(model_name: str) -> dict:
+    """Read ``config.json`` from either a local staging dir or the Hub."""
+    import json
+    if os.path.isdir(model_name):
+        path = os.path.join(model_name, "config.json")
+    else:
+        from huggingface_hub import hf_hub_download
+        path = hf_hub_download(model_name, "config.json")
+    with open(path) as f:
+        return json.load(f)
+
+
 def _detect_model_type(model_name: str) -> str:
     """Detect model architecture from HuggingFace config."""
     if _is_diffusion_model(model_name):
@@ -1058,11 +1106,7 @@ def _detect_model_type(model_name: str) -> str:
     except ValueError:
         # DeepSeek-V3.2 ships a custom config class not registered with
         # transformers; fall back to reading config.json directly.
-        from huggingface_hub import hf_hub_download
-        import json
-        path = hf_hub_download(model_name, "config.json")
-        with open(path) as f:
-            model_type = json.load(f).get("model_type", "llama")
+        model_type = _load_config_dict(model_name).get("model_type", "llama")
     if model_type == "deepseek_v32":
         model_type = "deepseek_v3"
     return model_type
@@ -1073,13 +1117,8 @@ def _detect_quant_config(model_name: str) -> dict | None:
     try:
         hf_config = AutoConfig.from_pretrained(model_name, trust_remote_code=True)
     except ValueError:
-        from huggingface_hub import hf_hub_download
-        import json
-        path = hf_hub_download(model_name, "config.json")
-        with open(path) as f:
-            cfg = json.load(f)
         from types import SimpleNamespace
-        hf_config = SimpleNamespace(**cfg)
+        hf_config = SimpleNamespace(**_load_config_dict(model_name))
     qc = getattr(hf_config, "quantization_config", None)
     if qc is None:
         return None
@@ -1210,6 +1249,12 @@ def load_model(
                     param.data = param.data.to(device=device)
             elif "weight_scale_inv" in name or "w13_scale" in name or "w2_scale" in name:
                 param.data = param.data.to(device=device)
+            elif param.dtype == torch.float32:
+                # Preserve FP32 parameters (e.g. the DeepSeek router's
+                # ``e_score_correction_bias``) that were intentionally allocated
+                # in FP32 and must stay FP32 to match vLLM's router bias path.
+                if param.data.device != device:
+                    param.data = param.data.to(device=device)
             elif param.data.device != device or param.dtype != dtype:
                 param.data = param.data.to(device=device, dtype=dtype)
         for name, buf in model.named_buffers():
