@@ -1,4 +1,4 @@
-"""ReLU activation kernel."""
+"""ReLU activation: max(0, x)."""
 
 from __future__ import annotations
 
