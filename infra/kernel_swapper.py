@@ -41,7 +41,7 @@ _KB_ROOT = KB_ROOT
 _CANDIDATE_DIR = CANDIDATE_DIR
 
 _L4_MODEL_KEYS: dict[str, str] = {
-    "gla": "gla",
+    "gpt_oss": "gpt_oss",
     "kimi_linear": "kimi_linear",
     "llama": "llama31",
     "llama4": "llama4",

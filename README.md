@@ -1,11 +1,14 @@
 # kb-nano
 
-A standalone, high-performance inference engine supporting **LLMs** (Llama 3.1, Mixtral-8x7B, Qwen2-VL, Qwen3-VL), **diffusion models** (FLUX.1-dev, SDXL, HunyuanVideo-1.5), **detection models** (YOLOv10, RTDetrV2), **vision encoders** (SigLIP-2, DINOv3, SwinV2), **segmentation models** (SAM3.1), **protein structure prediction** (OpenFold3), audio models (Whisper), and **TTS models** (CosyVoice3) with tensor parallelism. No vLLM dependency at runtime — just PyTorch, Triton, and Flash Attention.
+A standalone, high-performance inference engine supporting **LLMs** (Llama 3.1, Mixtral-8x7B, GPT-OSS, Kimi-Linear, Qwen3-Next, Qwen2-VL, Qwen3-VL), **diffusion models** (FLUX.1-dev, SDXL, HunyuanVideo-1.5), **detection models** (YOLOv10, RTDetrV2), **vision encoders** (SigLIP-2, DINOv3, SwinV2), **segmentation models** (SAM3.1), **protein structure prediction** (OpenFold3), audio models (Whisper), and **TTS models** (CosyVoice3) with tensor parallelism. No vLLM dependency at runtime — just PyTorch, Triton, and Flash Attention.
 
 ## Features
 
 - **Llama 3.1** (8B, 70B) with frequency-scaled RoPE
 - **Mixtral-8x7B** with fused Triton MoE grouped-GEMM kernels
+- **GPT-OSS** (20B, 120B) MXFP4-quantized MoE with native Triton inference, YaRN RoPE, attention sinks, and sliding window
+- **Kimi-Linear-48B-A3B-Instruct** hybrid recurrent + attention MoE: KDA (Kimi Delta Attention) linear-attention layers fused with MLA (Multi-head Latent Attention) full-attention layers, sigmoid-gated 256-expert MoE (top-8) with shared expert and `e_score_correction_bias` routing
+- **Qwen3-Next-80B-A3B-Instruct** hybrid recurrent + attention MoE: 3:1 GDN (Gated Delta Net) linear attention to full attention with output gating + per-head QK-norm + partial RoPE, softmax-gated 512-expert MoE (top-10) with sigmoid-gated shared expert
 - **FLUX.1-dev** diffusion transformer (text-to-image) with Flash Attention
 - **SDXL** (Stable Diffusion XL) UNet-based text-to-image with dual CLIP text encoders
 - **HunyuanVideo-1.5** 3D video diffusion transformer (text-to-video) with dual-stream joint attention, M-RoPE, and Qwen2.5-VL text encoder
@@ -107,6 +110,18 @@ python tests/bench_vllm.py --model meta-llama/Llama-3.1-8B-Instruct
 # With tensor parallelism
 python tests/bench_vllm.py \
     --model meta-llama/Llama-3.1-70B-Instruct --tp 4
+
+# GPT-OSS MoE (MXFP4 quantized)
+python tests/bench_vllm.py \
+    --model openai/gpt-oss-120b --tp 2
+
+# Kimi-Linear-48B-A3B (hybrid KDA + MLA MoE)
+python tests/bench_vllm.py \
+    --model moonshotai/Kimi-Linear-48B-A3B-Instruct --tp 2
+
+# Qwen3-Next-80B-A3B (hybrid GDN + full-attention MoE)
+python tests/bench_vllm.py \
+    --model Qwen/Qwen3-Next-80B-A3B-Instruct --tp 2
 
 # Whisper speech-to-text
 python tests/bench_vllm.py --model openai/whisper-large-v3
@@ -474,6 +489,32 @@ Run `tests/bench_vllm.py` to reproduce. Workload uses random token IDs with `ign
 | Mixtral-8x7B | 4 |   64 |  512/256  |  3,397 |  4,401 | 1.30x |
 | Mixtral-8x7B | 4 |  128 |  512/256  |  4,720 |  7,230 | 1.53x |
 | Mixtral-8x7B | 4 |  256 | 1024/1024 |  9,769 |  9,852 | 1.01x |
+
+### GPT-OSS (MXFP4)
+
+Run `tests/bench_vllm.py --model openai/gpt-oss-120b --tp 2` to reproduce. 1000 sequences per scenario, `temperature=0`. Expert weights remain in packed MXFP4 uint8 format — no dequantization at any point. Uses vLLM's Triton `matmul_ogs` kernel for fused MoE, FlashAttention 3 for attention sinks and sliding window, and YaRN RoPE.
+
+Throughput:
+
+| Model | TP | Scenario | Input/Output | vLLM (tok/s) | Ours (tok/s) | Ratio | Avg Match Tokens |
+|-------|---:|----------|:------------:|-------------:|-------------:|------:|-----------------:|
+| gpt-oss-20b  | 2 | prefill-heavy | 1024/512  |  11,554 |   9,675 | 0.84x | 460.4/512 |
+| gpt-oss-20b  | 2 | balanced      |  512/512  |  12,974 |  10,907 | 0.84x | 437.1/512 |
+| gpt-oss-20b  | 2 | decode-heavy  |  512/1024 |  13,175 |  12,035 | 0.91x | 925.6/1024 |
+| gpt-oss-120b | 2 | prefill-heavy | 1024/512  |  10,761 |  13,265 | **1.23x** | 112.3/512 |
+| gpt-oss-120b | 2 | balanced      |  512/512  |  16,300 |  17,274 | **1.06x** | 124.1/512 |
+| gpt-oss-120b | 2 | decode-heavy  |  512/1024 |  15,236 |  19,186 | **1.26x** | 213.0/1024 |
+
+Latency (128 output tokens, 5 iterations):
+
+| Model | TP | Scenario | Batch Size | vLLM median | Ours median | vLLM ms/tok | Ours ms/tok | Ratio |
+|-------|---:|----------|---:|------------:|------------:|------------:|------------:|------:|
+| gpt-oss-20b  | 2 | single-request | 1  | 0.446s | 0.554s | 3.48 | 4.32 | 0.80x |
+| gpt-oss-20b  | 2 | fixed-batch-32 | 32 | 0.665s | 0.743s | 0.16 | 0.18 | 0.90x |
+| gpt-oss-120b | 2 | single-request | 1  | 0.661s | 0.794s | 5.17 | 6.21 | 0.83x |
+| gpt-oss-120b | 2 | fixed-batch-32 | 32 | 3.044s | 1.393s | 0.74 | 0.34 | **2.19x** |
+
+The 120B model shows strong throughput advantages (1.06-1.26x) and a 2.19x batched latency speedup. The lower token match rate for the 120B model is expected: with 128 experts and top-4 routing, small numerical differences in router logits cause different expert selections, which cascade into divergent outputs. The 20B model (32 experts) shows higher match rates (85-90%).
 
 **Hardware: 4x NVIDIA B200 (NVLink)**
 
