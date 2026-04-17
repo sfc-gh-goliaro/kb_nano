@@ -234,16 +234,29 @@ python tests/test_sam.py --skip-latency
 git clone https://github.com/Pointcept/PointTransformerV3.git third_party/PointTransformerV3
 
 # PointTransformerV3: throughput + alignment benchmark vs official detached implementation
-python tests/bench_pointcloud.py --model Pointcept/PointTransformerV3 --use-fp16
+# First run auto-downloads jxie/scanobjectnn to data/scanobjectnn
+python tests/bench_pointcloud.py --use-fp16
+
+# Heavier ScanObjectNN workload used for README numbers
+python tests/bench_pointcloud.py \
+    --use-fp16 \
+    --split nobg_test \
+    --max-samples 128 \
+    --batch-size 8 \
+    --points-per-sample 2048 \
+    --grid-size 0.01 \
+    --warmup-iters 10 \
+    --measure-iters 50
 
 # Enable Flash Attention in both ours and reference
-python tests/bench_pointcloud.py --model Pointcept/PointTransformerV3 --use-fp16 --enable-flash
+python tests/bench_pointcloud.py --use-fp16 --enable-flash
 
 # kb-nano only (skip reference comparison)
-python tests/bench_pointcloud.py --model Pointcept/PointTransformerV3 --use-fp16 --skip-reference
+python tests/bench_pointcloud.py --use-fp16 --skip-reference
 
 # Save results to a specific directory
-python tests/bench_pointcloud.py --model Pointcept/PointTransformerV3 --use-fp16 --output-dir tests/results/H200/PointTransformerV3
+python tests/bench_pointcloud.py --use-fp16 --output-dir tests/results/H200/PointTransformerV3
+```
 
 ### Benchmarking detection models
 
@@ -460,7 +473,7 @@ git clone https://github.com/THU-MIG/yolov10.git third_party/yolov10
 Optional benchmark baselines:
 
 ```bash
-pip install addict spconv-cu121==2.3.8
+pip install addict datasets spconv-cu121==2.3.8
 ```
 
 PointTransformerV3 benchmarking compares against the official detached implementation in `third_party/PointTransformerV3`. The current benchmark path uses a local `torch_scatter.segment_csr` shim backed by `torch.segment_reduce`, so `torch_scatter` is not required.
@@ -864,23 +877,21 @@ The remaining numerical divergence is expected from SDPA vs Flash Attention nume
 
 ### PointTransformerV3 (Point Cloud)
 
-Run `tests/bench_pointcloud.py` to reproduce. The upstream PointTransformerV3 repository currently marks released pretrained weights as invalid, so this benchmark uses synthetic point clouds with synchronized random weights loaded into both the official detached implementation and kb-nano. Reported correctness is feature-space alignment on the final point features.
+Run `tests/bench_pointcloud.py` to reproduce. The benchmark uses the public `jxie/scanobjectnn` dataset from Hugging Face and auto-downloads it on first run into `data/scanobjectnn`. Inputs are deterministically voxel-deduplicated before building the sparse tensor so both the official detached implementation and kb-nano see the same valid voxel set. Reported correctness is feature-space alignment on the final point features.
 
 **Hardware: NVIDIA H200**
 
 Throughput (points/sec):
 
-| Attention Backend | Points/Cloud | Batch | Official Detached | Ours | Ratio |
-|-------------------|-------------:|------:|------------------:|-----:|------:|
-| SDPA | 4096 | 2 | 106,301 | 99,678 | 0.94x |
-| Flash Attention | 4096 | 2 | 113,489 | 110,542 | 0.97x |
+| Dataset Split | Requested Points/Sample | Avg Points After Voxelization | Batch | Official Detached | Ours | Ratio |
+|---------------|------------------------:|------------------------------:|------:|------------------:|-----:|------:|
+| ScanObjectNN `nobg_test` | 2048 | 1941.47 | 8 | 306,047 | 302,902 | 0.99x |
 
-Correctness (feature space, 2048 alignment points):
+Correctness (feature space, first alignment batch):
 
-| Attention Backend | Feature CosSim | Feature MAE | Feature Shape |
-|-------------------|---------------:|------------:|:-------------:|
-| SDPA | 0.999984 | 0.007682 | 2048x64 |
-| Flash Attention | 0.999984 | 0.007678 | 2048x64 |
+| Dataset Split | Feature CosSim | Feature MAE | Feature Shape |
+|---------------|---------------:|------------:|:-------------:|
+| ScanObjectNN `nobg_test` | 0.999813 | 0.02536 | 15702x64 |
 
 ### YOLOv10 (Detection)
 

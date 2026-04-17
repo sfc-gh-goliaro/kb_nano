@@ -70,6 +70,7 @@ def default_ptv3_kwargs(enable_flash: bool = False) -> dict:
         "enable_flash": enable_flash,
         "enc_patch_size": patch,
         "dec_patch_size": dec_patch,
+        "shuffle_orders": False,
     }
 
 

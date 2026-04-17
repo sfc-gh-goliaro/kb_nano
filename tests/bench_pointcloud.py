@@ -1,4 +1,4 @@
-"""Benchmark PointTransformerV3 vs official detached implementation."""
+"""Benchmark PointTransformerV3 on ScanObjectNN."""
 
 from __future__ import annotations
 
@@ -18,6 +18,8 @@ from bench.utils.worker import run_worker
 
 POINTCLOUD_WORKER = r'''
 import json, os, random, sys, time
+from pathlib import Path
+
 import numpy as np
 import torch
 
@@ -32,6 +34,7 @@ from infra.pointcloud_loader import (
     load_reference_point_model,
 )
 
+
 def set_seed(seed: int):
     random.seed(seed)
     np.random.seed(seed)
@@ -39,25 +42,216 @@ def set_seed(seed: int):
     if torch.cuda.is_available():
         torch.cuda.manual_seed_all(seed)
 
-def make_batch(points_per_cloud: int, batch_size: int, feat_dim: int, device: str, dtype: torch.dtype, grid_size: float):
-    total = points_per_cloud * batch_size
-    coord = torch.rand(total, 3, device=device, dtype=dtype) * 10.0
-    feat = torch.rand(total, feat_dim, device=device, dtype=dtype)
-    counts = torch.full((batch_size,), points_per_cloud, device=device, dtype=torch.long)
-    offset = torch.cumsum(counts, dim=0)
-    return {"coord": coord, "feat": feat, "grid_size": grid_size, "offset": offset}
+
+def _resample_points(pos: torch.Tensor, num_points: int) -> torch.Tensor:
+    if pos.shape[0] == num_points:
+        return pos
+    if pos.shape[0] > num_points:
+        index = torch.linspace(0, pos.shape[0] - 1, steps=num_points).round().long()
+        return pos[index]
+    repeat = (num_points + pos.shape[0] - 1) // pos.shape[0]
+    return pos.repeat((repeat, 1))[:num_points]
+
+
+def _voxel_unique(pos: torch.Tensor, grid_size: float) -> tuple[torch.Tensor, torch.Tensor]:
+    grid = torch.div(pos - pos.min(dim=0).values, grid_size, rounding_mode="trunc").int()
+    grid_unique, inverse, counts = torch.unique(
+        grid,
+        dim=0,
+        sorted=True,
+        return_inverse=True,
+        return_counts=True,
+    )
+    coord = torch.zeros((grid_unique.shape[0], pos.shape[1]), dtype=pos.dtype)
+    coord.index_add_(0, inverse, pos)
+    coord = coord / counts.unsqueeze(1)
+    return coord, grid_unique
+
+
+def load_scanobjectnn(dataset_root: str, split: str, points_per_sample: int, max_samples: int, grid_size: float):
+    try:
+        from datasets import load_dataset
+    except ImportError as exc:
+        raise ImportError(
+            "ScanObjectNN benchmark requires the Hugging Face datasets package."
+        ) from exc
+
+    dataset = load_dataset(
+        "jxie/scanobjectnn",
+        split=f"{split}[:{max_samples}]",
+        cache_dir=dataset_root,
+    )
+    samples = []
+    for idx, row in enumerate(dataset):
+        pos = torch.tensor(row["inputs"], dtype=torch.float32)
+        pos = _resample_points(pos, points_per_sample)
+        pos = pos - pos.mean(dim=0, keepdim=True)
+        scale = pos.norm(dim=1).amax().clamp(min=1e-6)
+        pos = pos / scale
+        pos, grid_coord = _voxel_unique(pos, grid_size=grid_size)
+        samples.append(
+            {
+                "pos": pos,
+                "normal": torch.zeros_like(pos),
+                "grid_coord": grid_coord,
+                "y": torch.tensor(int(row["label"]), dtype=torch.long),
+                "sample_id": f"{split}:{idx}",
+            }
+        )
+    return samples
+
+
+def _to_tensor(value):
+    if value is None:
+        return None
+    if isinstance(value, torch.Tensor):
+        return value
+    return torch.as_tensor(value)
+
+
+def _sample_get(sample, key, default=None):
+    if isinstance(sample, dict):
+        return sample.get(key, default)
+    return getattr(sample, key, default)
+
+
+def _sample_point_count(sample) -> int:
+    pos = _sample_get(sample, "pos")
+    return int(pos.shape[0])
+
+
+def _normalize_feat_dim(feat: torch.Tensor, target_dim: int = 6) -> torch.Tensor:
+    feat = feat.float()
+    if feat.shape[1] < target_dim:
+        pad = torch.zeros(feat.shape[0], target_dim - feat.shape[1], dtype=feat.dtype)
+        feat = torch.cat([feat, pad], dim=1)
+    elif feat.shape[1] > target_dim:
+        feat = feat[:, :target_dim]
+    return feat
+
+
+def build_batches(
+    samples,
+    dataset_name: str,
+    batch_size: int,
+    grid_size: float,
+    feat_dim: int,
+    device: str,
+    dtype: torch.dtype,
+):
+    batches = []
+    for batch_start in range(0, len(samples), batch_size):
+        batch_samples = samples[batch_start : batch_start + batch_size]
+        if len(batch_samples) < batch_size:
+            break
+
+        coords = []
+        feats = []
+        grid_coords = []
+        counts = []
+        labels = []
+        sample_ids = []
+        for local_idx, sample in enumerate(batch_samples):
+            coord = _to_tensor(_sample_get(sample, "pos")).float()
+            normal = _to_tensor(_sample_get(sample, "normal"))
+            grid_coord = _to_tensor(_sample_get(sample, "grid_coord"))
+            if normal is None:
+                normal = torch.zeros_like(coord)
+            feat = torch.cat([coord, normal.float()], dim=1)
+            feat = _normalize_feat_dim(feat, feat_dim)
+            coords.append(coord)
+            feats.append(feat)
+            if grid_coord is not None:
+                grid_coords.append(grid_coord.long())
+            counts.append(coord.shape[0])
+            label = _sample_get(sample, "y")
+            labels.append(int(label.item()) if label is not None else -1)
+            sample_ids.append(str(_sample_get(sample, "sample_id", f"{dataset_name}:{batch_start + local_idx}")))
+
+        coord = torch.cat(coords, dim=0).to(device=device, dtype=dtype)
+        feat = torch.cat(feats, dim=0).to(device=device, dtype=dtype)
+        offset = torch.as_tensor(counts, dtype=torch.long, device=device).cumsum(dim=0)
+        batch = {
+            "coord": coord,
+            "feat": feat,
+            "grid_size": float(grid_size),
+            "offset": offset,
+            "sample_ids": sample_ids,
+            "labels": labels,
+        }
+        if grid_coords:
+            batch["grid_coord"] = torch.cat(grid_coords, dim=0).to(device=device, dtype=torch.int32)
+        batches.append(batch)
+    return batches
+
 
 def forward_model(model, batch):
     out = model(batch)
     return out.feat if hasattr(out, "feat") else out["feat"]
 
+
+def measure(model, batches, warmup_iters: int, measure_iters: int):
+    for _ in range(warmup_iters):
+        for batch in batches:
+            forward_model(model, batch)
+    if torch.cuda.is_available():
+        torch.cuda.synchronize()
+    start = time.perf_counter()
+    total_points = 0
+    for _ in range(measure_iters):
+        for batch in batches:
+            forward_model(model, batch)
+            total_points += int(batch["coord"].shape[0])
+    if torch.cuda.is_available():
+        torch.cuda.synchronize()
+    elapsed = time.perf_counter() - start
+    return total_points / elapsed
+
+
 def main():
     with open(sys.argv[1]) as f:
         cfg = json.load(f)
+
     device = cfg["device"]
     dtype = torch.float16 if cfg["use_fp16"] else torch.float32
     enable_flash = bool(cfg.get("enable_flash", False))
     model_kwargs = default_ptv3_kwargs(enable_flash=enable_flash)
+
+    if cfg["dataset"] != "scanobjectnn":
+        raise ValueError(f"Unsupported dataset: {cfg['dataset']}")
+    samples = load_scanobjectnn(
+        cfg["dataset_root"],
+        cfg["split"],
+        cfg["points_per_sample"],
+        cfg["max_samples"],
+        cfg["grid_size"],
+    )
+    if len(samples) < cfg["batch_size"]:
+        raise RuntimeError(
+            f"Need at least batch_size={cfg['batch_size']} samples, found {len(samples)} under {cfg['dataset_root']}"
+        )
+    align_count = max(cfg["alignment_samples"], cfg["batch_size"])
+
+    throughput_batches = build_batches(
+        samples=samples,
+        dataset_name=cfg["dataset"],
+        batch_size=cfg["batch_size"],
+        grid_size=cfg["grid_size"],
+        feat_dim=cfg["feat_dim"],
+        device=device,
+        dtype=dtype,
+    )
+    align_batches = build_batches(
+        samples=samples[:align_count],
+        dataset_name=cfg["dataset"],
+        batch_size=min(cfg["batch_size"], align_count),
+        grid_size=cfg["grid_size"],
+        feat_dim=cfg["feat_dim"],
+        device=device,
+        dtype=dtype,
+    )
+    if not throughput_batches:
+        raise RuntimeError("No full batches could be built from dataset samples")
 
     set_seed(cfg["seed"])
     ours = load_ours_point_model(cfg["model"], device=device, dtype=dtype, **model_kwargs)
@@ -69,50 +263,27 @@ def main():
         if missing or unexpected:
             raise RuntimeError(f"PTv3 state mismatch missing={missing} unexpected={unexpected}")
 
-    throughput_batch = make_batch(
-        cfg["points_per_cloud"],
-        cfg["batch_size"],
-        cfg["feat_dim"],
-        device,
-        dtype,
-        cfg["grid_size"],
-    )
-    align_batch = make_batch(
-        cfg["alignment_points_per_cloud"],
-        cfg["alignment_batch_size"],
-        cfg["feat_dim"],
-        device,
-        dtype,
-        cfg["grid_size"],
-    )
-
-    def measure(model):
-        for _ in range(cfg["warmup_iters"]):
-            forward_model(model, throughput_batch)
-        torch.cuda.synchronize()
-        start = time.perf_counter()
-        for _ in range(cfg["measure_iters"]):
-            forward_model(model, throughput_batch)
-        torch.cuda.synchronize()
-        elapsed = time.perf_counter() - start
-        total_points = cfg["points_per_cloud"] * cfg["batch_size"] * cfg["measure_iters"]
-        return total_points / elapsed
+    ours_tps = measure(ours, throughput_batches, cfg["warmup_iters"], cfg["measure_iters"])
 
     result = {
         "model": cfg["model"],
-        "points_per_cloud": cfg["points_per_cloud"],
+        "dataset": cfg["dataset"],
+        "dataset_root": cfg["dataset_root"],
+        "split": cfg["split"],
+        "num_batches": len(throughput_batches),
+        "num_samples": len(samples),
         "batch_size": cfg["batch_size"],
+        "points_per_sample": cfg["points_per_sample"],
+        "avg_points_after_voxelization": sum(_sample_point_count(sample) for sample in samples) / len(samples),
         "enable_flash": enable_flash,
+        "ours": {"baseline_name": "kb-nano", "points_per_second": ours_tps},
     }
 
-    ours_tps = measure(ours)
-    result["ours"] = {"baseline_name": "kb-nano", "points_per_second": ours_tps}
-
     if ref is not None:
-        ref_tps = measure(ref)
+        ref_tps = measure(ref, throughput_batches, cfg["warmup_iters"], cfg["measure_iters"])
         with torch.no_grad():
-            ours_feat = forward_model(ours, align_batch).float()
-            ref_feat = forward_model(ref, align_batch).float()
+            ours_feat = forward_model(ours, align_batches[0]).float()
+            ref_feat = forward_model(ref, align_batches[0]).float()
         feat_cos = torch.nn.functional.cosine_similarity(
             ours_feat.reshape(1, -1), ref_feat.reshape(1, -1)
         ).item()
@@ -123,10 +294,12 @@ def main():
             "feat_cosine": feat_cos,
             "feat_mae": feat_mae,
             "feat_shape": list(ours_feat.shape),
+            "alignment_sample_ids": align_batches[0]["sample_ids"],
         }
 
     with open(cfg["output_file"], "w") as f:
         json.dump(result, f)
+
 
 if __name__ == "__main__":
     main()
@@ -134,16 +307,30 @@ if __name__ == "__main__":
 
 
 def parse_args() -> argparse.Namespace:
-    parser = argparse.ArgumentParser(description="Benchmark PointTransformerV3")
+    parser = argparse.ArgumentParser(description="Benchmark PointTransformerV3 on ScanObjectNN")
     parser.add_argument("--model", default="Pointcept/PointTransformerV3")
-    parser.add_argument("--points-per-cloud", type=int, default=4096)
-    parser.add_argument("--batch-size", type=int, default=2)
-    parser.add_argument("--alignment-points-per-cloud", type=int, default=2048)
-    parser.add_argument("--alignment-batch-size", type=int, default=1)
+    parser.add_argument("--dataset", default="scanobjectnn", choices=["scanobjectnn"])
+    parser.add_argument("--dataset-root", default=None)
+    parser.add_argument(
+        "--split",
+        default="nobg_test",
+        choices=[
+            "bg_test",
+            "bg_train",
+            "hardest_test",
+            "hardest_train",
+            "nobg_test",
+            "nobg_train",
+        ],
+    )
+    parser.add_argument("--max-samples", type=int, default=64)
+    parser.add_argument("--alignment-samples", type=int, default=2)
+    parser.add_argument("--batch-size", type=int, default=4)
+    parser.add_argument("--points-per-sample", type=int, default=2048)
     parser.add_argument("--feat-dim", type=int, default=6)
-    parser.add_argument("--grid-size", type=float, default=0.05)
-    parser.add_argument("--warmup-iters", type=int, default=1)
-    parser.add_argument("--measure-iters", type=int, default=3)
+    parser.add_argument("--grid-size", type=float, default=0.01)
+    parser.add_argument("--warmup-iters", type=int, default=5)
+    parser.add_argument("--measure-iters", type=int, default=20)
     parser.add_argument("--seed", type=int, default=1234)
     parser.add_argument("--use-fp16", action="store_true")
     parser.add_argument("--enable-flash", action="store_true")
@@ -156,14 +343,18 @@ def main() -> None:
     args = parse_args()
     os.makedirs(args.output_dir, exist_ok=True)
     device = "cuda" if torch.cuda.is_available() else "cpu"
+    dataset_root = Path(args.dataset_root) if args.dataset_root else (_KB_ROOT / "data" / args.dataset)
     cfg = {
         "kb_root": str(_KB_ROOT),
         "model": args.model,
+        "dataset": args.dataset,
+        "dataset_root": str(dataset_root),
+        "split": args.split,
         "device": device,
-        "points_per_cloud": args.points_per_cloud,
+        "max_samples": args.max_samples,
+        "alignment_samples": args.alignment_samples,
         "batch_size": args.batch_size,
-        "alignment_points_per_cloud": args.alignment_points_per_cloud,
-        "alignment_batch_size": args.alignment_batch_size,
+        "points_per_sample": args.points_per_sample,
         "feat_dim": args.feat_dim,
         "grid_size": args.grid_size,
         "warmup_iters": args.warmup_iters,
