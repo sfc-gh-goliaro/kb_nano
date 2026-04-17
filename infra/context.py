@@ -155,7 +155,7 @@ def auto_register_no_compile_layers(model: "nn.Module") -> None:
     Also sets ``_layer_name`` on each module so it knows its own key.
     ``_use_custom_op`` remains ``False`` until compilation is enabled.
     """
-    _TARGET_NAMES = {"Qwen3MoE", "MixtralMoE", "Attention"}
+    _TARGET_NAMES = {"Qwen3MoE", "MixtralMoE", "GptOssMoE", "Attention"}
     layers: dict[str, "nn.Module"] = {}
     for name, mod in model.named_modules():
         if type(mod).__name__ in _TARGET_NAMES:

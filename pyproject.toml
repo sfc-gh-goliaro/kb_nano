@@ -13,6 +13,8 @@ dependencies = [
     "numpy",
     "pyyaml",
     "transformers",
+    "huggingface_hub",
+    "safetensors",
     "tqdm",
     "flash-attn",
     "vllm==0.18.0",
@@ -23,14 +25,12 @@ dependencies = [
     "diffusers>=0.37",
     "peft>=0.17.0",
     "sam3 @ git+https://github.com/sfc-gh-goliaro/sam3.git",
-    "openfold3 @ git+https://github.com/aqlaboratory/openfold-3.git",
+    "openfold3 @ git+https://github.com/sfc-gh-goliaro/openfold-3.git",
     "pycocotools",
     "timm",
     "fastsafetensors",
+    "ultralytics",
 ]
-
-[project.optional-dependencies]
-tracking = ["mlflow>=2.10"]
 
 [project.scripts]
 kb_nano = "kb_nano.__main__:main"

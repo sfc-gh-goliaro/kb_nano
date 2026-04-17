@@ -41,6 +41,7 @@ _KB_ROOT = KB_ROOT
 _CANDIDATE_DIR = CANDIDATE_DIR
 
 _L4_MODEL_KEYS: dict[str, str] = {
+    "gpt_oss": "gpt_oss",
     "llama": "llama31",
     "llama4": "llama4",
     "mixtral": "mixtral",
@@ -51,6 +52,8 @@ _L4_MODEL_KEYS: dict[str, str] = {
     "cosyvoice3": "cosyvoice3",
     "hunyuan_video": "hunyuan_video",
     "pointtransformerv3": "pointtransformerv3",
+    "yolov10": "yolov10",
+    "rtdetrv2": "rtdetrv2",
     "openfold3": "openfold3",
     "siglip2": "siglip2",
     "dinov3": "dinov3",
