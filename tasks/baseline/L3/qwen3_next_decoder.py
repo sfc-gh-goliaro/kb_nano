@@ -12,7 +12,7 @@ import torch.nn as nn
 from ..L1.gemma_rms_norm import GemmaRMSNorm
 from ..L2.qwen3_next_gdn_attention import Qwen3NextGDNAttention
 from ..L2.qwen3_next_attention import Qwen3NextAttention
-from ..L2.qwen3_next_moe import Qwen3NextMoE
+from ..L2.shared_expert_moe import SharedExpertMoE
 
 
 class Qwen3NextDecoderLayer(nn.Module):
@@ -42,8 +42,20 @@ class Qwen3NextDecoderLayer(nn.Module):
         else:
             raise ValueError(f"Invalid layer_type: {self.layer_type}")
 
-        # MoE for all layers
-        self.mlp = Qwen3NextMoE(config)
+        # MoE for all Qwen3-Next layers (every layer is sparse).
+        self.mlp = SharedExpertMoE(
+            hidden_size=config.hidden_size,
+            num_experts=config.num_experts,
+            top_k=config.num_experts_per_tok,
+            moe_intermediate_size=config.moe_intermediate_size,
+            routing="softmax",
+            correction_bias=False,
+            renormalize=config.norm_topk_prob,
+            routed_scaling_factor=1.0,
+            shared_expert_intermediate_size=config.shared_expert_intermediate_size,
+            shared_expert_attr_name="shared_expert",
+            shared_expert_gate=True,
+        )
 
         self.input_layernorm = GemmaRMSNorm(config.hidden_size, eps=config.rms_norm_eps)
         self.post_attention_layernorm = GemmaRMSNorm(

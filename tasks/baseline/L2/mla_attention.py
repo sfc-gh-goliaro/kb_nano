@@ -1,4 +1,4 @@
-"""MLA (Multi-head Latent Attention) for Kimi-Linear.
+"""MLA (Multi-head Latent Attention) for Kimi-Linear (L2).
 
 DeepSeek-V2 style compressed KV attention (NO RoPE rotation):
   q = q_proj(x)                     -> split to (q_nope, q_rope)
@@ -9,6 +9,9 @@ DeepSeek-V2 style compressed KV attention (NO RoPE rotation):
   q = cat(q_nope, q_rope)           (no rotation applied)
   attn = SDPA(q, k, v)
   output = o_proj(attn)
+
+Composes only L1 ops (``RMSNorm``, ``SDPA``) and the canonical TP linears
+in ``parallel_linear``; no ``torch.nn.functional`` math here.
 
 Weight names:
   self_attn.q_proj.weight
@@ -22,11 +25,15 @@ from __future__ import annotations
 
 import torch
 import torch.nn as nn
-import torch.nn.functional as F
 
 from ....infra.tp import _tp_size
-from .parallel_linear import ColumnParallelLinear, RowParallelLinear
-from .kda_attention import ReplicatedLinear
+from ..L1.rms_norm import RMSNorm
+from ..L1.sdpa import SDPA
+from .parallel_linear import (
+    ColumnParallelLinear,
+    ReplicatedLinear,
+    RowParallelLinear,
+)
 
 
 class MLAAttention(nn.Module):
@@ -53,22 +60,21 @@ class MLAAttention(nn.Module):
         self.kv_lora_rank = kv_lora_rank
         self.scaling = self.qk_head_dim ** -0.5
 
-        # Q projection: hidden -> num_heads * qk_head_dim
         self.q_proj = ColumnParallelLinear(
             hidden_size, num_attention_heads * self.qk_head_dim
         )
-        # Compressed KV + shared rope key
         self.kv_a_proj_with_mqa = ReplicatedLinear(
-            hidden_size, kv_lora_rank + qk_rope_head_dim
+            hidden_size, kv_lora_rank + qk_rope_head_dim, bias=False,
         )
-        self.kv_a_layernorm = nn.RMSNorm(kv_lora_rank, eps=rms_norm_eps)
-        # Expand compressed KV
+        self.kv_a_layernorm = RMSNorm(kv_lora_rank, eps=rms_norm_eps)
         self.kv_b_proj = ColumnParallelLinear(
             kv_lora_rank, num_attention_heads * (qk_nope_head_dim + v_head_dim)
         )
         self.o_proj = RowParallelLinear(
             num_attention_heads * v_head_dim, hidden_size
         )
+
+        self.attn = SDPA(scale=self.scaling)
 
     def forward(self, hidden_states, layer_state=None):
         """
@@ -80,20 +86,21 @@ class MLAAttention(nn.Module):
         """
         B, T, _ = hidden_states.shape
 
-        # Q projection
         q = self.q_proj(hidden_states)
         q = q.view(B, T, self.local_num_heads, self.qk_head_dim)
         q_nope = q[..., :self.qk_nope_head_dim]
         q_rope = q[..., self.qk_nope_head_dim:]
 
-        # KV compression
         kv_a = self.kv_a_proj_with_mqa(hidden_states)
         kv_compressed = kv_a[..., :self.kv_lora_rank]
-        k_rope_shared = kv_a[..., self.kv_lora_rank:]  # [B, T, rope_dim]
+        k_rope_shared = kv_a[..., self.kv_lora_rank:]
 
-        kv_compressed = self.kv_a_layernorm(kv_compressed)
+        # RMSNorm wants 2D input on the CUDA path; flatten/restore around it.
+        kv_shape = kv_compressed.shape
+        kv_compressed = self.kv_a_layernorm(
+            kv_compressed.reshape(-1, self.kv_lora_rank)
+        ).view(kv_shape)
 
-        # Expand
         kv_b = self.kv_b_proj(kv_compressed)
         kv_b = kv_b.view(
             B, T, self.local_num_heads,
@@ -104,10 +111,12 @@ class MLAAttention(nn.Module):
 
         # No RoPE rotation for Kimi-Linear MLA — just concatenate
         k_rope = k_rope_shared.unsqueeze(2).expand(-1, -1, self.local_num_heads, -1)
-        q_full = torch.cat([q_nope, q_rope], dim=-1)  # [B, T, H, qk_head_dim]
-        k_full = torch.cat([k_nope, k_rope], dim=-1)  # [B, T, H, qk_head_dim]
+        q_full = torch.cat([q_nope, q_rope], dim=-1)
+        k_full = torch.cat([k_nope, k_rope], dim=-1)
 
-        # Handle KV cache for decode
+        # Per-sequence KV cache (managed by engine via layer_state dict —
+        # MLA layers don't share the engine's paged KV pool because their
+        # decoder is hybrid with the recurrent KDA path).
         if layer_state is not None:
             if "k_cache" not in layer_state:
                 layer_state["k_cache"] = k_full
@@ -122,19 +131,14 @@ class MLAAttention(nn.Module):
             k_full = layer_state["k_cache"]
             v = layer_state["v_cache"]
 
-        # SDPA: [B, T, H, D] -> [B, H, T, D]
+        # SDPA expects [B, H, T, D]
         q_full = q_full.transpose(1, 2)
         k_full = k_full.transpose(1, 2)
         v = v.transpose(1, 2)
 
         is_causal = (q_full.shape[2] == k_full.shape[2] and q_full.shape[2] > 1)
+        attn_out = self.attn(q_full, k_full, v, is_causal=is_causal)
 
-        attn_out = F.scaled_dot_product_attention(
-            q_full, k_full, v, is_causal=is_causal,
-            scale=self.scaling,
-        )
-
-        # [B, H, T, v_dim] -> [B, T, H*v_dim]
         attn_out = attn_out.transpose(1, 2).reshape(
             B, T, self.local_num_heads * self.v_head_dim
         )

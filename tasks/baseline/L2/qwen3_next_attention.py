@@ -1,12 +1,17 @@
-"""Qwen3-Next full attention with per-head QK-norm, partial RoPE, output gating, and KV cache.
+"""Qwen3-Next full attention with per-head QK-norm, partial RoPE, output gating, KV cache (L2).
 
 GQA attention: 16 query heads, 2 KV heads, head_dim=256.
 Q projection outputs 2x: [Q, gate] interleaved per head.
 Partial RoPE (25% of head_dim = 64 dims rotated).
 Output: attn_output * sigmoid(gate).
 
-KV cache is stored in layer_state dict for decode steps.
-Uses flash_attn_func for attention computation (same kernel family as vLLM).
+KV cache is stored in ``layer_state`` dict for decode steps (Qwen3-Next's
+hybrid decoder threads per-sequence state through both linear and full
+attention layers, so we don't use the engine's paged KV pool here).
+
+Composes only L1 ops (``GemmaRMSNorm``, ``FlashAttnDense``) and the
+canonical TP linears in ``parallel_linear``; no direct ``flash_attn``
+imports.
 
 Weight names match HuggingFace checkpoint:
   self_attn.q_proj.weight   [2 * num_heads * head_dim, hidden_size]  (Q + gate)
@@ -22,11 +27,10 @@ from __future__ import annotations
 import torch
 import torch.nn as nn
 
-from flash_attn import flash_attn_func
-
 from ....infra.tp import _tp_size
-from .parallel_linear import QKVParallelLinear, RowParallelLinear
+from ..L1.flash_attn_dense import FlashAttnDense
 from ..L1.gemma_rms_norm import GemmaRMSNorm
+from .parallel_linear import QKVParallelLinear, RowParallelLinear
 
 
 class Qwen3NextAttention(nn.Module):
@@ -61,6 +65,9 @@ class Qwen3NextAttention(nn.Module):
         # Per-head QK norms (GemmaRMSNorm)
         self.q_norm = GemmaRMSNorm(head_dim, eps=rms_norm_eps)
         self.k_norm = GemmaRMSNorm(head_dim, eps=rms_norm_eps)
+
+        # Dense flash-attention (L1 op) — KV cache lives in layer_state.
+        self.attn = FlashAttnDense(softmax_scale=self.scaling, causal=True)
 
     def forward(self, hidden_states, rotary_emb=None, positions=None,
                 layer_state=None):
@@ -117,13 +124,9 @@ class Qwen3NextAttention(nn.Module):
             layer_state["k_cache"] = k
             layer_state["v_cache"] = v
 
-        # flash_attn_func: [B, T, H, D] format, handles GQA natively
-        # causal=True with Q_len < K_len uses bottom-right alignment (correct for decode)
-        o = flash_attn_func(
-            q, k, v,
-            softmax_scale=self.scaling,
-            causal=True,
-        )  # [B, T_q, num_heads, head_dim]
+        # FlashAttnDense (L1): [B, T, H, D] layout, handles GQA natively;
+        # causal=True with Q_len < K_len uses bottom-right alignment for decode.
+        o = self.attn(q, k, v)  # [B, T_q, num_heads, head_dim]
 
         # Output gating: o * sigmoid(gate)
         o = o * torch.sigmoid(gate)
