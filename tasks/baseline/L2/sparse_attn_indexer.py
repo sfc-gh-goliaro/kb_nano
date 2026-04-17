@@ -26,12 +26,16 @@ def _kv_spans_from_batches(
     cu_seqlens_q: torch.Tensor,
     seq_lens_k: torch.Tensor,
     device: torch.device,
+    N: int | None = None,
 ) -> tuple[torch.Tensor, torch.Tensor]:
     """Per-token KV span boundaries for causal prefill indexer logits.
 
     Args:
         cu_seqlens_q: [B+1] cumulative query token counts.
         seq_lens_k:   [B] full KV sequence length per batch.
+        N: total number of query tokens. Pass explicitly to avoid a D2H
+           sync on ``cu_seqlens_q[-1].item()``; callers know this count
+           from the shape of the Q tensor.
 
     Returns:
         (cu_seqlen_ks, cu_seqlen_ke): both [N] int32, per-query-token
@@ -41,7 +45,9 @@ def _kv_spans_from_batches(
     L = seq_lens_k.long()
     B = L.numel()
     counts = q[1:] - q[:-1]
-    N = int(q[-1].item())
+    if N is None:
+        # Fallback: sync on cu_seqlens_q[-1]. Avoid this on the hot path.
+        N = int(q[-1].item())
     if N == 0:
         empty = torch.empty(0, dtype=torch.int32, device=device)
         return empty, empty
@@ -236,7 +242,7 @@ class SparseAttnIndexer(nn.Module):
             num_seqs = cu_k.shape[0] - 1
             seq_lens_k = cu_k[1:] - cu_k[:-1]
             cu_seqlen_ks, cu_seqlen_ke = _kv_spans_from_batches(
-                cu_q, seq_lens_k, hidden_states.device)
+                cu_q, seq_lens_k, hidden_states.device, N=np_)
 
             logits = self.fp8_mqa_logits.forward_prefill(
                 q_fp8_pf.view(-1, self.n_head, self.head_dim),

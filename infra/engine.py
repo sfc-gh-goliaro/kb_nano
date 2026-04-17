@@ -1124,6 +1124,21 @@ class ModelRunner:
                     bt[i, :len(b)] = b
             block_tables = torch.from_numpy(bt).pin_memory().cuda(non_blocking=True)
 
+        # Per-token request id (row into block_tables). Pre-computing this
+        # once per step avoids a Python for-loop + .item() sync inside every
+        # MLA / DSA layer (see ``_forward_sparse_bf16`` fallback in
+        # ``mla_attention_impl.py``).
+        nseqs_pf = len(seqs)
+        seq_lens_np = np.fromiter(
+            (len(s) for s in seqs), dtype=np.int32, count=nseqs_pf,
+        )
+        req_id_np = np.repeat(
+            np.arange(nseqs_pf, dtype=np.int32), seq_lens_np,
+        )
+        req_id_per_token = torch.from_numpy(req_id_np).pin_memory().cuda(
+            non_blocking=True,
+        )
+
         set_context(
             True,
             torch.tensor(cu_seqlens_q, dtype=torch.int32, pin_memory=True).cuda(non_blocking=True),
@@ -1132,6 +1147,7 @@ class ModelRunner:
             torch.tensor(slot_mapping, dtype=(torch.int64 if self.is_deepseek_mla else torch.int32),
                          pin_memory=True).cuda(non_blocking=True),
             block_tables=block_tables,
+            req_id_per_token=req_id_per_token,
         )
 
         input_ids_t = torch.tensor(input_ids, dtype=torch.int64, pin_memory=True).cuda(non_blocking=True)
@@ -1173,12 +1189,25 @@ class ModelRunner:
             b = seq.block_table
             bt[i, :len(b)] = b
         max_cl = int(cl[:n].max())
+        # Pure-decode: one token per request, so token i belongs to request i.
+        # Reuse the persistent arange buffer allocated in
+        # ``capture_cudagraph`` (also referenced by every captured decode
+        # CUDA graph) to avoid allocating a fresh tensor each step.  Falls
+        # back to an inline arange for eager runs where capture was skipped.
+        req_id_per_token = getattr(self, "_decode_req_id_buf", None)
+        if req_id_per_token is not None:
+            req_id_per_token = req_id_per_token[:n]
+        else:
+            req_id_per_token = torch.arange(
+                n, dtype=torch.int32, device=f"cuda:{self.rank}",
+            )
         set_context(
             False,
             slot_mapping=torch.from_numpy(sm).pin_memory().cuda(non_blocking=True),
             context_lens=torch.from_numpy(cl).pin_memory().cuda(non_blocking=True),
             block_tables=torch.from_numpy(bt).pin_memory().cuda(non_blocking=True),
             max_context_len=max_cl,
+            req_id_per_token=req_id_per_token,
         )
         self._apply_pending_cross_ctx()
         if use_mrope:
@@ -1290,6 +1319,29 @@ class ModelRunner:
                 device=torch.device(f"cuda:{self.rank}"),
             )
 
+        # Per-token request id, aligned with the flat token layout
+        # built above: ``[prefill_tokens..., decode_tokens...]``.
+        # The unified block_table used downstream (see
+        # ``_forward_sparse_bf16``) is laid out as
+        # ``[decode_seqs..., prefill_seqs...]``; hence prefill tokens map
+        # to rows ``num_decode_seqs + r`` and decode tokens to row ``j``.
+        total_tokens = num_prefill_tokens + nd
+        if total_tokens > 0:
+            if num_prefill_tokens > 0:
+                pf_ids_np = np.repeat(
+                    (nd + np.arange(num_prefill_seqs, dtype=np.int32)),
+                    np.asarray(prefill_chunk_sizes, dtype=np.int32),
+                )
+            else:
+                pf_ids_np = np.empty(0, dtype=np.int32)
+            dc_ids_np = np.arange(nd, dtype=np.int32)
+            req_id_np = np.concatenate([pf_ids_np, dc_ids_np])
+            req_id_per_token = torch.from_numpy(req_id_np).pin_memory().cuda(
+                non_blocking=True,
+            )
+        else:
+            req_id_per_token = None
+
         set_mixed_context(
             slot_mapping=torch.tensor(slot_mapping,
                                       dtype=(torch.int64 if self.is_deepseek_mla else torch.int32),
@@ -1307,6 +1359,7 @@ class ModelRunner:
             decode_max_context_len=dc_max_cl,
             logit_indices=torch.tensor(logit_idx, dtype=torch.int64, pin_memory=True).cuda(non_blocking=True),
             chunked_context=chunked_context,
+            req_id_per_token=req_id_per_token,
         )
 
         input_ids_t = torch.tensor(input_ids, dtype=torch.int64, pin_memory=True).cuda(non_blocking=True)
@@ -1465,12 +1518,16 @@ class ModelRunner:
         context_lens = self._eager_context_lens[:n]
         block_tables = self._eager_block_tables[:n, :bt_cols]
 
+        req_id_per_token = getattr(self, "_decode_req_id_buf", None)
+        if req_id_per_token is not None:
+            req_id_per_token = req_id_per_token[:n]
         set_context(
             False,
             slot_mapping=slot_mapping,
             context_lens=context_lens,
             block_tables=block_tables,
             max_context_len=int(cl_np.max()),
+            req_id_per_token=req_id_per_token,
         )
         self._apply_pending_cross_ctx()
         hidden = self.model(input_ids, positions)
@@ -2229,6 +2286,13 @@ class ModelRunner:
         slot_mapping = torch.full((max_bs,), -1, dtype=sm_torch_dtype)
         context_lens = torch.zeros(max_bs, dtype=torch.int32)
         block_tables = torch.zeros(max_bs, max_num_blocks, dtype=torch.int32)
+        # Persistent arange buffer for per-token request id mapping during
+        # pure-decode (token i -> sequence i).  Captured into decode CUDA
+        # graphs and reused by ``prepare_decode``; kept on-device so the
+        # sparse MLA ``convert_indices`` kernel never falls back to an
+        # all-zeros buffer (see ``_forward_sparse_bf16``).
+        decode_req_id = torch.arange(max_bs, dtype=torch.int32).cuda()
+        self._decode_req_id_buf = decode_req_id
 
         # Match vLLM's default ``cudagraph_capture_sizes`` for DeepSeek-V3.2:
         # [1, 2, 4, 8, 16, 24, ..., 256, 272, ..., 512].  vLLM caps captures at
@@ -2281,6 +2345,7 @@ class ModelRunner:
             context_lens=context_lens[:largest_bs],
             block_tables=block_tables[:largest_bs],
             max_context_len=self.max_model_len,
+            req_id_per_token=decode_req_id[:largest_bs],
         )
         # Mark batch dim as dynamic BEFORE the first compile-triggering forward
         # so Dynamo / Inductor produce a single symbolic-shape compiled graph
@@ -2324,6 +2389,7 @@ class ModelRunner:
                     False, slot_mapping=slot_mapping[:bs],
                     context_lens=context_lens[:bs], block_tables=block_tables[:bs],
                     max_context_len=self.max_model_len,
+                    req_id_per_token=decode_req_id[:bs],
                 )
 
                 ids_slice = input_ids[:bs]
