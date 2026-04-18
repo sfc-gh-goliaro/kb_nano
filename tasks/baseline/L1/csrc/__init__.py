@@ -15,6 +15,7 @@ _C = _load_ext(
         "binding.cpp", "rmsnorm.cu", "rmsnorm_quant.cu",
         "activation.cu", "pos_enc.cu",
         "moe_sum.cu", "moe_align.cu", "moe_topk_softmax.cu",
+        "eagle_utils.cu",
     ]],
     extra_cuda_cflags=["-O3", "--use_fast_math",
                        "-DFLASHINFER_ENABLE_BF16", "-DFLASHINFER_ENABLE_F16"],

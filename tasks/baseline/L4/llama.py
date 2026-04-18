@@ -84,15 +84,28 @@ class LlamaModel(nn.Module):
         ])
         self.norm = RMSNorm(config.hidden_size, eps=config.rms_norm_eps)
 
+        self.capture_aux_hidden_states: bool = False
+        # Capture indices follow sglang semantics: hidden_states + residual is
+        # collected BEFORE each layer in this list runs. For Llama-3.1-8B
+        # (L=32) sglang defaults to [2, num_layers//2, num_layers-3].
+        self.aux_layer_ids: list[int] = []
+
     def forward(self, input_ids, positions, inputs_embeds=None):
         if inputs_embeds is not None:
             hidden_states = inputs_embeds
         else:
             hidden_states = self.embed_tokens(input_ids)
         residual = None
-        for layer in self.layers:
+        aux_hidden_states: list[torch.Tensor] = []
+        for i, layer in enumerate(self.layers):
+            if self.capture_aux_hidden_states and i in self.aux_layer_ids:
+                aux_hidden_states.append(
+                    hidden_states if residual is None else hidden_states + residual
+                )
             hidden_states, residual = layer(positions, hidden_states, residual)
         hidden_states, _ = self.norm(hidden_states, residual)
+        if self.capture_aux_hidden_states:
+            return hidden_states, aux_hidden_states
         return hidden_states
 
 
@@ -116,8 +129,25 @@ class LlamaForCausalLM(nn.Module):
 
     def forward_with_lm_proj(self, input_ids, positions):
         """Forward pass including LM head linear (no gather)."""
-        hidden_states = self.model(input_ids, positions)
+        out = self.model(input_ids, positions)
+        if isinstance(out, tuple):
+            hidden_states, _ = out
+        else:
+            hidden_states = out
         return self.lm_head.project(hidden_states)
+
+    def set_eagle3_layers_to_capture(self, layer_ids: list[int] | None = None):
+        """Enable capture of intermediate aux hidden states for EAGLE-3.
+
+        With ``layer_ids=None`` defaults to sglang's heuristic
+        ``[2, num_layers//2, num_layers-3]``. For Llama-3.1-8B this is
+        ``[2, 16, 29]``.
+        """
+        num_layers = self.config.num_hidden_layers
+        if layer_ids is None:
+            layer_ids = [2, num_layers // 2, num_layers - 3]
+        self.model.capture_aux_hidden_states = True
+        self.model.aux_layer_ids = list(layer_ids)
 
     def compute_logits(self, hidden_states):
         logits = self.lm_head(hidden_states)

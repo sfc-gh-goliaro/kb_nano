@@ -30,6 +30,7 @@ from concurrent.futures import ThreadPoolExecutor
 
 from .tp import _tp_size
 from ..tasks.baseline.L4.llama import LlamaConfig, LlamaForCausalLM
+from ..tasks.baseline.L4.llama_eagle3 import LlamaEagle3Config, LlamaForCausalLMEagle3
 from ..tasks.baseline.L4.llama4 import Llama4Config, Llama4ForCausalLM
 from ..tasks.baseline.L4.mixtral import MixtralConfig, MixtralForCausalLM
 from ..tasks.baseline.L4.qwen2_vl import Qwen2VLConfig, Qwen2VLForConditionalGeneration
@@ -1028,5 +1029,123 @@ def load_model(
     elif model_type != "gpt_oss":
         model = model.to(device=device, dtype=dtype)
 
+    model.eval()
+    return model, config
+
+
+def _iter_draft_weights(model_path: str):
+    """Yield ``(name, tensor)`` from either safetensors or pytorch_model.bin.
+
+    EAGLE-3 draft checkpoints are typically published as a single
+    ``pytorch_model.bin`` file (HF legacy format). We also support
+    safetensors for forward compatibility.
+    """
+    safetensor_files = sorted(glob(os.path.join(model_path, "*.safetensors")))
+    if safetensor_files:
+        for sf_file in safetensor_files:
+            with safe_open(sf_file, "pt", "cpu") as f:
+                for k in f.keys():
+                    yield k, f.get_tensor(k)
+        return
+
+    bin_files = sorted(glob(os.path.join(model_path, "pytorch_model*.bin")))
+    if not bin_files:
+        raise FileNotFoundError(
+            f"No .safetensors or pytorch_model*.bin files found in {model_path}"
+        )
+    for bf in bin_files:
+        state = torch.load(bf, map_location="cpu", weights_only=True)
+        for k, v in state.items():
+            yield k, v
+
+
+def _load_eagle3_weights(model: LlamaForCausalLMEagle3, model_path: str) -> None:
+    """Load weights for the EAGLE-3 draft model.
+
+    Supports the published sglang draft checkpoints (e.g.
+    ``jamesliu1/sglang-EAGLE3-Llama-3.1-Instruct-8B``). Handles the same
+    packed_modules_mapping as the regular Llama loader, plus:
+      - any ``*.d2t`` tensor is converted to ``hot_token_id = d2t + arange``
+      - any ``*.t2d`` tensor is dropped
+      - ``model.embed_tokens.weight`` and ``lm_head.weight`` are routed to the
+        wrapped ``embedding_op.emb.weight`` parameter.
+    """
+    packed = getattr(model, "packed_modules_mapping", {})
+
+    loaded = 0
+    for weight_name, tensor in _iter_draft_weights(model_path):
+        if "d2t" in weight_name:
+            d2t = tensor.long()
+            hot = d2t + torch.arange(d2t.shape[0], dtype=torch.long, device=d2t.device)
+            model.hot_token_id.data.copy_(hot)
+            model._has_hot_token_id = True
+            loaded += 1
+            continue
+
+        if "t2d" in weight_name:
+            continue
+
+        mapped_name = weight_name
+        if not mapped_name.startswith("model.") and not mapped_name.startswith("lm_head"):
+            mapped_name = f"model.{mapped_name}"
+
+        matched = False
+        for orig_key, (packed_name, shard_id) in packed.items():
+            if orig_key in mapped_name:
+                param_name = mapped_name.replace(orig_key, packed_name)
+                try:
+                    param = model.get_parameter(param_name)
+                except AttributeError:
+                    break
+                weight_loader = getattr(param, "weight_loader")
+                weight_loader(param, tensor, shard_id)
+                loaded += 1
+                matched = True
+                break
+        if matched:
+            continue
+
+        m_emb_w = _EMBED_WEIGHT_RE.match(mapped_name)
+        if m_emb_w:
+            mapped_name = f"{m_emb_w.group(1)}.embedding_op.emb.weight"
+
+        try:
+            param = model.get_parameter(mapped_name)
+        except AttributeError:
+            continue
+        wl = getattr(param, "weight_loader", default_weight_loader)
+        wl(param, tensor)
+        loaded += 1
+
+    print(f"  Loaded {loaded} EAGLE-3 weight shards.")
+
+
+def load_eagle3_draft_model(
+    draft_repo: str,
+    target_config: LlamaConfig,
+    device: torch.device = torch.device("cuda"),
+    dtype: torch.dtype = torch.bfloat16,
+) -> tuple[LlamaForCausalLMEagle3, LlamaEagle3Config]:
+    """Download and load an EAGLE-3 draft checkpoint.
+
+    Supports both safetensors and pytorch_model.bin checkpoints. The returned
+    model's ``embed_tokens`` is initialized from the checkpoint when present;
+    the engine should still call
+    ``model.set_embed_tokens(target.model.embed_tokens)`` to share memory with
+    the target.
+    """
+    model_path = snapshot_download(
+        draft_repo,
+        allow_patterns=["*.safetensors", "*.json", "*.bin"],
+    )
+    config = LlamaEagle3Config.from_pretrained(draft_repo, target_config)
+    config.dtype = dtype
+    print(f"  Allocating EAGLE-3 draft model (hidden={config.hidden_size}, "
+          f"draft_vocab={config.draft_vocab_size})...")
+    model = LlamaForCausalLMEagle3(config)
+
+    _load_eagle3_weights(model, model_path)
+
+    model = model.to(device=device, dtype=dtype)
     model.eval()
     return model, config

@@ -177,6 +177,11 @@ class Sequence:
         self.token_ids.append(token_id)
         self.generated_ids.append(token_id)
 
+    def append_tokens(self, token_ids: list[int]):
+        """Append multiple accepted speculative tokens at once."""
+        self.token_ids.extend(token_ids)
+        self.generated_ids.extend(token_ids)
+
     def __getstate__(self):
         """Minimal pickling for shared memory transfer to non-rank-0 workers."""
         return (len(self), len(self.prompt_ids), self.block_table,
@@ -232,6 +237,21 @@ class BlockManager:
     def deallocate(self, seq):
         self.free_block_ids.extend(seq.block_table)
         seq.block_table.clear()
+
+    def free_tail_blocks(self, seq, n_blocks: int) -> int:
+        """Release the last ``n_blocks`` blocks of ``seq`` back to the pool.
+
+        Returns the number of blocks actually released. Used by the EAGLE-3
+        verify path when speculative tokens are rejected and their KV slots no
+        longer need to be cached.
+        """
+        n_blocks = min(n_blocks, len(seq.block_table))
+        if n_blocks <= 0:
+            return 0
+        released = seq.block_table[-n_blocks:]
+        del seq.block_table[-n_blocks:]
+        self.free_block_ids.extend(released)
+        return n_blocks
 
     def deallocate_cross(self, seq):
         """Return cross-attention KV blocks to the cross-attn free pool."""

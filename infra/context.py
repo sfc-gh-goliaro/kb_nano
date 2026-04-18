@@ -120,6 +120,13 @@ class Context:
     cross_context_lens: torch.Tensor | None = None
     cross_max_context_len: int = 0
 
+    # --- EAGLE-3 tree verify fields ---
+    # When True, attention layers should use TreeAttnPrefill instead of the
+    # regular causal prefill kernel. Only used by the EAGLE-3 verify forward.
+    is_tree_verify: bool = False
+    tree_mask: torch.Tensor | None = None
+    tree_num_verify_tokens: int = 0
+
     # --- Compilation / CUDA-graph fields (mirror vLLM ForwardContext) ---
     # Maps layer prefix -> live nn.Module for custom-op runtime lookup.
     no_compile_layers: dict[str, "nn.Module"] = field(default_factory=dict)
