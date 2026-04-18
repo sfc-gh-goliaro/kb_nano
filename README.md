@@ -162,6 +162,8 @@ python tests/bench_dllm.py --ours-backend dual --skip-reference
 
 ### Benchmarking vs transformers / timm (Image Classification)
 
+Default dataset: real `food101` validation images. If you have gated access to `ILSVRC/imagenet-1k`, you can override with `--dataset ILSVRC/imagenet-1k --dataset-split validation`.
+
 ```bash
 # ConvNeXtV2: throughput + latency + logits alignment vs transformers
 python tests/bench_image_cls.py \
@@ -177,6 +179,12 @@ python tests/bench_image_cls.py \
 python tests/bench_image_cls.py \
     --model facebook/convnextv2-base-22k-384 \
     --use-fp16 --skip-reference
+
+# Use gated ImageNet-1K validation instead
+python tests/bench_image_cls.py \
+    --model facebook/convnextv2-base-22k-384 \
+    --use-fp16 \
+    --dataset ILSVRC/imagenet-1k --dataset-split validation
 
 # Save results to a specific directory
 python tests/bench_image_cls.py \
@@ -612,19 +620,19 @@ Logit alignment stays close to the reference on all three runs (`cosine=0.999923
 
 ### ConvNeXtV2 / EfficientNetV2 (Image Classification)
 
-Run `tests/bench_image_cls.py` to reproduce. Synthetic random image tensors are used to isolate model compute. Both engines run in fp16 on H200.
+Run `tests/bench_image_cls.py` to reproduce. Real `food101` validation images are used by default (streamed from Hugging Face datasets), resized and center-cropped to the target resolution with model-specific normalization. Both engines run in fp16 on H200.
 
 | Model | Reference | Image Size | Ref (img/s) | Ours (img/s) | Ratio | Top1 Match |
 |-------|-----------|-----------:|------------:|-------------:|------:|-----------:|
-| facebook/convnextv2-base-22k-384 | transformers | 384 | 772.46 | 771.44 | **1.00x** | 1.00 |
-| timm/efficientnetv2_rw_m.agc_in1k | timm | 320 | 465.30 | 522.71 | **1.12x** | 1.00 |
+| facebook/convnextv2-base-22k-384 | transformers | 384 | 760.72 | 769.00 | **1.01x** | 1.00 |
+| timm/efficientnetv2_rw_m.agc_in1k | timm | 320 | 597.76 | 586.18 | 0.98x | 1.00 |
 
 Latency ratio (`reference median / ours median`):
 
 | Model | Batch 1 | Batch 8 |
 |-------|--------:|--------:|
-| ConvNeXtV2 | **1.10x** | **1.00x** |
-| EfficientNetV2 | **1.11x** | **1.10x** |
+| ConvNeXtV2 | 0.95x | **1.01x** |
+| EfficientNetV2 | 0.98x | 0.96x |
 
 Logit alignment:
 

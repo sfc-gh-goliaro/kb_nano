@@ -30,6 +30,24 @@ def infer_image_size(model_name: str) -> int:
     raise ValueError(f"Unsupported image classification model: {model_name}")
 
 
+def infer_image_mean_std(model_name: str) -> tuple[list[float], list[float]]:
+    if is_convnextv2_model(model_name):
+        from transformers import AutoImageProcessor
+
+        processor = AutoImageProcessor.from_pretrained(model_name)
+        mean = [float(x) for x in processor.image_mean]
+        std = [float(x) for x in processor.image_std]
+        return mean, std
+    if is_efficientnetv2_model(model_name):
+        import timm
+
+        ref = timm.create_model(_strip_timm_prefix(model_name), pretrained=True)
+        mean = [float(x) for x in ref.default_cfg["mean"]]
+        std = [float(x) for x in ref.default_cfg["std"]]
+        return mean, std
+    raise ValueError(f"Unsupported image classification model: {model_name}")
+
+
 def load_reference_model(model_name: str, device: str = "cuda", dtype: torch.dtype = torch.float16):
     if is_convnextv2_model(model_name):
         from transformers import ConvNextV2ForImageClassification

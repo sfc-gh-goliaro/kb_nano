@@ -14,7 +14,7 @@ _PACKAGE_DIR = _THIS_DIR.parent
 sys.path.insert(0, str(_PACKAGE_DIR))
 
 from bench.utils.worker import run_worker
-from infra.image_cls_loader import infer_image_size
+from infra.image_cls_loader import infer_image_mean_std, infer_image_size
 
 
 def _detect_gpu_name() -> str:
@@ -59,6 +59,59 @@ def _extract_logits(output):
     return output
 
 
+def _load_pil_images(dataset_name, dataset_split, num_needed, seed):
+    from datasets import load_dataset
+    from datasets.exceptions import DatasetNotFoundError
+    from PIL import Image
+
+    try:
+        ds = load_dataset(dataset_name, split=dataset_split, streaming=True)
+    except DatasetNotFoundError as exc:
+        if "gated dataset" in str(exc).lower():
+            raise RuntimeError(
+                f"{dataset_name}:{dataset_split} requires gated Hub access. "
+                f"Either request access/login for that dataset, or use an ungated dataset such as "
+                f"'food101' with '--dataset-split validation'.",
+            ) from exc
+        raise
+    ds = ds.shuffle(seed=seed, buffer_size=5000)
+
+    images = []
+    for sample in ds:
+        img = sample.get("image") or sample.get("img")
+        if img is None:
+            for value in sample.values():
+                if hasattr(value, "convert"):
+                    img = value
+                    break
+        if img is None:
+            continue
+        if isinstance(img, dict) and "bytes" in img:
+            from io import BytesIO
+
+            img = Image.open(BytesIO(img["bytes"]))
+        images.append(img.convert("RGB"))
+        if len(images) >= num_needed:
+            break
+    return images
+
+
+def _preprocess_batch(pil_images, resolution, image_mean, image_std, dtype):
+    from torchvision import transforms
+
+    transform = transforms.Compose([
+        transforms.Resize(
+            resolution,
+            interpolation=transforms.InterpolationMode.BICUBIC,
+        ),
+        transforms.CenterCrop(resolution),
+        transforms.ToTensor(),
+        transforms.Normalize(mean=image_mean, std=image_std),
+    ])
+    tensors = [transform(img) for img in pil_images]
+    return torch.stack(tensors).to(device="cuda", dtype=dtype)
+
+
 def main():
     with open(sys.argv[1]) as f:
         cfg = json.load(f)
@@ -70,12 +123,22 @@ def main():
     image_size = cfg["image_size"]
     batch_size = cfg["batch_size"]
     num_images = cfg["num_images"]
+    dataset_name = cfg["dataset_name"]
+    dataset_split = cfg["dataset_split"]
+    image_mean = cfg["image_mean"]
+    image_std = cfg["image_std"]
 
-    g = torch.Generator(device=device)
-    g.manual_seed(cfg["seed"])
-    pixel_values = torch.randn(
-        num_images, 3, image_size, image_size, device=device, dtype=dtype, generator=g
+    max_needed = max(
+        num_images,
+        batch_size,
+        cfg["alignment_images"],
+        *(cfg.get("latency_batch_sizes", []) or [0]),
     )
+    raw_images = _load_pil_images(dataset_name, dataset_split, max_needed, cfg["seed"])
+    if len(raw_images) < max_needed:
+        raise RuntimeError(
+            f"Requested {max_needed} images from {dataset_name}:{dataset_split}, got {len(raw_images)}",
+        )
 
     if backend == "ours":
         model = load_ours_model(model_name, device=device, dtype=dtype)
@@ -83,37 +146,63 @@ def main():
     else:
         model, baseline_name = load_reference_model(model_name, device=device, dtype=dtype)
 
-    logits = _extract_logits(model(pixel_values[:1]))
+    warm_batch = _preprocess_batch(
+        raw_images[:1], image_size, image_mean, image_std, dtype,
+    )
+    with torch.inference_mode():
+        logits = _extract_logits(model(warm_batch))
 
     for _ in range(cfg["warmup_iters"]):
         for start in range(0, num_images, batch_size):
-            _ = _extract_logits(model(pixel_values[start:start + batch_size]))
+            x = _preprocess_batch(
+                raw_images[start:start + batch_size], image_size, image_mean, image_std, dtype,
+            )
+            with torch.inference_mode():
+                _ = _extract_logits(model(x))
     torch.cuda.synchronize()
 
-    t0 = time.perf_counter()
+    total_elapsed = 0.0
+    total_images = 0
     for _ in range(cfg["measure_iters"]):
         for start in range(0, num_images, batch_size):
-            _ = _extract_logits(model(pixel_values[start:start + batch_size]))
-    torch.cuda.synchronize()
-    elapsed = time.perf_counter() - t0
+            end = min(start + batch_size, num_images)
+            actual_bs = end - start
+            x = _preprocess_batch(
+                raw_images[start:end], image_size, image_mean, image_std, dtype,
+            )
+            torch.cuda.synchronize()
+            t0 = time.perf_counter()
+            with torch.inference_mode():
+                _ = _extract_logits(model(x))
+            torch.cuda.synchronize()
+            total_elapsed += time.perf_counter() - t0
+            total_images += actual_bs
+
+    avg_elapsed = total_elapsed / max(cfg["measure_iters"], 1)
+    avg_images = total_images / max(cfg["measure_iters"], 1)
 
     result = {
         "backend": backend,
         "baseline_name": baseline_name,
-        "elapsed": elapsed / cfg["measure_iters"],
-        "images_per_second": num_images / (elapsed / cfg["measure_iters"]),
+        "dataset_name": dataset_name,
+        "dataset_split": dataset_split,
+        "elapsed": avg_elapsed,
+        "images_per_second": (avg_images / avg_elapsed) if avg_elapsed > 0 else 0.0,
         "logits_shape": list(logits.shape),
         "logits_sample": logits[:, :64].float().cpu().tolist(),
     }
 
     latencies = {}
     for bs in cfg.get("latency_batch_sizes", []):
-        batch = pixel_values[:bs]
+        batch = _preprocess_batch(
+            raw_images[:bs], image_size, image_mean, image_std, dtype,
+        )
         samples = []
         for _ in range(cfg["latency_iters"]):
             torch.cuda.synchronize()
             t0 = time.perf_counter()
-            _ = _extract_logits(model(batch))
+            with torch.inference_mode():
+                _ = _extract_logits(model(batch))
             torch.cuda.synchronize()
             samples.append(time.perf_counter() - t0)
         latencies[str(bs)] = {
@@ -122,8 +211,11 @@ def main():
         }
     result["latency"] = latencies
 
-    align_batch = pixel_values[:cfg["alignment_images"]]
-    align_logits = _extract_logits(model(align_batch))
+    align_batch = _preprocess_batch(
+        raw_images[:cfg["alignment_images"]], image_size, image_mean, image_std, dtype,
+    )
+    with torch.inference_mode():
+        align_logits = _extract_logits(model(align_batch))
     result["alignment_logits"] = align_logits.float().cpu().tolist()
     result["alignment_top1"] = align_logits.argmax(dim=-1).cpu().tolist()
 
@@ -186,6 +278,8 @@ def main():
     ap = argparse.ArgumentParser(description="Benchmark repo-native CNN models vs official baselines")
     ap.add_argument("--model", type=str, required=True)
     ap.add_argument("--image-size", type=int, default=0)
+    ap.add_argument("--dataset", type=str, default="food101")
+    ap.add_argument("--dataset-split", type=str, default="validation")
     ap.add_argument("--num-images", type=int, default=32)
     ap.add_argument("--batch-size", type=int, default=8)
     ap.add_argument("--alignment-images", type=int, default=8)
@@ -199,6 +293,7 @@ def main():
     args = ap.parse_args()
 
     image_size = args.image_size or infer_image_size(args.model)
+    image_mean, image_std = infer_image_mean_std(args.model)
     gpu = _detect_gpu_name()
     out_dir = Path(args.output_dir or f"tests/results/{gpu}/{Path(args.model).name}")
     out_dir.mkdir(parents=True, exist_ok=True)
@@ -207,6 +302,10 @@ def main():
         "project_root": str(_PACKAGE_DIR),
         "model": args.model,
         "image_size": image_size,
+        "dataset_name": args.dataset,
+        "dataset_split": args.dataset_split,
+        "image_mean": image_mean,
+        "image_std": image_std,
         "num_images": args.num_images,
         "batch_size": args.batch_size,
         "alignment_images": args.alignment_images,
@@ -228,11 +327,21 @@ def main():
         if ours and ref:
             comparisons["reference"] = _compare_outputs(ours, ref)
 
-    results = {"model": args.model, "image_size": image_size, "ours": ours, "references": references, "comparisons": comparisons}
+    results = {
+        "model": args.model,
+        "dataset_name": args.dataset,
+        "dataset_split": args.dataset_split,
+        "image_size": image_size,
+        "ours": ours,
+        "references": references,
+        "comparisons": comparisons,
+    }
     out_file = out_dir / "results.json"
     out_file.write_text(json.dumps(results, indent=2))
     summary = {
         "model": args.model,
+        "dataset_name": args.dataset,
+        "dataset_split": args.dataset_split,
         "image_size": image_size,
         "ours": _summarize_backend_result(ours),
         "references": {name: _summarize_backend_result(result) for name, result in references.items()},
