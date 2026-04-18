@@ -281,7 +281,7 @@ python -m pip install datasets==4.8.4 peft==0.18.1 GitPython==3.1.46 ujson==5.12
 python -m pip install --no-deps FlagEmbedding==1.3.5 colbert-ai==0.2.22
 ```
 
-After that, the following commands can be run directly from the repo root:
+After that, the following commands can be run directly from the repo root. By default, the embedding benchmark uses real `mteb/scifact` query/document samples, runs fp16 on CUDA, measures dataset-backed throughput on 128 sampled texts per scenario, runs latency at batch sizes 1 and 4, and checks alignment on 32 sampled texts/pairs. You can switch datasets with `--dataset <hf-retrieval-dataset>` as long as the dataset exposes `queries`, `corpus`, and qrels-style `default/test` splits. `--lengths` adds optional fixed-length stress scenarios:
 
 ```bash
 # BGE-M3: throughput + latency + alignment benchmark vs FlagEmbedding
@@ -289,6 +289,9 @@ python tests/bench_embedding.py --model BAAI/bge-m3
 
 # ColBERTv2: query/doc throughput + latency + alignment benchmark vs official ColBERT
 python tests/bench_embedding.py --model colbert-ir/colbertv2.0
+
+# Use a different retrieval dataset
+python tests/bench_embedding.py --model BAAI/bge-m3 --dataset <hf-retrieval-dataset>
 
 # kb-nano only (skip reference comparison)
 python tests/bench_embedding.py --model BAAI/bge-m3 --skip-reference
@@ -633,59 +636,59 @@ FP8 activation quantization uses a custom Triton kernel for single-launch per-to
 
 ### BGE-M3 (Embedding)
 
-Run `tests/bench_embedding.py --model BAAI/bge-m3` to reproduce. Reference baseline: FlagEmbedding / BGEM3FlagModel.
+Run `python tests/bench_embedding.py --model BAAI/bge-m3` to reproduce. Reference baseline: FlagEmbedding / BGEM3FlagModel.
 
 **Hardware: NVIDIA H200**
 
-Throughput (8 texts, batch size 4, fp16):
+Throughput (real docs from `mteb/scifact`, fp16):
 
-| Model | Len | FlagEmbedding (docs/s) | Ours (docs/s) | Ratio |
-|-------|----:|-----------------------:|--------------:|------:|
-| BGE-M3 | 128 | 222.28 | 348.60 | **1.57x** |
+| Scenario | BS | Samples | FlagEmbedding (docs/s) | Ours (docs/s) | Ratio |
+|----------|---:|--------:|-----------------------:|--------------:|------:|
+| mteb/scifact-doc | 4 | 128 | 167.72 | 261.68 | **1.56x** |
 
 Latency (median of 5 runs, fp16):
 
-| Batch Size | Len | FlagEmbedding median | Ours median | Ratio |
-|-----------:|----:|---------------------:|------------:|------:|
-| 1 | 128 | 0.0177s | 0.0058s | **3.07x** |
-| 4 | 128 | 0.0197s | 0.0065s | **3.05x** |
+| BS | Samples | Len | FlagEmbedding median | Ours median | Ratio |
+|---:|--------:|----:|---------------------:|------------:|------:|
+| 1 | 1 | 128 | 0.0178s | 0.0059s | **3.03x** |
+| 4 | 4 | 128 | 0.0200s | 0.0069s | **2.90x** |
 
 Alignment:
 
-| Output | Avg CosSim | Avg Mean Abs Diff | Notes |
-|--------|-----------:|------------------:|:------|
-| Dense | 0.99999905 | 3.33e-05 | PASS |
-| Sparse | — | 1.30e-04 | 100% exact key match |
+| Output | Metric | Avg Mean Abs Diff | Notes |
+|--------|:-------|------------------:|:------|
+| Dense | cosine=0.99999821 | 4.40e-05 | PASS |
+| Sparse | key jaccard=0.999572 | 1.41e-04 | PASS |
 
 ### ColBERTv2 (Retrieval)
 
-Run `tests/bench_embedding.py --model colbert-ir/colbertv2.0` to reproduce. Reference baseline: official ColBERT / HF_ColBERT.
+Run `python tests/bench_embedding.py --model colbert-ir/colbertv2.0` to reproduce. Reference baseline: official ColBERT / HF_ColBERT.
 
 **Hardware: NVIDIA H200**
 
-Throughput (8 texts, batch size 4, fp16):
+Throughput (real query/doc samples from `mteb/scifact`, fp16):
 
-| Scenario | Reference (docs/s) | Ours (docs/s) | Ratio |
-|----------|-------------------:|--------------:|------:|
-| Query len 32 | 758.83 | 975.56 | **1.29x** |
-| Doc len 128 | 318.92 | 389.34 | **1.22x** |
+| Scenario | BS | Samples | Reference (docs/s) | Ours (docs/s) | Ratio |
+|----------|---:|--------:|-------------------:|--------------:|------:|
+| mteb/scifact-query | 4 | 128 | 893.65 | 1180.66 | **1.32x** |
+| mteb/scifact-doc | 4 | 128 | 321.51 | 380.84 | **1.18x** |
 
 Latency (median of 5 runs, fp16):
 
-| Scenario | Reference median | Ours median | Ratio |
-|----------|-----------------:|------------:|------:|
-| Query bs=1 len=32 | 0.0038s | 0.0033s | **1.14x** |
-| Query bs=4 len=32 | 0.0046s | 0.0036s | **1.28x** |
-| Doc bs=1 len=128 | 0.0043s | 0.0039s | **1.10x** |
-| Doc bs=4 len=128 | 0.0102s | 0.0046s | **2.23x** |
+| Mode | BS | Samples | Len | Reference median | Ours median | Ratio |
+|------|---:|--------:|----:|-----------------:|------------:|------:|
+| Query | 1 | 1 | 32 | 0.0037s | 0.0034s | **1.09x** |
+| Query | 4 | 4 | 32 | 0.0044s | 0.0044s | **1.01x** |
+| Doc | 1 | 1 | 128 | 0.0044s | 0.0040s | **1.11x** |
+| Doc | 4 | 4 | 128 | 0.0057s | 0.0047s | **1.21x** |
 
 Alignment:
 
-| Output | Avg CosSim | Avg Mean Abs Diff | Notes |
-|--------|-----------:|------------------:|:------|
-| Query | 0.99999928 | 8.22e-05 | PASS |
-| Doc | 0.99999940 | 7.45e-05 | PASS |
-| MaxSim score | — | 1.08e-03 | PASS |
+| Output | Metric | Avg Mean Abs Diff | Notes |
+|--------|:-------|------------------:|:------|
+| Query | cosine=1.00000000 | 0.00e+00 | PASS |
+| Doc | cosine=0.99999946 | 7.05e-05 | PASS |
+| MaxSim score | score diff | 6.62e-04 | PASS |
 
 ### FLUX.1-dev (Diffusion)
 

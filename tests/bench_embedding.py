@@ -27,6 +27,7 @@ import argparse
 import importlib.util
 import json
 import os
+import random
 import subprocess
 import sys
 from pathlib import Path
@@ -64,6 +65,420 @@ def _detect_embedding_family(model_name: str) -> str:
 
 def _safe_div(num: float, den: float) -> float:
     return 0.0 if den == 0 else num / den
+
+
+def _join_title_and_text(title: str | None, text: str | None) -> str:
+    parts = []
+    if title and title.strip():
+        parts.append(title.strip())
+    if text and text.strip():
+        parts.append(text.strip())
+    return " ".join(parts)
+
+
+def _dataset_throughput_label(dataset_name: str, kind: str) -> str:
+    return f"{dataset_name}-{kind}"
+
+
+def _load_embedding_retrieval_dataset(
+    dataset_name: str,
+    cache_dir: str | None = None,
+) -> dict:
+    from datasets import load_dataset
+
+    queries_ds = load_dataset(
+        dataset_name,
+        "queries",
+        split="queries",
+        cache_dir=cache_dir,
+    )
+    corpus_ds = load_dataset(
+        dataset_name,
+        "corpus",
+        split="corpus",
+        cache_dir=cache_dir,
+    )
+    qrels_ds = load_dataset(
+        dataset_name,
+        "default",
+        split="test",
+        cache_dir=cache_dir,
+    )
+
+    query_by_id = {}
+    for item in queries_ds:
+        text = (item.get("text") or "").strip()
+        if text:
+            query_by_id[str(item["_id"])] = text
+
+    corpus_by_id = {}
+    for item in corpus_ds:
+        text = _join_title_and_text(item.get("title"), item.get("text"))
+        if text:
+            corpus_by_id[str(item["_id"])] = text
+
+    pairs = []
+    seen_pairs = set()
+    for item in qrels_ds:
+        if float(item.get("score", 0.0)) <= 0:
+            continue
+        query_id = str(item["query-id"])
+        corpus_id = str(item["corpus-id"])
+        if query_id not in query_by_id or corpus_id not in corpus_by_id:
+            continue
+        pair_key = (query_id, corpus_id)
+        if pair_key in seen_pairs:
+            continue
+        seen_pairs.add(pair_key)
+        pairs.append({
+            "query_id": query_id,
+            "corpus_id": corpus_id,
+            "query": query_by_id[query_id],
+            "doc": corpus_by_id[corpus_id],
+        })
+
+    if not query_by_id:
+        raise RuntimeError(f"No queries found in dataset {dataset_name}")
+    if not corpus_by_id:
+        raise RuntimeError(f"No corpus documents found in dataset {dataset_name}")
+    if not pairs:
+        raise RuntimeError(f"No positive query/doc pairs found in dataset {dataset_name}")
+
+    return {
+        "query_by_id": query_by_id,
+        "corpus_by_id": corpus_by_id,
+        "pairs": pairs,
+    }
+
+
+def _build_text_records(tokenizer, text_by_id: dict[str, str]) -> list[dict]:
+    ids = list(text_by_id)
+    texts = [text_by_id[item_id] for item_id in ids]
+    lengths = []
+    batch_size = 32
+    for start in range(0, len(texts), batch_size):
+        encoded = tokenizer(
+            texts[start:start + batch_size],
+            add_special_tokens=True,
+            padding=False,
+            truncation=False,
+            verbose=False,
+        )
+        lengths.extend(len(item) for item in encoded["input_ids"])
+    return [
+        {"id": item_id, "text": text, "length": length}
+        for item_id, text, length in zip(ids, texts, lengths, strict=True)
+    ]
+
+
+def _effective_model_max_length(tokenizer) -> int:
+    max_len = getattr(tokenizer, "model_max_length", None)
+    if max_len is None:
+        return 512
+    try:
+        max_len = int(max_len)
+    except (TypeError, ValueError):
+        return 512
+    if max_len <= 0 or max_len >= 100_000:
+        return 512
+    return max_len
+
+
+def _sample_texts(
+    records: list[dict],
+    num_texts: int,
+    seed: int,
+    min_tokens: int | None = None,
+) -> list[str]:
+    if not records:
+        raise RuntimeError("Cannot sample from an empty text pool")
+
+    pool = records
+    if min_tokens is not None:
+        filtered = [item for item in records if item["length"] >= min_tokens]
+        if filtered:
+            pool = filtered
+        else:
+            pool = sorted(records, key=lambda item: item["length"], reverse=True)
+            pool = pool[:max(1, min(num_texts, len(pool)))]
+
+    rng = random.Random(seed)
+    if len(pool) >= num_texts:
+        chosen = rng.sample(pool, k=num_texts)
+        return [item["text"] for item in chosen]
+
+    chosen = list(pool)
+    rng.shuffle(chosen)
+    out = [item["text"] for item in chosen]
+    while len(out) < num_texts:
+        out.append(rng.choice(pool)["text"])
+    return out
+
+
+def _sample_pairs(
+    pair_records: list[dict],
+    num_pairs: int,
+    seed: int,
+    min_query_tokens: int | None = None,
+    min_doc_tokens: int | None = None,
+) -> list[dict]:
+    if not pair_records:
+        raise RuntimeError("Cannot sample from an empty pair pool")
+
+    pool = pair_records
+    if min_query_tokens is not None or min_doc_tokens is not None:
+        filtered = [
+            item
+            for item in pair_records
+            if (min_query_tokens is None or item["query_length"] >= min_query_tokens)
+            and (min_doc_tokens is None or item["doc_length"] >= min_doc_tokens)
+        ]
+        if filtered:
+            pool = filtered
+        else:
+            pool = sorted(
+                pair_records,
+                key=lambda item: (item["doc_length"], item["query_length"]),
+                reverse=True,
+            )
+            pool = pool[:max(1, min(num_pairs, len(pool)))]
+
+    rng = random.Random(seed)
+    if len(pool) >= num_pairs:
+        return rng.sample(pool, k=num_pairs)
+
+    chosen = list(pool)
+    rng.shuffle(chosen)
+    while len(chosen) < num_pairs:
+        chosen.append(rng.choice(pool))
+    return chosen
+
+
+def _prepare_bge_dataset_workload(
+    model_name: str,
+    dataset_name: str,
+    dataset_cache_dir: str | None,
+    lengths: list[int],
+    latency_batch_sizes: list[int],
+    args,
+) -> dict:
+    from transformers import AutoTokenizer
+
+    tokenizer = AutoTokenizer.from_pretrained(model_name)
+    native_doc_max_len = _effective_model_max_length(tokenizer)
+    dataset = _load_embedding_retrieval_dataset(dataset_name, cache_dir=dataset_cache_dir)
+    corpus_records = _build_text_records(tokenizer, dataset["corpus_by_id"])
+
+    scenarios = []
+    if not args.skip_throughput:
+        scenarios.append({
+            "name": _dataset_throughput_label(dataset_name, "doc"),
+            "target_label": "dataset",
+            "target_len": native_doc_max_len,
+            "num_texts": args.num_texts,
+            "texts": _sample_texts(
+                corpus_records,
+                args.num_texts,
+                seed=args.seed + 11,
+            ),
+        })
+        for idx, seq_len in enumerate(lengths):
+            scenarios.append({
+                "name": f"len-{seq_len}",
+                "target_label": str(seq_len),
+                "target_len": seq_len,
+                "num_texts": args.num_texts,
+                "texts": _sample_texts(
+                    corpus_records,
+                    args.num_texts,
+                    seed=args.seed + 101 * (idx + 1) + seq_len,
+                    min_tokens=seq_len,
+                ),
+            })
+
+    latency_scenarios = []
+    if not args.skip_latency:
+        for idx, bs in enumerate(latency_batch_sizes):
+            latency_scenarios.append({
+                "name": f"bs-{bs}-len-{args.latency_len}",
+                "batch_size": bs,
+                "target_len": args.latency_len,
+                "num_warmup": 2,
+                "num_iters": args.latency_iters,
+                "texts": _sample_texts(
+                    corpus_records,
+                    bs,
+                    seed=args.seed + 701 + idx,
+                    min_tokens=args.latency_len,
+                ),
+            })
+
+    warm_texts = _sample_texts(
+        corpus_records,
+        min(4, args.batch_size),
+        seed=args.seed + 17,
+        min_tokens=32,
+    )
+
+    alignment_texts = []
+    if not args.skip_alignment:
+        alignment_texts = _sample_texts(
+            corpus_records,
+            args.alignment_texts,
+            seed=args.seed + 500,
+            min_tokens=args.alignment_len,
+        )
+
+    return {
+        "dataset_name": dataset_name,
+        "num_queries": len(dataset["query_by_id"]),
+        "num_docs": len(dataset["corpus_by_id"]),
+        "num_pairs": len(dataset["pairs"]),
+        "native_doc_max_len": native_doc_max_len,
+        "warm_texts": warm_texts,
+        "scenarios": scenarios,
+        "latency_scenarios": latency_scenarios,
+        "alignment_texts": alignment_texts,
+    }
+
+
+def _prepare_colbert_dataset_workload(
+    model_name: str,
+    dataset_name: str,
+    dataset_cache_dir: str | None,
+    lengths: list[int],
+    latency_batch_sizes: list[int],
+    args,
+) -> dict:
+    from transformers import AutoTokenizer
+
+    tokenizer = AutoTokenizer.from_pretrained(model_name)
+    native_doc_max_len = _effective_model_max_length(tokenizer)
+    dataset = _load_embedding_retrieval_dataset(dataset_name, cache_dir=dataset_cache_dir)
+    query_records = _build_text_records(tokenizer, dataset["query_by_id"])
+    doc_records = _build_text_records(tokenizer, dataset["corpus_by_id"])
+
+    query_length_by_id = {item["id"]: item["length"] for item in query_records}
+    doc_length_by_id = {item["id"]: item["length"] for item in doc_records}
+    pair_records = [
+        {
+            **item,
+            "query_length": query_length_by_id[item["query_id"]],
+            "doc_length": doc_length_by_id[item["corpus_id"]],
+        }
+        for item in dataset["pairs"]
+    ]
+
+    scenarios = []
+    if not args.skip_throughput:
+        scenarios.append({
+            "name": _dataset_throughput_label(dataset_name, "query"),
+            "mode": "query",
+            "target_label": "dataset",
+            "target_len": args.query_len,
+            "num_texts": args.num_texts,
+            "texts": _sample_texts(
+                query_records,
+                args.num_texts,
+                seed=args.seed + 101,
+            ),
+        })
+        scenarios.append({
+            "name": _dataset_throughput_label(dataset_name, "doc"),
+            "mode": "doc",
+            "target_label": "dataset",
+            "target_len": native_doc_max_len,
+            "num_texts": args.num_texts,
+            "texts": _sample_texts(
+                doc_records,
+                args.num_texts,
+                seed=args.seed + 202,
+            ),
+        })
+        for idx, seq_len in enumerate(lengths):
+            scenarios.append({
+                "name": f"doc-len-{seq_len}",
+                "mode": "doc",
+                "target_label": str(seq_len),
+                "target_len": seq_len,
+                "num_texts": args.num_texts,
+                "texts": _sample_texts(
+                    doc_records,
+                    args.num_texts,
+                    seed=args.seed + 303 + idx + seq_len,
+                    min_tokens=seq_len,
+                ),
+            })
+
+    latency_scenarios = []
+    if not args.skip_latency:
+        for idx, bs in enumerate(latency_batch_sizes):
+            latency_scenarios.append({
+                "name": f"query-bs-{bs}-len-{args.query_len}",
+                "mode": "query",
+                "batch_size": bs,
+                "target_len": args.query_len,
+                "num_warmup": 2,
+                "num_iters": args.latency_iters,
+                "texts": _sample_texts(
+                    query_records,
+                    bs,
+                    seed=args.seed + 901 + idx,
+                ),
+            })
+        for idx, bs in enumerate(latency_batch_sizes):
+            latency_scenarios.append({
+                "name": f"doc-bs-{bs}-len-{args.latency_len}",
+                "mode": "doc",
+                "batch_size": bs,
+                "target_len": args.latency_len,
+                "num_warmup": 2,
+                "num_iters": args.latency_iters,
+                "texts": _sample_texts(
+                    doc_records,
+                    bs,
+                    seed=args.seed + 1201 + idx,
+                    min_tokens=args.latency_len,
+                ),
+            })
+
+    warm_queries = _sample_texts(
+        query_records,
+        min(4, args.batch_size),
+        seed=args.seed + 111,
+    )
+    warm_docs = _sample_texts(
+        doc_records,
+        min(4, args.batch_size),
+        seed=args.seed + 222,
+        min_tokens=32,
+    )
+
+    alignment_queries = []
+    alignment_docs = []
+    if not args.skip_alignment:
+        sampled_pairs = _sample_pairs(
+            pair_records,
+            args.alignment_texts,
+            seed=args.seed + 500,
+            min_doc_tokens=args.alignment_len,
+        )
+        alignment_queries = [item["query"] for item in sampled_pairs]
+        alignment_docs = [item["doc"] for item in sampled_pairs]
+
+    return {
+        "dataset_name": dataset_name,
+        "num_queries": len(dataset["query_by_id"]),
+        "num_docs": len(dataset["corpus_by_id"]),
+        "num_pairs": len(pair_records),
+        "native_doc_max_len": native_doc_max_len,
+        "warm_queries": warm_queries,
+        "warm_docs": warm_docs,
+        "scenarios": scenarios,
+        "latency_scenarios": latency_scenarios,
+        "alignment_queries": alignment_queries,
+        "alignment_docs": alignment_docs,
+    }
 
 
 def _compute_alignment(local_outputs: dict, ref_outputs: dict) -> dict:
@@ -271,6 +686,19 @@ def _make_texts(tokenizer, num_texts, target_len, seed):
     return texts, token_counts
 
 
+def _token_counts_for_texts(tokenizer, texts, max_length):
+    return [
+        len(
+            tokenizer(
+                text,
+                truncation=True,
+                max_length=max_length,
+            )["input_ids"]
+        )
+        for text in texts
+    ]
+
+
 def _sanitize_outputs(outputs):
     sanitized = {}
     dense = outputs.get("dense_vecs")
@@ -303,12 +731,20 @@ def _run_suite(backend, cfg):
     batch_size = cfg["batch_size"]
 
     warm_len = scenarios[0]["target_len"] if scenarios else cfg.get("alignment_target_len", 32)
-    warm_texts, _ = _make_texts(
-        backend.tokenizer,
-        min(4, batch_size),
-        min(32, warm_len),
-        cfg["seed"] + 999,
-    )
+    warm_texts = list(cfg.get("warm_texts") or [])
+    if not warm_texts and scenarios and scenarios[0].get("texts"):
+        warm_texts = list(scenarios[0]["texts"][:min(4, batch_size)])
+    if not warm_texts and latency_specs and latency_specs[0].get("texts"):
+        warm_texts = list(latency_specs[0]["texts"][:min(4, batch_size)])
+    if not warm_texts and cfg.get("alignment_texts"):
+        warm_texts = list(cfg["alignment_texts"][:min(4, batch_size)])
+    if not warm_texts:
+        warm_texts, _ = _make_texts(
+            backend.tokenizer,
+            min(4, batch_size),
+            min(32, warm_len),
+            cfg["seed"] + 999,
+        )
     backend.encode(
         warm_texts,
         batch_size=min(batch_size, len(warm_texts)),
@@ -320,12 +756,20 @@ def _run_suite(backend, cfg):
 
     throughput = []
     for idx, scenario in enumerate(scenarios):
-        texts, token_counts = _make_texts(
-            backend.tokenizer,
-            scenario["num_texts"],
-            scenario["target_len"],
-            cfg["seed"] + idx,
-        )
+        if scenario.get("texts"):
+            texts = list(scenario["texts"])
+            token_counts = _token_counts_for_texts(
+                backend.tokenizer,
+                texts,
+                scenario["target_len"],
+            )
+        else:
+            texts, token_counts = _make_texts(
+                backend.tokenizer,
+                scenario["num_texts"],
+                scenario["target_len"],
+                cfg["seed"] + idx,
+            )
         _cuda_sync()
         start = time.perf_counter()
         backend.encode(
@@ -340,6 +784,7 @@ def _run_suite(backend, cfg):
         elapsed = time.perf_counter() - start
         throughput.append({
             "name": scenario["name"],
+            "target_label": scenario.get("target_label"),
             "num_texts": len(texts),
             "target_len": scenario["target_len"],
             "total_input_tokens": int(sum(token_counts)),
@@ -348,12 +793,20 @@ def _run_suite(backend, cfg):
 
     latency = []
     for idx, spec in enumerate(latency_specs):
-        texts, token_counts = _make_texts(
-            backend.tokenizer,
-            spec["batch_size"],
-            spec["target_len"],
-            cfg["seed"] + 200 + idx,
-        )
+        if spec.get("texts"):
+            texts = list(spec["texts"])
+            token_counts = _token_counts_for_texts(
+                backend.tokenizer,
+                texts,
+                spec["target_len"],
+            )
+        else:
+            texts, token_counts = _make_texts(
+                backend.tokenizer,
+                spec["batch_size"],
+                spec["target_len"],
+                cfg["seed"] + 200 + idx,
+            )
         run_kwargs = dict(
             batch_size=spec["batch_size"],
             max_length=spec["target_len"],
@@ -381,12 +834,20 @@ def _run_suite(backend, cfg):
 
     alignment = None
     if cfg.get("alignment_num_texts", 0) > 0:
-        texts, token_counts = _make_texts(
-            backend.tokenizer,
-            cfg["alignment_num_texts"],
-            cfg["alignment_target_len"],
-            cfg["seed"] + 500,
-        )
+        if cfg.get("alignment_texts"):
+            texts = list(cfg["alignment_texts"])
+            token_counts = _token_counts_for_texts(
+                backend.tokenizer,
+                texts,
+                cfg["alignment_target_len"],
+            )
+        else:
+            texts, token_counts = _make_texts(
+                backend.tokenizer,
+                cfg["alignment_num_texts"],
+                cfg["alignment_target_len"],
+                cfg["seed"] + 500,
+            )
         outputs = backend.encode(
             texts,
             batch_size=min(batch_size, len(texts)),
@@ -844,18 +1305,33 @@ def _run_colbert_suite(backend, cfg):
     latency_specs = cfg.get("latency_scenarios", [])
     batch_size = cfg["batch_size"]
 
-    warm_queries = _make_texts(
-        backend.tokenizer,
-        min(4, batch_size),
-        cfg.get("query_len", 32),
-        cfg["seed"] + 111,
-    )
-    warm_docs = _make_texts(
-        backend.tokenizer,
-        min(4, batch_size),
-        min(32, cfg.get("doc_len", 128)),
-        cfg["seed"] + 222,
-    )
+    warm_queries = list(cfg.get("warm_queries") or [])
+    if not warm_queries and scenarios:
+        for scenario in scenarios:
+            if scenario.get("mode") == "query" and scenario.get("texts"):
+                warm_queries = list(scenario["texts"][:min(4, batch_size)])
+                break
+    if not warm_queries:
+        warm_queries = _make_texts(
+            backend.tokenizer,
+            min(4, batch_size),
+            cfg.get("query_len", 32),
+            cfg["seed"] + 111,
+        )
+
+    warm_docs = list(cfg.get("warm_docs") or [])
+    if not warm_docs and scenarios:
+        for scenario in scenarios:
+            if scenario.get("mode") == "doc" and scenario.get("texts"):
+                warm_docs = list(scenario["texts"][:min(4, batch_size)])
+                break
+    if not warm_docs:
+        warm_docs = _make_texts(
+            backend.tokenizer,
+            min(4, batch_size),
+            min(32, cfg.get("doc_len", 128)),
+            cfg["seed"] + 222,
+        )
     backend.encode(
         warm_queries,
         mode="query",
@@ -871,12 +1347,15 @@ def _run_colbert_suite(backend, cfg):
 
     throughput = []
     for idx, scenario in enumerate(scenarios):
-        texts = _make_texts(
-            backend.tokenizer,
-            scenario["num_texts"],
-            scenario["target_len"],
-            cfg["seed"] + idx,
-        )
+        if scenario.get("texts"):
+            texts = list(scenario["texts"])
+        else:
+            texts = _make_texts(
+                backend.tokenizer,
+                scenario["num_texts"],
+                scenario["target_len"],
+                cfg["seed"] + idx,
+            )
         _cuda_sync()
         start = time.perf_counter()
         outputs = backend.encode(
@@ -889,6 +1368,7 @@ def _run_colbert_suite(backend, cfg):
         throughput.append({
             "name": scenario["name"],
             "mode": scenario["mode"],
+            "target_label": scenario.get("target_label"),
             "num_texts": len(texts),
             "target_len": scenario["target_len"],
             "total_input_tokens": int(outputs["total_input_tokens"]),
@@ -897,12 +1377,15 @@ def _run_colbert_suite(backend, cfg):
 
     latency = []
     for idx, spec in enumerate(latency_specs):
-        texts = _make_texts(
-            backend.tokenizer,
-            spec["batch_size"],
-            spec["target_len"],
-            cfg["seed"] + 200 + idx,
-        )
+        if spec.get("texts"):
+            texts = list(spec["texts"])
+        else:
+            texts = _make_texts(
+                backend.tokenizer,
+                spec["batch_size"],
+                spec["target_len"],
+                cfg["seed"] + 200 + idx,
+            )
         run_kwargs = dict(
             mode=spec["mode"],
             batch_size=spec["batch_size"],
@@ -931,18 +1414,22 @@ def _run_colbert_suite(backend, cfg):
 
     alignment = None
     if cfg.get("alignment_num_pairs", 0) > 0:
-        queries = _make_texts(
-            backend.tokenizer,
-            cfg["alignment_num_pairs"],
-            cfg["alignment_query_len"],
-            cfg["seed"] + 500,
-        )
-        docs = _make_texts(
-            backend.tokenizer,
-            cfg["alignment_num_pairs"],
-            cfg["alignment_doc_len"],
-            cfg["seed"] + 700,
-        )
+        if cfg.get("alignment_queries") and cfg.get("alignment_docs"):
+            queries = list(cfg["alignment_queries"])
+            docs = list(cfg["alignment_docs"])
+        else:
+            queries = _make_texts(
+                backend.tokenizer,
+                cfg["alignment_num_pairs"],
+                cfg["alignment_query_len"],
+                cfg["seed"] + 500,
+            )
+            docs = _make_texts(
+                backend.tokenizer,
+                cfg["alignment_num_pairs"],
+                cfg["alignment_doc_len"],
+                cfg["seed"] + 700,
+            )
         query_outputs = backend.encode(
             queries,
             mode="query",
@@ -1292,40 +1779,30 @@ if __name__ == "__main__":
 
 
 def _run_bge_benchmark(args, gpu: str, device: str, lengths: list[int], latency_batch_sizes: list[int]) -> None:
-    scenarios = []
-    if not args.skip_throughput:
-        scenarios = [
-            {
-                "name": f"len-{seq_len}",
-                "target_len": seq_len,
-                "num_texts": args.num_texts,
-            }
-            for seq_len in lengths
-        ]
-
-    latency_scenarios = []
-    if not args.skip_latency:
-        latency_scenarios = [
-            {
-                "name": f"bs-{bs}-len-{args.latency_len}",
-                "batch_size": bs,
-                "target_len": args.latency_len,
-                "num_warmup": 2,
-                "num_iters": args.latency_iters,
-            }
-            for bs in latency_batch_sizes
-        ]
+    workload = _prepare_bge_dataset_workload(
+        model_name=args.model,
+        dataset_name=args.dataset,
+        dataset_cache_dir=args.dataset_cache_dir,
+        lengths=lengths,
+        latency_batch_sizes=latency_batch_sizes,
+        args=args,
+    )
+    scenarios = workload["scenarios"]
+    latency_scenarios = workload["latency_scenarios"]
 
     print("=" * 88)
     print("  Embedding Benchmark: kb-nano vs FlagEmbedding")
     print("=" * 88)
     print(f"  Model               : {args.model}")
+    print(f"  Dataset             : {workload['dataset_name']} ({workload['num_queries']} queries, {workload['num_docs']} docs)")
     print(f"  SOTA baseline       : FlagEmbedding / BGEM3FlagModel")
     print(f"  Device              : {device}")
     print(f"  FP16                : {args.use_fp16}")
     print(f"  Return sparse       : {not args.dense_only}")
     print(f"  Return colbert      : {args.return_colbert_vecs}")
-    print(f"  Throughput lengths  : {lengths if scenarios else '(skipped)'}")
+    print(f"  Throughput scenarios: {[s['name'] for s in scenarios] if scenarios else '(skipped)'}")
+    print(f"  Stress lengths      : {lengths if lengths else '(none)'}")
+    print(f"  Native doc max len  : {workload['native_doc_max_len']}")
     print(f"  Num texts/scenario  : {args.num_texts}")
     print(f"  Batch size          : {args.batch_size}")
     print(f"  Latency scenarios   : {[s['name'] for s in latency_scenarios] if latency_scenarios else '(skipped)'}")
@@ -1343,10 +1820,12 @@ def _run_bge_benchmark(args, gpu: str, device: str, lengths: list[int], latency_
         "return_sparse": not args.dense_only,
         "return_colbert_vecs": args.return_colbert_vecs,
         "batch_size": args.batch_size,
+        "warm_texts": workload["warm_texts"],
         "scenarios": scenarios,
         "latency_scenarios": latency_scenarios,
         "alignment_num_texts": 0 if args.skip_alignment else args.alignment_texts,
         "alignment_target_len": args.alignment_len,
+        "alignment_texts": workload["alignment_texts"],
         "repo_dir": str(_PACKAGE_DIR),
     }
 
@@ -1378,7 +1857,7 @@ def _run_bge_benchmark(args, gpu: str, device: str, lengths: list[int], latency_
         print("  THROUGHPUT SUMMARY")
         print(f"{'=' * 104}")
         print(
-            f"  {'SCENARIO':<14} {'LEN':>6} {'KB docs/s':>14} {'FLAG docs/s':>14} "
+            f"  {'SCENARIO':<18} {'TARGET':>8} {'KB docs/s':>14} {'FLAG docs/s':>14} "
             f"{'KB tok/s':>14} {'FLAG tok/s':>14} {'SPEEDUP':>9}",
         )
         print(f"  {'-' * 96}")
@@ -1387,8 +1866,10 @@ def _run_bge_benchmark(args, gpu: str, device: str, lengths: list[int], latency_
         for idx, local_item in enumerate(local_raw["throughput"]):
             local_docs_s = local_item["num_texts"] / local_item["elapsed"]
             local_tok_s = local_item["total_input_tokens"] / local_item["elapsed"]
+            target_label = local_item.get("target_label") or str(local_item["target_len"])
             row = {
                 "scenario": local_item["name"],
+                "target_label": target_label,
                 "target_len": local_item["target_len"],
                 "num_texts": local_item["num_texts"],
                 "local_elapsed": local_item["elapsed"],
@@ -1413,7 +1894,7 @@ def _run_bge_benchmark(args, gpu: str, device: str, lengths: list[int], latency_
                 speedup_str = f"{speedup:.2f}x"
 
             print(
-                f"  {local_item['name']:<14} {local_item['target_len']:>6} "
+                f"  {local_item['name']:<18} {target_label:>8} "
                 f"{local_docs_s:>14.2f} {ref_docs_s_str:>14} "
                 f"{local_tok_s:>14,.0f} {ref_tok_s_str:>14} {speedup_str:>9}",
             )
@@ -1491,7 +1972,6 @@ def _run_bge_benchmark(args, gpu: str, device: str, lengths: list[int], latency_
         if sparse:
             print(
                 f"  Sparse : avg key jaccard={sparse['avg_key_jaccard']:.6f}, "
-                f"exact key match={sparse['exact_key_match_rate']:.2%}, "
                 f"avg mean abs diff={sparse['avg_mean_abs_diff']:.8e}, "
                 f"max abs diff={sparse['max_abs_diff']:.8e}",
             )
@@ -1505,6 +1985,10 @@ def _run_bge_benchmark(args, gpu: str, device: str, lengths: list[int], latency_
         "device": device,
         "local_backend": "kb-nano BGEM3ModelForInference",
         "reference_backend": "FlagEmbedding / BGEM3FlagModel" if ref_raw else None,
+        "dataset": workload["dataset_name"],
+        "dataset_num_queries": workload["num_queries"],
+        "dataset_num_docs": workload["num_docs"],
+        "dataset_num_pairs": workload["num_pairs"],
         "use_fp16": args.use_fp16,
         "return_sparse": not args.dense_only,
         "return_colbert_vecs": args.return_colbert_vecs,
@@ -1521,58 +2005,29 @@ def _run_bge_benchmark(args, gpu: str, device: str, lengths: list[int], latency_
 
 
 def _run_colbert_benchmark(args, gpu: str, device: str, lengths: list[int], latency_batch_sizes: list[int]) -> None:
-    scenarios = []
-    if not args.skip_throughput:
-        scenarios.append({
-            "name": f"query-len-{args.query_len}",
-            "mode": "query",
-            "target_len": args.query_len,
-            "num_texts": args.num_texts,
-        })
-        scenarios.extend([
-            {
-                "name": f"doc-len-{seq_len}",
-                "mode": "doc",
-                "target_len": seq_len,
-                "num_texts": args.num_texts,
-            }
-            for seq_len in lengths
-        ])
-
-    latency_scenarios = []
-    if not args.skip_latency:
-        latency_scenarios.extend([
-            {
-                "name": f"query-bs-{bs}-len-{args.query_len}",
-                "mode": "query",
-                "batch_size": bs,
-                "target_len": args.query_len,
-                "num_warmup": 2,
-                "num_iters": args.latency_iters,
-            }
-            for bs in latency_batch_sizes
-        ])
-        latency_scenarios.extend([
-            {
-                "name": f"doc-bs-{bs}-len-{args.latency_len}",
-                "mode": "doc",
-                "batch_size": bs,
-                "target_len": args.latency_len,
-                "num_warmup": 2,
-                "num_iters": args.latency_iters,
-            }
-            for bs in latency_batch_sizes
-        ])
+    workload = _prepare_colbert_dataset_workload(
+        model_name=args.model,
+        dataset_name=args.dataset,
+        dataset_cache_dir=args.dataset_cache_dir,
+        lengths=lengths,
+        latency_batch_sizes=latency_batch_sizes,
+        args=args,
+    )
+    scenarios = workload["scenarios"]
+    latency_scenarios = workload["latency_scenarios"]
 
     print("=" * 88)
     print("  Embedding Benchmark: kb-nano vs ColBERT")
     print("=" * 88)
     print(f"  Model               : {args.model}")
+    print(f"  Dataset             : {workload['dataset_name']} ({workload['num_queries']} queries, {workload['num_docs']} docs)")
     print(f"  SOTA baseline       : Official ColBERT / HF_ColBERT")
     print(f"  Device              : {device}")
     print(f"  FP16                : {args.use_fp16}")
     print(f"  Query len           : {args.query_len}")
-    print(f"  Doc lengths         : {lengths if scenarios else '(skipped)'}")
+    print(f"  Throughput scenarios: {[s['name'] for s in scenarios] if scenarios else '(skipped)'}")
+    print(f"  Stress doc lengths  : {lengths if lengths else '(none)'}")
+    print(f"  Native doc max len  : {workload['native_doc_max_len']}")
     print(f"  Num texts/scenario  : {args.num_texts}")
     print(f"  Batch size          : {args.batch_size}")
     print(f"  Latency scenarios   : {[s['name'] for s in latency_scenarios] if latency_scenarios else '(skipped)'}")
@@ -1592,11 +2047,15 @@ def _run_colbert_benchmark(args, gpu: str, device: str, lengths: list[int], late
         "query_len": args.query_len,
         "doc_len": args.latency_len,
         "colbert_dim": 128,
+        "warm_queries": workload["warm_queries"],
+        "warm_docs": workload["warm_docs"],
         "scenarios": scenarios,
         "latency_scenarios": latency_scenarios,
         "alignment_num_pairs": 0 if args.skip_alignment else args.alignment_texts,
         "alignment_query_len": args.query_len,
         "alignment_doc_len": args.alignment_len,
+        "alignment_queries": workload["alignment_queries"],
+        "alignment_docs": workload["alignment_docs"],
         "repo_dir": str(_PACKAGE_DIR),
     }
     ref_config = dict(local_config)
@@ -1627,7 +2086,7 @@ def _run_colbert_benchmark(args, gpu: str, device: str, lengths: list[int], late
         print("  THROUGHPUT SUMMARY")
         print(f"{'=' * 116}")
         print(
-            f"  {'SCENARIO':<20} {'MODE':<8} {'LEN':>6} {'KB docs/s':>14} {'REF docs/s':>14} "
+            f"  {'SCENARIO':<20} {'MODE':<8} {'TARGET':>8} {'KB docs/s':>14} {'REF docs/s':>14} "
             f"{'KB tok/s':>14} {'REF tok/s':>14} {'SPEEDUP':>9}",
         )
         print(f"  {'-' * 108}")
@@ -1636,9 +2095,11 @@ def _run_colbert_benchmark(args, gpu: str, device: str, lengths: list[int], late
         for idx, local_item in enumerate(local_raw["throughput"]):
             local_docs_s = local_item["num_texts"] / local_item["elapsed"]
             local_tok_s = local_item["total_input_tokens"] / local_item["elapsed"]
+            target_label = local_item.get("target_label") or str(local_item["target_len"])
             row = {
                 "scenario": local_item["name"],
                 "mode": local_item["mode"],
+                "target_label": target_label,
                 "target_len": local_item["target_len"],
                 "num_texts": local_item["num_texts"],
                 "local_elapsed": local_item["elapsed"],
@@ -1663,7 +2124,7 @@ def _run_colbert_benchmark(args, gpu: str, device: str, lengths: list[int], late
                 speedup_str = f"{speedup:.2f}x"
 
             print(
-                f"  {local_item['name']:<20} {local_item['mode']:<8} {local_item['target_len']:>6} "
+                f"  {local_item['name']:<20} {local_item['mode']:<8} {target_label:>8} "
                 f"{local_docs_s:>14.2f} {ref_docs_s_str:>14} "
                 f"{local_tok_s:>14,.0f} {ref_tok_s_str:>14} {speedup_str:>9}",
             )
@@ -1755,6 +2216,10 @@ def _run_colbert_benchmark(args, gpu: str, device: str, lengths: list[int], late
         "device": device,
         "local_backend": "kb-nano ColBERTv2ModelForInference",
         "reference_backend": "Official ColBERT / HF_ColBERT" if ref_raw else None,
+        "dataset": workload["dataset_name"],
+        "dataset_num_queries": workload["num_queries"],
+        "dataset_num_docs": workload["num_docs"],
+        "dataset_num_pairs": workload["num_pairs"],
         "use_fp16": args.use_fp16,
         "num_texts": args.num_texts,
         "batch_size": args.batch_size,
@@ -1777,11 +2242,23 @@ def main() -> None:
     parser.add_argument(
         "--lengths",
         type=str,
-        default="128",
-        help="Comma-separated throughput sequence lengths.",
+        default="",
+        help="Optional comma-separated fixed-length stress scenarios to add on top of dataset-backed throughput.",
     )
     parser.add_argument("--query-len", type=int, default=32)
-    parser.add_argument("--num-texts", type=int, default=8)
+    parser.add_argument(
+        "--dataset",
+        type=str,
+        default="mteb/scifact",
+        help="HuggingFace retrieval dataset used for real query/document workload.",
+    )
+    parser.add_argument(
+        "--dataset-cache-dir",
+        type=str,
+        default=None,
+        help="Optional cache directory for the HuggingFace retrieval dataset.",
+    )
+    parser.add_argument("--num-texts", type=int, default=128)
     parser.add_argument("--batch-size", type=int, default=4)
     parser.add_argument("--seed", type=int, default=42)
     parser.add_argument(
@@ -1800,7 +2277,7 @@ def main() -> None:
     parser.add_argument("--skip-throughput", action="store_true")
     parser.add_argument("--skip-latency", action="store_true")
     parser.add_argument("--skip-alignment", action="store_true")
-    parser.add_argument("--alignment-texts", type=int, default=4)
+    parser.add_argument("--alignment-texts", type=int, default=32)
     parser.add_argument("--alignment-len", type=int, default=128)
     parser.add_argument("--latency-len", type=int, default=128)
     parser.add_argument(
