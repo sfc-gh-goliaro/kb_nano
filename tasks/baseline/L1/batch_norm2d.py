@@ -1,4 +1,4 @@
-"""BatchNorm2d wrapper around F.batch_norm with affine params and running stats."""
+"""BatchNorm2d wrapping F.batch_norm with registered affine/running stats."""
 
 from __future__ import annotations
 

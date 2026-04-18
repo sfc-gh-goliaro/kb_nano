@@ -45,6 +45,10 @@ class MixtralMoE(nn.Module):
         self.fused_experts = FusedExperts()
         self.allreduce = AllReduce()
 
+        # Custom-op dispatch for torch.compile (set by engine after model init)
+        self._use_custom_op = False
+        self._layer_name = ""
+
     def _w13_weight_loader(self, param, loaded_weight, expert_id: int, is_w1: bool):
         tp, rank = _tp_size(), _tp_rank()
         N = self.intermediate_per_tp
@@ -57,7 +61,8 @@ class MixtralMoE(nn.Module):
         N = self.intermediate_per_tp
         param.data[expert_id].copy_(loaded_weight.narrow(1, rank * N, N))
 
-    def forward(self, hidden_states: torch.Tensor) -> torch.Tensor:
+    def forward_impl(self, hidden_states: torch.Tensor) -> torch.Tensor:
+        """Core MoE logic, callable from both eager and custom-op paths."""
         orig_shape = hidden_states.shape
         hidden_states = hidden_states.view(-1, self.hidden_size)
 
@@ -76,3 +81,8 @@ class MixtralMoE(nn.Module):
             out = self.allreduce(out)
 
         return out.view(orig_shape)
+
+    def forward(self, hidden_states: torch.Tensor) -> torch.Tensor:
+        if self._use_custom_op:
+            return torch.ops.kb_nano.moe_forward(hidden_states, self._layer_name)
+        return self.forward_impl(hidden_states)

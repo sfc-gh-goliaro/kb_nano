@@ -161,12 +161,16 @@ class Attention(nn.Module):
 
     def __init__(self, num_heads: int, head_size: int, scale: float,
                  num_kv_heads: int | None = None,
+                 sliding_window: int | None = None,
+                 sinks: torch.nn.Parameter | None = None,
                  attention_chunk_size: int | None = None):
         super().__init__()
         self.num_heads = num_heads
         self.head_size = head_size
         self.scale = scale
         self.num_kv_heads = num_kv_heads if num_kv_heads is not None else num_heads
+        self.sliding_window = sliding_window
+        self.sinks = sinks
         self.attention_chunk_size = attention_chunk_size
 
         # TODO(tech-debt): For chunked local attention layers the KV cache
@@ -178,6 +182,15 @@ class Attention(nn.Module):
         attn_cfg = get_attn_backend_config()
         self._use_trtllm = attn_cfg.use_trtllm
         self._block_size = attn_cfg.block_size
+
+        # Native FA3/TRTLLM path: sinks -> s_aux, sliding window -> window_size.
+        self._fa3_sinks = sinks
+        self._fa3_window_size = (
+            (sliding_window - 1, 0) if sliding_window is not None else (-1, -1)
+        )
+
+        self._use_custom_op = False
+        self._layer_name = ""
 
         if self._use_trtllm:
             self.store_kvcache = StoreKVCacheHND(page_size=attn_cfg.block_size)
@@ -205,8 +218,9 @@ class Attention(nn.Module):
             self.decode_op._workspace = workspace
             self.prefill_op._workspace = workspace
 
-    def forward(self, query: torch.Tensor, key: torch.Tensor,
-                value: torch.Tensor) -> torch.Tensor:
+    def forward_impl(self, query: torch.Tensor, key: torch.Tensor,
+                     value: torch.Tensor) -> torch.Tensor:
+        """Core attention logic, callable from both eager and custom-op paths."""
         ctx = get_context()
         N = query.shape[0]
 
@@ -225,7 +239,21 @@ class Attention(nn.Module):
 
         return o.reshape(N, self.num_heads * self.head_size)
 
+    def forward(self, query: torch.Tensor, key: torch.Tensor,
+                value: torch.Tensor) -> torch.Tensor:
+        if self._use_custom_op:
+            return torch.ops.kb_nano.unified_attention(
+                query, key, value, self._layer_name,
+            )
+        return self.forward_impl(query, key, value)
+
     def _forward_pure(self, q, k, v, k_cache, v_cache, ctx):
+        fa_extra = {}
+        if self._fa3_sinks is not None:
+            fa_extra["s_aux"] = self._fa3_sinks
+        if self._fa3_window_size != (-1, -1):
+            fa_extra["window_size"] = self._fa3_window_size
+
         if ctx.is_prefill:
             cu_q = ctx.cu_seqlens_q
             cu_k = ctx.cu_seqlens_k
@@ -244,13 +272,14 @@ class Attention(nn.Module):
                     cu_seqlens_q=cu_q, cu_seqlens_k=cu_k,
                     max_seqlen_q=msq, max_seqlen_k=msk,
                     softmax_scale=self.scale, causal=True,
-                    block_table=bt,
+                    block_table=bt, **fa_extra,
                 )
             return self.prefill_op(
                 q, k, v,
                 cu_seqlens_q=cu_q, cu_seqlens_k=cu_k,
                 max_seqlen_q=msq, max_seqlen_k=msk,
                 softmax_scale=self.scale, causal=True,
+                **fa_extra,
             )
 
         cache_seqlens = ctx.context_lens
@@ -266,10 +295,16 @@ class Attention(nn.Module):
             q, k_cache, v_cache,
             cache_seqlens=cache_seqlens, block_table=bt,
             softmax_scale=self.scale, causal=True,
-            max_seq_len=max_ctx,
+            max_seq_len=max_ctx, **fa_extra,
         )
 
     def _forward_mixed(self, q, k_cache, v_cache, ctx):
+        fa_extra = {}
+        if self._fa3_sinks is not None:
+            fa_extra["s_aux"] = self._fa3_sinks
+        if self._fa3_window_size != (-1, -1):
+            fa_extra["window_size"] = self._fa3_window_size
+
         np_ = ctx.num_prefill_tokens
         nd = ctx.num_decode_tokens
         out = torch.empty_like(q)
@@ -292,7 +327,7 @@ class Attention(nn.Module):
                 cu_seqlens_q=cu_q, cu_seqlens_k=cu_k,
                 max_seqlen_q=msq, max_seqlen_k=msk,
                 softmax_scale=self.scale, causal=True,
-                block_table=bt,
+                block_table=bt, **fa_extra,
             )
 
         if nd > 0:
@@ -310,6 +345,6 @@ class Attention(nn.Module):
                 q[np_:], k_cache, v_cache,
                 cache_seqlens=cache_seqlens, block_table=bt,
                 softmax_scale=self.scale, causal=True,
-                max_seq_len=max_ctx,
+                max_seq_len=max_ctx, **fa_extra,
             )
         return out
