@@ -299,6 +299,44 @@ ALL_TTS_WORKLOADS = {
 }
 
 
+# ---------------------------------------------------------------------------
+# Object detection workloads (COCO val2017)
+# ---------------------------------------------------------------------------
+
+@dataclass(frozen=True)
+class DetectionThroughputWorkload:
+    name: str
+    image_size: int
+    num_images: int
+    batch_size: int
+    dataset_name: str = "detection-datasets/coco"
+    dataset_split: str = "val"
+
+@dataclass(frozen=True)
+class DetectionLatencyWorkload:
+    name: str
+    image_size: int
+    batch_size: int
+    dataset_name: str = "detection-datasets/coco"
+    dataset_split: str = "val"
+    num_warmup: int = 3
+    num_iters: int = 20
+
+DETECTION_THROUGHPUT_WORKLOADS: list[DetectionThroughputWorkload] = [
+    DetectionThroughputWorkload("coco-val", image_size=640, num_images=5000, batch_size=32),
+]
+
+DETECTION_LATENCY_WORKLOADS: list[DetectionLatencyWorkload] = [
+    DetectionLatencyWorkload("single-image", image_size=640, batch_size=1),
+    DetectionLatencyWorkload("batch-4", image_size=640, batch_size=4),
+]
+
+ALL_DETECTION_WORKLOADS = {
+    "throughput": DETECTION_THROUGHPUT_WORKLOADS,
+    "latency": DETECTION_LATENCY_WORKLOADS,
+}
+
+
 def get_max_seq_len() -> int:
     """Return the maximum sequence length across all standardized LLM workloads."""
     max_len = 0
@@ -360,4 +398,54 @@ VIDEO_DIFFUSION_LATENCY_WORKLOADS: list[VideoDiffusionLatencyWorkload] = [
 ALL_VIDEO_DIFFUSION_WORKLOADS = {
     "throughput": VIDEO_DIFFUSION_THROUGHPUT_WORKLOADS,
     "latency": VIDEO_DIFFUSION_LATENCY_WORKLOADS,
+}
+
+
+# ---------------------------------------------------------------------------
+# Vision encoder workloads (pure image feature extraction, e.g. SigLIP-2, DINOv3)
+# ---------------------------------------------------------------------------
+
+@dataclass(frozen=True)
+class VisionEncoderThroughputWorkload:
+    """Throughput workload for vision encoders.
+
+    Processes num_images real images from dataset_name at the given resolution
+    in fixed batch_size batches, measuring images/sec.
+    """
+    name: str
+    resolution: int
+    num_images: int
+    batch_size: int
+    dataset_name: str = "ILSVRC/imagenet-1k"
+    dataset_split: str = "validation"
+
+@dataclass(frozen=True)
+class VisionEncoderLatencyWorkload:
+    """Latency workload for vision encoders.
+
+    Repeated inference on real images from dataset_name at the model's default
+    resolution, measuring median and P99 latency.
+    """
+    name: str
+    resolution: int
+    batch_size: int
+    dataset_name: str = "ILSVRC/imagenet-1k"
+    dataset_split: str = "validation"
+    num_warmup: int = 3
+    num_iters: int = 10
+
+
+VISION_ENCODER_THROUGHPUT_WORKLOADS: list[VisionEncoderThroughputWorkload] = [
+    VisionEncoderThroughputWorkload("default-res", resolution=0, num_images=5000, batch_size=32),
+    VisionEncoderThroughputWorkload("high-res",    resolution=512, num_images=2500, batch_size=16),
+]
+
+VISION_ENCODER_LATENCY_WORKLOADS: list[VisionEncoderLatencyWorkload] = [
+    VisionEncoderLatencyWorkload("single-image", resolution=0, batch_size=1, num_warmup=5, num_iters=30),
+    VisionEncoderLatencyWorkload("batch-8",      resolution=0, batch_size=8, num_warmup=5, num_iters=30),
+]
+
+ALL_VISION_ENCODER_WORKLOADS = {
+    "throughput": VISION_ENCODER_THROUGHPUT_WORKLOADS,
+    "latency": VISION_ENCODER_LATENCY_WORKLOADS,
 }

@@ -41,6 +41,7 @@ _KB_ROOT = KB_ROOT
 _CANDIDATE_DIR = CANDIDATE_DIR
 
 _L4_MODEL_KEYS: dict[str, str] = {
+    "gpt_oss": "gpt_oss",
     "llama": "llama31",
     "llama4": "llama4",
     "mixtral": "mixtral",
@@ -54,6 +55,11 @@ _L4_MODEL_KEYS: dict[str, str] = {
     "colbertv2": "colbertv2",
     "dlrmv2": "dlrmv2",
     "lightgcn": "lightgcn",
+    "yolov10": "yolov10",
+    "rtdetrv2": "rtdetrv2",
+    "openfold3": "openfold3",
+    "siglip2": "siglip2",
+    "dinov3": "dinov3",
 }
 
 
@@ -68,6 +74,10 @@ class BenchTarget:
     module_path: str
     models: list[str]
     target_cls: type
+    # L1 targets sit inside the compiled graph; replacing them requires
+    # re-triggering torch.compile.  L2+ targets are behind custom-op
+    # boundaries and can be swapped at runtime without recompilation.
+    requires_recompile: bool = False
 
 
 _TARGETS: list[BenchTarget] | None = None
@@ -197,6 +207,7 @@ def discover_targets() -> list[BenchTarget]:
                 module_path=module_path,
                 models=models,
                 target_cls=target_cls,
+                requires_recompile=(level_num == 1),
             ))
 
     _TARGETS = targets
@@ -430,9 +441,21 @@ def apply_candidates(candidates: list[tuple[BenchTarget, type]]) -> list[tuple]:
         )
 
     all_undo: list[tuple] = []
+    has_recompile_targets = False
     for target, user_cls in sorted_candidates:
+        if target.requires_recompile:
+            has_recompile_targets = True
+            print(
+                f"  NOTE: L{target.level} {target.name} sits inside the "
+                f"compiled graph.\n"
+                f"        Candidate must be torch.compile-compatible "
+                f"(no graph breaks)."
+            )
         undo = patch_class(target, user_cls)
         all_undo.extend(undo)
+    if has_recompile_targets:
+        print("  Candidates with requires_recompile=True need compilation "
+              "to be re-triggered.")
     return all_undo
 
 

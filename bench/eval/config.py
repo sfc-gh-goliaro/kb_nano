@@ -6,6 +6,7 @@ from dataclasses import dataclass, field
 
 
 MODEL_KEY_TO_DEFAULT_HF: dict[str, str] = {
+    "gpt_oss": "openai/gpt-oss-20b",
     "llama31": "meta-llama/Llama-3.1-8B-Instruct",
     "llama4": "meta-llama/Llama-4-Scout-17B-16E-Instruct",
     "mixtral": "mistralai/Mixtral-8x7B-Instruct-v0.1",
@@ -15,9 +16,12 @@ MODEL_KEY_TO_DEFAULT_HF: dict[str, str] = {
     "sam3": "facebook/sam3.1",
     "cosyvoice3": "FunAudioLLM/Fun-CosyVoice3-0.5B-2512",
     "hunyuan_video": "hunyuanvideo-community/HunyuanVideo-1.5-Diffusers-480p_t2v",
+    "openfold3": "OpenFold/OpenFold3",
 }
 
 MODEL_CATEGORY: dict[str, str] = {
+    "openai/gpt-oss-20b": "llm",
+    "openai/gpt-oss-120b": "llm",
     "meta-llama/Llama-3.1-8B-Instruct": "llm",
     "meta-llama/Llama-3.1-70B-Instruct": "llm",
     "meta-llama/Llama-4-Scout-17B-16E-Instruct": "llm",
@@ -28,6 +32,7 @@ MODEL_CATEGORY: dict[str, str] = {
     "facebook/sam3.1": "segmentation",
     "FunAudioLLM/Fun-CosyVoice3-0.5B-2512": "tts",
     "hunyuanvideo-community/HunyuanVideo-1.5-Diffusers-480p_t2v": "diffusion",
+    "OpenFold/OpenFold3": "structure_prediction",
 }
 
 

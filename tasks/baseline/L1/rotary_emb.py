@@ -1,6 +1,8 @@
 """Rotary position embeddings (RoPE), with optional Llama 3.1-style frequency scaling.
 
-Uses a custom CUDA kernel for high-performance in-place RoPE.
+Uses a custom CUDA kernel for high-performance in-place RoPE.  The pybind11
+op is wrapped into a ``torch.library`` custom op with in-place mutation
+annotations so ``torch.compile`` handles functionalization automatically.
 """
 
 from __future__ import annotations
@@ -11,6 +13,30 @@ import torch
 import torch.nn as nn
 
 from .csrc import _C
+
+# ---------------------------------------------------------------------------
+# Register in-place rotary embedding op for torch.compile compatibility.
+# Uses Tensor(a!) annotations so Inductor auto-functionalizes correctly.
+# ---------------------------------------------------------------------------
+
+_lib = torch.library.Library("kb_nano_rope", "DEF")
+
+_lib.define(
+    "rotary_embedding(Tensor positions, Tensor(a!) query, "
+    "Tensor(b!)? key, int head_size, Tensor cos_sin_cache, "
+    "bool is_neox) -> ()"
+)
+
+def _rotary_embedding_impl(
+    positions, query, key, head_size, cos_sin_cache, is_neox,
+):
+    _C.rotary_embedding(positions, query, key, head_size, cos_sin_cache, is_neox)
+
+_lib.impl("rotary_embedding", _rotary_embedding_impl, "CUDA")
+
+@torch.library.impl(_lib, "rotary_embedding", "Meta")
+def _rotary_embedding_meta(positions, query, key, head_size, cos_sin_cache, is_neox):
+    pass
 
 
 def _compute_scaled_inv_freq(
@@ -76,9 +102,54 @@ class RotaryEmbedding(nn.Module):
         cache = torch.cat((freqs.cos(), freqs.sin()), dim=-1).float()
         self.register_buffer("cos_sin_cache", cache, persistent=False)
 
-    def forward(self, positions, query, key):
+    @staticmethod
+    def forward_native(positions, query, key, head_dim, cos_sin_cache):
+        """Pure PyTorch NeOX-style RoPE matching the CUDA kernel.
+
+        The cache stores [cos, sin] each with embed_dim = head_dim/2 entries.
+        Rotation pairs elements (i, i + embed_dim) across the full head,
+        exactly matching the CUDA kernel's IS_NEOX=true path:
+          out[i]            = x[i]*cos[i] - x[i+embed_dim]*sin[i]
+          out[i+embed_dim]  = x[i+embed_dim]*cos[i] + x[i]*sin[i]
+        """
+        cos_sin = cos_sin_cache[positions]
+        embed_dim = cos_sin.shape[-1] // 2
+        cos = cos_sin[..., :embed_dim]
+        sin = cos_sin[..., embed_dim:]
+
+        q_shape = query.shape
+        k_shape = key.shape
+        q = query.view(q_shape[0], -1, head_dim)
+        k = key.view(k_shape[0], -1, head_dim)
+
+        cos = cos.unsqueeze(1)
+        sin = sin.unsqueeze(1)
+
+        q1, q2 = q[..., :embed_dim], q[..., embed_dim:]
+        k1, k2 = k[..., :embed_dim], k[..., embed_dim:]
+
+        query = torch.cat([q1 * cos - q2 * sin,
+                           q2 * cos + q1 * sin], dim=-1).view(q_shape)
+        key = torch.cat([k1 * cos - k2 * sin,
+                         k2 * cos + k1 * sin], dim=-1).view(k_shape)
+        return query, key
+
+    def forward_cuda(self, positions, query, key):
+        """CUDA kernel path for eager mode."""
         cache = self.cos_sin_cache
         if cache.dtype != query.dtype:
             cache = cache.to(query.dtype)
-        _C.rotary_embedding(positions, query, key, self.head_dim, cache, True)
+        torch.ops.kb_nano_rope.rotary_embedding(
+            positions, query, key, self.head_dim, cache, True,
+        )
         return query, key
+
+    def forward(self, positions, query, key):
+        if torch.compiler.is_compiling():
+            cache = self.cos_sin_cache
+            if cache.dtype != query.dtype:
+                cache = cache.to(query.dtype)
+            return self.forward_native(
+                positions, query, key, self.head_dim, cache,
+            )
+        return self.forward_cuda(positions, query, key)
