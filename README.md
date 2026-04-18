@@ -10,7 +10,7 @@ A standalone, high-performance inference engine supporting **LLMs** (Llama 3.1, 
 - **SDXL** (Stable Diffusion XL) UNet-based text-to-image with dual CLIP text encoders
 - **HunyuanVideo-1.5** 3D video diffusion transformer (text-to-video) with dual-stream joint attention, M-RoPE, and Qwen2.5-VL text encoder
 - **3D Gaussian Splatting** (poster scene) with native projection / tile intersection / rasterization path over `gsplat` CUDA primitives
-- **InstantNGP** (`fox` scene) with repo wrapper over official `pyngp` bindings plus kernel-level `HashGrid` / `FullyFusedMLP` field benchmarks
+- **InstantNGP** (`fox` scene) with repo wrapper over official `pyngp` bindings plus kernel-level `HashGrid` / `FullyFusedMLP` field benchmarks on real fox training-view samples
 - **Qwen2-VL / Qwen3-VL** vision-language models with image and video support
 - **SAM3.1** (facebook/sam3.1) image/video segmentation with ViT backbone, fusion encoder, detection decoder, and segmentation head
 - **Whisper** (large-v3) encoder-decoder speech-to-text with batched inference and paged cross-attention KV cache
@@ -257,22 +257,23 @@ python tests/bench_3dgs.py --scene poster --num-cameras 2 --max-points 8000 --ou
 
 ```bash
 # InstantNGP fox scene: render throughput + correctness benchmark vs official pyngp
-python tests/bench_instantngp.py --scene fox --train-steps 50 --num-views 2
+python tests/bench_instantngp.py
 
 # Faster smoke run at reduced resolution
-python tests/bench_instantngp.py --scene fox --train-steps 50 --num-views 2 --width 540 --height 960
+python tests/bench_instantngp.py --width 540 --height 960
 
 # kb-nano only (skip reference comparison)
-python tests/bench_instantngp.py --scene fox --train-steps 50 --num-views 2 --skip-reference
+python tests/bench_instantngp.py --skip-reference
 
 # Save results to a specific directory
-python tests/bench_instantngp.py --scene fox --train-steps 50 --num-views 2 --output-dir tests/results/H200/instantngp-fox
+python tests/bench_instantngp.py --output-dir tests/results/H200/instantngp-fox
 ```
 
 ### Benchmarking kernel-level InstantNGP field vs direct tinycudann
 
 ```bash
 # HashGrid + direction encoding + fully fused MLP field benchmark
+# Defaults use real fox training-view sampled field inputs
 python tests/bench_instantngp_kernels.py --num-samples 131072
 
 # Larger kernel batch
@@ -484,8 +485,8 @@ cd third_party/instant-ngp/dependencies/tiny-cuda-nn/bindings/torch
 TCNN_CUDA_ARCHITECTURES=90 python setup.py install
 ```
 
-The InstantNGP benchmark uses the official `fox` sample scene bundled with `instant-ngp`, trains a cached snapshot for `50` steps on first run, and then compares kb-nano's wrapper path against direct `pyngp` rendering.
-The kernel-level InstantNGP benchmark uses the same `tiny-cuda-nn` stack to compare kb-nano's `HashGrid` / direction encoding / `FullyFusedMLP` wrappers against direct `tinycudann` modules.
+The InstantNGP benchmark uses the official `fox` sample scene bundled with `instant-ngp`, trains a cached snapshot for `50` steps on first run, and then compares kb-nano's wrapper path against direct `pyngp` rendering on the same training views.
+The kernel-level InstantNGP benchmark uses the same `tiny-cuda-nn` stack, but samples positions and directions from real `fox` training-view rays derived from the cached snapshot metadata before comparing kb-nano's `HashGrid` / direction encoding / `FullyFusedMLP` wrappers against direct `tinycudann` modules.
 
 ## Performance
 
@@ -661,7 +662,7 @@ Throughput (images/sec, float32):
 
 | Scene | Cameras | Points | gsplat | Ours | Ratio |
 |-------|--------:|-------:|-------:|-----:|------:|
-| poster | 2 | 8,000 | 3,721 | 2,861 | 0.77x |
+| poster | 2 | 8,000 | 4,126 | 4,217 | 1.02x |
 
 Correctness:
 
@@ -680,7 +681,7 @@ Throughput (images/sec, spp=1):
 
 | Scene | Views | Resolution | pyngp | Ours | Ratio |
 |-------|------:|-----------:|------:|-----:|------:|
-| fox | 2 | 1920x1080 | 14.48 | 14.32 | 0.99x |
+| fox | 2 | 1920x1080 | 13.16 | 13.41 | 1.02x |
 
 Correctness:
 
@@ -690,7 +691,7 @@ Correctness:
 
 ### InstantNGP kernels
 
-Run `tests/bench_instantngp_kernels.py` to reproduce. This benchmark drops below the render wrapper and compares kb-nano's kernel-level `HashGrid` + direction encoding + `FullyFusedMLP` field wiring against direct `tinycudann` modules with synchronized weights.
+Run `tests/bench_instantngp_kernels.py` to reproduce. This benchmark drops below the render wrapper, samples positions and directions from real `fox` training-view rays using the cached snapshot metadata, and compares kb-nano's kernel-level `HashGrid` + direction encoding + `FullyFusedMLP` field wiring against direct `tinycudann` modules with synchronized weights.
 
 **Hardware: NVIDIA H200**
 
@@ -698,7 +699,7 @@ Throughput (samples/sec):
 
 | Samples | tinycudann | Ours | Ratio |
 |--------:|-----------:|-----:|------:|
-| 131072 | 420,637,414 | 417,892,261 | 0.99x |
+| 131072 | 428,227,937 | 427,416,206 | 1.00x |
 
 Correctness:
 

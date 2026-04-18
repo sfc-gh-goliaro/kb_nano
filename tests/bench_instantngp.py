@@ -60,12 +60,6 @@ def main():
             width=width,
             height=height,
             spp=cfg["spp"],
-            use_exact_marcher=cfg["use_exact_marcher"],
-            ray_chunk_size=cfg["ray_chunk_size"],
-            render_step_scale=cfg["render_step_scale"],
-            fast_alpha_thre=cfg["fast_alpha_thre"],
-            fast_early_stop_eps=cfg["fast_early_stop_eps"],
-            fast_use_sigma_pruning=cfg["fast_use_sigma_pruning"],
         )
         baseline_name = "kb-nano"
     elif cfg["backend"] == "reference":
@@ -119,24 +113,6 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--spp", type=int, default=1)
     parser.add_argument("--warmup-iters", type=int, default=5)
     parser.add_argument("--measure-iters", type=int, default=20)
-    parser.add_argument(
-        "--exact",
-        dest="use_exact",
-        action="store_true",
-        help="Use the exact native marcher (default).",
-    )
-    parser.add_argument(
-        "--fast",
-        dest="use_exact",
-        action="store_false",
-        help="Use the faster approximate nerfacc marcher.",
-    )
-    parser.set_defaults(use_exact=True)
-    parser.add_argument("--ray-chunk-size", type=int, default=131072)
-    parser.add_argument("--render-step-scale", type=float, default=0.5)
-    parser.add_argument("--fast-alpha-thre", type=float, default=0.0)
-    parser.add_argument("--fast-early-stop-eps", type=float, default=0.0)
-    parser.add_argument("--fast-use-sigma-pruning", action="store_true")
     parser.add_argument("--skip-reference", action="store_true")
     parser.add_argument("--output-dir", default="/tmp/instantngp_bench")
     return parser.parse_args()
@@ -153,12 +129,6 @@ def main() -> None:
         "width": args.width,
         "height": args.height,
         "spp": args.spp,
-        "use_exact_marcher": args.use_exact,
-        "ray_chunk_size": args.ray_chunk_size,
-        "render_step_scale": args.render_step_scale,
-        "fast_alpha_thre": args.fast_alpha_thre,
-        "fast_early_stop_eps": args.fast_early_stop_eps,
-        "fast_use_sigma_pruning": args.fast_use_sigma_pruning,
         "warmup_iters": args.warmup_iters,
         "measure_iters": args.measure_iters,
     }
@@ -173,12 +143,6 @@ def main() -> None:
         "num_views": args.num_views,
         "resolution": ours_data["resolution"],
         "spp": args.spp,
-        "use_exact_marcher": args.use_exact,
-        "ray_chunk_size": args.ray_chunk_size,
-        "render_step_scale": args.render_step_scale,
-        "fast_alpha_thre": args.fast_alpha_thre,
-        "fast_early_stop_eps": args.fast_early_stop_eps,
-        "fast_use_sigma_pruning": args.fast_use_sigma_pruning,
         "ours": {
             "baseline_name": ours_data["result"]["baseline_name"],
             "images_per_second": ours_data["result"]["images_per_second"],

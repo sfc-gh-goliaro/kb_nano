@@ -26,53 +26,36 @@ with open(sys.argv[1]) as f:
 sys.path.insert(0, cfg["kb_root"])
 
 import tinycudann as tcnn
+from infra.nerf_loader import sample_real_fox_field_inputs
 from tasks.baseline.L2.instantngp_field import InstantNGPField
 
-HASHGRID_CONFIG = {
-    "otype": "HashGrid",
-    "n_levels": 8,
-    "n_features_per_level": 4,
-    "log2_hashmap_size": 19,
-    "base_resolution": 16,
-}
-
-DIR_CONFIG = {
-    "otype": "Composite",
-    "nested": [
-        {
-            "n_dims_to_encode": 3,
-            "otype": "SphericalHarmonics",
-            "degree": 4,
-        },
-        {
-            "otype": "Identity",
-        },
-    ],
-}
-
-DENSITY_CONFIG = {
-    "otype": "FullyFusedMLP",
-    "activation": "ReLU",
-    "output_activation": "None",
-    "n_neurons": 64,
-    "n_hidden_layers": 1,
-}
-
-RGB_CONFIG = {
-    "otype": "FullyFusedMLP",
-    "activation": "ReLU",
-    "output_activation": "None",
-    "n_neurons": 64,
-    "n_hidden_layers": 2,
-}
-
 class ReferenceField(torch.nn.Module):
-    def __init__(self, seed: int):
+    def __init__(self, field: InstantNGPField):
         super().__init__()
-        self.position_encoding = tcnn.Encoding(3, HASHGRID_CONFIG, seed=seed, dtype=torch.float16)
-        self.density_mlp = tcnn.Network(self.position_encoding.n_output_dims, 16, DENSITY_CONFIG, seed=seed)
-        self.direction_encoding = tcnn.Encoding(3, DIR_CONFIG, seed=seed, dtype=torch.float16)
-        self.rgb_mlp = tcnn.Network(self.direction_encoding.n_output_dims + 16, 3, RGB_CONFIG, seed=seed)
+        self.position_encoding = tcnn.Encoding(
+            3,
+            field.position_encoding.config,
+            seed=field.seed,
+            dtype=field.dtype,
+        )
+        self.density_mlp = tcnn.Network(
+            self.position_encoding.n_output_dims,
+            1 + field.geo_feat_dims,
+            field.density_mlp.config,
+            seed=field.seed,
+        )
+        self.direction_encoding = tcnn.Encoding(
+            3,
+            field.direction_encoding.config,
+            seed=field.seed,
+            dtype=field.dtype,
+        )
+        self.rgb_mlp = tcnn.Network(
+            self.direction_encoding.n_output_dims + 1 + field.geo_feat_dims,
+            3,
+            field.rgb_mlp.config,
+            seed=field.seed,
+        )
 
     def forward(self, positions: torch.Tensor, directions: torch.Tensor):
         density_features = self.density_mlp(self.position_encoding(positions))
@@ -80,14 +63,6 @@ class ReferenceField(torch.nn.Module):
         geo_feat = density_features[:, 1:]
         rgb = self.rgb_mlp(torch.cat([density_features, self.direction_encoding(directions)], dim=-1))
         return sigma, geo_feat, rgb
-
-def sample_inputs(num_samples: int, device: str):
-    g = torch.Generator(device=device)
-    g.manual_seed(1234)
-    positions = torch.rand(num_samples, 3, device=device, dtype=torch.float32, generator=g)
-    directions = torch.randn(num_samples, 3, device=device, dtype=torch.float32, generator=g)
-    directions = F.normalize(directions, dim=-1)
-    return positions, directions
 
 def measure(fn, positions, directions, warmup_iters, measure_iters):
     for _ in range(warmup_iters):
@@ -102,10 +77,17 @@ def measure(fn, positions, directions, warmup_iters, measure_iters):
 
 def main():
     device = "cuda"
-    positions, directions = sample_inputs(cfg["num_samples"], device=device)
+    positions, directions = sample_real_fox_field_inputs(
+        num_samples=cfg["num_samples"],
+        device=device,
+        scene_name=cfg["scene"],
+        train_steps=cfg["train_steps"],
+        num_views=cfg["num_views"],
+        seed=cfg["seed"],
+    )
 
     ours = InstantNGPField(seed=cfg["seed"]).to(device).eval()
-    ref = ReferenceField(seed=cfg["seed"]).to(device).eval()
+    ref = ReferenceField(ours).to(device).eval()
 
     ref.position_encoding.load_state_dict(ours.position_encoding.encoding.state_dict())
     ref.density_mlp.load_state_dict(ours.density_mlp.network.state_dict())
@@ -126,6 +108,9 @@ def main():
         return torch.mean(torch.abs(a - b)).item()
 
     result = {
+        "scene": cfg["scene"],
+        "train_steps": cfg["train_steps"],
+        "num_views": cfg["num_views"],
         "num_samples": cfg["num_samples"],
         "ours": {
             "baseline_name": "kb-nano-kernel",
@@ -156,6 +141,9 @@ if __name__ == "__main__":
 
 def parse_args() -> argparse.Namespace:
     parser = argparse.ArgumentParser(description="Benchmark InstantNGP kernel-level field")
+    parser.add_argument("--scene", default="fox")
+    parser.add_argument("--train-steps", type=int, default=50)
+    parser.add_argument("--num-views", type=int, default=2)
     parser.add_argument("--num-samples", type=int, default=131072)
     parser.add_argument("--seed", type=int, default=1337)
     parser.add_argument("--warmup-iters", type=int, default=10)
@@ -169,6 +157,9 @@ def main() -> None:
     os.makedirs(args.output_dir, exist_ok=True)
     cfg = {
         "kb_root": str(_KB_ROOT),
+        "scene": args.scene,
+        "train_steps": args.train_steps,
+        "num_views": args.num_views,
         "num_samples": args.num_samples,
         "seed": args.seed,
         "warmup_iters": args.warmup_iters,
