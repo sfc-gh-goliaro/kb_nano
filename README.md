@@ -7,7 +7,7 @@ A standalone, high-performance inference engine supporting **LLMs** (Llama 3.1, 
 - **Llama 3.1** (8B, 70B) with frequency-scaled RoPE
 - **Llama 4** with fused MoE experts
 - **Mixtral-8x7B** with fused Triton MoE grouped-GEMM kernels
-- **DeepSeek V3.2** with MLA (Multi-head Latent Attention), 256-expert MoE via DeepGEMM FP8, DSA (DeepSeek Sparse Attention), and YARN RoPE — **1.28–1.47× faster than vLLM**
+- **DeepSeek V3.2** with MLA (Multi-head Latent Attention), 256-expert MoE via DeepGEMM FP8, DSA (DeepSeek Sparse Attention), and YARN RoPE — currently **0.78–0.90× of vLLM** throughput on 8×H200 (gap due to kernel-launch overhead, GEMM kernel selection, and AllReduce+RMSNorm fusion)
 - **GPT-OSS** (20B, 120B) MXFP4-quantized MoE with native Triton inference, YaRN RoPE, attention sinks, and sliding window
 - **FLUX.1-dev** diffusion transformer (text-to-image) with Flash Attention
 - **SDXL** (Stable Diffusion XL) UNet-based text-to-image with dual CLIP text encoders
@@ -611,18 +611,18 @@ Throughput (1000 sequences per scenario, `temperature=0`, `max_model_len=1536`):
 
 | Model | TP | Scenario | Input/Output | vLLM (tok/s) | Ours (tok/s) | Ratio | Avg Match Tokens |
 |-------|---:|----------|:------------:|-------------:|-------------:|------:|-----------------:|
-| DeepSeek-V3.2 | 8 | prefill-heavy | 1024/512  | 2,160 | 3,106 | **1.44x** | 21.0/512 |
-| DeepSeek-V3.2 | 8 | balanced      |  512/512  | 2,855 | 4,199 | **1.47x** | 17.5/512 |
-| DeepSeek-V3.2 | 8 | decode-heavy  |  512/1024 | 2,964 | 3,787 | **1.28x** | 35.4/1024 |
+| DeepSeek-V3.2 | 8 | prefill-heavy | 1024/512  | 2,805 | 2,190 | 0.78x | 195.9/512 |
+| DeepSeek-V3.2 | 8 | balanced      |  512/512  | 3,426 | 3,092 | 0.90x | 235.7/512 |
+| DeepSeek-V3.2 | 8 | decode-heavy  |  512/1024 | 3,688 | 2,941 | 0.80x | 434.8/1024 |
 
 Latency (128 output tokens, 5 iterations):
 
 | Model | TP | Scenario | BS | vLLM median | Ours median | ms/tok vLLM | ms/tok Ours | Ratio |
 |-------|---:|----------|---:|------------:|------------:|------------:|------------:|------:|
-| DeepSeek-V3.2 | 8 | single-request  |  1 | 2.539s | 4.701s | 19.84 | 36.72 | 0.54x |
-| DeepSeek-V3.2 | 8 | fixed-batch-32  | 32 | 4.596s | 5.703s |  1.12 |  1.39 | 0.81x |
+| DeepSeek-V3.2 | 8 | single-request  |  1 | 2.131s | 2.543s | 16.65 | 19.87 | 0.84x |
+| DeepSeek-V3.2 | 8 | fixed-batch-32  | 32 | 3.874s | 4.285s |  0.95 |  1.05 | 0.90x |
 
-Token match rates are lower than other models due to FP8 quantization differences in the 256-expert MoE routing and DSA sparse attention paths. Both engines produce valid, coherent text; the divergence is from different but equally valid greedy decoding paths.
+kb-nano currently runs 10–22% slower than vLLM on DeepSeek-V3.2 across all scenarios. The remaining gap is dominated by (1) per-step CPU launch overhead — kb-nano issues ~7× more uncaptured CUDA kernels than vLLM and its CUDA-graph launches are larger/slower; (2) GEMM kernel selection — kb-nano falls back to `sm90_fp8_gemm_1d2d_impl` on a few decode shapes where vLLM picks the faster `fp8_gemm_kernel_swapAB`; and (3) AllReduce fusion — vLLM fuses TP AllReduce with the surrounding RMSNorm + FP8 quant via flashinfer's `trtllm_allreduce_fusion`, eliminating ~3 kernel launches per AR site. Token match rates are higher than other MoE models in this README because we removed the prior bit-divergence in MLA/MoE routing; the residual divergence comes from FP8 quantization differences in the 256-expert MoE and DSA sparse-attention paths.
 
 ### FLUX.1-dev (Diffusion)
 
