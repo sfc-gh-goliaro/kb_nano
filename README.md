@@ -133,28 +133,25 @@ git clone https://github.com/NVlabs/Fast-dLLM.git third_party/Fast-dLLM
 # Extra packages only needed for Fast-dLLM comparison runs
 pip install lm_eval==0.4.8 antlr4-python3-runtime==4.11 math_verify gradio
 
-# Compare kb-nano LLaDA against the official HF implementation
-python tests/bench_dllm.py --reference-backends hf
+# Default protocol now follows the official Fast-dLLM evaluation style more closely:
+# real task prompts, variable-length batching with left padding, and token counting
+# after generation/post-processing. The default task is HumanEval 0-shot.
 
-# Compare our prefix-cache decoding against official Fast-dLLM prefix-cache
-python tests/bench_dllm.py \
-    --ours-backend prefix \
-    --reference-backends fastdllm-prefix
+# Default: kb-nano dual-cache + parallel vs official Fast-dLLM dual-cache + parallel
+python tests/bench_dllm.py
 
-# Compare our dual-cache decoding against official Fast-dLLM dual-cache
-python tests/bench_dllm.py \
-    --ours-backend dual \
-    --reference-backends fastdllm-dual
+# Prefix-cache + parallel vs official Fast-dLLM prefix-cache + parallel
+python tests/bench_dllm.py --ours-backend prefix
 
-# Longer rollout
-python tests/bench_dllm.py \
-    --ours-backend dual \
-    --reference-backends fastdllm-dual \
-    --gen-length 128 \
-    --steps 128
+# Vanilla decoding vs official HF LLaDA
+python tests/bench_dllm.py --ours-backend vanilla --reference-backends hf --no-threshold
+
+# Switch to GSM8K 5-shot under the same official-style protocol
+# Use batch size 8 here because batch size 32 can OOM on long 5-shot prompts.
+python tests/bench_dllm.py --task gsm8k --batch-size 8
 
 # kb-nano only
-python tests/bench_dllm.py --ours-backend dual --skip-reference
+python tests/bench_dllm.py --skip-reference
 ```
 
 ### Benchmarking vs vllm-omni (Diffusion)
@@ -569,15 +566,20 @@ Run `tests/bench_vllm.py` to reproduce. Three scenarios per model, 1000 sequence
 
 ### LLaDA / Fast-dLLM (Text Diffusion)
 
-Run `tests/bench_dllm.py` to reproduce. Model: `GSAI-ML/LLaDA-8B-Instruct`. Prompt batch size `2`, `temperature=0`, `remasking=low_confidence`, block length `32`.
+Run `tests/bench_dllm.py` to reproduce. The benchmark now defaults to a Fast-dLLM official-style protocol on real task prompts instead of the previous Alpaca prompt microbenchmark: HumanEval 0-shot by default, left-padded variable-length batches, and throughput counted from post-processed generated tokens.
 
-| Ours Backend | Reference | Gen/Steps | Reference (tok/s) | Ours (tok/s) | Ratio | Token Match | Seq Exact |
-|--------------|-----------|----------:|------------------:|-------------:|------:|------------:|----------:|
-| prefix | official Fast-dLLM prefix-cache | 64/64 | 75.13 | 137.13 | **1.83x** | 1.00 | 1.00 |
-| dual   | official Fast-dLLM dual-cache   | 64/64 | 26.38 | 30.46  | **1.15x** | 1.00 | 1.00 |
-| dual   | official Fast-dLLM dual-cache   | 128/128 | 40.26 | 54.98 | **1.37x** | 1.00 | 1.00 |
+Throughput (`temperature=0`, `gen_length=256`, `steps=8`, `block_length=32`, dual-cache + parallel decoding):
 
-Logit alignment stays close to the reference on all three runs (`cosine=0.9999239`).
+| Model | Task | Few-shot | Samples | BS | Fast-dLLM (tok/s) | Ours (tok/s) | Ratio | Token Match | Logits Cosine |
+|-------|------|---------:|--------:|---:|------------------:|-------------:|------:|------------:|--------------:|
+| LLaDA-8B-Instruct | HumanEval | 0 | 164 | 32 | 1,592 | 1,684 | **1.06x** | 97.10% | 0.99972 |
+| LLaDA-8B-Instruct | GSM8K | 5 | 1,319 | 8 | 584 | 624 | **1.07x** | 99.60% | 0.99994 |
+
+Notes:
+
+- `python tests/bench_dllm.py` runs the default HumanEval 0-shot comparison against official Fast-dLLM dual-cache.
+- `python tests/bench_dllm.py --task gsm8k --batch-size 8` runs the GSM8K 5-shot comparison against official Fast-dLLM dual-cache.
+- GSM8K is documented with `BS=8` because `BS=32` can OOM on long 5-shot prompts under the current full-vocab confidence computation path.
 
 ### Qwen2-VL / Qwen3-VL (VLM)
 

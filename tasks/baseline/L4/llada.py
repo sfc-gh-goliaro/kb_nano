@@ -32,6 +32,7 @@ class LLaDAConfig:
     max_sequence_length: int = 4096
     rms_norm_eps: float = 1e-5
     rope_theta: float = 500000.0
+    rope_full_precision: bool = False
     include_bias: bool = False
     include_qkv_bias: bool = False
     weight_tying: bool = False
@@ -58,6 +59,7 @@ class LLaDAConfig:
             max_sequence_length=hf.max_sequence_length,
             rms_norm_eps=hf.rms_norm_eps,
             rope_theta=hf.rope_theta,
+            rope_full_precision=getattr(hf, "rope_full_precision", False),
             include_bias=hf.include_bias,
             include_qkv_bias=hf.include_qkv_bias,
             weight_tying=hf.weight_tying,
@@ -96,6 +98,32 @@ class LLaDAModel(nn.Module):
                 ),
             }
         )
+
+    def rebuild_rope_cache_fp32(self) -> None:
+        if not self.config.rope_full_precision:
+            return
+        device = self.rotary_emb.cos_sin_cache.device
+        head_dim = self.rotary_emb.head_dim
+        inv_freq = 1.0 / (
+            self.config.rope_theta
+            ** (torch.arange(0, head_dim, 2, device=device, dtype=torch.float32) / head_dim)
+        )
+        positions = torch.arange(
+            self.config.max_sequence_length,
+            device=device,
+            dtype=torch.float32,
+        )
+        freqs = torch.einsum("i,j -> ij", positions, inv_freq)
+        full_positions = torch.cat((freqs, freqs), dim=-1)
+        pos_cos = full_positions.cos()[None, None, :, :]
+        pos_sin = full_positions.sin()[None, None, :, :]
+        half = head_dim // 2
+        self.rotary_emb.cos_sin_cache = torch.cat(
+            (pos_cos[0, 0, :, :half], pos_sin[0, 0, :, :half]),
+            dim=-1,
+        )
+        self.rotary_emb.llada_pos_cos_cache = pos_cos
+        self.rotary_emb.llada_pos_sin_cache = pos_sin
 
     @property
     def device(self) -> torch.device:

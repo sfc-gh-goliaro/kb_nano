@@ -282,7 +282,6 @@ def masked_diffusion_generate_with_dual_cache(
                 use_cache=True,
                 replace_position=replace_position,
             )
-            past_key_values = output.past_key_values
             mask_index = x[:, current_block_start:current_block_end] == mask_id
             quota = None if threshold is not None else num_transfer_tokens[:, step_idx]
             x0, transfer_index = get_transfer_index(

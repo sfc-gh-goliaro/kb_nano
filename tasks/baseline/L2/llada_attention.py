@@ -18,6 +18,7 @@ class LLaDAAttention(nn.Module):
         head_dim: int,
         rotary_emb: nn.Module | None = None,
         bias: bool = False,
+        rope_full_precision: bool = False,
     ):
         super().__init__()
         self.hidden_size = hidden_size
@@ -25,6 +26,7 @@ class LLaDAAttention(nn.Module):
         self.num_key_value_heads = num_key_value_heads
         self.head_dim = head_dim
         self.rotary_emb = rotary_emb
+        self.rope_full_precision = rope_full_precision
 
         self.q_proj = ReplicatedLinear(hidden_size, num_attention_heads * head_dim, bias=bias)
         self.k_proj = ReplicatedLinear(hidden_size, num_key_value_heads * head_dim, bias=bias)
@@ -32,22 +34,35 @@ class LLaDAAttention(nn.Module):
         self.attn_out = ReplicatedLinear(num_attention_heads * head_dim, hidden_size, bias=bias)
 
     def _rotate_half(self, x: torch.Tensor) -> torch.Tensor:
-        x1, x2 = x.chunk(2, dim=-1)
+        batch_size, num_heads, seq_len, head_dim = x.size()
+        x = x.view(batch_size, num_heads, seq_len, 2, head_dim // 2)
+        x1, x2 = x.unbind(dim=-2)
         return torch.cat((-x2, x1), dim=-1)
 
     def _apply_rope_to_states(self, x: torch.Tensor, positions: torch.Tensor) -> torch.Tensor:
         if self.rotary_emb is None:
             return x
+
+        if self.rope_full_precision and hasattr(self.rotary_emb, "llada_pos_cos_cache"):
+            index = positions[0] if positions.dim() == 2 else positions
+            pos_cos = self.rotary_emb.llada_pos_cos_cache.index_select(2, index)
+            pos_sin = self.rotary_emb.llada_pos_sin_cache.index_select(2, index)
+            x_work = x.float()
+            return ((x_work * pos_cos) + (self._rotate_half(x_work) * pos_sin)).to(x.dtype)
+
+        compute_dtype = x.dtype
         cache = self.rotary_emb.cos_sin_cache
-        if cache.dtype != x.dtype:
-            cache = cache.to(x.dtype)
+        if cache.dtype != compute_dtype:
+            cache = cache.to(compute_dtype)
         flat = positions.reshape(-1)
         rope = cache.index_select(0, flat).view(*positions.shape, -1)
         half = self.head_dim // 2
-        cos = rope[..., :half].unsqueeze(1)
-        sin = rope[..., half:].unsqueeze(1)
-        x1, x2 = x[..., :half], x[..., half:]
-        return torch.cat((x1 * cos - x2 * sin, x2 * cos + x1 * sin), dim=-1)
+        cos_half = rope[..., :half]
+        sin_half = rope[..., half:]
+        cos = torch.cat((cos_half, cos_half), dim=-1).unsqueeze(1)
+        sin = torch.cat((sin_half, sin_half), dim=-1).unsqueeze(1)
+        x_work = x.to(compute_dtype)
+        return ((x_work * cos) + (self._rotate_half(x_work) * sin)).to(x.dtype)
 
     def _rotary_positions(
         self,

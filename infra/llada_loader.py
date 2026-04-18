@@ -66,6 +66,7 @@ def load_llada_model(
     config = LLaDAConfig.from_pretrained(model_name)
     config.dtype = dtype
     model = LLaDAModelLM(config).to(device=device, dtype=dtype)
+    model.model.rebuild_rope_cache_fp32()
     model_path = download_model(model_name)
     load_weights(model, model_path)
     model.eval()

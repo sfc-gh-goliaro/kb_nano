@@ -21,6 +21,7 @@ class LLaDABlock(nn.Module):
             head_dim=config.head_dim,
             rotary_emb=rotary_emb,
             bias=config.include_bias or config.include_qkv_bias,
+            rope_full_precision=config.rope_full_precision,
         )
         self.mlp = LLaDAMLP(
             hidden_size=config.d_model,
