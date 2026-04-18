@@ -13,6 +13,7 @@ Usage:
     python tests/bench_vjepa2.py --skip-latency
     python tests/bench_vjepa2.py --task encoder
     python tests/bench_vjepa2.py --task classification --model facebook/vjepa2-vitl-fpc16-256-ssv2
+    python tests/bench_vjepa2.py --dataset nateraw/kinetics-mini --dataset-split validation
 """
 
 from __future__ import annotations
@@ -93,6 +94,7 @@ import json
 import os
 import sys
 import time
+import warnings
 
 import torch
 from tqdm import tqdm
@@ -182,7 +184,7 @@ def _forward(task, model, videos, context_mask, target_mask):
         }
 
 
-def _make_videos(total_videos, config, dtype, device, seed):
+def _make_synthetic_videos(total_videos, config, dtype, device, seed):
     gen = torch.Generator(device=device).manual_seed(seed)
     return torch.randn(
         (total_videos, config.frames_per_clip, 3, config.crop_size, config.crop_size),
@@ -190,6 +192,83 @@ def _make_videos(total_videos, config, dtype, device, seed):
         device=device,
         dtype=dtype,
     )
+
+
+def _sample_frame_indices(num_frames, frames_per_clip):
+    if num_frames <= 0:
+        raise ValueError("decoded video has zero frames")
+    if num_frames == 1:
+        return torch.zeros(frames_per_clip, dtype=torch.long)
+    return torch.linspace(0, num_frames - 1, steps=frames_per_clip).round().long()
+
+
+def _load_video_paths(dataset_name, dataset_split, num_needed, seed):
+    from datasets import Video, load_dataset
+
+    print(
+        f"Loading {num_needed} videos from {dataset_name} ({dataset_split})...",
+        file=sys.stderr, flush=True,
+    )
+    dataset = load_dataset(dataset_name, split=dataset_split).cast_column("video", Video(decode=False))
+    dataset = dataset.shuffle(seed=seed)
+
+    paths = []
+    for sample in dataset:
+        video = sample.get("video")
+        if isinstance(video, dict) and video.get("path"):
+            paths.append(video["path"])
+        if len(paths) >= num_needed:
+            break
+
+    if not paths:
+        raise RuntimeError(
+            f"No video paths found in dataset {dataset_name} ({dataset_split})."
+        )
+
+    if len(paths) < num_needed:
+        repeats = (num_needed + len(paths) - 1) // len(paths)
+        paths = (paths * repeats)[:num_needed]
+
+    print(f"  Using {len(paths)} videos", file=sys.stderr, flush=True)
+    return paths
+
+
+def _preprocess_dataset_videos(cfg, config, dtype, device, total_videos):
+    try:
+        with warnings.catch_warnings():
+            warnings.filterwarnings(
+                "ignore",
+                message="The video decoding and encoding capabilities of torchvision are deprecated.*",
+            )
+            from torchvision.io import read_video
+    except Exception as exc:
+        raise RuntimeError(
+            "Real video dataset benchmarking requires torchvision video decoding support. "
+            "Install PyAV, e.g. `python -m pip install av`."
+        ) from exc
+
+    from transformers import AutoVideoProcessor
+
+    dataset_name = cfg["dataset_name"]
+    dataset_split = cfg["dataset_split"]
+    video_paths = _load_video_paths(dataset_name, dataset_split, total_videos, cfg["seed"])
+    processor = AutoVideoProcessor.from_pretrained(cfg["model"])
+
+    clips = []
+    for path in video_paths:
+        video, _, _ = read_video(path, pts_unit="sec")
+        indices = _sample_frame_indices(video.shape[0], config.frames_per_clip)
+        clip = video.index_select(0, indices).numpy()
+        clips.append(clip)
+
+    pixel_values = processor(clips, return_tensors="pt")["pixel_values_videos"]
+    return pixel_values.to(device=device, dtype=dtype)
+
+
+def _make_videos(cfg, total_videos, config, dtype, device, seed):
+    if cfg["input_source"] == "synthetic":
+        return _make_synthetic_videos(total_videos, config, dtype, device, seed)
+    return _preprocess_dataset_videos(cfg, config, dtype, device, total_videos)
 
 
 def main():
@@ -210,7 +289,7 @@ def main():
     if mode == "throughput":
         total_videos = cfg["num_videos"]
         batch_size = cfg["batch_size"]
-        videos = _make_videos(total_videos, model_config, dtype, device, cfg["seed"])
+        videos = _make_videos(cfg, total_videos, model_config, dtype, device, cfg["seed"])
         context_mask, target_mask = _build_masks(
             batch_size=batch_size,
             num_patches=num_patches,
@@ -265,7 +344,7 @@ def main():
         batch_sizes = cfg["latency_batch_sizes"]
         results = []
         for batch_size in batch_sizes:
-            videos = _make_videos(batch_size, model_config, dtype, device, cfg["seed"] + batch_size)
+            videos = _make_videos(cfg, batch_size, model_config, dtype, device, cfg["seed"] + batch_size)
             context_mask, target_mask = _build_masks(
                 batch_size=batch_size,
                 num_patches=num_patches,
@@ -298,7 +377,7 @@ def main():
 
     if mode == "alignment":
         total_videos = cfg["alignment_videos"]
-        videos = _make_videos(total_videos, model_config, dtype, device, cfg["seed"])
+        videos = _make_videos(cfg, total_videos, model_config, dtype, device, cfg["seed"])
         context_mask, target_mask = _build_masks(
             batch_size=total_videos,
             num_patches=num_patches,
@@ -379,6 +458,9 @@ def main() -> None:
     parser.add_argument("--task", choices=["predictor", "encoder", "classification"], default="predictor")
     parser.add_argument("--device", default="cuda" if torch.cuda.is_available() else "cpu")
     parser.add_argument("--dtype", choices=["fp32", "fp16", "bf16"], default=None)
+    parser.add_argument("--input-source", choices=["dataset", "synthetic"], default="dataset")
+    parser.add_argument("--dataset", default="nateraw/kinetics-mini")
+    parser.add_argument("--dataset-split", default="validation")
     parser.add_argument("--num-videos", type=int, default=8)
     parser.add_argument("--batch-size", type=int, default=2)
     parser.add_argument("--alignment-videos", type=int, default=2)
@@ -408,6 +490,9 @@ def main() -> None:
         "task": args.task,
         "device": args.device,
         "dtype": args.dtype,
+        "input_source": args.input_source,
+        "dataset_name": args.dataset,
+        "dataset_split": args.dataset_split,
         "seed": args.seed,
         "package_root": str(_PACKAGE_DIR),
         "context_ratio": args.context_ratio,
@@ -420,6 +505,9 @@ def main() -> None:
         "device": args.device,
         "dtype": args.dtype,
         "gpu": _detect_gpu_name(),
+        "input_source": args.input_source,
+        "dataset_name": args.dataset,
+        "dataset_split": args.dataset_split,
         "throughput": {},
         "latency": {},
         "alignment": {},

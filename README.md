@@ -231,6 +231,12 @@ python tests/test_sam.py --skip-latency
 
 ### Benchmarking vs transformers (V-JEPA 2)
 
+Default input source is the real `nateraw/kinetics-mini` `validation` split. Install `av` first for video decoding:
+
+```bash
+python -m pip install av
+```
+
 ```bash
 # V-JEPA 2 predictor: throughput + latency + alignment benchmark vs transformers
 python tests/bench_vjepa2.py --model facebook/vjepa2-vitl-fpc64-256
@@ -243,6 +249,9 @@ python tests/bench_vjepa2.py --model facebook/vjepa2-vitl-fpc64-256 --task encod
 
 # Classification checkpoint benchmark
 python tests/bench_vjepa2.py --model facebook/vjepa2-vitl-fpc16-256-ssv2 --task classification
+
+# Old synthetic random-video path
+python tests/bench_vjepa2.py --model facebook/vjepa2-vitl-fpc64-256 --input-source synthetic
 
 # Skip latency phase
 python tests/bench_vjepa2.py --model facebook/vjepa2-vitl-fpc64-256 --skip-latency
@@ -445,6 +454,7 @@ Each run is tagged with a `tier` (`agent`, `kernel`, `eval`, or `e2e`) indicatin
 - PyTorch 2.x with CUDA
 - Triton
 - Flash Attention (`flash-attn`)
+- PyAV (`av`) — required for real-video V-JEPA 2 benchmark decoding
 - SGLang kernel library (`sgl-kernel`) — fused RMSNorm, SiLU, RoPE, MoE ops
 - FlashInfer (`flashinfer-python`) — TRTLLM-gen attention kernels on Blackwell+
 - Hugging Face (`transformers`, `huggingface_hub`, `safetensors`)
@@ -682,7 +692,9 @@ Correctness is measured in decoded pixel space (both engines produce PIL video f
 
 ### V-JEPA 2 (Predictive Video)
 
-Run `tests/bench_vjepa2.py --model facebook/vjepa2-vitl-fpc64-256` to reproduce the default predictor benchmark. Reference engine: `transformers` 4.57.6. The benchmark uses deterministic synthetic videos generated with `torch.randn`, not downloaded dataset videos. Predictor and encoder use the V-JEPA 2 pretraining geometry (64 frames, 256x256), bf16 precision, `context_ratio=0.75`, and `target_ratio=0.25`. Classification uses `facebook/vjepa2-vitl-fpc16-256-ssv2`. The classification rows below use larger workloads than the default smoke because `8 videos / batch 2` was too noisy.
+Run `python -m pip install av` once, then `tests/bench_vjepa2.py --model facebook/vjepa2-vitl-fpc64-256` to reproduce the default predictor benchmark. Reference engine: `transformers` 4.57.6. By default all three tasks use real videos from `nateraw/kinetics-mini` (`validation`), decoded via PyAV/torchvision and preprocessed with `VJEPA2VideoProcessor`. Predictor and encoder use the V-JEPA 2 pretraining geometry (64 frames, 256x256), bf16 precision, `context_ratio=0.75`, and `target_ratio=0.25`. Classification uses `facebook/vjepa2-vitl-fpc16-256-ssv2` on the same real-video dataset for pipeline parity, not task-accuracy measurement. Use `--input-source synthetic` to revert to the old random-video path.
+
+The results below use near-maximal non-repeating real-data workloads from the `kinetics-mini` validation split: `40` videos for predictor/encoder and `48` videos for classification.
 
 **Hardware: NVIDIA H200**
 
@@ -690,28 +702,31 @@ Throughput (videos/sec):
 
 | Model | Task | Videos | Batch | transformers | Ours | Ratio |
 |-------|------|-------:|------:|-------------:|-----:|------:|
-| facebook/vjepa2-vitl-fpc64-256 | predictor | 8 | 2 | 13.33 | 14.15 | **1.06x** |
-| facebook/vjepa2-vitl-fpc64-256 | encoder | 8 | 2 | 17.11 | 17.32 | **1.01x** |
-| facebook/vjepa2-vitl-fpc16-256-ssv2 | classification | 64 | 4 | 112.61 | 108.78 | 0.97x |
-| facebook/vjepa2-vitl-fpc16-256-ssv2 | classification | 128 | 8 | 129.58 | 127.14 | 0.98x |
+| facebook/vjepa2-vitl-fpc64-256 | predictor | 40 | 2 | 13.79 | 16.23 | **1.18x** |
+| facebook/vjepa2-vitl-fpc64-256 | encoder | 40 | 2 | 17.37 | 20.08 | **1.16x** |
+| facebook/vjepa2-vitl-fpc16-256-ssv2 | classification | 48 | 4 | 114.39 | 108.36 | 0.95x |
 
-Latency (median of 3 iterations, predictor path):
+Latency (median of 10 iterations):
 
-| Batch | transformers | Ours | Ratio |
-|------:|-------------:|-----:|------:|
-| 1 | 0.071s | 0.077s | 0.92x |
-| 2 | 0.126s | 0.147s | 0.86x |
+| Task | Batch | transformers | Ours | Ratio |
+|------|------:|-------------:|-----:|------:|
+| predictor | 1 | 0.0688s | 0.0715s | 0.96x |
+| predictor | 2 | 0.1224s | 0.1216s | **1.01x** |
+| encoder | 1 | 0.0516s | 0.0516s | **1.00x** |
+| encoder | 2 | 0.1115s | 0.0925s | **1.20x** |
+| classification | 1 | 0.0282s | 0.0331s | 0.85x |
+| classification | 4 | 0.0352s | 0.0361s | 0.97x |
 
 Alignment:
 
-| Output | Cosine | Mean Abs Diff |
-|--------|-------:|--------------:|
-| last_hidden_state | 1.000000 | 7.89e-02 |
-| masked_hidden_state | 1.000000 | 7.87e-02 |
-| predictor_hidden_state | 1.000000 | 5.96e-03 |
-| target_hidden_state | 0.999261 | 7.95e-02 |
-
-Classification alignment on `facebook/vjepa2-vitl-fpc16-256-ssv2` also remains stable after the short-sequence attention change: logits cosine `0.999853` and mean absolute difference `1.80e-02` over 16 synthetic videos.
+| Task | Output | Cosine | Mean Abs Diff |
+|------|--------|-------:|--------------:|
+| predictor | last_hidden_state | 1.000000 | 1.53e-01 |
+| predictor | masked_hidden_state | 1.000000 | 1.53e-01 |
+| predictor | predictor_hidden_state | 1.000000 | 1.03e-02 |
+| predictor | target_hidden_state | 0.996423 | 1.55e-01 |
+| encoder | last_hidden_state | 1.000000 | 1.53e-01 |
+| classification | logits | 0.999562 | 4.34e-02 |
 
 ### CosyVoice3 (TTS)
 
