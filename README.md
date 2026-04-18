@@ -258,14 +258,19 @@ python tests/bench_embedding.py --model colbert-ir/colbertv2.0 --output-dir test
 Install the optional benchmark baseline packages listed in [Dependencies](#dependencies) to run reference comparisons.
 
 ```bash
-# DLRMv2: throughput + alignment benchmark vs TorchRec DLRM
+# DLRMv2: real-data throughput + alignment benchmark vs TorchRec DLRM
+# Uses Hugging Face scikit-learn/adult-census-income (cached under tests/data/recsys by default)
 python tests/bench_recsys.py --model dlrmv2
 
-# LightGCN: throughput + alignment benchmark vs torch_geometric LightGCN
+# LightGCN: real-data throughput + alignment benchmark vs torch_geometric LightGCN
+# Uses official GroupLens MovieLens 1M ratings with implicit positives defined by rating >= 4
 python tests/bench_recsys.py --model lightgcn
 
 # Run both recsys baselines in one invocation
 python tests/bench_recsys.py --model all
+
+# Override dataset cache root
+python tests/bench_recsys.py --model all --dataset-root tests/data/recsys
 
 # Skip throughput or alignment
 python tests/bench_recsys.py --model lightgcn --skip-throughput
@@ -275,6 +280,8 @@ python tests/bench_recsys.py --model dlrmv2 --skip-alignment
 python tests/bench_recsys.py --model dlrmv2 --output-dir tests/results/H200/dlrmv2_recsys
 python tests/bench_recsys.py --model lightgcn --output-dir tests/results/H200/lightgcn_recsys
 ```
+
+Default timing for the recsys benchmark is `100` warmup iterations and `11000` measured iterations.
 
 ### Benchmarking detection models
 
@@ -500,7 +507,7 @@ pip install FlagEmbedding==1.3.5 colbert-ai==0.2.22 datasets==4.8.4 \
 RecSys / graph recommendation:
 
 ```bash
-pip install torchrec==1.4.0 fbgemm-gpu==1.5.0 torch-geometric==2.7.0
+pip install datasets==4.8.4 torchrec==1.4.0 fbgemm-gpu==1.5.0 torch-geometric==2.7.0
 ```
 
 `torch-sparse` is optional and is not required for the current `LightGCN` benchmark path.
@@ -723,44 +730,54 @@ Alignment:
 
 ### DLRMv2 (RecSys)
 
-Run `tests/bench_recsys.py --model dlrmv2` to reproduce. Reference baseline: `torchrec.models.dlrm.DLRM`.
+Default real benchmark: `python tests/bench_recsys.py --model dlrmv2`
+
+- Dataset: `scikit-learn/adult-census-income` train split
+- Reference baseline: `torchrec.models.dlrm.DLRM`
+- Default workload: batch size `16384`
+- Default timing: `100` warmup iterations + `11000` measured iterations
 
 **Hardware: NVIDIA H200**
 
-Throughput (default config: batch size 1024, bag size 4):
+Throughput (real dataset default: Adult train, batch size 16384, bag size 1):
 
 | Model | TorchRec (samples/s) | Ours (samples/s) | Ratio |
 |-------|----------------------:|-----------------:|------:|
-| DLRMv2 | 1,721,374 | 3,422,866 | **1.99x** |
+| DLRMv2 | 38,148,735 | 40,077,663 | **1.05x** |
 
-Alignment:
+Alignment (real dataset default):
 
 | Output | Avg CosSim | Avg Mean Abs Diff | Notes |
 |--------|-----------:|------------------:|:------|
-| Dense embedding | 0.99999988 | 0.00e+00 | PASS |
+| Dense embedding | 1.00000000 | 0.00e+00 | PASS |
 | Sparse embeddings | 1.00000000 | 0.00e+00 | PASS |
-| Interaction | 0.99999988 | 0.00e+00 | PASS |
+| Interaction | 1.00000000 | 0.00e+00 | PASS |
 | Logits | 1.00000000 | 0.00e+00 | PASS |
 
 ### LightGCN (Graph Recommendation)
 
-Run `tests/bench_recsys.py --model lightgcn` to reproduce. Reference baseline: `torch_geometric.nn.models.LightGCN`.
+Default real benchmark: `python tests/bench_recsys.py --model lightgcn`
+
+- Dataset: MovieLens 1M ratings, treating `rating >= 4` as positive implicit feedback
+- Reference baseline: `torch_geometric.nn.models.LightGCN`
+- Default workload: full graph with `575281` edges, `131072` scored pairs per iteration
+- Default timing: `100` warmup iterations + `11000` measured iterations
 
 **Hardware: NVIDIA H200**
 
-Throughput (default config: 4096 users, 8192 items, 32768 edges, 8192 query pairs):
+Throughput (real dataset default: MovieLens 1M, 575281 edges, 131072 query pairs):
 
 | Model | torch_geometric (pairs/s) | Ours (pairs/s) | Ratio |
 |-------|---------------------------:|---------------:|------:|
-| LightGCN | 48,544,792 | 59,398,305 | **1.22x** |
+| LightGCN | 258,886,800 | 264,966,359 | **1.02x** |
 
-Alignment:
+Alignment (real dataset default):
 
 | Output | Avg CosSim | Avg Mean Abs Diff | Notes |
 |--------|-----------:|------------------:|:------|
-| User embeddings | 0.99999988 | 0.00e+00 | PASS |
-| Item embeddings | 1.00000000 | 0.00e+00 | PASS |
-| Scores | 0.99999988 | 0.00e+00 | PASS |
+| User embeddings | 1.00000000 | 6.14e-10 | PASS |
+| Item embeddings | 1.00000000 | 8.97e-10 | PASS |
+| Scores | 1.00000000 | 2.40e-08 | PASS |
 
 ### FLUX.1-dev (Diffusion)
 

@@ -1,15 +1,18 @@
 #!/usr/bin/env python3
 """Alignment and throughput benchmark for recsys baselines.
 
+Real-data defaults:
+- `dlrmv2`: Hugging Face `scikit-learn/adult-census-income`
+- `lightgcn`: official GroupLens MovieLens 1M ratings
+
 Current reference backends:
 - `lightgcn`: `torch_geometric.nn.models.LightGCN`
 - `dlrmv2`: `torchrec.models.dlrm.DLRM`
 
 Usage:
-    python tests/bench_recsys.py --model lightgcn
     python tests/bench_recsys.py --model dlrmv2
+    python tests/bench_recsys.py --model lightgcn
     python tests/bench_recsys.py --model all
-    python tests/bench_recsys.py --model lightgcn --skip-throughput
 """
 
 from __future__ import annotations
@@ -18,16 +21,40 @@ import argparse
 import importlib.util
 import json
 import math
-import os
 import subprocess
 import sys
 import time
+import urllib.request
+import zipfile
 from pathlib import Path
 from typing import Any
 
 import torch
-import torch.nn as nn
 import torch.nn.functional as F
+
+
+ADULT_DATASET_ID = "scikit-learn/adult-census-income"
+MOVIELENS_1M_URL = "https://files.grouplens.org/datasets/movielens/ml-1m.zip"
+DEFAULT_DATASET_ROOT = Path("tests") / "data" / "recsys"
+
+ADULT_NUMERIC_COLUMNS = [
+    "age",
+    "fnlwgt",
+    "education.num",
+    "capital.gain",
+    "capital.loss",
+    "hours.per.week",
+]
+ADULT_CATEGORICAL_COLUMNS = [
+    "workclass",
+    "education",
+    "marital.status",
+    "occupation",
+    "relationship",
+    "race",
+    "sex",
+    "native.country",
+]
 
 
 def _bootstrap_local_package() -> None:
@@ -50,10 +77,17 @@ from kb_nano.tasks.baseline.L4.lightgcn import LightGCN, LightGCNConfig
 
 
 def _load_torchrec_dlrm():
-    from torchrec.models.dlrm import DLRM as TorchRecDLRM
-    from torchrec.modules.embedding_configs import EmbeddingBagConfig, PoolingType
-    from torchrec.modules.embedding_modules import EmbeddingBagCollection as TorchRecEmbeddingBagCollection
-    from torchrec.sparse.jagged_tensor import KeyedJaggedTensor
+    try:
+        from torchrec.models.dlrm import DLRM as TorchRecDLRM
+        from torchrec.modules.embedding_configs import EmbeddingBagConfig, PoolingType
+        from torchrec.modules.embedding_modules import EmbeddingBagCollection as TorchRecEmbeddingBagCollection
+        from torchrec.sparse.jagged_tensor import KeyedJaggedTensor
+    except ModuleNotFoundError as exc:
+        raise RuntimeError(
+            "TorchRec reference benchmark requires optional dependency 'torchrec' "
+            "(and its matching fbgemm_gpu build). Install the recsys benchmark "
+            "dependencies from README before running alignment/throughput.",
+        ) from exc
 
     return TorchRecDLRM, EmbeddingBagConfig, PoolingType, TorchRecEmbeddingBagCollection, KeyedJaggedTensor
 
@@ -212,37 +246,147 @@ def _copy_dlrm_weights_from_torchrec(ref, ours: DLRMv2) -> None:
         ours.top_mlp.layers[-1].bias.copy_(ref.over_arch.model[1].bias)
 
 
-def _generate_dlrm_inputs(
-    config: DLRMv2Config,
+def _load_adult_train_split(dataset_root: Path):
+    try:
+        from datasets import load_dataset
+    except ModuleNotFoundError as exc:
+        raise RuntimeError(
+            "Real DLRMv2 benchmark requires optional dependency 'datasets'. "
+            "Install it with `pip install datasets`.",
+        ) from exc
+
+    cache_dir = dataset_root / "adult_census_hf_cache"
+    cache_dir.mkdir(parents=True, exist_ok=True)
+    return load_dataset(ADULT_DATASET_ID, split="train", cache_dir=str(cache_dir))
+
+
+def _normalize_adult_category(value: Any) -> str:
+    if value is None:
+        return "<missing>"
+    normalized = str(value).strip()
+    return normalized if normalized else "<missing>"
+
+
+def _transform_adult_dense_value(value: Any) -> float:
+    if value is None:
+        return 0.0
+    return math.log1p(max(float(value), 0.0))
+
+
+def _build_adult_categorical_mappings(train_split) -> dict[str, dict[str, int]]:
+    mappings: dict[str, dict[str, int]] = {}
+    for column in ADULT_CATEGORICAL_COLUMNS:
+        mapping = {"<unk>": 0}
+        values = sorted({_normalize_adult_category(value) for value in train_split[column]})
+        for index, value in enumerate(values, start=1):
+            mapping[value] = index
+        mappings[column] = mapping
+    return mappings
+
+
+def _adult_rows_to_tensors(
+    rows: list[dict[str, Any]],
     *,
-    batch_size: int,
-    bag_size: int,
+    mappings: dict[str, dict[str, int]],
     device: torch.device,
 ) -> tuple[torch.Tensor, list[torch.Tensor]]:
-    dense_features = torch.randn(batch_size, config.num_dense_features, device=device)
+    dense_rows = []
+    sparse_columns = [[] for _ in ADULT_CATEGORICAL_COLUMNS]
+
+    for row in rows:
+        dense_rows.append([
+            _transform_adult_dense_value(row[column])
+            for column in ADULT_NUMERIC_COLUMNS
+        ])
+        for column_index, column in enumerate(ADULT_CATEGORICAL_COLUMNS):
+            token = _normalize_adult_category(row[column])
+            sparse_columns[column_index].append(mappings[column].get(token, 0))
+
+    dense_features = torch.tensor(dense_rows, dtype=torch.float32, device=device)
     sparse_indices = [
-        torch.randint(0, table_size, (batch_size, bag_size), device=device, dtype=torch.long)
-        for table_size in config.num_embeddings_per_feature
+        torch.tensor(values, dtype=torch.long, device=device).unsqueeze(1)
+        for values in sparse_columns
     ]
     return dense_features, sparse_indices
+
+
+def _take_dataset_rows(dataset, *, start: int, count: int) -> list[dict[str, Any]]:
+    dataset_size = len(dataset)
+    if dataset_size == 0:
+        raise ValueError("dataset is empty")
+    return [
+        dataset[(start + index) % dataset_size]
+        for index in range(count)
+    ]
+
+
+def _prepare_dlrm_inputs(
+    args: argparse.Namespace,
+    device: torch.device,
+) -> dict[str, Any]:
+    if args.dlrm_dataset != "adult":
+        raise ValueError(f"unsupported real DLRMv2 dataset: {args.dlrm_dataset}")
+
+    train_split = _load_adult_train_split(args.dataset_root)
+    shuffled = train_split.shuffle(seed=args.seed)
+    mappings = _build_adult_categorical_mappings(train_split)
+    config = DLRMv2Config(
+        num_dense_features=len(ADULT_NUMERIC_COLUMNS),
+        num_embeddings_per_feature=[
+            len(mappings[column])
+            for column in ADULT_CATEGORICAL_COLUMNS
+        ],
+        embedding_dim=64,
+        bottom_mlp_dims=[128, 64],
+        top_mlp_dims=[128, 64, 1],
+        embedding_bag_mode="sum",
+    )
+
+    alignment_rows = _take_dataset_rows(
+        shuffled,
+        start=0,
+        count=args.dlrm_batch_size,
+    )
+    throughput_rows = _take_dataset_rows(
+        shuffled,
+        start=args.dlrm_batch_size,
+        count=args.dlrm_batch_size,
+    )
+
+    return {
+        "config": config,
+        "alignment_batch": _adult_rows_to_tensors(
+            alignment_rows,
+            mappings=mappings,
+            device=device,
+        ),
+        "throughput_batch": _adult_rows_to_tensors(
+            throughput_rows,
+            mappings=mappings,
+            device=device,
+        ),
+        "metadata": {
+            "dataset": ADULT_DATASET_ID,
+            "split": "train",
+            "rows": len(train_split),
+            "batch_size": args.dlrm_batch_size,
+            "bag_size": 1,
+            "numeric_features": len(ADULT_NUMERIC_COLUMNS),
+            "categorical_features": len(ADULT_CATEGORICAL_COLUMNS),
+        },
+    }
 
 
 def _run_dlrm_alignment(
     *,
     device: torch.device,
-    batch_size: int,
-    bag_size: int,
+    prepared_inputs: dict[str, Any],
 ) -> dict[str, Any]:
-    config = DLRMv2Config()
+    config: DLRMv2Config = prepared_inputs["config"]
     ref = _build_torchrec_dlrm_reference(config, device)
     ours = DLRMv2(config).to(device).eval()
     _copy_dlrm_weights_from_torchrec(ref, ours)
-    dense_features, sparse_indices = _generate_dlrm_inputs(
-        config,
-        batch_size=batch_size,
-        bag_size=bag_size,
-        device=device,
-    )
+    dense_features, sparse_indices = prepared_inputs["alignment_batch"]
     kjt = _build_torchrec_kjt(sparse_indices)
 
     with torch.inference_mode():
@@ -267,22 +411,17 @@ def _run_dlrm_alignment(
 def _run_dlrm_throughput(
     *,
     device: torch.device,
-    batch_size: int,
-    bag_size: int,
+    prepared_inputs: dict[str, Any],
     warmup_iters: int,
     measure_iters: int,
 ) -> dict[str, Any]:
-    config = DLRMv2Config()
+    config: DLRMv2Config = prepared_inputs["config"]
     ref = _build_torchrec_dlrm_reference(config, device)
     ours = DLRMv2(config).to(device).eval()
     _copy_dlrm_weights_from_torchrec(ref, ours)
-    dense_features, sparse_indices = _generate_dlrm_inputs(
-        config,
-        batch_size=batch_size,
-        bag_size=bag_size,
-        device=device,
-    )
+    dense_features, sparse_indices = prepared_inputs["throughput_batch"]
     kjt = _build_torchrec_kjt(sparse_indices)
+    batch_size = dense_features.shape[0]
 
     with torch.inference_mode():
         ours_metrics = _benchmark_forward(
@@ -313,7 +452,14 @@ def _run_dlrm_throughput(
 
 
 def _load_pyg_lightgcn():
-    from torch_geometric.nn.models import LightGCN as PyGLightGCN
+    try:
+        from torch_geometric.nn.models import LightGCN as PyGLightGCN
+    except ModuleNotFoundError as exc:
+        raise RuntimeError(
+            "LightGCN reference benchmark requires optional dependency "
+            "'torch-geometric'. Install the recsys benchmark dependencies "
+            "from README before running alignment/throughput.",
+        ) from exc
     return PyGLightGCN
 
 
@@ -324,44 +470,164 @@ def _copy_lightgcn_weights(ours: LightGCN, ref) -> None:
         ref.embedding.weight[num_users:].copy_(ours.item_embedding.emb.weight)
 
 
-def _generate_lightgcn_inputs(
-    config: LightGCNConfig,
+def _download_file(url: str, destination: Path) -> None:
+    if destination.exists():
+        return
+    destination.parent.mkdir(parents=True, exist_ok=True)
+    tmp_path = destination.with_suffix(destination.suffix + ".tmp")
+    urllib.request.urlretrieve(url, tmp_path)
+    tmp_path.replace(destination)
+
+
+def _load_movielens_1m(
+    dataset_root: Path,
     *,
-    num_edges: int,
+    min_rating: float,
+) -> dict[str, Any]:
+    work_dir = dataset_root / "movielens_1m"
+    raw_zip = work_dir / "ml-1m.zip"
+    extracted_root = work_dir / "raw"
+    ratings_path = extracted_root / "ml-1m" / "ratings.dat"
+    cache_key = str(min_rating).replace(".", "_")
+    processed_path = work_dir / f"processed_min_rating_{cache_key}.pt"
+
+    if processed_path.exists():
+        return torch.load(processed_path, map_location="cpu")
+
+    _download_file(MOVIELENS_1M_URL, raw_zip)
+    if not ratings_path.exists():
+        extracted_root.mkdir(parents=True, exist_ok=True)
+        with zipfile.ZipFile(raw_zip) as archive:
+            archive.extractall(extracted_root)
+
+    edge_users = []
+    edge_items = []
+    total_rows = 0
+    with ratings_path.open("r", encoding="latin-1") as handle:
+        for line in handle:
+            total_rows += 1
+            user_id_str, item_id_str, rating_str, _timestamp = line.rstrip().split("::")
+            if float(rating_str) < min_rating:
+                continue
+            edge_users.append(int(user_id_str) - 1)
+            edge_items.append(int(item_id_str) - 1)
+
+    if not edge_users:
+        raise ValueError(f"MovieLens 1M produced no edges at min_rating={min_rating}")
+
+    payload = {
+        "dataset": "MovieLens 1M",
+        "source_url": MOVIELENS_1M_URL,
+        "num_users": max(edge_users) + 1,
+        "num_items": max(edge_items) + 1,
+        "num_edges": len(edge_users),
+        "num_ratings_total": total_rows,
+        "min_rating": min_rating,
+        "edge_users": torch.tensor(edge_users, dtype=torch.long),
+        "edge_items": torch.tensor(edge_items, dtype=torch.long),
+    }
+    work_dir.mkdir(parents=True, exist_ok=True)
+    torch.save(payload, processed_path)
+    return payload
+
+
+def _sample_lightgcn_pairs(
+    edge_users: torch.Tensor,
+    edge_items: torch.Tensor,
+    *,
     num_pairs: int,
+    seed: int,
+    offset: int,
+) -> tuple[torch.Tensor, torch.Tensor]:
+    if edge_users.numel() < offset + num_pairs:
+        raise ValueError(
+            f"requested {offset + num_pairs} positive pairs but dataset only has {edge_users.numel()} edges",
+        )
+    generator = torch.Generator().manual_seed(seed)
+    permutation = torch.randperm(edge_users.numel(), generator=generator)
+    selection = permutation[offset:offset + num_pairs]
+    return edge_users[selection], edge_items[selection]
+
+
+def _prepare_lightgcn_inputs(
+    args: argparse.Namespace,
     device: torch.device,
-) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor]:
-    edge_users = torch.randint(0, config.num_users, (num_edges,), device=device, dtype=torch.long)
-    edge_items = torch.randint(0, config.num_items, (num_edges,), device=device, dtype=torch.long)
-    user_ids = torch.randint(0, config.num_users, (num_pairs,), device=device, dtype=torch.long)
-    item_ids = torch.randint(0, config.num_items, (num_pairs,), device=device, dtype=torch.long)
-    adjacency = LightGCN.build_adjacency(
+) -> dict[str, Any]:
+    if args.lightgcn_dataset != "movielens-1m":
+        raise ValueError(f"unsupported real LightGCN dataset: {args.lightgcn_dataset}")
+
+    payload = _load_movielens_1m(
+        args.dataset_root,
+        min_rating=args.lightgcn_min_rating,
+    )
+    edge_users = payload["edge_users"]
+    edge_items = payload["edge_items"]
+    alignment_users, alignment_items = _sample_lightgcn_pairs(
         edge_users,
         edge_items,
+        num_pairs=args.lightgcn_num_pairs,
+        seed=args.seed,
+        offset=0,
+    )
+    throughput_users, throughput_items = _sample_lightgcn_pairs(
+        edge_users,
+        edge_items,
+        num_pairs=args.lightgcn_num_pairs,
+        seed=args.seed,
+        offset=args.lightgcn_num_pairs,
+    )
+
+    config = LightGCNConfig(
+        num_users=payload["num_users"],
+        num_items=payload["num_items"],
+        embedding_dim=args.lightgcn_embedding_dim,
+        num_layers=args.lightgcn_num_layers,
+    )
+    edge_users_device = edge_users.to(device)
+    edge_items_device = edge_items.to(device)
+    adjacency = LightGCN.build_adjacency(
+        edge_users_device,
+        edge_items_device,
         config.num_users,
         config.num_items,
         device=device,
     )
-    return edge_users, edge_items, user_ids, item_ids, adjacency
+
+    return {
+        "config": config,
+        "alignment_batch": (
+            edge_users_device,
+            edge_items_device,
+            alignment_users.to(device),
+            alignment_items.to(device),
+            adjacency,
+        ),
+        "throughput_batch": (
+            edge_users_device,
+            edge_items_device,
+            throughput_users.to(device),
+            throughput_items.to(device),
+            adjacency,
+        ),
+        "metadata": {
+            "dataset": "movielens-1m",
+            "source": MOVIELENS_1M_URL,
+            "users": payload["num_users"],
+            "items": payload["num_items"],
+            "edges": payload["num_edges"],
+            "pairs": args.lightgcn_num_pairs,
+            "min_rating": args.lightgcn_min_rating,
+        },
+    }
 
 
 def _run_lightgcn_alignment(
     *,
     device: torch.device,
-    num_users: int,
-    num_items: int,
-    embedding_dim: int,
-    num_layers: int,
-    num_edges: int,
-    num_pairs: int,
+    prepared_inputs: dict[str, Any],
 ) -> dict[str, Any]:
     PyGLightGCN = _load_pyg_lightgcn()
-    config = LightGCNConfig(
-        num_users=num_users,
-        num_items=num_items,
-        embedding_dim=embedding_dim,
-        num_layers=num_layers,
-    )
+    config: LightGCNConfig = prepared_inputs["config"]
     ours = LightGCN(config).to(device).eval()
     ref = PyGLightGCN(
         num_nodes=config.num_users + config.num_items,
@@ -372,22 +638,16 @@ def _run_lightgcn_alignment(
     ).to(device).eval()
     _copy_lightgcn_weights(ours, ref)
 
-    _, _, user_ids, item_ids, adjacency = _generate_lightgcn_inputs(
-        config,
-        num_edges=num_edges,
-        num_pairs=num_pairs,
-        device=device,
-    )
-    adjacency_csr = adjacency
+    _edge_users, _edge_items, user_ids, item_ids, adjacency = prepared_inputs["alignment_batch"]
     edge_label_index = torch.stack([user_ids, item_ids + config.num_users], dim=0)
 
     with torch.inference_mode():
         ours_user, ours_item = ours.get_user_item_embeddings(adjacency)
-        ref_all = ref.get_embedding(adjacency_csr)
+        ref_all = ref.get_embedding(adjacency)
         ref_user = ref_all[:config.num_users]
         ref_item = ref_all[config.num_users:]
         ours_scores = ours(user_ids, item_ids, adjacency)
-        ref_scores = ref(adjacency_csr, edge_label_index=edge_label_index)
+        ref_scores = ref(adjacency, edge_label_index=edge_label_index)
 
     return {
         "reference": "torch_geometric.nn.models.LightGCN",
@@ -400,22 +660,12 @@ def _run_lightgcn_alignment(
 def _run_lightgcn_throughput(
     *,
     device: torch.device,
-    num_users: int,
-    num_items: int,
-    embedding_dim: int,
-    num_layers: int,
-    num_edges: int,
-    num_pairs: int,
+    prepared_inputs: dict[str, Any],
     warmup_iters: int,
     measure_iters: int,
 ) -> dict[str, Any]:
     PyGLightGCN = _load_pyg_lightgcn()
-    config = LightGCNConfig(
-        num_users=num_users,
-        num_items=num_items,
-        embedding_dim=embedding_dim,
-        num_layers=num_layers,
-    )
+    config: LightGCNConfig = prepared_inputs["config"]
     ours = LightGCN(config).to(device).eval()
     ref = PyGLightGCN(
         num_nodes=config.num_users + config.num_items,
@@ -426,13 +676,7 @@ def _run_lightgcn_throughput(
     ).to(device).eval()
     _copy_lightgcn_weights(ours, ref)
 
-    _, _, user_ids, item_ids, adjacency = _generate_lightgcn_inputs(
-        config,
-        num_edges=num_edges,
-        num_pairs=num_pairs,
-        device=device,
-    )
-    adjacency_csr = adjacency
+    _edge_users, _edge_items, user_ids, item_ids, adjacency = prepared_inputs["throughput_batch"]
     edge_label_index = torch.stack([user_ids, item_ids + config.num_users], dim=0)
 
     with torch.inference_mode():
@@ -441,15 +685,15 @@ def _run_lightgcn_throughput(
             device=device,
             warmup_iters=warmup_iters,
             measure_iters=measure_iters,
-            items_per_iter=num_pairs,
+            items_per_iter=user_ids.numel(),
             metric_name="pairs_per_second",
         )
         ref_metrics = _benchmark_forward(
-            lambda: ref(adjacency_csr, edge_label_index=edge_label_index),
+            lambda: ref(adjacency, edge_label_index=edge_label_index),
             device=device,
             warmup_iters=warmup_iters,
             measure_iters=measure_iters,
-            items_per_iter=num_pairs,
+            items_per_iter=user_ids.numel(),
             metric_name="pairs_per_second",
         )
 
@@ -465,6 +709,21 @@ def _run_lightgcn_throughput(
 
 def _summarize_model_result(name: str, result: dict[str, Any]) -> None:
     print(f"\n== {name} ==")
+    metadata = result.get("data")
+    if metadata:
+        parts = [f"dataset={metadata['dataset']}"]
+        if "split" in metadata:
+            parts.append(f"split={metadata['split']}")
+        if "batch_size" in metadata:
+            parts.append(f"batch={metadata['batch_size']}")
+        if "bag_size" in metadata:
+            parts.append(f"bag={metadata['bag_size']}")
+        if "edges" in metadata:
+            parts.append(f"edges={metadata['edges']}")
+        if "pairs" in metadata:
+            parts.append(f"pairs={metadata['pairs']}")
+        print(f"  data: {', '.join(parts)}")
+
     alignment = result.get("alignment")
     if alignment:
         print(f"reference: {alignment['reference']}")
@@ -475,8 +734,7 @@ def _summarize_model_result(name: str, result: dict[str, Any]) -> None:
                     f"mae={value['mean_abs_diff']:.6e}, "
                     f"max={value['max_abs_diff']:.6e}"
                 )
-        if "note" in alignment:
-            print(f"  note: {alignment['note']}")
+
     throughput = result.get("throughput")
     if throughput:
         metric_name = "samples_per_second" if name == "dlrmv2" else "pairs_per_second"
@@ -494,40 +752,32 @@ def _run_model(args: argparse.Namespace, model_name: str, device: torch.device) 
         "device": str(device),
     }
     if model_name == "dlrmv2":
+        prepared_inputs = _prepare_dlrm_inputs(args, device)
+        result["data"] = prepared_inputs["metadata"]
         if not args.skip_alignment:
             result["alignment"] = _run_dlrm_alignment(
                 device=device,
-                batch_size=args.dlrm_batch_size,
-                bag_size=args.dlrm_bag_size,
+                prepared_inputs=prepared_inputs,
             )
         if not args.skip_throughput:
             result["throughput"] = _run_dlrm_throughput(
                 device=device,
-                batch_size=args.dlrm_batch_size,
-                bag_size=args.dlrm_bag_size,
+                prepared_inputs=prepared_inputs,
                 warmup_iters=args.warmup_iters,
                 measure_iters=args.measure_iters,
             )
     elif model_name == "lightgcn":
+        prepared_inputs = _prepare_lightgcn_inputs(args, device)
+        result["data"] = prepared_inputs["metadata"]
         if not args.skip_alignment:
             result["alignment"] = _run_lightgcn_alignment(
                 device=device,
-                num_users=args.lightgcn_num_users,
-                num_items=args.lightgcn_num_items,
-                embedding_dim=args.lightgcn_embedding_dim,
-                num_layers=args.lightgcn_num_layers,
-                num_edges=args.lightgcn_num_edges,
-                num_pairs=args.lightgcn_num_pairs,
+                prepared_inputs=prepared_inputs,
             )
         if not args.skip_throughput:
             result["throughput"] = _run_lightgcn_throughput(
                 device=device,
-                num_users=args.lightgcn_num_users,
-                num_items=args.lightgcn_num_items,
-                embedding_dim=args.lightgcn_embedding_dim,
-                num_layers=args.lightgcn_num_layers,
-                num_edges=args.lightgcn_num_edges,
-                num_pairs=args.lightgcn_num_pairs,
+                prepared_inputs=prepared_inputs,
                 warmup_iters=args.warmup_iters,
                 measure_iters=args.measure_iters,
             )
@@ -549,10 +799,16 @@ def _parse_args() -> argparse.Namespace:
         default="all",
         help="Which model baseline to benchmark.",
     )
+    parser.add_argument(
+        "--dataset-root",
+        type=Path,
+        default=DEFAULT_DATASET_ROOT,
+        help="Local cache root for real benchmark datasets.",
+    )
     parser.add_argument("--device", default="auto", help="Device to use (default: auto)")
     parser.add_argument("--seed", type=int, default=42, help="Random seed")
-    parser.add_argument("--warmup-iters", type=int, default=5, help="Warmup iterations")
-    parser.add_argument("--measure-iters", type=int, default=20, help="Measured iterations")
+    parser.add_argument("--warmup-iters", type=int, default=100, help="Warmup iterations")
+    parser.add_argument("--measure-iters", type=int, default=11000, help="Measured iterations")
     parser.add_argument("--skip-alignment", action="store_true", help="Skip numerical alignment")
     parser.add_argument("--skip-throughput", action="store_true", help="Skip throughput benchmark")
     parser.add_argument(
@@ -563,15 +819,34 @@ def _parse_args() -> argparse.Namespace:
              "for single-model runs.",
     )
 
-    parser.add_argument("--dlrm-batch-size", type=int, default=1024)
-    parser.add_argument("--dlrm-bag-size", type=int, default=4)
+    parser.add_argument(
+        "--dlrm-dataset",
+        choices=["adult"],
+        default="adult",
+        help="Real dataset used by DLRMv2 benchmark.",
+    )
+    parser.add_argument(
+        "--dlrm-batch-size",
+        type=int,
+        default=16384,
+        help="Per-iteration batch size for the real Adult benchmark.",
+    )
 
-    parser.add_argument("--lightgcn-num-users", type=int, default=4096)
-    parser.add_argument("--lightgcn-num-items", type=int, default=8192)
+    parser.add_argument(
+        "--lightgcn-dataset",
+        choices=["movielens-1m"],
+        default="movielens-1m",
+        help="Real dataset used by LightGCN benchmark.",
+    )
+    parser.add_argument("--lightgcn-min-rating", type=float, default=4.0)
     parser.add_argument("--lightgcn-embedding-dim", type=int, default=64)
     parser.add_argument("--lightgcn-num-layers", type=int, default=3)
-    parser.add_argument("--lightgcn-num-edges", type=int, default=32768)
-    parser.add_argument("--lightgcn-num-pairs", type=int, default=8192)
+    parser.add_argument(
+        "--lightgcn-num-pairs",
+        type=int,
+        default=131072,
+        help="Number of real positive (user, item) pairs scored per iteration.",
+    )
     return parser.parse_args()
 
 
@@ -586,6 +861,7 @@ def main() -> None:
         "seed": args.seed,
         "device": str(device),
         "gpu": _detect_gpu_name() if device.type == "cuda" else None,
+        "dataset_root": str(args.dataset_root),
         "models": {},
     }
 
