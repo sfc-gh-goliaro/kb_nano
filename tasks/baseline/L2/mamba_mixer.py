@@ -1,167 +1,283 @@
-"""Mamba v1 mixer: selective state space model with causal conv1d.
+"""Mamba v1 mixer (selective state-space model).
 
-Flow: in_proj → [x, z] → causal_conv1d(x) → x_proj → [dt, B, C] →
-      dt_proj → selective_scan(x, dt, A, B, C, D, z) → out_proj
+Implementation mirrors vLLM's ``MambaMixer``
+(``vllm/model_executor/layers/mamba/mamba_mixer.py``) so that:
 
-Weight names match HuggingFace checkpoint:
-  mixer.in_proj.weight        [2*intermediate_size, hidden_size]
-  mixer.conv1d.weight         [intermediate_size, 1, conv_kernel]
-  mixer.conv1d.bias           [intermediate_size]
-  mixer.x_proj.weight         [dt_rank + 2*state_size, intermediate_size]
-  mixer.dt_proj.weight        [intermediate_size, dt_rank]
-  mixer.dt_proj.bias          [intermediate_size]
-  mixer.A_log                 [intermediate_size, state_size]
-  mixer.D                     [intermediate_size]
-  mixer.out_proj.weight       [hidden_size, intermediate_size]
+  - kernel calls (causal_conv1d_fn / causal_conv1d_update /
+    selective_scan_fn / selective_state_update) are bit-identical to vLLM
+  - parameter layout / weight names match HF Mamba checkpoints
+    (state-spaces/mamba-* family)
+  - tensor parallelism uses ColumnParallelLinear (in_proj, conv1d,
+    dt_proj) and RowParallelLinear (x_proj, out_proj), matching vLLM
+
+State (conv_state, ssm_state) and per-batch metadata are read from
+kb_nano's global ``Context`` (``infra/context.py``), analogous to
+vLLM's ``ForwardContext``.
+
+Weight names from HF Mamba checkpoint
+-------------------------------------
+    mixer.in_proj.weight        [2*intermediate, hidden]   (gate + x)
+    mixer.conv1d.weight         [intermediate, 1, conv_kernel]
+    mixer.conv1d.bias           [intermediate]
+    mixer.x_proj.weight         [time_step_rank + 2*state_size, intermediate]
+    mixer.dt_proj.weight        [intermediate, time_step_rank]
+    mixer.dt_proj.bias          [intermediate]
+    mixer.A_log                 [intermediate, state_size]
+    mixer.D                     [intermediate]
+    mixer.out_proj.weight       [hidden, intermediate]
 """
 
 from __future__ import annotations
 
 import torch
 import torch.nn as nn
-import torch.nn.functional as F
 
-from causal_conv1d import causal_conv1d_fn, causal_conv1d_update
-from mamba_ssm.ops.selective_scan_interface import selective_scan_fn
+from vllm.model_executor.layers.mamba.ops.causal_conv1d import (
+    causal_conv1d_fn,
+    causal_conv1d_update,
+)
+from vllm.model_executor.layers.mamba.ops.mamba_ssm import (
+    selective_scan_fn,
+    selective_state_update,
+)
 
-selective_state_update = None
+from ....infra.context import get_context
+from ....infra.tp import _tp_rank, _tp_size
+from .parallel_linear import (
+    ColumnParallelLinear,
+    MergedColumnParallelLinear,
+    RowParallelLinear,
+)
 
 
 class MambaMixer(nn.Module):
-    """Mamba selective scan mixer block."""
+    """Mamba v1 selective-scan mixer block."""
 
-    def __init__(self, config, layer_idx: int):
+    def __init__(
+        self,
+        hidden_size: int,
+        ssm_state_size: int,
+        conv_kernel_size: int,
+        intermediate_size: int,
+        time_step_rank: int,
+        use_conv_bias: bool,
+        use_bias: bool,
+        activation: str = "silu",
+        layer_idx: int = 0,
+        quant_config: dict | None = None,
+    ):
         super().__init__()
+        self.tp_size = _tp_size()
+        self.tp_rank = _tp_rank()
+
+        assert intermediate_size % self.tp_size == 0, (
+            "Mamba v1 requires intermediate_size divisible by tp_size."
+        )
+
+        self.hidden_size = hidden_size
+        self.ssm_state_size = ssm_state_size
+        self.conv_kernel_size = conv_kernel_size
+        self.intermediate_size = intermediate_size
+        self.time_step_rank = time_step_rank
+        self.activation = activation
         self.layer_idx = layer_idx
-        self.hidden_size = config.hidden_size
-        self.intermediate_size = config.intermediate_size
-        self.state_size = config.state_size
-        self.conv_kernel_size = config.conv_kernel
-        self.time_step_rank = config.time_step_rank
 
-        self.in_proj = nn.Linear(
-            config.hidden_size, 2 * self.intermediate_size, bias=config.use_bias,
+        # conv1d as a column-parallel linear over the intermediate dim
+        # (output_size == intermediate_size sharded across TP).
+        self.conv1d = ColumnParallelLinear(
+            input_size=conv_kernel_size,
+            output_size=intermediate_size,
+            bias=use_conv_bias,
+            quant_config=None,
+        )
+        # Promote to depthwise-conv weight layout (D, 1, K) after load.
+        self.conv1d.weight.data = self.conv1d.weight.data.unsqueeze(1)
+
+        # in_proj packs [x, gate], each of size intermediate_size.
+        self.in_proj = MergedColumnParallelLinear(
+            input_size=hidden_size,
+            output_sizes=[intermediate_size, intermediate_size],
+            bias=use_bias,
+            quant_config=quant_config,
         )
 
-        # Depthwise conv1d — weight shape [D, 1, kernel] matches checkpoint
-        self.conv1d = nn.Conv1d(
-            in_channels=self.intermediate_size,
-            out_channels=self.intermediate_size,
-            kernel_size=config.conv_kernel,
-            groups=self.intermediate_size,
-            bias=config.use_conv_bias,
-            padding=config.conv_kernel - 1,
-        )
-
-        self.x_proj = nn.Linear(
-            self.intermediate_size,
-            self.time_step_rank + 2 * self.state_size,
+        # x_proj: produces [dt, B, C] from x.  RowParallel because input
+        # dim is intermediate (which is sharded), output is replicated.
+        self.x_proj = RowParallelLinear(
+            input_size=intermediate_size,
+            output_size=time_step_rank + 2 * ssm_state_size,
             bias=False,
+            quant_config=None,
         )
 
-        self.dt_proj = nn.Linear(self.time_step_rank, self.intermediate_size, bias=True)
-
-        # A_log and D: loaded directly from checkpoint
-        self.A_log = nn.Parameter(torch.empty(self.intermediate_size, self.state_size))
-        self.D = nn.Parameter(torch.empty(self.intermediate_size))
-
-        self.out_proj = nn.Linear(
-            self.intermediate_size, config.hidden_size, bias=config.use_bias,
+        # dt_proj: time_step_rank -> intermediate (column-parallel).
+        # Bias is added by the selective-scan kernel, so we keep it
+        # separately and pass it through.
+        self.dt_proj = ColumnParallelLinear(
+            input_size=time_step_rank,
+            output_size=intermediate_size,
+            bias=True,
+            quant_config=None,
         )
 
-    def forward(self, hidden_states, cache_params=None, cache_position=None):
-        B, T, _ = hidden_states.shape
-
-        # in_proj → x, z (gate)
-        xz = self.in_proj(hidden_states)
-        x, z = xz.chunk(2, dim=-1)
-
-        if T > 1:
-            return self._prefill(x, z, B, T, cache_params)
-        else:
-            return self._decode(x, z, B, cache_params)
-
-    def _prefill(self, x, z, B, T, cache_params):
-        conv_weight = self.conv1d.weight.squeeze(1)  # [D, kernel]
-        x = x.transpose(1, 2).contiguous()  # [B, D, T]
-
-        # Save conv state: last conv_kernel pre-conv values
-        if cache_params is not None:
-            if T >= self.conv_kernel_size:
-                cache_params.conv_states[self.layer_idx].copy_(
-                    x[:, :, -self.conv_kernel_size:]
-                )
-            else:
-                cache_params.conv_states[self.layer_idx].zero_()
-                cache_params.conv_states[self.layer_idx][:, :, -T:].copy_(x)
-
-        x = causal_conv1d_fn(x, conv_weight, self.conv1d.bias, activation="silu")
-        x = x.transpose(1, 2)  # [B, T, D]
-
-        # x_proj → dt, B_ssm, C_ssm
-        x_dbl = self.x_proj(x)
-        dt, B_ssm, C_ssm = x_dbl.split(
-            [self.time_step_rank, self.state_size, self.state_size], dim=-1,
+        tp_inter = intermediate_size // self.tp_size
+        self.A = nn.Parameter(
+            torch.empty(tp_inter, ssm_state_size, dtype=torch.float32),
         )
-        dt = self.dt_proj(dt)  # [B, T, D]
+        self.D = nn.Parameter(torch.ones(tp_inter))
 
-        # Selective scan
-        A = -torch.exp(self.A_log.float())
-        y, last_state = selective_scan_fn(
-            x.transpose(1, 2).contiguous(),
-            dt.transpose(1, 2).contiguous(),
-            A,
-            B_ssm.transpose(1, 2).contiguous(),
-            C_ssm.transpose(1, 2).contiguous(),
-            D=self.D.float(),
-            z=z.transpose(1, 2).contiguous(),
-            delta_softplus=True,
-            return_last_state=True,
-        )
-        # y: [B, D, T], last_state: [B, D, N]
-
-        if cache_params is not None:
-            cache_params.ssm_states[self.layer_idx].copy_(last_state)
-
-        return self.out_proj(y.transpose(1, 2))
-
-    def _decode(self, x, z, B, cache_params):
-        x = x.squeeze(1)  # [B, D]
-        z = z.squeeze(1)
-
-        # Conv1d update
-        conv_weight = self.conv1d.weight.squeeze(1)
-        x = causal_conv1d_update(
-            x, cache_params.conv_states[self.layer_idx],
-            conv_weight, self.conv1d.bias, activation="silu",
-        )
-
-        # x_proj → dt, B_ssm, C_ssm
-        x_dbl = self.x_proj(x)
-        dt, B_ssm, C_ssm = x_dbl.split(
-            [self.time_step_rank, self.state_size, self.state_size], dim=-1,
-        )
-        dt = self.dt_proj(dt)  # [B, D]
-
-        A = -torch.exp(self.A_log.float())
-
-        if selective_state_update is not None:
-            y = selective_state_update(
-                cache_params.ssm_states[self.layer_idx],
-                x, dt, A, B_ssm, C_ssm,
-                D=self.D, z=z, dt_softplus=True,
+        # A_log is sharded along dim 0 with the -exp() transform applied
+        # at load time so the kernel sees A directly.
+        def _shard0_loader(param, loaded_weight):
+            shard = param.data.size(0)
+            param.data.copy_(
+                loaded_weight.narrow(0, self.tp_rank * shard, shard).to(param.dtype),
             )
-        else:
-            # Manual SSM step
-            dt = F.softplus(dt)
-            ssm_state = cache_params.ssm_states[self.layer_idx]
-            dA = torch.exp(dt.float().unsqueeze(-1) * A)
-            dB = dt.float().unsqueeze(-1) * B_ssm.float().unsqueeze(1)
-            ssm_state.copy_(
-                (ssm_state.float() * dA + x.float().unsqueeze(-1) * dB).to(ssm_state.dtype)
-            )
-            y = torch.einsum("bdn,bn->bd", ssm_state.float(), C_ssm.float())
-            y = y + self.D.float() * x.float()
-            y = (y * F.silu(z.float())).to(x.dtype)
 
-        return self.out_proj(y.unsqueeze(1))
+        def _A_loader(param, loaded_weight):
+            shard = param.data.size(0)
+            slice_ = loaded_weight.narrow(0, self.tp_rank * shard, shard).float()
+            param.data.copy_(-torch.exp(slice_))
+
+        self.A.weight_loader = _A_loader
+        self.D.weight_loader = _shard0_loader
+
+        self.out_proj = RowParallelLinear(
+            intermediate_size, hidden_size,
+            bias=use_bias, quant_config=quant_config,
+        )
+
+    # ------------------------------------------------------------------
+    # Forward
+    # ------------------------------------------------------------------
+    def _ssm_transform(self, x: torch.Tensor):
+        """Compute (dt, B, C) from x via x_proj + dt_proj.
+
+        x: [N, intermediate_per_rank]
+        Returns:
+          dt: [N, intermediate_per_rank]
+          B:  [N, ssm_state_size]
+          C:  [N, ssm_state_size]
+        """
+        ssm_params = self.x_proj(x)  # [N, dt_rank + 2*N_state]
+        dt, B, C = torch.split(
+            ssm_params,
+            [self.time_step_rank, self.ssm_state_size, self.ssm_state_size],
+            dim=-1,
+        )
+        # dt_proj (skip bias add - the kernel handles it).
+        # ColumnParallelLinear adds bias inside; we want it raw, so we
+        # call F.linear without the bias and pass the bias separately.
+        import torch.nn.functional as F
+        dt = F.linear(dt, self.dt_proj.weight, None)  # [N, intermediate_per_rank]
+        return dt, B, C
+
+    def forward(self, hidden_states: torch.Tensor) -> torch.Tensor:
+        """Mamba v1 mixer forward.
+
+        Reads cache state and per-batch metadata from the global Context.
+        Mirrors vLLM ``MambaMixer.forward_impl`` but uses kb_nano's
+        flat-token (no batch dim) convention with prefill tokens first.
+
+        ``hidden_states`` shape: [num_tokens, hidden_size]
+        """
+        ctx = get_context()
+        mamba_state = getattr(ctx, "mamba_state", None)
+        mamba_meta = getattr(ctx, "mamba_metadata", None)
+
+        # in_proj -> packed [x, gate] (per-rank sharded).
+        proj = self.in_proj(hidden_states)  # [N, 2*tp_inter]
+        x, gate = proj.chunk(2, dim=-1)
+        tp_inter = x.shape[-1]
+
+        if mamba_state is None or mamba_meta is None:
+            # Profile / warmup path (no cache available).
+            return self.out_proj(x)
+
+        conv_state = mamba_state.conv_states[self.layer_idx]
+        ssm_state = mamba_state.ssm_states[self.layer_idx]
+
+        num_prefill_tokens = mamba_meta.num_prefill_tokens
+        num_decode_tokens = mamba_meta.num_decode_tokens
+        has_prefill = num_prefill_tokens > 0
+        has_decode = num_decode_tokens > 0
+        num_actual = num_prefill_tokens + num_decode_tokens
+
+        x_p, x_d = torch.split(
+            x[:num_actual], [num_prefill_tokens, num_decode_tokens], dim=0,
+        )
+        gate_p, gate_d = torch.split(
+            gate[:num_actual], [num_prefill_tokens, num_decode_tokens], dim=0,
+        )
+
+        conv_weights = self.conv1d.weight.view(
+            self.conv1d.weight.size(0), self.conv1d.weight.size(2),
+        )
+        ssm_outputs = []
+
+        if has_prefill:
+            # causal_conv1d_fn expects [dim, total_tokens]
+            x_p_t = x_p.transpose(0, 1).contiguous()
+            conv_out_p = causal_conv1d_fn(
+                x_p_t,
+                conv_weights,
+                self.conv1d.bias,
+                activation=self.activation,
+                conv_states=conv_state,
+                has_initial_state=mamba_meta.has_initial_states_p,
+                cache_indices=mamba_meta.state_indices_p,
+                query_start_loc=mamba_meta.query_start_loc_p,
+            )  # [dim, total_tokens]
+
+            dt_p, B_p, C_p = self._ssm_transform(conv_out_p.transpose(0, 1))
+            time_proj_bias = self.dt_proj.bias.float() if self.dt_proj.bias is not None else None
+
+            # selective_scan_fn returns y in [dim, total_tokens] layout
+            scan_out_p = selective_scan_fn(
+                conv_out_p,
+                ssm_state,
+                dt_p.transpose(0, 1),  # [dim, T]
+                self.A,
+                B_p.transpose(0, 1),   # [N_state, T]
+                C_p.transpose(0, 1),   # [N_state, T]
+                self.D.float(),
+                gate_p.transpose(0, 1),
+                time_proj_bias,
+                delta_softplus=True,
+                cache_indices=mamba_meta.state_indices_p,
+                has_initial_state=mamba_meta.has_initial_states_p,
+                query_start_loc=mamba_meta.query_start_loc_p,
+            )
+            # Back to [T, dim]
+            ssm_outputs.append(scan_out_p.transpose(0, 1))
+
+        if has_decode:
+            # causal_conv1d_update accepts [batch, dim] (single-token decode).
+            conv_out_d = causal_conv1d_update(
+                x_d, conv_state, conv_weights, self.conv1d.bias,
+                self.activation,
+                conv_state_indices=mamba_meta.state_indices_d,
+            )
+
+            dt_d, B_d, C_d = self._ssm_transform(conv_out_d)
+            time_proj_bias = self.dt_proj.bias.float() if self.dt_proj.bias is not None else None
+
+            out_d = torch.empty_like(conv_out_d)
+            selective_state_update(
+                ssm_state,
+                conv_out_d,
+                dt_d,
+                self.A,
+                B_d,
+                C_d,
+                self.D,
+                gate_d,
+                time_proj_bias,
+                dt_softplus=True,
+                state_batch_indices=mamba_meta.state_indices_d,
+                out=out_d,
+            )
+            ssm_outputs.append(out_d)
+
+        y = ssm_outputs[0] if len(ssm_outputs) == 1 else torch.cat(ssm_outputs, dim=0)
+        return self.out_proj(y)

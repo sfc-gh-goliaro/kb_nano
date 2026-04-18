@@ -1,5 +1,13 @@
 """Standalone Mamba v1 model implementation.
 
+Follows kb_nano's ``LlamaForCausalLM`` interface:
+``forward(input_ids, positions)`` returning hidden states; ``compute_logits``
+performs the LM-head projection separately.
+
+Per-batch SSM state and metadata (state slot indices, prefill/decode
+split, ...) are read from the global ``Context`` (``infra/context.py``)
+by the mixer; the engine populates them via ``set_forward_context``.
+
 Matches HuggingFace checkpoint weight names exactly:
   backbone.embeddings.weight              [vocab_size, hidden_size]
   backbone.layers.{i}.norm.weight         [hidden_size]
@@ -88,16 +96,16 @@ class MambaModel(nn.Module):
         ])
         self.norm_f = RMSNorm(config.hidden_size, eps=config.layer_norm_epsilon)
 
-    def forward(self, input_ids, cache_params=None, cache_position=None):
-        hidden_states = self.embeddings(input_ids)
+    def forward(self, input_ids, positions, inputs_embeds=None):
+        if inputs_embeds is not None:
+            hidden_states = inputs_embeds
+        else:
+            hidden_states = self.embeddings(input_ids)
+        residual = None
         for layer in self.layers:
-            hidden_states = layer(
-                hidden_states, cache_params=cache_params, cache_position=cache_position,
-            )
-        # Final norm (sgl_kernel requires 2D)
-        shape = hidden_states.shape
-        hidden_states = self.norm_f(hidden_states.reshape(-1, shape[-1]))
-        return hidden_states.reshape(shape)
+            hidden_states, residual = layer(positions, hidden_states, residual)
+        hidden_states, _ = self.norm_f(hidden_states, residual)
+        return hidden_states
 
 
 class MambaForCausalLM(nn.Module):
@@ -109,13 +117,21 @@ class MambaForCausalLM(nn.Module):
         if config.tie_word_embeddings:
             self.lm_head.weight = self.backbone.embeddings.weight
 
-    def forward(self, input_ids, cache_params=None, cache_position=None):
-        return self.backbone(
-            input_ids, cache_params=cache_params, cache_position=cache_position,
-        )
+    def forward(self, input_ids, positions):
+        return self.backbone(input_ids, positions)
 
     def compute_logits(self, hidden_states):
-        logits = self.lm_head(hidden_states)
+        """Project pre-selected per-seq hidden states to vocab logits.
+
+        ``infra/engine.py``'s ``run_mamba`` extracts the last hidden
+        state per sequence before calling here, so we bypass
+        ``ParallelLMHead.project``'s context-driven slicing (which
+        relies on attention-only ``cu_seqlens_q`` / ``logit_indices``).
+        """
+        partial = self.lm_head.linear_op(
+            hidden_states, self.lm_head.embedding_op.emb.weight,
+        )
+        logits = self.lm_head.gather_logits(partial)
         if logits is not None:
             logits = logits.float()
         return logits

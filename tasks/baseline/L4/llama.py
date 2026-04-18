@@ -35,6 +35,7 @@ class LlamaConfig:
     rope_high_freq_factor: float = 4.0
     rope_original_max_position_embeddings: int = 8192
     dtype: torch.dtype = torch.bfloat16
+    qkv_bias: bool = False
 
     @classmethod
     def from_pretrained(cls, model_name: str) -> "LlamaConfig":
@@ -45,6 +46,7 @@ class LlamaConfig:
         # Merge: rope_parameters takes priority (transformers 5.x)
         rope = {**rope, **rope_params}
         rope_theta = rope.get("rope_theta") or getattr(hf, "rope_theta", 500000.0)
+        is_qwen2 = getattr(hf, "model_type", "") in ("qwen2", "qwen2_moe")
         return cls(
             hidden_size=hf.hidden_size,
             intermediate_size=hf.intermediate_size,
@@ -62,6 +64,7 @@ class LlamaConfig:
             rope_original_max_position_embeddings=rope.get(
                 "original_max_position_embeddings", hf.max_position_embeddings,
             ),
+            qkv_bias=is_qwen2,
         )
 
 
@@ -79,13 +82,17 @@ class LlamaModel(nn.Module):
             rope_original_max_position_embeddings=config.rope_original_max_position_embeddings,
         )
         self.layers = nn.ModuleList([
-            LlamaDecoderLayer(config, rotary_emb=self.rotary_emb)
+            LlamaDecoderLayer(config, rotary_emb=self.rotary_emb,
+                              bias=config.qkv_bias)
             for _ in range(config.num_hidden_layers)
         ])
         self.norm = RMSNorm(config.hidden_size, eps=config.rms_norm_eps)
 
-    def forward(self, input_ids, positions):
-        hidden_states = self.embed_tokens(input_ids)
+    def forward(self, input_ids, positions, inputs_embeds=None):
+        if inputs_embeds is not None:
+            hidden_states = inputs_embeds
+        else:
+            hidden_states = self.embed_tokens(input_ids)
         residual = None
         for layer in self.layers:
             hidden_states, residual = layer(positions, hidden_states, residual)

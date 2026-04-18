@@ -14,18 +14,20 @@ from dataclasses import dataclass, field
 import numpy as np
 import torch
 import torch.nn as nn
-import torch.nn.functional as F
 from transformers import AutoConfig
 
+from ..L1.gelu import GELU
 from ..L1.mrope import MRotaryEmbedding
-from ..L1.rms_norm import RMSNorm
-from ..L1.vision_rotary_emb import VisionRotaryEmbedding
 from ..L1.mrope_input_positions import MRopeInputPositions
+from ..L1.rms_norm import RMSNorm
+from ..L1.silu import SiLU
+from ..L1.vision_rotary_emb import VisionRotaryEmbedding
 from ..L2.parallel_embedding import ParallelLMHead, VocabParallelEmbedding
 from ..L2.vision_patch_embed import VisionPatchEmbed
 from ..L2.vision_patch_merger import VisionPatchMerger
 from ..L2.vision_pos_embed_interpolate import VisionPosEmbedInterpolate
 from ..L3.llama_decoder import LlamaDecoderLayer
+from ..L3.qwen3_moe_decoder import Qwen3MoEDecoderLayer
 from ..L3.vision_block import VisionBlock
 
 
@@ -49,9 +51,9 @@ class Qwen3VLVisionConfig:
 class Qwen3VLConfig:
     hidden_size: int = 4096
     intermediate_size: int = 12288
-    num_hidden_layers: int = 36
-    num_attention_heads: int = 32
-    num_key_value_heads: int = 8
+    num_hidden_layers: int = 94
+    num_attention_heads: int = 64
+    num_key_value_heads: int = 4
     head_dim: int = 128
     vocab_size: int = 151936
     max_position_embeddings: int = 262144
@@ -64,13 +66,22 @@ class Qwen3VLConfig:
     video_token_id: int = 151656
     vision: Qwen3VLVisionConfig = field(default_factory=Qwen3VLVisionConfig)
     dtype: torch.dtype = torch.bfloat16
+    # MoE fields (only used when is_moe=True)
+    is_moe: bool = False
+    num_experts: int = 0
+    num_experts_per_tok: int = 0
+    moe_intermediate_size: int = 0
+    norm_topk_prob: bool = True
 
     @classmethod
     def from_pretrained(cls, model_name: str) -> "Qwen3VLConfig":
         hf = AutoConfig.from_pretrained(model_name)
         vc = hf.vision_config
         text_config = hf.get_text_config()
-        rope = getattr(text_config, "rope_scaling", {}) or {}
+        rope = getattr(text_config, "rope_scaling", None) or getattr(text_config, "rope_parameters", None) or {}
+        rope_theta = getattr(text_config, "rope_theta", None) or rope.get("rope_theta", 5000000.0)
+
+        is_moe = hasattr(text_config, "num_experts") and text_config.num_experts > 0
         return cls(
             hidden_size=text_config.hidden_size,
             intermediate_size=text_config.intermediate_size,
@@ -82,7 +93,7 @@ class Qwen3VLConfig:
             vocab_size=text_config.vocab_size,
             max_position_embeddings=text_config.max_position_embeddings,
             rms_norm_eps=text_config.rms_norm_eps,
-            rope_theta=text_config.rope_theta,
+            rope_theta=rope_theta,
             tie_word_embeddings=text_config.tie_word_embeddings,
             mrope_section=rope.get("mrope_section", [24, 20, 20]),
             mrope_interleaved=rope.get("mrope_interleaved", True),
@@ -102,15 +113,20 @@ class Qwen3VLConfig:
                 deepstack_visual_indexes=getattr(vc, "deepstack_visual_indexes", [8, 16, 24]),
                 num_position_embeddings=getattr(vc, "num_position_embeddings", 2304),
             ),
+            is_moe=is_moe,
+            num_experts=getattr(text_config, "num_experts", 0) if is_moe else 0,
+            num_experts_per_tok=getattr(text_config, "num_experts_per_tok", 0) if is_moe else 0,
+            moe_intermediate_size=getattr(text_config, "moe_intermediate_size", 0) if is_moe else 0,
+            norm_topk_prob=getattr(text_config, "norm_topk_prob", True) if is_moe else True,
         )
 
 
 # ---- Vision Encoder Components ----
 
 _ACTIVATION_MAP = {
-    "silu": F.silu,
-    "gelu": F.gelu,
-    "gelu_pytorch_tanh": lambda x: F.gelu(x, approximate="tanh"),
+    "silu": SiLU(),
+    "gelu": GELU(),
+    "gelu_pytorch_tanh": GELU(approximate="tanh"),
 }
 
 
@@ -137,7 +153,7 @@ class Qwen3VisionTransformer(nn.Module):
         head_dim = vision_config.hidden_size // vision_config.num_heads
         self.rotary_emb = VisionRotaryEmbedding(head_dim // 2)
 
-        act_fn = _ACTIVATION_MAP.get(vision_config.hidden_act, F.silu)
+        act_fn = _ACTIVATION_MAP.get(vision_config.hidden_act, SiLU())
 
         self.blocks = nn.ModuleList([
             VisionBlock(
@@ -199,14 +215,16 @@ class Qwen3VisionTransformer(nn.Module):
 
         hidden_states = self.merger(hidden_states)
         if deepstack_features:
-            return hidden_states, deepstack_features
-        return hidden_states, []
+            hidden_states = torch.cat(
+                [hidden_states] + deepstack_features, dim=1
+            )
+        return hidden_states
 
 
 # ---- Language Model ----
 
 class Qwen3Model(nn.Module):
-    def __init__(self, config: Qwen3VLConfig):
+    def __init__(self, config: Qwen3VLConfig, quant_config: dict | None = None):
         super().__init__()
         self.embed_tokens = VocabParallelEmbedding(config.vocab_size, config.hidden_size)
         self.rotary_emb = MRotaryEmbedding(
@@ -214,10 +232,18 @@ class Qwen3Model(nn.Module):
             config.rope_theta, config.mrope_section,
             config.mrope_interleaved,
         )
-        self.layers = nn.ModuleList([
-            LlamaDecoderLayer(config, rotary_emb=self.rotary_emb, qk_norm=True)
-            for _ in range(config.num_hidden_layers)
-        ])
+        if config.is_moe:
+            self.layers = nn.ModuleList([
+                Qwen3MoEDecoderLayer(config, rotary_emb=self.rotary_emb,
+                                     quant_config=quant_config)
+                for _ in range(config.num_hidden_layers)
+            ])
+        else:
+            self.layers = nn.ModuleList([
+                LlamaDecoderLayer(config, rotary_emb=self.rotary_emb, qk_norm=True,
+                                  quant_config=quant_config)
+                for _ in range(config.num_hidden_layers)
+            ])
         self.norm = RMSNorm(config.hidden_size, eps=config.rms_norm_eps)
 
     def forward(self, input_ids, positions, inputs_embeds=None,
@@ -244,11 +270,18 @@ class Qwen3VLForConditionalGeneration(nn.Module):
         "up_proj": ("gate_up_proj", 1),
     }
 
-    def __init__(self, config: Qwen3VLConfig):
+    def __init__(self, config: Qwen3VLConfig, quant_config: dict | None = None):
+        if config.is_moe:
+            self.packed_modules_mapping = {
+                "q_proj": ("qkv_proj", "q"),
+                "k_proj": ("qkv_proj", "k"),
+                "v_proj": ("qkv_proj", "v"),
+            }
         super().__init__()
         self.config = config
+        self.quant_config = quant_config
         self.visual = Qwen3VisionTransformer(config.vision)
-        self.model = Qwen3Model(config)
+        self.model = Qwen3Model(config, quant_config=quant_config)
         self.lm_head = ParallelLMHead(config.vocab_size, config.hidden_size)
         self._mrope_positions = MRopeInputPositions()
 

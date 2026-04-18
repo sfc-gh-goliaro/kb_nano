@@ -1,8 +1,22 @@
-"""Runtime Mamba state-slot cache management (non-benchmark infrastructure)."""
+"""Runtime Mamba state-slot cache management (non-benchmark infrastructure).
+
+Mirrors vLLM's Mamba state plumbing (see
+``vllm/v1/attention/backends/mamba_attn.py`` and
+``vllm/v1/attention/backends/mamba2_attn.py``):
+
+  - ``MambaStateManager`` owns the global conv/ssm state tensors, one
+    pair per layer, allocated as ``[num_slots, ...]``. Free slots are
+    managed via a deque so a ``Sequence`` claims one slot for its
+    lifetime.
+  - ``Mamba2Metadata`` / ``MambaMetadata`` carry per-batch tensors
+    (state slot indices, prefill/decode split, chunk indices) consumed
+    by the mixer in its forward pass via the global Context.
+"""
 
 from __future__ import annotations
 
 from collections import deque
+from dataclasses import dataclass
 
 import torch
 
@@ -94,6 +108,14 @@ class MambaStateManager:
             self.ssm_states[layer_idx][slot].zero_()
 
     def allocate(self, seq) -> int:
+        """Claim a free slot for ``seq``.
+
+        Each TP rank holds its own ``_free_slots`` deque.  Because ranks
+        receive identical, in-order ``allocate`` / ``deallocate`` calls
+        (broadcast via SHM in ``ModelRunner.call``), their free pools
+        stay in lockstep so popping from each rank's deque produces the
+        same slot index without explicit coordination.
+        """
         if getattr(seq, "state_slot", None) is not None:
             return seq.state_slot
         if not self._free_slots:
@@ -124,3 +146,112 @@ class MambaStateManager:
         cache = MambaSlotCache(conv_views, ssm_views, self.conv_kernel)
         self._slot_views[slot] = cache
         return cache
+
+
+@dataclass
+class MambaMetadata:
+    """Per-batch metadata for a Mamba v1 forward pass.
+
+    Mirrors vLLM ``Mamba1AttentionMetadata`` (a thin wrapper over
+    ``BaseMambaAttentionMetadata`` -- see
+    ``vllm/v1/attention/backends/mamba_attn.py``).
+
+    All tensors live on the inference device.
+    """
+    num_prefill_tokens: int = 0
+    num_decode_tokens: int = 0
+    num_prefills: int = 0
+    num_decodes: int = 0
+
+    # Prefill-only (None when num_prefills == 0)
+    has_initial_states_p: torch.Tensor | None = None  # bool [num_prefills]
+    query_start_loc_p: torch.Tensor | None = None     # int32 [num_prefills+1]
+    state_indices_p: torch.Tensor | None = None       # int32 [num_prefills]
+
+    # Decode-only (None when num_decodes == 0)
+    state_indices_d: torch.Tensor | None = None       # int32 [num_decodes]
+
+
+@dataclass
+class Mamba2Metadata(MambaMetadata):
+    """Per-batch metadata for a Mamba2 / SSD forward pass.
+
+    Adds chunked-prefill support on top of ``MambaMetadata``.  Mirrors
+    vLLM ``Mamba2AttentionMetadata``.
+    """
+    prep_initial_states: bool = False
+    chunk_size: int = 256
+
+    # Chunk metadata (prefill only) -- see vLLM
+    # ``BaseMambaAttentionMetadataBuilder._compute_chunk_metadata``.
+    seq_idx_p: torch.Tensor | None = None              # int32 [nchunks]
+    cu_chunk_seqlen_p: torch.Tensor | None = None      # int32 [nchunks+1]
+    last_chunk_indices_p: torch.Tensor | None = None   # int32 [num_prefills]
+
+
+def build_chunk_metadata(
+    query_start_loc_p: torch.Tensor,
+    chunk_size: int,
+    num_computed_tokens_p: torch.Tensor | None = None,
+) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
+    """Compute Mamba2 chunk-aligned varlen metadata.
+
+    Direct port of vLLM ``BaseMambaAttentionMetadataBuilder._compute_chunk_metadata``.
+
+    Args:
+      query_start_loc_p: int32 tensor [num_prefills+1] cumulative token
+        starts in the *prefill* sub-batch.
+      chunk_size: physical chunk size (e.g. 256 for Codestral).
+      num_computed_tokens_p: int32 tensor [num_prefills] of already-computed
+        tokens per request (for chunked prefill resumption).  If ``None``,
+        treated as all zeros (fresh prefill).
+
+    Returns ``(cu_chunk_seqlen_p, seq_idx_p, last_chunk_indices_p)`` on the
+    same device as ``query_start_loc_p``.
+    """
+    device = query_start_loc_p.device
+    qsl = query_start_loc_p.to("cpu").tolist()
+    num_prefills = len(qsl) - 1
+    if num_computed_tokens_p is None:
+        nct = [0] * num_prefills
+    else:
+        nct = num_computed_tokens_p.to("cpu").tolist()
+
+    cu_chunk_seqlen: list[int] = []
+    seq_idx: list[int] = []
+    last_chunk_indices: list[int] = []
+    seqlen_pos = 0
+
+    for req_idx in range(num_prefills):
+        this_num_computed = nct[req_idx]
+        this_new_tokens = qsl[req_idx + 1] - qsl[req_idx]
+
+        # Finish off a partially-filled chunk if computed isn't chunk aligned.
+        if this_num_computed % chunk_size != 0:
+            seq_idx.append(req_idx)
+            cu_chunk_seqlen.append(seqlen_pos)
+            chunk_len = (
+                ((this_num_computed + chunk_size - 1) // chunk_size) * chunk_size
+                - this_num_computed
+            )
+            chunk_len = min(chunk_len, this_new_tokens)
+            seqlen_pos += chunk_len
+            this_new_tokens -= chunk_len
+
+        n_chunks = (this_new_tokens + chunk_size - 1) // chunk_size
+        for _ in range(n_chunks):
+            seq_idx.append(req_idx)
+            cu_chunk_seqlen.append(seqlen_pos)
+            chunk_len = min(chunk_size, this_new_tokens)
+            seqlen_pos += chunk_len
+            this_new_tokens -= chunk_len
+
+        assert this_new_tokens == 0
+        last_chunk_indices.append(len(cu_chunk_seqlen) - 1)
+
+    cu_chunk_seqlen.append(seqlen_pos)
+
+    cu_chunk_seqlen_p = torch.tensor(cu_chunk_seqlen, device=device, dtype=torch.int32)
+    seq_idx_p = torch.tensor(seq_idx, device=device, dtype=torch.int32)
+    last_chunk_indices_p = torch.tensor(last_chunk_indices, device=device, dtype=torch.int32)
+    return cu_chunk_seqlen_p, seq_idx_p, last_chunk_indices_p

@@ -9,13 +9,15 @@ from ..L1.silu_and_mul import SiluAndMul
 
 
 class LlamaMLP(nn.Module):
-    def __init__(self, config):
+    def __init__(self, config, quant_config: dict | None = None):
         super().__init__()
         self.gate_up_proj = MergedColumnParallelLinear(
             config.hidden_size, [config.intermediate_size] * 2,
+            quant_config=quant_config,
         )
         self.down_proj = RowParallelLinear(
             config.intermediate_size, config.hidden_size,
+            quant_config=quant_config,
         )
         self.act_fn = SiluAndMul()
 
