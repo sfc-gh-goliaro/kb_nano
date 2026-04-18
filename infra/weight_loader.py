@@ -1,6 +1,6 @@
 """
-Weight loader for Llama 3.1, Llama 4, Mixtral, Qwen2-VL, Qwen3-VL,
-GPT-OSS, and Whisper with tensor parallelism.
+Weight loader for Llama 3.1, Llama 4, Mixtral, Kimi-Linear, Qwen3-Next,
+Qwen2-VL, Qwen3-VL, GPT-OSS, and Whisper with tensor parallelism.
 
 Loads weights from HuggingFace safetensors and distributes them
 across TP shards using the weight_loader callbacks on each parameter.
@@ -29,10 +29,12 @@ except ImportError:
 from concurrent.futures import ThreadPoolExecutor
 
 from .tp import _tp_size
+from ..tasks.baseline.L4.kimi_linear import KimiLinearConfig, KimiLinearForCausalLM
 from ..tasks.baseline.L4.llama import LlamaConfig, LlamaForCausalLM
 from ..tasks.baseline.L4.llama4 import Llama4Config, Llama4ForCausalLM
 from ..tasks.baseline.L4.mixtral import MixtralConfig, MixtralForCausalLM
 from ..tasks.baseline.L4.qwen2_vl import Qwen2VLConfig, Qwen2VLForConditionalGeneration
+from ..tasks.baseline.L4.qwen3_next import Qwen3NextConfig, Qwen3NextForCausalLM
 from ..tasks.baseline.L4.qwen3_vl import Qwen3VLConfig, Qwen3VLForConditionalGeneration
 from ..tasks.baseline.L4.flux import FluxConfig, FluxPipeline
 from ..tasks.baseline.L4.whisper import WhisperConfig, WhisperForConditionalGeneration
@@ -51,6 +53,11 @@ def download_model(model_name: str) -> str:
 
 _EXPERT_RE = re.compile(
     r"(.+\.block_sparse_moe)\.experts\.(\d+)\.(w[123])\.weight"
+)
+
+# Qwen3-Next MoE expert pattern: mlp.experts.{j}.{gate_proj|up_proj|down_proj}.weight
+_QWEN_NEXT_EXPERT_RE = re.compile(
+    r"(.+\.mlp)\.experts\.(\d+)\.(gate_proj|up_proj|down_proj)\.weight"
 )
 
 # Qwen3-MoE fused expert weight patterns: gate_up_proj [E, 2*inter, hidden], down_proj [E, hidden, inter]
@@ -685,6 +692,25 @@ def load_weights(model, model_path: str, model_type: str = "llama") -> None:
             loaded += 1
             continue
 
+        # Handle MoE expert weights (Qwen3-Next: mlp.experts)
+        m = _QWEN_NEXT_EXPERT_RE.match(mapped_name)
+        if m:
+            moe_prefix, expert_id_str, proj_name = m.groups()
+            expert_id = int(expert_id_str)
+            if proj_name in ("gate_proj", "up_proj"):
+                param_name = f"{moe_prefix}.w13"
+                param = model.get_parameter(param_name)
+                param.weight_loader(
+                    param, _get_tensor(),
+                    expert_id, is_gate=(proj_name == "gate_proj"),
+                )
+            else:
+                param_name = f"{moe_prefix}.w2"
+                param = model.get_parameter(param_name)
+                param.weight_loader(param, _get_tensor(), expert_id)
+            loaded += 1
+            continue
+
         # Handle Qwen3-VL-MoE fused 3D expert weights, scales, and gate
         if is_qwen3_vl_moe:
             m_gate = _QWEN3_MOE_GATE_RE.match(mapped_name)
@@ -896,7 +922,7 @@ def _detect_model_type(model_name: str) -> str:
 
 def _detect_quant_config(model_name: str) -> dict | None:
     """Detect FP8 quantization config from HuggingFace config."""
-    hf_config = AutoConfig.from_pretrained(model_name)
+    hf_config = AutoConfig.from_pretrained(model_name, trust_remote_code=True)
     qc = getattr(hf_config, "quantization_config", None)
     if qc is None:
         return None
@@ -974,6 +1000,20 @@ def load_model(
         else:
             print("  Allocating Qwen3-VL model...")
         model = Qwen3VLForConditionalGeneration(config, quant_config=quant_config)
+    elif model_type == "kimi_linear":
+        config = KimiLinearConfig.from_pretrained(model_name)
+        config.dtype = dtype
+        print(f"  Allocating Kimi-Linear model ({config.num_experts} experts, "
+              f"{len(config.kda_layers)} KDA + {len(config.full_attn_layers)} MLA layers)...")
+        model = KimiLinearForCausalLM(config)
+    elif model_type == "qwen3_next":
+        config = Qwen3NextConfig.from_pretrained(model_name)
+        config.dtype = dtype
+        n_linear = sum(1 for lt in config.layer_types if lt == "linear_attention")
+        n_full = sum(1 for lt in config.layer_types if lt == "full_attention")
+        print(f"  Allocating Qwen3-Next model ({config.num_experts} experts, "
+              f"{n_linear} GDN + {n_full} full attention layers)...")
+        model = Qwen3NextForCausalLM(config)
     else:
         config = LlamaConfig.from_pretrained(model_name)
         config.dtype = dtype

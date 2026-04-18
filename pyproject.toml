@@ -17,6 +17,8 @@ dependencies = [
     "safetensors",
     "tqdm",
     "flash-attn",
+    "flash-linear-attention",
+    "blobfile",
     "vllm==0.18.0",
     "deep-gemm @ git+https://github.com/deepseek-ai/DeepGEMM.git@v2.1.1.post3",
     "decord",

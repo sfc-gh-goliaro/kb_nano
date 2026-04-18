@@ -1,12 +1,14 @@
 # kb-nano
 
-A standalone, high-performance inference engine supporting **LLMs** (Llama 3.1, Mixtral-8x7B, GPT-OSS, Qwen2-VL, Qwen3-VL), **diffusion models** (FLUX.1-dev, SDXL, HunyuanVideo-1.5), **detection models** (YOLOv10, RTDetrV2), **vision encoders** (SigLIP-2, DINOv3, SwinV2), **segmentation models** (SAM3.1), **protein structure prediction** (OpenFold3), audio models (Whisper), and **TTS models** (CosyVoice3) with tensor parallelism. No vLLM dependency at runtime — just PyTorch, Triton, and Flash Attention.
+A standalone, high-performance inference engine supporting **LLMs** (Llama 3.1, Mixtral-8x7B, GPT-OSS, Kimi-Linear, Qwen3-Next, Qwen2-VL, Qwen3-VL), **diffusion models** (FLUX.1-dev, SDXL, HunyuanVideo-1.5), **detection models** (YOLOv10, RTDetrV2), **vision encoders** (SigLIP-2, DINOv3, SwinV2), **segmentation models** (SAM3.1), **protein structure prediction** (OpenFold3), audio models (Whisper), and **TTS models** (CosyVoice3) with tensor parallelism. No vLLM dependency at runtime — just PyTorch, Triton, and Flash Attention.
 
 ## Features
 
 - **Llama 3.1** (8B, 70B) with frequency-scaled RoPE
 - **Mixtral-8x7B** with fused Triton MoE grouped-GEMM kernels
 - **GPT-OSS** (20B, 120B) MXFP4-quantized MoE with native Triton inference, YaRN RoPE, attention sinks, and sliding window
+- **Kimi-Linear-48B-A3B-Instruct** hybrid recurrent + attention MoE: KDA (Kimi Delta Attention) linear-attention layers fused with MLA (Multi-head Latent Attention) full-attention layers, sigmoid-gated 256-expert MoE (top-8) with shared expert and `e_score_correction_bias` routing
+- **Qwen3-Next-80B-A3B-Instruct** hybrid recurrent + attention MoE: 3:1 GDN (Gated Delta Net) linear attention to full attention with output gating + per-head QK-norm + partial RoPE, softmax-gated 512-expert MoE (top-10) with sigmoid-gated shared expert
 - **FLUX.1-dev** diffusion transformer (text-to-image) with Flash Attention
 - **SDXL** (Stable Diffusion XL) UNet-based text-to-image with dual CLIP text encoders
 - **HunyuanVideo-1.5** 3D video diffusion transformer (text-to-video) with dual-stream joint attention, M-RoPE, and Qwen2.5-VL text encoder
@@ -112,6 +114,14 @@ python tests/bench_vllm.py \
 # GPT-OSS MoE (MXFP4 quantized)
 python tests/bench_vllm.py \
     --model openai/gpt-oss-120b --tp 2
+
+# Kimi-Linear-48B-A3B (hybrid KDA + MLA MoE)
+python tests/bench_vllm.py \
+    --model moonshotai/Kimi-Linear-48B-A3B-Instruct --tp 2
+
+# Qwen3-Next-80B-A3B (hybrid GDN + full-attention MoE)
+python tests/bench_vllm.py \
+    --model Qwen/Qwen3-Next-80B-A3B-Instruct --tp 2
 
 # Whisper speech-to-text
 python tests/bench_vllm.py --model openai/whisper-large-v3

@@ -34,6 +34,7 @@ from .context import (
     get_attn_backend_config, get_context,
     reset_context, set_context, set_forward_context, set_mixed_context,
 )
+from .kimi_linear_state import KimiLinearStateManager
 from ..tasks.baseline.L1.allreduce import set_custom_ar
 from .weight_loader import load_model
 
@@ -116,6 +117,7 @@ class Sequence:
         self.block_table: list[int] = []
         self.status = SeqStatus.WAITING
         self.num_computed_tokens: int = 0
+        self.state_slot: int | None = None
         # Multimodal fields
         self.pixel_values = None  # preprocessed image pixels
         self.image_grid_thw = None  # list of [t, h, w] per image
@@ -179,12 +181,21 @@ class Sequence:
 
     def __getstate__(self):
         """Minimal pickling for shared memory transfer to non-rank-0 workers."""
-        return (len(self), len(self.prompt_ids), self.block_table,
-                self.num_computed_tokens,
-                self.token_ids if not self.generated_ids else self.last_token)
+        return (
+            len(self),
+            len(self.prompt_ids),
+            self.block_table,
+            self.num_computed_tokens,
+            self.state_slot,
+            self.token_ids if not self.generated_ids else self.last_token,
+        )
 
     def __setstate__(self, state):
-        self._num_tokens, num_prompt, self.block_table, self.num_computed_tokens = state[:-1]
+        if len(state) == 6:
+            self._num_tokens, num_prompt, self.block_table, self.num_computed_tokens, self.state_slot = state[:-1]
+        else:
+            self._num_tokens, num_prompt, self.block_table, self.num_computed_tokens = state[:-1]
+            self.state_slot = None
         if isinstance(state[-1], list):
             self.token_ids = state[-1]
         else:
@@ -281,7 +292,7 @@ class ModelRunner:
 
         if dtype is None:
             from transformers import AutoConfig
-            _cfg = AutoConfig.from_pretrained(model_name)
+            _cfg = AutoConfig.from_pretrained(model_name, trust_remote_code=True)
             cfg_dtype = getattr(_cfg, "torch_dtype", None)
             if cfg_dtype is not None and isinstance(cfg_dtype, torch.dtype):
                 dtype = cfg_dtype
@@ -308,19 +319,28 @@ class ModelRunner:
                 getattr(self.config, "max_target_positions", self.max_model_len),
             )
 
+        model_type = getattr(self.config, "model_type", "")
+        self.model_family = (
+            "mamba" if model_type in {"kimi_linear", "qwen3_next"}
+            else "attention"
+        )
+
         auto_register_no_compile_layers(self.model)
 
         self._compiled = False
-        self._share_trtllm_workspace()
-        self._share_activation_buffers()
-        self.warmup_model()
-        self._warmup_deepgemm()
-        self.allocate_kv_cache()
-        self._init_fa3_decode_buffers()
-        if not self.enforce_eager:
-            self._compile_model()
-            self.capture_cudagraph()
-        self._init_greedy_buffers()
+        if self.model_family == "attention":
+            self._share_trtllm_workspace()
+            self._share_activation_buffers()
+            self.warmup_model()
+            self._warmup_deepgemm()
+            self.allocate_kv_cache()
+            self._init_fa3_decode_buffers()
+            if not self.enforce_eager:
+                self._compile_model()
+                self.capture_cudagraph()
+            self._init_greedy_buffers()
+        else:
+            self.allocate_mamba_state_cache()
         torch.set_default_device("cpu")
         torch.set_default_dtype(default_dtype)
 
@@ -761,6 +781,119 @@ class ModelRunner:
             import gc
             gc.collect()
             torch.cuda.empty_cache()
+
+    def allocate_mamba_state_cache(self):
+        """Allocate hybrid model state: flat slotted KDA/GDN tensors + paged MLA/MHA KV.
+
+        We size the MLA / MHA paged-KV pool from remaining GPU memory after
+        accounting for the flat KDA / GDN state tensors (which the manager
+        allocates eagerly inside ``__init__``). The pool is then chunked into
+        ``BLOCK_SIZE``-sized blocks per layer, mirroring the standard
+        ``allocate_kv_cache`` accounting in this file.
+        """
+        model_type = getattr(self.config, "model_type", "")
+        if model_type not in ("kimi_linear", "qwen3_next"):
+            raise ValueError(f"Unsupported SSM model type for state cache: {model_type}")
+
+        num_slots = self.max_num_seqs
+        device = torch.device(f"cuda:{self.rank}")
+        dtype = torch.get_default_dtype()
+        elem_size = torch.finfo(dtype).bits // 8
+
+        # Per-MLA-layer block byte cost (K + V, V padded to qk_head_dim so K
+        # and V share head dim and we can use the standard FA3 varlen kernel).
+        if model_type == "kimi_linear":
+            local_mla_heads = self.config.num_attention_heads // self.world_size
+            qk_head_dim = self.config.qk_nope_head_dim + self.config.qk_rope_head_dim
+            mla_layer_count = sum(
+                1 for i in range(self.config.num_hidden_layers)
+                if not self.config.is_kda_layer(i)
+            )
+            per_token_kv_bytes = 2 * local_mla_heads * qk_head_dim * elem_size
+        else:
+            local_kv_heads = max(
+                1, self.config.num_key_value_heads // self.world_size
+            )
+            head_dim = getattr(
+                self.config, "head_dim",
+                self.config.hidden_size // self.config.num_attention_heads,
+            )
+            mla_layer_count = sum(
+                1 for i in range(self.config.num_hidden_layers)
+                if not self.config.is_linear_attn_layer(i)
+            )
+            per_token_kv_bytes = 2 * local_kv_heads * head_dim * elem_size
+        block_bytes_per_layer = BLOCK_SIZE * per_token_kv_bytes
+        block_bytes_total = block_bytes_per_layer * mla_layer_count
+
+        # Reserve the GPU memory budget *before* allocating the state manager
+        # tensors, since those allocations themselves count against the budget.
+        free, total = torch.cuda.mem_get_info()
+        used = total - free
+        peak = torch.cuda.memory_stats()["allocated_bytes.all.peak"]
+        current = torch.cuda.memory_stats()["allocated_bytes.all.current"]
+        available_bytes = int(
+            total * self.gpu_memory_utilization - used - peak + current
+        )
+
+        # First, ask the state manager to compute its own (flat KDA / GDN)
+        # footprint so we can subtract it from the MLA budget. We do this by
+        # constructing it with ``num_mla_blocks=0`` to size the slotted state
+        # only, measure the new resident bytes, then reallocate with the
+        # correct block count. Cheap because both phases are torch.zeros().
+        self.mamba_state_manager = KimiLinearStateManager(
+            config=self.config,
+            num_slots=num_slots,
+            block_size=BLOCK_SIZE,
+            num_mla_blocks=0,
+            tp_size=self.world_size,
+            device=device,
+            dtype=dtype,
+        )
+        slotted_bytes = (
+            torch.cuda.memory_stats()["allocated_bytes.all.current"] - current
+        )
+        del self.mamba_state_manager
+        torch.cuda.empty_cache()
+
+        kv_budget = max(0, available_bytes - slotted_bytes)
+        if mla_layer_count > 0 and block_bytes_total > 0:
+            num_mla_blocks = max(1, kv_budget // block_bytes_total)
+        else:
+            num_mla_blocks = 0
+
+        self.mamba_state_manager = KimiLinearStateManager(
+            config=self.config,
+            num_slots=num_slots,
+            block_size=BLOCK_SIZE,
+            num_mla_blocks=num_mla_blocks,
+            tp_size=self.world_size,
+            device=device,
+            dtype=dtype,
+        )
+        self.num_state_slots = num_slots
+
+        if self.rank == 0:
+            label = "Kimi-Linear" if model_type == "kimi_linear" else "Qwen3-Next"
+            print(
+                f"  {label} state cache: {num_slots} sequence slots, "
+                f"{num_mla_blocks} MLA/MHA blocks "
+                f"(x {BLOCK_SIZE} = {num_mla_blocks * BLOCK_SIZE} KV token slots, "
+                f"{mla_layer_count} full-attn layers)"
+            )
+
+    def can_allocate_mamba_state(self):
+        return self.mamba_state_manager.has_free_slot()
+
+    def allocate_mamba_state(self, seq):
+        self.mamba_state_manager.allocate(seq)
+
+    def deallocate_mamba_state(self, seq):
+        self.mamba_state_manager.deallocate(seq)
+
+    def reset_mamba_state(self):
+        """Return all mamba state slots to the free pool (per-rank)."""
+        self.mamba_state_manager.reset()
 
     def prepare_prefill(self, seqs):
         input_ids, positions = [], []
@@ -1423,7 +1556,229 @@ class ModelRunner:
             return self.run_decode_greedy_fast_async(decode_data)
         return self.run_decode_greedy_fast_async(decode_data)
 
+    @torch.inference_mode()
+    def _run_kimi_linear_batch(self, seqs, is_prefill):
+        """vLLM-style batched forward for Kimi-Linear.
+
+        Builds a single flat ``[num_actual_tokens]`` token stream from all
+        sequences, constructs a ``KimiLinearMetadata`` describing the batch
+        (``cu_seqlens``, ``state_indices``, paged ``slot_mapping`` /
+        ``block_tables``, prefill / decode split), runs the model once, and
+        gathers per-sequence last-token logits.
+
+        Pure-decode batches and pure-prefill batches both flow through this
+        path; the engine's mamba scheduler keeps them homogeneous so the
+        decode-first ordering convention is trivially satisfied (a pure
+        prefill batch has ``num_decodes == 0``).
+        """
+        if not seqs:
+            return None
+        from .context import reset_context
+        from .kimi_linear_metadata import KimiLinearMetadata, set_metadata, reset_metadata
+
+        # Reset the legacy paged-KV ``Context`` so a stale prefill/decode
+        # state from a previous attention-family run can't leak into the
+        # KimiLinearMetadata path (in particular into ``lm_head.project``).
+        reset_context()
+
+        device = torch.device(f"cuda:{self.rank}")
+        sm_ = self.mamba_state_manager
+
+        # 1) Per-request allocations: ensure each seq has the MLA paged blocks
+        # it needs to write its KV for this step.
+        for seq in seqs:
+            if seq.state_slot is None:
+                raise RuntimeError("Kimi-Linear sequence has no allocated state slot")
+            total_after = (
+                len(seq.token_ids) if is_prefill
+                else seq.num_computed_tokens + 1
+            )
+            sm_.ensure_blocks_for(seq, total_after)
+
+        # 2) Flat batch construction (decode-first convention; with this
+        # scheduler all seqs are homogeneous so the split is trivial).
+        ids: list[int] = []
+        positions: list[int] = []
+        cu: list[int] = [0]
+        slot_mapping: list[int] = []
+        state_indices: list[int] = []
+        seq_lens: list[int] = []
+        has_initial_state: list[bool] = []
+        block_tables_rows: list[list[int]] = []
+        max_query_len = 0
+        max_seq_len = 0
+        max_blocks = 0
+        block_size = sm_.block_size
+
+        for seq in seqs:
+            if is_prefill:
+                tokens = list(seq.token_ids)
+                start_pos = 0
+                init_state = False
+            else:
+                tokens = [seq.last_token]
+                start_pos = seq.num_computed_tokens
+                init_state = True
+
+            n_tok = len(tokens)
+            ids.extend(tokens)
+            positions.extend(range(start_pos, start_pos + n_tok))
+            cu.append(cu[-1] + n_tok)
+            state_indices.append(seq.state_slot)
+            seq_total = start_pos + n_tok
+            seq_lens.append(seq_total)
+            has_initial_state.append(init_state)
+            max_query_len = max(max_query_len, n_tok)
+            max_seq_len = max(max_seq_len, seq_total)
+
+            # Per-token paged-KV slot id (block * block_size + offset).
+            for t in range(n_tok):
+                global_pos = start_pos + t
+                block_idx = global_pos // block_size
+                if block_idx < len(seq.block_table):
+                    block_id = seq.block_table[block_idx]
+                    slot_mapping.append(block_id * block_size + (global_pos % block_size))
+                else:
+                    slot_mapping.append(-1)  # PAD_SLOT_ID
+            block_tables_rows.append(list(seq.block_table))
+            max_blocks = max(max_blocks, len(seq.block_table))
+
+        N = len(ids)
+        B = len(seqs)
+
+        # 3) Move metadata to GPU in pinned-memory transfers.
+        ids_t = torch.tensor(ids, dtype=torch.int64, pin_memory=True).to(device, non_blocking=True)
+        pos_t = torch.tensor(positions, dtype=torch.int64, pin_memory=True).to(device, non_blocking=True)
+        # fla varlen kernels require int64 ``cu_seqlens``; FA3 requires
+        # int32. We carry int64 in metadata and cast to int32 in MLA.
+        cu_cpu = torch.tensor(cu, dtype=torch.int64, pin_memory=True)
+        cu_gpu = cu_cpu.to(device, non_blocking=True)
+        state_idx_t = torch.tensor(state_indices, dtype=torch.int32, pin_memory=True).to(device, non_blocking=True)
+        seq_lens_t = torch.tensor(seq_lens, dtype=torch.int32, pin_memory=True).to(device, non_blocking=True)
+        has_init_t = torch.tensor(has_initial_state, dtype=torch.bool, pin_memory=True).to(device, non_blocking=True)
+        slot_t = torch.tensor(slot_mapping, dtype=torch.int32, pin_memory=True).to(device, non_blocking=True)
+
+        if max_blocks == 0:
+            block_tables_t = torch.zeros((B, 1), dtype=torch.int32, device=device)
+        else:
+            import numpy as _np
+            bt = _np.full((B, max_blocks), -1, dtype=_np.int32)
+            for i, row in enumerate(block_tables_rows):
+                if row:
+                    bt[i, : len(row)] = row
+            block_tables_t = torch.from_numpy(bt).pin_memory().to(device, non_blocking=True)
+
+        # logit_indices: index of each sequence's *last* flat token (for
+        # sampling). Always cu[i+1]-1 because we pack N contiguous tokens.
+        logit_idx_cpu = (cu_cpu[1:] - 1).to(torch.int64)
+        logit_idx_t = logit_idx_cpu.to(device, non_blocking=True)
+
+        # In this scheduler, every batch is homogeneously prefill XOR decode,
+        # so the decode-first split is degenerate.
+        if is_prefill:
+            num_decodes = 0
+            num_decode_tokens = 0
+            num_prefills = B
+            num_prefill_tokens = N
+        else:
+            num_decodes = B
+            num_decode_tokens = N
+            num_prefills = 0
+            num_prefill_tokens = 0
+
+        md = KimiLinearMetadata(
+            num_actual_tokens=N,
+            batch_size=B,
+            positions=pos_t,
+            query_start_loc=cu_gpu,
+            query_start_loc_cpu=cu_cpu,
+            max_query_len=max_query_len,
+            seq_lens=seq_lens_t,
+            max_seq_len=max_seq_len,
+            state_indices=state_idx_t,
+            num_prefills=num_prefills,
+            num_prefill_tokens=num_prefill_tokens,
+            num_decodes=num_decodes,
+            num_decode_tokens=num_decode_tokens,
+            has_initial_state=has_init_t,
+            slot_mapping=slot_t,
+            block_tables=block_tables_t,
+            logit_indices=logit_idx_t,
+        )
+
+        # 4) Single batched forward + per-sequence last-token gather.
+        set_metadata(md)
+        try:
+            hidden_states = self.model(
+                ids_t, positions=pos_t, state_manager=sm_,
+            )
+        finally:
+            reset_metadata()
+
+        last_hidden = hidden_states.index_select(0, logit_idx_t)
+        logits = self.model.compute_logits(last_hidden)
+
+        # 5) Bookkeeping.
+        for seq in seqs:
+            if is_prefill:
+                seq.num_computed_tokens = len(seq.token_ids)
+            else:
+                seq.num_computed_tokens += 1
+        return logits
+
+    @torch.inference_mode()
+    def _run_qwen3_next_seq(self, seq, is_prefill):
+        raise NotImplementedError(
+            "Qwen3-Next per-sequence path is disabled; the batched path "
+            "(mirroring _run_kimi_linear_batch) needs to be wired up after "
+            "the state manager rewrite."
+        )
+        slot_cache = self.mamba_state_manager.get_slot_cache(seq.state_slot)
+
+        if is_prefill:
+            input_ids = torch.tensor(
+                seq.token_ids, dtype=torch.int64, device=f"cuda:{self.rank}",
+            ).unsqueeze(0)
+        else:
+            input_ids = torch.tensor(
+                [[seq.last_token]], dtype=torch.int64, device=f"cuda:{self.rank}",
+            )
+
+        T = input_ids.shape[1]
+        positions = torch.arange(
+            seq.num_computed_tokens,
+            seq.num_computed_tokens + T,
+            dtype=torch.int64,
+            device=input_ids.device,
+        )
+
+        hidden_states = self.model(
+            input_ids,
+            positions=positions,
+            layer_states=slot_cache,
+        )
+        logits = self.model.compute_logits(hidden_states[:, -1:, :])[:, -1, :]
+
+        if is_prefill:
+            seq.num_computed_tokens = T
+        else:
+            seq.num_computed_tokens += 1
+        return logits
+
+    @torch.inference_mode()
+    def _run_qwen3_next_batch(self, seqs, is_prefill):
+        outputs = [self._run_qwen3_next_seq(seq, is_prefill) for seq in seqs]
+        if not outputs:
+            return None
+        return torch.cat(outputs, dim=0)
+
     def run(self, seqs, is_prefill):
+        if self.model_family == "mamba":
+            model_type = getattr(self.config, "model_type", "")
+            if model_type == "kimi_linear":
+                return self._run_kimi_linear_batch(seqs, is_prefill)
+            if model_type == "qwen3_next":
+                return self._run_qwen3_next_batch(seqs, is_prefill)
         input_ids, positions = (
             self.prepare_prefill(seqs) if is_prefill
             else self.prepare_decode(seqs)
@@ -2054,18 +2409,35 @@ class LlamaEngine:
             enforce_eager, self.events, shm_name,
             **mr_kwargs,
         )
-        self.block_manager = BlockManager(self.model_runner.num_blocks)
-        if hasattr(self.model_runner, '_cross_free_block_ids_init'):
-            n = self.model_runner._cross_free_block_ids_init
-            self.block_manager.cross_free_block_ids = deque(range(n))
-            self.block_manager._num_cross_blocks = n
-        if hasattr(self.model_runner, 'cross_blocks_per_seq'):
-            self.cross_blocks_per_seq = self.model_runner.cross_blocks_per_seq
+        self.model_family = self.model_runner.model_family
+        self.model_type = getattr(self.model_runner.config, "model_type", "")
+        if self.model_family == "attention":
+            self.block_manager = BlockManager(self.model_runner.num_blocks)
+            if hasattr(self.model_runner, '_cross_free_block_ids_init'):
+                n = self.model_runner._cross_free_block_ids_init
+                self.block_manager.cross_free_block_ids = deque(range(n))
+                self.block_manager._num_cross_blocks = n
+            if hasattr(self.model_runner, 'cross_blocks_per_seq'):
+                self.cross_blocks_per_seq = self.model_runner.cross_blocks_per_seq
+        else:
+            # Mamba/SSM families (kimi_linear, qwen3_next) don't use a
+            # paged-attention BlockManager, but bench harnesses still call
+            # ``engine.block_manager.reset()`` between scenarios. Expose a
+            # tiny shim that forwards reset() to the rank-0 state manager
+            # and broadcasts to other ranks via the existing dispatch loop.
+            engine_self = self
+
+            class _MambaBlockManagerShim:
+                def reset(self_inner) -> None:
+                    engine_self.model_runner.call("reset_mamba_state")
+
+            self.block_manager = _MambaBlockManagerShim()
         self.max_num_seqs = self.model_runner.max_num_seqs
         print(f"  Scheduling: max_num_seqs={self.max_num_seqs}, "
               f"max_num_batched_tokens={self.max_num_batched_tokens}")
 
-        self.tokenizer = AutoTokenizer.from_pretrained(model_name)
+        self.tokenizer = AutoTokenizer.from_pretrained(
+            model_name, trust_remote_code=True)
         if self.tokenizer.pad_token_id is None:
             self.tokenizer.pad_token_id = self.tokenizer.eos_token_id
 
@@ -2075,7 +2447,8 @@ class LlamaEngine:
         self.processor = None
         if self.is_qwen_vl:
             from transformers import AutoProcessor
-            self.processor = AutoProcessor.from_pretrained(model_name)
+            self.processor = AutoProcessor.from_pretrained(
+                model_name, trust_remote_code=True)
 
         self.encoder_cache: dict[int, tuple] = {}
 
@@ -2559,6 +2932,12 @@ class LlamaEngine:
         _preprocess_time = time.perf_counter() - _preprocess_t0
         if os.environ.get("KB_NANO_STEP_PROFILE") == "1":
             print(f"[Profile] Preprocessing {num_prompts} seqs: {_preprocess_time:.3f}s")
+
+        if self.model_family == "mamba":
+            return self._generate_mamba(
+                prompts, sp_list, waiting, running, all_seqs,
+                collect_logits, seq_logits, use_tqdm,
+            )
 
         pbar = None
         if use_tqdm:
@@ -3138,6 +3517,126 @@ class LlamaEngine:
             for i in range(len(prompts))
         ]
 
+    def _generate_mamba(self, prompts, sp_list, waiting, running, all_seqs,
+                        collect_logits, seq_logits, use_tqdm=False):
+        """SSM scheduling loop for recurrent/hybrid models (Kimi-Linear, Qwen3-Next)."""
+        eos = self.tokenizer.eos_token_id
+        max_num_seqs = self.max_num_seqs
+
+        num_prompts = len(prompts)
+        pbar = None
+        total_in_toks = 0
+        total_out_toks = 0
+        if use_tqdm:
+            from tqdm import tqdm as _tqdm
+            pbar = _tqdm(total=num_prompts, desc="Processed prompts",
+                         dynamic_ncols=True,
+                         postfix="est. speed input: 0.00 toks/s, "
+                                 "output: 0.00 toks/s")
+
+        def _on_finish(seq):
+            nonlocal total_in_toks, total_out_toks
+            if pbar is None:
+                return
+            total_in_toks += seq.num_prompt_tokens
+            total_out_toks += len(seq.generated_ids)
+            elapsed = pbar.format_dict["elapsed"]
+            if elapsed > 0:
+                pbar.postfix = (
+                    f"est. speed input: {total_in_toks / elapsed:.2f}"
+                    f" toks/s, output: "
+                    f"{total_out_toks / elapsed:.2f} toks/s"
+                )
+            pbar.update(1)
+
+        max_batched_tokens = self.max_num_batched_tokens
+        while waiting or running:
+            prefill_seqs = []
+            prefill_tokens = 0
+            while (
+                waiting
+                and len(prefill_seqs) < max_num_seqs
+                and self.model_runner.can_allocate_mamba_state()
+            ):
+                # Token budget: keep each prefill step within
+                # ``max_num_batched_tokens`` so that activation memory for the
+                # batched forward stays bounded (matches vLLM's chunk-prefill
+                # token budget). Always admit at least one sequence.
+                seq_len = len(waiting[0].token_ids)
+                if (
+                    prefill_seqs
+                    and prefill_tokens + seq_len > max_batched_tokens
+                ):
+                    break
+                seq = waiting.popleft()
+                self.model_runner.allocate_mamba_state(seq)
+                seq.status = SeqStatus.RUNNING
+                running.append(seq)
+                prefill_seqs.append(seq)
+                prefill_tokens += seq_len
+
+            if prefill_seqs:
+                logits = self.model_runner.call("run", prefill_seqs, True)
+                if logits is not None:
+                    if collect_logits:
+                        for i, seq in enumerate(prefill_seqs):
+                            seq_logits[id(seq)].append(logits[i:i+1].cpu())
+                    token_ids = self._sample(logits, sp_list[0])
+                    finished_set = set()
+                    for seq, tid in zip(prefill_seqs, token_ids):
+                        seq.append_token(tid)
+                        done = len(seq.generated_ids) >= seq.max_tokens
+                        if not seq.ignore_eos:
+                            done = done or tid == eos
+                        if done:
+                            seq.status = SeqStatus.FINISHED
+                            finished_set.add(id(seq))
+                            self.model_runner.deallocate_mamba_state(seq)
+                            _on_finish(seq)
+                    if finished_set:
+                        running = deque(s for s in running if id(s) not in finished_set)
+
+            if not running:
+                continue
+
+            decode_seqs = list(running)
+            result = self.model_runner.call("run", decode_seqs, False)
+            if result is not None:
+                if collect_logits:
+                    for i, seq in enumerate(decode_seqs):
+                        seq_logits[id(seq)].append(result[i:i+1].cpu())
+                token_ids = self._sample(result, sp_list[0])
+                finished_set = set()
+                for seq, tid in zip(decode_seqs, token_ids):
+                    seq.append_token(tid)
+                    done = len(seq.generated_ids) >= seq.max_tokens
+                    if not seq.ignore_eos:
+                        done = done or tid == eos
+                    if done:
+                        seq.status = SeqStatus.FINISHED
+                        finished_set.add(id(seq))
+                        self.model_runner.deallocate_mamba_state(seq)
+                        _on_finish(seq)
+                if finished_set:
+                    running = deque(s for s in running if id(s) not in finished_set)
+
+        if pbar is not None:
+            pbar.close()
+
+        return [
+            GenerationOutput(
+                prompt=(prompts[i] if isinstance(prompts[i], str) else ""),
+                generated_text=self.tokenizer.decode(
+                    all_seqs[i].generated_ids, skip_special_tokens=True,
+                ),
+                token_ids=all_seqs[i].generated_ids,
+                logits_history=(
+                    seq_logits.get(id(all_seqs[i])) if collect_logits else None
+                ),
+            )
+            for i in range(len(prompts))
+        ]
+
     def _process_prefill_logits(
         self, logits, prefill_seqs, prefill_chunk_sizes,
         sp, eos, collect_logits, seq_logits,
@@ -3185,4 +3684,3 @@ class LlamaEngine:
                     bm.deallocate(seq)
             else:
                 running.append(seq)
-
