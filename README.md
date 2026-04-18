@@ -7,6 +7,7 @@ A standalone, high-performance inference engine supporting **LLMs** (Llama 3.1, 
 - **Llama 3.1** (8B, 70B) with frequency-scaled RoPE
 - **Mixtral-8x7B** with fused Triton MoE grouped-GEMM kernels
 - **GPT-OSS** (20B, 120B) MXFP4-quantized MoE with native Triton inference, YaRN RoPE, attention sinks, and sliding window
+- **Mamba / Mamba2** (`state-spaces/mamba-2.8b-hf`, `mistralai/Mamba-Codestral-7B-v0.1`) selective state-space models with vLLM-aligned `causal_conv1d` + `mamba_chunk_scan` / `selective_scan` kernels, slot-based recurrent state cache, chunked-prefill metadata, and TP sharding (incl. `n_groups % tp != 0` head-shard groups)
 - **FLUX.1-dev** diffusion transformer (text-to-image) with Flash Attention
 - **SDXL** (Stable Diffusion XL) UNet-based text-to-image with dual CLIP text encoders
 - **HunyuanVideo-1.5** 3D video diffusion transformer (text-to-video) with dual-stream joint attention, M-RoPE, and Qwen2.5-VL text encoder
@@ -505,6 +506,23 @@ Latency (128 output tokens, 5 iterations):
 | gpt-oss-120b | 2 | fixed-batch-32 | 32 | 3.044s | 1.393s | 0.74 | 0.34 | **2.19x** |
 
 The 120B model shows strong throughput advantages (1.06-1.26x) and a 2.19x batched latency speedup. The lower token match rate for the 120B model is expected: with 128 experts and top-4 routing, small numerical differences in router logits cause different expert selections, which cascade into divergent outputs. The 20B model (32 experts) shows higher match rates (85-90%).
+
+### Mamba / Mamba2 (Selective State-Space)
+
+Run `tests/bench_vllm.py --model state-spaces/mamba-2.8b-hf --enforce-eager` and `tests/bench_vllm.py --model mistralai/Mamba-Codestral-7B-v0.1 --enforce-eager` to reproduce. 1000 sequences per scenario, `temperature=0`, eager mode (vLLM Mamba/Mamba2 do not currently support CUDA graphs / `torch.compile`). kb-nano reuses vLLM's `causal_conv1d` + `mamba_chunk_scan_combined_varlen` / `selective_scan_fn` Triton kernels behind a slot-based recurrent state cache and a chunked-prefill scheduler with a `max_num_batched_tokens` budget.
+
+Throughput (1000 sequences per scenario, eager mode):
+
+| Model | TP | Scenario | Input/Output | vLLM (tok/s) | Ours (tok/s) | Ratio | Avg Match Tokens |
+|-------|---:|----------|:------------:|-------------:|-------------:|------:|-----------------:|
+| mamba-2.8b-hf            | 1 | prefill-heavy | 1024/512  |  7,608 |  4,799 | 0.63x | 389.4/512 |
+| mamba-2.8b-hf            | 1 | balanced      |  512/512  |  8,255 |  5,795 | 0.70x | 369.1/512 |
+| mamba-2.8b-hf            | 1 | decode-heavy  |  512/1024 | 13,640 |  8,012 | 0.59x | 729.8/1024 |
+| Mamba-Codestral-7B-v0.1  | 1 | prefill-heavy | 1024/512  |  3,511 |  2,911 | 0.83x | 413.2/512 |
+| Mamba-Codestral-7B-v0.1  | 1 | balanced      |  512/512  |  4,147 |  3,283 | 0.79x | 421.4/512 |
+| Mamba-Codestral-7B-v0.1  | 1 | decode-heavy  |  512/1024 |  4,489 |  3,524 | 0.78x | 823.4/1024 |
+
+Token alignment is in the expected range for two independent SSM implementations (~72-80%): the recurrent state accumulates small bf16 numerical differences over the full prefill chunk-scan, and divergences compound across the decode loop. The throughput gap vs vLLM comes primarily from vLLM's Mamba scheduler doing slightly tighter batching of mixed prefill+decode steps and from kb-nano not yet fusing the post-SSM RMSNorm-gated path. The Codestral-7B (Mamba2) gap is smaller than the 2.8B (Mamba v1) gap because the SSD chunk-scan kernel dominates runtime at 7B scale, and both engines call the same Triton kernel.
 
 **Hardware: 4x NVIDIA B200 (NVLink)**
 

@@ -194,7 +194,10 @@ class MambaMixer(nn.Module):
             # Profile / warmup path (no cache available).
             return self.out_proj(x)
 
-        conv_state = mamba_state.conv_states[self.layer_idx]
+        # MambaStateManager allocates as ``[N, kernel-1, dim]`` so we
+        # transpose to the kernel's expected ``[N, dim, kernel-1]`` view
+        # which keeps ``stride(dim) == 1``.
+        conv_state = mamba_state.conv_states[self.layer_idx].transpose(-1, -2)
         ssm_state = mamba_state.ssm_states[self.layer_idx]
 
         num_prefill_tokens = mamba_meta.num_prefill_tokens

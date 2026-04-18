@@ -2723,19 +2723,36 @@ class LlamaEngine:
         def _admit():
             """Allocate a state slot for as many waiting seqs as fit.
 
+            Respects both the slot pool (``can_allocate_mamba_state``) and
+            the per-step token budget (``max_num_batched_tokens``): the
+            sum of admitted prompt lengths plus one decode token per
+            running seq must stay under the budget.  This prevents a
+            single forward pass from ballooning to >100k tokens at large
+            batch sizes (which would OOM the SSM kernels).
+
             Allocation must happen on every TP rank so each rank's local
             ``MambaStateManager`` agrees on slot ownership.  ``call``
             broadcasts via SHM and runs locally on rank 0.
             """
             admitted: list[Sequence] = []
+            token_budget = max(
+                getattr(self.model_runner, "max_num_batched_tokens", 16384),
+                1,
+            )
+            tokens_used = len(running)  # 1 decode token per running seq
             while (
                 waiting
                 and self.model_runner.can_allocate_mamba_state()
                 and len(running) + len(admitted) < self.max_num_seqs
             ):
-                s = waiting.popleft()
+                s = waiting[0]
+                seq_tokens = len(s.token_ids) - s.num_computed_tokens
+                if admitted and tokens_used + seq_tokens > token_budget:
+                    break
+                waiting.popleft()
                 self.model_runner.call("allocate_mamba_state", s)
                 admitted.append(s)
+                tokens_used += seq_tokens
             return admitted
 
         def _sample(logits_row: torch.Tensor, sp) -> int:

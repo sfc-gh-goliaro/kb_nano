@@ -393,7 +393,10 @@ class Mamba2Mixer(nn.Module):
             y = self.norm(x, gate)
             return self.out_proj(y)
 
-        conv_state = mamba_state.conv_states[self.layer_idx]
+        # MambaStateManager allocates as ``[N, kernel-1, conv_dim]``;
+        # transpose to ``[N, conv_dim, kernel-1]`` so the conv kernels'
+        # ``stride_istate_dim == 1`` requirement is satisfied.
+        conv_state = mamba_state.conv_states[self.layer_idx].transpose(-1, -2)
         ssm_state = mamba_state.ssm_states[self.layer_idx]
 
         num_prefill_tokens = mamba_meta.num_prefill_tokens
@@ -436,7 +439,6 @@ class Mamba2Mixer(nn.Module):
                 has_initial_state=mamba_meta.has_initial_states_p,
                 cache_indices=mamba_meta.state_indices_p,
                 query_start_loc=mamba_meta.query_start_loc_p,
-                metadata=mamba_meta,
             ).transpose(0, 1)[:num_prefill_tokens]
 
             x_p, B_p, C_p = self._split_BC(hsBC_p)

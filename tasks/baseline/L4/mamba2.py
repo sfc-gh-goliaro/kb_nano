@@ -119,7 +119,9 @@ class Mamba2ForCausalLM(nn.Module):
         self.backbone = Mamba2Model(config)
         self.lm_head = ParallelLMHead(config.vocab_size, config.hidden_size)
         if config.tie_word_embeddings:
-            self.lm_head.weight = self.backbone.embeddings.weight
+            self.lm_head.embedding_op.emb.weight = (
+                self.backbone.embeddings.embedding_op.emb.weight
+            )
 
     def forward(self, input_ids, positions):
         return self.backbone(input_ids, positions)

@@ -80,10 +80,15 @@ class MambaStateManager:
         self.conv_states: list[torch.Tensor] = []
         self.ssm_states: list[torch.Tensor] = []
         for _ in range(num_hidden_layers):
+            # Layout matches vLLM's mamba1/2 state cache:
+            #   ``[num_slots, conv_kernel - 1, conv_dim]``.
+            # Mixers transpose the last two dims when handing the cache
+            # to ``causal_conv1d_fn`` / ``causal_conv1d_update`` so that
+            # the kernel-required ``stride_istate_dim == 1`` holds.
             conv_state = torch.zeros(
                 num_slots,
+                max(conv_kernel - 1, 1),
                 conv_dim,
-                conv_kernel,
                 device=device,
                 dtype=dtype,
             )
