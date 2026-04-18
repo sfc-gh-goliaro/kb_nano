@@ -94,22 +94,7 @@ class DenseAttention(nn.Module):
         causal=False,
         attn_mask: torch.Tensor | None = None,
     ):
-        # Custom masks need SDPA (FlashAttn path does not support arbitrary masks).
-        if attn_mask is not None:
-            q = query.permute(0, 2, 1, 3)
-            k = key.permute(0, 2, 1, 3)
-            v = value.permute(0, 2, 1, 3)
-            am = attn_mask.to(dtype=q.dtype)
-            out = F.scaled_dot_product_attention(
-                q, k, v,
-                attn_mask=am,
-                dropout_p=0.0,
-                is_causal=False,
-                scale=softmax_scale,
-            )
-            return out.permute(0, 2, 1, 3)
-
-        if self.fa_func is not None and query.dtype != torch.float32:
+        if self.fa_func is not None and attn_mask is None and query.dtype != torch.float32:
             out = self.fa_func(
                 query, key, value,
                 softmax_scale=softmax_scale,
@@ -119,13 +104,16 @@ class DenseAttention(nn.Module):
                 out = out[0]
             return out
 
+        # SDPA handles both the masked case and the plain causal/non-causal case.
+        # Custom masks force is_causal=False; FlashAttn does not support arbitrary masks.
         q = query.permute(0, 2, 1, 3)
         k = key.permute(0, 2, 1, 3)
         v = value.permute(0, 2, 1, 3)
         out = F.scaled_dot_product_attention(
             q, k, v,
+            attn_mask=attn_mask.to(dtype=q.dtype) if attn_mask is not None else None,
             dropout_p=0.0,
-            is_causal=causal,
+            is_causal=False if attn_mask is not None else causal,
             scale=softmax_scale,
         )
         return out.permute(0, 2, 1, 3)

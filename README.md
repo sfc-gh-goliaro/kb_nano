@@ -217,46 +217,105 @@ python tests/bench_diffusers.py --output-dir tests/results/B200/stable-diffusion
 
 ### Benchmarking vs OpenPI / HF Transformers (Pi0 Robotics VLA)
 
-Default runs use **real ALOHA pen_uncap** data (`physical-intelligence/aloha_pen_uncap_diverse`). Use `--synthetic-only` only for debugging.
+Default runs use **real robot demonstration data** from three domains: ALOHA, DROID, and LIBERO. Use `--synthetic-only` only for debugging.
 
-**Like-with-like comparison:** both kb-nano and OpenPI load the **same fine-tuned Pi0 checkpoint** (`pi0_aloha_pen_uncap`, converted to PyTorch) with `action_horizon=50`, `action_dim=32`. Both sides apply matching ALOHA transforms (joint flip, gripper encoding, z-score normalization) and use pre-generated shared noise for deterministic flow-matching. Correctness is measured on the 14-dim robot-space actions after full output post-processing. ALOHA is used because OpenPI publishes a real fine-tuned Pi0 checkpoint for it (unlike LIBERO, which only has Pi0.5).
+**Like-with-like comparison:** both kb-nano and OpenPI load the **same fine-tuned Pi0 checkpoint** (converted to PyTorch). Both sides apply matching domain-specific transforms and use pre-generated shared noise for deterministic flow-matching. Correctness is measured on robot-space actions after full output post-processing.
 
-**Install OpenPI** (upstream uses `uv sync` in a clone; do not install into the kb-nano venv — dependency pins conflict). Example: clone to `/raid/user_data/olu/openpi`, run `GIT_LFS_SKIP_SMUDGE=1 uv sync`, copy `src/openpi/models_pytorch/transformers_replace/*` into `.venv/lib/python3.11/site-packages/transformers/` per OpenPI README, then use `--reference-python /raid/user_data/olu/openpi/.venv/bin/python`.
+| Dataset | HF dataset | Checkpoint | action_dim | action_horizon |
+|---------|-----------|-----------|----------:|---------------:|
+| ALOHA | `physical-intelligence/aloha_pen_uncap_diverse` | `pi0_aloha_pen_uncap` | 14 | 50 |
+| DROID | `lerobot/droid_100` | `pi0_droid` | 8 | 10 |
+| LIBERO | `lerobot/libero_10_image` | `pi0_libero` | 7 | 50 |
 
-**One-time checkpoint conversion** (PyTorch weights from JAX):
+> **DROID dataset note:** `lerobot/droid_100` stores observations as MP4 videos.
+> The benchmark selects LeRobot's bundled `pyav` video backend
+> (`video_backend="pyav"`), which decodes without a system FFmpeg install.
+
+**Why a separate venv for OpenPI:** OpenPI pins `transformers==4.53.2` and requires manually overlaying `src/openpi/models_pytorch/transformers_replace/` into the transformers site-package. This conflicts with kb-nano's environment. Keep them isolated; pass `--reference-python` to point at the OpenPI interpreter.
+
+**Install OpenPI:**
+```bash
+# Clone (skip LFS checkpoints — we download separately)
+GIT_LFS_SKIP_SMUDGE=1 git clone https://github.com/physical-intelligence/openpi \
+  /raid/user_data/olu/openpi
+cd /raid/user_data/olu/openpi
+uv sync
+
+# Overlay the custom Transformers modules OpenPI requires
+cp -r src/openpi/models_pytorch/transformers_replace/* \
+  .venv/lib/python3.11/site-packages/transformers/
+```
+
+**One-time checkpoint conversion** (JAX → PyTorch safetensors). Repeat for each domain checkpoint:
 ```bash
 cd /raid/user_data/olu/openpi
+
+# ALOHA
 .venv/bin/python examples/convert_jax_model_to_pytorch.py \
   --checkpoint-dir ~/.cache/openpi/openpi-assets/checkpoints/pi0_aloha_pen_uncap \
   --config-name pi0_aloha_pen_uncap \
   --output-path /raid/user_data/olu/pi0_aloha_pen_uncap_pytorch
-
-# Copy assets (norm_stats required for OpenPI AlohaInputs/Outputs transforms)
 cp -a ~/.cache/openpi/openpi-assets/checkpoints/pi0_aloha_pen_uncap/assets \
   /raid/user_data/olu/pi0_aloha_pen_uncap_pytorch/
+
+# DROID
+.venv/bin/python examples/convert_jax_model_to_pytorch.py \
+  --checkpoint-dir ~/.cache/openpi/openpi-assets/checkpoints/pi0_droid \
+  --config-name pi0_droid \
+  --output-path /raid/user_data/olu/pi0_droid_pytorch
+cp -a ~/.cache/openpi/openpi-assets/checkpoints/pi0_droid/assets \
+  /raid/user_data/olu/pi0_droid_pytorch/
+
+# LIBERO
+.venv/bin/python examples/convert_jax_model_to_pytorch.py \
+  --checkpoint-dir ~/.cache/openpi/openpi-assets/checkpoints/pi0_libero \
+  --config-name pi0_libero \
+  --output-path /raid/user_data/olu/pi0_libero_pytorch
+cp -a ~/.cache/openpi/openpi-assets/checkpoints/pi0_libero/assets \
+  /raid/user_data/olu/pi0_libero_pytorch/
 ```
 
-The **OpenPI** reference uses `create_trained_policy` + `Policy.infer`. **Default is PyTorch** (`--openpi-backend pytorch`): the checkpoint must include **`model.safetensors`**. If PyTorch weights are missing, the benchmark **stops** (no automatic JAX fallback). Use **`--openpi-backend jax`** only when you explicitly want the JAX stack.
+The **OpenPI** reference uses `create_trained_policy` + `Policy.infer` with the PyTorch backend (`--openpi-backend pytorch`). The checkpoint must contain `model.safetensors`; there is no automatic JAX fallback. Use `--openpi-backend jax` only when explicitly testing the JAX stack.
 
 On shared GPUs, set `CUDA_VISIBLE_DEVICES` to an idle GPU (`nvidia-smi`).
 
 ```bash
-# kb-nano vs OpenPI PyTorch (same fine-tuned Pi0, pi0_aloha_pen_uncap config)
+# All three datasets vs OpenPI PyTorch
 CUDA_VISIBLE_DEVICES=3 python tests/bench_openpi.py \
-  --reference-python /raid/user_data/olu/openpi/.venv/bin/python
+  --reference-python /raid/user_data/olu/openpi/.venv/bin/python \
+  --model /raid/user_data/olu/pi0_aloha_pen_uncap_pytorch \
+  --droid-model /raid/user_data/olu/pi0_droid_pytorch \
+  --libero-model /raid/user_data/olu/pi0_libero_pytorch
 
-# kb-nano only
-python tests/bench_openpi.py --skip-reference
+# Single dataset
+CUDA_VISIBLE_DEVICES=3 python tests/bench_openpi.py \
+  --datasets aloha \
+  --reference-python /raid/user_data/olu/openpi/.venv/bin/python \
+  --model /raid/user_data/olu/pi0_aloha_pen_uncap_pytorch
 
-# Same Pi0 weights as kb-nano (HF reference — same-pipeline parity)
-python tests/bench_openpi.py --reference hf
+# kb-nano only (no OpenPI reference)
+python tests/bench_openpi.py --skip-reference \
+  --model /raid/user_data/olu/pi0_aloha_pen_uncap_pytorch \
+  --droid-model /raid/user_data/olu/pi0_droid_pytorch \
+  --libero-model /raid/user_data/olu/pi0_libero_pytorch
 
 # Synthetic tensors (debug only — not for reported benchmarks)
 python tests/bench_openpi.py --synthetic-only --num-requests 10 --num-steps 10
 
 # Save results to a specific directory
-python tests/bench_openpi.py --output-dir tests/results/B200/pi0_aloha
+python tests/bench_openpi.py --output-dir tests/results/B200/pi0
 ```
+
+**Results (B200, N=100, 10 flow-matching steps, bfloat16):**
+
+| Scenario | kb-nano ips | OpenPI ips | Speedup | kb-nano p50 latency | OpenPI p50 latency | CosSim | MSE |
+|---|---:|---:|---:|---:|---:|---:|---:|
+| ALOHA 3-cam | 29.35 | 8.11 | 3.62× | 33.8 ms | 121.6 ms | 0.9999995 | 2.3e-07 |
+| ALOHA 1-cam | 16.66 | 8.16 | 2.04× | 25.9 ms | 121.4 ms | 0.9999992 | 3.4e-07 |
+| DROID 2-cam | 33.76 | 8.13 | 4.15× | 29.7 ms | 122.8 ms | 0.9994678 | 5.6e-05 |
+| LIBERO 2-cam | 33.59 | 8.15 | 4.12× | 29.2 ms | 121.2 ms | 0.9994360 | 2.4e-04 |
+
+Correctness is the mean cosine similarity between kb-nano and OpenPI predicted action chunks on 100 real dataset samples, with both sides using the same shared flow-matching noise. All four scenarios clear the ≥0.99 bar.
 
 ### Benchmarking vs facebook/sam3 (Segmentation)
 
@@ -728,32 +787,38 @@ The remaining numerical divergence is expected from SDPA vs Flash Attention nume
 
 ### Pi0 (Robotics VLA)
 
-Run `tests/bench_openpi.py` to reproduce. Both engines load the same fine-tuned Pi0 checkpoint (`pi0_aloha_pen_uncap`, converted to PyTorch). Both sides apply matching ALOHA transforms (joint flip, gripper encoding, z-score normalization on input; un-normalize + AbsoluteActions + AlohaOutputs on output) and use pre-generated shared noise for identical flow-matching initialisation. OpenPI uses the `pi0_aloha_pen_uncap` config with PyTorch backend. 100 real ALOHA pen_uncap samples per scenario, 10 denoising steps.
+Run `tests/bench_openpi.py` to reproduce. Both engines load the same domain-specific fine-tuned Pi0 checkpoint (converted to PyTorch safetensors). Both sides apply matching domain transforms and use pre-generated shared noise for identical flow-matching initialisation. OpenPI uses the PyTorch backend. N=100 real dataset samples per scenario, 10 denoising steps, bfloat16.
 
 **Hardware: NVIDIA B200**
 
-Throughput (inferences/sec, real ALOHA data):
+Throughput + latency (single inference, p50 of 10 runs):
 
-| Scenario | Requests | OpenPI (inf/s) | Ours (inf/s) | Speedup |
-|----------|--------:|-----------:|-----------:|--------:|
-| 3-camera | 100 | 34.06 | 43.50 | **1.28x** |
-| 1-camera | 100 | 38.91 | 43.54 | **1.12x** |
+| Scenario | OpenPI (inf/s) | Ours (inf/s) | Speedup (thru) | OpenPI p50 | Ours p50 | Speedup (p50) |
+|----------|-----------:|-----------:|-----------:|----------:|--------:|-----------:|
+| aloha-3cam | 8.11 | 29.35 | **3.62x** | 121.6 ms | 33.8 ms | **3.60x** |
+| aloha-1cam | 8.16 | 16.66 | **2.04x** | 121.4 ms | 25.9 ms | **4.69x** |
+| droid-2cam | 8.13 | 33.76 | **4.15x** | 122.8 ms | 29.7 ms | **4.13x** |
+| libero-2cam | 8.15 | 33.59 | **4.12x** | 121.2 ms | 29.2 ms | **4.15x** |
 
-Latency (single inference, median of 10 runs):
+Correctness (mean cosine similarity of predicted action chunks vs OpenPI, shared noise):
 
-| Scenario | OpenPI p50 | Ours p50 | Speedup |
-|----------|----------:|--------:|--------:|
-| single-3cam | 0.026s | 0.023s | **1.13x** |
-| single-1cam | 0.026s | 0.023s | **1.12x** |
+| Scenario | action_dim | action_horizon | Samples | Mean CosSim | Mean MSE | Result |
+|----------|----------:|---------------:|--------:|------------:|---------:|-------:|
+| aloha-3cam | 14 | 50 | 100 | 0.9999995 | 2.3e-07 | PASS |
+| aloha-1cam | 14 | 50 | 100 | 0.9999992 | 3.4e-07 | PASS |
+| droid-2cam | 8 | 10 | 100 | 0.9994678 | 5.6e-05 | PASS |
+| libero-2cam | 7 | 50 | 100 | 0.9994360 | 2.4e-04 | PASS |
 
-Correctness (action-space cosine similarity, 14-dim ALOHA robot actions):
+Stability across seeds (seeds 42/100/200, N=100 each, 1,200 samples total; minimum CosSim observed per scenario):
 
-| Scenario | Samples | Mean CosSim | Mean MSE | Result |
-|----------|--------:|------------:|---------:|-------:|
-| 3-camera | 100 | 0.989 | 0.005 | PASS |
-| 1-camera | 100 | 0.986 | 0.007 | PASS |
+| Scenario | min CosSim (any seed) |
+|----------|----------------------:|
+| aloha-3cam | 0.9999995 |
+| aloha-1cam | 0.9999989 |
+| droid-2cam | 0.9989521 |
+| libero-2cam | 0.9993237 |
 
-Both engines produce 14-dim robot-space actions after applying matching ALOHA transforms. The remaining numerical divergence (~1% CosSim gap) is from bf16 accumulation differences in the 10-step flow-matching Euler loop across two different Gemma implementations.
+Both engines apply matching domain-specific transforms (joint flip + gripper encoding for ALOHA; z-score state normalization for DROID/LIBERO) and identical shared noise for flow-matching. The residual ~0.001 CosSim gap on DROID/LIBERO is bf16 accumulation drift across 18-layer Gemma × 10-step Euler loop, occasionally amplified near gripper open/close decision thresholds where small precision differences flip the action to the opposite side.
 
 ### Key optimizations
 
