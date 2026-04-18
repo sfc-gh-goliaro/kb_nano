@@ -145,7 +145,10 @@ class QKVParallelLinear(nn.Module):
         tp = _tp_size()
         self.head_size = head_size
         self.num_heads = total_num_heads // tp
-        self.num_kv_heads = total_num_kv_heads // tp
+        if total_num_kv_heads >= tp:
+            self.num_kv_heads = total_num_kv_heads // tp
+        else:
+            self.num_kv_heads = 1
         output_size = (self.num_heads + 2 * self.num_kv_heads) * head_size
         self.use_fp8 = quant_config is not None
 
