@@ -131,6 +131,7 @@ def main():
         gpu_memory_utilization=cfg.get("gpu_memory_utilization", 0.9),
         max_model_len=cfg["max_model_len"],
         enable_prefix_caching=False,
+        trust_remote_code=cfg.get("trust_remote_code", True),
     )
     if cfg.get("load_format"):
         llm_kwargs["load_format"] = cfg["load_format"]
@@ -537,6 +538,7 @@ def main():
         gpu_memory_utilization=cfg.get("gpu_memory_utilization", 0.9),
         max_model_len=cfg["max_model_len"],
         enable_prefix_caching=False,
+        trust_remote_code=cfg.get("trust_remote_code", True),
     )
     if cfg.get("load_format"):
         llm_kwargs["load_format"] = cfg["load_format"]
@@ -902,6 +904,7 @@ def main():
         gpu_memory_utilization=cfg.get("gpu_memory_utilization", 0.9),
         max_model_len=cfg["max_model_len"],
         enable_prefix_caching=False,
+        trust_remote_code=cfg.get("trust_remote_code", True),
     )
     if cfg.get("load_format"):
         llm_kwargs["load_format"] = cfg["load_format"]
