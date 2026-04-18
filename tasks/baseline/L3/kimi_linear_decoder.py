@@ -1,5 +1,11 @@
 """Kimi-Linear decoder layer: hybrid KDA/MLA attention + MoE/dense MLP (L3).
 
+Operates on a flat varlen batch ``[num_actual_tokens, hidden_size]``
+throughout (no reshape gymnastics around residuals or norms): the engine
+packs all sequences into a single 2D activation and the layer threads it
+through KDA or MLA + MoE/MLP without ever materializing a 3D ``[B, T, D]``
+tensor.
+
 Dispatches to KDA (Delta-Net) or MLA (latent attention) based on layer
 index. Uses MoE for most layers, dense SwiGLU MLP for layer 0.
 """
@@ -25,6 +31,7 @@ class KimiLinearDecoderLayer(nn.Module):
                 hidden_size=config.hidden_size,
                 num_heads=config.kda_num_heads,
                 head_dim=config.kda_head_dim,
+                layer_idx=layer_idx,
                 conv_kernel_size=config.short_conv_kernel_size,
                 rms_norm_eps=config.rms_norm_eps,
             )
@@ -36,10 +43,10 @@ class KimiLinearDecoderLayer(nn.Module):
                 qk_rope_head_dim=config.qk_rope_head_dim,
                 v_head_dim=config.v_head_dim,
                 kv_lora_rank=config.kv_lora_rank,
+                layer_idx=layer_idx,
                 rms_norm_eps=config.rms_norm_eps,
             )
 
-        # MoE for sparse layers, dense SwiGLU MLP for layer 0.
         if config.is_moe_layer(layer_idx):
             self.block_sparse_moe = SharedExpertMoE(
                 hidden_size=config.hidden_size,
@@ -65,30 +72,16 @@ class KimiLinearDecoderLayer(nn.Module):
             config.hidden_size, eps=config.rms_norm_eps
         )
 
-    def forward(self, hidden_states, residual, layer_state=None):
-        # sgl_kernel RMSNorm requires 2D; reshape around norm calls
-        shape = hidden_states.shape
-        h2d = hidden_states.reshape(-1, shape[-1])
-
+    def forward(self, hidden_states, residual, state_manager=None):
+        # hidden_states: [num_actual_tokens, hidden_size] (already flat 2D)
         if residual is None:
-            residual = h2d
-            hidden_states = self.input_layernorm(h2d)
+            residual = hidden_states
+            hidden_states = self.input_layernorm(hidden_states)
         else:
-            residual = residual.reshape(-1, shape[-1])
-            hidden_states, residual = self.input_layernorm(h2d, residual)
+            hidden_states, residual = self.input_layernorm(hidden_states, residual)
 
-        hidden_states = hidden_states.reshape(shape)
-        residual = residual.reshape(shape)
+        hidden_states = self.self_attn(hidden_states, state_manager=state_manager)
 
-        # Both KDA and MLA share the (hidden_states, layer_state) signature.
-        hidden_states = self.self_attn(hidden_states, layer_state=layer_state)
-
-        shape = hidden_states.shape
-        h2d = hidden_states.reshape(-1, shape[-1])
-        r2d = residual.reshape(-1, shape[-1])
-        hidden_states, residual = self.post_attention_layernorm(h2d, r2d)
-        hidden_states = hidden_states.reshape(shape)
-        residual = residual.reshape(shape)
-
+        hidden_states, residual = self.post_attention_layernorm(hidden_states, residual)
         hidden_states = self.mlp(hidden_states)
         return hidden_states, residual

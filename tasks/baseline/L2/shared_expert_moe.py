@@ -65,8 +65,15 @@ class _TPSwiGLUMLP(nn.Module):
         self.act_fn = SiluAndMul()
 
     def forward(self, x: torch.Tensor) -> torch.Tensor:
+        # SiluAndMul.forward_cuda returns a 2D buffer regardless of input
+        # rank, which collapses the leading dims. Save/restore the input
+        # shape so downstream code (e.g. KimiLinearDecoderLayer, which passes
+        # [B, T, hidden]) sees a same-rank output.
+        orig_shape = x.shape
+        x = x.reshape(-1, orig_shape[-1])
         gate_up = self.gate_up_proj(x)
-        return self.down_proj(self.act_fn(gate_up))
+        out = self.down_proj(self.act_fn(gate_up))
+        return out.view(*orig_shape[:-1], out.shape[-1])
 
 
 class SharedExpertMoE(nn.Module):

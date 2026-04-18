@@ -98,6 +98,10 @@ class Qwen3NextConfig:
     model_type: str = "qwen3_next"
     dtype: torch.dtype = torch.bfloat16
 
+    def is_linear_attn_layer(self, layer_idx: int) -> bool:
+        """``True`` if ``layer_idx`` is a Gated-DeltaNet (linear) layer."""
+        return self.layer_types[layer_idx] == "linear_attention"
+
     @classmethod
     def from_pretrained(cls, model_name_or_path: str) -> "Qwen3NextConfig":
         try:

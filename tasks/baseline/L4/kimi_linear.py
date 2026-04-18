@@ -191,25 +191,40 @@ class KimiLinearModel(nn.Module):
         )
         self.norm = RMSNorm(config.hidden_size, eps=config.rms_norm_eps)
 
-    def forward(self, input_ids, positions=None, past_key_values=None, use_cache=False):
-        B, T = input_ids.shape
+    def forward(self, input_ids, positions=None, state_manager=None):
+        """Run the full hybrid model on a flat varlen batch.
+
+        Args:
+            input_ids: [num_actual_tokens] int64 — flat concatenation of all
+                request tokens for this step (decode tokens first, then
+                prefill tokens; matches ``KimiLinearMetadata`` ordering).
+            positions: [num_actual_tokens] int64 — absolute position of each
+                token in its sequence. Currently unused inside the layers
+                (no RoPE on Kimi-Linear MLA / KDA), kept for future hooks.
+            state_manager: ``KimiLinearStateManager`` owning the flat KDA
+                conv/recurrent tensors and per-MLA-layer paged KV.
+
+        Returns:
+            hidden_states: [num_actual_tokens, hidden_size]
+        """
+        # Flatten any leading batch dim so the engine can pass either a
+        # ``[N]`` flat tensor (varlen path) or a ``[1, N]`` tensor (legacy /
+        # debugging) without callers worrying about the layout.
+        if input_ids.dim() > 1:
+            input_ids = input_ids.reshape(-1)
+
         hidden_states = self.embed_tokens(input_ids)
+        if hidden_states.dim() == 3:
+            hidden_states = hidden_states.reshape(-1, hidden_states.shape[-1])
 
         residual = None
-        for i, layer in enumerate(self.layers):
-            layer_state = None
-            if past_key_values is not None:
-                layer_state = past_key_values[i]
+        for layer in self.layers:
             hidden_states, residual = layer(
-                hidden_states, residual, layer_state=layer_state,
+                hidden_states, residual, state_manager=state_manager,
             )
 
-        # Final norm (sgl_kernel requires 2D)
-        shape = hidden_states.shape
-        h2d = hidden_states.reshape(-1, shape[-1])
-        r2d = residual.reshape(-1, shape[-1])
-        hidden_states, _ = self.norm(h2d, r2d)
-        return hidden_states.reshape(shape)
+        hidden_states, _ = self.norm(hidden_states, residual)
+        return hidden_states
 
 
 class KimiLinearForCausalLM(nn.Module):
@@ -226,8 +241,8 @@ class KimiLinearForCausalLM(nn.Module):
         if config.tie_word_embeddings:
             self.lm_head.weight = self.model.embed_tokens.weight
 
-    def forward(self, input_ids, positions=None, past_key_values=None, use_cache=False):
-        return self.model(input_ids, positions, past_key_values, use_cache)
+    def forward(self, input_ids, positions=None, state_manager=None):
+        return self.model(input_ids, positions, state_manager=state_manager)
 
     def compute_logits(self, hidden_states):
         logits = self.lm_head(hidden_states)

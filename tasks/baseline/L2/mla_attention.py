@@ -7,18 +7,17 @@ DeepSeek-V2 style compressed KV attention (NO RoPE rotation):
   kv_b = kv_b_proj(kv_compressed)   -> split to (k_nope, v)
   k = cat(k_nope, k_rope)           (no rotation applied)
   q = cat(q_nope, q_rope)           (no rotation applied)
-  attn = SDPA(q, k, v)
+  attn = SDPA(q, k, v)              FA3 varlen on paged KV cache
   output = o_proj(attn)
 
-Composes only L1 ops (``RMSNorm``, ``SDPA``) and the canonical TP linears
-in ``parallel_linear``; no ``torch.nn.functional`` math here.
+Operates on a flat varlen batch ``[num_actual_tokens, hidden_size]`` with
+per-request metadata supplied via ``KimiLinearMetadata``. Stores K/V into
+the per-layer paged-KV cache owned by ``KimiLinearStateManager`` using
+``slot_mapping``; runs FA3 (asymmetric ``head_dim_qk != head_dim_v`` is
+supported on Hopper / SM90+) over the full per-sequence cached context.
 
-Weight names:
-  self_attn.q_proj.weight
-  self_attn.kv_a_proj_with_mqa.weight
-  self_attn.kv_a_layernorm.weight
-  self_attn.kv_b_proj.weight
-  self_attn.o_proj.weight
+Composes only L1 ops (``RMSNorm``, ``StoreKVCache``, ``FlashAttnPrefill``,
+``FlashAttnDecode``) and the canonical TP linears in ``parallel_linear``.
 """
 
 from __future__ import annotations
@@ -26,9 +25,12 @@ from __future__ import annotations
 import torch
 import torch.nn as nn
 
+from ....infra.kimi_linear_metadata import get_metadata
 from ....infra.tp import _tp_size
+from ..L1.flash_attn_decode import FlashAttnDecode
+from ..L1.flash_attn_prefill import FlashAttnPrefill
 from ..L1.rms_norm import RMSNorm
-from ..L1.sdpa import SDPA
+from ..L1.store_kvcache import StoreKVCache
 from .parallel_linear import (
     ColumnParallelLinear,
     ReplicatedLinear,
@@ -37,7 +39,7 @@ from .parallel_linear import (
 
 
 class MLAAttention(nn.Module):
-    """Multi-head Latent Attention (DeepSeek-V2 style)."""
+    """Multi-head Latent Attention (DeepSeek-V2 style) with paged KV."""
 
     def __init__(
         self,
@@ -47,10 +49,12 @@ class MLAAttention(nn.Module):
         qk_rope_head_dim: int,
         v_head_dim: int,
         kv_lora_rank: int,
+        layer_idx: int,
         rms_norm_eps: float = 1e-5,
     ):
         super().__init__()
         tp = _tp_size()
+        self.layer_idx = layer_idx
         self.num_heads = num_attention_heads
         self.local_num_heads = num_attention_heads // tp
         self.qk_nope_head_dim = qk_nope_head_dim
@@ -74,72 +78,111 @@ class MLAAttention(nn.Module):
             num_attention_heads * v_head_dim, hidden_size
         )
 
-        self.attn = SDPA(scale=self.scaling)
+        self.store_kvcache = StoreKVCache()
+        self.flash_attn_prefill = FlashAttnPrefill(
+            self.local_num_heads, self.local_num_heads, self.qk_head_dim,
+        )
+        self.flash_attn_decode = FlashAttnDecode(
+            self.local_num_heads, self.local_num_heads, self.qk_head_dim,
+        )
 
-    def forward(self, hidden_states, layer_state=None):
+    def forward(
+        self,
+        hidden_states: torch.Tensor,
+        state_manager=None,
+    ) -> torch.Tensor:
         """
         Args:
-            hidden_states: [B, T, hidden_size]
-            layer_state: dict with 'k_cache', 'v_cache' or None
+            hidden_states: [num_actual_tokens, hidden_size] flat varlen batch
+            state_manager: ``KimiLinearStateManager`` (paged KV owner).
         Returns:
-            output: [B, T, hidden_size]
+            output: [num_actual_tokens, hidden_size]
         """
-        B, T, _ = hidden_states.shape
+        md = get_metadata()
+        N = hidden_states.shape[0]
+
+        if md is None or state_manager is None:
+            return torch.zeros_like(hidden_states)
+
+        layer_idx = self.layer_idx
 
         q = self.q_proj(hidden_states)
-        q = q.view(B, T, self.local_num_heads, self.qk_head_dim)
-        q_nope = q[..., :self.qk_nope_head_dim]
-        q_rope = q[..., self.qk_nope_head_dim:]
+        q = q.view(N, self.local_num_heads, self.qk_head_dim)
 
         kv_a = self.kv_a_proj_with_mqa(hidden_states)
         kv_compressed = kv_a[..., :self.kv_lora_rank]
         k_rope_shared = kv_a[..., self.kv_lora_rank:]
 
-        # RMSNorm wants 2D input on the CUDA path; flatten/restore around it.
-        kv_shape = kv_compressed.shape
-        kv_compressed = self.kv_a_layernorm(
-            kv_compressed.reshape(-1, self.kv_lora_rank)
-        ).view(kv_shape)
+        kv_compressed = self.kv_a_layernorm(kv_compressed)
 
         kv_b = self.kv_b_proj(kv_compressed)
         kv_b = kv_b.view(
-            B, T, self.local_num_heads,
+            N, self.local_num_heads,
             self.qk_nope_head_dim + self.v_head_dim,
         )
         k_nope = kv_b[..., :self.qk_nope_head_dim]
-        v = kv_b[..., self.qk_nope_head_dim:]
+        v_unpadded = kv_b[..., self.qk_nope_head_dim:]
 
-        # No RoPE rotation for Kimi-Linear MLA — just concatenate
-        k_rope = k_rope_shared.unsqueeze(2).expand(-1, -1, self.local_num_heads, -1)
-        q_full = torch.cat([q_nope, q_rope], dim=-1)
-        k_full = torch.cat([k_nope, k_rope], dim=-1)
-
-        # Per-sequence KV cache (managed by engine via layer_state dict —
-        # MLA layers don't share the engine's paged KV pool because their
-        # decoder is hybrid with the recurrent KDA path).
-        if layer_state is not None:
-            if "k_cache" not in layer_state:
-                layer_state["k_cache"] = k_full
-                layer_state["v_cache"] = v
-            else:
-                layer_state["k_cache"] = torch.cat(
-                    [layer_state["k_cache"], k_full], dim=1
-                )
-                layer_state["v_cache"] = torch.cat(
-                    [layer_state["v_cache"], v], dim=1
-                )
-            k_full = layer_state["k_cache"]
-            v = layer_state["v_cache"]
-
-        # SDPA expects [B, H, T, D]
-        q_full = q_full.transpose(1, 2)
-        k_full = k_full.transpose(1, 2)
-        v = v.transpose(1, 2)
-
-        is_causal = (q_full.shape[2] == k_full.shape[2] and q_full.shape[2] > 1)
-        attn_out = self.attn(q_full, k_full, v, is_causal=is_causal)
-
-        attn_out = attn_out.transpose(1, 2).reshape(
-            B, T, self.local_num_heads * self.v_head_dim
+        k_rope = k_rope_shared.unsqueeze(1).expand(
+            N, self.local_num_heads, self.qk_rope_head_dim,
         )
-        return self.o_proj(attn_out)
+        k = torch.cat([k_nope, k_rope], dim=-1).contiguous()
+
+        # Pad V to qk_head_dim so K and V share head dim -> can use the
+        # standard FA3 varlen kernel (which requires headdim_q == headdim_kv).
+        # The trailing ``qk_rope_head_dim`` slots are zeros; we slice them
+        # back off the attention output before ``o_proj``. Matches vLLM's
+        # non-absorbed MLA path.
+        v_padded = torch.nn.functional.pad(
+            v_unpadded, (0, self.qk_head_dim - self.v_head_dim),
+        ).contiguous()
+
+        k_cache = state_manager.k_cache[layer_idx]
+        v_cache = state_manager.v_cache[layer_idx]
+        # store_kvcache reads ``key.shape`` to size the per-token stride,
+        # so we pass V with the padded layout that matches v_cache's shape.
+        self.store_kvcache(k, v_padded, k_cache, v_cache, md.slot_mapping)
+
+        out = torch.empty(
+            N, self.local_num_heads, self.qk_head_dim,
+            device=hidden_states.device, dtype=hidden_states.dtype,
+        )
+
+        nd = md.num_decodes
+        ndt = md.num_decode_tokens
+        np_ = md.num_prefills
+        npt = md.num_prefill_tokens
+
+        # FA3 requires int32 cu_seqlens / seqused_k.
+        if nd > 0:
+            cache_seqlens = md.seq_lens[:nd].to(torch.int32)
+            decode_block_tables = md.block_tables[:nd]
+            out[:ndt] = self.flash_attn_decode(
+                q[:ndt], k_cache, v_cache,
+                cache_seqlens=cache_seqlens,
+                block_table=decode_block_tables,
+                softmax_scale=self.scaling,
+                causal=True,
+                max_seq_len=md.max_seq_len,
+            )
+
+        if np_ > 0:
+            cu_pf = (md.query_start_loc[nd:] - md.query_start_loc[nd]).to(torch.int32)
+            seqs_k = md.seq_lens[nd:]
+            cu_k_pf = torch.zeros(np_ + 1, dtype=torch.int32, device=q.device)
+            cu_k_pf[1:] = torch.cumsum(seqs_k.to(torch.int32), dim=0)
+            prefill_block_tables = md.block_tables[nd:]
+            out[ndt:] = self.flash_attn_prefill(
+                q[ndt:], k_cache, v_cache,
+                cu_seqlens_q=cu_pf,
+                cu_seqlens_k=cu_k_pf,
+                max_seqlen_q=md.max_query_len,
+                max_seqlen_k=md.max_seq_len,
+                softmax_scale=self.scaling,
+                causal=True,
+                block_table=prefill_block_tables,
+            )
+
+        # Slice the v_head_dim suffix back off (it was zero-padded for FA).
+        out_v = out[..., : self.v_head_dim].contiguous()
+        return self.o_proj(out_v.reshape(N, self.local_num_heads * self.v_head_dim))

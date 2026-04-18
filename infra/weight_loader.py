@@ -922,7 +922,7 @@ def _detect_model_type(model_name: str) -> str:
 
 def _detect_quant_config(model_name: str) -> dict | None:
     """Detect FP8 quantization config from HuggingFace config."""
-    hf_config = AutoConfig.from_pretrained(model_name)
+    hf_config = AutoConfig.from_pretrained(model_name, trust_remote_code=True)
     qc = getattr(hf_config, "quantization_config", None)
     if qc is None:
         return None

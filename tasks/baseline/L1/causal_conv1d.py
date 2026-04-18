@@ -39,6 +39,7 @@ class CausalConv1d(nn.Module):
         output_final_state: bool = False,
         activation: str | None = "silu",
         backend: str | None = None,
+        cu_seqlens: torch.Tensor | None = None,
     ) -> tuple[torch.Tensor, torch.Tensor | None]:
         kwargs = dict(
             activation=activation,
@@ -47,4 +48,6 @@ class CausalConv1d(nn.Module):
         )
         if backend is not None:
             kwargs["backend"] = backend
+        if cu_seqlens is not None:
+            kwargs["cu_seqlens"] = cu_seqlens
         return _fla_causal_conv1d(x, weight, **kwargs)
