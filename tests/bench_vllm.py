@@ -116,13 +116,14 @@ def _is_whisper_model(model_name: str) -> bool:
 VLLM_WORKER = r'''
 import json, os, sys, time
 os.environ.setdefault("VLLM_WORKER_MULTIPROC_METHOD", "spawn")
+os.environ.setdefault("VLLM_DEEP_GEMM_WARMUP", "skip")
 
 def main():
     from vllm import LLM, SamplingParams
 
     with open(sys.argv[1]) as f:
         cfg = json.load(f)
-    llm = LLM(
+    llm_kwargs = dict(
         model=cfg["model"],
         seed=cfg["seed"],
         enforce_eager=cfg.get("enforce_eager", False),
@@ -131,6 +132,9 @@ def main():
         max_model_len=cfg["max_model_len"],
         enable_prefix_caching=False,
     )
+    if cfg.get("load_format"):
+        llm_kwargs["load_format"] = cfg["load_format"]
+    llm = LLM(**llm_kwargs)
 
     # Warmup
     llm.generate(
@@ -512,6 +516,7 @@ def _filter_and_prepare(mm_data, processor, max_input_tokens):
 VLLM_VLM_WORKER = _MM_PRELOAD_FN + r'''
 import json, os, sys, time
 os.environ.setdefault("VLLM_WORKER_MULTIPROC_METHOD", "spawn")
+os.environ.setdefault("VLLM_DEEP_GEMM_WARMUP", "skip")
 
 
 def main():
@@ -524,7 +529,7 @@ def main():
     model_name = cfg["model"]
     processor = AutoProcessor.from_pretrained(model_name, trust_remote_code=True)
 
-    llm = LLM(
+    llm_kwargs = dict(
         model=model_name,
         seed=cfg["seed"],
         enforce_eager=cfg.get("enforce_eager", False),
@@ -533,6 +538,9 @@ def main():
         max_model_len=cfg["max_model_len"],
         enable_prefix_caching=False,
     )
+    if cfg.get("load_format"):
+        llm_kwargs["load_format"] = cfg["load_format"]
+    llm = LLM(**llm_kwargs)
 
     llm.generate(
         [dict(prompt_token_ids=[0] * 16)],
@@ -863,6 +871,7 @@ VLLM_WHISPER_WORKER = r'''
 import json, os, sys, time
 import numpy as np
 os.environ.setdefault("VLLM_WORKER_MULTIPROC_METHOD", "spawn")
+os.environ.setdefault("VLLM_DEEP_GEMM_WARMUP", "skip")
 
 def _load_librispeech(dataset_name, dataset_split, num_seqs, seed):
     """Load audio samples from LibriSpeech and return as list of numpy arrays."""
@@ -885,7 +894,7 @@ def main():
     with open(sys.argv[1]) as f:
         cfg = json.load(f)
 
-    llm = LLM(
+    llm_kwargs = dict(
         model=cfg["model"],
         seed=cfg["seed"],
         enforce_eager=cfg.get("enforce_eager", False),
@@ -894,6 +903,9 @@ def main():
         max_model_len=cfg["max_model_len"],
         enable_prefix_caching=False,
     )
+    if cfg.get("load_format"):
+        llm_kwargs["load_format"] = cfg["load_format"]
+    llm = LLM(**llm_kwargs)
 
     from vllm.inputs import ExplicitEncoderDecoderPrompt, TextPrompt
 
@@ -1456,6 +1468,7 @@ def main():
             "max_model_len": global_max_seq_len,
             "scenarios": scenario_data,
             "latency_scenarios": latency_data,
+            "load_format": "fastsafetensors",
         }
         vllm_raw = run_worker(
             vllm_worker, vllm_config,
