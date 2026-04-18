@@ -677,28 +677,25 @@ Correctness is measured in decoded pixel space (both engines produce PIL video f
 
 ### Oasis 500M (Autoregressive Diffusion)
 
-Run `tests/bench_oasis.py --model Etched/oasis-500m` to reproduce. Reference baseline: official `open-oasis`.
+Run `python tests/bench_oasis.py --model Etched/oasis-500m` to reproduce. Reference baseline: official `open-oasis`.
+
+Dataset: `TESS-Computer/minecraft-vla-stage1` (`train` split), using 8 non-overlapping real Minecraft clips from distinct source videos with 16 frames per clip at 360x640. The benchmark converts each dataset action string into Oasis' 25-d control vector and caches the resulting prompt/action tensors locally under `data/oasis_cache/`.
 
 **Hardware: NVIDIA H200**
 
 Throughput:
 
-| Scenario | Reference (videos/s) | Ours (videos/s) | Ratio |
-|----------|---------------------:|----------------:|------:|
-| 4 frames, 2 DDIM | 4.26 | 5.72 | **1.34x** |
-| 8 frames, 4 DDIM | 0.68 | 1.11 | **1.64x** |
-| 16 frames, 4 DDIM | 0.38 | 0.56 | **1.47x** |
+| Scenario | Dataset | Clips | Frames | Reference (videos/s) | Ours (videos/s) | Ratio |
+|----------|---------|------:|-------:|---------------------:|----------------:|------:|
+| real-minecraft-16f | `TESS-Computer/minecraft-vla-stage1` | 8 | 16 | 1.65 | 2.10 | **1.28x** |
 
 Alignment:
 
-| Scenario | Output | Avg CosSim | Avg Mean Abs Diff | Notes |
-|----------|--------|-----------:|------------------:|:------|
-| 4 frames, 2 DDIM | Prompt latents | 0.99985957 | 3.85e-03 | PASS |
-| 4 frames, 2 DDIM | Rollout latents | 0.99965012 | 1.08e-02 | PASS |
-| 4 frames, 2 DDIM | Decoded video | 0.99993378 | 2.55e-03 | PASS |
-| 8 frames, 4 DDIM | Prompt latents | 0.99985957 | 3.85e-03 | PASS |
-| 8 frames, 4 DDIM | Rollout latents | 0.99740279 | 2.61e-02 | PASS |
-| 8 frames, 4 DDIM | Decoded video | 0.99958181 | 5.13e-03 | PASS |
+| Scenario | Align Clips | Output | Avg CosSim | Avg Mean Abs Diff | Notes |
+|----------|------------:|--------|-----------:|------------------:|:------|
+| real-minecraft-16f | 4 | Prompt latents | 0.99979734 | 3.99e-03 | PASS |
+| real-minecraft-16f | 4 | Rollout latents | 0.97681195 | 8.50e-02 | PASS |
+| real-minecraft-16f | 4 | Decoded video | 0.99244010 | 1.40e-02 | PASS |
 
 ### CosyVoice3 (TTS)
 
