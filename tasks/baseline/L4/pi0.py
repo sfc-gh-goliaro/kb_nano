@@ -289,20 +289,18 @@ class GemmaModel(nn.Module):
                 prefix_len, seq_len, bsz, hidden_states.device,
             )
             if attention_mask is not None:
+                prefix_pad = (attention_mask == 0)[:, None, None, :]
                 neg_inf = torch.finfo(pi0_attn_bias.dtype).min
-                pad_cols = (attention_mask == 0)
-                pad_bias = pad_cols[:, None, None, :].to(pi0_attn_bias.dtype) * neg_inf
                 pi0_attn_bias = pi0_attn_bias.clone()
-                pi0_attn_bias[..., :prefix_len] += pad_bias
+                pi0_attn_bias[..., :prefix_len].masked_fill_(prefix_pad, neg_inf)
         elif attention_mask is not None:
-            am_bool = attention_mask.to(torch.bool)
-            pad_2d = am_bool[:, :, None] & am_bool[:, None, :]
+            am = attention_mask.to(torch.bool)
+            pad_2d = (am[:, :, None] & am[:, None, :])[:, None, :, :]
             neg_inf = torch.finfo(hidden_states.dtype).min
-            pi0_attn_bias = torch.where(
-                pad_2d,
-                torch.zeros((), dtype=hidden_states.dtype, device=hidden_states.device),
-                torch.full((), neg_inf, dtype=hidden_states.dtype, device=hidden_states.device),
-            ).unsqueeze(1)
+            pi0_attn_bias = torch.zeros(
+                bsz, 1, seq_len, seq_len,
+                dtype=hidden_states.dtype, device=hidden_states.device,
+            ).masked_fill_(~pad_2d, neg_inf)
 
         new_kv_caches = [] if use_cache else None
         for i, layer in enumerate(self.layers):
