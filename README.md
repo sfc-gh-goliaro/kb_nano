@@ -482,29 +482,29 @@ Run `tests/bench_vllm.py` to reproduce. Workload uses random token IDs with `ign
 
 ### GPT-OSS (MXFP4)
 
-Run `tests/bench_vllm.py --model openai/gpt-oss-120b --tp 2` to reproduce. 1000 sequences per scenario, `temperature=0`. Expert weights remain in packed MXFP4 uint8 format — no dequantization at any point. Uses vLLM's Triton `matmul_ogs` kernel for fused MoE, FlashAttention 3 for attention sinks and sliding window, and YaRN RoPE.
+Run `tests/bench_vllm.py --model openai/gpt-oss-20b` (TP=1) and `tests/bench_vllm.py --model openai/gpt-oss-120b --tp 2` to reproduce. 1000 sequences per scenario, `temperature=0`. Expert weights remain in packed MXFP4 uint8 format — no dequantization at any point. The fused MoE forward (routing, MXFP4 swizzling, OAI SwiGLU + `matmul_ogs`) is implemented as the `Mxfp4MoE` L1 op (`tasks/baseline/L1/mxfp4_moe.py`) wrapping the OAI `triton_kernels` library; FlashAttention 3 handles attention sinks and sliding window, and YaRN RoPE handles position encoding.
 
 Throughput:
 
 | Model | TP | Scenario | Input/Output | vLLM (tok/s) | Ours (tok/s) | Ratio | Avg Match Tokens |
 |-------|---:|----------|:------------:|-------------:|-------------:|------:|-----------------:|
-| gpt-oss-20b  | 2 | prefill-heavy | 1024/512  |  11,554 |   9,675 | 0.84x | 460.4/512 |
-| gpt-oss-20b  | 2 | balanced      |  512/512  |  12,974 |  10,907 | 0.84x | 437.1/512 |
-| gpt-oss-20b  | 2 | decode-heavy  |  512/1024 |  13,175 |  12,035 | 0.91x | 925.6/1024 |
-| gpt-oss-120b | 2 | prefill-heavy | 1024/512  |  10,761 |  13,265 | **1.23x** | 112.3/512 |
-| gpt-oss-120b | 2 | balanced      |  512/512  |  16,300 |  17,274 | **1.06x** | 124.1/512 |
-| gpt-oss-120b | 2 | decode-heavy  |  512/1024 |  15,236 |  19,186 | **1.26x** | 213.0/1024 |
+| gpt-oss-20b  | 1 | prefill-heavy | 1024/512  |  14,847 |  15,431 | **1.04x** | 468.0/512 |
+| gpt-oss-20b  | 1 | balanced      |  512/512  |  21,023 |  20,924 | **1.00x** | 446.4/512 |
+| gpt-oss-20b  | 1 | decode-heavy  |  512/1024 |  23,130 |  23,568 | **1.02x** | 884.5/1024 |
+| gpt-oss-120b | 2 | prefill-heavy | 1024/512  |  13,182 |  13,415 | **1.02x** | 117.6/512 |
+| gpt-oss-120b | 2 | balanced      |  512/512  |  16,789 |  17,249 | **1.03x** | 116.6/512 |
+| gpt-oss-120b | 2 | decode-heavy  |  512/1024 |  18,416 |  19,392 | **1.05x** | 208.9/1024 |
 
 Latency (128 output tokens, 5 iterations):
 
 | Model | TP | Scenario | Batch Size | vLLM median | Ours median | vLLM ms/tok | Ours ms/tok | Ratio |
 |-------|---:|----------|---:|------------:|------------:|------------:|------------:|------:|
-| gpt-oss-20b  | 2 | single-request | 1  | 0.446s | 0.554s | 3.48 | 4.32 | 0.80x |
-| gpt-oss-20b  | 2 | fixed-batch-32 | 32 | 0.665s | 0.743s | 0.16 | 0.18 | 0.90x |
-| gpt-oss-120b | 2 | single-request | 1  | 0.661s | 0.794s | 5.17 | 6.21 | 0.83x |
-| gpt-oss-120b | 2 | fixed-batch-32 | 32 | 3.044s | 1.393s | 0.74 | 0.34 | **2.19x** |
+| gpt-oss-20b  | 1 | single-request | 1  | 0.500s | 0.538s | 3.90 | 4.20 | 0.93x |
+| gpt-oss-20b  | 1 | fixed-batch-32 | 32 | 0.859s | 0.859s | 0.21 | 0.21 | **1.00x** |
+| gpt-oss-120b | 2 | single-request | 1  | 0.665s | 0.800s | 5.19 | 6.25 | 0.83x |
+| gpt-oss-120b | 2 | fixed-batch-32 | 32 | 1.331s | 1.394s | 0.33 | 0.34 | 0.95x |
 
-The 120B model shows strong throughput advantages (1.06-1.26x) and a 2.19x batched latency speedup. The lower token match rate for the 120B model is expected: with 128 experts and top-4 routing, small numerical differences in router logits cause different expert selections, which cascade into divergent outputs. The 20B model (32 experts) shows higher match rates (85-90%).
+Both models are at or above vLLM throughput across all scenarios (20B: 1.00–1.04x, 120B: 1.02–1.05x). Single-request latency trails vLLM (0.83–0.93x) since vLLM benefits from `torch.compile`/Inductor fusions at small batch sizes, while batched latency is on par. The lower token match rate for the 120B model is expected: with 128 experts and top-4 routing, small numerical differences in router logits cause different expert selections, which cascade into divergent outputs. The 20B model (32 experts) shows higher match rates (~86–91%).
 
 **Hardware: 4x NVIDIA B200 (NVLink)**
 
