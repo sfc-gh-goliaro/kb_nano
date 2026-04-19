@@ -193,16 +193,31 @@ class GatedLinearAttention(nn.Module):
         g = self.g_proj(hidden_states)
 
         if self.use_rotary:
-            # Reshape to flat [B*T, num_heads*head_k_dim] for the L1 RoPE op,
-            # synthesize positions 0..T-1 per batch element.
+            # Build per-token absolute positions. For uncached single-shot
+            # forward we use 0..T-1 per row. For cached prefill / decode the
+            # engine passes ``past_key_values.seq_offsets`` (int or [B]
+            # int64) giving the global position of token 0 in this call,
+            # per row. Without that offset, RoPE would re-encode every
+            # decode step at position 0 — totally breaking RetNet.
             #
             # NOTE: must materialize a contiguous int64 buffer with B*T real
-            # elements. ``arange(T).unsqueeze(0).expand(B, T).reshape(-1)``
-            # returns a stride-0 view (only T elements of storage), and the
-            # CUDA RoPE kernel does flat ``positions[token_idx]`` indexing
-            # which would read out-of-bounds for token_idx >= T → garbage
-            # ``pos`` → ``cos_sin_cache + pos*rot_dim`` illegal access.
-            positions = torch.arange(T, device=q.device, dtype=torch.int64).repeat(B)
+            # elements. ``arange(T).expand(B, T).reshape(-1)`` returns a
+            # stride-0 view (only T elements of storage); the CUDA RoPE
+            # kernel does flat ``positions[token_idx]`` indexing which would
+            # read out-of-bounds for token_idx >= T → illegal access.
+            offsets = None
+            if past_key_values is not None:
+                offsets = getattr(past_key_values, "seq_offsets", None)
+            local = torch.arange(T, device=q.device, dtype=torch.int64)
+            if offsets is None:
+                positions = local.repeat(B)
+            elif isinstance(offsets, int):
+                positions = (local + offsets).repeat(B)
+            else:
+                # [B] int64 tensor of per-row prefix lengths
+                positions = (offsets.to(device=q.device, dtype=torch.int64)
+                             .unsqueeze(1) + local.unsqueeze(0)).reshape(-1)
+                positions = positions.contiguous()
             q_flat = q.reshape(B * T, self.num_heads * self.head_k_dim).contiguous()
             k_flat = k.reshape(B * T, self.num_heads * self.head_k_dim).contiguous()
             q_flat, k_flat = self.rotary_emb(positions, q_flat, k_flat)

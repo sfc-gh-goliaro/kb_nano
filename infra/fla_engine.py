@@ -10,15 +10,25 @@ The semantic gap is too wide to share scheduling code:
   - No CUDA-graph capture against fixed slot tables: the state buffers
     move whenever the active batch shape changes.
 
-So we keep ``LlamaEngine`` clean for paged-KV models and put recurrent
-scheduling here.
-
 Surface area mirrors ``LlamaEngine`` for the bits ``bench_*.py`` and
 user code touch:
 
   - ``FLAEngine(model_name, dtype, seed, max_num_seqs, ...).generate(prompts, sampling_params)``
   - ``SamplingParams`` and ``GenerationOutput`` are re-exported from
     ``infra.engine`` so callers can use either engine interchangeably.
+
+Scheduling: continuous batching with chunked prefill. Each loop
+iteration runs at most ONE B=1 prefill chunk (fixed
+``chunked_prefill_size``, default 256) AND one B=N batched decode step
+over all sequences whose prefill is complete. New sequences enter the
+decode batch as soon as their final prefill chunk produces a sample,
+without waiting for the rest of the prefill backlog.
+
+The chunk size is forced to a multiple of 64 (FLA's chunk-vs-recurrent
+threshold) and the *last* chunk of each prompt is absorbed if it would
+leave a sub-64-token tail; this keeps every chunk on the chunk kernel
+and avoids tiny FP differences vs single-shot prefill that can flip
+argmax for low-confidence tokens.
 
 Tensor parallel is not implemented (TP=1 only) — all FLA models we
 target are < 10B params and fit on a single H200.
@@ -28,6 +38,7 @@ from __future__ import annotations
 
 import os
 import random
+import warnings
 from collections import deque
 from dataclasses import dataclass, field
 from glob import glob
@@ -41,20 +52,34 @@ from .engine import GenerationOutput, SamplingParams  # re-exported
 __all__ = ["FLAEngine", "SamplingParams", "GenerationOutput"]
 
 
+# Suppress one expected FLA warning: ``seq_len < num_heads`` triggers a
+# layout heuristic check during T=1 RWKV7 decode. Our shapes are correct.
+warnings.filterwarnings(
+    "ignore",
+    message=r".*seq_len.*<.*num_heads.*",
+    category=UserWarning,
+)
+
+
 # ---------------------------------------------------------------------------
-# Per-sequence state container
+# Per-sequence bookkeeping
 # ---------------------------------------------------------------------------
 @dataclass
 class _ActiveSeq:
     """Bookkeeping for a single in-flight sequence."""
     seq_id: int
     prompt_ids: list[int]
-    generated_ids: list[int] = field(default_factory=list)
+    sampling: SamplingParams
     max_tokens: int = 512
     ignore_eos: bool = False
-    sampling: SamplingParams = field(default_factory=SamplingParams)
+
+    # prefill progress (number of prompt tokens already consumed)
+    prefill_pos: int = 0
+    # tokens we've sampled (does not include the prompt)
+    generated_ids: list[int] = field(default_factory=list)
     finished: bool = False
-    # per-layer recurrent / conv state, keyed by id(L2 attention module)
+
+    # per-layer recurrent / conv state (each shape [1, ...])
     states: dict[int, torch.Tensor] = field(default_factory=dict)
     conv_states: dict[int, torch.Tensor] = field(default_factory=dict)
 
@@ -71,11 +96,7 @@ _REGISTRY = {
 
 
 def _load_model(model_name: str, dtype: torch.dtype, device: torch.device):
-    """Load an FLA model via snapshot_download + safetensors weight copy.
-
-    Returns ``(model, model_path)`` where ``model`` is on ``device`` /
-    ``dtype`` and in eval mode.
-    """
+    """Load an FLA model via snapshot_download + safetensors weight copy."""
     from huggingface_hub import snapshot_download
     from safetensors import safe_open
     import importlib
@@ -128,21 +149,12 @@ class FLAEngine:
 
     Public methods mirror ``LlamaEngine``:
       - ``generate(prompts, sampling_params, use_tqdm=False, collect_logits=False)``
-
-    Internal scheduling is much simpler than ``LlamaEngine``:
-
-      1. **Prefill phase** (one seq at a time, full prompt in a single
-         forward) initialises each seq's per-layer recurrent state and
-         samples the first decode token. Doing prefills sequentially
-         (rather than padded-batched) is the simplest correct option and
-         matches FLA's reference behaviour for varlen prompts.
-
-      2. **Decode phase** batches across all currently-running seqs:
-         each step gathers per-seq state into a single ``[B, H, K, V]``
-         tensor per layer, runs one ``[B, 1, D]`` forward, then scatters
-         the updated state back. Newly-finished seqs are dropped from the
-         batch on the next step.
     """
+
+    # FLA's chunk-kernel boundary. Sub-64 tails fall back to fused-recurrent
+    # which is mathematically equivalent but not bit-identical, so we never
+    # leave a chunk smaller than this.
+    _CHUNK_BOUNDARY = 64
 
     def __init__(
         self,
@@ -151,6 +163,7 @@ class FLAEngine:
         dtype: torch.dtype = torch.bfloat16,
         seed: int = 42,
         max_num_seqs: int = 256,
+        chunked_prefill_size: int = 256,
         trust_remote_code: bool = True,
     ):
         from transformers import AutoTokenizer
@@ -158,6 +171,12 @@ class FLAEngine:
         self.model_name = model_name
         self.seed = seed
         self.max_num_seqs = max_num_seqs
+        # Round up to a multiple of 64 so every prefill chunk dispatches
+        # to the chunk kernel (not fused-recurrent), matching single-shot
+        # prefill bit-for-bit at the chunk boundary.
+        cps = max(chunked_prefill_size, self._CHUNK_BOUNDARY)
+        self.chunked_prefill_size = ((cps + self._CHUNK_BOUNDARY - 1)
+                                     // self._CHUNK_BOUNDARY) * self._CHUNK_BOUNDARY
         self.device = torch.device(device)
         self.dtype = dtype
         self._set_seeds(seed)
@@ -169,13 +188,22 @@ class FLAEngine:
         if self.tokenizer.pad_token_id is None and self.tokenizer.eos_token_id is not None:
             self.tokenizer.pad_token_id = self.tokenizer.eos_token_id
 
-        # Cache the ordered list of L2 attention module ids so state
+        # Cache the ordered list of L2 attention + FFN module ids so state
         # gather/scatter walks them in deterministic, layer-natural order.
         from kb_nano.tasks.baseline.L2.gla_attention import GatedLinearAttention
         from kb_nano.tasks.baseline.L2.rwkv7_attention import RWKV7Attention
+        from kb_nano.tasks.baseline.L2.rwkv7_ffn import RWKV7FeedForward
+
         attn_classes = (GatedLinearAttention, RWKV7Attention)
+        # Order matters for stable cache walks
         self._attn_layer_ids: list[int] = [
             id(m) for m in self.model.modules() if isinstance(m, attn_classes)
+        ]
+        # Conv-state-bearing modules (RWKV7 attn + FFN). Order matches
+        # discovery order so gather/scatter is deterministic.
+        self._conv_module_ids: list[int] = [
+            id(m) for m in self.model.modules()
+            if isinstance(m, (RWKV7Attention, RWKV7FeedForward))
         ]
         self._is_rwkv7 = any(
             isinstance(m, RWKV7Attention) for m in self.model.modules()
@@ -188,9 +216,10 @@ class FLAEngine:
         if torch.cuda.is_available():
             torch.cuda.manual_seed_all(seed)
 
-    # -- sampling -------------------------------------------------------
+    # ------------------------------------------------------------------
+    # Sampling
+    # ------------------------------------------------------------------
     def _sample(self, logits: torch.Tensor, params: SamplingParams) -> int:
-        """Sample one token id from a ``[V]`` logits row."""
         if params.temperature == 0.0:
             return int(logits.argmax(dim=-1).item())
         scaled = logits.float() / params.temperature
@@ -204,13 +233,23 @@ class FLAEngine:
         probs = torch.softmax(scaled, dim=-1)
         return int(torch.multinomial(probs, 1).item())
 
-    # -- state plumbing -------------------------------------------------
-    def _build_batched_cache(self, active: list[_ActiveSeq]):
+    def _sample_batch(
+        self, logits: torch.Tensor, seqs: list[_ActiveSeq],
+    ) -> list[int]:
+        # Greedy fast path (most common)
+        if all(s.sampling.temperature == 0.0 for s in seqs):
+            return logits.argmax(dim=-1).tolist()
+        return [self._sample(logits[i], s.sampling) for i, s in enumerate(seqs)]
+
+    # ------------------------------------------------------------------
+    # State plumbing
+    # ------------------------------------------------------------------
+    def _build_batched_cache(self, active: list[_ActiveSeq], decode: bool):
         """Stack per-seq states into a batched RecurrentCache.
 
-        Each layer's state tensors must have the same shape across
-        sequences (model architecture guarantees this). Sequences that
-        haven't seen a forward yet contribute zero-init state.
+        ``decode=True`` also fills ``seq_offsets`` from each seq's
+        total prefix length so RoPE / position-aware kernels see the
+        right global token index.
         """
         from kb_nano.tasks.baseline.L4.recurrent_cache import RecurrentCache
 
@@ -221,10 +260,10 @@ class FLAEngine:
                 None,
             )
             if ref is None:
-                continue  # no seq has run a forward yet for this layer
-            shape = ref.shape  # [1, H, K, V]
+                continue
             stacked = torch.empty(
-                (len(active),) + shape[1:], dtype=ref.dtype, device=ref.device,
+                (len(active),) + ref.shape[1:],
+                dtype=ref.dtype, device=ref.device,
             )
             for i, seq in enumerate(active):
                 if layer_id in seq.states:
@@ -232,53 +271,121 @@ class FLAEngine:
                 else:
                     stacked[i].zero_()
             cache.states[layer_id] = stacked
+
+        for mod_id in self._conv_module_ids:
+            ref = next(
+                (s.conv_states[mod_id] for s in active if mod_id in s.conv_states),
+                None,
+            )
+            if ref is None:
+                continue
+            stacked = torch.empty(
+                (len(active),) + ref.shape[1:],
+                dtype=ref.dtype, device=ref.device,
+            )
+            for i, seq in enumerate(active):
+                if mod_id in seq.conv_states:
+                    stacked[i] = seq.conv_states[mod_id][0]
+                else:
+                    stacked[i].zero_()
+            cache.conv_states[mod_id] = stacked
+
+        # seq_offsets per row (prefill_pos = number of tokens already in state)
+        cache.seq_offsets = torch.tensor(
+            [s.prefill_pos for s in active],
+            dtype=torch.int64, device=self.device,
+        )
         return cache
 
     def _scatter_batched_cache(
         self, active: list[_ActiveSeq], cache,
     ) -> None:
-        """Write the post-forward batched state back to per-seq slots."""
+        # IMPORTANT: clone each slice so the per-seq state owns its own
+        # storage. A bare ``batched[i:i+1]`` is a view into the batched
+        # tensor; the *entire* batched tensor would then stay alive as
+        # long as any seq references its slice, causing a memory leak
+        # that grows linearly with the number of decode steps.
         for layer_id, batched in cache.states.items():
             for i, seq in enumerate(active):
-                seq.states[layer_id] = batched[i:i + 1].detach()
+                seq.states[layer_id] = batched[i:i + 1].detach().clone()
+        for mod_id, batched in cache.conv_states.items():
+            for i, seq in enumerate(active):
+                seq.conv_states[mod_id] = batched[i:i + 1].detach().clone()
 
-    # -- prefill / decode primitives -----------------------------------
+    def _store_single_cache(self, seq: _ActiveSeq, cache) -> None:
+        for layer_id, t in cache.states.items():
+            seq.states[layer_id] = t.detach().clone()
+        for mod_id, t in cache.conv_states.items():
+            seq.conv_states[mod_id] = t.detach().clone()
+
+    @staticmethod
+    def _drop_seq_state(seq: _ActiveSeq) -> None:
+        seq.states.clear()
+        seq.conv_states.clear()
+
+    # ------------------------------------------------------------------
+    # Prefill / decode primitives
+    # ------------------------------------------------------------------
     @torch.no_grad()
-    def _prefill_one(self, seq: _ActiveSeq) -> int:
-        """Run prefill for ``seq``, store its per-layer state, and
-        sample the first decode token."""
+    def _prefill_chunk(
+        self, seq: _ActiveSeq, chunk_ids: list[int],
+    ) -> torch.Tensor | None:
+        """Run a single prefill chunk for ``seq``, threading state in/out.
+
+        Returns the per-token logits tensor [1, T, V] only when this
+        chunk is the LAST chunk of the prompt (so the engine can sample
+        the first generated token). Otherwise returns ``None`` to save
+        the upcast / lm_head call.
+        """
         from kb_nano.tasks.baseline.L4.recurrent_cache import RecurrentCache
 
-        ids = torch.tensor([seq.prompt_ids], dtype=torch.long, device=self.device)
+        ids = torch.tensor([chunk_ids], dtype=torch.long, device=self.device)
         cache = RecurrentCache()
-        out = self.model(input_ids=ids, past_key_values=cache, use_cache=True)
-        for layer_id, state in out.past_key_values.states.items():
-            seq.states[layer_id] = state.detach()
-        next_id = self._sample(out.logits[0, -1], seq.sampling)
-        return next_id
+        for layer_id, t in seq.states.items():
+            cache.states[layer_id] = t
+        for mod_id, t in seq.conv_states.items():
+            cache.conv_states[mod_id] = t
+        cache.seq_offsets = seq.prefill_pos  # int — broadcast across the row
+
+        new_pos = seq.prefill_pos + len(chunk_ids)
+        is_last_chunk = new_pos >= len(seq.prompt_ids)
+
+        out = self.model(
+            input_ids=ids, past_key_values=cache, use_cache=True,
+        )
+        self._store_single_cache(seq, out.past_key_values)
+        seq.prefill_pos = new_pos
+        return out.logits if is_last_chunk else None
 
     @torch.no_grad()
     def _decode_step(self, active: list[_ActiveSeq]) -> list[int]:
-        """One batched decode step over the active seqs.
-
-        Returns the list of newly-sampled token ids in the same order as
-        ``active``.
-        """
         ids = torch.tensor(
-            [[seq.generated_ids[-1] if seq.generated_ids else seq.prompt_ids[-1]]
-             for seq in active],
+            [[seq.generated_ids[-1]] for seq in active],
             dtype=torch.long, device=self.device,
         )
-        cache = self._build_batched_cache(active)
+        cache = self._build_batched_cache(active, decode=True)
         out = self.model(
             input_ids=ids, past_key_values=cache, use_cache=True,
         )
         self._scatter_batched_cache(active, out.past_key_values)
-        last_logits = out.logits[:, -1, :]
-        return [self._sample(last_logits[i], seq.sampling)
-                for i, seq in enumerate(active)]
+        for seq in active:
+            seq.prefill_pos += 1  # decode step appends one token to the state
+        return self._sample_batch(out.logits[:, -1, :], active)
 
-    # -- public API ----------------------------------------------------
+    # ------------------------------------------------------------------
+    # Chunk planner — tail-absorption to keep every chunk on the chunk
+    # kernel (T >= 64) when the prompt allows.
+    # ------------------------------------------------------------------
+    def _next_chunk_size(self, seq: _ActiveSeq) -> int:
+        remaining = len(seq.prompt_ids) - seq.prefill_pos
+        if remaining <= self.chunked_prefill_size + self._CHUNK_BOUNDARY:
+            # Take everything that's left to avoid leaving a sub-64 tail.
+            return remaining
+        return self.chunked_prefill_size
+
+    # ------------------------------------------------------------------
+    # Public API
+    # ------------------------------------------------------------------
     def generate(
         self,
         prompts: list[str] | list[list[int]],
@@ -286,11 +393,6 @@ class FLAEngine:
         collect_logits: bool = False,
         use_tqdm: bool = False,
     ) -> list[GenerationOutput]:
-        """Greedy / top-p generate for a batch of prompts.
-
-        ``prompts`` may be raw strings (will be tokenized) or already-
-        tokenised id lists. Output order matches ``prompts`` order.
-        """
         if collect_logits:
             raise NotImplementedError("collect_logits is not yet supported by FLAEngine.")
 
@@ -308,68 +410,77 @@ class FLAEngine:
             all_seqs.append(_ActiveSeq(
                 seq_id=i,
                 prompt_ids=list(ids),
+                sampling=sp,
                 max_tokens=sp.max_tokens,
                 ignore_eos=sp.ignore_eos,
-                sampling=sp,
             ))
 
         pbar = None
         if use_tqdm:
             from tqdm import tqdm as _tqdm
             pbar = _tqdm(total=len(all_seqs), desc="FLAEngine prompts")
+        finished_count = 0
 
-        # Phase 1 — sequential prefill.
-        # Done one-at-a-time so each seq gets its own clean cache.
-        # Batched-prefill with left padding could be added later but
-        # complicates state init for left-padded slots.
         waiting: deque[_ActiveSeq] = deque(all_seqs)
+        # In-progress prefill (not yet sampled their first token)
+        prefilling: list[_ActiveSeq] = []
+        # Decoding (have at least one generated token, still under max_tokens)
         running: list[_ActiveSeq] = []
-        while waiting and len(running) < self.max_num_seqs:
-            seq = waiting.popleft()
-            first_tok = self._prefill_one(seq)
-            seq.generated_ids.append(first_tok)
-            if not seq.ignore_eos and eos is not None and first_tok == eos:
-                seq.finished = True
-            elif len(seq.generated_ids) >= seq.max_tokens:
-                seq.finished = True
-            running.append(seq)
 
-        # Phase 2 — batched decode loop.
-        while running:
-            active = [s for s in running if not s.finished]
-            if not active:
-                break
-            tokens = self._decode_step(active)
-            for seq, tok in zip(active, tokens):
-                seq.generated_ids.append(tok)
-                if not seq.ignore_eos and eos is not None and tok == eos:
-                    seq.finished = True
-                elif len(seq.generated_ids) >= seq.max_tokens:
-                    seq.finished = True
-            # Drop fully-finished seqs from the running list to admit
-            # any waiting seqs (rare path: only triggers if max_num_seqs
-            # was hit during prefill).
-            still_running = [s for s in running if not s.finished]
-            while waiting and len(still_running) < self.max_num_seqs:
-                seq = waiting.popleft()
-                first_tok = self._prefill_one(seq)
-                seq.generated_ids.append(first_tok)
-                if not seq.ignore_eos and eos is not None and first_tok == eos:
-                    seq.finished = True
-                elif len(seq.generated_ids) >= seq.max_tokens:
-                    seq.finished = True
-                still_running.append(seq)
-                if pbar is not None:
-                    pbar.update(0)
-            running = still_running
-            if pbar is not None:
-                # update once per fully-finished seq
-                done_now = sum(1 for s in all_seqs if s.finished and getattr(s, "_pbar_counted", False) is False)
-                for s in all_seqs:
-                    if s.finished and not getattr(s, "_pbar_counted", False):
-                        s._pbar_counted = True
-                if done_now:
-                    pbar.update(done_now)
+        def _admit() -> None:
+            while waiting and (len(prefilling) + len(running)) < self.max_num_seqs:
+                prefilling.append(waiting.popleft())
+
+        _admit()
+
+        # Main loop: each iteration runs at most one B=1 prefill chunk and
+        # one B=N decode step over running seqs. New seqs that finish
+        # prefill are added to ``running`` immediately so they decode on
+        # the next iteration.
+        while prefilling or running:
+            # ---- prefill: pop the head of the prefilling list, run one chunk
+            if prefilling:
+                seq = prefilling[0]
+                chunk_size = self._next_chunk_size(seq)
+                chunk = seq.prompt_ids[seq.prefill_pos:seq.prefill_pos + chunk_size]
+                logits = self._prefill_chunk(seq, chunk)
+                if logits is not None:
+                    # Last chunk: sample first generated token, promote.
+                    first = self._sample(logits[0, -1], seq.sampling)
+                    seq.generated_ids.append(first)
+                    if not seq.ignore_eos and eos is not None and first == eos:
+                        seq.finished = True
+                    elif len(seq.generated_ids) >= seq.max_tokens:
+                        seq.finished = True
+                    prefilling.pop(0)
+                    if seq.finished:
+                        finished_count += 1
+                        self._drop_seq_state(seq)
+                        if pbar is not None:
+                            pbar.update(1)
+                    else:
+                        running.append(seq)
+                    _admit()
+
+            # ---- decode: one step over all running seqs
+            if running:
+                tokens = self._decode_step(running)
+                still_running: list[_ActiveSeq] = []
+                for seq, tok in zip(running, tokens):
+                    seq.generated_ids.append(tok)
+                    if not seq.ignore_eos and eos is not None and tok == eos:
+                        seq.finished = True
+                    elif len(seq.generated_ids) >= seq.max_tokens:
+                        seq.finished = True
+                    if seq.finished:
+                        finished_count += 1
+                        self._drop_seq_state(seq)
+                        if pbar is not None:
+                            pbar.update(1)
+                    else:
+                        still_running.append(seq)
+                running = still_running
+                _admit()
 
         if pbar is not None:
             pbar.close()
@@ -377,10 +488,9 @@ class FLAEngine:
         outputs: list[GenerationOutput] = []
         for seq in all_seqs:
             text = self.tokenizer.decode(seq.generated_ids, skip_special_tokens=True)
-            prompt_text = (seq.prompt_ids if isinstance(prompts[seq.seq_id], list)
-                           else prompts[seq.seq_id])
+            prompt_text = prompts[seq.seq_id] if isinstance(prompts[seq.seq_id], str) else ""
             outputs.append(GenerationOutput(
-                prompt=prompt_text if isinstance(prompt_text, str) else "",
+                prompt=prompt_text,
                 generated_text=text,
                 token_ids=list(seq.generated_ids),
             ))

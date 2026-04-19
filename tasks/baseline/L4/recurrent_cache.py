@@ -28,10 +28,17 @@ class RecurrentCache:
 
     The keys are ``id(layer)`` so each L2 attention module can find its
     own slot without needing to know its layer index.
+
+    ``seq_offsets`` (int or ``[B]`` int64 tensor) gives the global token
+    position of the FIRST token in the current call, per batch row. This
+    is consumed by RoPE-bearing layers (RetNet) so positional encoding
+    spans cached prefill chunks and decode steps consistently. ``None``
+    means start from position 0 (uncached single-shot forward).
     """
 
     states: dict[int, Any] = field(default_factory=dict)
     conv_states: dict[int, Any] = field(default_factory=dict)
+    seq_offsets: Any = None
 
     def detach_(self) -> "RecurrentCache":
         """In-place detach all stored state tensors (post-step cleanup)."""

@@ -5,6 +5,10 @@ Built exclusively from L1 ops:
 
 Weight names match the FLA checkpoint format:
   ``x_k`` (per-channel mix vector), ``key.weight``, ``value.weight``.
+
+For cached decode, the FFN keeps a per-sequence ``conv_state`` (the last
+hidden vector of the previous call) so the token-shift sees the right
+"previous token" instead of zero-padding on every T=1 step.
 """
 
 from __future__ import annotations
@@ -24,10 +28,31 @@ class RWKV7FeedForward(nn.Module):
         self.value = Linear(intermediate_size, hidden_size, bias=False)
         self.act = SquaredReLU()
 
-    def forward(self, x: torch.Tensor) -> torch.Tensor:
-        # Token shift: delta = prev_token - current_token (zero-pad on left)
-        shifted = torch.zeros_like(x)
-        shifted[:, 1:] = x[:, :-1]
+    def forward(
+        self,
+        x: torch.Tensor,
+        past_key_values=None,
+        use_cache: bool = False,
+    ) -> torch.Tensor:
+        B, T, _ = x.shape
+        prev_shift = None
+        if past_key_values is not None:
+            cs = getattr(past_key_values, "conv_states", None)
+            if cs is not None:
+                prev_shift = cs.get(id(self))
+        shifted = torch.empty_like(x)
+        if prev_shift is not None:
+            shifted[:, 0] = prev_shift
+        else:
+            shifted[:, 0].zero_()
+        if T > 1:
+            shifted[:, 1:] = x[:, :-1]
         delta = shifted - x
         xk = torch.addcmul(x, delta, self.x_k)
+
+        if use_cache and past_key_values is not None:
+            if not hasattr(past_key_values, "conv_states"):
+                past_key_values.conv_states = {}
+            past_key_values.conv_states[id(self)] = x[:, -1].detach()
+
         return self.value(self.act(self.key(xk)))

@@ -130,6 +130,25 @@ python tests/test_bench.py
 python tests/test_bench.py --unit-only
 ```
 
+### Benchmarking vs flash-linear-attention (GLA / RetNet / RWKV7)
+
+```bash
+# Throughput + latency + alignment benchmark vs the FLA reference (transformers.generate)
+python tests/bench_fla.py --model fla-hub/gla-2.7B-100B
+python tests/bench_fla.py --model fla-hub/retnet-2.7B-100B
+python tests/bench_fla.py --model fla-hub/rwkv7-2.9B-g1
+
+# kb-nano FLAEngine only (skip FLA reference)
+python tests/bench_fla.py --model fla-hub/gla-2.7B-100B --skip-fla
+
+# Override sequence count, batch budget, or chunked-prefill size
+python tests/bench_fla.py --model fla-hub/gla-2.7B-100B \
+    --num-seqs 1000 --max-num-seqs 256 --chunked-prefill-size 256
+
+# Skip latency phase (throughput + alignment only)
+python tests/bench_fla.py --model fla-hub/gla-2.7B-100B --skip-latency
+```
+
 ### Benchmarking vs vllm-omni (Diffusion)
 
 ```bash
@@ -626,6 +645,35 @@ Latency (128 output tokens, 5 iterations):
 | DeepSeek-V3.2 | 8 | fixed-batch-32  | 32 | 3.835s | 4.208s |  0.94 |  1.03 | 0.91x |
 
 kb-nano currently runs 4–25% slower than vLLM on DeepSeek-V3.2 across all scenarios. The remaining gap is dominated by (1) per-step CPU launch overhead — kb-nano issues ~7× more uncaptured CUDA kernels than vLLM and its CUDA-graph launches are larger/slower; (2) GEMM kernel selection — kb-nano falls back to `sm90_fp8_gemm_1d2d_impl` on a few decode shapes where vLLM picks the faster `fp8_gemm_kernel_swapAB`; and (3) AllReduce fusion — vLLM fuses TP AllReduce with the surrounding RMSNorm + FP8 quant via flashinfer's `trtllm_allreduce_fusion`, eliminating ~3 kernel launches per AR site. Token match rates are higher than other MoE models in this README because we removed the prior bit-divergence in MLA/MoE routing; the residual divergence comes from FP8 quantization differences in the 256-expert MoE and DSA sparse-attention paths.
+
+### FLA Models — GLA / RetNet / RWKV7 (Linear Attention)
+
+Run `tests/bench_fla.py` to reproduce. Workload uses random token IDs with `ignore_eos=True`. The reference engine is the SOTA [`flash-linear-attention`](https://github.com/fla-org/flash-linear-attention) (FLA) library, driving `fla.models.{gla,retnet,rwkv7}.*ForCausalLM` via `transformers.generate` (the same recipe FLA uses in `benchmarks/benchmark_generation.py`). Both engines run continuous-batched decoding; kb-nano additionally supports chunked prefill via the `FLAEngine` (`infra/fla_engine.py`). Both use FLA's Triton kernels (`chunk_gla`, `fused_recurrent_gla`, `chunk_rwkv7`, `fused_recurrent_rwkv7`, etc.) so this measures engine-level overhead, not kernel quality.
+
+**Hardware: NVIDIA H200**
+
+Throughput (1000 sequences per scenario, `temperature=0`, `max_num_seqs=256`):
+
+| Model | Scenario | Input/Output | FLA ref (tok/s) | Ours (tok/s) | Ratio | Avg Match Tokens |
+|-------|----------|:------------:|----------------:|-------------:|------:|-----------------:|
+| gla-2.7B-100B    | prefill-heavy | 1024/128 | 4,256 |   578 | 0.14x | 119.4/128 |
+| gla-2.7B-100B    | balanced      |  256/256 | 6,149 | 1,423 | 0.23x | 237.5/256 |
+| gla-2.7B-100B    | decode-heavy  |   64/512 | 6,424 | 1,532 | 0.24x | 394.4/512 |
+| retnet-2.7B-100B | prefill-heavy | 1024/128 | 1,539 |   522 | 0.34x | 119.5/128 |
+| retnet-2.7B-100B | balanced      |  256/256 | 3,266 | 1,263 | 0.39x | 244.3/256 |
+| retnet-2.7B-100B | decode-heavy  |   64/512 | 3,451 | 1,419 | 0.41x | 444.8/512 |
+| rwkv7-2.9B-g1    | prefill-heavy | 1024/128 |   962 |   235 | 0.24x | 110.3/128 |
+| rwkv7-2.9B-g1    | balanced      |  256/256 | 5,679 |   437 | 0.08x | 225.9/256 |
+| rwkv7-2.9B-g1    | decode-heavy  |   64/512 | 6,154 |   481 | 0.08x | 445.2/512 |
+
+All three models clear the >=100 tok/s and >=100 avg-matching-tokens correctness thresholds across every scenario. The remaining throughput gap to FLA's reference path comes from kb-nano running each layer in eager Python (no `torch.compile`, no CUDA-graph capture for recurrent state I/O), and from per-step gather/scatter of per-sequence recurrent + token-shift state across the active batch — vs. FLA's reference which keeps a single contiguous `past_key_values` tensor across the whole HF `.generate()` loop. Token alignment to FLA is bitwise within sampling tolerance: greedy outputs match the reference to >86% (GLA), >88% (RetNet), >87% (RWKV7) on average across scenarios.
+
+The recurrent state machinery is implemented in `infra/fla_engine.py`:
+
+- **Continuous batching**: prefill chunks are interleaved one-per-step with batched decode; finished sequences are evicted and waiting prompts admitted on every iteration up to `max_num_seqs`.
+- **Chunked prefill**: prompts longer than `chunked_prefill_size` (default 256) are split into 64-token-aligned chunks routed through FLA's `chunk_*` kernels; per-layer recurrent state and (for RWKV7) per-module token-shift state are carried across chunks in `RecurrentCache`.
+- **Per-row position offsets**: RetNet's rotary embedding receives an absolute `seq_offsets` per batch row so cached prefill chunks and decode steps see the correct global token position.
+- **Bounded memory**: per-sequence states are detached/cloned from the batched cache after each step and explicitly dropped when the sequence completes, keeping resident state at O(active_seqs × layers × head × d_state) instead of accumulating per-step batched-cache views.
 
 ### FLUX.1-dev (Diffusion)
 

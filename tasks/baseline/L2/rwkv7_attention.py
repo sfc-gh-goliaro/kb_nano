@@ -149,10 +149,24 @@ class RWKV7Attention(nn.Module):
     ) -> tuple[torch.Tensor, None, object | None, torch.Tensor]:
         B, T, _ = hidden_states.shape
 
-        # Token shift: delta = prev_token - current_token (zero-pad on left)
-        shifted = torch.zeros_like(hidden_states)
-        shifted[:, 1:] = hidden_states[:, :-1]
+        # Token shift: shifted[t] = previous token's hidden state.
+        # For cached decode the previous token lives in past_key_values.conv_states[id(self)]
+        # (a [B, hidden_size] tensor); for fresh prefill it's zero (left-pad).
+        prev_shift = None
+        if past_key_values is not None:
+            cs = getattr(past_key_values, "conv_states", None)
+            if cs is not None:
+                prev_shift = cs.get(id(self))
+        shifted = torch.empty_like(hidden_states)
+        if prev_shift is not None:
+            shifted[:, 0] = prev_shift
+        else:
+            shifted[:, 0].zero_()
+        if T > 1:
+            shifted[:, 1:] = hidden_states[:, :-1]
         delta = shifted - hidden_states
+        # Save the last hidden vec as the conv_state for the next call.
+        new_conv_state = hidden_states[:, -1].detach() if use_cache else None
 
         # Fused addcmul: xi = hidden_states + delta * x_i
         xr = torch.addcmul(hidden_states, delta, self.x_r)
@@ -238,6 +252,9 @@ class RWKV7Attention(nn.Module):
             if not hasattr(past_key_values, "states"):
                 past_key_values.states = {}
             past_key_values.states[id(self)] = final_state
+            if not hasattr(past_key_values, "conv_states"):
+                past_key_values.conv_states = {}
+            past_key_values.conv_states[id(self)] = new_conv_state
 
         # [B, T, H, V] -> [B*T, value_dim] for GroupNorm
         o = self.g_norm(o.reshape(B * T, -1)).view(B, T, -1)
