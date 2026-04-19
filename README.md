@@ -509,7 +509,7 @@ The 120B model shows strong throughput advantages (1.06-1.26x) and a 2.19x batch
 
 ### Mamba / Mamba2 (Selective State-Space)
 
-Run `tests/bench_vllm.py --model state-spaces/mamba-2.8b-hf` and `tests/bench_vllm.py --model mistralai/Mamba-Codestral-7B-v0.1 --tp 2` to reproduce. 1000 sequences per scenario, `temperature=0`. kb-nano reuses vLLM's `causal_conv1d_fn` / `causal_conv1d_update`, `mamba_chunk_scan_combined_varlen` / `selective_scan_fn`, and `selective_state_update` Triton kernels behind a slot-based recurrent state cache, a chunked-prefill scheduler with a `max_num_batched_tokens` budget, **decode-only CUDA graphs at bucketed batch sizes (1, 2, 4, 8, …, 256)** with `PAD_SLOT_ID = -1` padding, **GPU greedy argmax + async D2H** of next-token IDs (a Mamba mirror of the attention engine's fast greedy path), and **batched per-step state slot allocation/deallocation** broadcast over SHM.
+Run `tests/bench_vllm.py --model state-spaces/mamba-2.8b-hf` and `tests/bench_vllm.py --model mistralai/Mamba-Codestral-7B-v0.1` to reproduce. 1000 sequences per scenario, `temperature=0`. kb-nano reuses vLLM's `causal_conv1d_fn` / `causal_conv1d_update`, `mamba_chunk_scan_combined_varlen` / `selective_scan_fn`, and `selective_state_update` Triton kernels behind a slot-based recurrent state cache, a chunked-prefill scheduler with a `max_num_batched_tokens` budget, **decode-only CUDA graphs at bucketed batch sizes (1, 2, 4, 8, …, 256)** with `PAD_SLOT_ID = -1` padding, **GPU greedy argmax + async D2H** of next-token IDs (a Mamba mirror of the attention engine's fast greedy path), **batched per-step state slot allocation/deallocation** broadcast over SHM, and **profile-based state pool sizing** that runs a synthetic worst-case prefill before allocating slots (mirrors vLLM's `determine_available_memory` → `get_kv_cache_configs` flow) so the slot count tracks vLLM's KV cache concurrency.
 
 Throughput (1000 sequences per scenario, CUDA graphs enabled):
 
@@ -518,13 +518,20 @@ Throughput (1000 sequences per scenario, CUDA graphs enabled):
 | mamba-2.8b-hf            | 1 | prefill-heavy | 1024/512  |  7,329 |  5,867 | 0.80x | 394.0/512  |
 | mamba-2.8b-hf            | 1 | balanced      |  512/512  |  8,643 |  7,441 | 0.86x | 371.8/512  |
 | mamba-2.8b-hf            | 1 | decode-heavy  |  512/1024 | 12,711 | 11,463 | 0.90x | 735.3/1024 |
-| Mamba-Codestral-7B-v0.1  | 2 | prefill-heavy | 1024/512  |  6,163 |  5,476 | 0.89x | 346.8/512  |
-| Mamba-Codestral-7B-v0.1  | 2 | balanced      |  512/512  |  8,334 |  6,333 | 0.76x | 372.9/512  |
-| Mamba-Codestral-7B-v0.1  | 2 | decode-heavy  |  512/1024 |  8,941 |  6,966 | 0.78x | 816.6/1024 |
+| Mamba-Codestral-7B-v0.1  | 1 | prefill-heavy | 1024/512  |  3,814 |  3,215 | 0.84x | 414.5/512  |
+| Mamba-Codestral-7B-v0.1  | 1 | balanced      |  512/512  |  4,448 |  3,685 | 0.83x | 417.6/512  |
+| Mamba-Codestral-7B-v0.1  | 1 | decode-heavy  |  512/1024 |  4,763 |  4,007 | 0.84x | 814.7/1024 |
 
-Token alignment is in the expected range for two independent SSM implementations (~70-80%): the recurrent state accumulates small bf16 numerical differences over the full prefill chunk-scan, and divergences compound across the decode loop. The remaining throughput gap vs vLLM comes from (i) vLLM's larger Mamba state pool (`num_blocks ≈ 1790` slots vs our `~614` for Codestral on 2x H200) which keeps more requests in flight, and (ii) vLLM's `@support_torch_compile` backbone + asynchronous scheduling that overlaps the CPU dispatch of the next step with the previous step's GPU work. With CUDA graphs and the GPU greedy fast path, kb-nano now reaches **0.86-0.90x** of vLLM on decode-heavy/balanced traffic for Mamba v1 (up from `0.59-0.70x` in eager mode) and **0.76-0.89x** for Mamba2 Codestral (up from `0.78-0.83x`).
+Latency (Codestral 7B, TP=1, 5 timed iterations):
 
-**Hardware: 2x NVIDIA H200 (NVLink)**
+| Scenario       | Batch | Output | vLLM (s) | Ours (s) | vLLM (ms/tok) | Ours (ms/tok) | Ratio |
+|----------------|------:|-------:|---------:|---------:|--------------:|--------------:|------:|
+| single-request |     1 |    128 |   0.6997 |   0.9485 |          5.47 |          7.41 | 0.74x |
+| fixed-batch-32 |    32 |    128 |   1.5479 |   1.9878 |          0.38 |          0.49 | 0.78x |
+
+Token alignment is in the expected range for two independent SSM implementations (~70-90% match for `temperature=0` greedy decoding): the recurrent state accumulates small bf16 numerical differences over the full prefill chunk-scan, and divergences compound across the decode loop. With profile-based state sizing kb-nano now allocates **814 slots** for Codestral on a single H200 vs vLLM's ~854, so the remaining gap is no longer slot-pool capacity. Per-step instrumentation (enable with `KB_NANO_PROFILE_MAMBA=1`) shows that **97% of decode-step wall time is in GPU + D2H wait**; CPU-side phases (admit, decode prep, finalize, slot bookkeeping) together account for less than 3%. The residual ~16% gap to vLLM is therefore almost entirely on the GPU side and traces to two vLLM optimizations not yet replicated here: (i) a `@support_torch_compile` Mamba backbone with `mamba_mixer2` registered as a `splitting_op`, eliminating per-layer Python dispatch on every step, and (ii) **piecewise CUDA graphs over mixed prefill+decode batches** (we only graph pure-decode steps; mixed steps still run eager).
+
+**Hardware: NVIDIA H200**
 
 Run `tests/bench_vllm.py` to reproduce. Three scenarios per model, 1000 sequences each, `temperature=0`.
 
