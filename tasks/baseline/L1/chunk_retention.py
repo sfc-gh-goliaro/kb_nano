@@ -8,6 +8,7 @@ from __future__ import annotations
 
 import torch
 import torch.nn as nn
+from fla.ops.retention import chunk_retention
 
 
 class ChunkRetention(nn.Module):
@@ -23,7 +24,6 @@ class ChunkRetention(nn.Module):
         output_final_state: bool = False,
         cu_seqlens: torch.Tensor | None = None,
     ) -> tuple[torch.Tensor, torch.Tensor | None]:
-        from fla.ops.retention import chunk_retention
         return chunk_retention(
             q=q, k=k, v=v,
             scale=scale,

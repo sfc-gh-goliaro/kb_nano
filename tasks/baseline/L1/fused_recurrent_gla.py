@@ -12,6 +12,7 @@ from __future__ import annotations
 
 import torch
 import torch.nn as nn
+from fla.ops.gla import fused_recurrent_gla
 
 
 class FusedRecurrentGLA(nn.Module):
@@ -28,7 +29,6 @@ class FusedRecurrentGLA(nn.Module):
         output_final_state: bool = False,
         cu_seqlens: torch.Tensor | None = None,
     ) -> tuple[torch.Tensor, torch.Tensor | None]:
-        from fla.ops.gla import fused_recurrent_gla
         return fused_recurrent_gla(
             q=q, k=k, v=v, gk=gk,
             scale=scale,

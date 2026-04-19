@@ -12,6 +12,7 @@ from __future__ import annotations
 
 import torch
 import torch.nn as nn
+from fla.ops.retention import fused_recurrent_retention
 
 
 class FusedRecurrentRetention(nn.Module):
@@ -27,7 +28,6 @@ class FusedRecurrentRetention(nn.Module):
         output_final_state: bool = False,
         cu_seqlens: torch.Tensor | None = None,
     ) -> tuple[torch.Tensor, torch.Tensor | None]:
-        from fla.ops.retention import fused_recurrent_retention
         return fused_recurrent_retention(
             q=q, k=k, v=v,
             scale=scale,

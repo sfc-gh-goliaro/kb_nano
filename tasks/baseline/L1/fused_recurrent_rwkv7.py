@@ -14,6 +14,7 @@ from __future__ import annotations
 
 import torch
 import torch.nn as nn
+from fla.ops.rwkv7 import fused_mul_recurrent_rwkv7
 
 
 class FusedRecurrentRWKV7(nn.Module):
@@ -32,7 +33,6 @@ class FusedRecurrentRWKV7(nn.Module):
         output_final_state: bool = False,
         cu_seqlens: torch.Tensor | None = None,
     ) -> tuple[torch.Tensor, torch.Tensor | None]:
-        from fla.ops.rwkv7 import fused_mul_recurrent_rwkv7
         return fused_mul_recurrent_rwkv7(
             r=r, w=w, k=k, v=v, kk=kk, a=a,
             scale=scale,

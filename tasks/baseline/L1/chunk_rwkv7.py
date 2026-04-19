@@ -11,6 +11,7 @@ from __future__ import annotations
 
 import torch
 import torch.nn as nn
+from fla.ops.rwkv7 import chunk_rwkv7
 
 
 class ChunkRWKV7(nn.Module):
@@ -30,7 +31,6 @@ class ChunkRWKV7(nn.Module):
         cu_seqlens: torch.Tensor | None = None,
         chunk_size: int = 64,
     ) -> tuple[torch.Tensor, torch.Tensor | None]:
-        from fla.ops.rwkv7 import chunk_rwkv7
         return chunk_rwkv7(
             r=r, w=w, k=k, v=v, a=a, b=b,
             scale=scale,

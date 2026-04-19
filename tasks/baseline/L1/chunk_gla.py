@@ -13,6 +13,7 @@ from __future__ import annotations
 
 import torch
 import torch.nn as nn
+from fla.ops.gla import chunk_gla
 
 
 class ChunkGLA(nn.Module):
@@ -29,7 +30,6 @@ class ChunkGLA(nn.Module):
         output_final_state: bool = False,
         cu_seqlens: torch.Tensor | None = None,
     ) -> tuple[torch.Tensor, torch.Tensor | None]:
-        from fla.ops.gla import chunk_gla
         return chunk_gla(
             q=q, k=k, v=v, g=g,
             scale=scale,
