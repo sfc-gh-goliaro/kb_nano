@@ -31,15 +31,48 @@ from typing import Mapping, Sequence
 
 import torch
 import torch.nn as nn
+import torch.nn.functional as F
 
 from .bitnet_int8xint2_linear import (
     VALUES_PER_BYTE,
     bitnet_int8xint2_linear,
     hf_packed_to_kn_packed,
+    unpack_kn_to_ternary,
 )
 
 
 __all__ = ["BitLinear", "BitLinearMerged", "VALUES_PER_BYTE"]
+
+
+def _bitnet_use_bf16_path(M: int) -> bool:
+    """True iff this call should use the bf16 fake-quant prefill path.
+
+    Mirrors SOTA's hybrid model split (separate ``BitLinear(nn.Linear)``
+    for prefill, ``BitLinearKernel`` for decode) using kb-nano's engine
+    context flag.  Outside an engine context we fall back to an
+    M-threshold heuristic (1024) so unit tests / micro-benchmarks pick
+    a sensible default.
+    """
+    try:
+        from ....infra.context import get_context
+        ctx = get_context()
+        return bool(ctx.is_prefill)
+    except Exception:
+        return M > 1024
+
+
+@torch.compile(dynamic=True)
+def _fake_quant_act_bf16(x: torch.Tensor) -> torch.Tensor:
+    """Per-token symmetric int8 *fake* quantization.
+
+    Bit-for-bit identical to SOTA ``BitLinear.quant_input``
+    (vllm_repo/BitNet/gpu/model.py:79): all arithmetic in the input
+    dtype (bf16), no fp32 promotion.  ``@torch.compile`` matches SOTA's
+    wrapper and fuses absmax + scale + round + clamp + divide into one
+    Triton kernel, avoiding 4-5 separate eager-mode kernel launches.
+    """
+    s = 127 / x.abs().max(dim=-1, keepdim=True).values.clamp_(min=1e-5)
+    return (x * s).round().clamp_(-128, 127) / s
 
 
 def _broadcast_scale_(slice_: torch.Tensor, loaded: torch.Tensor) -> None:
@@ -119,8 +152,21 @@ class BitLinear(nn.Module):
                 f"expected scalar or {tuple(param.shape)}"
             )
 
+    # -- post-load: derive bf16 fake-quant weight (SOTA prefill path) -----
+    def process_weights_after_loading(self) -> None:
+        if getattr(self, "bf16_weight", None) is not None:
+            return
+        ternary = unpack_kn_to_ternary(self.weight.data)
+        bf16 = ternary.to(self.scale_dtype) * self.weight_scale.data.unsqueeze(1)
+        self.register_buffer("bf16_weight", bf16.contiguous(), persistent=False)
+
     # -- forward -----------------------------------------------------------
     def forward(self, x: torch.Tensor) -> torch.Tensor:
+        M = 1
+        for d in x.shape[:-1]:
+            M *= d
+        if _bitnet_use_bf16_path(M) and getattr(self, "bf16_weight", None) is not None:
+            return F.linear(_fake_quant_act_bf16(x), self.bf16_weight, self.bias)
         return bitnet_int8xint2_linear(x, self.weight, self.weight_scale, self.bias)
 
 
@@ -235,6 +281,19 @@ class BitLinearMerged(nn.Module):
         sl = self._shard_slice(idx)
         param.data[sl].copy_(loaded.to(param.dtype))
 
+    # -- post-load: derive bf16 fake-quant weight (SOTA prefill path) -----
+    def process_weights_after_loading(self) -> None:
+        if getattr(self, "bf16_weight", None) is not None:
+            return
+        ternary = unpack_kn_to_ternary(self.weight.data)
+        bf16 = ternary.to(self.scale_dtype) * self.weight_scale.data.unsqueeze(1)
+        self.register_buffer("bf16_weight", bf16.contiguous(), persistent=False)
+
     # -- forward -----------------------------------------------------------
     def forward(self, x: torch.Tensor) -> torch.Tensor:
+        M = 1
+        for d in x.shape[:-1]:
+            M *= d
+        if _bitnet_use_bf16_path(M) and getattr(self, "bf16_weight", None) is not None:
+            return F.linear(_fake_quant_act_bf16(x), self.bf16_weight, self.bias)
         return bitnet_int8xint2_linear(x, self.weight, self.weight_scale, self.bias)

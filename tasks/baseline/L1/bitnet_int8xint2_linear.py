@@ -160,29 +160,89 @@ def _bitnet_int8xint2_gemm_kernel(
 #     q = round(x * s).clamp(-128, 127)   in int8
 #
 # ``s`` is returned in bf16 so the GEMM kernel can fold it into the output
-# scaling step.
+# scaling step.  Implemented as a single Triton kernel so we get one CUDA
+# launch with one HBM read + one HBM write (no fp32 promotion copy, no
+# intermediate ``absmax``/``scale`` tensors -- the eager-PyTorch version
+# is ~5x slower because it dispatches 4-5 separate kernels).
 # ---------------------------------------------------------------------------
 
+@triton.jit
+def _activation_quant_int8_kernel(
+    X_ptr,            # bf16/fp16/fp32 (M, K)
+    Q_ptr,            # int8           (M, K)
+    S_ptr,            # bf16           (M,)
+    M, K,
+    stride_xm, stride_xk,
+    stride_qm, stride_qk,
+    BLOCK_K: tl.constexpr,
+):
+    pid = tl.program_id(0)
+    if pid >= M:
+        return
+
+    # One program per row; we sweep ``BLOCK_K`` lanes per iteration.
+    # ``BLOCK_K`` is set at launch to the next pow2 >= K so the loop
+    # has exactly one iteration for the typical hidden sizes.
+    offs_k = tl.arange(0, BLOCK_K)
+    mask = offs_k < K
+
+    x_ptrs = X_ptr + pid * stride_xm + offs_k * stride_xk
+    x = tl.load(x_ptrs, mask=mask, other=0.0).to(tl.float32)
+
+    # Per-row absmax in fp32, clamped (matches HF ActQuant).
+    absmax = tl.maximum(tl.max(tl.abs(x), axis=0), 1e-5)
+    scale = 127.0 / absmax
+
+    q = tl.extra.cuda.libdevice.rint(x * scale)
+    q = tl.minimum(tl.maximum(q, -128.0), 127.0).to(tl.int8)
+
+    q_ptrs = Q_ptr + pid * stride_qm + offs_k * stride_qk
+    tl.store(q_ptrs, q, mask=mask)
+
+    tl.store(S_ptr + pid, scale.to(tl.bfloat16))
+
+
+_bn_lib_q = torch.library.Library("kb_nano_bitnet_q", "DEF")
+_bn_lib_q.define(
+    "act_quant_int8(Tensor x, Tensor! q_out, Tensor! s_out) -> ()"
+)
+
+
+def _act_quant_impl(x: torch.Tensor, q_out: torch.Tensor,
+                    s_out: torch.Tensor) -> None:
+    M, K = x.shape
+    BLOCK_K = triton.next_power_of_2(K)
+    _activation_quant_int8_kernel[(M,)](
+        x, q_out, s_out, M, K,
+        x.stride(0), x.stride(1),
+        q_out.stride(0), q_out.stride(1),
+        BLOCK_K=BLOCK_K, num_warps=8 if BLOCK_K >= 4096 else 4,
+    )
+
+
+_bn_lib_q.impl("act_quant_int8", _act_quant_impl, "CUDA")
+
+
+@torch.library.impl(_bn_lib_q, "act_quant_int8", "Meta")
+def _act_quant_meta(x, q_out, s_out):
+    pass
+
+
 def _activation_quant_int8(x: torch.Tensor) -> tuple[torch.Tensor, torch.Tensor]:
-    """Per-token symmetric int8 activation quantization.
+    """Per-token symmetric int8 activation quantization (single Triton launch).
 
     Mirrors HF's ``transformers.integrations.bitnet.ActQuant.forward``:
     promote to fp32, take per-row absmax (clamped at 1e-5), compute
     ``s = 127 / absmax``, quantize via ``round(x * s).clamp(-128, 127)``.
 
     Returns ``(q_int8, scale_bf16)`` where ``q_int8`` has the same shape
-    as ``x`` and ``scale_bf16`` has shape ``(M,)``.  HF's ``ActQuant``
-    keeps the scale in fp32 and recovers a bf16 dequantized activation
-    via ``round(x*s)/s``, which rounds away the same precision we would
-    by storing ``s`` in bf16.  In practice both choices produce the
-    same end-to-end greedy outputs to within ~1 token on this checkpoint;
-    bf16 makes the kernel arg slightly cheaper to load.
+    as ``x`` and ``scale_bf16`` has shape ``(M,)``.
     """
-    x32 = x.to(torch.float32)
-    absmax = x32.abs().amax(dim=-1, keepdim=True).clamp_(min=1e-5)
-    scale = (127.0 / absmax).to(torch.float32)
-    q = (x32 * scale).round().clamp_(-128, 127).to(torch.int8)
-    return q, scale.squeeze(-1).to(torch.bfloat16)
+    M, K = x.shape
+    q_out = torch.empty_like(x, dtype=torch.int8)
+    s_out = torch.empty(M, dtype=torch.bfloat16, device=x.device)
+    torch.ops.kb_nano_bitnet_q.act_quant_int8(x, q_out, s_out)
+    return q_out, s_out
 
 
 # ---------------------------------------------------------------------------
@@ -212,14 +272,28 @@ def _bitnet_gemm_impl(
     assert weight_scale.numel() == N
     assert act_scale.numel() == M
 
-    # Pick block sizes.  H100/H200 has plenty of SMs; small N/K can fit in
-    # one block per dim.  Triton's int8 ``tl.dot`` requires BLOCK_M>=16.
-    BLOCK_M = 16 if M >= 16 else triton.next_power_of_2(max(M, 16))
-    BLOCK_M = min(BLOCK_M, 64)
-    BLOCK_N = 64
-    BLOCK_K = 64
+    # Tile selection (hand-picked from H200 microbench):
+    #
+    # * Decode (M <= 64): tall narrow tiles. ``BLOCK_K=256`` was the
+    #   single biggest win in microbench (-7% vs 64) because it cuts the
+    #   K-loop trip count from K/64 -> K/256 and amortizes int8-dot
+    #   overhead.  Wider BLOCK_N (128/256) hurts at this M because we
+    #   spawn fewer grid blocks than SMs.
+    # * Small (64 < M <= 256): same shape, slightly wider warps.
+    # * Prefill (M > 256): wide tiles to amortize launch + maximize
+    #   tensor-core occupancy.  ``BLOCK_M=64, BLOCK_N=256, BLOCK_K=64,
+    #   warps=8`` matches H100/H200 m16n8k32 WMMA mode best.
+    if M <= 64:
+        BLOCK_M, BLOCK_N, BLOCK_K = 16, 64, 256
+        num_warps, num_stages = 4, 3
+    elif M <= 256:
+        BLOCK_M, BLOCK_N, BLOCK_K = 16, 128, 256
+        num_warps, num_stages = 8, 4
+    else:
+        BLOCK_M, BLOCK_N, BLOCK_K = 64, 256, 64
+        num_warps, num_stages = 8, 3
     if BLOCK_K > K:
-        BLOCK_K = max(4, triton.next_power_of_2(K) // 1)
+        BLOCK_K = max(4, triton.next_power_of_2(K))
         BLOCK_K = ((BLOCK_K + 3) // 4) * 4
 
     grid = (triton.cdiv(M, BLOCK_M), triton.cdiv(N, BLOCK_N))
@@ -233,7 +307,7 @@ def _bitnet_gemm_impl(
         output.stride(0), output.stride(1),
         HAS_BIAS=bias is not None,
         BLOCK_M=BLOCK_M, BLOCK_N=BLOCK_N, BLOCK_K=BLOCK_K,
-        num_warps=4, num_stages=3,
+        num_warps=num_warps, num_stages=num_stages,
     )
 
 
@@ -335,6 +409,28 @@ def repack_ternary_kn(unpacked: torch.Tensor) -> torch.Tensor:
 def hf_packed_to_kn_packed(packed_hf: torch.Tensor) -> torch.Tensor:
     """Convenience: HF ``(out/4, in)`` -> KN-packed ``(out, in/4)`` uint8."""
     return repack_ternary_kn(unpack_hf_ternary(packed_hf))
+
+
+def unpack_kn_to_ternary(packed_kn: torch.Tensor) -> torch.Tensor:
+    """Inverse of :func:`repack_ternary_kn`: KN-packed ``(out, in/4)``
+    uint8 -> ``(out, in)`` int8 ternary in ``{-1, 0, +1}``.
+
+    Used by ``BitLinear.process_weights_after_loading`` to materialize
+    the bf16 fake-quant weight buffer once at load time.  Pure-tensor
+    GPU op (4 bit-shift + mask + concat); no kernel launch overhead
+    matters here because it runs once per layer.
+    """
+    assert packed_kn.dtype == torch.uint8
+    assert packed_kn.dim() == 2
+    out_features, in_packed = packed_kn.shape
+    p = packed_kn.to(torch.int32)
+    # Decompose each byte into 4 ternary lanes ``(byte >> 2j) & 3 - 1``
+    # so the rightmost lane (j=0) is K-position 4c+0, ..., (j=3) is 4c+3.
+    lanes = torch.empty((out_features, in_packed, VALUES_PER_BYTE),
+                        dtype=torch.int8, device=packed_kn.device)
+    for j in range(VALUES_PER_BYTE):
+        lanes[..., j] = ((p >> (2 * j)) & 3).to(torch.int8) - 1
+    return lanes.reshape(out_features, in_packed * VALUES_PER_BYTE)
 
 
 # ---------------------------------------------------------------------------

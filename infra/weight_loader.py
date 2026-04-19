@@ -1279,6 +1279,19 @@ def load_model(
     if model_type == "deepseek_v3" and quant_config is None:
         _compute_mla_absorbed_weights(model)
 
+    if model_type == "bitnet":
+        # Materialize bf16 fake-quant weight per BitLinear (mirrors SOTA's
+        # ``model_state_fp16.pt``).  ``ternary * scale`` derived once
+        # on-device from the already-loaded packed-int2 weight + scale.
+        from ..tasks.baseline.L1.bitnet_linear import BitLinear, BitLinearMerged
+        n = 0
+        for mod in model.modules():
+            if isinstance(mod, (BitLinear, BitLinearMerged)):
+                mod.process_weights_after_loading()
+                n += 1
+        print(f"  Materialized bf16 fake-quant weights for {n} BitLinear layers.",
+              flush=True)
+
     model.eval()
     return model, config
 

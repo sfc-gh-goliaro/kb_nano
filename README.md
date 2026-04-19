@@ -527,13 +527,36 @@ Run `tests/bench_microsoft_bitnet.py` to reproduce. 1000 sequences per scenario,
 
 Throughput:
 
+| Model | TP | Scenario | Input/Output | Microsoft BitNet GPU (tok/s) | Ours (tok/s) | Ratio | Avg Match Tokens |
+| --- | --- | --- | --- | --- | --- | --- | --- |
+| BitNet-b1.58-2B-4T | 1 | prefill-heavy | 1024/512  | 27,964 | 38,668 | **1.38x** | 31.9/512 |
+| BitNet-b1.58-2B-4T | 1 | balanced      |  512/512  | 23,122 | 33,003 | **1.43x** | 41.6/512 |
+| BitNet-b1.58-2B-4T | 1 | decode-heavy  |  512/1024 | 18,490 | 24,658 | **1.33x** | 82.8/1024 |
+
+kb-nano is **1.33–1.43× faster than the Microsoft BitNet GPU library** across all three scenarios. Three components drive this: (1) a fused Triton `act_quant_int8` kernel that does per-token absmax + scale + round-to-int8 in a single launch with no fp32 intermediate (the eager-PyTorch implementation was 4–19× slower because it dispatched 4–5 separate kernels and an fp32-promotion copy); (2) hand-tuned tile shapes per `M` regime in the int8×int2 GEMM (`BLOCK_K=256` with 4 warps for decode, `BLOCK_M=64,BLOCK_N=256,8 warps` for prefill, picked from H200 microbench); (3) **hybrid bf16-prefill + int8-decode dispatch** that mirrors SOTA's two-model architecture — every `BitLinear` carries a derived bf16 fake-quant weight buffer (`ternary * scale`, materialized once at load time) and dispatches to `F.linear(quant_input(x), bf16_weight)` for prefill (large `M`, `is_prefill=True`) versus the int8×int2 Triton kernel for decode. The bf16 prefill path is bit-exact with SOTA's `BitLinear.quant_input + F.linear` at the layer level, and `torch.compile` fuses the fake-quant into a single Triton kernel that beats our int8 prefill due to cuBLAS bf16 GEMM efficiency at large `M` and avoiding the per-`BitLinear` `act_quant_int8` launch.
+
+Greedy-decode token alignment vs SOTA averages 31.9/41.6/82.8 matching tokens per request across the three scenarios. The residual divergence is *not* from BitLinear precision (the bf16 prefill path matches SOTA bit-for-bit at the layer level), but from kb-nano's independent implementations of `RMSNorm`, `RoPE`, and the prefill attention kernel (we use flash-attn 2; SOTA uses xformers `fmha.flash.FwOp`) — small numerical differences in these primitives compound across 30 layers and flip argmaxes, which BitNet is unusually sensitive to because ternary weights produce many close-magnitude logits.
+
+<details>
+<summary>Earlier numbers</summary>
+
+Pre-bf16-prefill (int8 throughout, fused act_quant_int8 + tuned GEMM tiles):
+
+| Model | TP | Scenario | Input/Output | Microsoft BitNet GPU (tok/s) | Ours (tok/s) | Ratio | Avg Match Tokens |
+|-------|---:|----------|:------------:|------------------------------:|-------------:|------:|-----------------:|
+| BitNet-b1.58-2B-4T | 1 | prefill-heavy | 1024/512  | 27,964 | 26,809 | 0.96x | 33.5/512 |
+| BitNet-b1.58-2B-4T | 1 | balanced      |  512/512  | 23,129 | 25,810 | 1.12x | 43.2/512 |
+| BitNet-b1.58-2B-4T | 1 | decode-heavy  |  512/1024 | 18,504 | 21,802 | 1.18x | 86.0/1024 |
+
+Initial integration (eager `_activation_quant_int8` + fixed GEMM tiles):
+
 | Model | TP | Scenario | Input/Output | Microsoft BitNet GPU (tok/s) | Ours (tok/s) | Ratio |
 |-------|---:|----------|:------------:|------------------------------:|-------------:|------:|
 | BitNet-b1.58-2B-4T | 1 | prefill-heavy | 1024/512  | 27,943 | 11,433 | 0.41x |
 | BitNet-b1.58-2B-4T | 1 | balanced      |  512/512  | 23,108 | 11,296 | 0.49x |
 | BitNet-b1.58-2B-4T | 1 | decode-heavy  |  512/1024 | 18,489 | 10,499 | 0.57x |
 
-kb-nano currently runs at 0.41–0.57x of the Microsoft BitNet GPU library across the three scenarios. The remaining gap is dominated by (1) the Triton int8×int2 GEMM not yet matching the official `dp4a`-based CUDA kernel on Hopper (the SOTA kernel uses 16×32 weight-block permutation, fast-decode interleaving, and per-warp `dp4a` accumulation); (2) the SOTA library uses a separate fp16 prefill model + int2 decode model with model-specific CUDA-graph capture, while kb-nano runs a single int2 model with paged KV-cache scheduling that adds per-step launch overhead at small batch sizes; and (3) kb-nano carries general-purpose paged-attention / chunked-prefill machinery whose fixed cost is not amortized at 2B parameters. Closing the gap is tracked under follow-up work to either port the official `dp4a` GEMM as an L1 candidate or to autotune larger Triton tile shapes for Hopper.
+</details>
 
 **Hardware: 4x NVIDIA B200 (NVLink)**
 
