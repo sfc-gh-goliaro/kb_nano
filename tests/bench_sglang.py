@@ -279,6 +279,8 @@ def main():
         max_model_len=cfg["max_model_len"],
         max_num_seqs=cfg.get("max_running_requests", 64),
         spec_steps=cfg["spec_steps"],
+        spec_topk=cfg.get("spec_topk", 1),
+        num_draft_tokens=cfg.get("spec_num_draft_tokens", None),
         gpu_memory_utilization=cfg.get("gpu_memory_utilization", 0.85),
     )
 
@@ -425,16 +427,17 @@ def main():
     parser.add_argument("--seed", type=int, default=42)
     parser.add_argument("--temperature", type=float, default=0.0,
                         help="Sampling temperature (0 = greedy for alignment).")
-    parser.add_argument("--spec-steps", type=int, default=5,
-                        help="EAGLE-3 speculative steps (depth).")
-    parser.add_argument("--spec-topk", type=int, default=8,
-                        help="EAGLE-3 per-step top-k branching for sglang.")
-    parser.add_argument("--spec-num-draft-tokens", type=int, default=64,
-                        help="EAGLE-3 total draft tokens per verify (sglang).")
-    parser.add_argument("--max-running-requests", type=int, default=16)
-    parser.add_argument("--gpu-memory-utilization", type=float, default=0.80)
     parser.add_argument("--latency-iters", type=int, default=5)
     parser.add_argument("--latency-batch-size", type=int, default=1)
+    # The following EAGLE-3 / runtime knobs are intentionally NOT exposed via
+    # --flags. Both engines run with sglang's reference defaults so that
+    # comparisons stay apples-to-apples.
+    spec_steps = 3
+    spec_topk = 4
+    spec_num_draft_tokens = 16
+    gpu_memory_utilization = 0.7
+    cuda_graph_max_bs = 8
+    max_running_requests = 8
     parser.add_argument("--skip-sglang", action="store_true")
     parser.add_argument("--skip-kb-nano", action="store_true")
     parser.add_argument("--skip-throughput", action="store_true")
@@ -445,6 +448,12 @@ def main():
              "Default: tests/results/<gpu>/<model>_eagle3",
     )
     args = parser.parse_args()
+    args.spec_steps = spec_steps
+    args.spec_topk = spec_topk
+    args.spec_num_draft_tokens = spec_num_draft_tokens
+    args.gpu_memory_utilization = gpu_memory_utilization
+    args.cuda_graph_max_bs = cuda_graph_max_bs
+    args.max_running_requests = max_running_requests
 
     gpu = _detect_gpu_name()
     if args.output_dir is None:
@@ -507,7 +516,7 @@ def main():
             "spec_num_draft_tokens": args.spec_num_draft_tokens,
             "max_running_requests": args.max_running_requests,
             "gpu_memory_utilization": args.gpu_memory_utilization,
-            "cuda_graph_max_bs": max(8, args.max_running_requests),
+            "cuda_graph_max_bs": args.cuda_graph_max_bs,
             "max_model_len": args.max_model_len,
             "scenarios": scenarios,
             "latency_scenarios": latency_scenarios,
@@ -528,9 +537,12 @@ def main():
             "seed": args.seed,
             "temperature": args.temperature,
             "spec_steps": args.spec_steps,
+            "spec_topk": args.spec_topk,
+            "spec_num_draft_tokens": args.spec_num_draft_tokens,
             "max_model_len": args.max_model_len,
             "max_running_requests": args.max_running_requests,
             "gpu_memory_utilization": args.gpu_memory_utilization,
+            "cuda_graph_max_bs": args.cuda_graph_max_bs,
             "project_root": str(_PROJECT_ROOT),
             "package_name": _PACKAGE_DIR.name,
             "scenarios": scenarios,

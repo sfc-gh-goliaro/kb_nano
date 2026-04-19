@@ -17,7 +17,9 @@ def main():
         draft_repo="jamesliu1/sglang-EAGLE3-Llama-3.1-Instruct-8B",
         max_model_len=2048,
         max_num_seqs=4,
-        spec_steps=4,
+        spec_steps=3,
+        spec_topk=4,
+        num_draft_tokens=16,
         gpu_memory_utilization=0.85,
     )
     print("\n[smoke] Engine ready.\n")

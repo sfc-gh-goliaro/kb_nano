@@ -1,17 +1,30 @@
-"""EAGLE-3 speculative-decoding engine for kb_nano (eager-only, chain draft).
+"""EAGLE-3 speculative-decoding engine for kb_nano (eager, tree draft).
 
-This first cut implements EAGLE-3 with a *chain* draft (topk=1) instead of the
-full topk=8 tree. Greedy chain drafting + greedy verify still produces the
-exact same accepted-token sequence as the target model would generate on its
-own (because we keep tokens only when they match ``target.argmax``), so it
-satisfies the benchmark's per-request token alignment metric. The
-``num_draft_tokens = spec_steps`` chain accepts roughly the prefix of matching
-tokens at each step, giving real speedups over plain target decode.
+Implements EAGLE-3 with K-branch tree drafting (matches sglang's
+``select_top_k_tokens`` + ``build_tree_kernel_efficient`` + ``verify_tree_greedy``
+pipeline). The default config mirrors sglang's reference defaults:
+``spec_steps=3``, ``topk=4``, ``num_draft_tokens=16``.
 
-Tree drafting (topk=8) for higher mean acceptance can be plugged in later by
-replacing ``_draft_chain`` with a per-step tree expansion.
+For each speculative step:
 
-Scope (matches the user's "tree_eager" choice, simplified):
+  1. ``_draft_chain`` runs S-1 forward passes on the draft model, producing K
+     candidates per seq per step. Each step expands K * K candidates and selects
+     the top K by cumulative log-probability. All branches share the prefix
+     KV (set up by the most recent ``_draft_extend``); each branch additionally
+     writes to a per-branch tail block in the draft paged KV cache.
+  2. ``build_tree_kernel_efficient`` packs the K * (S-1) + K candidates into a
+     flat tree of ``num_draft_tokens`` verify positions with the right
+     parent / sibling / position table.
+  3. ``_target_verify`` runs the target on the flat tree and ``verify_tree_greedy``
+     selects the longest accepted path.
+  4. ``_remap_target_kv_after_verify`` re-orders target KV slots so logical
+     position ``t_committed_len + k`` holds the K/V for the k-th accepted
+     token (vs. the k-th tree node in flat write order). This is a no-op
+     for chain drafting but required for correctness with tree drafting.
+  5. ``_draft_extend`` digests the accepted tokens (with target aux hidden
+     states) into the draft KV cache, capturing the next round's K topk.
+
+Scope:
   - single GPU, TP=1
   - eager forwards (no CUDA graphs) on both target and draft
   - greedy verify only (T=0)
@@ -119,6 +132,10 @@ class _Eagle3Sequence:
 
         self.t_blocks: List[int] = []
         self.d_blocks: List[int] = []
+        # Branch-specific tail blocks for the current draft chain (allocated
+        # at the start of each ``_draft_chain`` and freed before the next
+        # draft extend). Length K per seq.
+        self._chain_tail_blocks: List[int] = []
 
         # Draft hidden state (target hidden3-cat) at the last accepted token.
         self.last_aux: Optional[torch.Tensor] = None
@@ -165,18 +182,23 @@ class LlamaEagle3Engine:
         gpu_memory_utilization: float = 0.85,
         max_model_len: int = 4096,
         max_num_seqs: int = 32,
-        spec_steps: int = 5,
+        spec_steps: int = 3,
+        spec_topk: int = 4,
+        num_draft_tokens: Optional[int] = None,
     ):
         torch.manual_seed(seed)
         torch.cuda.manual_seed_all(seed)
 
         self.device = torch.device("cuda")
         self.dtype = dtype
-        # Chain drafting: topk = 1, num_draft_tokens = spec_steps + 1
-        # (sglang's tree convention: 1 root + S draft = S+1 verified positions).
         self.spec_steps = spec_steps
-        self.topk = 1
-        self.num_draft_tokens = spec_steps + 1
+        self.topk = spec_topk
+        # sglang default: 1 (root) + topk + (spec_steps - 1) * topk * topk
+        # candidates produced; the build_tree kernel keeps the top
+        # num_draft_tokens - 1 by score and prepends the root.
+        if num_draft_tokens is None:
+            num_draft_tokens = 1 + spec_topk + (spec_steps - 1) * spec_topk * spec_topk
+        self.num_draft_tokens = num_draft_tokens
         self.max_model_len = max_model_len
         self.max_num_seqs = max_num_seqs
 
@@ -304,6 +326,69 @@ class LlamaEagle3Engine:
             blk = blocks[p // self.block_size]
             out.append(blk * self.block_size + (p % self.block_size))
         return out
+
+    def _slot_for(self, blocks: List[int], pos: int) -> int:
+        return blocks[pos // self.block_size] * self.block_size + (pos % self.block_size)
+
+    @torch.inference_mode()
+    def _remap_target_kv_after_verify(
+        self,
+        seqs: List[_Eagle3Sequence],
+        accept_index_cpu: List[List[int]],
+        accept_num_cpu: List[int],
+    ):
+        """After tree verify, K/V for tree node ``i`` was written at the slot
+        for logical position ``t_committed_len + i`` (linear write order).
+        For the next iteration we need K/V for the k-th accepted token at the
+        slot for logical position ``t_committed_len + k``. With chain drafting
+        accepted tree indices are already ``[0, 1, 2, ...]`` so this is a no-op,
+        but with tree drafting the accepted chain typically picks non-contiguous
+        tree nodes and we MUST remap, otherwise subsequent attention reads
+        garbage K/V from rejected branches.
+
+        Mirrors sglang's ``move_kv_cache(tgt_cache_loc, src_cache_loc)``.
+        """
+        N = self.num_draft_tokens
+        src_slots: list[int] = []
+        dst_slots: list[int] = []
+        for i, seq in enumerate(seqs):
+            n_accept = int(accept_num_cpu[i])
+            base = seq.t_committed_len
+            for k in range(n_accept + 1):
+                flat = int(accept_index_cpu[i][k])
+                tree_idx = flat - i * N
+                if tree_idx == k:
+                    continue
+                src_slots.append(self._slot_for(seq.t_blocks, base + tree_idx))
+                dst_slots.append(self._slot_for(seq.t_blocks, base + k))
+
+        if not src_slots:
+            return
+
+        src_t = torch.tensor(src_slots, device=self.device, dtype=torch.long)
+        dst_t = torch.tensor(dst_slots, device=self.device, dtype=torch.long)
+        kv = self.target_kv.kv
+        BS = self.block_size
+        if self.kv_layout == "NHD":
+            # kv: [2, L, NB, BS, H, D] -> view as [2, L, NB*BS, H, D].
+            flat = kv.view(
+                2, self.target_kv.num_layers,
+                self.target_kv.num_blocks * BS,
+                self.target_kv.num_kv_heads, self.target_kv.head_dim,
+            )
+            src_vals = flat[:, :, src_t].clone()
+            flat[:, :, dst_t] = src_vals
+        else:
+            # HND: kv [2, L, NB, H, BS, D]. NB and BS are non-adjacent so
+            # we cannot trivially view as [..., NB*BS, ...]. Instead index
+            # block / offset directly per slot.
+            src_blk = (src_t // BS).tolist()
+            src_off = (src_t % BS).tolist()
+            dst_blk = (dst_t // BS).tolist()
+            dst_off = (dst_t % BS).tolist()
+            for n in range(len(src_blk)):
+                kv[:, :, dst_blk[n], :, dst_off[n], :] = \
+                    kv[:, :, src_blk[n], :, src_off[n], :].clone()
 
     # ------------------------------------------------------------------
     # Target prefill on the prompt
@@ -482,34 +567,31 @@ class LlamaEagle3Engine:
             seq.draft_hidden = last_aux_h[i].clone()
 
     # ------------------------------------------------------------------
-    # Draft chain (topk=K, S steps).  Step 0 only records (no forward);
-    # steps 1..S-1 each do one draft forward.
+    # Draft chain (topk=K, S steps). Tree drafting:
+    #   - Step 0: record the K candidates from the latest draft-extend.
+    #   - Forward step f (f=0..S-2): run B*K decode queries, each branch in
+    #     its own per-branch tail block; produce K new candidates per branch
+    #     and reduce K*K -> K by cumulative log-prob (sglang select_top_k).
     # ------------------------------------------------------------------
     @torch.inference_mode()
     def _draft_chain(self, seqs: List[_Eagle3Sequence]):
-        """Produce sglang-format tree inputs from S sequential draft steps.
-
-        Step 0 uses the (topk_p, topk_i, hidden) cached on each seq from the
-        most recent draft-extend.  Subsequent steps run a 1-query forward and
-        write to draft KV at positions ``[d_committed_len .. d_committed_len + S - 2]``.
-        """
+        """Produce sglang-format tree inputs from S draft steps with K branches."""
         S = self.spec_steps
-        K = self.topk  # = 1 for chain
+        K = self.topk
         bs = len(seqs)
 
         verified_id = torch.tensor(
             [s.last_token for s in seqs], device=self.device, dtype=torch.long,
         )
 
+        # Pull initial state from most recent draft extend.
+        cur_top_p = torch.stack([s.draft_topk_p for s in seqs])           # [bs, K]
+        cur_top_i_t = torch.stack([s.draft_topk_i_t for s in seqs])       # [bs, K]
+        cur_hidden = torch.stack([s.draft_hidden for s in seqs])          # [bs, H_d]
+
         score_list: list[torch.Tensor] = []
         token_list: list[torch.Tensor] = []
         parents_list: list[torch.Tensor] = []
-
-        # Pull initial state from most recent draft extend.
-        cur_top_p = torch.stack([s.draft_topk_p for s in seqs])           # [bs, K]
-        cur_top_i = torch.stack([s.draft_topk_i for s in seqs])           # [bs, K]
-        cur_top_i_t = torch.stack([s.draft_topk_i_t for s in seqs])       # [bs, K]
-        cur_hidden = torch.stack([s.draft_hidden for s in seqs])          # [bs, H_d]
 
         # Step 0: just record (no forward).
         score_list.append(cur_top_p.unsqueeze(1))                          # [bs, 1, K]
@@ -519,68 +601,190 @@ class LlamaEagle3Engine:
             .unsqueeze(0).repeat(bs, 1)                                    # [bs, K + 1]
         )
 
-        for step in range(1, S):
-            # Shift convention: at draft pos p, input is the token at seq pos
-            # p+1 and output predicts seq pos p+2.  cur_top_i_t holds the
-            # prediction for seq pos d_committed_len + step + 1 from the
-            # previous step's output, so we forward at draft pos
-            # d_committed_len + (step - 1).
-            slot_mapping: list[int] = []
-            positions_list: list[int] = []
-            block_tables_rows: list[list[int]] = []
-            for seq in seqs:
-                pos = seq.d_committed_len + (step - 1)
-                self._ensure_draft_capacity(seq, pos + 1)
-                slot = seq.d_blocks[pos // self.block_size] * self.block_size + (
-                    pos % self.block_size
+        if S <= 1:
+            parent_list, top_scores_index, draft_tokens = organize_draft_results(
+                score_list, token_list, parents_list, self.num_draft_tokens,
+            )
+            return parent_list, top_scores_index, draft_tokens, verified_id
+
+        # Per-(seq, branch) initial state for the forward loop.
+        input_ids_bk = cur_top_i_t.reshape(bs * K).to(torch.int64)
+        hidden_bk = cur_hidden.repeat_interleave(K, dim=0)                # [bs*K, H_d]
+        scores = cur_top_p                                                # [bs, K]
+
+        # Build per-branch block tables. Each branch needs an ISOLATED tail
+        # past d_committed_len (so K branches don't collide on shared slots).
+        # When d_committed_len isn't block-aligned, the last prefix block has
+        # `r = d_committed_len % block_size` real slots and `block_size - r`
+        # unused-but-shared slots. The branch tail starts at position
+        # d_committed_len, which lies in the partial last prefix block. We
+        # therefore COPY the partial last prefix block per branch and append
+        # extra blocks if the tail spills past one block_size boundary.
+        bsz = self.block_size
+        max_tail_pos = (S - 2)  # last forward writes at position d + (S-2)
+        # Per-seq: number of branch blocks = blocks needed to cover positions
+        # [aligned_down(d), aligned_down(d) + r + max_tail_pos].
+        per_seq_branch_blocks: list[int] = []
+        for seq in seqs:
+            r = seq.d_committed_len % bsz
+            span = r + max_tail_pos + 1  # +1 for inclusive count
+            n = max(1, (span + bsz - 1) // bsz)
+            per_seq_branch_blocks.append(n)
+        max_bb = max(per_seq_branch_blocks) if per_seq_branch_blocks else 1
+
+        prefix_aligned_blocks = [
+            (s.d_committed_len + bsz - 1) // bsz for s in seqs
+        ]
+
+        # block_table per (seq, branch) length:
+        #   prefix_blocks_truncated ++ branch_blocks
+        # where prefix_blocks_truncated drops the last prefix block IF the
+        # branch needs to own the partial slot (i.e. r > 0 OR we need to
+        # extend); the dropped slot's content is copied into branch_blocks[0].
+        max_prefix_kept = max(
+            (s.d_committed_len // bsz) for s in seqs
+        )  # full blocks before the partial one
+        max_blocks_branch = max_prefix_kept + max_bb
+
+        bt_branch_np = np.full((bs * K, max_blocks_branch), -1, dtype=np.int32)
+        branch_blocks_first_np = np.empty((bs, K), dtype=np.int64)
+
+        # Collect (src, dst) block ids for the batched partial-prefix-block
+        # copy so we can issue one kernel instead of B*K small kernels.
+        copy_src: list[int] = []
+        copy_dst: list[int] = []
+
+        for j, seq in enumerate(seqs):
+            r = seq.d_committed_len % bsz
+            n_full_prefix = seq.d_committed_len // bsz
+            n_branch = per_seq_branch_blocks[j]
+            full_prefix = seq.d_blocks[:n_full_prefix]
+
+            # Allocate K * n_branch fresh blocks for this seq.
+            new_blocks = self.draft_kv.alloc(K * n_branch)
+            seq._chain_tail_blocks = new_blocks
+
+            need_partial_copy = r > 0 and len(seq.d_blocks) > n_full_prefix
+            partial_src = int(seq.d_blocks[n_full_prefix]) if need_partial_copy else -1
+
+            for k in range(K):
+                bb = new_blocks[k * n_branch:(k + 1) * n_branch]
+                if need_partial_copy:
+                    copy_src.append(partial_src)
+                    copy_dst.append(bb[0])
+                base = j * K + k
+                bt_branch_np[base, :n_full_prefix] = full_prefix
+                bt_branch_np[base, n_full_prefix:n_full_prefix + n_branch] = bb
+                branch_blocks_first_np[j, k] = bb[0]
+
+        if copy_src:
+            src_t = torch.tensor(copy_src, device=self.device, dtype=torch.long)
+            dst_t = torch.tensor(copy_dst, device=self.device, dtype=torch.long)
+            self.draft_kv.kv[:, :, dst_t] = self.draft_kv.kv[:, :, src_t]
+
+        bt_branch = torch.from_numpy(bt_branch_np).to(self.device)
+        branch_blocks_first = torch.from_numpy(branch_blocks_first_np).to(
+            self.device,
+        )                                                                  # [B, K]
+
+        base_pos_np = np.array(
+            [s.d_committed_len for s in seqs], dtype=np.int64,
+        )
+        base_pos_bk = (
+            torch.from_numpy(base_pos_np).to(self.device).repeat_interleave(K)
+        )                                                                  # [B*K]
+        d_committed_t = torch.from_numpy(base_pos_np).to(self.device)      # [B]
+        # offset within the FIRST branch block where the tail begins.
+        r_per_seq = torch.from_numpy(base_pos_np % bsz).to(self.device)    # [B]
+        # Pre-computed CPU-side max base_pos so we can derive max_ctx for each
+        # chain step without a GPU sync per step.
+        max_base_pos_cpu = int(base_pos_np.max())
+
+        for f in range(S - 1):
+            # Position for this forward step: base_pos + f for every branch.
+            positions = base_pos_bk + f                                    # [B*K]
+
+            # Slot mapping: branch's first block * block_size + (r + f), for
+            # the case where the tail still fits in the first branch block.
+            # If (r + f) >= block_size we'd need to look at branch_blocks[1+...];
+            # we restrict S so that r + (S-2) < 2*block_size at most and
+            # allocate enough branch blocks above; here pick the right block.
+            offset_full = r_per_seq + f                                    # [B]
+            block_idx_within_branch = (offset_full // bsz).to(torch.long)  # [B]
+            offset_in_block = (offset_full % bsz).to(torch.long)           # [B]
+            # Resolve the block id for each (seq, branch) at this f.
+            # The branch's blocks live at bt_branch[base, n_full_prefix..]
+            # so the i-th branch block id can be computed from
+            # branch_blocks_first when block_idx == 0 (the common case) or
+            # by gathering from bt_branch otherwise.
+            # For simplicity, always gather from bt_branch.
+            n_full_prefix_t = (d_committed_t // bsz).to(torch.long)        # [B]
+            block_table_col = (
+                n_full_prefix_t + block_idx_within_branch
+            ).repeat_interleave(K)                                         # [B*K]
+            block_ids_at_f = bt_branch[
+                torch.arange(bs * K, device=self.device), block_table_col,
+            ].to(torch.int64)                                              # [B*K]
+            slot_mapping = (
+                block_ids_at_f * bsz
+                + offset_in_block.repeat_interleave(K).to(torch.int64)
+            ).to(torch.int32)                                              # [B*K]
+
+            # cache_seqlens for decode-mode attention = base_pos + f + 1.
+            cache_seqlens = (d_committed_t + (f + 1)).to(torch.int32)      # [B]
+            cache_seqlens_bk = cache_seqlens.repeat_interleave(K)          # [B*K]
+            max_ctx = max_base_pos_cpu + (f + 1)
+
+            with set_forward_context(
+                is_prefill=False,
+                slot_mapping=slot_mapping,
+                context_lens=cache_seqlens_bk,
+                block_tables=bt_branch,
+                max_context_len=max_ctx,
+            ):
+                hidden_to_logits, hidden_to_aux = self.draft.forward_draft(
+                    input_ids_bk, positions.to(torch.long), hidden_bk,
                 )
-                slot_mapping.append(slot)
-                positions_list.append(pos)
-                block_tables_rows.append(seq.d_blocks)
+                # Decode-mode: ParallelLMHead.project returns one logit per
+                # query, so this gives [B*K, draft_vocab].
+                logits = self.draft.compute_logits(hidden_to_logits)
 
-            max_blocks = max(len(b) for b in block_tables_rows)
-            bt = np.full((bs, max_blocks), -1, dtype=np.int32)
-            for i, b in enumerate(block_tables_rows):
-                bt[i, :len(b)] = b
+            log_probs = torch.log_softmax(logits, dim=-1)                  # [B*K, V_d]
+            topk_p, topk_index = torch.topk(log_probs, K, dim=-1)          # [B*K, K]
+            topk_index_t = self.draft.remap_draft_ids(topk_index)          # [B*K, K]
 
-            cu_q = torch.arange(bs + 1, device=self.device, dtype=torch.int32)
-            cu_k_vals = [0]
-            for seq in seqs:
-                cu_k_vals.append(cu_k_vals[-1] + seq.d_committed_len + step)
-            cu_k = torch.tensor(cu_k_vals, dtype=torch.int32, device=self.device)
-            max_sk = max(seq.d_committed_len + step for seq in seqs)
+            # select_top_k: combine cumulative log-prob scores (B, K) with new
+            # K*K candidate log-probs and pick top K per seq. Sglang multiplies
+            # probabilities; we add log-probs which is mathematically equivalent
+            # for ordering and avoids underflow on long chains.
+            expand_scores = (
+                scores.unsqueeze(2) + topk_p.reshape(bs, K, K)
+            )                                                              # [B, K, K]
+            topk_cs_p, topk_cs_index = torch.topk(
+                expand_scores.flatten(start_dim=1), K, dim=-1,
+            )                                                              # [B, K]
+            scores = topk_cs_p
 
-            set_context(
-                True,
-                cu_q, cu_k,
-                1, max_sk,
-                torch.tensor(slot_mapping, dtype=torch.int32, device=self.device),
-                block_tables=torch.from_numpy(bt).to(self.device),
-            )
+            topk_index_t_flat = topk_index_t.reshape(bs, K * K)            # [B, K*K]
+            new_input_ids = torch.gather(
+                topk_index_t_flat, dim=1, index=topk_cs_index,
+            ).reshape(bs * K)                                              # [B*K]
 
-            ids_t = cur_top_i_t.view(bs).to(torch.int64)
-            pos_t = torch.tensor(positions_list, dtype=torch.long, device=self.device)
+            # Gather selected hidden states for the next step (per branch).
+            sel_idx = (
+                topk_cs_index.flatten() // K
+                + torch.arange(0, bs * K, K, device=self.device)
+                .repeat_interleave(K)
+            )                                                              # [B*K]
+            new_hidden = hidden_to_aux[sel_idx]
 
-            hidden_to_logits, hidden_to_aux = self.draft.forward_draft(
-                ids_t, pos_t, cur_hidden,
-            )
-            logits = self.draft.compute_logits(hidden_to_logits)
-            log_probs = torch.log_softmax(logits, dim=-1)
-            top_p, top_i = torch.topk(log_probs, K, dim=-1)               # [bs, K]
-            top_i_t = self.draft.remap_draft_ids(top_i)                    # [bs, K]
+            # Tree-info bookkeeping for organize_draft_results.
+            score_list.append(expand_scores)                               # [B, K, K]
+            token_list.append(topk_index_t_flat)                           # [B, K*K]
+            parents_list.append(topk_cs_index + (K * K * f + K))            # [B, K]
 
-            # sglang tree shape for K=1: each subsequent step contributes
-            # K=1 new candidate per seq, parented to the previous level's
-            # single node.  cs_index is 0 (only 1 sibling).
-            score_list.append(top_p.view(bs, K, K))                        # [bs, K, K]
-            token_list.append(top_i_t.view(bs, K * K))                     # [bs, K*K]
-            cs_index = torch.zeros((bs, K), dtype=torch.long, device=self.device)
-            parents_list.append(cs_index + (K * K * (step - 1) + K))       # [bs, K]
-
-            cur_top_p = top_p
-            cur_top_i = top_i
-            cur_top_i_t = top_i_t
-            cur_hidden = hidden_to_aux
+            input_ids_bk = new_input_ids
+            hidden_bk = new_hidden
 
         parent_list, top_scores_index, draft_tokens = organize_draft_results(
             score_list, token_list, parents_list, self.num_draft_tokens,
@@ -626,13 +830,14 @@ class LlamaEagle3Engine:
         slot_t = torch.tensor(slot_mapping, dtype=torch.int32, device=self.device)
         bt_t = torch.from_numpy(bt).to(self.device)
         ctx_t = torch.tensor(ctx_lens, dtype=torch.int32, device=self.device)
+        max_ctx_cpu = max(ctx_lens)
 
         with set_forward_context(
             is_prefill=False,
             slot_mapping=slot_t,
             context_lens=ctx_t,
             block_tables=bt_t,
-            max_context_len=int(max(ctx_lens)),
+            max_context_len=max_ctx_cpu,
             is_tree_verify=True,
             tree_mask=tree_mask,
             tree_num_verify_tokens=N,
@@ -685,10 +890,11 @@ class LlamaEagle3Engine:
             print(f"[dbg] draft chain done", flush=True)
 
         # 2. Build tree.
+        seq_lens_cpu_list = [s.t_committed_len for s in seqs]
         seq_lens = torch.tensor(
-            [s.t_committed_len for s in seqs], device=self.device, dtype=torch.long,
+            seq_lens_cpu_list, device=self.device, dtype=torch.long,
         )
-        seq_lens_sum = int(seq_lens.sum().item())
+        seq_lens_sum = sum(seq_lens_cpu_list)
         (
             tree_mask, positions, retrive_index, retrive_next_token,
             retrive_next_sibling, full_draft_tokens,
@@ -724,6 +930,13 @@ class LlamaEagle3Engine:
         N = self.num_draft_tokens
         accept_num_cpu = accept_token_num.tolist()
         accept_index_cpu = accept_index.tolist()
+
+        # Remap target K/V so that logical position ``t_committed_len + k``
+        # holds the K/V for the k-th accepted token (NOT for the k-th tree
+        # node in flat write order). Must run before we touch t_committed_len
+        # or free any blocks. With chain drafting this is a no-op; with tree
+        # drafting it is required for correctness.
+        self._remap_target_kv_after_verify(seqs, accept_index_cpu, accept_num_cpu)
 
         if len(aux_list) > 0:
             aux_cat_full = torch.cat(aux_list, dim=-1)  # [B*N, 3*H_t]
@@ -766,9 +979,15 @@ class LlamaEagle3Engine:
                     device=self.device, dtype=self.dtype,
                 ))
 
-            # Free the draft KV chain slots we appended during _draft_chain
-            # (positions [d_committed_len .. d_committed_len + S - 2]).
-            # We then re-extend with the actually-accepted tokens below.
+            # Free the per-branch tail blocks allocated by _draft_chain.
+            # The draft KV will be re-extended with the actually-accepted
+            # tokens (and target aux hidden states) below.
+            tail = getattr(seq, "_chain_tail_blocks", None)
+            if tail is not None and len(tail) > 0:
+                self.draft_kv.free(list(tail))
+                seq._chain_tail_blocks = []
+            # Also drop any stray prefix-tail blocks (none should exist after
+            # the prior extend, but keep this for safety).
             self._free_draft_tail(seq, seq.d_committed_len)
 
             if not seq.ignore_eos and (eos_id in accepted_ids):

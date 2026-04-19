@@ -922,6 +922,32 @@ Correctness (deterministic, all queries across all scenarios):
 
 Both engines run identical model code with the same pretrained weights and deterministic seeding, achieving bitwise reproducibility (100% correctness pass rate). The throughput advantage comes from vectorized block conversion utilities (`torch.gather`-based) in the atom attention module, replacing Python for-loops in the reference implementation.
 
+### EAGLE-3 Speculative Decoding (Llama 3.1 8B)
+
+Run `tests/bench_sglang.py` to reproduce. Target model: `meta-llama/Llama-3.1-8B-Instruct`. Draft model: `jamesliu1/sglang-EAGLE3-Llama-3.1-Instruct-8B`. Reference engine: `sglang` v2 with EAGLE-3 enabled. Both engines use identical defaults: `spec_steps=3`, `topk=4`, `num_draft_tokens=16`, `mem_fraction_static=0.7`, `cuda_graph_max_bs=8`. Sampling is greedy (temperature 0).
+
+**Hardware: NVIDIA H200**
+
+Throughput (8 prompts, max 128 tokens each):
+
+| Scenario | Batch | Out tokens | sglang (tok/s) | kb-nano (tok/s) | Speedup |
+|----------|------:|-----------:|---------------:|----------------:|--------:|
+| eagle3-1seqs-out128  |  1 | 128 |   192.8 |  56.3 | 0.29x |
+| eagle3-4seqs-out128  |  4 | 128 |   667.3 | 133.4 | 0.20x |
+| eagle3-8seqs-out128  |  8 | 128 | 1,188.6 | 155.9 | 0.13x |
+| eagle3-16seqs-out128 | 16 | 128 | 1,209.8 | 156.4 | 0.13x |
+
+Alignment vs sglang (avg matching tokens / request, greedy decoding):
+
+| Scenario | Batch | Out tokens | Avg match | Result |
+|----------|------:|-----------:|----------:|--------|
+| eagle3-1seqs-out128  |  1 | 128 | 128.0/128 | **PASS** |
+| eagle3-4seqs-out128  |  4 | 128 | 127.8/128 | **PASS** |
+| eagle3-8seqs-out128  |  8 | 128 |  85.5/128 | numerics |
+| eagle3-16seqs-out128 | 16 | 128 |  92.4/128 | numerics |
+
+The implementation matches `sglang` exactly at small batches (1 and 4 sequences). At larger batches the divergences are concentrated on a small number of prompts where the target's top-2 logits are very close, so bf16 batched-matmul reduction-order differences flip the argmax. Per-step time profiling on B=8 shows target verify dominates at 92% of step time (69 ms / 75 ms) — closing the throughput gap to sglang requires CUDA graph capture for the verify forward (constant `B*N` shape), which is the main pending optimization.
+
 ### Key optimizations
 
 - **Fused RMSNorm**: Uses `sgl_kernel`'s fused residual-add + RMSNorm CUDA kernel, eliminating multiple kernel launches per norm call
