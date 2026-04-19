@@ -27,27 +27,48 @@ import numpy as np
 import torch
 import torch.distributed as dist
 import torch.multiprocessing as mp
-from transformers import AutoConfig, AutoTokenizer
+from transformers import AutoTokenizer
 
-from .context import get_context, reset_context, set_context, set_mixed_context
-from .gla_state import GLAStateManager
-from .kimi_linear_state import KimiLinearStateManager
-from .mamba_state import MambaStateManager
-from .rwkv7_state import RWKV7StateManager
+from .context import (
+    AttnBackendConfig, CUDAGraphMode, auto_register_no_compile_layers,
+    get_attn_backend_config, get_context,
+    reset_context, set_context, set_forward_context, set_mixed_context,
+)
 from ..tasks.baseline.L1.allreduce import set_custom_ar
 from .weight_loader import load_model
 
-BLOCK_SIZE = 256
-MAX_NUM_BATCHED_TOKENS = 16384
-MAX_NUM_SEQS = 512
-MAX_MODEL_LEN = 8192
+MAX_MODEL_LEN = 131072
 NCCL_PORT = int(os.environ.get("KB_NANO_NCCL_PORT", "29501"))
 
-# Placeholder token IDs for Qwen VL models
-QWEN_IMAGE_PAD_ID = 151655  # <|image_pad|>
-QWEN_VIDEO_PAD_ID = 151656  # <|video_pad|>
+
+
+def _detect_scheduling_defaults() -> tuple[int, int]:
+    """Choose max_num_batched_tokens and max_num_seqs based on GPU memory.
+
+    Mirrors vLLM's heuristic: high-memory GPUs (>=70 GiB, non-A100) get
+    larger defaults; everything else gets conservative values.
+    """
+    if not torch.cuda.is_available():
+        return 8192, 256
+    _GiB = 1 << 30
+    _, total = torch.cuda.mem_get_info()
+    name = torch.cuda.get_device_name(0).lower()
+    if total >= 70 * _GiB and "a100" not in name:
+        return 16384, 1024
+    return 8192, 256
+
+
+_DEFAULT_MAX_NUM_BATCHED_TOKENS, _DEFAULT_MAX_NUM_SEQS = (
+    _detect_scheduling_defaults()
+)
 
 _PROFILE = os.environ.get("KB_NANO_PROFILE", "0") == "1"
+
+
+ATTN_BACKEND_CONFIG = get_attn_backend_config()
+USE_TRTLLM = ATTN_BACKEND_CONFIG.use_trtllm
+BLOCK_SIZE = ATTN_BACKEND_CONFIG.block_size
+USE_FLASHINFER = USE_TRTLLM  # back-compat alias
 
 
 # ---------------------------------------------------------------------------
@@ -95,7 +116,6 @@ class Sequence:
         self.block_table: list[int] = []
         self.status = SeqStatus.WAITING
         self.num_computed_tokens: int = 0
-        self.state_slot: int | None = None
         # Multimodal fields
         self.pixel_values = None  # preprocessed image pixels
         self.image_grid_thw = None  # list of [t, h, w] per image
@@ -103,6 +123,11 @@ class Sequence:
         self.video_grid_thw = None
         self.mrope_position_delta: int = 0
         self.mrope_positions = None  # (3, seq_len) tensor computed at prefill
+        # Encoder-decoder fields (Whisper)
+        self.encoder_features: torch.Tensor | None = None  # [num_mel_bins, T] log-mel
+        self.encoder_seq_len: int = 0  # num encoder tokens (after conv)
+        self.cross_block_table: list[int] = []  # paged KV blocks for cross-attn
+        self.encoder_computed: bool = False  # True after encoder has run
 
     def __len__(self):
         if self.token_ids is not None:
@@ -138,28 +163,28 @@ class Sequence:
         blocks_after = (total_after + BLOCK_SIZE - 1) // BLOCK_SIZE
         return max(0, blocks_after - len(self.block_table))
 
+    def preempt(self):
+        """Reset to re-prefillable state (vLLM-style recompute preemption)."""
+        self.token_ids = list(self.prompt_ids)
+        self.generated_ids.clear()
+        self.block_table.clear()
+        self.cross_block_table.clear()
+        self.num_computed_tokens = 0
+        self.encoder_computed = False
+        self.status = SeqStatus.WAITING
+
     def append_token(self, token_id):
         self.token_ids.append(token_id)
         self.generated_ids.append(token_id)
 
     def __getstate__(self):
         """Minimal pickling for shared memory transfer to non-rank-0 workers."""
-        return (
-            len(self),
-            len(self.prompt_ids),
-            self.block_table,
-            self.num_computed_tokens,
-            self.state_slot,
-            self.token_ids if not self.generated_ids else self.last_token,
-        )
+        return (len(self), len(self.prompt_ids), self.block_table,
+                self.num_computed_tokens,
+                self.token_ids if not self.generated_ids else self.last_token)
 
     def __setstate__(self, state):
-        if len(state) == 6:
-            self._num_tokens, num_prompt, self.block_table, self.num_computed_tokens, self.state_slot = state[:-1]
-        else:
-            # Backward-compatible fallback for older pickled tuples.
-            self._num_tokens, num_prompt, self.block_table, self.num_computed_tokens = state[:-1]
-            self.state_slot = None
+        self._num_tokens, num_prompt, self.block_table, self.num_computed_tokens = state[:-1]
         if isinstance(state[-1], list):
             self.token_ids = state[-1]
         else:
@@ -174,7 +199,14 @@ class Sequence:
 # ---------------------------------------------------------------------------
 class BlockManager:
     def __init__(self, num_blocks: int):
+        self._num_blocks = num_blocks
         self.free_block_ids: deque[int] = deque(range(num_blocks))
+
+    def reset(self):
+        """Return all blocks to the free pool."""
+        self.free_block_ids = deque(range(self._num_blocks))
+        if hasattr(self, '_num_cross_blocks'):
+            self.cross_free_block_ids = deque(range(self._num_cross_blocks))
 
     def can_allocate(self, seq):
         return len(self.free_block_ids) >= seq.num_blocks
@@ -201,20 +233,34 @@ class BlockManager:
         self.free_block_ids.extend(seq.block_table)
         seq.block_table.clear()
 
+    def deallocate_cross(self, seq):
+        """Return cross-attention KV blocks to the cross-attn free pool."""
+        if hasattr(self, 'cross_free_block_ids') and seq.cross_block_table:
+            self.cross_free_block_ids.extend(seq.cross_block_table)
+            seq.cross_block_table.clear()
+
 
 # ---------------------------------------------------------------------------
 # ModelRunner — runs on EACH TP rank
 # ---------------------------------------------------------------------------
 class ModelRunner:
     def __init__(self, model_name: str, rank: int, world_size: int,
-                 dtype: torch.dtype, enforce_eager: bool,
-                 event, shm_name: str):
+                 dtype: torch.dtype | None, enforce_eager: bool,
+                 event, shm_name: str,
+                 gpu_memory_utilization: float = 0.9,
+                 max_model_len: int = MAX_MODEL_LEN,
+                 max_num_seqs: int | None = None,
+                 max_num_batched_tokens: int | None = None):
+        self.model_name = model_name
         self.rank = rank
         self.world_size = world_size
         self.enforce_eager = enforce_eager
         self.event = event
         self.block_size = BLOCK_SIZE
-        self._model_dtype = dtype
+        self.gpu_memory_utilization = gpu_memory_utilization
+        self.max_model_len = ((max_model_len + BLOCK_SIZE - 1) // BLOCK_SIZE + 2) * BLOCK_SIZE
+        self.max_num_seqs = max_num_seqs if max_num_seqs is not None else _DEFAULT_MAX_NUM_SEQS
+        self.max_num_batched_tokens = max_num_batched_tokens if max_num_batched_tokens is not None else _DEFAULT_MAX_NUM_BATCHED_TOKENS
 
         torch.cuda.set_device(rank)
         dist.init_process_group(
@@ -233,28 +279,113 @@ class ModelRunner:
                 )
                 set_custom_ar(self.custom_ar)
 
+        if dtype is None:
+            # DeepSeek V3.2 checkpoints use ``model_type: "deepseek_v32"`` which
+            # is not yet a registered AutoConfig key in transformers, so load
+            # with ``trust_remote_code=True`` and fall back to raw config.json
+            # parsing if AutoConfig still refuses.
+            from transformers import AutoConfig
+            _cfg = None
+            try:
+                _cfg = AutoConfig.from_pretrained(
+                    model_name, trust_remote_code=True,
+                )
+            except (ValueError, KeyError, OSError):
+                # BitNet b1.58 ships an ``auto_map`` pointing at
+                # ``configuration_bitnet.py`` / ``modeling_bitnet.py`` files
+                # that don't actually exist in the repo (the model_type is
+                # registered natively in transformers).  Retry without
+                # ``trust_remote_code`` so AutoConfig uses the registered
+                # class instead of the dynamic loader.
+                try:
+                    _cfg = AutoConfig.from_pretrained(
+                        model_name, trust_remote_code=False,
+                    )
+                except Exception:
+                    try:
+                        from huggingface_hub import hf_hub_download
+                        import json as _json
+                        if os.path.isdir(model_name):
+                            _cfg_path = os.path.join(model_name, "config.json")
+                        else:
+                            _cfg_path = hf_hub_download(model_name, "config.json")
+                        with open(_cfg_path) as _f:
+                            _cfg_dict = _json.load(_f)
+                        _td = _cfg_dict.get("torch_dtype", None)
+                        cfg_dtype = getattr(torch, _td) if isinstance(_td, str) else None
+                        if isinstance(cfg_dtype, torch.dtype):
+                            dtype = cfg_dtype
+                    except Exception:
+                        pass
+            if dtype is None:
+                cfg_dtype = getattr(_cfg, "torch_dtype", None) if _cfg is not None else None
+                if cfg_dtype is not None and isinstance(cfg_dtype, torch.dtype):
+                    dtype = cfg_dtype
+                else:
+                    dtype = torch.bfloat16
+        self.dtype = dtype
         default_dtype = torch.get_default_dtype()
         torch.set_default_dtype(dtype)
         torch.set_default_device("cuda")
 
+        import time as _time
+        _t0 = _time.perf_counter()
+        if rank == 0:
+            print(f"  [1/6] Loading model weights...", flush=True)
         self.model, self.config = load_model(
             model_name, torch.device(f"cuda:{rank}"), dtype,
         )
-        model_type = getattr(self.config, "model_type", "")
-        self.model_family = (
-            "mamba" if model_type in {"mamba", "mamba2", "gla", "rwkv7", "kimi_linear", "qwen3_next"}
-            else "attention"
-        )
-        self.is_moe = hasattr(self.config, "num_local_experts")
+        self.is_moe = hasattr(self.config, "num_local_experts") or getattr(self.config, "is_moe", False)
         self.is_qwen_vl = hasattr(self.config, "mrope_section")
-        if self.model_family == "attention":
-            self.warmup_model()
-            self.allocate_kv_cache()
-            if not self.enforce_eager:
-                self.capture_cudagraph()
-            self._init_greedy_buffers()
-        else:
-            self.allocate_mamba_state_cache()
+        self.is_qwen3_vl = self.is_qwen_vl and hasattr(
+            getattr(self.config, "vision", None), "deepstack_visual_indexes"
+        )
+        self.is_whisper = getattr(self.config, "is_encoder_decoder", False)
+        self.is_deepseek_mla = hasattr(self.config, "kv_lora_rank")
+        if self.is_whisper:
+            self.enforce_eager = True
+            self.max_model_len = min(
+                self.max_model_len,
+                getattr(self.config, "max_target_positions", self.max_model_len),
+            )
+
+        auto_register_no_compile_layers(self.model)
+
+        self._compiled = False
+        if rank == 0:
+            print(f"  [1/6] Model loaded in {_time.perf_counter()-_t0:.1f}s", flush=True)
+        self._share_trtllm_workspace()
+        self._share_activation_buffers()
+        if rank == 0:
+            print(f"  [2/6] Warmup forward pass...", flush=True)
+        _t1 = _time.perf_counter()
+        self.warmup_model()
+        if rank == 0:
+            print(f"  [2/6] Warmup done in {_time.perf_counter()-_t1:.1f}s", flush=True)
+            print(f"  [3/6] DeepGEMM warmup...", flush=True)
+        _t2 = _time.perf_counter()
+        self._warmup_deepgemm()
+        if rank == 0:
+            print(f"  [3/6] DeepGEMM done in {_time.perf_counter()-_t2:.1f}s", flush=True)
+            print(f"  [4/6] Allocating KV cache...", flush=True)
+        _t3 = _time.perf_counter()
+        self.allocate_kv_cache()
+        self._init_fa3_decode_buffers()
+        if rank == 0:
+            print(f"  [4/6] KV cache done in {_time.perf_counter()-_t3:.1f}s", flush=True)
+        if not self.enforce_eager:
+            if rank == 0:
+                print(f"  [5/6] Compiling + capturing CUDA graphs...", flush=True)
+            _t4 = _time.perf_counter()
+            self._compile_model()
+            self.capture_cudagraph()
+            if rank == 0:
+                print(f"  [5/6] CUDA graphs done in {_time.perf_counter()-_t4:.1f}s", flush=True)
+        if rank == 0:
+            print(f"  [6/6] Init greedy buffers...", flush=True)
+        self._init_greedy_buffers()
+        if rank == 0:
+            print(f"  Engine ready in {_time.perf_counter()-_t0:.1f}s total", flush=True)
         torch.set_default_device("cpu")
         torch.set_default_dtype(default_dtype)
 
@@ -333,187 +464,583 @@ class ModelRunner:
             self._signal_workers()
         return getattr(self, method_name)(*args)
 
+    def _share_trtllm_workspace(self):
+        """Replace per-layer TRTLLM workspace buffers with a single shared one."""
+        if not ATTN_BACKEND_CONFIG.use_trtllm:
+            return
+        self._attn_layers = []
+        self._cross_attn_layers = []
+        for module in self.model.modules():
+            if hasattr(module, "k_cache") and hasattr(module, "v_cache"):
+                if getattr(module, "is_cross_attn", False):
+                    self._cross_attn_layers.append(module)
+                else:
+                    self._attn_layers.append(module)
+        trtllm_workspace = torch.zeros(
+            512 * 1024 * 1024, dtype=torch.uint8, device=f"cuda:{self.rank}"
+        )
+        for layer in self._attn_layers:
+            layer.set_trtllm_workspace(trtllm_workspace)
+        torch.cuda.empty_cache()
+
+    def _share_activation_buffers(self):
+        """No-op (was: share SiluAndMul output buffers across layers).
+
+        The previous implementation made all ``SiluAndMul`` instances point
+        to a single ``_ActivationBuffer`` so the output tensor would be
+        reused across layers (saving allocations).  However the underlying
+        CUDA kernel writes to ``out`` assuming a contiguous
+        ``[num_tokens, d]`` layout (row stride == ``d``), and the shared
+        buffer returned a non-contiguous slice ``buf[:rows, :cols]`` whose
+        row stride was the buffer's *full* width.  When two SiluAndMul
+        instances had different ``d`` (e.g. dense MLP at d=9216 and the
+        DeepSeek-V3 shared expert at d=2048), the shared-expert output
+        was silently corrupted — every row past row 0 wrote to the wrong
+        storage offset.  ``SiluAndMul.forward_cuda`` now allocates a
+        fresh contiguous output per call (matches vLLM exactly).
+        """
+        return
+
     def warmup_model(self):
         torch.cuda.empty_cache()
         torch.cuda.reset_peak_memory_stats()
-        num_seqs = min(MAX_NUM_BATCHED_TOKENS // MAX_MODEL_LEN, MAX_NUM_SEQS)
-        seqs = [Sequence([0] * MAX_MODEL_LEN) for _ in range(num_seqs)]
-        self.run(seqs, True)
+
+        if self.is_qwen_vl:
+            self._warmup_vision_encoder()
+
+        if self.is_whisper:
+            self._warmup_whisper()
+        else:
+            warmup_len = min(self.max_model_len, self.max_num_batched_tokens)
+            num_seqs = min(self.max_num_batched_tokens // warmup_len, self.max_num_seqs)
+            seqs = [Sequence([0] * warmup_len) for _ in range(num_seqs)]
+            self.run(seqs, True)
+
         torch.cuda.empty_cache()
 
+    def _warmup_deepgemm(self):
+        """Pre-JIT DeepGEMM FP8 kernels for all weight shapes at decode and
+        prefill batch sizes, pre-allocate decode buffers per instance and
+        shared prefill buffers per unique (K, N) shape.
+
+        Respects VLLM_DEEP_GEMM_WARMUP env var: "skip" disables JIT warmup
+        (buffers are still allocated), "relax"/"full" run warmup normally.
+        """
+        import os
+        try:
+            from ..tasks.baseline.L1.fp8_linear import Fp8Linear, _Fp8PrefillBufs
+        except ImportError:
+            return
+
+        skip_jit = os.environ.get("VLLM_DEEP_GEMM_WARMUP", "").lower() == "skip"
+
+        fp8_modules = []
+        for module in self.model.modules():
+            linear_op = getattr(module, 'linear_op', None)
+            if isinstance(linear_op, Fp8Linear):
+                fp8_modules.append((module, linear_op))
+
+        if not fp8_modules:
+            return
+
+        import deep_gemm
+
+        max_decode = self.max_num_seqs
+        max_prefill = self.max_num_batched_tokens
+        device = next(self.model.parameters()).device
+
+        decode_bs = [1, 2, 4, 8] + list(range(16, max_decode + 1, 16))
+        prefill_bs = [s for s in [128, 256, 512, 1024, 2048, 4096, 8192, 16384]
+                      if s <= max_prefill and s > max_decode]
+
+        prefill_bufs: dict[tuple[int, int], _Fp8PrefillBufs] = {}
+
+        seen_shapes = set()
+        for module, linear_op in fp8_modules:
+            w = module.weight
+            ws = module.weight_scale_inv
+            N, K = w.shape
+
+            linear_op._ensure_buffers(max_decode, K, N, device)
+
+            key = (N, K)
+            if key not in prefill_bufs:
+                prefill_bufs[key] = _Fp8PrefillBufs(max_prefill, K, N, device)
+            linear_op._pf = prefill_bufs[key]
+
+            if skip_jit or key in seen_shapes:
+                seen_shapes.add(key)
+                continue
+            seen_shapes.add(key)
+
+            a_fp8 = linear_op._a_buf
+            a_scale = linear_op._s_buf
+            out = linear_op._o_buf
+            for num_tokens in decode_bs:
+                if num_tokens > max_decode:
+                    break
+                deep_gemm.fp8_gemm_nt(
+                    (a_fp8[:num_tokens], a_scale[:num_tokens]),
+                    (w, ws),
+                    out[:num_tokens],
+                )
+
+            pf = prefill_bufs[key]
+            for num_tokens in prefill_bs:
+                deep_gemm.fp8_gemm_nt(
+                    (pf.a[:num_tokens], pf.s[:num_tokens]),
+                    (w, ws),
+                    pf.o[:num_tokens],
+                )
+
+        torch.cuda.synchronize()
+        torch.cuda.empty_cache()
+        if self.rank == 0:
+            if skip_jit:
+                print(f"  DeepGEMM warmup: skipped JIT (VLLM_DEEP_GEMM_WARMUP=skip), "
+                      f"{len(seen_shapes)} shapes buffered")
+            else:
+                print(f"  DeepGEMM warmup: {len(seen_shapes)} unique FP8 weight shapes")
+
+    def _warmup_whisper(self):
+        """Warmup Whisper encoder + decoder with dummy audio input.
+
+        Exercises the full forward path: encoder -> cross-attn KV write ->
+        decoder prefill with cross-attn read.
+        """
+        config = self.config
+        num_mel_bins = config.num_mel_bins
+        max_source_positions = config.max_source_positions
+        max_target_positions = config.max_target_positions
+
+        T_mel = max_source_positions * 2
+        dummy_features = torch.randn(
+            1, num_mel_bins, T_mel,
+            device=f"cuda:{self.rank}", dtype=torch.get_default_dtype(),
+        )
+        with torch.inference_mode():
+            encoder_outputs = self.model.get_multimodal_embeddings(dummy_features)
+
+        warmup_len = min(max_target_positions, self.max_num_batched_tokens)
+        num_seqs = min(self.max_num_batched_tokens // warmup_len, self.max_num_seqs)
+        seqs = [Sequence([0] * warmup_len) for _ in range(num_seqs)]
+        self.run(seqs, True)
+
+        if self.rank == 0:
+            print(f"  Whisper warmup: encoder T_mel={T_mel}, "
+                  f"decoder warmup_len={warmup_len}")
+
+    def _warmup_vision_encoder(self):
+        """Run vision encoder with worst-case dummy inputs to capture peak
+        activation memory, following vLLM's profile_run() approach."""
+        import math
+        from PIL import Image
+
+        model = self.model
+        vision_cfg = self.config.vision
+        patch_size = vision_cfg.patch_size
+        merge_size = vision_cfg.spatial_merge_size
+        temporal_patch_size = getattr(vision_cfg, "temporal_patch_size", 2)
+
+        max_pixels = getattr(vision_cfg, "max_pixels", None)
+        if max_pixels is None:
+            max_pixels = 1280 * 28 * 28
+
+        unit = patch_size * merge_size
+        max_patches = max_pixels // (unit * unit)
+
+        def _closest_factor_pair(n):
+            for d in range(math.isqrt(n), 0, -1):
+                if n % d == 0:
+                    return d, n // d
+            return 1, n
+
+        hf, wf = 1, max_patches
+        for s in range(max_patches, 0, -1):
+            hf, wf = _closest_factor_pair(s)
+            if wf / hf <= 200:
+                break
+        img_h, img_w = unit * hf, unit * wf
+
+        if self.rank == 0:
+            print(f"  Vision warmup: image {img_w}x{img_h}")
+
+        dummy_img = Image.new("RGB", (img_w, img_h), color=255)
+        from transformers import AutoProcessor
+        processor = AutoProcessor.from_pretrained(
+            self.model_name, trust_remote_code=True)
+        messages = [{"role": "user", "content": [
+            {"type": "image", "image": dummy_img},
+            {"type": "text", "text": "x"},
+        ]}]
+        text = processor.apply_chat_template(
+            messages, tokenize=False, add_generation_prompt=True)
+        inputs = processor(
+            text=[text], images=[dummy_img], return_tensors="pt", padding=True)
+
+        pv = inputs["pixel_values"].cuda()
+        grid_thw = inputs["image_grid_thw"].cpu()
+        with torch.inference_mode():
+            vis_out = model.visual(pv, grid_thw=grid_thw)
+
+        self._warmup_encoder_cache = {}
+        if isinstance(vis_out, tuple):
+            embeds, ds = vis_out
+            self._warmup_encoder_cache["img"] = (embeds, ds)
+        else:
+            self._warmup_encoder_cache["img"] = vis_out
+
+        num_frames = 32
+        padded_nf = num_frames + num_frames % temporal_patch_size
+        vid_h = min(img_h, 420)
+        vid_w = min(img_w, 420)
+        vid_h = (vid_h // unit) * unit or unit
+        vid_w = (vid_w // unit) * unit or unit
+
+        if self.rank == 0:
+            print(f"  Vision warmup: video {num_frames}f {vid_w}x{vid_h}")
+
+        dummy_vid = np.full(
+            (num_frames, vid_h, vid_w, 3), 255, dtype=np.uint8)
+        messages = [{"role": "user", "content": [
+            {"type": "video", "video": list(dummy_vid)},
+            {"type": "text", "text": "x"},
+        ]}]
+        text = processor.apply_chat_template(
+            messages, tokenize=False, add_generation_prompt=True)
+        vid_frames_pil = [Image.fromarray(f) for f in dummy_vid]
+        inputs = processor(
+            text=[text], videos=[vid_frames_pil],
+            return_tensors="pt", padding=True)
+
+        vpv = inputs["pixel_values_videos"].cuda()
+        vgrid = inputs["video_grid_thw"].cpu()
+        with torch.inference_mode():
+            vis_out = model.visual(vpv, grid_thw=vgrid)
+
+        if isinstance(vis_out, tuple):
+            embeds, ds = vis_out
+            self._warmup_encoder_cache["vid"] = (embeds, ds)
+        else:
+            self._warmup_encoder_cache["vid"] = vis_out
+
+        del processor, dummy_img, dummy_vid, vid_frames_pil, pv, vpv
+        del inputs, messages, text
+
+    def _init_fa3_decode_buffers(self):
+        """Pre-allocate cu_seqlens_q buffers for FA3 decode to avoid
+        allocations during CUDA graph capture."""
+        try:
+            from ..tasks.baseline.L1.flash_attn_decode import _FA3_AVAILABLE
+        except ImportError:
+            return
+        if not _FA3_AVAILABLE:
+            return
+        max_bs = self.max_num_seqs
+        for module in self.model.modules():
+            if hasattr(module, '_cu_seqlens_q'):
+                module._cu_seqlens_q = torch.arange(
+                    max_bs + 1, dtype=torch.int32,
+                    device=f"cuda:{self.rank}",
+                )
+
     def allocate_kv_cache(self):
+        if not hasattr(self, '_attn_layers') or not self._attn_layers:
+            self._attn_layers = []
+            self._cross_attn_layers = []
+            for module in self.model.modules():
+                if hasattr(module, "k_cache") and hasattr(module, "v_cache"):
+                    if getattr(module, "is_cross_attn", False):
+                        self._cross_attn_layers.append(module)
+                    else:
+                        self._attn_layers.append(module)
+
+        if self.is_deepseek_mla:
+            self._allocate_mla_kv_cache()
+            return
+
         free, total = torch.cuda.mem_get_info()
         used = total - free
         peak = torch.cuda.memory_stats()["allocated_bytes.all.peak"]
         current = torch.cuda.memory_stats()["allocated_bytes.all.current"]
         num_kv_heads = self.config.num_key_value_heads // self.world_size
         head_dim = self.config.head_dim
-        num_layers = self.config.num_hidden_layers
+        num_self_attn_layers = len(self._attn_layers)
+        num_cross_attn_layers = len(self._cross_attn_layers)
         elem_size = torch.finfo(torch.get_default_dtype()).bits // 8
-        block_bytes = 2 * num_layers * BLOCK_SIZE * num_kv_heads * head_dim * elem_size
-        num_blocks = int(total * 0.9 - used - peak + current) // block_bytes
+
+        available_bytes = int(total * self.gpu_memory_utilization - used - peak + current)
+
+        if num_cross_attn_layers > 0:
+            max_encoder_tokens = getattr(self.config, 'max_source_positions', 1500)
+            cross_blocks_per_seq = (max_encoder_tokens + BLOCK_SIZE - 1) // BLOCK_SIZE
+            cross_block_bytes = (
+                2 * num_cross_attn_layers * BLOCK_SIZE * num_kv_heads * head_dim * elem_size
+            )
+            cross_bytes_per_seq = cross_blocks_per_seq * cross_block_bytes
+            max_cross_seqs = min(
+                self.max_num_seqs,
+                max(1, int(available_bytes * 0.5) // cross_bytes_per_seq),
+            )
+            self.max_num_seqs = max_cross_seqs
+            num_cross_blocks = cross_blocks_per_seq * max_cross_seqs
+            cross_cache_bytes = num_cross_blocks * cross_block_bytes
+            available_bytes -= cross_cache_bytes
+
+            self.num_cross_blocks = num_cross_blocks
+            self.cross_blocks_per_seq = cross_blocks_per_seq
+            self.max_encoder_tokens = max_encoder_tokens
+
+            if ATTN_BACKEND_CONFIG.kv_layout == "HND":
+                self.cross_kv_cache = torch.empty(
+                    2, num_cross_attn_layers, num_cross_blocks,
+                    num_kv_heads, BLOCK_SIZE, head_dim,
+                )
+            else:
+                self.cross_kv_cache = torch.empty(
+                    2, num_cross_attn_layers, num_cross_blocks,
+                    BLOCK_SIZE, num_kv_heads, head_dim,
+                )
+            for i, module in enumerate(self._cross_attn_layers):
+                module.k_cache = self.cross_kv_cache[0, i]
+                module.v_cache = self.cross_kv_cache[1, i]
+
+            self._cross_free_block_ids_init = num_cross_blocks
+            if self.rank == 0:
+                print(f"  Cross-attn KV cache: {num_cross_blocks} blocks "
+                      f"({cross_blocks_per_seq} per seq x {max_cross_seqs} seqs, "
+                      f"capped from {_DEFAULT_MAX_NUM_SEQS})")
+
+        self_attn_block_bytes = (
+            2 * num_self_attn_layers * BLOCK_SIZE * num_kv_heads * head_dim * elem_size
+        )
+        num_blocks = available_bytes // self_attn_block_bytes
+        if self.is_qwen_vl:
+            num_blocks = int(num_blocks * 0.95)
         assert num_blocks > 0, f"Not enough GPU memory for KV cache on rank {self.rank}"
         self.num_blocks = num_blocks
         if self.rank == 0:
             print(f"  KV cache: {num_blocks} blocks x {BLOCK_SIZE} = {num_blocks * BLOCK_SIZE} token slots")
 
-        self.kv_cache = torch.empty(
-            2, num_layers, num_blocks, BLOCK_SIZE, num_kv_heads, head_dim,
-        )
-        layer_id = 0
-        for module in self.model.modules():
-            if hasattr(module, "k_cache") and hasattr(module, "v_cache"):
-                module.k_cache = self.kv_cache[0, layer_id]
-                module.v_cache = self.kv_cache[1, layer_id]
-                layer_id += 1
+        if ATTN_BACKEND_CONFIG.kv_layout == "HND":
+            self.kv_cache = torch.empty(
+                2, num_self_attn_layers, num_blocks, num_kv_heads, BLOCK_SIZE, head_dim,
+            )
+        else:
+            self.kv_cache = torch.empty(
+                2, num_self_attn_layers, num_blocks, BLOCK_SIZE, num_kv_heads, head_dim,
+            )
+        for i, module in enumerate(self._attn_layers):
+            module.k_cache = self.kv_cache[0, i]
+            module.v_cache = self.kv_cache[1, i]
 
-    def allocate_mamba_state_cache(self):
+        if self.rank == 0:
+            cfg = ATTN_BACKEND_CONFIG
+            print(f"  Attention backend: {cfg.backend} "
+                  f"(block_size={cfg.block_size}, kv_layout={cfg.kv_layout})")
+
+        if hasattr(self, '_warmup_encoder_cache'):
+            del self._warmup_encoder_cache
+            import gc
+            gc.collect()
+            torch.cuda.empty_cache()
+
+    def _allocate_mla_kv_cache(self):
+        """Allocate MLA KV cache + indexer K cache.
+
+        The KV cache layout follows ``MLAAttention.kv_cache_dtype`` (set
+        via ``KB_NANO_KV_CACHE_DTYPE``, default ``"auto"`` = BF16):
+
+        * ``"auto"`` (default): BF16 cache, shape
+          ``[num_blocks, block_size, kv_lora_rank + qk_rope_head_dim]``
+          (1152 bytes/token for DeepSeek-V3.2). Matches stock vLLM's
+          ``kv_cache_dtype=auto`` on DeepSeek-V3.2 so ``topk_indices``
+          and MoE expert ids are bit-comparable.
+        * ``"fp8_ds_mla"``: uint8 cache, shape
+          ``[num_blocks, block_size, 656]`` (656 bytes/token).
+        """
+        from ..tasks.baseline.L2.mla_attention_impl import MLAAttention
+        from ..tasks.baseline.L2.sparse_attn_indexer import SparseAttnIndexer
+
+        _MLA_BLOCK_SIZE = 64  # FlashMLA uses block_size=64
+        _INDEXER_CACHE_BYTES = 132
+        _FP8_CACHE_BYTES = 656
+
+        mla_layers = []
+        indexer_layers = []
+        for module in self.model.modules():
+            if isinstance(module, MLAAttention):
+                mla_layers.append(module)
+            elif isinstance(module, SparseAttnIndexer):
+                indexer_layers.append(module)
+
+        num_layers = len(mla_layers)
+        num_indexer_layers = len(indexer_layers)
+
+        # All MLA layers must agree on the cache layout.
+        if num_layers > 0:
+            kv_cache_dtype = mla_layers[0].kv_cache_dtype
+            for ml in mla_layers[1:]:
+                assert ml.kv_cache_dtype == kv_cache_dtype, (
+                    "Inconsistent kv_cache_dtype across MLA layers"
+                )
+        else:
+            kv_cache_dtype = "auto"
+
+        use_fp8_kv = kv_cache_dtype == "fp8_ds_mla"
+        if use_fp8_kv:
+            cache_last_dim = _FP8_CACHE_BYTES
+            cache_torch_dtype = torch.uint8
+            bytes_per_slot = _FP8_CACHE_BYTES
+            backend_desc = "FP8 KV cache"
+        else:
+            # BF16: shape = (num_blocks, block_size, kv_lora_rank + rope_dim)
+            kv_lora_rank = mla_layers[0].kv_lora_rank if num_layers else 512
+            rope_dim = mla_layers[0].qk_rope_head_dim if num_layers else 64
+            cache_last_dim = kv_lora_rank + rope_dim
+            cache_torch_dtype = torch.bfloat16
+            bytes_per_slot = cache_last_dim * 2  # BF16 = 2 bytes/element
+            backend_desc = "BF16 KV cache"
+
         free, total = torch.cuda.mem_get_info()
         used = total - free
         peak = torch.cuda.memory_stats()["allocated_bytes.all.peak"]
         current = torch.cuda.memory_stats()["allocated_bytes.all.current"]
-        model_type = getattr(self.config, "model_type", "")
-        num_layers = self.config.num_hidden_layers
 
-        if model_type == "kimi_linear":
-            # Kimi-Linear: lightweight slot-based state (dicts populated at runtime)
-            num_slots = MAX_NUM_SEQS
-            self.mamba_state_manager = KimiLinearStateManager(
-                num_hidden_layers=num_layers,
-                num_slots=num_slots,
-            )
-            self.num_state_slots = num_slots
-            if self.rank == 0:
-                print(f"  Kimi-Linear state cache: {num_slots} sequence slots")
-            return
+        kv_bytes_per_block = num_layers * _MLA_BLOCK_SIZE * bytes_per_slot
+        idx_bytes_per_block = num_indexer_layers * _MLA_BLOCK_SIZE * _INDEXER_CACHE_BYTES
+        total_bytes_per_block = kv_bytes_per_block + idx_bytes_per_block
 
-        if model_type == "qwen3_next":
-            # Qwen3-Next: lightweight slot-based state (dicts populated at runtime)
-            # Reuse KimiLinearStateManager for simplicity
-            num_slots = MAX_NUM_SEQS
-            self.mamba_state_manager = KimiLinearStateManager(
-                num_hidden_layers=num_layers,
-                num_slots=num_slots,
-            )
-            self.num_state_slots = num_slots
-            if self.rank == 0:
-                print(f"  Qwen3-Next state cache: {num_slots} sequence slots")
-            return
+        num_blocks = int(total * self.gpu_memory_utilization - used - peak + current) // total_bytes_per_block
+        assert num_blocks > 0, f"Not enough GPU memory for MLA KV cache on rank {self.rank}"
+        self.num_blocks = num_blocks
+        self.block_size = _MLA_BLOCK_SIZE
 
-        if model_type == "gla":
-            num_heads = self.config.num_heads
-            key_dim = int(self.config.hidden_size * self.config.expand_k)
-            value_dim = int(self.config.hidden_size * self.config.expand_v)
-            head_k_dim = key_dim // num_heads
-            head_v_dim = value_dim // num_heads
-            state_dtype = torch.float32
-            elem_size = torch.finfo(state_dtype).bits // 8
-            per_layer_bytes = num_heads * head_k_dim * head_v_dim * elem_size
-            per_slot_bytes = num_layers * per_layer_bytes
-            budget = int(total * 0.9 - used - peak + current)
-            num_slots = max(1, min(MAX_NUM_SEQS, budget // max(1, per_slot_bytes)))
-
-            self.mamba_state_manager = GLAStateManager(
-                num_hidden_layers=num_layers,
-                num_heads=num_heads,
-                head_k_dim=head_k_dim,
-                head_v_dim=head_v_dim,
-                num_slots=num_slots,
-                dtype=state_dtype,
-                device=torch.device(f"cuda:{self.rank}"),
-            )
-            self.num_state_slots = num_slots
-            if self.rank == 0:
-                print(f"  GLA state cache: {num_slots} sequence slots")
-            return
-
-        if model_type == "rwkv7":
-            num_heads = int(self.config.num_heads)
-            head_dim = int(self.config.head_dim)
-            value_dims = getattr(self.config, "value_dim", None)
-            if value_dims is None:
-                value_dims = [self.config.hidden_size] * num_layers
-            elif isinstance(value_dims, int):
-                value_dims = [value_dims] * num_layers
-            head_v_dims = [int(v // num_heads) for v in value_dims]
-
-            conv_elem_size = torch.finfo(self._model_dtype).bits // 8
-            recurrent_elem_size = torch.finfo(torch.float32).bits // 8
-            conv_bytes = num_layers * 2 * self.config.hidden_size * conv_elem_size
-            recurrent_bytes = sum(
-                num_heads * head_dim * head_v_dim * recurrent_elem_size
-                for head_v_dim in head_v_dims
-            )
-            per_slot_bytes = conv_bytes + recurrent_bytes
-            budget = int(total * 0.9 - used - peak + current)
-            num_slots = max(1, min(MAX_NUM_SEQS, budget // max(1, per_slot_bytes)))
-
-            self.mamba_state_manager = RWKV7StateManager(
-                num_hidden_layers=num_layers,
-                hidden_size=self.config.hidden_size,
-                num_heads=num_heads,
-                head_dim=head_dim,
-                head_v_dims=head_v_dims,
-                num_slots=num_slots,
-                conv_dtype=self._model_dtype,
-                recurrent_dtype=torch.float32,
-                device=torch.device(f"cuda:{self.rank}"),
-            )
-            self.num_state_slots = num_slots
-            if self.rank == 0:
-                print(f"  RWKV7 state cache: {num_slots} sequence slots")
-            return
-
-        elem_size = torch.finfo(self._model_dtype).bits // 8
-        if model_type == "mamba2":
-            intermediate_size = getattr(
-                self.config,
-                "intermediate_size",
-                int(self.config.expand * self.config.hidden_size),
-            )
-            conv_dim = intermediate_size + 2 * self.config.n_groups * self.config.state_size
-            ssm_state_shape = (
-                self.config.num_heads,
-                self.config.head_dim,
-                self.config.state_size,
-            )
-            per_layer_bytes = (
-                conv_dim * self.config.conv_kernel
-                + self.config.num_heads * self.config.head_dim * self.config.state_size
-            ) * elem_size
-        else:
-            conv_dim = self.config.intermediate_size
-            ssm_state_shape = (self.config.intermediate_size, self.config.state_size)
-            per_layer_bytes = (
-                conv_dim * self.config.conv_kernel
-                + self.config.intermediate_size * self.config.state_size
-            ) * elem_size
-
-        per_slot_bytes = num_layers * per_layer_bytes
-        budget = int(total * 0.9 - used - peak + current)
-        num_slots = max(1, min(MAX_NUM_SEQS, budget // max(1, per_slot_bytes)))
-
-        self.mamba_state_manager = MambaStateManager(
-            num_hidden_layers=num_layers,
-            conv_dim=conv_dim,
-            ssm_state_shape=ssm_state_shape,
-            conv_kernel=self.config.conv_kernel,
-            num_slots=num_slots,
-            dtype=self._model_dtype,
-            device=torch.device(f"cuda:{self.rank}"),
+        # Update module-level BLOCK_SIZE so Sequence.num_blocks,
+        # blocks_needed_for, BlockManager, prepare_prefill/decode, etc.
+        # all use the MLA block size consistently.
+        global BLOCK_SIZE
+        BLOCK_SIZE = _MLA_BLOCK_SIZE
+        # Recompute max_model_len with the new block size
+        self.max_model_len = (
+            (self.max_model_len + _MLA_BLOCK_SIZE - 1)
+            // _MLA_BLOCK_SIZE * _MLA_BLOCK_SIZE
         )
-        self.num_state_slots = num_slots
+
         if self.rank == 0:
-            print(f"  Mamba state cache: {num_slots} sequence slots")
+            print(f"  MLA KV cache: {num_blocks} blocks x {_MLA_BLOCK_SIZE} = "
+                  f"{num_blocks * _MLA_BLOCK_SIZE} token slots ({num_layers} layers, "
+                  f"{bytes_per_slot} bytes/token, dtype={kv_cache_dtype})")
 
-    def can_allocate_mamba_state(self):
-        return self.mamba_state_manager.has_free_slot()
+        device = f"cuda:{self.rank}"
+        for i, layer in enumerate(mla_layers):
+            cache = torch.zeros(
+                num_blocks, _MLA_BLOCK_SIZE, cache_last_dim,
+                dtype=cache_torch_dtype, device=device,
+            )
+            layer.k_cache = cache
+            layer.v_cache = cache
 
-    def allocate_mamba_state(self, seq):
-        self.mamba_state_manager.allocate(seq)
+        if num_indexer_layers > 0:
+            if self.rank == 0:
+                print(f"  Indexer K cache: {num_blocks} blocks x {_MLA_BLOCK_SIZE} = "
+                      f"{num_blocks * _MLA_BLOCK_SIZE} token slots ({num_indexer_layers} layers, "
+                      f"{_INDEXER_CACHE_BYTES} bytes/token)")
+            for i, layer in enumerate(indexer_layers):
+                layer.indexer_k_cache = torch.zeros(
+                    num_blocks, _MLA_BLOCK_SIZE, _INDEXER_CACHE_BYTES,
+                    dtype=torch.uint8, device=device,
+                )
 
-    def deallocate_mamba_state(self, seq):
-        self.mamba_state_manager.deallocate(seq)
+        if self.rank == 0:
+            print(f"  MLA attention backend: FlashMLA (block_size={_MLA_BLOCK_SIZE}, {backend_desc})")
+
+        # Pre-allocate chunked prefill workspace for MLA context gathering.
+        # Matches vllm's MLACommonMetadataBuilder workspace sizing.
+        workspace_tokens = min(
+            max(8 * self.max_model_len,
+                4 * self.max_num_seqs * _MLA_BLOCK_SIZE),
+            64 * 1024,
+        )
+        workspace_tokens = max(workspace_tokens,
+                               self.max_num_seqs * _MLA_BLOCK_SIZE)
+        # Workspace holds BF16 kv_c + k_pe (kv_lora_rank + qk_rope_head_dim
+        # elements per token), regardless of on-disk cache layout.
+        kv_lora_rank_ws = mla_layers[0].kv_lora_rank if num_layers else 512
+        rope_dim_ws = mla_layers[0].qk_rope_head_dim if num_layers else 64
+        self._mla_chunked_prefill_workspace = torch.empty(
+            workspace_tokens, kv_lora_rank_ws + rope_dim_ws,
+            dtype=torch.bfloat16, device=device,
+        )
+        self._mla_workspace_size = workspace_tokens
+
+    def _build_chunked_context(self, prefill_seqs, prefill_chunk_sizes,
+                               block_tables, device):
+        """Build ChunkedContextMetadata for MLA prefill with prior context.
+
+        When a prefill request has already-computed tokens (chunked prefill),
+        those tokens live in the KV cache and must be gathered and attended to
+        in workspace-sized chunks. This matches vllm's
+        MLACommonMetadataBuilder.build() chunked context logic.
+        """
+        from .context import ChunkedContextMetadata
+
+        num_prefills = len(prefill_seqs)
+        context_lens = []
+        for seq, chunk_size in zip(prefill_seqs, prefill_chunk_sizes):
+            context_lens.append(seq.num_computed_tokens)
+        context_lens_cpu = torch.tensor(context_lens, dtype=torch.int32)
+        max_context_len = int(context_lens_cpu.max().item())
+
+        if max_context_len == 0:
+            return None
+
+        num_prefills_with_context = int((context_lens_cpu > 0).sum().item())
+        if num_prefills_with_context == 0:
+            return None
+
+        max_context_chunk = self._mla_workspace_size // num_prefills_with_context
+        block_size = self.block_size
+        max_context_chunk = (max_context_chunk // block_size) * block_size
+        if max_context_chunk == 0:
+            max_context_chunk = block_size
+        num_chunks = (max_context_len + max_context_chunk - 1) // max_context_chunk
+
+        chunk_starts = (
+            torch.arange(num_chunks, dtype=torch.int32)
+            .unsqueeze(1).expand(-1, num_prefills)
+            * max_context_chunk
+        )
+        chunk_ends = torch.min(
+            context_lens_cpu.unsqueeze(0), chunk_starts + max_context_chunk
+        )
+        chunk_seq_lens = (chunk_ends - chunk_starts).clamp(min=0)
+
+        cu_seq_lens_cpu = torch.zeros(
+            num_chunks, num_prefills + 1, dtype=torch.int32)
+        torch.cumsum(chunk_seq_lens, dim=1, out=cu_seq_lens_cpu[:, 1:],
+                     dtype=torch.int32)
+        chunk_total_token = cu_seq_lens_cpu[:, -1]
+
+        max_token_num = int(chunk_total_token.max().item())
+        token_to_seq_cpu = torch.zeros(
+            num_chunks, max_token_num, dtype=torch.int32)
+        range_idx = torch.arange(num_prefills, dtype=torch.int32)
+        for i in range(num_chunks):
+            chunk_t2s = torch.repeat_interleave(range_idx, chunk_seq_lens[i])
+            clen = chunk_t2s.shape[0]
+            token_to_seq_cpu[i, :clen] = chunk_t2s
+
+        return ChunkedContextMetadata(
+            cu_seq_lens=cu_seq_lens_cpu.to(device, non_blocking=True),
+            starts=chunk_starts.to(device, non_blocking=True),
+            seq_tot=chunk_seq_lens.sum(dim=1).tolist(),
+            max_seq_lens=chunk_seq_lens.max(dim=1).values.tolist(),
+            seq_lens=chunk_seq_lens,
+            workspace=self._mla_chunked_prefill_workspace,
+            token_to_seq=token_to_seq_cpu.to(device, non_blocking=True),
+            chunk_total_token=chunk_total_token.tolist(),
+        )
 
     def prepare_prefill(self, seqs):
         input_ids, positions = [], []
@@ -521,19 +1048,20 @@ class ModelRunner:
         max_sq, max_sk = 0, 0
         slot_mapping = []
         max_bt = 0
-        use_mrope = self.is_qwen_vl and any(s.mrope_positions is not None for s in seqs)
+        has_block_tables = False
+        use_mrope = self.is_qwen_vl
         mrope_pos_list = [] if use_mrope else None
 
         for seq in seqs:
             sl = len(seq)
             input_ids.extend(seq.token_ids)
-            if use_mrope and seq.mrope_positions is not None:
+            if use_mrope and getattr(seq, 'mrope_positions', None) is not None:
                 mrope_pos_list.append(seq.mrope_positions)
             else:
                 positions.extend(range(sl))
                 if use_mrope:
                     mrope_pos_list.append(
-                        torch.arange(sl, dtype=torch.int64).unsqueeze(0).expand(3, -1)
+                        torch.arange(sl, dtype=torch.int64, device="cpu").unsqueeze(0).expand(3, -1)
                     )
             cu_seqlens_q.append(cu_seqlens_q[-1] + sl)
             cu_seqlens_k.append(cu_seqlens_k[-1] + sl)
@@ -541,6 +1069,7 @@ class ModelRunner:
             max_sk = max(sl, max_sk)
             if not seq.block_table:  # warmup
                 continue
+            has_block_tables = True
             for i in range(seq.num_blocks):
                 start = seq.block_table[i] * BLOCK_SIZE
                 end = start + (BLOCK_SIZE if i != seq.num_blocks - 1
@@ -560,13 +1089,30 @@ class ModelRunner:
                     bt[i, :len(b)] = b
             block_tables = torch.from_numpy(bt).pin_memory().cuda(non_blocking=True)
 
+        # Per-token request id (row into block_tables). Pre-computing this
+        # once per step avoids a Python for-loop + .item() sync inside every
+        # MLA / DSA layer (see ``_forward_sparse_bf16`` fallback in
+        # ``mla_attention_impl.py``).
+        nseqs_pf = len(seqs)
+        seq_lens_np = np.fromiter(
+            (len(s) for s in seqs), dtype=np.int32, count=nseqs_pf,
+        )
+        req_id_np = np.repeat(
+            np.arange(nseqs_pf, dtype=np.int32), seq_lens_np,
+        )
+        req_id_per_token = torch.from_numpy(req_id_np).pin_memory().cuda(
+            non_blocking=True,
+        )
+
         set_context(
             True,
             torch.tensor(cu_seqlens_q, dtype=torch.int32, pin_memory=True).cuda(non_blocking=True),
             torch.tensor(cu_seqlens_k, dtype=torch.int32, pin_memory=True).cuda(non_blocking=True),
             max_sq, max_sk,
-            torch.tensor(slot_mapping, dtype=torch.int32, pin_memory=True).cuda(non_blocking=True),
+            torch.tensor(slot_mapping, dtype=(torch.int64 if self.is_deepseek_mla else torch.int32),
+                         pin_memory=True).cuda(non_blocking=True),
             block_tables=block_tables,
+            req_id_per_token=req_id_per_token,
         )
 
         input_ids_t = torch.tensor(input_ids, dtype=torch.int64, pin_memory=True).cuda(non_blocking=True)
@@ -582,7 +1128,7 @@ class ModelRunner:
         n = len(seqs)
         ids = np.empty(n, dtype=np.int64)
         pos = np.empty(n, dtype=np.int64)
-        sm = np.empty(n, dtype=np.int32)
+        sm = np.empty(n, dtype=np.int64)
         cl = np.empty(n, dtype=np.int32)
         use_mrope = self.is_qwen_vl
         if use_mrope:
@@ -602,16 +1148,33 @@ class ModelRunner:
             blen = len(seq.block_table)
             if blen > max_bt:
                 max_bt = blen
+
         bt = np.full((n, max_bt), -1, dtype=np.int32)
         for i, seq in enumerate(seqs):
             b = seq.block_table
             bt[i, :len(b)] = b
+        max_cl = int(cl[:n].max())
+        # Pure-decode: one token per request, so token i belongs to request i.
+        # Reuse the persistent arange buffer allocated in
+        # ``capture_cudagraph`` (also referenced by every captured decode
+        # CUDA graph) to avoid allocating a fresh tensor each step.  Falls
+        # back to an inline arange for eager runs where capture was skipped.
+        req_id_per_token = getattr(self, "_decode_req_id_buf", None)
+        if req_id_per_token is not None:
+            req_id_per_token = req_id_per_token[:n]
+        else:
+            req_id_per_token = torch.arange(
+                n, dtype=torch.int32, device=f"cuda:{self.rank}",
+            )
         set_context(
             False,
             slot_mapping=torch.from_numpy(sm).pin_memory().cuda(non_blocking=True),
             context_lens=torch.from_numpy(cl).pin_memory().cuda(non_blocking=True),
             block_tables=torch.from_numpy(bt).pin_memory().cuda(non_blocking=True),
+            max_context_len=max_cl,
+            req_id_per_token=req_id_per_token,
         )
+        self._apply_pending_cross_ctx()
         if use_mrope:
             positions_t = torch.from_numpy(mrope_pos).pin_memory().cuda(non_blocking=True)
         else:
@@ -622,96 +1185,202 @@ class ModelRunner:
         )
 
     def prepare_mixed_batch(self, prefill_seqs, prefill_chunk_sizes, decode_seqs):
-        """Prepare a unified mixed batch with full prefills and decode tokens.
+        """Prepare a unified mixed batch: [prefill_tokens... | decode_tokens...].
 
-        All attention reads from the paged KV cache via block_table.
-        cu_seqlens_q/k cover all sequences (prefill + decode).
+        The attention layer receives split metadata so it can dispatch
+        prefill tokens to the prefill kernel and decode tokens to the
+        decode kernel independently.
         """
         input_ids, positions = [], []
         slot_mapping = []
-        cu_seqlens_q, cu_seqlens_k = [0], [0]
-        max_sq, max_sk = 0, 0
-
         block_size = self.block_size
-        all_seqs = list(prefill_seqs) + list(decode_seqs)
-        max_bt = 0
 
-        # Prefill sequences: q_len = prompt_len, k_len = prompt_len
+        use_mrope = self.is_qwen_vl
+        mrope_pos_list = [] if use_mrope else None
+
+        # --- Prefill portion ---
+        pf_cu_q, pf_cu_k = [0], [0]
+        pf_max_sq, pf_max_sk = 0, 0
+        pf_max_bt = 0
+
         for seq, chunk_size in zip(prefill_seqs, prefill_chunk_sizes):
-            sl = chunk_size
-            input_ids.extend(seq.token_ids[:sl])
-            positions.extend(range(sl))
-            cu_seqlens_q.append(cu_seqlens_q[-1] + sl)
-            cu_seqlens_k.append(cu_seqlens_k[-1] + sl)
-            max_sq = max(sl, max_sq)
-            max_sk = max(sl, max_sk)
-            for i in range(seq.num_blocks):
-                start = seq.block_table[i] * block_size
-                end = start + (block_size if i != seq.num_blocks - 1
-                               else seq.last_block_num_tokens)
-                slot_mapping.extend(range(start, end))
+            start_pos = seq.num_computed_tokens
+            chunk_ids = seq.token_ids[start_pos:start_pos + chunk_size]
+            input_ids.extend(chunk_ids)
+            if use_mrope and getattr(seq, 'mrope_positions', None) is not None:
+                mrope_pos_list.append(seq.mrope_positions[:, start_pos:start_pos + chunk_size])
+            else:
+                positions.extend(range(start_pos, start_pos + chunk_size))
+                if use_mrope:
+                    mrope_pos_list.append(
+                        torch.arange(start_pos, start_pos + chunk_size,
+                                     dtype=torch.int64, device="cpu").unsqueeze(0).expand(3, -1)
+                    )
+
+            kv_len = start_pos + chunk_size
+            pf_cu_q.append(pf_cu_q[-1] + chunk_size)
+            pf_cu_k.append(pf_cu_k[-1] + kv_len)
+            pf_max_sq = max(chunk_size, pf_max_sq)
+            pf_max_sk = max(kv_len, pf_max_sk)
+
+            for p in range(start_pos, start_pos + chunk_size):
+                slot_mapping.append(
+                    seq.block_table[p // block_size] * block_size + (p % block_size)
+                )
             blen = len(seq.block_table)
-            if blen > max_bt:
-                max_bt = blen
+            if blen > pf_max_bt:
+                pf_max_bt = blen
 
         num_prefill_tokens = len(input_ids)
+        num_prefill_seqs = len(prefill_seqs)
 
-        # Decode sequences: q_len = 1, k_len = full context length
-        for seq in decode_seqs:
+        # Build prefill block table
+        prefill_block_tables = None
+        if pf_max_bt > 0 and num_prefill_seqs > 0:
+            pbt = np.full((num_prefill_seqs, pf_max_bt), -1, dtype=np.int32)
+            for i, seq in enumerate(prefill_seqs):
+                b = seq.block_table
+                pbt[i, :len(b)] = b
+            prefill_block_tables = torch.from_numpy(pbt).pin_memory().cuda(non_blocking=True)
+
+        # --- Decode portion ---
+        nd = len(decode_seqs)
+        dc_cl = np.empty(nd, dtype=np.int32)
+        dc_max_bt = 0
+        for i, seq in enumerate(decode_seqs):
             input_ids.append(seq.last_token)
-            positions.append(len(seq) - 1)
-            cu_seqlens_q.append(cu_seqlens_q[-1] + 1)
-            cu_seqlens_k.append(cu_seqlens_k[-1] + len(seq))
-            max_sk = max(len(seq), max_sk)
-            max_sq = max(1, max_sq)
+            pos = len(seq) - 1
+            if use_mrope:
+                delta = getattr(seq, 'mrope_position_delta', 0)
+                p = pos + delta
+                mrope_pos_list.append(
+                    torch.tensor([[p], [p], [p]], dtype=torch.int64, device="cpu"))
+            else:
+                positions.append(pos)
+            dc_cl[i] = len(seq)
             slot_mapping.append(
                 seq.block_table[-1] * block_size + seq.last_block_num_tokens - 1
             )
             blen = len(seq.block_table)
-            if blen > max_bt:
-                max_bt = blen
+            if blen > dc_max_bt:
+                dc_max_bt = blen
 
-        num_decode_tokens = len(decode_seqs)
-
-        # Unified block table for all sequences
-        n_all = len(all_seqs)
-        bt = np.full((n_all, max_bt), -1, dtype=np.int32)
-        for i, seq in enumerate(all_seqs):
+        dc_bt = np.full((nd, dc_max_bt), -1, dtype=np.int32) if nd > 0 else np.empty((0, 0), dtype=np.int32)
+        for i, seq in enumerate(decode_seqs):
             b = seq.block_table
-            bt[i, :len(b)] = b
+            dc_bt[i, :len(b)] = b
+        dc_max_cl = int(dc_cl[:nd].max()) if nd > 0 else 0
+
+        logit_idx = []
+        for i in range(num_prefill_seqs):
+            logit_idx.append(pf_cu_q[i + 1] - 1)
+        for j in range(nd):
+            logit_idx.append(num_prefill_tokens + j)
+
+        chunked_context = None
+        if self.is_deepseek_mla and num_prefill_seqs > 0:
+            chunked_context = self._build_chunked_context(
+                prefill_seqs, prefill_chunk_sizes, prefill_block_tables,
+                device=torch.device(f"cuda:{self.rank}"),
+            )
+
+        # Per-token request id, aligned with the flat token layout
+        # built above: ``[prefill_tokens..., decode_tokens...]``.
+        # The unified block_table used downstream (see
+        # ``_forward_sparse_bf16``) is laid out as
+        # ``[decode_seqs..., prefill_seqs...]``; hence prefill tokens map
+        # to rows ``num_decode_seqs + r`` and decode tokens to row ``j``.
+        total_tokens = num_prefill_tokens + nd
+        if total_tokens > 0:
+            if num_prefill_tokens > 0:
+                pf_ids_np = np.repeat(
+                    (nd + np.arange(num_prefill_seqs, dtype=np.int32)),
+                    np.asarray(prefill_chunk_sizes, dtype=np.int32),
+                )
+            else:
+                pf_ids_np = np.empty(0, dtype=np.int32)
+            dc_ids_np = np.arange(nd, dtype=np.int32)
+            req_id_np = np.concatenate([pf_ids_np, dc_ids_np])
+            req_id_per_token = torch.from_numpy(req_id_np).pin_memory().cuda(
+                non_blocking=True,
+            )
+        else:
+            req_id_per_token = None
 
         set_mixed_context(
-            cu_seqlens_q=torch.tensor(cu_seqlens_q, dtype=torch.int32, pin_memory=True).cuda(non_blocking=True),
-            cu_seqlens_k=torch.tensor(cu_seqlens_k, dtype=torch.int32, pin_memory=True).cuda(non_blocking=True),
-            max_seqlen_q=max_sq,
-            max_seqlen_k=max_sk,
-            slot_mapping=torch.tensor(slot_mapping, dtype=torch.int32, pin_memory=True).cuda(non_blocking=True),
+            slot_mapping=torch.tensor(slot_mapping,
+                                      dtype=(torch.int64 if self.is_deepseek_mla else torch.int32),
+                                      pin_memory=True).cuda(non_blocking=True),
             num_prefill_tokens=num_prefill_tokens,
-            num_decode_tokens=num_decode_tokens,
-            decode_context_lens=None,
-            decode_block_tables=torch.from_numpy(bt).pin_memory().cuda(non_blocking=True),
+            num_decode_tokens=nd,
+            num_prefill_seqs=num_prefill_seqs,
+            prefill_cu_seqlens_q=torch.tensor(pf_cu_q, dtype=torch.int32, pin_memory=True).cuda(non_blocking=True),
+            prefill_cu_seqlens_k=torch.tensor(pf_cu_k, dtype=torch.int32, pin_memory=True).cuda(non_blocking=True),
+            prefill_max_seqlen_q=pf_max_sq,
+            prefill_max_seqlen_k=pf_max_sk,
+            prefill_block_tables=prefill_block_tables,
+            decode_context_lens=torch.from_numpy(dc_cl).pin_memory().cuda(non_blocking=True) if nd > 0 else None,
+            decode_block_tables=torch.from_numpy(dc_bt).pin_memory().cuda(non_blocking=True) if nd > 0 else None,
+            decode_max_context_len=dc_max_cl,
+            logit_indices=torch.tensor(logit_idx, dtype=torch.int64, pin_memory=True).cuda(non_blocking=True),
+            chunked_context=chunked_context,
+            req_id_per_token=req_id_per_token,
         )
-        return (
-            torch.tensor(input_ids, dtype=torch.int64, pin_memory=True).cuda(non_blocking=True),
-            torch.tensor(positions, dtype=torch.int64, pin_memory=True).cuda(non_blocking=True),
-        )
+
+        input_ids_t = torch.tensor(input_ids, dtype=torch.int64, pin_memory=True).cuda(non_blocking=True)
+        if use_mrope:
+            positions_t = torch.cat(mrope_pos_list, dim=1).to(torch.int64).pin_memory().cuda(non_blocking=True)
+        else:
+            positions_t = torch.tensor(positions, dtype=torch.int64, pin_memory=True).cuda(non_blocking=True)
+        return input_ids_t, positions_t
 
     @torch.inference_mode()
     def run_model(self, input_ids, positions, is_prefill, inputs_embeds=None,
-                  deepstack_embeds=None):
+                  deepstack_embeds=None, encoder_outputs=None):
         if is_prefill or self.enforce_eager or input_ids.size(0) > self.graph_bs_list[-1]:
+            # For compiled VL models, always compute inputs_embeds outside
+            # the compiled graph (matching vLLM).  The compiled inner
+            # Qwen3Model was traced with inputs_embeds, so it must always
+            # receive one.
+            if self.is_qwen_vl and self._compiled and inputs_embeds is None:
+                inputs_embeds = self.model.get_input_embeddings()(input_ids)
             if inputs_embeds is not None:
+                if deepstack_embeds is not None:
+                    # Multimodal prefill with actual vision features —
+                    # use the uncompiled inner model since the compiled
+                    # graph was traced without deepstack_embeds.
+                    inner = getattr(self, '_eager_inner_model', None)
+                    if inner is not None:
+                        hidden = inner(input_ids, positions,
+                                       inputs_embeds=inputs_embeds,
+                                       deepstack_embeds=deepstack_embeds)
+                        return self.model.compute_logits(hidden)
+                    return self.model.compute_logits(
+                        self.model(input_ids, positions,
+                                   inputs_embeds=inputs_embeds,
+                                   deepstack_embeds=deepstack_embeds)
+                    )
                 return self.model.compute_logits(
-                    self.model(input_ids, positions, inputs_embeds=inputs_embeds,
-                               deepstack_embeds=deepstack_embeds)
+                    self.model(input_ids, positions, inputs_embeds=inputs_embeds)
+                )
+            if encoder_outputs is not None:
+                return self.model.compute_logits(
+                    self.model(input_ids, positions, encoder_outputs=encoder_outputs)
                 )
             return self.model.compute_logits(self.model(input_ids, positions))
+        # Decode path: CUDA graph replay.
+        # For VL models, embed_fn is recorded inside the graph — updating
+        # input_ids in graph_vars is sufficient; the graph replays embed_fn
+        # on the new ids to produce inputs_embeds internally.
         bs = input_ids.size(0)
         ctx = get_context()
         graph_bs = self._graph_bs_for_n[bs]
         gv = self.graph_vars
         gv["input_ids"][:bs] = input_ids
-        gv["positions"][:bs] = positions
+        if self.is_qwen_vl:
+            gv["positions"][:, :bs] = positions
+        else:
+            gv["positions"][:bs] = positions
         gv["slot_mapping"][:bs] = ctx.slot_mapping
         if bs < graph_bs:
             gv["slot_mapping"][bs:graph_bs].fill_(-1)
@@ -742,12 +1411,20 @@ class ModelRunner:
         if self.enforce_eager:
             return self._run_decode_greedy_eager(n, ids_np, pos_np, sm_np, cl_np, bt_np)
 
+        self._run_graph_from_numpy(n, ids_np, pos_np, sm_np, cl_np, bt_np)
+        return self._greedy_from_hidden(n)
+
+    def _run_graph_from_numpy(self, n, ids_np, pos_np, sm_np, cl_np, bt_np):
+        """Copy numpy arrays into graph vars and replay the CUDA graph."""
         gv = self.graph_vars
         graph_bs = self._graph_bs_for_n[n]
         prev_n = getattr(self, '_prev_decode_n', -1)
 
         gv["input_ids"][:n].copy_(torch.from_numpy(ids_np), non_blocking=True)
-        gv["positions"][:n].copy_(torch.from_numpy(pos_np), non_blocking=True)
+        if self.is_qwen_vl:
+            gv["positions"][:, :n].copy_(torch.from_numpy(pos_np), non_blocking=True)
+        else:
+            gv["positions"][:n].copy_(torch.from_numpy(pos_np), non_blocking=True)
         gv["slot_mapping"][:n].copy_(torch.from_numpy(sm_np), non_blocking=True)
         if n < graph_bs and n != prev_n:
             gv["slot_mapping"][n:graph_bs].fill_(-1)
@@ -757,14 +1434,40 @@ class ModelRunner:
             torch.from_numpy(bt_np), non_blocking=True
         )
         self._prev_decode_n = n
-
         self.graphs[graph_bs].replay()
-        return self._greedy_from_hidden(n)
+
+    @torch.inference_mode()
+    def run_decode_greedy_fast_async(self, decode_data):
+        """Like run_decode_greedy_fast but starts async D2H copy.
+
+        Returns (has_result, n) -- caller must call _wait_async_tokens(n)
+        later to get the Python list of token IDs.
+        """
+        n, ids_np, pos_np, sm_np, cl_np, bt_np = decode_data
+
+        if self.enforce_eager:
+            result = self._run_decode_greedy_eager(n, ids_np, pos_np, sm_np, cl_np, bt_np)
+            if result is not None:
+                main_stream = torch.cuda.current_stream()
+                cs = self._copy_stream
+                with torch.cuda.stream(cs):
+                    cs.wait_stream(main_stream)
+                    self._pinned_token_ids[:n].copy_(result, non_blocking=True)
+                    self._copy_event.record(cs)
+                return True, n
+            return False, n
+
+        self._run_graph_from_numpy(n, ids_np, pos_np, sm_np, cl_np, bt_np)
+        has_result = self._greedy_from_hidden_async(n)
+        return has_result, n
 
     def _run_decode_greedy_eager(self, n, ids_np, pos_np, sm_np, cl_np, bt_np):
         """Eager decode path for greedy sampling with TP (no CUDA graphs)."""
         self._eager_input_ids[:n].copy_(torch.from_numpy(ids_np), non_blocking=True)
-        self._eager_positions[:n].copy_(torch.from_numpy(pos_np), non_blocking=True)
+        if self.is_qwen_vl:
+            self._eager_positions[:, :n].copy_(torch.from_numpy(pos_np), non_blocking=True)
+        else:
+            self._eager_positions[:n].copy_(torch.from_numpy(pos_np), non_blocking=True)
         bt_cols = bt_np.shape[1]
         self._eager_slot_mapping[:n].copy_(torch.from_numpy(sm_np), non_blocking=True)
         self._eager_context_lens[:n].copy_(torch.from_numpy(cl_np), non_blocking=True)
@@ -772,20 +1475,29 @@ class ModelRunner:
             torch.from_numpy(bt_np), non_blocking=True)
 
         input_ids = self._eager_input_ids[:n]
-        positions = self._eager_positions[:n]
+        if self.is_qwen_vl:
+            positions = self._eager_positions[:, :n]
+        else:
+            positions = self._eager_positions[:n]
         slot_mapping = self._eager_slot_mapping[:n]
         context_lens = self._eager_context_lens[:n]
         block_tables = self._eager_block_tables[:n, :bt_cols]
 
+        req_id_per_token = getattr(self, "_decode_req_id_buf", None)
+        if req_id_per_token is not None:
+            req_id_per_token = req_id_per_token[:n]
         set_context(
             False,
             slot_mapping=slot_mapping,
             context_lens=context_lens,
             block_tables=block_tables,
+            max_context_len=int(cl_np.max()),
+            req_id_per_token=req_id_per_token,
         )
+        self._apply_pending_cross_ctx()
         hidden = self.model(input_ids, positions)
         lm_head = self.model.lm_head
-        logits = lm_head.linear_op(hidden, lm_head.weight).float()
+        logits = lm_head.linear_op(hidden, lm_head.embedding_op.emb.weight).float()
         max_vals, max_idxs = logits.max(dim=-1)
         reset_context()
 
@@ -805,7 +1517,7 @@ class ModelRunner:
 
     def _init_greedy_buffers(self):
         """Pre-allocate buffers for gather_greedy to avoid per-step allocation."""
-        max_bs = MAX_NUM_SEQS
+        max_bs = self.max_num_seqs
         dev = f"cuda:{self.rank}"
         self._greedy_info = torch.zeros(max_bs, 2, dtype=torch.float32, device=dev)
         self._greedy_gathered = [
@@ -815,18 +1527,34 @@ class ModelRunner:
         self._greedy_all_info = torch.zeros(self.world_size, max_bs, 2, dtype=torch.float32, device=dev)
         self._greedy_arange = torch.arange(max_bs, device=dev)
 
-        max_num_blocks = (MAX_MODEL_LEN + BLOCK_SIZE - 1) // BLOCK_SIZE
+        max_num_blocks = (self.max_model_len + BLOCK_SIZE - 1) // BLOCK_SIZE
         self._np_ids = np.empty(max_bs, dtype=np.int64)
-        self._np_pos = np.empty(max_bs, dtype=np.int64)
-        self._np_sm = np.empty(max_bs, dtype=np.int32)
+        if self.is_qwen_vl:
+            self._np_pos = np.empty((3, max_bs), dtype=np.int64)
+        else:
+            self._np_pos = np.empty(max_bs, dtype=np.int64)
+        # DeepSeek MLA FP8 KV cache stores require int64 slot_mapping;
+        # the FA3 path only needs int32.
+        sm_np_dtype = np.int64 if self.is_deepseek_mla else np.int32
+        sm_torch_dtype = torch.int64 if self.is_deepseek_mla else torch.int32
+        self._np_sm = np.empty(max_bs, dtype=sm_np_dtype)
         self._np_cl = np.empty(max_bs, dtype=np.int32)
         self._np_bt = np.full((max_bs, max_num_blocks), -1, dtype=np.int32)
 
         self._eager_input_ids = torch.zeros(max_bs, dtype=torch.int64, device=dev)
-        self._eager_positions = torch.zeros(max_bs, dtype=torch.int64, device=dev)
-        self._eager_slot_mapping = torch.zeros(max_bs, dtype=torch.int32, device=dev)
+        if self.is_qwen_vl:
+            self._eager_positions = torch.zeros(3, max_bs, dtype=torch.int64, device=dev)
+        else:
+            self._eager_positions = torch.zeros(max_bs, dtype=torch.int64, device=dev)
+        self._eager_slot_mapping = torch.zeros(max_bs, dtype=sm_torch_dtype, device=dev)
         self._eager_context_lens = torch.zeros(max_bs, dtype=torch.int32, device=dev)
         self._eager_block_tables = torch.zeros(max_bs, max_num_blocks, dtype=torch.int32, device=dev)
+
+        # Async D2H: pinned buffer + copy stream for pipelined decode
+        self._pinned_token_ids = torch.empty(max_bs, dtype=torch.int64,
+                                             device="cpu", pin_memory=True)
+        self._copy_stream = torch.cuda.Stream(device=dev)
+        self._copy_event = torch.cuda.Event()
 
     def _greedy_from_hidden(self, n):
         """Use CUDA-graph-captured LM head + local argmax, then allgather.
@@ -835,11 +1563,12 @@ class ModelRunner:
         Caller must call .tolist() to sync.
         """
         gv = self.graph_vars
-        local_max_vals = gv["lm_max_vals"][:n]
-        local_max_idxs = gv["lm_max_idxs"][:n] + self.model.lm_head.vocab_start
 
         if self.world_size == 1:
-            return local_max_idxs
+            return gv["lm_max_idxs"][:n]
+
+        local_max_vals = gv["lm_max_vals"][:n]
+        local_max_idxs = gv["lm_max_idxs"][:n] + self.model.lm_head.vocab_start
 
         info = self._greedy_info[:n]
         info[:, 0] = local_max_vals
@@ -848,16 +1577,36 @@ class ModelRunner:
         gathered = [g[:n] for g in self._greedy_gathered]
         dist.all_gather(gathered, info)
 
-        for i, g in enumerate(gathered):
-            self._greedy_all_info[i, :n] = g
-        all_vals = self._greedy_all_info[:, :n, 0]
-        all_idxs = self._greedy_all_info[:, :n, 1].long()
-        best_rank = all_vals.argmax(dim=0)
-        token_ids = all_idxs[best_rank, self._greedy_arange[:n]]
+        all_info = self._greedy_all_info
+        torch.stack(gathered, out=all_info[:, :n])
+        best_rank = all_info[:, :n, 0].argmax(dim=0)
+        token_ids = all_info[:, :n, 1].long()[best_rank, self._greedy_arange[:n]]
 
         if self.rank == 0:
             return token_ids
         return None
+
+    def _greedy_from_hidden_async(self, n):
+        """Like _greedy_from_hidden but starts async D2H copy.
+
+        After calling this, the caller must eventually call
+        _wait_async_tokens(n) to get the Python list of token IDs.
+        Between the two calls, the CPU is free to do other work.
+        """
+        gpu_ids = self._greedy_from_hidden(n)
+        if gpu_ids is not None:
+            main_stream = torch.cuda.current_stream()
+            cs = self._copy_stream
+            with torch.cuda.stream(cs):
+                cs.wait_stream(main_stream)
+                self._pinned_token_ids[:n].copy_(gpu_ids, non_blocking=True)
+                self._copy_event.record(cs)
+        return gpu_ids is not None
+
+    def _wait_async_tokens(self, n):
+        """Wait for the async D2H copy to complete and return token list."""
+        self._copy_event.synchronize()
+        return self._pinned_token_ids[:n].tolist()
 
     def _prepare_decode_arrays(self, seqs):
         """Precompute numpy arrays for decode - uses pre-allocated buffers."""
@@ -867,15 +1616,25 @@ class ModelRunner:
         sm_np = self._np_sm
         cl_np = self._np_cl
         max_bt = 0
+        bs = BLOCK_SIZE
         for i, seq in enumerate(seqs):
-            ids_np[i] = seq.last_token
-            if self.is_qwen_vl:
-                pos_np[i] = len(seq) - 1 + seq.mrope_position_delta
+            tids = seq.token_ids
+            if tids is not None:
+                slen = len(tids)
+                ids_np[i] = tids[-1]
             else:
-                pos_np[i] = len(seq) - 1
-            cl_np[i] = len(seq)
-            sm_np[i] = seq.block_table[-1] * BLOCK_SIZE + seq.last_block_num_tokens - 1
-            blen = len(seq.block_table)
+                slen = seq._num_tokens
+                ids_np[i] = seq._last_token
+            if self.is_qwen_vl:
+                decode_pos = slen - 1 + seq.mrope_position_delta
+                pos_np[:, i] = decode_pos
+            else:
+                pos_np[i] = slen - 1
+            cl_np[i] = slen
+            bt = seq.block_table
+            blen = len(bt)
+            r = slen % bs
+            sm_np[i] = bt[-1] * bs + (r - 1 if r else bs - 1)
             if blen > max_bt:
                 max_bt = blen
         bt_np = self._np_bt
@@ -885,235 +1644,98 @@ class ModelRunner:
             bt_np[i, :blen] = b
             if blen < max_bt:
                 bt_np[i, blen:max_bt] = -1
+        self._prev_max_bt = max_bt
+        if self.is_qwen_vl:
+            return (n, ids_np[:n], pos_np[:, :n], sm_np[:n], cl_np[:n], bt_np[:n, :max_bt])
         return (n, ids_np[:n], pos_np[:n], sm_np[:n], cl_np[:n], bt_np[:n, :max_bt])
 
-    @torch.inference_mode()
-    def _run_mamba_seq(self, seq, is_prefill):
-        if seq.state_slot is None:
-            raise RuntimeError("Mamba sequence has no allocated state slot")
-        slot_cache = self.mamba_state_manager.get_slot_cache(seq.state_slot)
+    def _update_decode_arrays_incremental(self, n, token_ids, decode_seqs):
+        """Update pre-allocated decode arrays incrementally after a decode step.
 
-        if is_prefill:
-            input_ids = torch.tensor(
-                seq.prompt_ids, dtype=torch.int64, device=f"cuda:{self.rank}",
-            ).unsqueeze(0)
-            cache_position = torch.arange(
-                self.config.conv_kernel, dtype=torch.long, device=input_ids.device,
-            )
+        Much faster than _prepare_decode_arrays: vectorized numpy ops +
+        only touches block table rows that crossed a block boundary.
+        """
+        ids_np = self._np_ids
+        pos_np = self._np_pos
+        sm_np = self._np_sm
+        cl_np = self._np_cl
+        bt_np = self._np_bt
+        bs = BLOCK_SIZE
+
+        ids_np[:n] = token_ids
+        if self.is_qwen_vl:
+            pos_np[:, :n] += 1
         else:
-            input_ids = torch.tensor(
-                [[seq.last_token]], dtype=torch.int64, device=f"cuda:{self.rank}",
-            )
-            cache_position = torch.tensor(
-                [seq.num_computed_tokens], dtype=torch.long, device=input_ids.device,
-            )
+            pos_np[:n] += 1
+        cl_np[:n] += 1
+        sm_np[:n] += 1
 
-        hidden_states = self.model(
-            input_ids,
-            cache_params=slot_cache,
-            cache_position=cache_position,
-        )
-        logits = self.model.compute_logits(hidden_states[:, -1:, :])[:, -1, :]
-
-        if is_prefill:
-            seq.num_computed_tokens = seq.num_prompt_tokens
+        boundary_mask = cl_np[:n] % bs == 1
+        if boundary_mask.any():
+            max_bt = 0
+            for i in np.where(boundary_mask)[0]:
+                seq = decode_seqs[i]
+                bt = seq.block_table
+                blen = len(bt)
+                sm_np[i] = bt[-1] * bs
+                bt_np[i, :blen] = bt
+                if blen > max_bt:
+                    max_bt = blen
+            if max_bt == 0:
+                max_bt = self._prev_max_bt
+            else:
+                for i in np.where(~boundary_mask)[0]:
+                    blen = len(decode_seqs[i].block_table)
+                    if blen > max_bt:
+                        max_bt = blen
+                self._prev_max_bt = max_bt
         else:
-            seq.num_computed_tokens += 1
-        return logits
-
-    @torch.inference_mode()
-    def _run_mamba_batch(self, seqs, is_prefill):
-        outputs = [self._run_mamba_seq(seq, is_prefill) for seq in seqs]
-        if not outputs:
-            return None
-        return torch.cat(outputs, dim=0)
-
-    @torch.inference_mode()
-    def _run_gla_seq(self, seq, is_prefill):
-        if seq.state_slot is None:
-            raise RuntimeError("GLA sequence has no allocated state slot")
-        slot_cache = self.mamba_state_manager.get_slot_cache(seq.state_slot)
-
-        if is_prefill:
-            input_ids = torch.tensor(
-                seq.prompt_ids, dtype=torch.int64, device=f"cuda:{self.rank}",
-            ).unsqueeze(0)
-        else:
-            input_ids = torch.tensor(
-                [[seq.last_token]], dtype=torch.int64, device=f"cuda:{self.rank}",
-            )
-
-        hidden_states = self.model(
-            input_ids,
-            past_key_values=slot_cache,
-            use_cache=True,
-        )
-        logits = self.model.compute_logits(hidden_states[:, -1:, :])[:, -1, :]
-
-        if is_prefill:
-            seq.num_computed_tokens = seq.num_prompt_tokens
-        else:
-            seq.num_computed_tokens += 1
-        return logits
-
-    @torch.inference_mode()
-    def _run_gla_batch(self, seqs, is_prefill):
-        outputs = [self._run_gla_seq(seq, is_prefill) for seq in seqs]
-        if not outputs:
-            return None
-        return torch.cat(outputs, dim=0)
-
-    @torch.inference_mode()
-    def _run_rwkv7_seq(self, seq, is_prefill):
-        if seq.state_slot is None:
-            raise RuntimeError("RWKV7 sequence has no allocated state slot")
-        slot_cache = self.mamba_state_manager.get_slot_cache(seq.state_slot)
-
-        if is_prefill:
-            input_ids = torch.tensor(
-                seq.prompt_ids,
-                dtype=torch.int64,
-                device=f"cuda:{self.rank}",
-            ).unsqueeze(0)
-        else:
-            input_ids = torch.tensor(
-                [[seq.last_token]],
-                dtype=torch.int64,
-                device=f"cuda:{self.rank}",
-            )
-
-        hidden_states = self.model(
-            input_ids,
-            past_key_values=slot_cache,
-            use_cache=True,
-        )
-        logits = self.model.compute_logits(hidden_states[:, -1:, :])[:, -1, :]
-
-        if is_prefill:
-            seq.num_computed_tokens = seq.num_prompt_tokens
-        else:
-            seq.num_computed_tokens += 1
-        return logits
-
-    @torch.inference_mode()
-    def _run_rwkv7_batch(self, seqs, is_prefill):
-        outputs = [self._run_rwkv7_seq(seq, is_prefill) for seq in seqs]
-        if not outputs:
-            return None
-        return torch.cat(outputs, dim=0)
-
-    @torch.inference_mode()
-    def _run_kimi_linear_seq(self, seq, is_prefill):
-        if seq.state_slot is None:
-            raise RuntimeError("Kimi-Linear sequence has no allocated state slot")
-        slot_cache = self.mamba_state_manager.get_slot_cache(seq.state_slot)
-
-        if is_prefill:
-            # Use token_ids (preserved across pickle) instead of prompt_ids
-            # (stripped by __getstate__ for workers)
-            input_ids = torch.tensor(
-                seq.token_ids, dtype=torch.int64, device=f"cuda:{self.rank}",
-            ).unsqueeze(0)
-        else:
-            input_ids = torch.tensor(
-                [[seq.last_token]], dtype=torch.int64, device=f"cuda:{self.rank}",
-            )
-
-        T = input_ids.shape[1]
-        positions = torch.arange(
-            seq.num_computed_tokens,
-            seq.num_computed_tokens + T,
-            dtype=torch.int64,
-            device=input_ids.device,
-        )
-
-        hidden_states = self.model(
-            input_ids,
-            positions=positions,
-            past_key_values=slot_cache,
-            use_cache=True,
-        )
-        logits = self.model.compute_logits(hidden_states[:, -1:, :])[:, -1, :]
-
-        if is_prefill:
-            seq.num_computed_tokens = T
-        else:
-            seq.num_computed_tokens += 1
-        return logits
-
-    @torch.inference_mode()
-    def _run_kimi_linear_batch(self, seqs, is_prefill):
-        outputs = [self._run_kimi_linear_seq(seq, is_prefill) for seq in seqs]
-        if not outputs:
-            return None
-        return torch.cat(outputs, dim=0)
-
-    def _run_qwen3_next_seq(self, seq, is_prefill):
-        if seq.state_slot is None:
-            raise RuntimeError("Qwen3-Next sequence has no allocated state slot")
-        slot_cache = self.mamba_state_manager.get_slot_cache(seq.state_slot)
-
-        if is_prefill:
-            input_ids = torch.tensor(
-                seq.token_ids, dtype=torch.int64, device=f"cuda:{self.rank}",
-            ).unsqueeze(0)
-        else:
-            input_ids = torch.tensor(
-                [[seq.last_token]], dtype=torch.int64, device=f"cuda:{self.rank}",
-            )
-
-        T = input_ids.shape[1]
-        positions = torch.arange(
-            seq.num_computed_tokens,
-            seq.num_computed_tokens + T,
-            dtype=torch.int64,
-            device=input_ids.device,
-        )
-
-        hidden_states = self.model(
-            input_ids,
-            positions=positions,
-            layer_states=slot_cache,
-        )
-        logits = self.model.compute_logits(hidden_states[:, -1:, :])[:, -1, :]
-
-        if is_prefill:
-            seq.num_computed_tokens = T
-        else:
-            seq.num_computed_tokens += 1
-        return logits
-
-    @torch.inference_mode()
-    def _run_qwen3_next_batch(self, seqs, is_prefill):
-        outputs = [self._run_qwen3_next_seq(seq, is_prefill) for seq in seqs]
-        if not outputs:
-            return None
-        return torch.cat(outputs, dim=0)
+            max_bt = self._prev_max_bt
+        if self.is_qwen_vl:
+            return (n, ids_np[:n], pos_np[:, :n], sm_np[:n], cl_np[:n],
+                    bt_np[:n, :max_bt])
+        return (n, ids_np[:n], pos_np[:n], sm_np[:n], cl_np[:n],
+                bt_np[:n, :max_bt])
 
     def _write_decode_shm(self, n, ids_np, pos_np, sm_np, cl_np, bt_np):
         """Write decode arrays directly into SHM with binary layout.
         
-        Layout: [n(2)][max_bt(2)][ids(n*8)][pos(n*8)][sm(n*4)][cl(n*4)][bt(n*max_bt*4)]
+        Layout: [n(2)][max_bt(2)][ids(n*8)][pos(n*8 or 3*n*8)][sm(n*4)][cl(n*4)][bt(n*max_bt*4)]
+        pos_np is (n,) for standard models or (3, n) for MRoPE models.
         """
         max_bt = bt_np.shape[1]
         buf = self.shm.buf
         buf[0:2] = n.to_bytes(2, "little")
         buf[2:4] = max_bt.to_bytes(2, "little")
         off = 4
-        for arr in (ids_np, pos_np, sm_np, cl_np, bt_np):
+        for arr in (ids_np, pos_np.ravel(), sm_np, cl_np, bt_np):
             nb = arr.nbytes
             buf[off:off+nb] = arr.tobytes()
             off += nb
 
     def _loop_decode_greedy(self):
-        """Worker fast path: read decode arrays from SHM without pickle."""
+        """Worker fast path: read decode arrays from SHM without pickle.
+
+        Must mirror :meth:`_write_decode_shm` exactly. In particular, MLA
+        models write ``slot_mapping`` as ``int64`` (8 bytes per element)
+        because the FP8 paged KV cache stores require it; non-MLA models
+        use ``int32``. Reading the wrong dtype here both garbles ``sm``
+        and shifts every following field, which produces inconsistent
+        decode metadata across ranks and deadlocks TP collectives.
+        """
         buf = self.shm.buf
         n = int.from_bytes(buf[0:2], "little")
         max_bt = int.from_bytes(buf[2:4], "little")
         off = 4
         ids_np = np.frombuffer(buf, dtype=np.int64, count=n, offset=off).copy(); off += n * 8
-        pos_np = np.frombuffer(buf, dtype=np.int64, count=n, offset=off).copy(); off += n * 8
-        sm_np = np.frombuffer(buf, dtype=np.int32, count=n, offset=off).copy(); off += n * 4
+        if self.is_qwen_vl:
+            pos_np = np.frombuffer(buf, dtype=np.int64, count=3*n, offset=off).copy().reshape(3, n); off += 3 * n * 8
+        else:
+            pos_np = np.frombuffer(buf, dtype=np.int64, count=n, offset=off).copy(); off += n * 8
+        if self.is_deepseek_mla:
+            sm_np = np.frombuffer(buf, dtype=np.int64, count=n, offset=off).copy(); off += n * 8
+        else:
+            sm_np = np.frombuffer(buf, dtype=np.int32, count=n, offset=off).copy(); off += n * 4
         cl_np = np.frombuffer(buf, dtype=np.int32, count=n, offset=off).copy(); off += n * 4
         bt_np = np.frombuffer(buf, dtype=np.int32, count=n*max_bt, offset=off).copy().reshape(n, max_bt)
         self.run_decode_greedy_fast((n, ids_np, pos_np, sm_np, cl_np, bt_np))
@@ -1150,18 +1772,21 @@ class ModelRunner:
             return result
         return self.run_decode_greedy(seqs)
 
+    def call_decode_greedy_async(self, decode_data):
+        """Launch greedy decode from precomputed arrays and start async D2H.
+
+        Returns (has_result, n). Caller must call
+        model_runner._wait_async_tokens(n) to get token IDs.
+        """
+        n = decode_data[0]
+        if self.world_size > 1 and self.rank == 0:
+            self._write_decode_shm(*decode_data)
+            self.shm.buf[self._SHM_FLAG_OFFSET] = 1
+            self._signal_workers()
+            return self.run_decode_greedy_fast_async(decode_data)
+        return self.run_decode_greedy_fast_async(decode_data)
+
     def run(self, seqs, is_prefill):
-        if self.model_family == "mamba":
-            model_type = getattr(self.config, "model_type", "")
-            if model_type == "gla":
-                return self._run_gla_batch(seqs, is_prefill)
-            if model_type == "rwkv7":
-                return self._run_rwkv7_batch(seqs, is_prefill)
-            if model_type == "kimi_linear":
-                return self._run_kimi_linear_batch(seqs, is_prefill)
-            if model_type == "qwen3_next":
-                return self._run_qwen3_next_batch(seqs, is_prefill)
-            return self._run_mamba_batch(seqs, is_prefill)
         input_ids, positions = (
             self.prepare_prefill(seqs) if is_prefill
             else self.prepare_decode(seqs)
@@ -1178,22 +1803,495 @@ class ModelRunner:
         reset_context()
         return result
 
+    @staticmethod
+    def _strip_mm_tensors(seqs):
+        """Return lightweight copies of sequences for SHM dispatch (no large tensors)."""
+        stripped = []
+        for s in seqs:
+            c = Sequence.__new__(Sequence)
+            c.__dict__.update(s.__dict__)
+            c.pixel_values = None
+            c.video_pixel_values = None
+            c.encoder_features = None
+            stripped.append(c)
+        return stripped
+
+    def _run_mm_lm(self, prefill_seqs, prefill_chunk_sizes, decode_seqs,
+                   vis_cache_map):
+        """Run LM forward with vision embeddings from _vis_cache.
+
+        All ranks have vision outputs in self._vis_cache from prior
+        _broadcast_visual calls. This method:
+        1. Computes text embeddings via embed_fn (TP allreduce)
+        2. Merges cached vision embeddings into text embeddings
+        3. Runs LM forward pass
+
+        vis_cache_map: list of dicts per prefill seq:
+          [{"cache_idx": int, "modality": str, "thw": [[t,h,w],...]}]
+          None entries mean no vision for that seq.
+        """
+        input_ids, positions = self.prepare_mixed_batch(
+            prefill_seqs, prefill_chunk_sizes, decode_seqs,
+        )
+
+        if self.is_qwen_vl and self.world_size > 1:
+            if self.rank == 0:
+                if positions.ndim == 1:
+                    shape_flag = torch.zeros(1, dtype=torch.int64, device="cuda")
+                else:
+                    shape_flag = torch.tensor([positions.shape[0]], dtype=torch.int64, device="cuda")
+                dist.broadcast(shape_flag, src=0)
+                pos_gpu = positions.cuda() if not positions.is_cuda else positions
+                dist.broadcast(pos_gpu, src=0)
+                positions = pos_gpu
+            else:
+                shape_flag = torch.zeros(1, dtype=torch.int64, device="cuda")
+                dist.broadcast(shape_flag, src=0)
+                ndim0 = shape_flag.item()
+                if ndim0 > 0:
+                    n_tokens = input_ids.shape[0]
+                    positions = torch.empty(int(ndim0), n_tokens, dtype=torch.int64, device="cuda")
+                    dist.broadcast(positions, src=0)
+                else:
+                    pos_gpu = positions.cuda() if not positions.is_cuda else positions
+                    dist.broadcast(pos_gpu, src=0)
+                    positions = pos_gpu
+        device = input_ids.device
+        model = self.model
+        embed_fn = model.get_input_embeddings()
+
+        has_deepstack = hasattr(model.visual, 'deepstack_merger_list')
+        if has_deepstack:
+            visual_dim = model.config.vision.out_hidden_size
+        merge_size = model.config.vision.spatial_merge_size
+        image_token_id = self.config.image_token_id
+        video_token_id = self.config.video_token_id
+
+        all_inputs_embeds = []
+        all_deepstack = [] if has_deepstack else None
+
+        for seq_idx, seq in enumerate(prefill_seqs):
+            full_ids = torch.tensor(seq.token_ids, dtype=torch.int64, device=device)
+            if prefill_chunk_sizes is not None:
+                start = seq.num_computed_tokens
+                end = start + prefill_chunk_sizes[seq_idx]
+                chunk_ids = full_ids[start:end]
+            else:
+                chunk_ids = full_ids
+                start = 0
+                end = len(full_ids)
+
+            text_embeds = embed_fn(chunk_ids)
+            seq_deepstack = [] if has_deepstack else None
+
+            info = vis_cache_map[seq_idx] if seq_idx < len(vis_cache_map) else None
+            if os.environ.get("KB_DIAG_MM") and self.rank == 0:
+                _dc2 = getattr(self, '_diag_mm_count', 0)
+                if _dc2 < 2:
+                    print(f"  [DIAG_MM seq_idx={seq_idx}] info={info} "
+                          f"chunk_ids_len={len(chunk_ids)} "
+                          f"has_img_tokens={(chunk_ids == image_token_id).sum().item()}")
+            if info is not None:
+                vis_out = self._vis_cache[info["cache_idx"]]
+                modality = info["modality"]
+                tok_id = image_token_id if modality == "image" else video_token_id
+
+                if has_deepstack:
+                    all_vis_embeds = vis_out[:, :visual_dim]
+                    ds_cat = vis_out[:, visual_dim:]
+                    all_ds_features = list(ds_cat.split(visual_dim, dim=1))
+                else:
+                    all_vis_embeds = vis_out
+                    all_ds_features = []
+
+                if "embed_start" in info:
+                    es = info["embed_start"]
+                    ec = info["embed_count"]
+                    embeds = all_vis_embeds[es:es+ec]
+                    ds_features = [d[es:es+ec] for d in all_ds_features]
+                else:
+                    embeds = all_vis_embeds
+                    ds_features = all_ds_features
+
+                mask = chunk_ids == tok_id
+                if mask.any():
+                    if os.environ.get("KB_DIAG_MM") and self.rank == 0:
+                        _dc = getattr(self, '_diag_mm_count', 0)
+                        if _dc < 2:
+                            n_m = mask.sum().item()
+                            print(f"  [DIAG_MM seq={seq_idx}] vis_out={vis_out.shape} "
+                                  f"modality={modality} "
+                                  f"embeds={embeds.shape} mask_count={n_m} "
+                                  f"vis_norm={embeds.norm().item():.4f} "
+                                  f"text_norm_before={text_embeds.norm().item():.4f} "
+                                  f"chunk_ids_len={len(chunk_ids)} "
+                                  f"ds_features={len(ds_features)}")
+                    if prefill_chunk_sizes is not None:
+                        full_mask = full_ids == tok_id
+                        chunk_vis_start = full_mask[:start].sum().item()
+                        n_vis = mask.sum().item()
+                        text_embeds[mask] = embeds[chunk_vis_start:chunk_vis_start+n_vis].to(text_embeds.dtype)
+                    else:
+                        text_embeds[mask] = embeds.to(text_embeds.dtype)
+
+                if has_deepstack and ds_features:
+                    for ds_feat in ds_features:
+                        ds_e = torch.zeros_like(text_embeds)
+                        if mask.any():
+                            if prefill_chunk_sizes is not None:
+                                ds_e[mask] = ds_feat[chunk_vis_start:chunk_vis_start+n_vis].to(text_embeds.dtype)
+                            else:
+                                ds_e[mask] = ds_feat.to(text_embeds.dtype)
+                        seq_deepstack.append(ds_e)
+
+            all_inputs_embeds.append(text_embeds)
+            if has_deepstack:
+                all_deepstack.append(seq_deepstack if seq_deepstack else [])
+
+        for seq in decode_seqs:
+            dc_id = torch.tensor([seq.last_token], dtype=torch.int64, device=device)
+            dc_embed = embed_fn(dc_id)
+            all_inputs_embeds.append(dc_embed)
+            if has_deepstack:
+                all_deepstack.append([])
+
+        inputs_embeds = torch.cat(all_inputs_embeds, dim=0)
+
+        deepstack_embeds = None
+        if has_deepstack and all_deepstack:
+            num_levels = max((len(ds) for ds in all_deepstack), default=0)
+            if num_levels > 0:
+                deepstack_embeds = []
+                hidden_dim = inputs_embeds.shape[-1]
+                for level in range(num_levels):
+                    level_parts = []
+                    for ds_idx, ds in enumerate(all_deepstack):
+                        if level < len(ds):
+                            level_parts.append(ds[level])
+                        else:
+                            n_tokens = all_inputs_embeds[ds_idx].shape[0]
+                            level_parts.append(torch.zeros(n_tokens, hidden_dim,
+                                                           device=device, dtype=inputs_embeds.dtype))
+                    deepstack_embeds.append(torch.cat(level_parts, dim=0))
+
+        self._vis_cache = []
+
+        if os.environ.get("KB_DIAG_MM") and self.rank == 0:
+            _diag_count = getattr(self, '_diag_mm_count', 0)
+            if _diag_count < 2:
+                print(f"\n[DIAG_MM seq_count={len(prefill_seqs)}] "
+                      f"inputs_embeds={inputs_embeds.shape} "
+                      f"norm={inputs_embeds.norm().item():.4f} "
+                      f"positions={'x'.join(str(d) for d in positions.shape)} "
+                      f"pos_range=[{positions.min().item()},{positions.max().item()}]")
+                if deepstack_embeds:
+                    for i, ds in enumerate(deepstack_embeds):
+                        print(f"  deepstack[{i}]: shape={ds.shape} "
+                              f"norm={ds.norm().item():.4f} "
+                              f"nonzero={ds.abs().sum(dim=-1).gt(0).sum().item()}")
+                # Print per-seq position info
+                offset = 0
+                for si, seq in enumerate(prefill_seqs):
+                    sl = len(seq) if prefill_chunk_sizes is None else prefill_chunk_sizes[si]
+                    seq_pos = positions[:, offset:offset+sl]
+                    print(f"  seq[{si}] len={sl} pos_range=["
+                          f"t:{seq_pos[0].min().item()}-{seq_pos[0].max().item()}, "
+                          f"h:{seq_pos[1].min().item()}-{seq_pos[1].max().item()}, "
+                          f"w:{seq_pos[2].min().item()}-{seq_pos[2].max().item()}] "
+                          f"mrope_delta={getattr(seq, 'mrope_position_delta', 'N/A')}")
+                    offset += sl
+                self._diag_mm_count = _diag_count + 1
+
+        result = self.run_model(input_ids, positions, True,
+                                inputs_embeds=inputs_embeds,
+                                deepstack_embeds=deepstack_embeds)
+        reset_context()
+        return result
+
+    def _broadcast_visual(self, pv_shape, thw_shape):
+        """Broadcast pixel values and run vision encoder on all ranks.
+
+        Rank 0 must set self._mm_pv and self._mm_thw before calling.
+        Other ranks receive via NCCL broadcast.
+        All ranks participate in model.visual() which uses TP allreduce.
+        Returns the vision encoder output tensor.
+        """
+        device = torch.device("cuda")
+        vis_dtype = self.model.visual.patch_embed.proj.weight.dtype
+        if self.rank == 0:
+            bpv = self._mm_pv.to(device=device, dtype=vis_dtype)
+            bthw = (self._mm_thw.clone() if isinstance(self._mm_thw, torch.Tensor)
+                    else torch.tensor(self._mm_thw, dtype=torch.long)).to(device)
+            self._mm_pv = None
+            self._mm_thw = None
+        else:
+            bpv = torch.empty(pv_shape, dtype=vis_dtype, device=device)
+            bthw = torch.empty(thw_shape, dtype=torch.long, device=device)
+        dist.broadcast(bpv, src=0)
+        dist.broadcast(bthw, src=0)
+        vis_out = self.model.visual(bpv, grid_thw=bthw.cpu())
+        del bpv
+        if not hasattr(self, '_vis_cache'):
+            self._vis_cache = []
+        self._vis_cache.append(vis_out)
+        return vis_out
+
+    # ------------------------------------------------------------------
+    # Whisper cross-attention context helpers
+    # ------------------------------------------------------------------
+
+    def _set_cross_attn_context_prefill(self, prefill_seqs, prefill_chunk_sizes,
+                                        encoder_seqs):
+        """Set cross-attention metadata on the global Context for prefill.
+
+        For sequences with new encoder outputs: builds slot_mapping for
+        writing encoder K/V to paged cache, and cu_seqlens for Q (decoder
+        tokens) x K (encoder tokens) non-causal attention.
+
+        For decode sequences in a mixed batch, cross-attn context is also
+        needed (handled by the mixed path caller).
+        """
+        ctx = get_context()
+        block_size = BLOCK_SIZE
+
+        # Cross-attn slot mapping: for NEW encoder outputs being written to cache
+        cross_slot_mapping = []
+        for seq in encoder_seqs:
+            enc_len = seq.encoder_seq_len
+            for p in range(enc_len):
+                block_idx = seq.cross_block_table[p // block_size]
+                cross_slot_mapping.append(block_idx * block_size + (p % block_size))
+
+        # Q = decoder tokens (for each prefill seq, chunk_size tokens)
+        # K = encoder tokens (encoder_seq_len per seq)
+        cross_cu_q, cross_cu_k = [0], [0]
+        cross_max_sq, cross_max_sk = 0, 0
+        cross_max_bt = 0
+        for seq, chunk in zip(prefill_seqs, prefill_chunk_sizes):
+            cross_cu_q.append(cross_cu_q[-1] + chunk)
+            enc_len = seq.encoder_seq_len
+            cross_cu_k.append(cross_cu_k[-1] + enc_len)
+            cross_max_sq = max(chunk, cross_max_sq)
+            cross_max_sk = max(enc_len, cross_max_sk)
+            blen = len(seq.cross_block_table)
+            if blen > cross_max_bt:
+                cross_max_bt = blen
+
+        cross_bt = None
+        if cross_max_bt > 0:
+            n = len(prefill_seqs)
+            bt_arr = np.full((n, cross_max_bt), -1, dtype=np.int32)
+            for i, seq in enumerate(prefill_seqs):
+                b = seq.cross_block_table
+                bt_arr[i, :len(b)] = b
+            cross_bt = torch.from_numpy(bt_arr).pin_memory().cuda(non_blocking=True)
+
+        ctx.cross_slot_mapping = (
+            torch.tensor(cross_slot_mapping, dtype=torch.int32, pin_memory=True).cuda(non_blocking=True)
+            if cross_slot_mapping else None
+        )
+        ctx.cross_cu_seqlens_q = torch.tensor(
+            cross_cu_q, dtype=torch.int32, pin_memory=True).cuda(non_blocking=True)
+        ctx.cross_cu_seqlens_k = torch.tensor(
+            cross_cu_k, dtype=torch.int32, pin_memory=True).cuda(non_blocking=True)
+        ctx.cross_max_seqlen_q = cross_max_sq
+        ctx.cross_max_seqlen_k = cross_max_sk
+        ctx.cross_block_tables = cross_bt
+
+    def _set_cross_attn_context_decode(self, decode_seqs):
+        """Set cross-attention metadata on the global Context for decode.
+
+        Each decode token attends to the full encoder output via paged cache.
+        Also stores the tensors as instance state so they can be applied to
+        any Context created later (e.g., by the greedy eager decode path).
+        """
+        n = len(decode_seqs)
+        cross_cl = np.empty(n, dtype=np.int32)
+        cross_max_bt = 0
+        for i, seq in enumerate(decode_seqs):
+            cross_cl[i] = seq.encoder_seq_len
+            blen = len(seq.cross_block_table)
+            if blen > cross_max_bt:
+                cross_max_bt = blen
+
+        cross_bt = np.full((n, cross_max_bt), -1, dtype=np.int32)
+        for i, seq in enumerate(decode_seqs):
+            b = seq.cross_block_table
+            cross_bt[i, :len(b)] = b
+
+        self._pending_cross_ctx = {
+            "cross_context_lens": torch.from_numpy(cross_cl).pin_memory().cuda(non_blocking=True),
+            "cross_block_tables": torch.from_numpy(cross_bt).pin_memory().cuda(non_blocking=True),
+            "cross_max_context_len": int(cross_cl.max()) if n > 0 else 0,
+        }
+        self._apply_pending_cross_ctx()
+
+    def _apply_pending_cross_ctx(self):
+        """Apply pending cross-attention context to the current global Context."""
+        pending = getattr(self, '_pending_cross_ctx', None)
+        if pending is None:
+            return
+        ctx = get_context()
+        ctx.cross_slot_mapping = None
+        ctx.cross_context_lens = pending["cross_context_lens"]
+        ctx.cross_block_tables = pending["cross_block_tables"]
+        ctx.cross_max_context_len = pending["cross_max_context_len"]
+
+    def _clear_pending_cross_ctx(self):
+        self._pending_cross_ctx = None
+
+    def _set_cross_attn_context_mixed(self, prefill_seqs, prefill_chunk_sizes,
+                                      decode_seqs, encoder_seqs):
+        """Set cross-attention metadata for mixed prefill+decode batch.
+
+        Prefill seqs: Q = chunked decoder tokens, K = encoder tokens (from paged cache).
+        Decode seqs: Q = 1 token each, K = encoder tokens (from paged cache).
+        Both use non-causal attention via the prefill kernel with block tables.
+        """
+        ctx = get_context()
+        block_size = BLOCK_SIZE
+
+        # Cross-attn slot mapping for NEW encoder outputs
+        cross_slot_mapping = []
+        for seq in encoder_seqs:
+            enc_len = seq.encoder_seq_len
+            for p in range(enc_len):
+                block_idx = seq.cross_block_table[p // block_size]
+                cross_slot_mapping.append(block_idx * block_size + (p % block_size))
+
+        # Build unified cu_seqlens: prefill seqs first, then decode seqs
+        all_seqs = list(prefill_seqs) + list(decode_seqs)
+        cross_cu_q, cross_cu_k = [0], [0]
+        cross_max_sq, cross_max_sk = 0, 0
+        cross_max_bt = 0
+
+        for idx, seq in enumerate(all_seqs):
+            if idx < len(prefill_seqs):
+                q_tokens = prefill_chunk_sizes[idx]
+            else:
+                q_tokens = 1
+            enc_len = seq.encoder_seq_len
+            cross_cu_q.append(cross_cu_q[-1] + q_tokens)
+            cross_cu_k.append(cross_cu_k[-1] + enc_len)
+            cross_max_sq = max(q_tokens, cross_max_sq)
+            cross_max_sk = max(enc_len, cross_max_sk)
+            blen = len(seq.cross_block_table)
+            if blen > cross_max_bt:
+                cross_max_bt = blen
+
+        cross_bt = None
+        if cross_max_bt > 0:
+            n = len(all_seqs)
+            bt_arr = np.full((n, cross_max_bt), -1, dtype=np.int32)
+            for i, seq in enumerate(all_seqs):
+                b = seq.cross_block_table
+                bt_arr[i, :len(b)] = b
+            cross_bt = torch.from_numpy(bt_arr).pin_memory().cuda(non_blocking=True)
+
+        ctx.cross_slot_mapping = (
+            torch.tensor(cross_slot_mapping, dtype=torch.int32, pin_memory=True).cuda(non_blocking=True)
+            if cross_slot_mapping else None
+        )
+        ctx.cross_cu_seqlens_q = torch.tensor(
+            cross_cu_q, dtype=torch.int32, pin_memory=True).cuda(non_blocking=True)
+        ctx.cross_cu_seqlens_k = torch.tensor(
+            cross_cu_k, dtype=torch.int32, pin_memory=True).cuda(non_blocking=True)
+        ctx.cross_max_seqlen_q = cross_max_sq
+        ctx.cross_max_seqlen_k = cross_max_sk
+        ctx.cross_block_tables = cross_bt
+
+    def _compile_model(self):
+        """Apply torch.compile with KBNanoBackend (mirrors vLLM).
+
+        The backend:
+        1. Splits the graph at attention custom-op boundaries
+        2. Compiles each subgraph with symbolic shapes (one compile per
+           unique subgraph structure, not per batch size)
+        3. Drops all Dynamo guards so no re-tracing occurs
+
+        After this, the model works for any batch size.  The subsequent
+        ``capture_cudagraph`` call records the compiled kernels into
+        per-batch-size CUDA graphs for decode replay.
+
+        For VL models, only the inner Qwen3Model is compiled (not the
+        outer Qwen3VLForConditionalGeneration).  This keeps embed_tokens
+        and lm_head outside the compiled boundary, matching vLLM's
+        architecture where @support_torch_compile is applied only to the
+        inner LLM model.  The engine always computes inputs_embeds
+        outside the compiled graph and passes it in, so the compiled
+        graph only ever traces the inputs_embeds branch.
+        """
+        from .compilation import compile_model, configure_post_grad_passes
+
+        configure_post_grad_passes()
+        if self.is_qwen_vl:
+            # Save the uncompiled inner model for multimodal prefill
+            # (which needs deepstack_embeds that the compiled graph
+            # doesn't trace).
+            self._eager_inner_model = self.model.model
+            self.model.model = compile_model(self.model.model)
+        else:
+            self._eager_model = self.model
+            self.model = compile_model(self.model)
+        self._compiled = True
+        self._mark_dynamic_done = False
+
     @torch.inference_mode()
     def capture_cudagraph(self):
+        import gc
         from contextlib import nullcontext
-        max_bs = MAX_NUM_SEQS
-        max_num_blocks = (MAX_MODEL_LEN + BLOCK_SIZE - 1) // BLOCK_SIZE
+        max_bs = self.max_num_seqs
+        max_num_blocks = (self.max_model_len + BLOCK_SIZE - 1) // BLOCK_SIZE
         input_ids = torch.zeros(max_bs, dtype=torch.int64)
-        positions = torch.zeros(max_bs, dtype=torch.int64)
-        slot_mapping = torch.full((max_bs,), -1, dtype=torch.int32)
+        if self.is_qwen_vl:
+            positions = torch.zeros(3, max_bs + 1, dtype=torch.int64)
+        else:
+            positions = torch.zeros(max_bs, dtype=torch.int64)
+        sm_torch_dtype = torch.int64 if self.is_deepseek_mla else torch.int32
+        slot_mapping = torch.full((max_bs,), -1, dtype=sm_torch_dtype)
         context_lens = torch.zeros(max_bs, dtype=torch.int32)
         block_tables = torch.zeros(max_bs, max_num_blocks, dtype=torch.int32)
+        # Persistent arange buffer for per-token request id mapping during
+        # pure-decode (token i -> sequence i).  Captured into decode CUDA
+        # graphs and reused by ``prepare_decode``; kept on-device so the
+        # sparse MLA ``convert_indices`` kernel never falls back to an
+        # all-zeros buffer (see ``_forward_sparse_bf16``).
+        decode_req_id = torch.arange(max_bs, dtype=torch.int32).cuda()
+        self._decode_req_id_buf = decode_req_id
 
-        self.graph_bs_list = [1, 2, 4, 8] + list(range(16, max_bs + 1, 16))
+        # Match vLLM's default ``cudagraph_capture_sizes`` for DeepSeek-V3.2:
+        # [1, 2, 4, 8, 16, 24, ..., 256, 272, ..., 512].  vLLM caps captures at
+        # ``max_cudagraph_capture_size=512`` (see logs); larger decode batches
+        # are dispatched to the largest captured graph or fall back to a
+        # piecewise/eager path.  Going past 512 here makes the compile time
+        # dominate (each graph at bs>512 takes seconds) without measurable
+        # decode wins, so we keep the same 512 cap.
+        max_capture = min(max_bs, 512)
+        self.graph_bs_list = [i for i in [1, 2, 4] if i <= max_capture]
+        if max_capture >= 8:
+            self.graph_bs_list += list(range(8, min(max_capture + 1, 256), 8))
+        if max_capture >= 256:
+            self.graph_bs_list += list(range(256, max_capture + 1, 16))
+        if self.graph_bs_list[-1] != max_capture:
+            self.graph_bs_list.append(max_capture)
         self.graphs = {}
         self.graph_pool = None
 
         outputs = torch.zeros(max_bs, self.config.hidden_size)
+
+        # For VL models, allocate an inputs_embeds buffer so the compiled
+        # inner model is always traced with inputs_embeds (matching vLLM).
+        # deepstack_embeds is NOT passed here — it is only needed during
+        # multimodal prefill, which uses the eager model.  Keeping deepstack
+        # out of the compiled graph avoids unnecessary zero-tensor additions
+        # on every decode step.
+        vl_inputs_embeds = None
+        vl_embed_fn = None
+        if self.is_qwen_vl:
+            hidden_size = self.config.hidden_size
+            vl_inputs_embeds = torch.zeros(max_bs, hidden_size,
+                                           dtype=self.dtype)
+            vl_embed_fn = self.model.get_input_embeddings()
 
         lm_head = self.model.lm_head
         vocab_per_rank = lm_head.per_partition
@@ -1202,20 +2300,111 @@ class ModelRunner:
         lm_max_idxs = torch.zeros(max_bs, dtype=torch.int64)
 
         ar_ctx = self.custom_ar.capture() if self.custom_ar is not None else nullcontext()
+        _graph_list = list(reversed(self.graph_bs_list))
+
+        # Single warmup at the largest batch size to trigger all Triton/CUDA
+        # kernel JIT compilation. Subsequent captures reuse compiled kernels.
+        largest_bs = _graph_list[0]
+        set_context(
+            False, slot_mapping=slot_mapping[:largest_bs],
+            context_lens=context_lens[:largest_bs],
+            block_tables=block_tables[:largest_bs],
+            max_context_len=self.max_model_len,
+            req_id_per_token=decode_req_id[:largest_bs],
+        )
+        # Mark batch dim as dynamic BEFORE the first compile-triggering forward
+        # so Dynamo / Inductor produce a single symbolic-shape compiled graph
+        # that works for every batch size we will subsequently capture, instead
+        # of hard-coding the warmup batch size into the compiled subgraphs
+        # (which under ``skip_all_guards_unsafe`` would silently get reused at
+        # the wrong size and trip Inductor's ``assert_size_stride`` checks).
+        warmup_ids = input_ids[:largest_bs]
+        warmup_pos = (positions[:, :largest_bs]
+                      if self.is_qwen_vl else positions[:largest_bs])
+        if self._compiled and not self._mark_dynamic_done:
+            torch._dynamo.mark_dynamic(warmup_ids, 0)
+            if self.is_qwen_vl:
+                torch._dynamo.mark_dynamic(warmup_pos, 1)
+            else:
+                torch._dynamo.mark_dynamic(warmup_pos, 0)
+            self._mark_dynamic_done = True
+        if self.is_qwen_vl:
+            outputs[:largest_bs] = self.model(warmup_ids, warmup_pos)
+        else:
+            outputs[:largest_bs] = self.model(warmup_ids, warmup_pos)
+        lm_logits[:largest_bs] = lm_head.linear_op(
+            outputs[:largest_bs], lm_head.embedding_op.emb.weight).float()
+        lm_max_vals[:largest_bs], lm_max_idxs[:largest_bs] = \
+            lm_logits[:largest_bs].max(dim=-1)
+        reset_context()
+        torch.cuda.synchronize()
+
+        # Freeze GC during capture to avoid Python GC stalls (matches vllm).
+        gc.collect()
+        gc.freeze()
+
         with ar_ctx:
-            for bs in reversed(self.graph_bs_list):
+            for _gi, bs in enumerate(_graph_list):
+                if self.rank == 0 and (_gi % max(1, len(_graph_list) // 5) == 0
+                                       or _gi == len(_graph_list) - 1):
+                    print(f"    CUDA graph {_gi+1}/{len(_graph_list)} (bs={bs})",
+                          flush=True)
                 graph = torch.cuda.CUDAGraph()
                 set_context(
                     False, slot_mapping=slot_mapping[:bs],
                     context_lens=context_lens[:bs], block_tables=block_tables[:bs],
+                    max_context_len=self.max_model_len,
+                    req_id_per_token=decode_req_id[:bs],
                 )
-                outputs[:bs] = self.model(input_ids[:bs], positions[:bs])
-                lm_logits[:bs] = lm_head.linear_op(outputs[:bs], lm_head.weight).float()
+
+                ids_slice = input_ids[:bs]
+                if self.is_qwen_vl:
+                    pos_slice = positions[:, :bs]
+                else:
+                    pos_slice = positions[:bs]
+
+                # For VL: create a slice reference ONCE and reuse for both
+                # mark_dynamic and the warmup call so the dynamic metadata
+                # stays on the exact tensor object Dynamo will trace.
+                ie_slice = (vl_inputs_embeds[:bs]
+                            if vl_inputs_embeds is not None else None)
+
+                if self._compiled and not self._mark_dynamic_done:
+                    torch._dynamo.mark_dynamic(ids_slice, 0)
+                    if self.is_qwen_vl:
+                        torch._dynamo.mark_dynamic(pos_slice, 1)
+                    else:
+                        torch._dynamo.mark_dynamic(pos_slice, 0)
+                    if ie_slice is not None:
+                        torch._dynamo.mark_dynamic(ie_slice, 0)
+                    self._mark_dynamic_done = True
+
+                # Warmup forward: for VL, compute inputs_embeds outside and
+                # pass it so the compiled inner model traces the
+                # inputs_embeds branch (never embed_tokens).
+                if ie_slice is not None:
+                    ie_slice.copy_(vl_embed_fn(ids_slice))
+                    outputs[:bs] = self.model(
+                        ids_slice, pos_slice,
+                        inputs_embeds=ie_slice,
+                    )
+                else:
+                    outputs[:bs] = self.model(ids_slice, pos_slice)
+                lm_logits[:bs] = lm_head.linear_op(
+                    outputs[:bs], lm_head.embedding_op.emb.weight).float()
                 lm_max_vals[:bs], lm_max_idxs[:bs] = lm_logits[:bs].max(dim=-1)
 
                 with torch.cuda.graph(graph, self.graph_pool):
-                    outputs[:bs] = self.model(input_ids[:bs], positions[:bs])
-                    lm_logits[:bs] = lm_head.linear_op(outputs[:bs], lm_head.weight).float()
+                    if ie_slice is not None:
+                        ie_slice.copy_(vl_embed_fn(ids_slice))
+                        outputs[:bs] = self.model(
+                            ids_slice, pos_slice,
+                            inputs_embeds=ie_slice,
+                        )
+                    else:
+                        outputs[:bs] = self.model(ids_slice, pos_slice)
+                    lm_logits[:bs] = lm_head.linear_op(
+                        outputs[:bs], lm_head.embedding_op.emb.weight).float()
                     lm_max_vals[:bs], lm_max_idxs[:bs] = lm_logits[:bs].max(dim=-1)
 
                 if self.graph_pool is None:
@@ -1224,6 +2413,9 @@ class ModelRunner:
                 torch.cuda.synchronize()
                 reset_context()
 
+        gc.unfreeze()
+        gc.collect()
+
         self.graph_vars = dict(
             input_ids=input_ids, positions=positions,
             slot_mapping=slot_mapping, context_lens=context_lens,
@@ -1231,11 +2423,15 @@ class ModelRunner:
             lm_logits=lm_logits, lm_max_vals=lm_max_vals,
             lm_max_idxs=lm_max_idxs,
         )
-
         # Pre-compute lookup table: _graph_bs_for_n[n] = smallest graph_bs >= n
         self._graph_bs_for_n = [0] * (max_bs + 1)
         for n in range(max_bs + 1):
-            self._graph_bs_for_n[n] = next(x for x in self.graph_bs_list if x >= n)
+            for x in self.graph_bs_list:
+                if x >= n:
+                    self._graph_bs_for_n[n] = x
+                    break
+            else:
+                self._graph_bs_for_n[n] = max_bs
 
 
 # ---------------------------------------------------------------------------
@@ -1246,28 +2442,30 @@ class LlamaEngine:
         self,
         model_name: str = "meta-llama/Llama-3.1-8B-Instruct",
         device: str = "cuda",
-        dtype: torch.dtype = torch.bfloat16,
+        dtype: torch.dtype | None = None,
         seed: int = 42,
         enforce_eager: bool = False,
         tensor_parallel_size: int = 1,
+        gpu_memory_utilization: float = 0.9,
+        max_model_len: int = MAX_MODEL_LEN,
+        max_num_seqs: int | None = None,
+        max_num_batched_tokens: int | None = None,
     ):
         self.model_name = model_name
         self.seed = seed
+        self.max_num_seqs = max_num_seqs if max_num_seqs is not None else _DEFAULT_MAX_NUM_SEQS
+        self.max_num_batched_tokens = max_num_batched_tokens if max_num_batched_tokens is not None else _DEFAULT_MAX_NUM_BATCHED_TOKENS
         self._set_seeds(seed)
-        model_type = getattr(AutoConfig.from_pretrained(model_name, trust_remote_code=True), "model_type", "")
-        self.model_family = (
-            "mamba" if model_type in {"mamba", "mamba2", "gla", "rwkv7", "kimi_linear", "qwen3_next"}
-            else "attention"
-        )
-        self.model_type = model_type
-        if self.model_family == "mamba":
-            if tensor_parallel_size != 1 and model_type not in {"kimi_linear", "qwen3_next"}:
-                raise ValueError("Recurrent-family currently supports tensor_parallel_size=1 only")
-            if not enforce_eager:
-                enforce_eager = True
 
         # Unique shared memory name to avoid collisions
         shm_name = f"sllama_{uuid.uuid4().hex[:8]}"
+
+        mr_kwargs = dict(
+            gpu_memory_utilization=gpu_memory_utilization,
+            max_model_len=max_model_len,
+            max_num_seqs=self.max_num_seqs,
+            max_num_batched_tokens=self.max_num_batched_tokens,
+        )
 
         # Launch non-rank-0 workers
         self.workers = []
@@ -1279,6 +2477,7 @@ class LlamaEngine:
                 target=ModelRunner,
                 args=(model_name, i, tensor_parallel_size, dtype,
                       enforce_eager, event, shm_name),
+                kwargs=mr_kwargs,
             )
             p.start()
             self.workers.append(p)
@@ -1288,21 +2487,36 @@ class LlamaEngine:
         self.model_runner = ModelRunner(
             model_name, 0, tensor_parallel_size, dtype,
             enforce_eager, self.events, shm_name,
+            **mr_kwargs,
         )
-        self.block_manager = (
-            BlockManager(self.model_runner.num_blocks)
-            if self.model_family == "attention" else None
-        )
+        self.block_manager = BlockManager(self.model_runner.num_blocks)
+        if hasattr(self.model_runner, '_cross_free_block_ids_init'):
+            n = self.model_runner._cross_free_block_ids_init
+            self.block_manager.cross_free_block_ids = deque(range(n))
+            self.block_manager._num_cross_blocks = n
+        if hasattr(self.model_runner, 'cross_blocks_per_seq'):
+            self.cross_blocks_per_seq = self.model_runner.cross_blocks_per_seq
+        self.max_num_seqs = self.model_runner.max_num_seqs
+        print(f"  Scheduling: max_num_seqs={self.max_num_seqs}, "
+              f"max_num_batched_tokens={self.max_num_batched_tokens}")
 
-        self.tokenizer = AutoTokenizer.from_pretrained(model_name, trust_remote_code=True)
+        self.tokenizer = AutoTokenizer.from_pretrained(model_name)
         if self.tokenizer.pad_token_id is None:
             self.tokenizer.pad_token_id = self.tokenizer.eos_token_id
 
         self.is_qwen_vl = self.model_runner.is_qwen_vl
+        self.is_qwen3_vl = self.model_runner.is_qwen3_vl
+        self.is_whisper = self.model_runner.is_whisper
         self.processor = None
         if self.is_qwen_vl:
             from transformers import AutoProcessor
             self.processor = AutoProcessor.from_pretrained(model_name)
+
+        self.encoder_cache: dict[int, tuple] = {}
+
+        if self.is_whisper:
+            from transformers import WhisperProcessor
+            self.whisper_processor = WhisperProcessor.from_pretrained(model_name)
 
         atexit.register(self._cleanup)
 
@@ -1372,73 +2586,236 @@ class LlamaEngine:
         return (token_ids, pixel_values, image_grid_thw,
                 video_pixel_values, video_grid_thw)
 
-    @torch.inference_mode()
-    def _run_vision_encoder(self, seqs):
-        """Run vision encoder for sequences with multimodal data and merge embeddings.
+    def _dispatch_vision_encoder(self, seqs):
+        """Dispatch vision encoder to all TP ranks and build vis_cache_map.
 
-        Returns (inputs_embeds, deepstack_embeds) where deepstack_embeds is a list
-        of tensors for Qwen3-VL DeepStack, or None for Qwen2-VL.
+        For each sequence with images/videos, broadcasts pixel values via NCCL
+        and runs the vision encoder on all ranks (required for TP allreduce).
+
+        Returns (vis_cache_map, cache_count) where vis_cache_map is a list
+        with one entry per seq: None for text-only seqs, or a dict with
+        cache_idx/modality for vision seqs.
         """
-        model = self.model_runner.model
-        all_inputs_embeds = []
-        has_deepstack = hasattr(model.visual, 'deepstack_merger_list')
-        all_deepstack = [] if has_deepstack else None
+        mr = self.model_runner
+        model = mr.model
+        merge_size = model.config.vision.spatial_merge_size
 
-        for seq in seqs:
-            token_ids = torch.tensor(seq.token_ids, dtype=torch.int64, device="cuda")
-            text_embeds = model.get_input_embeddings()(token_ids)
-            seq_deepstack = [] if has_deepstack else None
+        mr._vis_cache = []
+        vis_cache_map = []
+        cache_idx = 0
 
+        seq_entries = []
+        img_thw_list = []
+        for i, seq in enumerate(seqs):
             if seq.pixel_values is not None:
-                pixel_values = seq.pixel_values.cuda()
-                grid_thw = seq.image_grid_thw
-                vis_out = model.visual(pixel_values, grid_thw=grid_thw)
+                pv = seq.pixel_values.cuda()
+                thw = seq.image_grid_thw
+                if not isinstance(thw, torch.Tensor):
+                    thw = torch.tensor(thw, dtype=torch.long)
+                img_thw_list.append(thw)
+                pv_shape = list(pv.shape)
+                thw_shape = list(thw.shape)
+                mr._mm_pv = pv
+                mr._mm_thw = thw
+                mr.call("_broadcast_visual", pv_shape, thw_shape)
+                seq_entries.append((i, cache_idx, "image"))
+                cache_idx += 1
+                del pv
 
-                if has_deepstack:
-                    image_embeds, ds_features = vis_out
-                else:
-                    image_embeds = vis_out
-                    ds_features = []
-
-                merge_size = model.config.vision.spatial_merge_size
-                sizes = []
-                for thw in grid_thw:
-                    t, h, w = thw
-                    sizes.append(t * (h // merge_size) * (w // merge_size))
-
-                mask = token_ids == QWEN_IMAGE_PAD_ID
-                if mask.any():
-                    text_embeds[mask] = image_embeds.to(text_embeds.dtype)
-
-                if has_deepstack and ds_features:
-                    for ds_feat in ds_features:
-                        ds_expanded = torch.zeros_like(text_embeds)
-                        if mask.any():
-                            ds_expanded[mask] = ds_feat.to(text_embeds.dtype)
-                        seq_deepstack.append(ds_expanded)
-
+        for i, seq in enumerate(seqs):
             if seq.video_pixel_values is not None:
                 video_pv = seq.video_pixel_values.cuda()
                 grid_thw = seq.video_grid_thw
-                vis_out = model.visual(video_pv, grid_thw=grid_thw)
+                if not isinstance(grid_thw, torch.Tensor):
+                    grid_thw = torch.tensor(grid_thw, dtype=torch.long)
+                grid_thw = grid_thw.cpu()
+                vpv_shape = list(video_pv.shape)
+                vthw_shape = list(grid_thw.shape)
+                mr._mm_pv = video_pv
+                mr._mm_thw = grid_thw
+                mr.call("_broadcast_visual", vpv_shape, vthw_shape)
+                seq_entries.append((i, cache_idx, "video"))
+                cache_idx += 1
+                del video_pv
 
-                if has_deepstack:
-                    video_embeds, ds_features = vis_out
+        per_seq_map = [None] * len(seqs)
+        for si, ci, modality in seq_entries:
+            seq = seqs[si]
+            if modality == "image":
+                thw_list = seq.image_grid_thw
+                if isinstance(thw_list, list):
+                    thw_t = torch.tensor(thw_list, dtype=torch.long)
+                else:
+                    thw_t = thw_list if isinstance(thw_list, torch.Tensor) else torch.tensor(thw_list, dtype=torch.long)
+                sizes = (thw_t.prod(-1) // (merge_size ** 2)).tolist()
+                per_seq_map[si] = {
+                    "cache_idx": ci,
+                    "modality": "image",
+                    "embed_start": 0,
+                    "embed_count": sum(sizes),
+                }
+            else:
+                per_seq_map[si] = {
+                    "cache_idx": ci,
+                    "modality": "video",
+                }
+
+        return per_seq_map, cache_idx
+
+    @torch.inference_mode()
+    def _run_vision_encoder(self, seqs, chunk_sizes=None):
+        """Run vision encoder with batching and caching.
+
+        Images are batched into a single model.visual() call (concatenated
+        pixel_values, stacked grid_thw). Videos are processed one-by-one to
+        avoid OOM. Results are cached by id(seq) for reuse across steps.
+
+        If chunk_sizes is provided, only produces embeddings for the chunk
+        range [num_computed_tokens : num_computed_tokens + chunk_size] per seq,
+        enabling chunked multimodal prefill.
+
+        Returns (inputs_embeds, deepstack_embeds) where deepstack_embeds is a
+        list of tensors for Qwen3-VL DeepStack, or None for Qwen2-VL.
+        """
+        model = self.model_runner.model
+        has_deepstack = hasattr(model.visual, 'deepstack_merger_list')
+        if has_deepstack:
+            visual_dim = model.config.vision.out_hidden_size
+            deepstack_num_levels = len(model.visual.deepstack_visual_indexes)
+        merge_size = model.config.vision.spatial_merge_size
+        image_token_id = self.model_runner.config.image_token_id
+        video_token_id = self.model_runner.config.video_token_id
+
+        # --- Phase 1: Run encoder for uncached sequences ---
+        img_seqs = []
+        img_pv_list = []
+        img_thw_list = []
+        for seq in seqs:
+            if seq.pixel_values is not None and id(seq) not in self.encoder_cache:
+                img_seqs.append(seq)
+                img_pv_list.append(seq.pixel_values.cuda())
+                thw = seq.image_grid_thw
+                if not isinstance(thw, torch.Tensor):
+                    thw = torch.tensor(thw, dtype=torch.long)
+                img_thw_list.append(thw)
+
+        if img_seqs:
+            batched_pv = torch.cat(img_pv_list, dim=0)
+            batched_thw = torch.cat(img_thw_list, dim=0).cpu()
+            pv_shape = list(batched_pv.shape)
+            thw_shape = list(batched_thw.shape)
+            self.model_runner._mm_pv = batched_pv
+            self.model_runner._mm_thw = batched_thw
+            vis_out = self.model_runner.call(
+                "_broadcast_visual", pv_shape, thw_shape,
+            )
+
+            sizes = (batched_thw.prod(-1) // (merge_size ** 2)).tolist()
+            if has_deepstack and deepstack_num_levels > 0:
+                all_img_embeds = vis_out[:, :visual_dim]
+                ds_cat = vis_out[:, visual_dim:]
+                all_ds_features = list(ds_cat.split(visual_dim, dim=1))
+            else:
+                all_img_embeds = vis_out
+                all_ds_features = None
+
+            per_seq_embeds = all_img_embeds.split(sizes)
+            if all_ds_features is not None:
+                per_seq_ds = [ds.split(sizes) for ds in all_ds_features]
+            else:
+                per_seq_ds = None
+
+            embed_idx = 0
+            for i, seq in enumerate(img_seqs):
+                thw = seq.image_grid_thw
+                n_items = len(thw) if isinstance(thw, list) else thw.shape[0]
+                seq_embeds = torch.cat(
+                    per_seq_embeds[embed_idx:embed_idx + n_items], dim=0
+                ) if n_items > 1 else per_seq_embeds[embed_idx]
+                if per_seq_ds is not None:
+                    seq_ds = [
+                        torch.cat(ds[embed_idx:embed_idx + n_items], dim=0)
+                        if n_items > 1 else ds[embed_idx]
+                        for ds in per_seq_ds
+                    ]
+                else:
+                    seq_ds = []
+                self.encoder_cache[id(seq)] = (seq_embeds, seq_ds, "image")
+                embed_idx += n_items
+
+            del batched_pv, batched_thw
+
+        for seq in seqs:
+            if seq.video_pixel_values is not None and id(seq) not in self.encoder_cache:
+                video_pv = seq.video_pixel_values.cuda()
+                grid_thw = seq.video_grid_thw
+                if not isinstance(grid_thw, torch.Tensor):
+                    grid_thw = torch.tensor(grid_thw, dtype=torch.long)
+                grid_thw = grid_thw.cpu()
+                vpv_shape = list(video_pv.shape)
+                vthw_shape = list(grid_thw.shape)
+                self.model_runner._mm_pv = video_pv
+                self.model_runner._mm_thw = grid_thw
+                vis_out = self.model_runner.call(
+                    "_broadcast_visual", vpv_shape, vthw_shape,
+                )
+
+                if has_deepstack and deepstack_num_levels > 0:
+                    video_embeds = vis_out[:, :visual_dim]
+                    ds_cat = vis_out[:, visual_dim:]
+                    ds_features = list(ds_cat.split(visual_dim, dim=1))
                 else:
                     video_embeds = vis_out
                     ds_features = []
+                self.encoder_cache[id(seq)] = (video_embeds, ds_features, "video")
+                del video_pv
 
-                mask = token_ids == QWEN_VIDEO_PAD_ID
+        # --- Phase 2: Merge vision embeddings into text embeddings ---
+        all_inputs_embeds = []
+        all_deepstack = [] if has_deepstack else None
+        embed_fn = model.get_input_embeddings()
+
+        for seq_idx, seq in enumerate(seqs):
+            full_ids = torch.tensor(seq.token_ids, dtype=torch.int64, device="cuda")
+
+            if chunk_sizes is not None:
+                start = seq.num_computed_tokens
+                end = start + chunk_sizes[seq_idx]
+                chunk_ids = full_ids[start:end]
+            else:
+                chunk_ids = full_ids
+                start = 0
+                end = len(full_ids)
+
+            text_embeds = embed_fn(chunk_ids)
+            seq_deepstack = [] if has_deepstack else None
+
+            cached = self.encoder_cache.get(id(seq))
+            if cached is not None:
+                embeds, ds_features, modality = cached
+                tok_id = image_token_id if modality == "image" else video_token_id
+
+                mask = chunk_ids == tok_id
                 if mask.any():
-                    text_embeds[mask] = video_embeds.to(text_embeds.dtype)
+                    if chunk_sizes is not None:
+                        full_mask = full_ids == tok_id
+                        chunk_vis_start = full_mask[:start].sum().item()
+                        n_vis_in_chunk = mask.sum().item()
+                        chunk_embeds = embeds[chunk_vis_start:chunk_vis_start + n_vis_in_chunk]
+                        text_embeds[mask] = chunk_embeds.to(text_embeds.dtype)
+                    else:
+                        text_embeds[mask] = embeds.to(text_embeds.dtype)
 
                 if has_deepstack and ds_features:
-                    for i, ds_feat in enumerate(ds_features):
+                    for i_ds, ds_feat in enumerate(ds_features):
                         ds_expanded = torch.zeros_like(text_embeds)
                         if mask.any():
-                            ds_expanded[mask] = ds_feat.to(text_embeds.dtype)
-                        if i < len(seq_deepstack):
-                            seq_deepstack[i] = seq_deepstack[i] + ds_expanded
+                            if chunk_sizes is not None:
+                                ds_expanded[mask] = ds_feat[chunk_vis_start:chunk_vis_start + n_vis_in_chunk].to(text_embeds.dtype)
+                            else:
+                                ds_expanded[mask] = ds_feat.to(text_embeds.dtype)
+                        if modality == "video" and i_ds < len(seq_deepstack):
+                            seq_deepstack[i_ds] = seq_deepstack[i_ds] + ds_expanded
                         else:
                             seq_deepstack.append(ds_expanded)
 
@@ -1449,24 +2826,39 @@ class LlamaEngine:
         inputs_embeds = torch.cat(all_inputs_embeds, dim=0)
 
         if has_deepstack and all_deepstack:
-            num_levels = max(len(ds) for ds in all_deepstack)
-            deepstack_embeds = []
-            for level in range(num_levels):
-                level_parts = []
-                for ds in all_deepstack:
-                    if level < len(ds):
-                        level_parts.append(ds[level])
-                    else:
-                        level_parts.append(torch.zeros_like(all_inputs_embeds[0]))
-                deepstack_embeds.append(torch.cat(level_parts, dim=0))
-            return inputs_embeds, deepstack_embeds
+            num_levels = max((len(ds) for ds in all_deepstack), default=0)
+            if num_levels > 0:
+                deepstack_embeds = []
+                for level in range(num_levels):
+                    level_parts = []
+                    for ds in all_deepstack:
+                        if level < len(ds):
+                            level_parts.append(ds[level])
+                        else:
+                            level_parts.append(
+                                torch.zeros_like(all_inputs_embeds[0]))
+                    deepstack_embeds.append(torch.cat(level_parts, dim=0))
+                return inputs_embeds, deepstack_embeds
 
         return inputs_embeds, None
 
     @torch.inference_mode()
     def generate(self, prompts, sampling_params, collect_logits: bool = False,
-                 images=None, videos=None):
-        """Generate completions for a batch of prompts."""
+                 images=None, videos=None, audio_features=None,
+                 use_tqdm: bool = False):
+        """Generate completions for a batch of prompts.
+
+        Uses unified chunked-prefill scheduling: every GPU step processes
+        both decode tokens (for running seqs) and prefill chunks (for
+        new/continuing seqs) in a single forward pass, matching vLLM's
+        approach.
+
+        For Whisper (encoder-decoder), audio_features is a list of
+        [num_mel_bins, T] log-mel spectrogram tensors. The encoder runs
+        during the first prefill step and cross-attention KV is written
+        to paged cache. No chunked prefill for encoder-decoder (matching
+        vLLM).
+        """
         if isinstance(sampling_params, list):
             sp_list = sampling_params
         else:
@@ -1477,8 +2869,9 @@ class LlamaEngine:
             self._set_seeds(seed)
 
         eos = self.tokenizer.eos_token_id
-        waiting = deque()
-        running = deque()
+        waiting: deque[Sequence] = deque()
+        running: deque[Sequence] = deque()
+        prefilling: deque[Sequence] = deque()
 
         seq_logits: dict[int, list[torch.Tensor]] = {}
 
@@ -1487,12 +2880,37 @@ class LlamaEngine:
             images = [None] * len(prompts)
         if videos is None:
             videos = [None] * len(prompts)
+        if audio_features is None:
+            audio_features = [None] * len(prompts)
 
-        for i, (prompt, sp) in enumerate(zip(prompts, sp_list)):
+        _preprocess_t0 = time.perf_counter()
+
+        # Whisper: compute encoder output length from mel spectrogram length.
+        # Two conv layers with stride 2 => T_enc = T_mel // 4 (rounded down
+        # by convolutions, but padding ensures it's close to T_mel // 2 per layer).
+        # More precisely: after conv1 with kernel=3, stride=1, padding=1: T_out = T_mel
+        # after conv2 with kernel=3, stride=2, padding=1: T_out = (T_mel + 1) // 2
+        # Then the max is clamped to max_source_positions (1500).
+        def _whisper_encoder_tokens(mel_T):
+            return min((mel_T + 1) // 2, getattr(self.model_runner.config, 'max_source_positions', 1500))
+
+        def _make_seq(i):
+            prompt = prompts[i]
+            sp = sp_list[i]
             img = images[i] if i < len(images) else None
             vid = videos[i] if i < len(videos) else None
+            aud = audio_features[i] if i < len(audio_features) else None
 
-            if self.is_qwen_vl and (img is not None or vid is not None):
+            if self.is_whisper and aud is not None:
+                ids = prompt if isinstance(prompt, list) else self.tokenizer.encode(prompt)
+                max_toks = min(sp.max_tokens,
+                               self.model_runner.max_model_len - len(ids))
+                seq = Sequence(ids, max_tokens=max_toks, ignore_eos=sp.ignore_eos)
+                seq.encoder_features = aud
+                mel_T = aud.shape[-1]
+                seq.encoder_seq_len = _whisper_encoder_tokens(mel_T)
+                return seq
+            elif self.is_qwen_vl and (img is not None or vid is not None):
                 (ids, pixel_values, image_grid_thw,
                  video_pv, video_grid_thw) = self._preprocess_multimodal(
                     prompt, images=img, videos=vid,
@@ -1503,9 +2921,10 @@ class LlamaEngine:
                 seq.video_pixel_values = video_pv
                 seq.video_grid_thw = video_grid_thw.tolist() if video_grid_thw is not None else None
 
-                # Compute M-RoPE positions
                 model = self.model_runner.model
                 merge_size = model.config.vision.spatial_merge_size
+                image_token_id = self.model_runner.config.image_token_id
+                video_token_id = self.model_runner.config.video_token_id
                 image_offsets = []
                 video_offsets = []
                 img_idx = 0
@@ -1513,18 +2932,32 @@ class LlamaEngine:
                 i_tok = 0
                 while i_tok < len(ids):
                     tid = ids[i_tok]
-                    if tid == QWEN_IMAGE_PAD_ID and seq.image_grid_thw and img_idx < len(seq.image_grid_thw):
+                    if tid == image_token_id and seq.image_grid_thw and img_idx < len(seq.image_grid_thw):
                         image_offsets.append(i_tok)
                         t, h, w = seq.image_grid_thw[img_idx]
                         num_tokens = t * (h // merge_size) * (w // merge_size)
                         i_tok += num_tokens
                         img_idx += 1
-                    elif tid == QWEN_VIDEO_PAD_ID and seq.video_grid_thw and vid_idx < len(seq.video_grid_thw):
-                        video_offsets.append(i_tok)
+                    elif tid == video_token_id and seq.video_grid_thw and vid_idx < len(seq.video_grid_thw):
                         t, h, w = seq.video_grid_thw[vid_idx]
-                        num_tokens = t * (h // merge_size) * (w // merge_size)
-                        i_tok += num_tokens
-                        vid_idx += 1
+                        tokens_per_frame = (h // merge_size) * (w // merge_size)
+                        if self.is_qwen3_vl:
+                            frames_found = 0
+                            j = i_tok
+                            while j < len(ids) and frames_found < t:
+                                if ids[j] == video_token_id:
+                                    video_offsets.append(j)
+                                    j += tokens_per_frame
+                                    frames_found += 1
+                                else:
+                                    j += 1
+                            vid_idx += 1
+                            i_tok = j
+                        else:
+                            video_offsets.append(i_tok)
+                            num_tokens = t * tokens_per_frame
+                            i_tok += num_tokens
+                            vid_idx += 1
                     else:
                         i_tok += 1
 
@@ -1540,57 +2973,449 @@ class LlamaEngine:
             elif self.is_qwen_vl:
                 ids = prompt if isinstance(prompt, list) else self.tokenizer.encode(prompt)
                 seq = Sequence(ids, max_tokens=sp.max_tokens, ignore_eos=sp.ignore_eos)
-                # Text-only with M-RoPE: all 3 dims same
                 seq.mrope_positions = torch.arange(len(ids), dtype=torch.int64).unsqueeze(0).expand(3, -1)
                 seq.mrope_position_delta = 0
             else:
                 ids = prompt if isinstance(prompt, list) else self.tokenizer.encode(prompt)
                 seq = Sequence(ids, max_tokens=sp.max_tokens, ignore_eos=sp.ignore_eos)
+            return seq
 
+        from concurrent.futures import ThreadPoolExecutor
+        with ThreadPoolExecutor(max_workers=8) as pool:
+            all_seqs_ordered = list(pool.map(_make_seq, range(len(prompts))))
+
+        for seq in all_seqs_ordered:
             waiting.append(seq)
             if collect_logits:
                 seq_logits[id(seq)] = []
 
         all_seqs = list(waiting)
+        num_prompts = len(prompts)
+        _preprocess_time = time.perf_counter() - _preprocess_t0
+        if os.environ.get("KB_NANO_STEP_PROFILE") == "1":
+            print(f"[Profile] Preprocessing {num_prompts} seqs: {_preprocess_time:.3f}s")
 
-        if self.model_family == "mamba":
-            while waiting or running:
-                prefill_seqs = []
-                while (
-                    waiting
-                    and len(prefill_seqs) < MAX_NUM_SEQS
-                    and self.model_runner.can_allocate_mamba_state()
-                ):
-                    seq = waiting.popleft()
-                    self.model_runner.allocate_mamba_state(seq)
-                    seq.status = SeqStatus.RUNNING
-                    running.append(seq)
-                    prefill_seqs.append(seq)
+        pbar = None
+        if use_tqdm:
+            from tqdm import tqdm as _tqdm
+            pbar = _tqdm(total=num_prompts, desc="Processed prompts",
+                         dynamic_ncols=True,
+                         postfix="est. speed input: 0.00 toks/s, "
+                                 "output: 0.00 toks/s")
+        num_finished = 0
+        total_in_toks = 0
+        total_out_toks = 0
 
-                if prefill_seqs:
-                    logits = self.model_runner.call("run", prefill_seqs, True)
-                    if logits is not None:
-                        if collect_logits:
-                            for i, seq in enumerate(prefill_seqs):
-                                seq_logits[id(seq)].append(logits[i:i+1].cpu())
-                        token_ids = self._sample(logits, sp_list[0])
-                        finished_set = set()
-                        for seq, tid in zip(prefill_seqs, token_ids):
+        use_greedy = (sp_list[0].temperature == 0.0
+                      and not collect_logits)
+        block_size = BLOCK_SIZE
+        bm = self.block_manager
+        num_blocks = bm._num_blocks
+        watermark_blocks = max(int(num_blocks * 0.01), 1)
+
+        _pbar_pending = 0
+        _pbar_pending_in = 0
+        _pbar_pending_out = 0
+
+        step_profile = {
+            "pure_decode": 0, "decode_tokens": 0, "decode_time": 0.0,
+            "pure_mm_prefill": 0, "mm_prefill_tokens": 0, "mm_prefill_time": 0.0,
+            "pure_text_prefill": 0, "text_prefill_tokens": 0,
+            "mixed_mm": 0, "mixed_mm_pf_tokens": 0, "mixed_mm_dc_tokens": 0, "mixed_mm_time": 0.0,
+            "mixed_text": 0, "mixed_text_pf_tokens": 0, "mixed_text_dc_tokens": 0,
+        }
+        _step_profile_active = os.environ.get("KB_NANO_STEP_PROFILE") == "1"
+
+        def _finish_seq(seq: Sequence) -> None:
+            nonlocal _pbar_pending, _pbar_pending_in, _pbar_pending_out
+            seq.status = SeqStatus.FINISHED
+            bm.deallocate(seq)
+            bm.deallocate_cross(seq)
+            self.encoder_cache.pop(id(seq), None)
+            if pbar is not None:
+                _pbar_pending += 1
+                _pbar_pending_in += seq.num_prompt_tokens
+                _pbar_pending_out += len(seq.generated_ids)
+
+        def _flush_pbar() -> None:
+            nonlocal _pbar_pending, _pbar_pending_in, _pbar_pending_out
+            nonlocal total_in_toks, total_out_toks
+            if _pbar_pending == 0:
+                return
+            total_in_toks += _pbar_pending_in
+            total_out_toks += _pbar_pending_out
+            elapsed = pbar.format_dict["elapsed"]
+            if elapsed > 0:
+                pbar.postfix = (
+                    f"est. speed input: {total_in_toks / elapsed:.2f}"
+                    f" toks/s, output: "
+                    f"{total_out_toks / elapsed:.2f} toks/s")
+            pbar.update(_pbar_pending)
+            _pbar_pending = 0
+            _pbar_pending_in = 0
+            _pbar_pending_out = 0
+
+        while waiting or running or prefilling:
+            if pbar is not None:
+                _flush_pbar()
+            # =============================================================
+            # FAST PATH: pure decode (most common steady-state)
+            # No waiting/prefilling seqs, so skip the full scheduler.
+            # =============================================================
+            if running and not waiting and not prefilling and use_greedy:
+                need_blocks = 0
+                for seq in running:
+                    if len(seq) % block_size == 1:
+                        need_blocks += 1
+                if need_blocks <= len(bm.free_block_ids):
+                    if _step_profile_active:
+                        _spt0 = time.perf_counter()
+                        step_profile["fast_decode"] = step_profile.get("fast_decode", 0) + 1
+                        step_profile["fast_decode_tokens"] = step_profile.get("fast_decode_tokens", 0) + len(running)
+                    if _PROFILE:
+                        _fp_t0 = time.perf_counter()
+                    decode_seqs = list(running)
+                    for seq in decode_seqs:
+                        if len(seq) % block_size == 1:
+                            seq.block_table.append(bm.free_block_ids.popleft())
+
+                    mr = self.model_runner
+                    n_dc = len(decode_seqs)
+                    if self.is_whisper:
+                        mr._set_cross_attn_context_decode(decode_seqs)
+                    decode_data = mr._prepare_decode_arrays(decode_seqs)
+                    if _PROFILE:
+                        _fp_t1 = time.perf_counter()
+                    if mr.world_size > 1:
+                        mr._write_decode_shm(*decode_data)
+                        mr.shm.buf[mr._SHM_FLAG_OFFSET] = 1
+                        mr._signal_workers()
+                    has_result, _async_n = mr.run_decode_greedy_fast_async(decode_data)
+                    if _PROFILE:
+                        _fp_t2 = time.perf_counter()
+                    if has_result:
+                        token_ids = mr._wait_async_tokens(_async_n)
+                        if _PROFILE:
+                            _fp_t3 = time.perf_counter()
+                        any_finished = False
+                        for seq, tid in zip(decode_seqs, token_ids):
                             seq.append_token(tid)
                             done = len(seq.generated_ids) >= seq.max_tokens
                             if not seq.ignore_eos:
                                 done = done or tid == eos
                             if done:
-                                seq.status = SeqStatus.FINISHED
-                                finished_set.add(id(seq))
-                                self.model_runner.deallocate_mamba_state(seq)
-                        if finished_set:
-                            running = deque(s for s in running if id(s) not in finished_set)
+                                _finish_seq(seq)
+                                any_finished = True
+                        if any_finished:
+                            running = deque(s for s in running
+                                            if s.status != SeqStatus.FINISHED)
+                        if _PROFILE:
+                            _fp_t4 = time.perf_counter()
+                            _fp = getattr(self, '_fast_path_profile', None)
+                            if _fp is None:
+                                _fp = {'prep': 0., 'gpu': 0., 'tolist': 0.,
+                                       'post': 0., 'n': 0}
+                                self._fast_path_profile = _fp
+                            _fp['prep'] += _fp_t1 - _fp_t0
+                            _fp['gpu'] += _fp_t2 - _fp_t1
+                            _fp['tolist'] += _fp_t3 - _fp_t2
+                            _fp['post'] += _fp_t4 - _fp_t3
+                            _fp['n'] += 1
 
-                if not running:
+                        _whisper_fast = self.is_whisper
+                        use_incr = True
+                        while running and not waiting and not prefilling:
+                            if any_finished:
+                                decode_seqs = list(running)
+                                n_dc = len(decode_seqs)
+                                any_finished = False
+                                use_incr = False
+                                if _whisper_fast:
+                                    mr._set_cross_attn_context_decode(decode_seqs)
+
+                            need_blocks = 0
+                            for seq in decode_seqs:
+                                if len(seq) % block_size == 1:
+                                    need_blocks += 1
+                            if need_blocks > len(bm.free_block_ids):
+                                break
+                            if os.environ.get("KB_NANO_STEP_PROFILE") == "1":
+                                step_profile["fast_decode"] = step_profile.get("fast_decode", 0) + 1
+                                step_profile["fast_decode_tokens"] = step_profile.get("fast_decode_tokens", 0) + n_dc
+                            for seq in decode_seqs:
+                                if len(seq) % block_size == 1:
+                                    seq.block_table.append(
+                                        bm.free_block_ids.popleft())
+                            if _PROFILE:
+                                _fp_t0 = time.perf_counter()
+                            if use_incr:
+                                decode_data = \
+                                    mr._update_decode_arrays_incremental(
+                                        n_dc, token_ids, decode_seqs)
+                            else:
+                                decode_data = mr._prepare_decode_arrays(
+                                    decode_seqs)
+                                use_incr = True
+                            if _PROFILE:
+                                _fp_t1 = time.perf_counter()
+                            if mr.world_size > 1:
+                                mr._write_decode_shm(*decode_data)
+                                mr.shm.buf[mr._SHM_FLAG_OFFSET] = 1
+                                mr._signal_workers()
+                            has_result, _async_n = mr.run_decode_greedy_fast_async(decode_data)
+                            if _PROFILE:
+                                _fp_t2 = time.perf_counter()
+                            if has_result:
+                                token_ids = mr._wait_async_tokens(_async_n)
+                                if _PROFILE:
+                                    _fp_t3 = time.perf_counter()
+                                for seq, tid in zip(decode_seqs, token_ids):
+                                    seq.append_token(tid)
+                                    done = (len(seq.generated_ids)
+                                            >= seq.max_tokens)
+                                    if not seq.ignore_eos:
+                                        done = done or tid == eos
+                                    if done:
+                                        _finish_seq(seq)
+                                        any_finished = True
+                                if any_finished:
+                                    running = deque(
+                                        s for s in running
+                                        if s.status != SeqStatus.FINISHED)
+                                if _PROFILE:
+                                    _fp_t4 = time.perf_counter()
+                                    _fp['prep'] += _fp_t1 - _fp_t0
+                                    _fp['gpu'] += _fp_t2 - _fp_t1
+                                    _fp['tolist'] += _fp_t3 - _fp_t2
+                                    _fp['post'] += _fp_t4 - _fp_t3
+                                    _fp['n'] += 1
+                    if _step_profile_active:
+                        step_profile["decode_time"] += time.perf_counter() - _spt0
                     continue
 
+            elif running and not waiting and not prefilling:
                 decode_seqs = list(running)
+                need_blocks = 0
+                for seq in decode_seqs:
+                    if len(seq) % block_size == 1:
+                        need_blocks += 1
+                if need_blocks <= len(bm.free_block_ids):
+                    for seq in decode_seqs:
+                        if len(seq) % block_size == 1:
+                            seq.block_table.append(bm.free_block_ids.popleft())
+                    if self.is_whisper:
+                        self.model_runner._set_cross_attn_context_decode(decode_seqs)
+                    result = self.model_runner.call("run", decode_seqs, False)
+                    if result is not None:
+                        if collect_logits:
+                            for i, seq in enumerate(decode_seqs):
+                                seq_logits[id(seq)].append(result[i:i+1].cpu())
+                        token_ids = self._sample(result, sp_list[0])
+                        finished_set = set()
+                        for seq, tid in zip(decode_seqs, token_ids):
+                            seq.append_token(tid)
+                            done = len(seq.generated_ids) >= seq.max_tokens
+                            if not seq.ignore_eos:
+                                done = done or tid == eos
+                            if done:
+                                _finish_seq(seq)
+                                finished_set.add(id(seq))
+                        if finished_set:
+                            running = deque(s for s in running if id(s) not in finished_set)
+                    continue
+
+            # =============================================================
+            # SCHEDULE: one unified step
+            # =============================================================
+            token_budget = self.max_num_batched_tokens
+
+            # --- 1. Allocate blocks for decode seqs that need a new block ---
+            decode_seqs: list[Sequence] = []
+            new_running: deque[Sequence] = deque()
+            while running:
+                seq = running.popleft()
+                if len(decode_seqs) >= self.max_num_seqs:
+                    new_running.append(seq)
+                    continue
+                needs_block = (len(seq) % block_size == 1)
+                if needs_block:
+                    if not bm.free_block_ids:
+                        bm.deallocate(seq)
+                        bm.deallocate_cross(seq)
+                        seq.preempt()
+                        waiting.appendleft(seq)
+                        continue
+                    seq.block_table.append(bm.free_block_ids.popleft())
+                decode_seqs.append(seq)
+            running = new_running
+            token_budget -= len(decode_seqs)
+
+            # --- 2. Continue prefilling seqs already mid-prefill ---
+            prefill_seqs: list[Sequence] = []
+            prefill_chunk_sizes: list[int] = []
+            still_prefilling: deque[Sequence] = deque()
+            while prefilling and token_budget > 0:
+                seq = prefilling.popleft()
+                remaining = seq.num_remaining_prefill
+                chunk = min(remaining, token_budget)
+                blocks_needed = seq.blocks_needed_for(chunk)
+                if blocks_needed > 0:
+                    if len(bm.free_block_ids) < blocks_needed:
+                        still_prefilling.append(seq)
+                        continue
+                    bm.allocate_n(seq, blocks_needed)
+                prefill_seqs.append(seq)
+                prefill_chunk_sizes.append(chunk)
+                token_budget -= chunk
+            while prefilling:
+                still_prefilling.append(prefilling.popleft())
+            prefilling = still_prefilling
+
+            # --- 3. Admit new seqs from waiting queue ---
+            total_peak = 0
+            for seq in decode_seqs:
+                total_peak += (seq.num_prompt_tokens + seq.max_tokens
+                               + block_size - 1) // block_size
+            for seq in running:
+                total_peak += (seq.num_prompt_tokens + seq.max_tokens
+                               + block_size - 1) // block_size
+            for seq in prefilling:
+                total_peak += (seq.num_prompt_tokens + seq.max_tokens
+                               + block_size - 1) // block_size
+            encoder_budget = self.max_num_batched_tokens
+            while waiting and token_budget > 0:
+                seq = waiting[0]
+                prompt_len = seq.num_prompt_tokens
+
+                has_mm = self.is_qwen_vl and (
+                    getattr(seq, 'pixel_values', None) is not None
+                    or getattr(seq, 'video_pixel_values', None) is not None)
+
+                is_whisper_seq = (seq.encoder_features is not None)
+
+                if is_whisper_seq:
+                    # No chunked prefill for encoder-decoder (matching vLLM).
+                    chunk = prompt_len
+                    if chunk > token_budget:
+                        break
+                    # Check cross-attn block availability
+                    cross_blocks_needed = getattr(self, 'cross_blocks_per_seq', 0)
+                    cross_free = len(getattr(bm, 'cross_free_block_ids', []))
+                    if cross_blocks_needed > 0 and cross_free < cross_blocks_needed:
+                        break
+                elif has_mm:
+                    chunk = min(prompt_len, token_budget)
+                    if chunk > encoder_budget:
+                        break
+                else:
+                    chunk = min(prompt_len, token_budget)
+
+                blocks_needed = (chunk + block_size - 1) // block_size
+                free = len(bm.free_block_ids)
+                if free < blocks_needed + watermark_blocks:
+                    break
+                seq_peak = (prompt_len + seq.max_tokens
+                            + block_size - 1) // block_size
+                if total_peak + seq_peak > num_blocks:
+                    break
+                if len(prefill_seqs) + len(decode_seqs) >= self.max_num_seqs:
+                    break
+                waiting.popleft()
+                bm.allocate_n(seq, blocks_needed)
+                if is_whisper_seq and cross_blocks_needed > 0:
+                    for _ in range(cross_blocks_needed):
+                        seq.cross_block_table.append(bm.cross_free_block_ids.popleft())
+                seq.status = SeqStatus.PREFILLING
+                prefill_seqs.append(seq)
+                prefill_chunk_sizes.append(chunk)
+                token_budget -= chunk
+                total_peak += seq_peak
+                if has_mm:
+                    encoder_budget -= chunk
+
+            if not decode_seqs and not prefill_seqs:
+                continue
+
+            # =============================================================
+            # EXECUTE: single forward pass
+            # =============================================================
+            n_pf = len(prefill_seqs)
+            n_dc = len(decode_seqs)
+
+            if _step_profile_active:
+                _spt0 = time.perf_counter()
+                _sp = step_profile
+                has_mm_step = self.is_qwen_vl and any(
+                    s.pixel_values is not None or s.video_pixel_values is not None
+                    for s in prefill_seqs
+                )
+                _sp_cat = None
+                if n_pf == 0:
+                    _sp["pure_decode"] += 1
+                    _sp["decode_tokens"] += n_dc
+                    _sp_cat = "decode_time"
+                elif n_dc == 0 and has_mm_step:
+                    _sp["pure_mm_prefill"] += 1
+                    _sp["mm_prefill_tokens"] += sum(prefill_chunk_sizes)
+                    _sp_cat = "mm_prefill_time"
+                elif n_dc == 0:
+                    _sp["pure_text_prefill"] += 1
+                    _sp["text_prefill_tokens"] += sum(prefill_chunk_sizes)
+                elif has_mm_step:
+                    _sp["mixed_mm"] += 1
+                    _sp["mixed_mm_pf_tokens"] += sum(prefill_chunk_sizes)
+                    _sp["mixed_mm_dc_tokens"] += n_dc
+                    _sp_cat = "mixed_mm_time"
+                else:
+                    _sp["mixed_text"] += 1
+                    _sp["mixed_text_pf_tokens"] += sum(prefill_chunk_sizes)
+                    _sp["mixed_text_dc_tokens"] += n_dc
+
+            # ----- Whisper: run encoder for new prefill seqs -----
+            encoder_outputs = None
+            encoder_seqs = []
+            if self.is_whisper and n_pf > 0:
+                encoder_seqs = [s for s in prefill_seqs
+                                if s.encoder_features is not None and not s.encoder_computed]
+                if encoder_seqs:
+                    model = self.model_runner.model
+                    features_batch = torch.stack([
+                        s.encoder_features.to(
+                            device=f"cuda:{self.model_runner.rank}",
+                            dtype=self.model_runner.dtype,
+                        ) for s in encoder_seqs
+                    ], dim=0)
+                    encoder_outputs = model.get_multimodal_embeddings(features_batch)
+                    for seq, enc_out in zip(encoder_seqs, encoder_outputs):
+                        seq.encoder_computed = True
+                        seq.encoder_seq_len = enc_out.shape[0]
+
+            if n_pf == 0 and use_greedy:
+                # Pure decode with CUDA graphs (fast path)
+                if self.is_whisper:
+                    self.model_runner._set_cross_attn_context_decode(decode_seqs)
+                gpu_result = self.model_runner.call_decode_greedy(decode_seqs)
+                if gpu_result is not None:
+                    token_ids = gpu_result.tolist()
+                    finished_set = set()
+                    for seq, tid in zip(decode_seqs, token_ids):
+                        seq.append_token(tid)
+                        done = len(seq.generated_ids) >= seq.max_tokens
+                        if not seq.ignore_eos:
+                            done = done or tid == eos
+                        if done:
+                            _finish_seq(seq)
+                            finished_set.add(id(seq))
+                        else:
+                            running.append(seq)
+                    if finished_set:
+                        running = deque(s for s in running if id(s) not in finished_set)
+                else:
+                    running.extend(decode_seqs)
+            elif n_pf == 0:
+                # Pure decode, non-greedy
+                if self.is_whisper:
+                    self.model_runner._set_cross_attn_context_decode(decode_seqs)
                 result = self.model_runner.call("run", decode_seqs, False)
                 if result is not None:
                     if collect_logits:
@@ -1604,215 +3429,134 @@ class LlamaEngine:
                         if not seq.ignore_eos:
                             done = done or tid == eos
                         if done:
-                            seq.status = SeqStatus.FINISHED
+                            _finish_seq(seq)
                             finished_set.add(id(seq))
-                            self.model_runner.deallocate_mamba_state(seq)
+                        else:
+                            running.append(seq)
                     if finished_set:
                         running = deque(s for s in running if id(s) not in finished_set)
-
-            return [
-                GenerationOutput(
-                    prompt=(prompts[i] if isinstance(prompts[i], str) else ""),
-                    generated_text=self.tokenizer.decode(
-                        all_seqs[i].generated_ids, skip_special_tokens=True,
-                    ),
-                    token_ids=all_seqs[i].generated_ids,
-                    logits_history=(
-                        seq_logits.get(id(all_seqs[i])) if collect_logits else None
-                    ),
+                else:
+                    running.extend(decode_seqs)
+            elif n_dc == 0:
+                # Pure prefill (no running decode seqs)
+                has_mm = self.is_qwen_vl and any(
+                    s.pixel_values is not None or s.video_pixel_values is not None
+                    for s in prefill_seqs
                 )
-                for i in range(len(prompts))
-            ]
-
-        use_greedy = (sp_list[0].temperature == 0.0
-                      and not collect_logits)
-        block_size = BLOCK_SIZE
-
-        profile = _PROFILE
-        if profile:
-            _pf_time = 0.0
-            _pf_steps = 0
-            _pf_tokens = 0
-            _dc_time = 0.0
-            _dc_steps = 0
-            _dc_tokens = 0
-            _dc_sched_time = 0.0
-            _dc_call_time = 0.0
-            _dc_tolist_time = 0.0
-            _dc_post_time = 0.0
-            _dc_bs_counts = []
-
-        while waiting or running:
-            # --- Prefill one batch (if any waiting) ---
-            prefill_seqs = []
-            num_batched_tokens = 0
-            while waiting:
-                seq = waiting[0]
-                seq_len = len(seq)
-                if num_batched_tokens + seq_len > MAX_NUM_BATCHED_TOKENS:
-                    break
-                if len(prefill_seqs) >= MAX_NUM_SEQS:
-                    break
-                if not self.block_manager.can_allocate(seq):
-                    break
-                waiting.popleft()
-                self.block_manager.allocate(seq)
-                seq.status = SeqStatus.RUNNING
-                running.append(seq)
-                prefill_seqs.append(seq)
-                num_batched_tokens += seq_len
-
-            if prefill_seqs:
-                if profile:
-                    _t0 = time.perf_counter()
-                # Check if any sequences have multimodal data
-                has_mm = any(s.pixel_values is not None or s.video_pixel_values is not None
-                             for s in prefill_seqs)
                 if has_mm:
-                    inputs_embeds, deepstack_embeds = self._run_vision_encoder(prefill_seqs)
-                    input_ids_t, positions_t = self.model_runner.prepare_prefill(prefill_seqs)
+                    vis_cache_map, _ = self._dispatch_vision_encoder(prefill_seqs)
+                    _stripped_pf = self.model_runner._strip_mm_tensors(prefill_seqs)
+                    logits = self.model_runner.call(
+                        "_run_mm_lm", _stripped_pf, prefill_chunk_sizes, [],
+                        vis_cache_map,
+                    )
+                    if _step_profile_active:
+                        torch.cuda.synchronize()
+                        step_profile["mm_prefill_time"] += time.perf_counter() - _spt0
+                elif self.is_whisper and encoder_outputs:
+                    input_ids_t, positions_t = self.model_runner.prepare_mixed_batch(
+                        prefill_seqs, prefill_chunk_sizes, [],
+                    )
+                    self.model_runner._set_cross_attn_context_prefill(
+                        prefill_seqs, prefill_chunk_sizes, encoder_seqs)
                     logits = self.model_runner.run_model(
                         input_ids_t, positions_t, True,
-                        inputs_embeds=inputs_embeds,
-                        deepstack_embeds=deepstack_embeds,
+                        encoder_outputs=encoder_outputs,
                     )
                     reset_context()
                 else:
-                    logits = self.model_runner.call("run", prefill_seqs, True)
+                    logits = self.model_runner.call(
+                        "run_mixed", prefill_seqs, prefill_chunk_sizes, [],
+                    )
                 if logits is not None:
-                    if collect_logits:
-                        for i, seq in enumerate(prefill_seqs):
-                            seq_logits[id(seq)].append(logits[i:i+1].cpu())
-                    token_ids = self._sample(logits, sp_list[0])
-                    for seq, tid in zip(prefill_seqs, token_ids):
-                        seq.num_computed_tokens = len(seq)
-                        seq.append_token(tid)
-                        done = len(seq.generated_ids) >= seq.max_tokens
-                        if not seq.ignore_eos:
-                            done = done or tid == eos
-                        if done:
-                            seq.status = SeqStatus.FINISHED
-                            running.remove(seq)
-                            self.block_manager.deallocate(seq)
-                if profile:
-                    _pf_time += time.perf_counter() - _t0
-                    _pf_steps += 1
-                    _pf_tokens += num_batched_tokens
-
-            # --- Decode all running sequences (CUDA graph path) ---
-            if not running:
-                continue
-
-            if profile:
-                _t_sched = time.perf_counter()
-
-            bm = self.block_manager
-            free = bm.free_block_ids
-            decode_seqs = []
-            temp = deque()
-            while running and len(decode_seqs) < MAX_NUM_SEQS:
-                seq = running.popleft()
-                if len(seq) % block_size == 1 and not free:
-                    break
-                if len(seq) % block_size == 1:
-                    seq.block_table.append(free.popleft())
-                decode_seqs.append(seq)
-                temp.append(seq)
-            running.extendleft(reversed(temp))
-
-            if not decode_seqs:
-                if not waiting:
-                    break
-                continue
-
-            if profile:
-                _dc_sched_time += time.perf_counter() - _t_sched
-                _dc_bs_counts.append(len(decode_seqs))
-                _t_call = time.perf_counter()
-
-            if use_greedy:
-                gpu_result = self.model_runner.call_decode_greedy(decode_seqs)
-                if profile:
-                    _dc_call_time += time.perf_counter() - _t_call
-                    _t_tolist = time.perf_counter()
-                if gpu_result is not None:
-                    token_ids = gpu_result.tolist()
-                    if profile:
-                        _dc_tolist_time += time.perf_counter() - _t_tolist
-                        _t_post = time.perf_counter()
-                    finished_set = set()
-                    for seq, tid in zip(decode_seqs, token_ids):
-                        seq.append_token(tid)
-                        done = len(seq.generated_ids) >= seq.max_tokens
-                        if not seq.ignore_eos:
-                            done = done or tid == eos
-                        if done:
-                            seq.status = SeqStatus.FINISHED
-                            finished_set.add(id(seq))
-                            bm.deallocate(seq)
-                    if finished_set:
-                        running = deque(s for s in running if id(s) not in finished_set)
-                    if profile:
-                        _dc_post_time += time.perf_counter() - _t_post
-                elif profile:
-                    _dc_tolist_time += time.perf_counter() - _t_tolist
-                    _dc_post_time += 0.0
+                    self._process_prefill_logits(
+                        logits, prefill_seqs, prefill_chunk_sizes,
+                        sp_list[0], eos, collect_logits, seq_logits,
+                        running, prefilling, bm, block_size,
+                        finish_seq=_finish_seq,
+                    )
             else:
-                result = self.model_runner.call("run", decode_seqs, False)
-                if profile:
-                    _dc_call_time += time.perf_counter() - _t_call
-                    _t_tolist = time.perf_counter()
-                    _dc_tolist_time += 0.0
-                    _t_post = time.perf_counter()
-                if result is not None:
+                # Mixed batch: prefill + decode together
+                has_mm = self.is_qwen_vl and any(
+                    s.pixel_values is not None or s.video_pixel_values is not None
+                    for s in prefill_seqs
+                )
+                if has_mm:
+                    vis_cache_map, _ = self._dispatch_vision_encoder(prefill_seqs)
+                    _stripped_pf = self.model_runner._strip_mm_tensors(prefill_seqs)
+                    _stripped_dc = self.model_runner._strip_mm_tensors(decode_seqs)
+                    logits = self.model_runner.call(
+                        "_run_mm_lm", _stripped_pf, prefill_chunk_sizes,
+                        _stripped_dc, vis_cache_map,
+                    )
+                    if _step_profile_active:
+                        torch.cuda.synchronize()
+                        step_profile["mixed_mm_time"] += time.perf_counter() - _spt0
+                elif self.is_whisper:
+                    input_ids_t, positions_t = self.model_runner.prepare_mixed_batch(
+                        prefill_seqs, prefill_chunk_sizes, decode_seqs,
+                    )
+                    self.model_runner._set_cross_attn_context_mixed(
+                        prefill_seqs, prefill_chunk_sizes, decode_seqs,
+                        encoder_seqs)
+                    logits = self.model_runner.run_model(
+                        input_ids_t, positions_t, True,
+                        encoder_outputs=encoder_outputs if encoder_outputs else [],
+                    )
+                    reset_context()
+                else:
+                    logits = self.model_runner.call(
+                        "run_mixed", prefill_seqs, prefill_chunk_sizes, decode_seqs,
+                    )
+                if logits is not None:
+                    pf_logits = logits[:n_pf]
+                    dc_logits = logits[n_pf:]
+
+                    self._process_prefill_logits(
+                        pf_logits, prefill_seqs, prefill_chunk_sizes,
+                        sp_list[0], eos, collect_logits, seq_logits,
+                        running, prefilling, bm, block_size,
+                        finish_seq=_finish_seq,
+                    )
+
                     if collect_logits:
                         for i, seq in enumerate(decode_seqs):
-                            seq_logits[id(seq)].append(result[i:i+1].cpu())
-                    token_ids = self._sample(result, sp_list[0])
+                            seq_logits[id(seq)].append(dc_logits[i:i+1].cpu())
+                    dc_token_ids = self._sample(dc_logits, sp_list[0])
                     finished_set = set()
-                    for seq, tid in zip(decode_seqs, token_ids):
+                    for seq, tid in zip(decode_seqs, dc_token_ids):
                         seq.append_token(tid)
                         done = len(seq.generated_ids) >= seq.max_tokens
                         if not seq.ignore_eos:
                             done = done or tid == eos
                         if done:
-                            seq.status = SeqStatus.FINISHED
+                            _finish_seq(seq)
                             finished_set.add(id(seq))
-                            bm.deallocate(seq)
+                        else:
+                            running.append(seq)
                     if finished_set:
                         running = deque(s for s in running if id(s) not in finished_set)
-                if profile:
-                    _dc_post_time += time.perf_counter() - _t_post
+                else:
+                    running.extend(decode_seqs)
 
-            if profile:
-                _dc_steps += 1
-                _dc_tokens += len(decode_seqs)
+        if pbar is not None:
+            _flush_pbar()
+            pbar.close()
 
-        if profile:
-            self._profile_data = {
-                "prefill_time": _pf_time,
-                "prefill_steps": _pf_steps,
-                "prefill_tokens": _pf_tokens,
-                "decode_time": _dc_time,
-                "decode_steps": _dc_steps,
-                "decode_tokens": _dc_tokens,
-                "decode_sched_time": _dc_sched_time,
-                "decode_call_time": _dc_call_time,
-                "decode_tolist_time": _dc_tolist_time,
-                "decode_post_time": _dc_post_time,
-                "decode_bs_counts": _dc_bs_counts,
-            }
-            self._profile_data["decode_time"] = (
-                _dc_sched_time + _dc_call_time + _dc_tolist_time + _dc_post_time
-            )
-            cp = getattr(self.model_runner, '_call_profile', None)
-            if cp and cp["n_calls"] > 0:
-                self._profile_data["call_detail"] = {
-                    "prepare_ms": cp["prepare"] / cp["n_calls"] * 1000,
-                    "signal_ms": cp["signal"] / cp["n_calls"] * 1000,
-                    "gpu_exec_ms": cp["gpu_exec"] / cp["n_calls"] * 1000,
-                    "n_calls": cp["n_calls"],
-                }
+        if _step_profile_active:
+            sp = step_profile
+            fd = sp.get("fast_decode", 0)
+            fdt = sp.get("fast_decode_tokens", 0)
+            slow = (sp["pure_decode"] + sp["pure_mm_prefill"]
+                    + sp["pure_text_prefill"] + sp["mixed_mm"] + sp["mixed_text"])
+            total = fd + slow
+            print(f"\n[Step Profile] total_steps={total} (fast_decode={fd}, scheduled={slow})")
+            print(f"  fast_decode:       {fd:6d} steps, {fdt:10d} tokens, {sp['decode_time']:.3f}s")
+            print(f"  pure_decode:       {sp['pure_decode']:6d} steps, {sp['decode_tokens']:10d} tokens")
+            print(f"  pure_text_prefill: {sp['pure_text_prefill']:6d} steps, {sp['text_prefill_tokens']:10d} tokens")
+            print(f"  pure_mm_prefill:   {sp['pure_mm_prefill']:6d} steps, {sp['mm_prefill_tokens']:10d} tokens, {sp['mm_prefill_time']:.3f}s")
+            print(f"  mixed_text:        {sp['mixed_text']:6d} steps, pf={sp['mixed_text_pf_tokens']:10d} dc={sp['mixed_text_dc_tokens']:10d}")
+            print(f"  mixed_mm:          {sp['mixed_mm']:6d} steps, pf={sp['mixed_mm_pf_tokens']:10d} dc={sp['mixed_mm_dc_tokens']:10d}, {sp['mixed_mm_time']:.3f}s")
 
         # Return in original order
         return [
@@ -1828,3 +3572,52 @@ class LlamaEngine:
             )
             for i in range(len(prompts))
         ]
+
+    def _process_prefill_logits(
+        self, logits, prefill_seqs, prefill_chunk_sizes,
+        sp, eos, collect_logits, seq_logits,
+        running, prefilling, bm, block_size,
+        finish_seq=None,
+    ):
+        """Handle output from prefill sequences after a forward pass.
+
+        For sequences whose prefill is complete, sample the first decode
+        token. For sequences still mid-prefill, update num_computed_tokens
+        and move them to the prefilling queue.
+        """
+        # Separate seqs into "done prefilling" vs "still prefilling"
+        sample_seqs = []
+        sample_logits = []
+        for i, (seq, chunk) in enumerate(zip(prefill_seqs, prefill_chunk_sizes)):
+            seq.num_computed_tokens += chunk
+            if seq.num_remaining_prefill == 0:
+                # Prefill complete — sample first decode token
+                sample_seqs.append(seq)
+                sample_logits.append(logits[i:i+1])
+            else:
+                # More prefill chunks needed
+                prefilling.append(seq)
+
+        if not sample_seqs:
+            return
+
+        sample_logits_t = torch.cat(sample_logits, dim=0)
+        if collect_logits:
+            for i, seq in enumerate(sample_seqs):
+                seq_logits[id(seq)].append(sample_logits_t[i:i+1].cpu())
+        token_ids = self._sample(sample_logits_t, sp)
+        for seq, tid in zip(sample_seqs, token_ids):
+            seq.append_token(tid)
+            seq.status = SeqStatus.RUNNING
+            done = len(seq.generated_ids) >= seq.max_tokens
+            if not seq.ignore_eos:
+                done = done or tid == eos
+            if done:
+                if finish_seq is not None:
+                    finish_seq(seq)
+                else:
+                    seq.status = SeqStatus.FINISHED
+                    bm.deallocate(seq)
+            else:
+                running.append(seq)
+

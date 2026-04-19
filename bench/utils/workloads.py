@@ -104,11 +104,348 @@ ALL_VLM_WORKLOADS = {
 }
 
 
+# ---------------------------------------------------------------------------
+# Diffusion workloads (image generation)
+# ---------------------------------------------------------------------------
+
+@dataclass(frozen=True)
+class DiffusionModelConfig:
+    num_inference_steps: int
+    guidance_scale: float
+
+FLUX_CONFIG = DiffusionModelConfig(num_inference_steps=28, guidance_scale=3.5)
+SDXL_CONFIG = DiffusionModelConfig(num_inference_steps=50, guidance_scale=5.0)
+
+
+@dataclass(frozen=True)
+class DiffusionThroughputWorkload:
+    name: str
+    height: int
+    width: int
+    batch_size: int
+    num_requests: int = 10
+
+@dataclass(frozen=True)
+class DiffusionLatencyWorkload:
+    name: str
+    height: int
+    width: int
+    batch_size: int = 1
+    num_warmup: int = 2
+    num_iters: int = 5
+
+DIFFUSION_THROUGHPUT_WORKLOADS: list[DiffusionThroughputWorkload] = [
+    DiffusionThroughputWorkload("1024x1024", height=1024, width=1024, batch_size=4, num_requests=10),
+    DiffusionThroughputWorkload("512x512",   height=512,  width=512,  batch_size=8, num_requests=10),
+]
+
+DIFFUSION_LATENCY_WORKLOADS: list[DiffusionLatencyWorkload] = [
+    DiffusionLatencyWorkload("single-1024x1024", height=1024, width=1024),
+    DiffusionLatencyWorkload("single-512x512",   height=512,  width=512),
+]
+
+ALL_DIFFUSION_WORKLOADS = {
+    "throughput": DIFFUSION_THROUGHPUT_WORKLOADS,
+    "latency": DIFFUSION_LATENCY_WORKLOADS,
+}
+
+
+# ---------------------------------------------------------------------------
+# Segmentation workloads (promptable concept segmentation)
+# ---------------------------------------------------------------------------
+
+@dataclass(frozen=True)
+class SegmentationThroughputWorkload:
+    """Workload for segmentation throughput measurement."""
+    name: str
+    resolution: int
+    num_requests: int
+    dataset_name: str
+    dataset_subset: str = ""
+    modality: str = "image"  # "image" or "video"
+
+@dataclass(frozen=True)
+class SegmentationLatencyWorkload:
+    """Workload for segmentation latency measurement."""
+    name: str
+    resolution: int
+    batch_size: int
+    dataset_name: str
+    dataset_subset: str = ""
+    modality: str = "image"
+    num_warmup: int = 3
+    num_iters: int = 10
+
+SEGMENTATION_THROUGHPUT_WORKLOADS: list[SegmentationThroughputWorkload] = [
+    SegmentationThroughputWorkload(
+        "gold-metaclip-nps", resolution=1008, num_requests=500,
+        dataset_name="facebook/SACo-Gold", dataset_subset="metaclip_nps",
+    ),
+    SegmentationThroughputWorkload(
+        "gold-wiki-common", resolution=1008, num_requests=500,
+        dataset_name="facebook/SACo-Gold", dataset_subset="wiki_common",
+    ),
+    SegmentationThroughputWorkload(
+        "gold-crowded", resolution=1008, num_requests=500,
+        dataset_name="facebook/SACo-Gold", dataset_subset="crowded",
+    ),
+    SegmentationThroughputWorkload(
+        "veval-sav-val", resolution=1008, num_requests=100,
+        dataset_name="facebook/SACo-VEval", dataset_subset="sav_val",
+        modality="video",
+    ),
+    SegmentationThroughputWorkload(
+        "veval-yt1b-val", resolution=1008, num_requests=100,
+        dataset_name="facebook/SACo-VEval", dataset_subset="yt1b_val",
+        modality="video",
+    ),
+]
+
+SEGMENTATION_LATENCY_WORKLOADS: list[SegmentationLatencyWorkload] = [
+    SegmentationLatencyWorkload(
+        "single-image-1008", resolution=1008, batch_size=1,
+        dataset_name="facebook/SACo-Gold", dataset_subset="metaclip_nps",
+    ),
+    SegmentationLatencyWorkload(
+        "batch-4-image-1008", resolution=1008, batch_size=4,
+        dataset_name="facebook/SACo-Gold", dataset_subset="metaclip_nps",
+    ),
+    SegmentationLatencyWorkload(
+        "single-video-frame-1008", resolution=1008, batch_size=1,
+        dataset_name="facebook/SACo-VEval", dataset_subset="smartglasses_val",
+        modality="video",
+    ),
+]
+
+@dataclass(frozen=True)
+class SegmentationVideoWorkload:
+    """Workload for multi-frame video segmentation benchmark."""
+    name: str
+    resolution: int
+    num_clips: int
+    frames_per_clip: int
+    dataset_name: str
+    dataset_subset: str = ""
+    text_prompt: str = "objects"
+
+SEGMENTATION_VIDEO_WORKLOADS: list[SegmentationVideoWorkload] = [
+    SegmentationVideoWorkload(
+        "sav-val-video", resolution=1008, num_clips=10, frames_per_clip=16,
+        dataset_name="facebook/SACo-VEval", dataset_subset="sav_val",
+    ),
+    SegmentationVideoWorkload(
+        "smartglasses-val-video", resolution=1008, num_clips=10, frames_per_clip=16,
+        dataset_name="facebook/SACo-VEval", dataset_subset="smartglasses_val",
+    ),
+]
+
+ALL_SEGMENTATION_WORKLOADS = {
+    "throughput": SEGMENTATION_THROUGHPUT_WORKLOADS,
+    "latency": SEGMENTATION_LATENCY_WORKLOADS,
+    "video": SEGMENTATION_VIDEO_WORKLOADS,
+}
+
+
+# ---------------------------------------------------------------------------
+# TTS workloads (text-to-speech, e.g. CosyVoice3)
+# ---------------------------------------------------------------------------
+
+@dataclass(frozen=True)
+class TTSModelConfig:
+    sample_rate: int
+    n_timesteps: int
+
+COSYVOICE3_CONFIG = TTSModelConfig(sample_rate=24000, n_timesteps=10)
+
+
+@dataclass(frozen=True)
+class TTSThroughputWorkload:
+    """TTS throughput workload definition.
+
+    Uses the SEED-TTS-Eval dataset for realistic TTS benchmarking.
+    Each request has a text prompt and a reference audio for voice cloning.
+    """
+    name: str
+    num_requests: int = 100
+    max_text_len: int = 200
+    dataset_name: str = "zhaochenyang20/seed-tts-eval"
+    dataset_split: str = "train"
+
+
+@dataclass(frozen=True)
+class TTSLatencyWorkload:
+    name: str
+    batch_size: int = 1
+    max_text_len: int = 200
+    dataset_name: str = "zhaochenyang20/seed-tts-eval"
+    dataset_split: str = "train"
+    num_warmup: int = 2
+    num_iters: int = 5
+
+
+TTS_THROUGHPUT_WORKLOADS: list[TTSThroughputWorkload] = [
+    TTSThroughputWorkload("tts-short", num_requests=100, max_text_len=50),
+    TTSThroughputWorkload("tts-medium", num_requests=100, max_text_len=200),
+    TTSThroughputWorkload("tts-long", num_requests=50, max_text_len=500),
+]
+
+TTS_LATENCY_WORKLOADS: list[TTSLatencyWorkload] = [
+    TTSLatencyWorkload("single-utterance", batch_size=1, max_text_len=100),
+]
+
+ALL_TTS_WORKLOADS = {
+    "throughput": TTS_THROUGHPUT_WORKLOADS,
+    "latency": TTS_LATENCY_WORKLOADS,
+}
+
+
+# ---------------------------------------------------------------------------
+# Object detection workloads (COCO val2017)
+# ---------------------------------------------------------------------------
+
+@dataclass(frozen=True)
+class DetectionThroughputWorkload:
+    name: str
+    image_size: int
+    num_images: int
+    batch_size: int
+    dataset_name: str = "detection-datasets/coco"
+    dataset_split: str = "val"
+
+@dataclass(frozen=True)
+class DetectionLatencyWorkload:
+    name: str
+    image_size: int
+    batch_size: int
+    dataset_name: str = "detection-datasets/coco"
+    dataset_split: str = "val"
+    num_warmup: int = 3
+    num_iters: int = 20
+
+DETECTION_THROUGHPUT_WORKLOADS: list[DetectionThroughputWorkload] = [
+    DetectionThroughputWorkload("coco-val", image_size=640, num_images=5000, batch_size=32),
+]
+
+DETECTION_LATENCY_WORKLOADS: list[DetectionLatencyWorkload] = [
+    DetectionLatencyWorkload("single-image", image_size=640, batch_size=1),
+    DetectionLatencyWorkload("batch-4", image_size=640, batch_size=4),
+]
+
+ALL_DETECTION_WORKLOADS = {
+    "throughput": DETECTION_THROUGHPUT_WORKLOADS,
+    "latency": DETECTION_LATENCY_WORKLOADS,
+}
+
+
 def get_max_seq_len() -> int:
-    """Return the maximum sequence length across all standardized workloads."""
+    """Return the maximum sequence length across all standardized LLM workloads."""
     max_len = 0
     for w in THROUGHPUT_WORKLOADS:
         max_len = max(max_len, w.input_len + w.output_len)
     for w in LATENCY_WORKLOADS:
         max_len = max(max_len, w.input_len + w.output_len)
     return max_len
+
+
+# ---------------------------------------------------------------------------
+# Video diffusion workloads (text-to-video generation)
+# ---------------------------------------------------------------------------
+
+@dataclass(frozen=True)
+class VideoDiffusionModelConfig:
+    num_inference_steps: int
+    guidance_scale: float
+
+HUNYUAN_VIDEO_CONFIG = VideoDiffusionModelConfig(
+    num_inference_steps=30, guidance_scale=6.0,
+)
+
+@dataclass(frozen=True)
+class VideoDiffusionThroughputWorkload:
+    name: str
+    height: int
+    width: int
+    num_frames: int
+    num_prompts: int
+
+@dataclass(frozen=True)
+class VideoDiffusionLatencyWorkload:
+    name: str
+    height: int
+    width: int
+    num_frames: int
+    num_warmup: int = 2
+    num_iters: int = 5
+
+VIDEO_DIFFUSION_THROUGHPUT_WORKLOADS: list[VideoDiffusionThroughputWorkload] = [
+    VideoDiffusionThroughputWorkload(
+        "480p-short", height=480, width=832, num_frames=25, num_prompts=16,
+    ),
+    VideoDiffusionThroughputWorkload(
+        "480p-medium", height=480, width=832, num_frames=49, num_prompts=8,
+    ),
+]
+
+VIDEO_DIFFUSION_LATENCY_WORKLOADS: list[VideoDiffusionLatencyWorkload] = [
+    VideoDiffusionLatencyWorkload(
+        "single-480p-short", height=480, width=832, num_frames=25,
+    ),
+    VideoDiffusionLatencyWorkload(
+        "single-480p-medium", height=480, width=832, num_frames=49,
+    ),
+]
+
+ALL_VIDEO_DIFFUSION_WORKLOADS = {
+    "throughput": VIDEO_DIFFUSION_THROUGHPUT_WORKLOADS,
+    "latency": VIDEO_DIFFUSION_LATENCY_WORKLOADS,
+}
+
+
+# ---------------------------------------------------------------------------
+# Vision encoder workloads (pure image feature extraction, e.g. SigLIP-2, DINOv3)
+# ---------------------------------------------------------------------------
+
+@dataclass(frozen=True)
+class VisionEncoderThroughputWorkload:
+    """Throughput workload for vision encoders.
+
+    Processes num_images real images from dataset_name at the given resolution
+    in fixed batch_size batches, measuring images/sec.
+    """
+    name: str
+    resolution: int
+    num_images: int
+    batch_size: int
+    dataset_name: str = "ILSVRC/imagenet-1k"
+    dataset_split: str = "validation"
+
+@dataclass(frozen=True)
+class VisionEncoderLatencyWorkload:
+    """Latency workload for vision encoders.
+
+    Repeated inference on real images from dataset_name at the model's default
+    resolution, measuring median and P99 latency.
+    """
+    name: str
+    resolution: int
+    batch_size: int
+    dataset_name: str = "ILSVRC/imagenet-1k"
+    dataset_split: str = "validation"
+    num_warmup: int = 3
+    num_iters: int = 10
+
+
+VISION_ENCODER_THROUGHPUT_WORKLOADS: list[VisionEncoderThroughputWorkload] = [
+    VisionEncoderThroughputWorkload("default-res", resolution=0, num_images=5000, batch_size=32),
+    VisionEncoderThroughputWorkload("high-res",    resolution=512, num_images=2500, batch_size=16),
+]
+
+VISION_ENCODER_LATENCY_WORKLOADS: list[VisionEncoderLatencyWorkload] = [
+    VisionEncoderLatencyWorkload("single-image", resolution=0, batch_size=1, num_warmup=5, num_iters=30),
+    VisionEncoderLatencyWorkload("batch-8",      resolution=0, batch_size=8, num_warmup=5, num_iters=30),
+]
+
+ALL_VISION_ENCODER_WORKLOADS = {
+    "throughput": VISION_ENCODER_THROUGHPUT_WORKLOADS,
+    "latency": VISION_ENCODER_LATENCY_WORKLOADS,
+}

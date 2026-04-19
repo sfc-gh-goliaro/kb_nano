@@ -59,20 +59,22 @@ class Qwen2VLConfig:
     @classmethod
     def from_pretrained(cls, model_name: str) -> "Qwen2VLConfig":
         hf = AutoConfig.from_pretrained(model_name)
+        text = getattr(hf, "text_config", hf)
         vc = hf.vision_config
-        rope = getattr(hf, "rope_scaling", {}) or {}
+        rope = getattr(text, "rope_scaling", None) or getattr(text, "rope_parameters", None) or {}
+        rope_theta = getattr(text, "rope_theta", None) or rope.get("rope_theta", 1000000.0)
         return cls(
-            hidden_size=hf.hidden_size,
-            intermediate_size=hf.intermediate_size,
-            num_hidden_layers=hf.num_hidden_layers,
-            num_attention_heads=hf.num_attention_heads,
-            num_key_value_heads=hf.num_key_value_heads,
-            head_dim=getattr(hf, "head_dim", hf.hidden_size // hf.num_attention_heads),
-            vocab_size=hf.vocab_size,
-            max_position_embeddings=hf.max_position_embeddings,
-            rms_norm_eps=hf.rms_norm_eps,
-            rope_theta=hf.rope_theta,
-            tie_word_embeddings=hf.tie_word_embeddings,
+            hidden_size=text.hidden_size,
+            intermediate_size=text.intermediate_size,
+            num_hidden_layers=text.num_hidden_layers,
+            num_attention_heads=text.num_attention_heads,
+            num_key_value_heads=text.num_key_value_heads,
+            head_dim=getattr(text, "head_dim", text.hidden_size // text.num_attention_heads),
+            vocab_size=text.vocab_size,
+            max_position_embeddings=text.max_position_embeddings,
+            rms_norm_eps=text.rms_norm_eps,
+            rope_theta=rope_theta,
+            tie_word_embeddings=getattr(text, "tie_word_embeddings", getattr(hf, "tie_word_embeddings", False)),
             mrope_section=rope.get("mrope_section", [16, 24, 24]),
             mrope_interleaved=rope.get("mrope_interleaved", False),
             image_token_id=hf.image_token_id,

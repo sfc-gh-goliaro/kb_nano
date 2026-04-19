@@ -1,20 +1,26 @@
 """Standalone BitNet b1.58 model implementation.
 
-Matches the Microsoft BitNet-b1.58-2B-4T architecture:
-    - GQA (20 query heads, 5 KV heads, head_dim=128)
-    - RoPE (theta=500000)
-    - Squared ReLU activation (not SwiGLU)
-    - Per-token int8 activation quantization in all projections
-    - Attention and FFN sub-norms
-    - Tied embeddings (lm_head shares weight with embed_tokens)
+Targets ``microsoft/bitnet-b1.58-2B-4T`` with the "Native 1.58-bit weights
+and 8-bit activations" (W1.58A8) format:
 
-Weight names match HuggingFace checkpoint convention:
+    * GQA attention (20 query heads / 5 KV heads, head_dim=128)
+    * NeoX-style RoPE (theta=500000, max_position=4096)
+    * Squared-ReLU gated MLP (no SwiGLU)
+    * Per-token int8 activation quantization in every projection
+      (see ``L1/bitnet_linear.py``)
+    * Per-tensor bf16 ``weight_scale`` recovered from packed uint8 weights
+    * Attention and FFN sub-RMSNorms
+    * Tied embeddings (lm_head shares weight with embed_tokens)
+
+Weight names follow the HuggingFace checkpoint convention so that the shared
+weight loader can populate them directly:
+
     model.embed_tokens.weight
     model.layers.{i}.input_layernorm.weight
-    model.layers.{i}.self_attn.{q,k,v,o}_proj.weight
+    model.layers.{i}.self_attn.{q,k,v,o}_proj.weight (+ .weight_scale)
     model.layers.{i}.self_attn.attn_sub_norm.weight
     model.layers.{i}.post_attention_layernorm.weight
-    model.layers.{i}.mlp.{gate,up,down}_proj.weight
+    model.layers.{i}.mlp.{gate,up,down}_proj.weight  (+ .weight_scale)
     model.layers.{i}.mlp.ffn_sub_norm.weight
     model.norm.weight
     lm_head.weight  (tied with model.embed_tokens.weight)
@@ -22,24 +28,26 @@ Weight names match HuggingFace checkpoint convention:
 
 from __future__ import annotations
 
-import json
 from dataclasses import dataclass
-from pathlib import Path
 
 import torch
 import torch.nn as nn
+from transformers import AutoConfig
 
-from ..L3.bitnet_decoder import BitNetBlock
+from ..L1.rms_norm import RMSNorm
+from ..L1.rotary_emb import RotaryEmbedding
+from ..L2.parallel_embedding import ParallelLMHead, VocabParallelEmbedding
+from ..L3.bitnet_decoder import BitNetDecoderLayer
 
 
 @dataclass
 class BitNetConfig:
     hidden_size: int = 2560
+    intermediate_size: int = 6912
     num_hidden_layers: int = 30
     num_attention_heads: int = 20
     num_key_value_heads: int = 5
     head_dim: int = 128
-    intermediate_size: int = 6912
     vocab_size: int = 128256
     max_position_embeddings: int = 4096
     rms_norm_eps: float = 1e-5
@@ -48,47 +56,85 @@ class BitNetConfig:
     dtype: torch.dtype = torch.bfloat16
 
     @classmethod
-    def from_dict(cls, data: dict) -> "BitNetConfig":
-        keys = {f.name for f in cls.__dataclass_fields__.values() if f.name != "dtype"}
-        kwargs = {k: data[k] for k in keys if k in data}
-        return cls(**kwargs)
-
-    @classmethod
-    def from_pretrained(cls, model_path: str | Path) -> "BitNetConfig":
-        path = Path(model_path)
-        config_path = path / "config.json" if path.is_dir() else path
-        with config_path.open("r", encoding="utf-8") as f:
-            data = json.load(f)
-        return cls.from_dict(data)
+    def from_pretrained(cls, model_name: str) -> "BitNetConfig":
+        # BitNet ships an ``auto_map`` pointing at remote .py files that
+        # are not actually present in the repo, so loading with
+        # ``trust_remote_code=True`` fails.  ``model_type: "bitnet"`` is
+        # registered natively in transformers, so loading without
+        # ``trust_remote_code`` works on recent transformers releases.
+        try:
+            hf = AutoConfig.from_pretrained(model_name, trust_remote_code=False)
+        except (KeyError, ValueError):
+            hf = AutoConfig.from_pretrained(model_name, trust_remote_code=True)
+        head_dim = getattr(hf, "head_dim", None)
+        if head_dim is None:
+            head_dim = hf.hidden_size // hf.num_attention_heads
+        return cls(
+            hidden_size=hf.hidden_size,
+            intermediate_size=hf.intermediate_size,
+            num_hidden_layers=hf.num_hidden_layers,
+            num_attention_heads=hf.num_attention_heads,
+            num_key_value_heads=hf.num_key_value_heads,
+            head_dim=head_dim,
+            vocab_size=hf.vocab_size,
+            max_position_embeddings=hf.max_position_embeddings,
+            rms_norm_eps=hf.rms_norm_eps,
+            rope_theta=hf.rope_theta,
+            tie_word_embeddings=getattr(hf, "tie_word_embeddings", True),
+        )
 
 
 class BitNetModel(nn.Module):
     def __init__(self, config: BitNetConfig):
         super().__init__()
-        self.embed_tokens = nn.Embedding(config.vocab_size, config.hidden_size)
-        self.layers = nn.ModuleList(
-            [BitNetBlock(config, layer_idx=i) for i in range(config.num_hidden_layers)]
+        self.embed_tokens = VocabParallelEmbedding(config.vocab_size, config.hidden_size)
+        self.rotary_emb = RotaryEmbedding(
+            config.head_dim, config.max_position_embeddings, config.rope_theta,
         )
-        self.norm = nn.RMSNorm(config.hidden_size, eps=config.rms_norm_eps)
+        self.layers = nn.ModuleList([
+            BitNetDecoderLayer(config, rotary_emb=self.rotary_emb)
+            for _ in range(config.num_hidden_layers)
+        ])
+        self.norm = RMSNorm(config.hidden_size, eps=config.rms_norm_eps)
 
-    def forward(self, input_ids: torch.Tensor, positions=None) -> torch.Tensor:
-        hidden_states = self.embed_tokens(input_ids)
+    def forward(self, input_ids: torch.Tensor,
+                positions: torch.Tensor,
+                inputs_embeds: torch.Tensor | None = None) -> torch.Tensor:
+        if inputs_embeds is not None:
+            hidden_states = inputs_embeds
+        else:
+            hidden_states = self.embed_tokens(input_ids)
+        residual = None
         for layer in self.layers:
-            hidden_states = layer(hidden_states)
-        return self.norm(hidden_states)
+            hidden_states, residual = layer(positions, hidden_states, residual)
+        hidden_states, _ = self.norm(hidden_states, residual)
+        return hidden_states
 
 
 class BitNetForCausalLM(nn.Module):
+    # BitNet stores attention projections separately (q_proj, k_proj, v_proj)
+    # rather than as a fused qkv_proj.  No packed mapping is required.
+    packed_modules_mapping: dict = {}
+
     def __init__(self, config: BitNetConfig):
         super().__init__()
         self.config = config
         self.model = BitNetModel(config)
-        self.lm_head = nn.Linear(config.hidden_size, config.vocab_size, bias=False)
+        self.lm_head = ParallelLMHead(config.vocab_size, config.hidden_size)
         if config.tie_word_embeddings:
-            self.lm_head.weight = self.model.embed_tokens.weight
+            # ParallelLMHead inherits from VocabParallelEmbedding, so the
+            # underlying nn.Embedding parameter must be shared.
+            self.lm_head.embedding_op.emb.weight = (
+                self.model.embed_tokens.embedding_op.emb.weight
+            )
 
-    def forward(self, input_ids: torch.Tensor, positions=None) -> torch.Tensor:
-        return self.model(input_ids, positions)
+    def forward(self, input_ids: torch.Tensor, positions: torch.Tensor,
+                inputs_embeds: torch.Tensor | None = None) -> torch.Tensor:
+        return self.model(input_ids, positions, inputs_embeds=inputs_embeds)
+
+    def forward_with_lm_proj(self, input_ids, positions):
+        hidden_states = self.model(input_ids, positions)
+        return self.lm_head.project(hidden_states)
 
     def compute_logits(self, hidden_states: torch.Tensor) -> torch.Tensor:
         logits = self.lm_head(hidden_states)
@@ -96,5 +142,11 @@ class BitNetForCausalLM(nn.Module):
             logits = logits.float()
         return logits
 
-    def compute_logits_decode(self, hidden_states: torch.Tensor) -> torch.Tensor:
-        return self.compute_logits(hidden_states)
+    def compute_logits_decode(self, partial_logits: torch.Tensor) -> torch.Tensor:
+        logits = self.lm_head.gather_logits(partial_logits)
+        if logits is not None:
+            logits = logits.float()
+        return logits
+
+    def greedy_sample_decode(self, partial_logits: torch.Tensor):
+        return self.lm_head.gather_greedy(partial_logits.float())

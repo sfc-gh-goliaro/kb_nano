@@ -36,6 +36,9 @@ def get_custom_ar():
 # ---------------------------------------------------------------------------
 class AllReduce(nn.Module):
     def forward(self, tensor):
+        if torch.compiler.is_compiling():
+            dist.all_reduce(tensor)
+            return tensor
         ar = _CUSTOM_AR
         if ar is not None:
             out = ar.custom_all_reduce(tensor)
