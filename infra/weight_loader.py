@@ -31,6 +31,7 @@ except ImportError:
 from concurrent.futures import ThreadPoolExecutor
 
 from .tp import _tp_size
+from ..tasks.baseline.L4.bitnet import BitNetConfig, BitNetForCausalLM
 from ..tasks.baseline.L4.llama import LlamaConfig, LlamaForCausalLM
 from ..tasks.baseline.L4.llama4 import Llama4Config, Llama4ForCausalLM
 from ..tasks.baseline.L4.mixtral import MixtralConfig, MixtralForCausalLM
@@ -1103,9 +1104,11 @@ def _detect_model_type(model_name: str) -> str:
     try:
         hf_config = AutoConfig.from_pretrained(model_name, trust_remote_code=True)
         model_type = getattr(hf_config, "model_type", "llama")
-    except ValueError:
+    except (ValueError, OSError):
         # DeepSeek-V3.2 ships a custom config class not registered with
-        # transformers; fall back to reading config.json directly.
+        # transformers; BitNet b1.58 ships an ``auto_map`` pointing at
+        # files that don't exist in the repo (model_type is registered
+        # natively).  In both cases reading config.json directly works.
         model_type = _load_config_dict(model_name).get("model_type", "llama")
     if model_type == "deepseek_v32":
         model_type = "deepseek_v3"
@@ -1116,7 +1119,7 @@ def _detect_quant_config(model_name: str) -> dict | None:
     """Detect FP8 quantization config from HuggingFace config."""
     try:
         hf_config = AutoConfig.from_pretrained(model_name, trust_remote_code=True)
-    except ValueError:
+    except (ValueError, OSError):
         from types import SimpleNamespace
         hf_config = SimpleNamespace(**_load_config_dict(model_name))
     qc = getattr(hf_config, "quantization_config", None)
@@ -1202,6 +1205,13 @@ def load_model(
         print(f"  Allocating DeepSeek V3.2 model ({config.n_routed_experts} experts, "
               f"top-{config.num_experts_per_tok}, DSA topk={config.index_topk})...")
         model = DeepSeekV3ForCausalLM(config, quant_config=quant_config)
+    elif model_type == "bitnet":
+        config = BitNetConfig.from_pretrained(model_name)
+        config.dtype = dtype
+        print(f"  Allocating BitNet b1.58 model "
+              f"({config.num_hidden_layers}L, hidden={config.hidden_size}, "
+              f"W1.58A8)...")
+        model = BitNetForCausalLM(config)
     else:
         config = LlamaConfig.from_pretrained(model_name)
         config.dtype = dtype
@@ -1269,8 +1279,168 @@ def load_model(
     if model_type == "deepseek_v3" and quant_config is None:
         _compute_mla_absorbed_weights(model)
 
+    if model_type == "bitnet":
+        # Materialize bf16 fake-quant weight per BitLinear (mirrors SOTA's
+        # ``model_state_fp16.pt``).  ``ternary * scale`` derived once
+        # on-device from the already-loaded packed-int2 weight + scale.
+        from ..tasks.baseline.L1.bitnet_linear import BitLinear, BitLinearMerged
+        n = 0
+        for mod in model.modules():
+            if isinstance(mod, (BitLinear, BitLinearMerged)):
+                mod.process_weights_after_loading()
+                n += 1
+        print(f"  Materialized bf16 fake-quant weights for {n} BitLinear layers.",
+              flush=True)
+        if os.environ.get("KB_BITNET_BF16_ALIGN", "1") != "0":
+            _override_bitnet_bf16_with_master(model, model_name, device)
+
     model.eval()
     return model, config
+
+
+# Mapping from int2-release HF id -> matching BF16 master release id.
+# The BF16 release contains the same model with full-precision master
+# weights (used by SOTA's ``convert_safetensors`` + ``convert_checkpoint``
+# pipeline to produce ``model_state_fp16.pt``).  Both releases come from
+# the same QAT run but differ in their final-quantization scale, so the
+# int2 weights don't round-trip back to the BF16 master values bit-exactly.
+_BITNET_INT2_TO_BF16_MASTER: dict = {
+    "microsoft/bitnet-b1.58-2B-4T": "microsoft/bitnet-b1.58-2B-4T-bf16",
+}
+
+
+def _override_bitnet_bf16_with_master(model, model_name: str,
+                                      device: torch.device) -> None:
+    """Re-derive ``bf16_weight`` buffers from the BF16 master release.
+
+    SOTA's prefill weights (``model_state_fp16.pt``) are produced by
+    applying ``quant_weight_fp16(w) = (w*s).round().clamp(-1,1) / s``
+    (``s = 1/|w|.mean().clamp(min=1e-5)``) to the BF16 master weights of
+    ``microsoft/bitnet-b1.58-2B-4T-bf16``.  The same formula on
+    ``unpack(int2_release) * weight_scale`` does *not* round-trip to those
+    bf16 values bit-exactly — the two HF releases were quantized with
+    slightly different scales (~1-22% of ternary positions disagree per
+    tensor between the two), which compounds across 30 layers and flips
+    ~80% of greedy-decode argmaxes.
+
+    By auto-fetching the BF16 master release alongside the int2 release
+    and re-quantizing it via SOTA's exact formula, we make every
+    ``BitLinear`` in the prefill path bit-identical to SOTA at the layer
+    level.  The decode path still uses HF's int2 packed weights (unmodified).
+
+    No-op for BitNet variants that don't have a published BF16 master
+    release (the int2-derived bf16_weight from
+    ``process_weights_after_loading`` is then the best we can do).
+    """
+    bf16_repo = _BITNET_INT2_TO_BF16_MASTER.get(model_name)
+    if bf16_repo is None:
+        print(f"  No BF16 master release registered for {model_name}; "
+              f"keeping int2-derived bf16 fake-quant weights "
+              f"(prefill alignment may drift).", flush=True)
+        return
+
+    from ..tasks.baseline.L1.bitnet_linear import BitLinear, BitLinearMerged
+    from ..tasks.baseline.L1.bitnet_int8xint2_linear import (
+        repack_ternary_kn, VALUES_PER_BYTE,
+    )
+
+    print(f"  Auto-fetching BF16 master release {bf16_repo} for "
+          f"bit-exact alignment with SOTA (prefill + decode)...", flush=True)
+    try:
+        bf16_path = download_model(bf16_repo)
+    except Exception as exc:
+        print(f"  WARNING: failed to fetch {bf16_repo} ({exc}); keeping "
+              f"int2-derived bf16 fake-quant weights.", flush=True)
+        return
+
+    # Stream tensors from disk one safetensors file at a time to avoid
+    # holding the entire 5GB BF16 master in CPU memory.  We collect just
+    # the names we need (every ``*_proj.weight``) into a name->path
+    # index, then open each file once per layer it contributes to.
+    sf_files = sorted(glob(os.path.join(bf16_path, "*.safetensors")))
+    if not sf_files:
+        print(f"  WARNING: no .safetensors files in {bf16_path}; "
+              f"keeping int2-derived bf16 weights.", flush=True)
+        return
+
+    name_to_file: dict = {}
+    for sf_file in sf_files:
+        with safe_open(sf_file, "pt", "cpu") as f:
+            for k in f.keys():
+                name_to_file[k] = sf_file
+
+    def quant_weight_int8_and_fp16(w: torch.Tensor):
+        """Bit-for-bit identical to SOTA's ``quant_weight_int8`` and
+        ``quant_weight_fp16`` (``vllm_repo/BitNet/gpu/convert_checkpoint.py``).
+        Returns ``(ternary_int8, scale_bf16, fake_quant_bf16)`` for one shard,
+        all on the same device as ``w`` (which is bf16).
+        """
+        s = 1.0 / w.abs().mean().clamp_(min=1e-5)
+        ternary = (w * s).round().clamp(-1, 1)
+        return (
+            ternary.to(torch.int8),
+            (1.0 / s).to(torch.bfloat16).reshape(1),  # SOTA returns shape (1,)
+            ternary / s,                              # fake-quant bf16 weight
+        )
+
+    def _load_shard(shard_key: str) -> torch.Tensor:
+        file_path = name_to_file.get(shard_key)
+        if file_path is None:
+            raise KeyError(
+                f"BF16 master release {bf16_repo} is missing "
+                f"{shard_key}; cannot align weights")
+        with safe_open(file_path, "pt", "cpu") as f:
+            return f.get_tensor(shard_key).to(device=device,
+                                              dtype=torch.bfloat16)
+
+    n_merged, n_single = 0, 0
+    for mod_name, mod in model.named_modules():
+        if isinstance(mod, BitLinearMerged):
+            attn_match = re.match(r"(.+)\.qkv_proj$", mod_name)
+            mlp_match = re.match(r"(.+)\.gate_up_proj$", mod_name)
+            if attn_match:
+                base = attn_match.group(1)
+                shards = [f"{base}.q_proj.weight",
+                          f"{base}.k_proj.weight",
+                          f"{base}.v_proj.weight"]
+            elif mlp_match:
+                base = mlp_match.group(1)
+                shards = [f"{base}.gate_proj.weight",
+                          f"{base}.up_proj.weight"]
+            else:
+                continue
+            ternary_parts, fake_parts, scale_parts = [], [], []
+            for shard_key in shards:
+                w = _load_shard(shard_key)
+                t_int8, s_bf16, fq_bf16 = quant_weight_int8_and_fp16(w)
+                ternary_parts.append(t_int8)
+                fake_parts.append(fq_bf16)
+                # kb-nano stores per-row scale across the shard's rows;
+                # SOTA stores a single scalar per shard.  Broadcast the
+                # SOTA scalar across the matching number of rows so the
+                # int8xint2 GEMM kernel sees the right per-row dequant.
+                scale_parts.append(s_bf16.expand(t_int8.shape[0]).contiguous())
+            ternary = torch.cat(ternary_parts, dim=0)
+            mod.weight.data.copy_(repack_ternary_kn(ternary))
+            mod.weight_scale.data.copy_(torch.cat(scale_parts, dim=0))
+            mod.register_buffer(
+                "bf16_weight",
+                torch.cat(fake_parts, dim=0).contiguous(),
+                persistent=False,
+            )
+            n_merged += 1
+        elif isinstance(mod, BitLinear):
+            shard_key = f"{mod_name}.weight"
+            w = _load_shard(shard_key)
+            t_int8, s_bf16, fq_bf16 = quant_weight_int8_and_fp16(w)
+            mod.weight.data.copy_(repack_ternary_kn(t_int8))
+            mod.weight_scale.data.fill_(float(s_bf16.item()))
+            mod.register_buffer("bf16_weight", fq_bf16.contiguous(),
+                                persistent=False)
+            n_single += 1
+    print(f"  Bit-exact int8 + bf16 weights re-materialized from BF16 "
+          f"master: {n_merged} merged + {n_single} single = "
+          f"{n_merged + n_single} BitLinear layers.", flush=True)
 
 
 def _compute_mla_absorbed_weights(model: torch.nn.Module) -> None:

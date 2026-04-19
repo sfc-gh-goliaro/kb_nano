@@ -41,6 +41,7 @@ _KB_ROOT = KB_ROOT
 _CANDIDATE_DIR = CANDIDATE_DIR
 
 _L4_MODEL_KEYS: dict[str, str] = {
+    "bitnet": "bitnet",
     "gpt_oss": "gpt_oss",
     "llama": "llama31",
     "llama4": "llama4",

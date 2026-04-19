@@ -1,6 +1,6 @@
 # kb-nano
 
-A standalone, high-performance inference engine supporting **LLMs** (Llama 3.1, Llama 4, Mixtral-8x7B, DeepSeek V3.2, GPT-OSS, Qwen2-VL, Qwen3-VL), **diffusion models** (FLUX.1-dev, SDXL, HunyuanVideo-1.5), **detection models** (YOLOv10, RTDetrV2), **vision encoders** (SigLIP-2, DINOv3, SwinV2), **segmentation models** (SAM3.1), **protein structure prediction** (OpenFold3), audio models (Whisper), and **TTS models** (CosyVoice3) with tensor parallelism and FP8 quantization. No vLLM dependency at runtime — just PyTorch, Triton, and Flash Attention.
+A standalone, high-performance inference engine supporting **LLMs** (Llama 3.1, Llama 4, Mixtral-8x7B, DeepSeek V3.2, GPT-OSS, BitNet b1.58, Qwen2-VL, Qwen3-VL), **diffusion models** (FLUX.1-dev, SDXL, HunyuanVideo-1.5), **detection models** (YOLOv10, RTDetrV2), **vision encoders** (SigLIP-2, DINOv3, SwinV2), **segmentation models** (SAM3.1), **protein structure prediction** (OpenFold3), audio models (Whisper), and **TTS models** (CosyVoice3) with tensor parallelism and FP8 quantization. No vLLM dependency at runtime — just PyTorch, Triton, and Flash Attention.
 
 ## Features
 
@@ -9,6 +9,7 @@ A standalone, high-performance inference engine supporting **LLMs** (Llama 3.1, 
 - **Mixtral-8x7B** with fused Triton MoE grouped-GEMM kernels
 - **DeepSeek V3.2** with MLA (Multi-head Latent Attention), 256-expert MoE via DeepGEMM FP8, DSA (DeepSeek Sparse Attention), and YARN RoPE — currently **0.78–0.90× of vLLM** throughput on 8×H200 (gap due to kernel-launch overhead, GEMM kernel selection, and AllReduce+RMSNorm fusion)
 - **GPT-OSS** (20B, 120B) MXFP4-quantized MoE with native Triton inference, YaRN RoPE, attention sinks, and sliding window
+- **BitNet b1.58 2B** (`microsoft/bitnet-b1.58-2B-4T`) native **W1.58A8** inference (1.58-bit ternary weights × int8 activations) with a custom Triton `int8 × packed-int2` GEMM, fused QKV / gate-up `BitLinearMerged` projections, squared-ReLU gated FFN, and `attn_sub_norm` / `ffn_sub_norm` placement matching the SOTA `vllm_repo/BitNet` architecture
 - **FLUX.1-dev** diffusion transformer (text-to-image) with Flash Attention
 - **SDXL** (Stable Diffusion XL) UNet-based text-to-image with dual CLIP text encoders
 - **HunyuanVideo-1.5** 3D video diffusion transformer (text-to-video) with dual-stream joint attention, M-RoPE, and Qwen2.5-VL text encoder
@@ -119,6 +120,12 @@ python tests/bench_vllm.py \
 
 # Whisper speech-to-text
 python tests/bench_vllm.py --model openai/whisper-large-v3
+
+# BitNet b1.58 (W1.58A8 native int8 inference) vs Microsoft BitNet GPU lib
+# (requires building the official CUDA kernel + converting the checkpoint -
+#  see tests/bench_microsoft_bitnet.py docstring for the one-time setup)
+BITNET_REPO=/path/to/microsoft/BitNet python tests/bench_microsoft_bitnet.py
+python tests/bench_microsoft_bitnet.py --skip-sota  # kb-nano only
 
 # Bench module tests (unit tests + GPU integration)
 python tests/test_bench.py
@@ -509,6 +516,47 @@ Latency (128 output tokens, 5 iterations):
 | gpt-oss-120b | 2 | fixed-batch-32 | 32 | 1.331s | 1.394s | 0.33 | 0.34 | 0.95x |
 
 Both models are at or above vLLM throughput across all scenarios (20B: 1.00–1.04x, 120B: 1.02–1.05x). Single-request latency trails vLLM (0.83–0.93x) since vLLM benefits from `torch.compile`/Inductor fusions at small batch sizes, while batched latency is on par. The lower token match rate for the 120B model is expected: with 128 experts and top-4 routing, small numerical differences in router logits cause different expert selections, which cascade into divergent outputs. The 20B model (32 experts) shows higher match rates (~86–91%).
+
+### BitNet b1.58 2B (W1.58A8)
+
+`microsoft/bitnet-b1.58-2B-4T` runs in its native ternary-weight × int8-activation regime via a custom Triton `int8 × packed-int2` GEMM kernel (`tasks/baseline/L1/bitnet_int8xint2_linear.py`). The HuggingFace checkpoint stores ternary weights packed 4-per-`uint8` along the output axis; we re-pack to KN-layout (`out, in//4`) at load time to match the kernel's tile layout. QKV and gate/up projections are fused into single `BitLinearMerged` calls, the MLP uses a fused squared-ReLU + multiply L1 primitive (`SquaredReluAndMul`), and `attn_sub_norm` / `ffn_sub_norm` RMSNorms are placed inside attention/MLP blocks per the SOTA `vllm_repo/BitNet` architecture. SOTA reference is the official **Microsoft BitNet GPU library** (`vllm_repo/BitNet/gpu`, custom W2A8 CUDA kernel + CUDA-graph batched decode); HuggingFace `transformers` does *not* run this model in its native quantized format and is roughly 5× slower than either implementation, so it is not used as a reference.
+
+Run `tests/bench_microsoft_bitnet.py` to reproduce. 1000 sequences per scenario, `temperature=0`, `ignore_eos=True`, `enforce_eager=True`. The Microsoft GPU library hard-pins (batch size, prompt length, decode length) at CUDA-graph capture time, so the SOTA worker rebuilds the engine per scenario and processes prompts in `gen_bsz=32` chunks (the largest that fits the prefill activation in 140 GB).
+
+**Hardware: NVIDIA H200**
+
+Throughput:
+
+| Model | TP | Scenario | Input/Output | Microsoft BitNet GPU (tok/s) | Ours (tok/s) | Ratio | Avg Match Tokens |
+| --- | --- | --- | --- | --- | --- | --- | --- |
+| BitNet-b1.58-2B-4T | 1 | prefill-heavy | 1024/512  | 27,964 | 38,668 | **1.38x** | 31.9/512 |
+| BitNet-b1.58-2B-4T | 1 | balanced      |  512/512  | 23,122 | 33,003 | **1.43x** | 41.6/512 |
+| BitNet-b1.58-2B-4T | 1 | decode-heavy  |  512/1024 | 18,490 | 24,658 | **1.33x** | 82.8/1024 |
+
+kb-nano is **1.33–1.43× faster than the Microsoft BitNet GPU library** across all three scenarios. Three components drive this: (1) a fused Triton `act_quant_int8` kernel that does per-token absmax + scale + round-to-int8 in a single launch with no fp32 intermediate (the eager-PyTorch implementation was 4–19× slower because it dispatched 4–5 separate kernels and an fp32-promotion copy); (2) hand-tuned tile shapes per `M` regime in the int8×int2 GEMM (`BLOCK_K=256` with 4 warps for decode, `BLOCK_M=64,BLOCK_N=256,8 warps` for prefill, picked from H200 microbench); (3) **hybrid bf16-prefill + int8-decode dispatch** that mirrors SOTA's two-model architecture — every `BitLinear` carries a derived bf16 fake-quant weight buffer (`ternary * scale`, materialized once at load time) and dispatches to `F.linear(quant_input(x), bf16_weight)` for prefill (large `M`, `is_prefill=True`) versus the int8×int2 Triton kernel for decode. The bf16 prefill path is bit-exact with SOTA's `BitLinear.quant_input + F.linear` at the layer level, and `torch.compile` fuses the fake-quant into a single Triton kernel that beats our int8 prefill due to cuBLAS bf16 GEMM efficiency at large `M` and avoiding the per-`BitLinear` `act_quant_int8` launch.
+
+Greedy-decode token alignment vs SOTA averages 31.9/41.6/82.8 matching tokens per request across the three scenarios. The residual divergence is *not* from BitLinear precision (the bf16 prefill path matches SOTA bit-for-bit at the layer level), but from kb-nano's independent implementations of `RMSNorm`, `RoPE`, and the prefill attention kernel (we use flash-attn 2; SOTA uses xformers `fmha.flash.FwOp`) — small numerical differences in these primitives compound across 30 layers and flip argmaxes, which BitNet is unusually sensitive to because ternary weights produce many close-magnitude logits.
+
+<details>
+<summary>Earlier numbers</summary>
+
+Pre-bf16-prefill (int8 throughout, fused act_quant_int8 + tuned GEMM tiles):
+
+| Model | TP | Scenario | Input/Output | Microsoft BitNet GPU (tok/s) | Ours (tok/s) | Ratio | Avg Match Tokens |
+|-------|---:|----------|:------------:|------------------------------:|-------------:|------:|-----------------:|
+| BitNet-b1.58-2B-4T | 1 | prefill-heavy | 1024/512  | 27,964 | 26,809 | 0.96x | 33.5/512 |
+| BitNet-b1.58-2B-4T | 1 | balanced      |  512/512  | 23,129 | 25,810 | 1.12x | 43.2/512 |
+| BitNet-b1.58-2B-4T | 1 | decode-heavy  |  512/1024 | 18,504 | 21,802 | 1.18x | 86.0/1024 |
+
+Initial integration (eager `_activation_quant_int8` + fixed GEMM tiles):
+
+| Model | TP | Scenario | Input/Output | Microsoft BitNet GPU (tok/s) | Ours (tok/s) | Ratio |
+|-------|---:|----------|:------------:|------------------------------:|-------------:|------:|
+| BitNet-b1.58-2B-4T | 1 | prefill-heavy | 1024/512  | 27,943 | 11,433 | 0.41x |
+| BitNet-b1.58-2B-4T | 1 | balanced      |  512/512  | 23,108 | 11,296 | 0.49x |
+| BitNet-b1.58-2B-4T | 1 | decode-heavy  |  512/1024 | 18,489 | 10,499 | 0.57x |
+
+</details>
 
 **Hardware: 4x NVIDIA B200 (NVLink)**
 

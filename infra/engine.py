@@ -290,22 +290,33 @@ class ModelRunner:
                 _cfg = AutoConfig.from_pretrained(
                     model_name, trust_remote_code=True,
                 )
-            except (ValueError, KeyError):
+            except (ValueError, KeyError, OSError):
+                # BitNet b1.58 ships an ``auto_map`` pointing at
+                # ``configuration_bitnet.py`` / ``modeling_bitnet.py`` files
+                # that don't actually exist in the repo (the model_type is
+                # registered natively in transformers).  Retry without
+                # ``trust_remote_code`` so AutoConfig uses the registered
+                # class instead of the dynamic loader.
                 try:
-                    from huggingface_hub import hf_hub_download
-                    import json as _json
-                    if os.path.isdir(model_name):
-                        _cfg_path = os.path.join(model_name, "config.json")
-                    else:
-                        _cfg_path = hf_hub_download(model_name, "config.json")
-                    with open(_cfg_path) as _f:
-                        _cfg_dict = _json.load(_f)
-                    _td = _cfg_dict.get("torch_dtype", None)
-                    cfg_dtype = getattr(torch, _td) if isinstance(_td, str) else None
-                    if isinstance(cfg_dtype, torch.dtype):
-                        dtype = cfg_dtype
+                    _cfg = AutoConfig.from_pretrained(
+                        model_name, trust_remote_code=False,
+                    )
                 except Exception:
-                    pass
+                    try:
+                        from huggingface_hub import hf_hub_download
+                        import json as _json
+                        if os.path.isdir(model_name):
+                            _cfg_path = os.path.join(model_name, "config.json")
+                        else:
+                            _cfg_path = hf_hub_download(model_name, "config.json")
+                        with open(_cfg_path) as _f:
+                            _cfg_dict = _json.load(_f)
+                        _td = _cfg_dict.get("torch_dtype", None)
+                        cfg_dtype = getattr(torch, _td) if isinstance(_td, str) else None
+                        if isinstance(cfg_dtype, torch.dtype):
+                            dtype = cfg_dtype
+                    except Exception:
+                        pass
             if dtype is None:
                 cfg_dtype = getattr(_cfg, "torch_dtype", None) if _cfg is not None else None
                 if cfg_dtype is not None and isinstance(cfg_dtype, torch.dtype):
