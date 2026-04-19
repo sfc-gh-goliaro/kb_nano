@@ -262,9 +262,8 @@ def main():
         with torch.no_grad():
             for _ in range(max_tokens):
                 ids_tensor = torch.tensor([context], device=device)
-                hidden = model.model(ids_tensor)
-                last_h = hidden[:, -1:, :].reshape(1, -1)
-                logits = model.compute_logits(last_h)
+                output = model(input_ids=ids_tensor, use_cache=False)
+                logits = output.logits[:, -1, :]
                 next_id = int(logits.argmax(dim=-1).item())
                 context.append(next_id)
                 if tokenizer.eos_token_id is not None and next_id == tokenizer.eos_token_id:

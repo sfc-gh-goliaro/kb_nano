@@ -22,6 +22,7 @@ import torch.nn as nn
 
 from ..L1.rms_norm import RMSNorm
 from ..L3.retnet_decoder import RetNetDecoderLayer
+from .recurrent_cache import CausalLMOutputWithPast, RecurrentCache
 
 
 @dataclass
@@ -67,14 +68,34 @@ class RetNetModel(nn.Module):
         )
         self.norm = RMSNorm(config.hidden_size, eps=config.norm_eps)
 
-    def forward(self, input_ids: torch.Tensor, positions=None) -> torch.Tensor:
-        hidden_states = self.embeddings(input_ids)
+    def forward(
+        self,
+        input_ids: torch.Tensor | None = None,
+        attention_mask: torch.Tensor | None = None,
+        inputs_embeds: torch.Tensor | None = None,
+        past_key_values: RecurrentCache | None = None,
+        use_cache: bool = False,
+        **kwargs,
+    ) -> tuple[torch.Tensor, RecurrentCache | None]:
+        if inputs_embeds is None:
+            inputs_embeds = self.embeddings(input_ids)
+        hidden_states = inputs_embeds
+        if use_cache and past_key_values is None:
+            past_key_values = RecurrentCache()
+
         for layer in self.layers:
-            hidden_states = layer(hidden_states)
+            hidden_states, _, past_key_values = layer(
+                hidden_states,
+                attention_mask=attention_mask,
+                past_key_values=past_key_values,
+                use_cache=use_cache,
+            )
+
         norm_dtype = self.norm.weight.dtype
-        return self.norm(
+        hidden_states = self.norm(
             hidden_states.to(dtype=norm_dtype).reshape(-1, hidden_states.size(-1))
         ).reshape_as(hidden_states)
+        return hidden_states, past_key_values
 
 
 class RetNetForCausalLM(nn.Module):
@@ -86,14 +107,38 @@ class RetNetForCausalLM(nn.Module):
         if config.tie_word_embeddings:
             self.lm_head.weight = self.model.embeddings.weight
 
-    def forward(self, input_ids: torch.Tensor, positions=None) -> torch.Tensor:
-        return self.model(input_ids, positions)
+    def forward(
+        self,
+        input_ids: torch.Tensor | None = None,
+        attention_mask: torch.Tensor | None = None,
+        inputs_embeds: torch.Tensor | None = None,
+        past_key_values: RecurrentCache | None = None,
+        labels: torch.Tensor | None = None,
+        use_cache: bool = False,
+        **kwargs,
+    ) -> CausalLMOutputWithPast:
+        hidden_states, past_key_values = self.model(
+            input_ids=input_ids,
+            attention_mask=attention_mask,
+            inputs_embeds=inputs_embeds,
+            past_key_values=past_key_values,
+            use_cache=use_cache,
+        )
+        logits = self.lm_head(hidden_states).float()
+        loss = None
+        if labels is not None:
+            shift_logits = logits[..., :-1, :].contiguous()
+            shift_labels = labels[..., 1:].contiguous()
+            loss = nn.functional.cross_entropy(
+                shift_logits.view(-1, shift_logits.size(-1)),
+                shift_labels.view(-1),
+            )
+        return CausalLMOutputWithPast(
+            logits=logits, past_key_values=past_key_values, loss=loss,
+        )
 
     def compute_logits(self, hidden_states: torch.Tensor) -> torch.Tensor:
-        logits = self.lm_head(hidden_states)
-        if logits is not None:
-            logits = logits.float()
-        return logits
+        return self.lm_head(hidden_states).float()
 
     def compute_logits_decode(self, hidden_states: torch.Tensor) -> torch.Tensor:
         return self.compute_logits(hidden_states)

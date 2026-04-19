@@ -3,6 +3,10 @@
 Pre-norm residual pattern with LayerNorm (with bias):
   Layer 0: pre_norm -> attn_norm -> RWKV7Attention -> residual -> ffn_norm -> FFN -> residual
   Other:              attn_norm -> RWKV7Attention -> residual -> ffn_norm -> FFN -> residual
+
+Built only from L1 ops (LayerNorm) and the L2 RWKV7 attention / FFN
+modules. Forward signature mirrors FLA's ``RWKV7Block.forward`` so the
+``v_first`` cross-layer carry threads through correctly.
 """
 
 from __future__ import annotations
@@ -10,6 +14,7 @@ from __future__ import annotations
 import torch
 import torch.nn as nn
 
+from ..L1.layer_norm import LayerNorm
 from ..L2.rwkv7_attention import RWKV7Attention
 from ..L2.rwkv7_ffn import RWKV7FeedForward
 
@@ -20,12 +25,16 @@ class RWKV7Block(nn.Module):
         self.layer_idx = layer_idx
 
         if layer_idx == 0:
-            self.pre_norm = nn.LayerNorm(
-                config.hidden_size, bias=config.norm_bias, eps=config.norm_eps,
+            self.pre_norm = LayerNorm(
+                config.hidden_size,
+                eps=config.norm_eps,
+                create_offset=config.norm_bias,
             )
 
-        self.attn_norm = nn.LayerNorm(
-            config.hidden_size, bias=config.norm_bias, eps=config.norm_eps,
+        self.attn_norm = LayerNorm(
+            config.hidden_size,
+            eps=config.norm_eps,
+            create_offset=config.norm_bias,
         )
         self.attn = RWKV7Attention(
             hidden_size=config.hidden_size,
@@ -39,8 +48,10 @@ class RWKV7Block(nn.Module):
             layer_idx=layer_idx,
         )
 
-        self.ffn_norm = nn.LayerNorm(
-            config.hidden_size, bias=config.norm_bias, eps=config.norm_eps,
+        self.ffn_norm = LayerNorm(
+            config.hidden_size,
+            eps=config.norm_eps,
+            create_offset=config.norm_bias,
         )
         self.ffn = RWKV7FeedForward(
             hidden_size=config.hidden_size,
@@ -48,20 +59,28 @@ class RWKV7Block(nn.Module):
         )
 
     def forward(
-        self, hidden_states: torch.Tensor, v_first: torch.Tensor,
-    ) -> tuple[torch.Tensor, torch.Tensor]:
-        # Layer 0 pre-norm
+        self,
+        hidden_states: torch.Tensor,
+        v_first: torch.Tensor,
+        attention_mask: torch.Tensor | None = None,
+        past_key_values=None,
+        use_cache: bool = False,
+        **kwargs,
+    ) -> tuple[torch.Tensor, torch.Tensor, None, object | None]:
         residual = self.pre_norm(hidden_states) if hasattr(self, 'pre_norm') else hidden_states
 
-        # Attention sub-block
-        hidden_states = self.attn_norm(residual)
-        hidden_states, v_first = self.attn(hidden_states, v_first)
-        hidden_states = residual + hidden_states
+        h = self.attn_norm(residual)
+        h, attentions, past_key_values, v_first = self.attn(
+            hidden_states=h,
+            v_first=v_first,
+            attention_mask=attention_mask,
+            past_key_values=past_key_values,
+            use_cache=use_cache,
+        )
+        hidden_states = residual + h
 
-        # FFN sub-block
         residual = hidden_states
-        hidden_states = self.ffn_norm(hidden_states)
-        hidden_states = self.ffn(hidden_states)
-        hidden_states = residual + hidden_states
+        h = self.ffn_norm(hidden_states)
+        hidden_states = residual + self.ffn(h)
 
-        return hidden_states, v_first
+        return hidden_states, v_first, attentions, past_key_values
