@@ -147,6 +147,10 @@ class Context:
     cudagraph_runtime_mode: CUDAGraphMode = CUDAGraphMode.NONE
     # Batch size key used by CUDAGraphWrapper for per-shape graph caching.
     batch_size_for_graph: int = 0
+    # True while the current forward is being captured into / replayed from a
+    # CUDA graph. Lets attention layers assert that all tensors they consume
+    # live in persistent buffers (their pointers must be stable across replays).
+    is_cuda_graph_replay: bool = False
 
 
 # Global module registry populated once at model init; copied into each

@@ -185,6 +185,8 @@ class LlamaEagle3Engine:
         spec_steps: int = 3,
         spec_topk: int = 4,
         num_draft_tokens: Optional[int] = None,
+        enforce_eager: bool = False,
+        cuda_graph_max_bs: int = 8,
     ):
         torch.manual_seed(seed)
         torch.cuda.manual_seed_all(seed)
@@ -201,6 +203,8 @@ class LlamaEagle3Engine:
         self.num_draft_tokens = num_draft_tokens
         self.max_model_len = max_model_len
         self.max_num_seqs = max_num_seqs
+        self.enforce_eager = enforce_eager
+        self.cuda_graph_max_bs = cuda_graph_max_bs
 
         if not dist.is_initialized():
             os.environ.setdefault("MASTER_ADDR", "127.0.0.1")
@@ -240,6 +244,28 @@ class LlamaEagle3Engine:
         self.draft_attn_layers = _gather_attn_layers(self.draft)
 
         self._allocate_kv_caches(gpu_memory_utilization)
+
+        # Reserve block 0 of each KV cache as the "scratch" page that ghost
+        # rows of CUDA-graph padding write to / read from. This block must
+        # never be allocated to a real sequence, so we pop it out of the
+        # free list at engine init and never return it.
+        self._scratch_block_t = self.target_kv.alloc(1)[0]
+        self._scratch_block_d = self.draft_kv.alloc(1)[0]
+
+        # CUDA graph runners (built lazily on first generate() call so we
+        # don't pay capture cost when the engine is only used for prefill
+        # debugging / tests). Captures depend on max_running_requests which
+        # is bounded by max_num_seqs.
+        self._target_verify_runner = None
+        self._draft_chain_runner = None
+        self._draft_extend_runner = None
+        self._graph_pool = None
+        # Width of the captured ``bt_branch`` block table = enough to cover
+        # the full draft prefix (at max_model_len) plus the branch tail
+        # (at most 2 blocks for typical S-1=2 step chains).
+        self._chain_max_blocks_branch = (
+            (self.max_model_len + self.block_size - 1) // self.block_size + 2
+        )
 
         torch.set_default_device("cpu")
         torch.set_default_dtype(torch.float32)
@@ -294,6 +320,90 @@ class LlamaEagle3Engine:
         )
         self.target_kv.attach(self.target_attn_layers)
         self.draft_kv.attach(self.draft_attn_layers)
+
+    # ------------------------------------------------------------------
+    # CUDA graph runner construction (lazy)
+    # ------------------------------------------------------------------
+    def _maybe_build_graph_runners(self):
+        """Build and capture CUDA graph runners on first use.
+
+        Skips entirely if ``enforce_eager`` is set. Capture is one-shot;
+        subsequent generate() calls reuse the captured graphs.
+        """
+        if self.enforce_eager:
+            return
+        if self._target_verify_runner is not None:
+            return
+
+        from .eagle3_cuda_graph import (
+            TargetVerifyGraphRunner,
+            DraftChainGraphRunner,
+            DraftExtendGraphRunner,
+        )
+
+        # Cap at max_num_seqs -- there's no point capturing larger buckets
+        # than the engine will ever batch.
+        max_bs = min(self.cuda_graph_max_bs, self.max_num_seqs)
+        if max_bs < 1:
+            return
+
+        print(
+            f"[EAGLE-3] Capturing target-verify CUDA graphs for "
+            f"B in 1..{max_bs} (N={self.num_draft_tokens})..."
+        )
+        runner = TargetVerifyGraphRunner(
+            engine=self,
+            cuda_graph_max_bs=max_bs,
+            scratch_block_t=self._scratch_block_t,
+            graph_pool=self._graph_pool,
+        )
+        runner.capture_all()
+        if self._graph_pool is None:
+            self._graph_pool = runner.graph_pool
+        self._target_verify_runner = runner
+        print(
+            f"[EAGLE-3] Captured {len(runner.graphs)} target-verify graphs."
+        )
+
+        if self.spec_steps > 1:
+            print(
+                f"[EAGLE-3] Capturing draft-chain CUDA graphs for "
+                f"B in 1..{max_bs} (K={self.topk}, S-1={self.spec_steps-1})..."
+            )
+            chain_runner = DraftChainGraphRunner(
+                engine=self,
+                cuda_graph_max_bs=max_bs,
+                scratch_block_d=self._scratch_block_d,
+                max_blocks_branch=self._chain_max_blocks_branch,
+                graph_pool=self._graph_pool,
+            )
+            chain_runner.capture_all()
+            if self._graph_pool is None:
+                self._graph_pool = chain_runner.graph_pool
+            self._draft_chain_runner = chain_runner
+            print(
+                f"[EAGLE-3] Captured {len(chain_runner.graphs)} "
+                f"draft-chain graphs."
+            )
+
+        print(
+            f"[EAGLE-3] Capturing draft-extend CUDA graphs for "
+            f"B in 1..{max_bs} (S+1={self.spec_steps + 1})..."
+        )
+        extend_runner = DraftExtendGraphRunner(
+            engine=self,
+            cuda_graph_max_bs=max_bs,
+            scratch_block_d=self._scratch_block_d,
+            graph_pool=self._graph_pool,
+        )
+        extend_runner.capture_all()
+        if self._graph_pool is None:
+            self._graph_pool = extend_runner.graph_pool
+        self._draft_extend_runner = extend_runner
+        print(
+            f"[EAGLE-3] Captured {len(extend_runner.graphs)} "
+            f"draft-extend graphs."
+        )
 
     # ------------------------------------------------------------------
     # Helpers
@@ -480,15 +590,37 @@ class LlamaEagle3Engine:
         ext_input_ids: list[torch.Tensor],   # per-seq, shape [L_i] target-vocab ids
         ext_hiddens: list[torch.Tensor],     # per-seq, shape [L_i, 3*H_t]
         ext_lens: list[int],                 # per-seq L_i
+        post_verify: bool = False,
     ):
         """Run the draft model in extend mode and capture, per-seq, the
         first-step (topk_p, topk_i, topk_i_t, hidden) for the next chain.
 
         Each seq's draft KV is grown from ``d_committed_len`` to
         ``d_committed_len + L_i``. Updates ``d_committed_len`` in-place.
+
+        ``post_verify=True`` indicates the call is the post-verify digest
+        with bounded ``L_i in [1, S+1]``; this allows the captured
+        ``DraftExtendGraphRunner`` fast-path.
         """
         bs = len(seqs)
         K = self.topk
+
+        # ------------------------------------------------------------------
+        # Fast path: captured CUDA graph for the post-verify draft extend.
+        # ------------------------------------------------------------------
+        runner = (
+            self._draft_extend_runner
+            if (post_verify and bs > 0) else None
+        )
+        if (
+            runner is not None
+            and bs <= runner.B_max
+            and all(L <= runner.SP1 for L in ext_lens)
+        ):
+            self._draft_extend_via_graph(
+                seqs, ext_input_ids, ext_hiddens, ext_lens, runner,
+            )
+            return
 
         positions: list[int] = []
         cu_q = [0]
@@ -567,6 +699,101 @@ class LlamaEagle3Engine:
             seq.draft_hidden = last_aux_h[i].clone()
 
     # ------------------------------------------------------------------
+    # CUDA-graph fast path for the post-verify draft extend.
+    # ------------------------------------------------------------------
+    @torch.inference_mode()
+    def _draft_extend_via_graph(
+        self,
+        seqs: List[_Eagle3Sequence],
+        ext_input_ids: list[torch.Tensor],
+        ext_hiddens: list[torch.Tensor],
+        ext_lens: list[int],
+        runner,
+    ):
+        """Fast-path that delegates to ``DraftExtendGraphRunner.replay``.
+
+        Builds the per-seq inputs / cu_seqlens / accept_length tensors
+        Python-side, allocates draft KV, and invokes ``runner.replay``.
+        Updates each ``seq``'s ``d_committed_len`` / ``draft_topk_*`` /
+        ``draft_hidden`` from the persistent output views.
+        """
+        import bisect
+        bs = len(seqs)
+        K = self.topk
+        B_pad = runner.capture_bs[bisect.bisect_left(runner.capture_bs, bs)]
+        device = self.device
+
+        per_seq_input_ids: list[torch.Tensor] = []
+        per_seq_positions: list[torch.Tensor] = []
+        per_seq_hidden: list[torch.Tensor] = []
+        per_seq_slot_mapping: list[torch.Tensor] = []
+
+        cu_k_padded = [0] * (B_pad + 1)
+        accept_padded = [1] * B_pad
+        max_blocks = 0
+
+        for i, seq in enumerate(seqs):
+            L = ext_lens[i]
+            prefix = seq.d_committed_len
+            new_total = prefix + L
+            self._ensure_draft_capacity(seq, new_total)
+
+            per_seq_input_ids.append(ext_input_ids[i].to(device).to(torch.int64))
+            per_seq_positions.append(
+                torch.arange(prefix, new_total, dtype=torch.long, device=device)
+            )
+            per_seq_hidden.append(ext_hiddens[i].to(device))
+
+            sm = self._slot_mapping_for_range(seq.d_blocks, prefix, new_total)
+            per_seq_slot_mapping.append(
+                torch.tensor(sm, dtype=torch.int32, device=device)
+            )
+
+            cu_k_padded[i + 1] = cu_k_padded[i] + new_total
+            accept_padded[i] = L
+            max_blocks = max(max_blocks, len(seq.d_blocks))
+
+        # Ghost seqs (i in [bs, B_pad)): cu_k delta = 1, accept_length = 1.
+        for i in range(bs, B_pad):
+            cu_k_padded[i + 1] = cu_k_padded[i] + 1
+
+        cu_k_padded_t = torch.tensor(
+            cu_k_padded, dtype=torch.int32, device=device,
+        )
+        accept_padded_t = torch.tensor(
+            accept_padded, dtype=torch.int32, device=device,
+        )
+
+        bt = np.full((bs, max_blocks), -1, dtype=np.int32)
+        for i, seq in enumerate(seqs):
+            bt[i, :len(seq.d_blocks)] = seq.d_blocks
+        bt_t = torch.from_numpy(bt).to(device)
+
+        top_p_view, top_i_view, top_i_t_view, last_aux_h_view = runner.replay(
+            per_seq_input_ids=per_seq_input_ids,
+            per_seq_positions=per_seq_positions,
+            per_seq_hidden=per_seq_hidden,
+            per_seq_slot_mapping=per_seq_slot_mapping,
+            block_table_real=bt_t,
+            cu_seqlens_k_padded=cu_k_padded_t,
+            accept_length_padded=accept_padded_t,
+            raw_bs=bs,
+        )
+
+        # Clone outputs since they alias persistent buffers that the next
+        # extend replay will overwrite.
+        top_p_c = top_p_view.clone()
+        top_i_c = top_i_view.clone()
+        top_i_t_c = top_i_t_view.clone()
+        last_aux_h_c = last_aux_h_view.clone()
+        for i, seq in enumerate(seqs):
+            seq.d_committed_len += ext_lens[i]
+            seq.draft_topk_p = top_p_c[i]
+            seq.draft_topk_i = top_i_c[i]
+            seq.draft_topk_i_t = top_i_t_c[i]
+            seq.draft_hidden = last_aux_h_c[i]
+
+    # ------------------------------------------------------------------
     # Draft chain (topk=K, S steps). Tree drafting:
     #   - Step 0: record the K candidates from the latest draft-extend.
     #   - Forward step f (f=0..S-2): run B*K decode queries, each branch in
@@ -612,6 +839,7 @@ class LlamaEagle3Engine:
         hidden_bk = cur_hidden.repeat_interleave(K, dim=0)                # [bs*K, H_d]
         scores = cur_top_p                                                # [bs, K]
 
+        # ------------------------------------------------------------------
         # Build per-branch block tables. Each branch needs an ISOLATED tail
         # past d_committed_len (so K branches don't collide on shared slots).
         # When d_committed_len isn't block-aligned, the last prefix block has
@@ -690,14 +918,47 @@ class LlamaEagle3Engine:
         base_pos_np = np.array(
             [s.d_committed_len for s in seqs], dtype=np.int64,
         )
-        base_pos_bk = (
-            torch.from_numpy(base_pos_np).to(self.device).repeat_interleave(K)
-        )                                                                  # [B*K]
-        d_committed_t = torch.from_numpy(base_pos_np).to(self.device)      # [B]
-        # offset within the FIRST branch block where the tail begins.
-        r_per_seq = torch.from_numpy(base_pos_np % bsz).to(self.device)    # [B]
-        # Pre-computed CPU-side max base_pos so we can derive max_ctx for each
-        # chain step without a GPU sync per step.
+        base_pos_t = torch.from_numpy(base_pos_np).to(self.device)         # [B]
+        r_per_seq_t = torch.from_numpy(base_pos_np % bsz).to(self.device)  # [B]
+        n_full_prefix_t_input = torch.from_numpy(base_pos_np // bsz).to(
+            self.device,
+        )                                                                  # [B]
+
+        chain_runner = self._draft_chain_runner
+        if (
+            chain_runner is not None
+            and bs <= chain_runner.B_max
+            and bt_branch.shape[1] <= chain_runner.max_blocks_branch
+        ):
+            score_steps, token_steps, parents_steps, _ = chain_runner.replay(
+                cur_top_i_t_real=input_ids_bk,
+                cur_hidden_real=hidden_bk,
+                cur_top_p_real=cur_top_p,
+                base_pos_real=base_pos_t,
+                r_per_seq_real=r_per_seq_t,
+                n_full_prefix_real=n_full_prefix_t_input,
+                bt_branch_real=bt_branch,
+                raw_bs=bs,
+            )
+            for f in range(S - 1):
+                score_list.append(score_steps[f].clone())
+                token_list.append(token_steps[f].clone())
+                parents_list.append(parents_steps[f].clone())
+
+            parent_list, top_scores_index, draft_tokens = (
+                organize_draft_results(
+                    score_list, token_list, parents_list,
+                    self.num_draft_tokens,
+                )
+            )
+            return parent_list, top_scores_index, draft_tokens, verified_id
+
+        # ------------------------------------------------------------------
+        # Eager fallback: per-step forward+topk+select_top_k loop.
+        # ------------------------------------------------------------------
+        base_pos_bk = base_pos_t.repeat_interleave(K)                      # [B*K]
+        d_committed_t = base_pos_t                                         # [B]
+        r_per_seq = r_per_seq_t                                            # [B]
         max_base_pos_cpu = int(base_pos_np.max())
 
         for f in range(S - 1):
@@ -928,33 +1189,58 @@ class LlamaEagle3Engine:
             prefix_lens_cpu, slot_t, tree_mask,
         )
 
-        with set_forward_context(
-            is_prefill=False,
-            slot_mapping=slot_t,
-            context_lens=ctx_t,
-            block_tables=bt_t,
-            max_context_len=max_ctx_cpu,
-            is_tree_verify=True,
-            tree_num_verify_tokens=N,
-            tree_block_table_prefix=bt_t,
-            tree_cache_seqlens_prefix=cascade["cache_seqlens_prefix"],
-            tree_cu_seqlens_q_prefix=cascade["cu_seqlens_q_prefix"],
-            tree_max_seqlen_q_prefix=N,
-            tree_max_seqlen_k_prefix=cascade["max_seqlen_k_prefix"],
-            tree_page_table_expand=cascade["page_table_expand"],
-            tree_cache_seqlens_expand=cascade["cache_seqlens_expand"],
-            tree_cu_seqlens_q_expand=cascade["cu_seqlens_q_expand"],
+        runner = self._target_verify_runner
+        if (
+            runner is not None
+            and bs <= runner.B_max
         ):
+            # Fast path: replay a captured CUDA graph.  All metadata is
+            # copied into runner-owned persistent buffers; outputs are
+            # views into shared persistent output buffers, so we clone
+            # before they might be overwritten by a subsequent replay.
             ids_t = full_draft_tokens.to(torch.int64)
-            out = self.target.model(ids_t, positions_tensor.to(torch.long))
-            if isinstance(out, tuple):
-                hidden_states, aux_list = out
-            else:
-                hidden_states, aux_list = out, []
+            pos_t = positions_tensor.to(torch.long)
+            h_view, aux_views, logits_view = runner.replay(
+                input_ids_real=ids_t,
+                positions_real=pos_t,
+                slot_mapping_real=slot_t,
+                block_table_real=bt_t,
+                cache_seqlens_prefix_real=cascade["cache_seqlens_prefix"],
+                page_table_expand_real=cascade["page_table_expand"],
+                cache_seqlens_expand_real=cascade["cache_seqlens_expand"],
+                raw_bs=bs,
+            )
+            hidden_states = h_view.clone()
+            aux_list = [a.clone() for a in aux_views]
+            logits = logits_view.clone()
+        else:
+            with set_forward_context(
+                is_prefill=False,
+                slot_mapping=slot_t,
+                context_lens=ctx_t,
+                block_tables=bt_t,
+                max_context_len=max_ctx_cpu,
+                is_tree_verify=True,
+                tree_num_verify_tokens=N,
+                tree_block_table_prefix=bt_t,
+                tree_cache_seqlens_prefix=cascade["cache_seqlens_prefix"],
+                tree_cu_seqlens_q_prefix=cascade["cu_seqlens_q_prefix"],
+                tree_max_seqlen_q_prefix=N,
+                tree_max_seqlen_k_prefix=cascade["max_seqlen_k_prefix"],
+                tree_page_table_expand=cascade["page_table_expand"],
+                tree_cache_seqlens_expand=cascade["cache_seqlens_expand"],
+                tree_cu_seqlens_q_expand=cascade["cu_seqlens_q_expand"],
+            ):
+                ids_t = full_draft_tokens.to(torch.int64)
+                out = self.target.model(ids_t, positions_tensor.to(torch.long))
+                if isinstance(out, tuple):
+                    hidden_states, aux_list = out
+                else:
+                    hidden_states, aux_list = out, []
 
-            # compute_logits while still in is_prefill=False context so it
-            # returns one logit per *flat tree token* (shape [B*N, vocab]).
-            logits = self.target.compute_logits(hidden_states)
+                # compute_logits while still in is_prefill=False context so it
+                # returns one logit per *flat tree token* (shape [B*N, vocab]).
+                logits = self.target.compute_logits(hidden_states)
         target_predict = logits.argmax(dim=-1)  # [B*N]
 
         candidates = full_draft_tokens.view(bs, N).to(torch.long)
@@ -1150,7 +1436,10 @@ class LlamaEagle3Engine:
             live_seqs.append(seq)
 
         if live_seqs:
-            self._draft_extend(live_seqs, ext_input_ids, ext_hiddens, ext_lens)
+            self._draft_extend(
+                live_seqs, ext_input_ids, ext_hiddens, ext_lens,
+                post_verify=True,
+            )
             if _dbg:
                 print(f"[dbg] post-verify draft extend done; "
                       f"d_committed_lens={[s.d_committed_len for s in live_seqs]}",
@@ -1173,6 +1462,9 @@ class LlamaEagle3Engine:
         if isinstance(sampling_params, Eagle3SamplingParams):
             sampling_params = [sampling_params] * len(prompts)
         assert len(sampling_params) == len(prompts)
+
+        # One-shot CUDA graph capture (if enabled).
+        self._maybe_build_graph_runners()
 
         prompt_token_ids: List[List[int]] = []
         for p in prompts:

@@ -282,6 +282,8 @@ def main():
         spec_topk=cfg.get("spec_topk", 1),
         num_draft_tokens=cfg.get("spec_num_draft_tokens", None),
         gpu_memory_utilization=cfg.get("gpu_memory_utilization", 0.85),
+        enforce_eager=cfg.get("enforce_eager", False),
+        cuda_graph_max_bs=cfg.get("cuda_graph_max_bs", 8),
     )
 
     from transformers import AutoTokenizer
@@ -561,6 +563,7 @@ def main():
             "max_running_requests": args.max_running_requests,
             "gpu_memory_utilization": args.gpu_memory_utilization,
             "cuda_graph_max_bs": args.cuda_graph_max_bs,
+            "enforce_eager": args.enforce_eager,
             "project_root": str(_PROJECT_ROOT),
             "package_name": _PACKAGE_DIR.name,
             "scenarios": scenarios,
