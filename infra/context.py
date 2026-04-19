@@ -121,11 +121,24 @@ class Context:
     cross_max_context_len: int = 0
 
     # --- EAGLE-3 tree verify fields ---
-    # When True, attention layers should use TreeAttnPrefill instead of the
-    # regular causal prefill kernel. Only used by the EAGLE-3 verify forward.
+    # When True, attention layers should use TreeAttnPrefill (FA3 cascade)
+    # instead of the regular causal prefill kernel. The metadata below
+    # mirrors sglang's ``target_verify_metadata_topk_normal`` (prefix pass)
+    # and ``target_verify_metadata_topk_expand`` (per-query draft pass).
     is_tree_verify: bool = False
-    tree_mask: torch.Tensor | None = None
     tree_num_verify_tokens: int = 0
+    # Prefix pass: B sequences of N queries each, attending to the prefix.
+    tree_block_table_prefix: torch.Tensor | None = None
+    tree_cache_seqlens_prefix: torch.Tensor | None = None
+    tree_cu_seqlens_q_prefix: torch.Tensor | None = None
+    tree_max_seqlen_q_prefix: int = 0
+    tree_max_seqlen_k_prefix: int = 0
+    # Expand pass: B*N queries (one per draft token), each attending only to
+    # its tree-ancestor draft tokens via a token-level page table.
+    tree_page_table_expand: torch.Tensor | None = None
+    tree_cache_seqlens_expand: torch.Tensor | None = None
+    tree_cu_seqlens_q_expand: torch.Tensor | None = None
+    tree_max_seqlen_k_expand: int = 0
 
     # --- Compilation / CUDA-graph fields (mirror vLLM ForwardContext) ---
     # Maps layer prefix -> live nn.Module for custom-op runtime lookup.

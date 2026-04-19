@@ -443,6 +443,22 @@ def main():
     parser.add_argument("--skip-throughput", action="store_true")
     parser.add_argument("--skip-latency", action="store_true")
     parser.add_argument(
+        "--enforce-eager", action="store_true",
+        help="Run both engines in pure eager mode (no CUDA graphs, no torch.compile). "
+             "On sglang this maps to disable_cuda_graph=True; kb-nano is already "
+             "eager so this is a no-op on its side. Use for apples-to-apples "
+             "comparisons isolating raw kernel/dispatch perf.",
+    )
+    parser.add_argument(
+        "--sglang-python", type=str,
+        default="/home/yak/miniconda3/envs/sglang-bench/bin/python",
+        help="Python interpreter to use for the sglang subprocess. We launch "
+             "sglang in an isolated conda env so its torch / CUDA versions do "
+             "not conflict with kb-nano's (e.g. sglang ships torch 2.9 + cu128, "
+             "kb-nano runs on torch 2.10 + cu130). Default points at the "
+             "`sglang-bench` env created by tests/setup_sglang_env.sh.",
+    )
+    parser.add_argument(
         "--output-dir", type=str, default=None,
         help="Where to dump per-scenario outputs / results.json. "
              "Default: tests/results/<gpu>/<model>_eagle3",
@@ -520,10 +536,12 @@ def main():
             "max_model_len": args.max_model_len,
             "scenarios": scenarios,
             "latency_scenarios": latency_scenarios,
+            "disable_cuda_graph": args.enforce_eager,
         }
         sgl_raw = run_worker(
             SGLANG_WORKER, sgl_cfg,
             f"sglang [EAGLE-3] {args.model.split('/')[-1]}",
+            python_executable=args.sglang_python,
         )
         if sgl_raw is None:
             print("  WARNING: sglang subprocess failed -- continuing with kb-nano only")

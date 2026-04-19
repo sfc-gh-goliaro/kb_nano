@@ -795,6 +795,93 @@ class LlamaEagle3Engine:
     # Verify forward on the target
     # ------------------------------------------------------------------
     @torch.inference_mode()
+    def _build_tree_cascade_metadata(
+        self,
+        prefix_lens_cpu: List[int],
+        slot_mapping_draft: torch.Tensor,
+        tree_mask: torch.Tensor,
+    ) -> dict:
+        """Build the FA3 cascade-attention metadata for ``_target_verify``.
+
+        Mirrors sglang's ``target_verify_metadata_topk_normal`` (prefix pass)
+        and ``target_verify_metadata_topk_expand`` (per-query draft pass) in
+        ``flashattention_backend.py``.
+
+        Inputs
+        ------
+        prefix_lens_cpu : list[int]  -- length B; ``t_committed_len`` per seq.
+        slot_mapping_draft : [B*N] int32  -- token-level cache slot for each
+            draft token in linear write order, slot[i*N + k] = slot for seq i,
+            draft token k.
+        tree_mask : flat bool [seq_lens_sum*N + N*N*B] in FULL_MASK layout.
+
+        Returns
+        -------
+        dict with the seven tensors / scalars consumed by ``TreeAttnPrefill``.
+        """
+        device = self.device
+        N = self.num_draft_tokens
+        bs = len(prefix_lens_cpu)
+
+        prefix_lens = torch.tensor(prefix_lens_cpu, device=device, dtype=torch.long)
+
+        cu_seqlens_q_prefix = torch.arange(
+            0, (bs + 1) * N, N, device=device, dtype=torch.int32,
+        )
+        cache_seqlens_prefix = prefix_lens.to(torch.int32)
+        max_seqlen_k_prefix = max(prefix_lens_cpu) if prefix_lens_cpu else 0
+
+        # Per-query draft slot list: [bs*N, N], one row per query, each row
+        # contains the N draft slot indices of the query's sequence.
+        draft_slots_per_seq = slot_mapping_draft.view(bs, N).long()
+        draft_slots_per_query = draft_slots_per_seq.repeat_interleave(N, dim=0)
+
+        # Extract the N draft-side bits from the FULL_MASK tree_mask for each
+        # query. For seq i, query j the bits live at:
+        #   start_ij = sum_{i'<i} N*(prefix_lens[i'] + N)
+        #              + j * (prefix_lens[i] + N) + prefix_lens[i]
+        # spanning N consecutive bool entries.
+        row_lens = prefix_lens + N
+        seq_total = N * row_lens
+        seq_offsets = torch.zeros(bs, device=device, dtype=torch.long)
+        if bs > 1:
+            seq_offsets[1:] = torch.cumsum(seq_total[:-1], dim=0)
+
+        i_idx = torch.arange(bs, device=device).repeat_interleave(N)  # [bs*N]
+        j_idx = torch.arange(N, device=device).repeat(bs)             # [bs*N]
+
+        start_offsets = (
+            seq_offsets[i_idx]
+            + j_idx * row_lens[i_idx]
+            + prefix_lens[i_idx]
+        )                                                              # [bs*N]
+        col_offsets = torch.arange(N, device=device, dtype=torch.long) # [N]
+        mask_indices = start_offsets[:, None] + col_offsets[None, :]   # [bs*N, N]
+        draft_mask = tree_mask[mask_indices].to(torch.bool)            # [bs*N, N]
+
+        # Sort each row so the True entries come first (match sglang).
+        col_keys = col_offsets.expand(bs * N, -1)
+        keys = torch.where(draft_mask, col_keys, col_keys + N)         # [bs*N, N]
+        _, sort_order = torch.sort(keys, dim=1)
+
+        page_table_expand = (
+            draft_slots_per_query.gather(1, sort_order).to(torch.int32)
+        )                                                              # [bs*N, N]
+        cache_seqlens_expand = draft_mask.sum(dim=1).to(torch.int32)   # [bs*N]
+        cu_seqlens_q_expand = torch.arange(
+            bs * N + 1, device=device, dtype=torch.int32,
+        )
+
+        return {
+            "cu_seqlens_q_prefix": cu_seqlens_q_prefix,
+            "cache_seqlens_prefix": cache_seqlens_prefix,
+            "max_seqlen_k_prefix": max_seqlen_k_prefix,
+            "page_table_expand": page_table_expand,
+            "cache_seqlens_expand": cache_seqlens_expand,
+            "cu_seqlens_q_expand": cu_seqlens_q_expand,
+        }
+
+    @torch.inference_mode()
     def _target_verify(
         self,
         seqs: List[_Eagle3Sequence],
@@ -810,7 +897,7 @@ class LlamaEagle3Engine:
 
         slot_mapping: list[int] = []
         block_tables_rows: list[list[int]] = []
-        ctx_lens: list[int] = []
+        prefix_lens_cpu: list[int] = []
         for seq in seqs:
             new_total = seq.t_committed_len + N
             self._ensure_target_capacity(seq, new_total)
@@ -820,7 +907,7 @@ class LlamaEagle3Engine:
                 )
             )
             block_tables_rows.append(seq.t_blocks)
-            ctx_lens.append(new_total)
+            prefix_lens_cpu.append(seq.t_committed_len)
 
         max_blocks = max(len(b) for b in block_tables_rows)
         bt = np.full((bs, max_blocks), -1, dtype=np.int32)
@@ -829,8 +916,17 @@ class LlamaEagle3Engine:
 
         slot_t = torch.tensor(slot_mapping, dtype=torch.int32, device=self.device)
         bt_t = torch.from_numpy(bt).to(self.device)
-        ctx_t = torch.tensor(ctx_lens, dtype=torch.int32, device=self.device)
-        max_ctx_cpu = max(ctx_lens)
+        # Total context length per seq (prefix + N draft tokens). This is the
+        # legacy ``context_lens`` field; the FA3 cascade uses
+        # ``cache_seqlens_prefix`` (prefix only) and ``cache_seqlens_expand``
+        # (per-query attended draft count) instead.
+        ctx_lens_cpu = [p + N for p in prefix_lens_cpu]
+        ctx_t = torch.tensor(ctx_lens_cpu, dtype=torch.int32, device=self.device)
+        max_ctx_cpu = max(ctx_lens_cpu)
+
+        cascade = self._build_tree_cascade_metadata(
+            prefix_lens_cpu, slot_t, tree_mask,
+        )
 
         with set_forward_context(
             is_prefill=False,
@@ -839,8 +935,15 @@ class LlamaEagle3Engine:
             block_tables=bt_t,
             max_context_len=max_ctx_cpu,
             is_tree_verify=True,
-            tree_mask=tree_mask,
             tree_num_verify_tokens=N,
+            tree_block_table_prefix=bt_t,
+            tree_cache_seqlens_prefix=cascade["cache_seqlens_prefix"],
+            tree_cu_seqlens_q_prefix=cascade["cu_seqlens_q_prefix"],
+            tree_max_seqlen_q_prefix=N,
+            tree_max_seqlen_k_prefix=cascade["max_seqlen_k_prefix"],
+            tree_page_table_expand=cascade["page_table_expand"],
+            tree_cache_seqlens_expand=cascade["cache_seqlens_expand"],
+            tree_cu_seqlens_q_expand=cascade["cu_seqlens_q_expand"],
         ):
             ids_t = full_draft_tokens.to(torch.int64)
             out = self.target.model(ids_t, positions_tensor.to(torch.long))

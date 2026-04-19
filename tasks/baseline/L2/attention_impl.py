@@ -240,10 +240,15 @@ class Attention(nn.Module):
         if getattr(ctx, "is_tree_verify", False):
             o = self.tree_attn_op(
                 q, k_cache, v_cache,
-                cache_seqlens=ctx.context_lens,
-                block_table=ctx.block_tables,
-                tree_mask=ctx.tree_mask,
-                num_verify_tokens=ctx.tree_num_verify_tokens,
+                block_table_prefix=ctx.tree_block_table_prefix,
+                cache_seqlens_prefix=ctx.tree_cache_seqlens_prefix,
+                cu_seqlens_q_prefix=ctx.tree_cu_seqlens_q_prefix,
+                max_seqlen_q_prefix=ctx.tree_max_seqlen_q_prefix,
+                max_seqlen_k_prefix=ctx.tree_max_seqlen_k_prefix,
+                page_table_expand=ctx.tree_page_table_expand,
+                cache_seqlens_expand=ctx.tree_cache_seqlens_expand,
+                cu_seqlens_q_expand=ctx.tree_cu_seqlens_q_expand,
+                max_seqlen_k_expand=ctx.tree_num_verify_tokens,
                 block_size=self._block_size,
                 softmax_scale=self.scale,
             )

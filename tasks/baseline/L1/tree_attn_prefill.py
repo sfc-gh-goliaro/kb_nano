@@ -1,13 +1,37 @@
-"""Tree-mask attention for the EAGLE-3 verify step.
+"""FA3 cascade attention for the EAGLE-3 verify step.
 
-Each sequence has a small window of ``num_verify_tokens`` query tokens that
-must attend to the entire prefix (causal) plus a tree-structured mask over the
-sibling/parent draft tokens. We implement this with PyTorch SDPA, gathering
-the full KV from the paged cache per sequence. Sizes are tiny (B * 64 ≈ a few
-thousand tokens), so the per-sequence Python loop is fine.
+Direct port of sglang's two-stage strategy
+(`flashattention_backend.py`, ``use_cascade_attn=True``):
 
-This op is only used for the EAGLE-3 verify forward; the regular causal prefill
-and decode paths are unchanged.
+1. **Prefix pass** -- a single batched FlashAttention call where every draft
+   query in sequence ``i`` attends to *all* prefix tokens of sequence ``i``.
+   The KV cache is read at its native paged layout (``page_size = block_size``)
+   via the existing block table for the target. ``causal=False`` is correct
+   because every draft token's logical position is strictly greater than every
+   prefix position, so the noncausal mask reduces to "attend to the full
+   prefix".
+
+2. **Expand pass** -- a single batched FlashAttention call where each draft
+   query is its own length-1 "sequence" attending only to its tree-ancestor
+   draft tokens (per the verify tree mask).
+
+   With FA3, this is paged at ``page_size = 1`` (each "page" is a single
+   token); ``page_table_expand`` is sorted so the first
+   ``cache_seqlens_expand[i]`` entries are the live attended slots.
+
+   With FA2 (which requires page_size divisible by 256 for paged KV) we
+   instead gather the relevant draft K/V into a small contiguous buffer
+   (size <= B*N*N tokens, e.g. <=2048) and use the non-paged FA2 varlen
+   path. This is mathematically identical and a tiny one-time cost
+   relative to the prefix pass.
+
+3. **LSE merge** -- combine the two outputs exactly using the standard
+   log-sum-exp merge, since the two key sets (prefix tokens and draft tokens)
+   are disjoint.
+
+This replaces the previous per-sequence Python SDPA loop, which was ~92%
+of ``_target_verify`` time. With the cascade we do at most two batched
+kernel launches per layer, identical to sglang.
 """
 
 from __future__ import annotations
@@ -16,32 +40,77 @@ from typing import Optional
 
 import torch
 import torch.nn as nn
-import torch.nn.functional as F
+
+from .merge_state import merge_state
+
+_FA3_AVAILABLE = False
+_FA3_VARLEN_FUNC = None
+try:
+    from vllm.vllm_flash_attn import (
+        flash_attn_varlen_func as _vllm_fa_varlen,
+        is_fa_version_supported,
+    )
+    if is_fa_version_supported(3) and torch.cuda.is_available():
+        cc = torch.cuda.get_device_capability()
+        if cc[0] >= 9:
+            _FA3_AVAILABLE = True
+            _FA3_VARLEN_FUNC = _vllm_fa_varlen
+except ImportError:
+    pass
+
+from flash_attn import flash_attn_varlen_func as _FA2_VARLEN_FUNC
 
 
-def _gather_paged_kv(
-    cache: torch.Tensor,
-    block_table_row: torch.Tensor,
-    seq_len: int,
-    block_size: int,
-) -> torch.Tensor:
-    """Gather first `seq_len` tokens from paged KV cache for one sequence.
+def _fa3_paged(q, k_cache, v_cache, cu_seqlens_q, seqused_k,
+               max_seqlen_q, max_seqlen_k, block_table, softmax_scale):
+    out, lse = _FA3_VARLEN_FUNC(
+        q, k_cache, v_cache,
+        max_seqlen_q=max_seqlen_q,
+        cu_seqlens_q=cu_seqlens_q,
+        max_seqlen_k=max_seqlen_k,
+        seqused_k=seqused_k,
+        block_table=block_table,
+        softmax_scale=softmax_scale,
+        causal=False,
+        return_softmax_lse=True,
+        fa_version=3,
+    )
+    return out, lse
 
-    cache: [num_blocks, block_size, H_kv, D] (NHD layout)
-    block_table_row: [max_blocks] int32
-    Returns: [seq_len, H_kv, D]
-    """
-    n_blocks = (seq_len + block_size - 1) // block_size
-    if n_blocks == 0:
-        return cache.new_empty((0, cache.shape[2], cache.shape[3]))
-    blocks = block_table_row[:n_blocks].long()
-    gathered = cache[blocks]
-    flat = gathered.reshape(n_blocks * block_size, cache.shape[2], cache.shape[3])
-    return flat[:seq_len]
+
+def _fa2_paged(q, k_cache, v_cache, cu_seqlens_q, cu_seqlens_k,
+               max_seqlen_q, max_seqlen_k, block_table, softmax_scale):
+    out, lse, _ = _FA2_VARLEN_FUNC(
+        q, k_cache, v_cache,
+        cu_seqlens_q=cu_seqlens_q,
+        cu_seqlens_k=cu_seqlens_k,
+        max_seqlen_q=max_seqlen_q,
+        max_seqlen_k=max_seqlen_k,
+        block_table=block_table,
+        softmax_scale=softmax_scale,
+        causal=False,
+        return_attn_probs=True,
+    )
+    return out, lse
+
+
+def _fa2_dense(q, k_flat, v_flat, cu_seqlens_q, cu_seqlens_k,
+               max_seqlen_q, max_seqlen_k, softmax_scale):
+    out, lse, _ = _FA2_VARLEN_FUNC(
+        q, k_flat, v_flat,
+        cu_seqlens_q=cu_seqlens_q,
+        cu_seqlens_k=cu_seqlens_k,
+        max_seqlen_q=max_seqlen_q,
+        max_seqlen_k=max_seqlen_k,
+        softmax_scale=softmax_scale,
+        causal=False,
+        return_attn_probs=True,
+    )
+    return out, lse
 
 
 class TreeAttnPrefill(nn.Module):
-    """Verify-step attention with a tree mask, looping over sequences."""
+    """Verify-step attention via cascade (two batched calls + LSE merge)."""
 
     def __init__(self, num_heads: int, num_kv_heads: int, head_dim: int):
         super().__init__()
@@ -49,71 +118,125 @@ class TreeAttnPrefill(nn.Module):
         self.num_kv_heads = num_kv_heads
         self.head_dim = head_dim
         self.sm_scale = head_dim ** -0.5
-        self.gqa_groups = num_heads // num_kv_heads
 
     def forward(
         self,
         q: torch.Tensor,
         k_cache: torch.Tensor,
         v_cache: torch.Tensor,
-        cache_seqlens: torch.Tensor,
-        block_table: torch.Tensor,
-        tree_mask: torch.Tensor,
-        num_verify_tokens: int,
+        block_table_prefix: torch.Tensor,
+        cache_seqlens_prefix: torch.Tensor,
+        cu_seqlens_q_prefix: torch.Tensor,
+        max_seqlen_q_prefix: int,
+        max_seqlen_k_prefix: int,
+        page_table_expand: torch.Tensor,
+        cache_seqlens_expand: torch.Tensor,
+        cu_seqlens_q_expand: torch.Tensor,
+        max_seqlen_k_expand: int,
         block_size: int,
         softmax_scale: Optional[float] = None,
     ) -> torch.Tensor:
         """
         Parameters
         ----------
-        q : [B * N, H_q, D] -- the new query tokens (N = num_verify_tokens)
-        k_cache, v_cache : paged NHD cache, KV for prefix + new draft already stored
-        cache_seqlens : [B] -- total seq length **including** the just-stored
-            draft tokens (i.e. prefix_len + N)
-        block_table : [B, max_blocks_per_seq]
-        tree_mask : flat bool tensor in FULL_MASK layout produced by
-            build_tree_kernel_efficient. For batch i with prefix length
-            s_i = cache_seqlens[i] - N it contains N rows of (s_i + N) bools,
-            concatenated across the batch.
+        q : [B*N, H_q, D]
+            Verify queries (N = num_draft_tokens) flattened across batch.
+        k_cache, v_cache : [num_blocks, block_size, H_kv, D]
+            Paged KV cache (NHD layout). Prefix + draft tokens already written.
+        block_table_prefix : [B, max_pages] int32
+            Block-level page table for the prefix pass.
+        cache_seqlens_prefix : [B] int32
+            Prefix length per sequence (== ``t_committed_len[i]``).
+        cu_seqlens_q_prefix : [B+1] int32 = [0, N, 2N, ..., B*N]
+        max_seqlen_q_prefix : int = N
+        max_seqlen_k_prefix : int = max(prefix lengths)
+        page_table_expand : [B*N, N] int32
+            Token-level slot indices for the expand pass. Each row i contains
+            up to N slots; the first ``cache_seqlens_expand[i]`` are the draft
+            tokens this query is allowed to attend to (sorted "live" first).
+        cache_seqlens_expand : [B*N] int32
+            Number of attended draft tokens per query.
+        cu_seqlens_q_expand : [B*N+1] int32 = arange(B*N+1)
+        max_seqlen_k_expand : int  (== N)
+        block_size : int
+            Page size of the underlying KV cache.
         """
         scale = softmax_scale if softmax_scale is not None else self.sm_scale
-        B = cache_seqlens.shape[0]
-        N = num_verify_tokens
-        H_q = self.num_heads
         H_kv = self.num_kv_heads
         D = self.head_dim
-        device = q.device
-        dtype = q.dtype
 
-        out = torch.empty_like(q)
+        kc_blk = k_cache.view(-1, block_size, H_kv, D)
+        vc_blk = v_cache.view(-1, block_size, H_kv, D)
 
-        cs_cpu = cache_seqlens.tolist()
-        mask_offset = 0
-        for i in range(B):
-            total_len = int(cs_cpu[i])
-            prefix_len = total_len - N
-            k_full = _gather_paged_kv(k_cache, block_table[i], total_len, block_size)
-            v_full = _gather_paged_kv(v_cache, block_table[i], total_len, block_size)
-
-            row_len = prefix_len + N
-            mask_size = N * row_len
-            mask_bits = tree_mask[mask_offset:mask_offset + mask_size].view(N, row_len)
-            mask_offset += mask_size
-
-            qi = q[i * N:(i + 1) * N]
-            qi_b = qi.transpose(0, 1).unsqueeze(0)
-            k_b = k_full.transpose(0, 1).unsqueeze(0)
-            v_b = v_full.transpose(0, 1).unsqueeze(0)
-
-            attn_mask = mask_bits.to(dtype=torch.bool, device=device).unsqueeze(0).unsqueeze(0)
-
-            oi = F.scaled_dot_product_attention(
-                qi_b, k_b, v_b,
-                attn_mask=attn_mask,
-                dropout_p=0.0,
-                scale=scale,
-                enable_gqa=(self.gqa_groups != 1),
+        if _FA3_AVAILABLE:
+            o_prefix, lse_prefix = _fa3_paged(
+                q, kc_blk, vc_blk,
+                cu_seqlens_q=cu_seqlens_q_prefix,
+                seqused_k=cache_seqlens_prefix,
+                max_seqlen_q=max_seqlen_q_prefix,
+                max_seqlen_k=max_seqlen_k_prefix,
+                block_table=block_table_prefix,
+                softmax_scale=scale,
             )
-            out[i * N:(i + 1) * N] = oi.squeeze(0).transpose(0, 1).to(dtype)
 
+            kc_tok = k_cache.view(-1, 1, H_kv, D)
+            vc_tok = v_cache.view(-1, 1, H_kv, D)
+            o_expand, lse_expand = _fa3_paged(
+                q, kc_tok, vc_tok,
+                cu_seqlens_q=cu_seqlens_q_expand,
+                seqused_k=cache_seqlens_expand,
+                max_seqlen_q=1,
+                max_seqlen_k=max_seqlen_k_expand,
+                block_table=page_table_expand,
+                softmax_scale=scale,
+            )
+        else:
+            cu_seqlens_k_prefix = torch.zeros(
+                cache_seqlens_prefix.shape[0] + 1,
+                dtype=torch.int32, device=q.device,
+            )
+            cu_seqlens_k_prefix[1:] = torch.cumsum(
+                cache_seqlens_prefix, dim=0, dtype=torch.int32,
+            )
+            o_prefix, lse_prefix = _fa2_paged(
+                q, kc_blk, vc_blk,
+                cu_seqlens_q=cu_seqlens_q_prefix,
+                cu_seqlens_k=cu_seqlens_k_prefix,
+                max_seqlen_q=max_seqlen_q_prefix,
+                max_seqlen_k=max_seqlen_k_prefix,
+                block_table=block_table_prefix,
+                softmax_scale=scale,
+            )
+
+            BN, N = page_table_expand.shape
+            row_arange = torch.arange(N, device=q.device)
+            valid_mask = (
+                row_arange[None, :] < cache_seqlens_expand[:, None].long()
+            )                                                         # [B*N, N]
+            flat_slots = page_table_expand[valid_mask].long()         # [total_k]
+            kc_flat = k_cache.view(-1, H_kv, D)
+            vc_flat = v_cache.view(-1, H_kv, D)
+            k_gathered = kc_flat[flat_slots]                          # [total_k, H_kv, D]
+            v_gathered = vc_flat[flat_slots]
+            cu_seqlens_k_expand = torch.zeros(
+                BN + 1, dtype=torch.int32, device=q.device,
+            )
+            cu_seqlens_k_expand[1:] = torch.cumsum(
+                cache_seqlens_expand, dim=0, dtype=torch.int32,
+            )
+            o_expand, lse_expand = _fa2_dense(
+                q, k_gathered, v_gathered,
+                cu_seqlens_q=cu_seqlens_q_expand,
+                cu_seqlens_k=cu_seqlens_k_expand,
+                max_seqlen_q=1,
+                max_seqlen_k=max_seqlen_k_expand,
+                softmax_scale=scale,
+            )
+
+        lse_prefix_t = lse_prefix.transpose(0, 1).contiguous()
+        lse_expand_t = lse_expand.transpose(0, 1).contiguous()
+        out, _ = merge_state(
+            o_prefix, lse_prefix_t,
+            o_expand, lse_expand_t,
+        )
         return out
