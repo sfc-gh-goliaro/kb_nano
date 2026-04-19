@@ -112,9 +112,22 @@ class BitNetModel(nn.Module):
 
 
 class BitNetForCausalLM(nn.Module):
-    # BitNet stores attention projections separately (q_proj, k_proj, v_proj)
-    # rather than as a fused qkv_proj.  No packed mapping is required.
-    packed_modules_mapping: dict = {}
+    # BitNet's checkpoint stores attention projections separately
+    # (q_proj, k_proj, v_proj) and MLP gate / up separately, but kb_nano
+    # consolidates each group into a single ``BitLinearMerged`` for SOTA
+    # parity with vllm_repo/BitNet's ``wqkv`` and ``w13`` and to halve
+    # GEMM kernel launch overhead.  ``packed_modules_mapping`` tells the
+    # shared weight loader how to redirect the on-disk tensor names into
+    # the fused params, with the ``shard_id`` carrying the sub-projection
+    # tag.  Substring matching in the loader handles both ``.weight`` and
+    # ``.weight_scale`` automatically.
+    packed_modules_mapping: dict = {
+        "q_proj":    ("qkv_proj", "q"),
+        "k_proj":    ("qkv_proj", "k"),
+        "v_proj":    ("qkv_proj", "v"),
+        "gate_proj": ("gate_up_proj", 0),
+        "up_proj":   ("gate_up_proj", 1),
+    }
 
     def __init__(self, config: BitNetConfig):
         super().__init__()

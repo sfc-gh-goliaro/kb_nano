@@ -1,99 +1,82 @@
-"""BitLinear: linear layer for BitNet b1.58 with W1.58A8 inference.
+"""BitLinear: native W1.58A8 linear layers for ``microsoft/bitnet-b1.58-2B-4T``.
 
-Implements the "Native 1.58-bit weights and 8-bit activations" (W1.58A8)
-format used by Microsoft's ``microsoft/bitnet-b1.58-2B-4T`` checkpoint:
+This module provides two parameter-holding modules that wrap the
+:func:`bitnet_int8xint2_linear` kernel from
+``kb_nano/tasks/baseline/L1/bitnet_int8xint2_linear.py``:
 
-    w_quant   in {-1, 0, +1}      (per-tensor scale ``weight_scale``)
-    a_quant   per-token int8      (per-row scale ``act_scale``)
-    y         = (a_quant @ w_quant.T) * weight_scale / act_scale + bias
+* :class:`BitLinear` - single projection (one HF Linear in, one out).
+* :class:`BitLinearMerged` - fused projection used to consolidate
+  ``{q_proj, k_proj, v_proj}`` into one ``qkv_proj`` and
+  ``{gate_proj, up_proj}`` into one ``gate_up_proj``.  This matches the
+  SOTA reference (``vllm_repo/BitNet/gpu/model.py``'s ``wqkv`` / ``w13``)
+  and lets a single GEMM kernel launch handle three (resp. two) projections.
 
-The HuggingFace checkpoint stores ``weight`` in one of two formats:
+Weight memory layout (for both classes)::
 
-    * **offline / packed**:  uint8 tensor of shape ``(out//4, in)`` where each
-      byte packs four ternary values (2 bits each, biased by +1 so unsigned).
-      ``weight_scale`` is a scalar bf16 stored alongside.
-    * **online / bf16**:     bf16 tensor of shape ``(out, in)`` already
-      containing dequantized ternary values (master weights).  In this mode
-      the model card omits ``weight_scale`` and the scale is implicit (=1).
+    weight       : uint8, (total_out, in_features // 4)   KN-packed ternary
+    weight_scale : bf16,  (total_out,)                    per-output-row scale
+    bias         : bf16,  (total_out,)  -- optional
 
-After loading, ``self.weight`` always holds the unpacked bf16 ternary tensor
-``(out, in)`` and ``self.weight_scale`` is a scalar bf16 buffer.  Forward
-matches HuggingFace's ``AutoBitLinear`` (offline mode) and Microsoft's
-reference ``BitLinear``: per-token int8 activation quantization, dequantized
-matmul, then multiplied by ``weight_scale``.
+The on-disk HuggingFace checkpoint stores ``weight`` as ``(out//4, in)``
+uint8 packed along OUT (a 2-bit interleave per byte) and ``weight_scale``
+as a single bf16 scalar.  The ``weight_loader`` callbacks below unpack the
+HF format and re-pack into the simpler KN-major layout once at load time;
+all forward-pass arithmetic happens in native int8 / int2 with bf16 scale
+folding -- no bf16 master weights, no ``F.linear`` fallback.
 """
 
 from __future__ import annotations
 
+from typing import Mapping, Sequence
+
 import torch
 import torch.nn as nn
-import torch.nn.functional as F
+
+from .bitnet_int8xint2_linear import (
+    VALUES_PER_BYTE,
+    bitnet_int8xint2_linear,
+    hf_packed_to_kn_packed,
+)
 
 
-# Two-bit ternary packing factor used by the offline checkpoint format.
-VALUES_PER_ITEM = 4
+__all__ = ["BitLinear", "BitLinearMerged", "VALUES_PER_BYTE"]
 
 
-def unpack_ternary_weights(packed: torch.Tensor, dtype: torch.dtype) -> torch.Tensor:
-    """Unpack a uint8 (out//4, in) tensor into bf16 ternary (out, in).
+def _broadcast_scale_(slice_: torch.Tensor, loaded: torch.Tensor) -> None:
+    """Fill ``slice_`` (1D) with the scalar value carried by ``loaded``.
 
-    Layout matches ``transformers.integrations.bitnet.unpack_weights``: each
-    byte stores four 2-bit values along the row dimension; the i-th value
-    occupies bits ``2i .. 2i+1`` and is biased by +1 (so 0 -> -1, 1 -> 0,
-    2 -> +1).
+    HF stores ``weight_scale`` as a single-element bf16 tensor.  We
+    broadcast that scalar across every output row of the corresponding
+    shard so the GEMM kernel can apply per-row dequantization in one pass
+    (uniform for non-merged ``BitLinear``; per-shard for the merged form).
     """
-    if packed.dtype != torch.uint8:
-        packed = packed.to(torch.uint8)
-    packed_rows = packed.shape[0]
-    out_rows = packed_rows * VALUES_PER_ITEM
-    rest = packed.shape[1:]
-
-    unpacked = torch.empty((out_rows, *rest), device=packed.device, dtype=torch.uint8)
-    for i in range(VALUES_PER_ITEM):
-        mask = 3 << (2 * i)
-        unpacked[i * packed_rows:(i + 1) * packed_rows] = (packed & mask) >> (2 * i)
-    return unpacked.to(dtype) - 1
-
-
-def activation_quant(x: torch.Tensor) -> tuple[torch.Tensor, torch.Tensor]:
-    """Symmetric per-token int8 activation quantization.
-
-    Returns ``(x_int8_as_dtype, scale)`` where ``scale`` is the per-token
-    factor such that ``x_int8 / scale`` recovers the dequantized activation.
-    The returned tensor is kept in the input dtype (rather than int8) to
-    feed straight into ``F.linear`` without an extra cast.
-    """
-    scale = 127.0 / x.abs().amax(dim=-1, keepdim=True).clamp_(min=1e-5)
-    q = (x * scale).round().clamp_(-128, 127)
-    return q, scale
+    slice_.fill_(float(loaded.detach().to(torch.float32).flatten()[0]))
 
 
 class BitLinear(nn.Module):
-    """W1.58A8 linear layer.
-
-    ``weight`` and ``weight_scale`` are exposed as ``nn.Parameter`` so they
-    integrate with the shared :func:`~kb_nano.infra.weight_loader.load_weights`
-    pipeline (which uses ``model.get_parameter`` to locate each tensor).
-    Both are non-trainable.  The custom ``weight_loader`` callback on
-    ``weight`` transparently unpacks the packed uint8 (out//4, in) format
-    used by the offline HuggingFace checkpoint into the bf16 (out, in)
-    ternary tensor expected at runtime.
-    """
+    """W1.58A8 linear layer (single projection)."""
 
     def __init__(self, in_features: int, out_features: int, bias: bool = False,
                  device=None, dtype=None):
         super().__init__()
-        self.in_features = in_features
-        self.out_features = out_features
         if dtype is None:
             dtype = torch.get_default_dtype()
+        assert in_features % VALUES_PER_BYTE == 0, (
+            f"BitLinear in_features={in_features} must be divisible by "
+            f"{VALUES_PER_BYTE} for KN-packed ternary weights"
+        )
+        self.in_features = in_features
+        self.out_features = out_features
+        self.scale_dtype = dtype
+
         self.weight = nn.Parameter(
-            torch.empty(out_features, in_features, dtype=dtype, device=device),
+            torch.zeros(out_features, in_features // VALUES_PER_BYTE,
+                        dtype=torch.uint8, device=device),
             requires_grad=False,
         )
         self.weight.weight_loader = self._weight_loader
         self.weight_scale = nn.Parameter(
-            torch.ones(1, dtype=dtype, device=device),
+            torch.ones(out_features, dtype=dtype, device=device),
             requires_grad=False,
         )
         self.weight_scale.weight_loader = self._scale_loader
@@ -105,24 +88,153 @@ class BitLinear(nn.Module):
         else:
             self.bias = None
 
+    # -- weight loading ----------------------------------------------------
     def _weight_loader(self, param: nn.Parameter, loaded: torch.Tensor) -> None:
-        if loaded.dtype == torch.uint8 or (
-            loaded.shape[0] * VALUES_PER_ITEM == param.data.shape[0]
-            and loaded.shape[1] == param.data.shape[1]
+        # HF stores packed ternary as uint8 (out//4, in); occasionally it
+        # arrives as a master-weight bf16 (out, in) tensor in {-1, 0, +1}.
+        if loaded.dtype == torch.uint8 and loaded.shape == (
+            self.out_features // VALUES_PER_BYTE, self.in_features
         ):
-            loaded = unpack_ternary_weights(loaded, dtype=param.data.dtype)
-        param.data.copy_(loaded)
+            kn = hf_packed_to_kn_packed(loaded.to(param.device))
+        elif loaded.dtype == torch.uint8 and loaded.shape == (
+            self.out_features, self.in_features // VALUES_PER_BYTE
+        ):
+            # Already KN-packed (e.g. another kb_nano checkpoint).
+            kn = loaded.to(param.device)
+        else:
+            # Treat as bf16 master weights with values already in {-1, 0, +1}.
+            from .bitnet_int8xint2_linear import repack_ternary_kn
+            mw = loaded.to(param.device).round().clamp_(-1, 1).to(torch.int8)
+            kn = repack_ternary_kn(mw)
+        param.data.copy_(kn)
 
     def _scale_loader(self, param: nn.Parameter, loaded: torch.Tensor) -> None:
-        if loaded.numel() == param.data.numel():
-            param.data.copy_(loaded.reshape(param.data.shape))
+        if loaded.numel() == 1:
+            _broadcast_scale_(param.data, loaded)
+        elif loaded.numel() == param.data.numel():
+            param.data.copy_(loaded.to(param.dtype))
         else:
-            param.data.copy_(loaded)
+            raise ValueError(
+                f"BitLinear weight_scale shape mismatch: got {tuple(loaded.shape)}, "
+                f"expected scalar or {tuple(param.shape)}"
+            )
 
+    # -- forward -----------------------------------------------------------
     def forward(self, x: torch.Tensor) -> torch.Tensor:
-        x_q, act_scale = activation_quant(x)
-        y = F.linear(x_q, self.weight)
-        y = y * (self.weight_scale / act_scale)
-        if self.bias is not None:
-            y = y + self.bias
-        return y
+        return bitnet_int8xint2_linear(x, self.weight, self.weight_scale, self.bias)
+
+
+class BitLinearMerged(nn.Module):
+    """W1.58A8 linear with multiple shards fused along the output dim.
+
+    Mirrors ``QKVParallelLinear`` / ``MergedColumnParallelLinear`` from
+    kb_nano's L2 parallel-linear primitives, except specialized to BitNet's
+    int8-x-int2 GEMM and *without* tensor-parallel sharding (BitNet 2B is TP=1
+    by design - the model is small enough to fit on a single GPU).
+    """
+
+    def __init__(self, in_features: int, out_sizes: Sequence[int],
+                 shard_id_map: Mapping | None = None,
+                 bias: bool = False, device=None, dtype=None):
+        super().__init__()
+        if dtype is None:
+            dtype = torch.get_default_dtype()
+        assert in_features % VALUES_PER_BYTE == 0
+        assert all(s % VALUES_PER_BYTE == 0 for s in out_sizes), (
+            f"BitLinearMerged shard sizes {out_sizes} must each be divisible "
+            f"by {VALUES_PER_BYTE}"
+        )
+        self.in_features = in_features
+        self.out_sizes = list(out_sizes)
+        self.total_out = sum(self.out_sizes)
+        self.shard_offsets = [0]
+        for s in self.out_sizes:
+            self.shard_offsets.append(self.shard_offsets[-1] + s)
+        self.scale_dtype = dtype
+
+        self.weight = nn.Parameter(
+            torch.zeros(self.total_out, in_features // VALUES_PER_BYTE,
+                        dtype=torch.uint8, device=device),
+            requires_grad=False,
+        )
+        self.weight.weight_loader = self._weight_loader
+        self.weight_scale = nn.Parameter(
+            torch.ones(self.total_out, dtype=dtype, device=device),
+            requires_grad=False,
+        )
+        self.weight_scale.weight_loader = self._scale_loader
+        if bias:
+            self.bias = nn.Parameter(
+                torch.zeros(self.total_out, dtype=dtype, device=device),
+                requires_grad=False,
+            )
+            self.bias.weight_loader = self._bias_loader
+        else:
+            self.bias = None
+
+        # ``shard_id_map`` lets callers route HF shard names like ``"q"``,
+        # ``"k"``, ``"v"`` to integer slot indices.  Unmapped integer ids
+        # are passed through unchanged (used by gate_up_proj which natively
+        # carries 0/1 from packed_modules_mapping).
+        self._shard_map = dict(shard_id_map) if shard_id_map else {}
+
+    # -- helpers -----------------------------------------------------------
+    def _shard_index(self, shard_id) -> int:
+        if shard_id in self._shard_map:
+            return int(self._shard_map[shard_id])
+        if isinstance(shard_id, int):
+            return shard_id
+        raise KeyError(
+            f"BitLinearMerged: unknown shard_id {shard_id!r}; expected one of "
+            f"{list(self._shard_map.keys()) or 'integer index'}"
+        )
+
+    def _shard_slice(self, idx: int) -> slice:
+        start = self.shard_offsets[idx]
+        end = self.shard_offsets[idx + 1]
+        return slice(start, end)
+
+    # -- weight loading ----------------------------------------------------
+    def _weight_loader(self, param: nn.Parameter, loaded: torch.Tensor,
+                       shard_id) -> None:
+        idx = self._shard_index(shard_id)
+        sz = self.out_sizes[idx]
+        sl = self._shard_slice(idx)
+        if loaded.dtype == torch.uint8 and loaded.shape == (
+            sz // VALUES_PER_BYTE, self.in_features
+        ):
+            kn = hf_packed_to_kn_packed(loaded.to(param.device))
+        elif loaded.dtype == torch.uint8 and loaded.shape == (
+            sz, self.in_features // VALUES_PER_BYTE
+        ):
+            kn = loaded.to(param.device)
+        else:
+            from .bitnet_int8xint2_linear import repack_ternary_kn
+            mw = loaded.to(param.device).round().clamp_(-1, 1).to(torch.int8)
+            kn = repack_ternary_kn(mw)
+        param.data[sl].copy_(kn)
+
+    def _scale_loader(self, param: nn.Parameter, loaded: torch.Tensor,
+                      shard_id) -> None:
+        idx = self._shard_index(shard_id)
+        sl = self._shard_slice(idx)
+        if loaded.numel() == 1:
+            _broadcast_scale_(param.data[sl], loaded)
+        elif loaded.numel() == self.out_sizes[idx]:
+            param.data[sl].copy_(loaded.to(param.dtype))
+        else:
+            raise ValueError(
+                f"BitLinearMerged weight_scale shape mismatch for shard "
+                f"{shard_id}: got {tuple(loaded.shape)}, expected scalar "
+                f"or {(self.out_sizes[idx],)}"
+            )
+
+    def _bias_loader(self, param: nn.Parameter, loaded: torch.Tensor,
+                     shard_id) -> None:
+        idx = self._shard_index(shard_id)
+        sl = self._shard_slice(idx)
+        param.data[sl].copy_(loaded.to(param.dtype))
+
+    # -- forward -----------------------------------------------------------
+    def forward(self, x: torch.Tensor) -> torch.Tensor:
+        return bitnet_int8xint2_linear(x, self.weight, self.weight_scale, self.bias)

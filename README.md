@@ -1,6 +1,6 @@
 # kb-nano
 
-A standalone, high-performance inference engine supporting **LLMs** (Llama 3.1, Llama 4, Mixtral-8x7B, DeepSeek V3.2, GPT-OSS, Qwen2-VL, Qwen3-VL), **diffusion models** (FLUX.1-dev, SDXL, HunyuanVideo-1.5), **detection models** (YOLOv10, RTDetrV2), **vision encoders** (SigLIP-2, DINOv3, SwinV2), **segmentation models** (SAM3.1), **protein structure prediction** (OpenFold3), audio models (Whisper), and **TTS models** (CosyVoice3) with tensor parallelism and FP8 quantization. No vLLM dependency at runtime — just PyTorch, Triton, and Flash Attention.
+A standalone, high-performance inference engine supporting **LLMs** (Llama 3.1, Llama 4, Mixtral-8x7B, DeepSeek V3.2, GPT-OSS, BitNet b1.58, Qwen2-VL, Qwen3-VL), **diffusion models** (FLUX.1-dev, SDXL, HunyuanVideo-1.5), **detection models** (YOLOv10, RTDetrV2), **vision encoders** (SigLIP-2, DINOv3, SwinV2), **segmentation models** (SAM3.1), **protein structure prediction** (OpenFold3), audio models (Whisper), and **TTS models** (CosyVoice3) with tensor parallelism and FP8 quantization. No vLLM dependency at runtime — just PyTorch, Triton, and Flash Attention.
 
 ## Features
 
@@ -9,6 +9,7 @@ A standalone, high-performance inference engine supporting **LLMs** (Llama 3.1, 
 - **Mixtral-8x7B** with fused Triton MoE grouped-GEMM kernels
 - **DeepSeek V3.2** with MLA (Multi-head Latent Attention), 256-expert MoE via DeepGEMM FP8, DSA (DeepSeek Sparse Attention), and YARN RoPE — currently **0.78–0.90× of vLLM** throughput on 8×H200 (gap due to kernel-launch overhead, GEMM kernel selection, and AllReduce+RMSNorm fusion)
 - **GPT-OSS** (20B, 120B) MXFP4-quantized MoE with native Triton inference, YaRN RoPE, attention sinks, and sliding window
+- **BitNet b1.58 2B** (`microsoft/bitnet-b1.58-2B-4T`) native **W1.58A8** inference (1.58-bit ternary weights × int8 activations) with a custom Triton `int8 × packed-int2` GEMM, fused QKV / gate-up `BitLinearMerged` projections, squared-ReLU gated FFN, and `attn_sub_norm` / `ffn_sub_norm` placement matching the SOTA `vllm_repo/BitNet` architecture
 - **FLUX.1-dev** diffusion transformer (text-to-image) with Flash Attention
 - **SDXL** (Stable Diffusion XL) UNet-based text-to-image with dual CLIP text encoders
 - **HunyuanVideo-1.5** 3D video diffusion transformer (text-to-video) with dual-stream joint attention, M-RoPE, and Qwen2.5-VL text encoder
@@ -119,6 +120,12 @@ python tests/bench_vllm.py \
 
 # Whisper speech-to-text
 python tests/bench_vllm.py --model openai/whisper-large-v3
+
+# BitNet b1.58 (W1.58A8 native int8 inference) vs Microsoft BitNet GPU lib
+# (requires building the official CUDA kernel + converting the checkpoint -
+#  see tests/bench_microsoft_bitnet.py docstring for the one-time setup)
+BITNET_REPO=/path/to/microsoft/BitNet python tests/bench_microsoft_bitnet.py
+python tests/bench_microsoft_bitnet.py --skip-sota  # kb-nano only
 
 # Bench module tests (unit tests + GPU integration)
 python tests/test_bench.py
@@ -509,6 +516,24 @@ Latency (128 output tokens, 5 iterations):
 | gpt-oss-120b | 2 | fixed-batch-32 | 32 | 1.331s | 1.394s | 0.33 | 0.34 | 0.95x |
 
 Both models are at or above vLLM throughput across all scenarios (20B: 1.00–1.04x, 120B: 1.02–1.05x). Single-request latency trails vLLM (0.83–0.93x) since vLLM benefits from `torch.compile`/Inductor fusions at small batch sizes, while batched latency is on par. The lower token match rate for the 120B model is expected: with 128 experts and top-4 routing, small numerical differences in router logits cause different expert selections, which cascade into divergent outputs. The 20B model (32 experts) shows higher match rates (~86–91%).
+
+### BitNet b1.58 2B (W1.58A8)
+
+`microsoft/bitnet-b1.58-2B-4T` runs in its native ternary-weight × int8-activation regime via a custom Triton `int8 × packed-int2` GEMM kernel (`tasks/baseline/L1/bitnet_int8xint2_linear.py`). The HuggingFace checkpoint stores ternary weights packed 4-per-`uint8` along the output axis; we re-pack to KN-layout (`out, in//4`) at load time to match the kernel's tile layout. QKV and gate/up projections are fused into single `BitLinearMerged` calls, the MLP uses a fused squared-ReLU + multiply L1 primitive (`SquaredReluAndMul`), and `attn_sub_norm` / `ffn_sub_norm` RMSNorms are placed inside attention/MLP blocks per the SOTA `vllm_repo/BitNet` architecture. SOTA reference is the official **Microsoft BitNet GPU library** (`vllm_repo/BitNet/gpu`, custom W2A8 CUDA kernel + CUDA-graph batched decode); HuggingFace `transformers` does *not* run this model in its native quantized format and is roughly 5× slower than either implementation, so it is not used as a reference.
+
+Run `tests/bench_microsoft_bitnet.py` to reproduce. 1000 sequences per scenario, `temperature=0`, `ignore_eos=True`, `enforce_eager=True`. The Microsoft GPU library hard-pins (batch size, prompt length, decode length) at CUDA-graph capture time, so the SOTA worker rebuilds the engine per scenario and processes prompts in `gen_bsz=32` chunks (the largest that fits the prefill activation in 140 GB).
+
+**Hardware: NVIDIA H200**
+
+Throughput:
+
+| Model | TP | Scenario | Input/Output | Microsoft BitNet GPU (tok/s) | Ours (tok/s) | Ratio |
+|-------|---:|----------|:------------:|------------------------------:|-------------:|------:|
+| BitNet-b1.58-2B-4T | 1 | prefill-heavy | 1024/512  | 27,943 | 11,433 | 0.41x |
+| BitNet-b1.58-2B-4T | 1 | balanced      |  512/512  | 23,108 | 11,296 | 0.49x |
+| BitNet-b1.58-2B-4T | 1 | decode-heavy  |  512/1024 | 18,489 | 10,499 | 0.57x |
+
+kb-nano currently runs at 0.41–0.57x of the Microsoft BitNet GPU library across the three scenarios. The remaining gap is dominated by (1) the Triton int8×int2 GEMM not yet matching the official `dp4a`-based CUDA kernel on Hopper (the SOTA kernel uses 16×32 weight-block permutation, fast-decode interleaving, and per-warp `dp4a` accumulation); (2) the SOTA library uses a separate fp16 prefill model + int2 decode model with model-specific CUDA-graph capture, while kb-nano runs a single int2 model with paged KV-cache scheduling that adds per-step launch overhead at small batch sizes; and (3) kb-nano carries general-purpose paged-attention / chunked-prefill machinery whose fixed cost is not amortized at 2B parameters. Closing the gap is tracked under follow-up work to either port the official `dp4a` GEMM as an L1 candidate or to autotune larger Triton tile shapes for Hopper.
 
 **Hardware: 4x NVIDIA B200 (NVLink)**
 
