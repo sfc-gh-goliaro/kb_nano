@@ -44,6 +44,10 @@ from .bitnet_int8xint2_linear import (
 __all__ = ["BitLinear", "BitLinearMerged", "VALUES_PER_BYTE"]
 
 
+_BITNET_FORCE_BF16 = bool(int(__import__("os").environ.get(
+    "KB_BITNET_FORCE_BF16", "0")))
+
+
 def _bitnet_use_bf16_path(M: int) -> bool:
     """True iff this call should use the bf16 fake-quant prefill path.
 
@@ -52,7 +56,14 @@ def _bitnet_use_bf16_path(M: int) -> bool:
     context flag.  Outside an engine context we fall back to an
     M-threshold heuristic (1024) so unit tests / micro-benchmarks pick
     a sensible default.
+
+    ``KB_BITNET_FORCE_BF16=1`` short-circuits to the bf16 path always —
+    used to bisect alignment vs throughput regressions: if avg-match
+    stays the same with this on, the int8 kernel is correctly aligned;
+    if it jumps, the int8 path has divergence (kernel/quantization).
     """
+    if _BITNET_FORCE_BF16:
+        return True
     try:
         from ....infra.context import get_context
         ctx = get_context()
