@@ -58,7 +58,13 @@ class MambaSlotCache:
 
 
 class MambaStateManager:
-    """Owns global Mamba recurrent state tensors and free slot bookkeeping."""
+    """Owns global Mamba recurrent state tensors and free-slot bookkeeping.
+
+    All TP ranks maintain identical ``_free_slots`` deques: each rank
+    deterministically pops slots in the same order, so the per-step
+    state slot indices match across ranks without any cross-rank
+    communication.
+    """
 
     def __init__(
         self,

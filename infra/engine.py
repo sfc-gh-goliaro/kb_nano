@@ -334,6 +334,10 @@ class ModelRunner:
             # buffers, torch.compile, CUDA graphs, fast greedy buffers --
             # those all hardcode kv_cache / context_lens / block_tables).
             self._share_activation_buffers()
+            # Tier 1A: profile pass before sizing the state pool, mirroring
+            # vLLM's profile_run -> determine_available_memory ->
+            # get_kv_cache_configs flow.
+            self._profile_mamba_run()
             self.allocate_mamba_state_cache()
             self._init_mamba_decode_buffers()
             if not self.enforce_eager:
@@ -798,26 +802,31 @@ class ModelRunner:
     # ------------------------------------------------------------------
     # Mamba / SSM model support (slot-based recurrent state)
     # ------------------------------------------------------------------
-    def allocate_mamba_state_cache(self):
-        """Size and allocate the global Mamba conv/ssm state pool.
+    # Memory reserved for the CUDA-graph private pool (decode buckets).
+    # Mirrors vLLM's ``profile_cudagraph_memory`` headroom, but without
+    # the temp-graph capture pass: empirically ~1.0-1.5 GiB covers up to
+    # 14 buckets at bs=256 for both Mamba v1 (2.8B) and Mamba2 (Codestral
+    # 7B) on H200.  Tunable via env if a model needs more.
+    _MAMBA_GRAPH_RESERVE_BYTES = int(
+        os.environ.get("KB_NANO_MAMBA_GRAPH_RESERVE_BYTES", 1500 * 1024 * 1024)
+    )
 
-        Mirrors the heuristic used in ``allocate_kv_cache``: budget the
-        remaining 90% of GPU memory and divide by per-slot bytes to pick
-        ``num_slots``, capped by ``max_num_seqs``.
+    def _compute_mamba_state_shapes(self):
+        """Compute per-slot conv/ssm state shapes for the configured model.
+
+        Factored out so both ``_profile_mamba_run`` (temp pool) and
+        ``allocate_mamba_state_cache`` (final pool) use identical
+        sizing -- mirrors how vLLM's MambaSpec is computed once and
+        reused (``vllm/v1/attention/backends/mamba2_attn.py:get_kv_cache_shape``).
+
+        Returns ``(conv_dim, ssm_state_shape, conv_kernel, per_slot_bytes)``.
         """
-        free, total = torch.cuda.mem_get_info()
-        used = total - free
-        peak = torch.cuda.memory_stats()["allocated_bytes.all.peak"]
-        current = torch.cuda.memory_stats()["allocated_bytes.all.current"]
         cfg = self.config
-        num_layers = cfg.num_hidden_layers
         elem_size = torch.finfo(self.dtype).bits // 8
 
         if self.is_mamba2:
             n_groups = getattr(cfg, "n_groups", 1)
             tp = self.world_size
-            # Replicate groups so every TP shard owns at least one group
-            # (mirrors mixer's extra_groups_for_head_shards).
             if n_groups % tp != 0 and n_groups == 1:
                 effective_groups = tp
             elif n_groups % tp != 0:
@@ -829,8 +838,6 @@ class ModelRunner:
             intermediate_size = getattr(
                 cfg, "intermediate_size", cfg.num_heads * cfg.head_dim,
             )
-            # TP shards num_heads / intermediate_size / conv_dim across ranks
-            # (mirroring vLLM's MambaSpec which is sized per-rank).
             assert cfg.num_heads % tp == 0, (
                 f"num_heads={cfg.num_heads} not divisible by tp={tp}"
             )
@@ -860,23 +867,223 @@ class ModelRunner:
                 conv_dim * conv_kernel + intermediate_size * state_size
             ) * elem_size
 
+        return conv_dim, ssm_state_shape, conv_kernel, per_layer_bytes
+
+    def _build_profile_mamba_metadata(self, n_seqs: int, tokens_per_seq: int):
+        """Construct a synthetic prefill-only ``Mamba(2)Metadata`` for profiling.
+
+        Mirrors ``_mamba_prepare_tensors`` for ``n_seqs`` prefill seqs
+        of equal length, with state slot indices ``[0..n_seqs-1]``.
+        """
+        device = torch.device(f"cuda:{self.rank}")
+        chunk_size = getattr(self.config, "chunk_size", 256)
+
+        if self.is_mamba2:
+            meta = Mamba2Metadata(chunk_size=chunk_size)
+        else:
+            meta = MambaMetadata()
+
+        meta.num_prefill_tokens = n_seqs * tokens_per_seq
+        meta.num_decode_tokens = 0
+        meta.num_prefills = n_seqs
+        meta.num_decodes = 0
+
+        qsl = [i * tokens_per_seq for i in range(n_seqs + 1)]
+        meta.query_start_loc_p = torch.tensor(
+            qsl, dtype=torch.int32, device=device,
+        )
+        meta.state_indices_p = torch.arange(
+            n_seqs, dtype=torch.int32, device=device,
+        )
+        meta.has_initial_states_p = torch.zeros(
+            n_seqs, dtype=torch.bool, device=device,
+        )
+        meta.prep_initial_states = False
+
+        if self.is_mamba2:
+            num_computed = torch.zeros(n_seqs, dtype=torch.int32, device=device)
+            cu_chunk, seq_idx, last_idx = build_chunk_metadata(
+                meta.query_start_loc_p,
+                chunk_size=chunk_size,
+                num_computed_tokens_p=num_computed,
+            )
+            meta.cu_chunk_seqlen_p = cu_chunk
+            meta.seq_idx_p = seq_idx
+            meta.last_chunk_indices_p = last_idx
+
+        return meta
+
+    @torch.inference_mode()
+    def _profile_mamba_run(self):
+        """Measure peak activation memory of a worst-case Mamba prefill.
+
+        Mirrors vLLM's ``GPUWorker.determine_available_memory`` ->
+        ``GPUModelRunner.profile_run`` -> ``_dummy_run(max_num_tokens,
+        is_profile=True)`` chain (``vllm/v1/worker/gpu_worker.py:401-441``,
+        ``vllm/v1/worker/gpu_model_runner.py:5456-5528``).
+
+        Allocates a *temporary* small Mamba state cache (just enough
+        slots to host the synthetic batch) so the SSM kernels
+        (``chunk_scan_combined_varlen``, ``selective_state_update``,
+        ``causal_conv1d_fn``) are exercised on the real path -- skipping
+        the mixer's profile/warmup branch which would otherwise
+        underestimate the peak by ~10x for Mamba2 (the chunk-scan kernel,
+        residual stack, and float32 ``silu(gate)`` cast in
+        ``Mixer2RMSNormGated`` together dominate the activation
+        working set at 16384 tokens).
+
+        ``@torch.inference_mode`` is critical: without it the forward
+        records an autograd graph, pinning every layer's intermediate
+        activation and inflating the peak by 50-100x.
+
+        Records ``self._profile_peak_bytes``.
+        """
+        torch.cuda.empty_cache()
+        torch.cuda.synchronize()
+        torch.cuda.reset_peak_memory_stats()
+        baseline_alloc = torch.cuda.memory_stats()["allocated_bytes.all.current"]
+
+        n_tokens = int(self.max_num_batched_tokens)
+        device = torch.device(f"cuda:{self.rank}")
+
+        # Spread max_num_batched_tokens across multiple synthetic seqs so
+        # the chunk-scan kernel sees a realistic ``query_start_loc``
+        # layout.  vLLM's profile_run uses one synthetic seq per
+        # max_num_seqs slot; we use a small constant since Mamba's
+        # activation peak is dominated by total token count, not seq
+        # count (chunk_scan operates over the flat token axis).
+        n_seqs = max(1, min(8, n_tokens // 256))
+        tokens_per_seq = n_tokens // n_seqs
+        n_tokens = n_seqs * tokens_per_seq  # round to exact multiple
+
+        # Allocate a temporary state pool (just n_seqs slots) so the
+        # SSM kernels run on a real cache.  Mirrors vLLM's
+        # ``_init_minimal_kv_cache_for_profiling``
+        # (``vllm/v1/worker/gpu_model_runner.py:5531-5550``).
+        conv_dim, ssm_state_shape, conv_kernel, _ = self._compute_mamba_state_shapes()
+        temp_state = MambaStateManager(
+            num_hidden_layers=self.config.num_hidden_layers,
+            conv_dim=conv_dim,
+            ssm_state_shape=ssm_state_shape,
+            conv_kernel=conv_kernel,
+            num_slots=n_seqs,
+            dtype=self.dtype,
+            device=device,
+        )
+
+        input_ids = torch.zeros(n_tokens, dtype=torch.int64, device=device)
+        positions = torch.zeros(n_tokens, dtype=torch.int64, device=device)
+        for i in range(n_seqs):
+            positions[i * tokens_per_seq:(i + 1) * tokens_per_seq] = (
+                torch.arange(tokens_per_seq, dtype=torch.int64, device=device)
+            )
+
+        meta = self._build_profile_mamba_metadata(n_seqs, tokens_per_seq)
+
+        set_mamba_context(
+            is_prefill=True,
+            mamba_state=temp_state,
+            mamba_metadata=meta,
+        )
+        try:
+            hidden = self.model(input_ids, positions)
+            # Run lm_head on the largest plausible logits batch so its
+            # activation peak is also captured.  In real serving we
+            # pick last-token-per-seq; here we just pass max_num_seqs
+            # rows which is the upper bound.
+            n_logits = min(self.max_num_seqs, n_tokens)
+            logits_in = hidden[:n_logits]
+            _ = self.model.compute_logits(logits_in)
+            del logits_in
+        finally:
+            reset_context()
+        torch.cuda.synchronize()
+
+        peak = torch.cuda.memory_stats()["allocated_bytes.all.peak"]
+        self._profile_peak_bytes = max(0, int(peak - baseline_alloc))
+
+        del input_ids, positions, hidden, meta, temp_state
+        torch.cuda.empty_cache()
+        torch.cuda.synchronize()
+
+        if self.rank == 0:
+            print(
+                f"  Mamba profile pass: activation peak "
+                f"{self._profile_peak_bytes / (1<<20):.1f} MiB "
+                f"(at {n_tokens} tokens, {n_seqs} synthetic prefill seqs)"
+            )
+
+    def allocate_mamba_state_cache(self):
+        """Size and allocate the global Mamba conv/ssm state pool.
+
+        Tier 1A: profile-based sizing modeled on vLLM's
+        ``determine_available_memory`` (``vllm/v1/worker/gpu_worker.py:
+        349-441``):
+
+        ``num_slots = (total*gpu_memory_utilization
+                       - currently_allocated_bytes
+                       - profile_activation_peak
+                       - graph_reserve) / per_slot_bytes``
+
+        ``currently_allocated_bytes`` covers model parameters; the
+        profile peak (measured by ``_profile_mamba_run``) covers
+        worst-case prefill activations; ``graph_reserve`` covers the
+        CUDA-graph private pool.  Replaces the previous static
+        ``state_cache_fraction`` heuristic.
+        """
+        # ``free`` is what the OS sees as available; ``current_alloc`` is
+        # what PyTorch's caching allocator reports as actively held
+        # (including activations from previous transient ops that were
+        # freed but cached).  We want to size against actually-needed
+        # memory, not allocator cache; mirrors vLLM's approach which uses
+        # ``allocated_bytes.all.peak`` rather than ``mem_get_info``
+        # (``vllm/utils/mem_utils.py:252-281``,
+        # ``vllm/v1/worker/gpu_worker.py:401-441``).
+        free, total = torch.cuda.mem_get_info()
+        current_alloc = torch.cuda.memory_stats()["allocated_bytes.all.current"]
+        num_layers = self.config.num_hidden_layers
+
+        conv_dim, ssm_state_shape, conv_kernel, per_layer_bytes = (
+            self._compute_mamba_state_shapes()
+        )
         per_slot_bytes = num_layers * per_layer_bytes
-        # Leave headroom for runtime activations + CUDA graph private pools.
-        # vLLM does this implicitly via its memory-profiler pass; we just
-        # use a conservative fraction of the gpu_memory_utilization budget
-        # for the state pool.  Mamba2's prefill activations (chunk states,
-        # residuals, RMSNormGated float32 casts) can hit several tens of
-        # GiB at max_num_batched_tokens=16384 -- without headroom we OOM
-        # in the silu/cast right after eating the entire state pool.
-        # Mamba2's grouped RMSNorm + chunk_scan + residual stack at
-        # ``max_num_batched_tokens=16384`` can spike to ~25 GiB of
-        # activations per rank during prefill, so we leave a generous
-        # headroom out of the state-cache budget.  Mamba v1 has a much
-        # smaller per-token footprint and gets a tighter share.
-        state_cache_fraction = 0.6 if self.is_mamba2 else 0.85
-        gpu_cap = total * self.gpu_memory_utilization * state_cache_fraction
-        budget = int(gpu_cap - used - peak + current)
+
+        # Profile-based sizing (mirrors vLLM ``gpu_worker.py:437-441``):
+        #   requested_bytes = total * gpu_memory_utilization
+        #   non_kv_bytes    = current_alloc           # model params + persistent buffers
+        #                   + non_torch_overhead       # NCCL workspace, custom AR, ...
+        #                   + profile_peak_increase    # worst-case prefill activations
+        #                   + graph_reserve            # CUDA-graph private pool
+        #   budget          = requested_bytes - non_kv_bytes
+        #
+        # ``current_alloc`` (PyTorch allocator) is what the model + buffers
+        # actually need; ``non_torch_overhead`` is the gap between
+        # ``mem_get_info(used)`` and ``current_alloc``, which captures
+        # things outside PyTorch's allocator (NCCL/Gloo workspaces,
+        # fastsafetensors temp buffers, custom_ar staging, etc.).
+        # ``profile_peak`` comes from ``_profile_mamba_run`` and is
+        # already a *delta over baseline_alloc*, so it can be added on
+        # top of ``current_alloc`` directly.
+        profile_peak = getattr(self, "_profile_peak_bytes", 0)
+        graph_reserve = self._MAMBA_GRAPH_RESERVE_BYTES
+        requested_bytes = int(total * self.gpu_memory_utilization)
+        non_torch_overhead = max(0, (total - free) - current_alloc)
+        non_kv_bytes = (
+            current_alloc + non_torch_overhead + profile_peak + graph_reserve
+        )
+        budget = max(0, requested_bytes - non_kv_bytes)
         num_slots = max(1, min(self.max_num_seqs, budget // max(1, per_slot_bytes)))
+
+        if self.rank == 0:
+            print(
+                f"  Mamba memory budget: total={total / (1<<30):.1f} GiB, "
+                f"requested={requested_bytes / (1<<30):.1f} GiB | "
+                f"params={current_alloc / (1<<30):.2f} GiB, "
+                f"non_torch={non_torch_overhead / (1<<30):.2f} GiB, "
+                f"profile_peak={profile_peak / (1<<30):.2f} GiB, "
+                f"graph_reserve={graph_reserve / (1<<30):.2f} GiB | "
+                f"slot_budget={budget / (1<<30):.2f} GiB"
+            )
 
         self.mamba_state_manager = MambaStateManager(
             num_hidden_layers=num_layers,
@@ -905,17 +1112,28 @@ class ModelRunner:
         if self.mamba_state_manager is not None:
             self.mamba_state_manager.deallocate(seq)
 
-    def allocate_mamba_state_batch(self, n: int):
-        """Pop ``n`` free slots in deque order.
+    def empty_cuda_cache(self):
+        """Drop the PyTorch caching allocator's cached blocks.
 
-        Invoked via ``mr.call`` so every rank consumes the same slots in
-        the same order from its (replica) ``_free_slots`` deque.  Rank 0
-        attaches the slot IDs to the actual ``Sequence`` objects after
-        the call returns; workers don't have ``Sequence`` python objects
-        but their pool stays in lockstep with rank 0's.
+        Called via ``mr.call`` between ``generate()`` invocations to
+        mirror vLLM's per-step ``empty_cache`` and avoid cumulative
+        fragmentation across benchmark scenarios.  Returns the freed
+        bytes for diagnostics.
+        """
+        before = torch.cuda.memory_stats()["reserved_bytes.all.current"]
+        torch.cuda.empty_cache()
+        after = torch.cuda.memory_stats()["reserved_bytes.all.current"]
+        return before - after
 
-        Returns the list of slot IDs in the same order as popped (rank 0
-        reads this; workers ignore the return value).
+    def allocate_mamba_state_batch(self, n: int) -> list[int]:
+        """Pop ``n`` free slots in deque order on every rank.
+
+        Called from ``mr.call(...)`` so all TP ranks pop the same
+        ``n`` slots in lock-step (the deque is identical across
+        ranks).  Batched into a single SHM message to avoid the
+        race conditions seen with per-seq ``mr.call`` invocations
+        (``_pickle.UnpicklingError`` when the worker spin-loop
+        outruns the writer).
         """
         sm = self.mamba_state_manager
         slots: list[int] = []
@@ -928,11 +1146,12 @@ class ModelRunner:
             slots.append(slot)
         return slots
 
-    def deallocate_mamba_state_batch(self, slot_ids: list[int]):
-        """Return specific slots in the given order.
+    def deallocate_mamba_state_batch(self, slot_ids: list[int]) -> None:
+        """Return specific slots to the free pool on every rank.
 
-        Order matters: free slots are pushed to the back of the deque so
-        every rank must see the same sequence of returns.
+        Batched counterpart of ``allocate_mamba_state_batch`` -- all
+        ranks remove the same slot ids from ``_in_use`` and re-append
+        them to ``_free_slots`` in lock-step.
         """
         sm = self.mamba_state_manager
         if sm is None:
@@ -1070,6 +1289,7 @@ class ModelRunner:
             reset_context()
         return logits
 
+    @torch.inference_mode()
     def run_mamba_mixed(self, prefill_seqs, decode_seqs):
         """Run a mixed prefill+decode batch through the Mamba model."""
         input_ids, positions, meta, num_actual = self.prepare_mamba_mixed(
@@ -1331,6 +1551,7 @@ class ModelRunner:
                 f"max={self._mamba_graph_bs_list[-1]})"
             )
 
+    @torch.inference_mode()
     def _run_mamba_decode_eager(self, n, ids_np, pos_np, si_np):
         """Eager-mode Mamba decode + greedy local argmax."""
         self._md_input_ids[:n].copy_(
@@ -1366,6 +1587,7 @@ class ModelRunner:
 
         return self._mamba_greedy_gather(n, max_vals, max_idxs)
 
+    @torch.inference_mode()
     def _run_mamba_decode_graph(self, n, ids_np, pos_np, si_np):
         """Run a captured CUDA graph for Mamba decode at bucket >= n."""
         bucket = self._mamba_graph_bs_for_n[n]
@@ -1419,6 +1641,7 @@ class ModelRunner:
         best_rank = all_info[:, :n, 0].argmax(dim=0)
         return all_info[best_rank, self._md_greedy_arange[:n], 1].long()
 
+    @torch.inference_mode()
     def run_mamba_decode_fast_async(self, decode_data):
         """Greedy Mamba decode step + async D2H copy of token IDs.
 
@@ -1467,6 +1690,7 @@ class ModelRunner:
             buf[off:off + nb] = arr.tobytes()
             off += nb
 
+    @torch.inference_mode()
     def _loop_mamba_decode_greedy(self):
         """Worker fast path for Mamba: read decode arrays from SHM into
         the pinned-CPU staging buffers, then dispatch the same fast path
@@ -1490,6 +1714,7 @@ class ModelRunner:
              self._md_state_indices_np[:n]),
         )
 
+    @torch.inference_mode()
     def call_mamba_decode_async(self, decode_data):
         """Launch a greedy Mamba decode from precomputed arrays + async D2H.
 
@@ -3187,6 +3412,30 @@ class LlamaEngine:
         eos = self.tokenizer.eos_token_id
         mr = self.model_runner
 
+        # Optional per-step instrumentation -- enable with
+        # ``KB_NANO_PROFILE_MAMBA=1``.  Records wall-clock time spent
+        # in each phase (admit, decode-array prep, GPU dispatch, D2H
+        # wait, finalize/dealloc) and prints a summary at the end so
+        # we can see which phase dominates without resorting to a full
+        # CUDA profiler.
+        _profile = os.environ.get("KB_NANO_PROFILE_MAMBA", "0") == "1"
+        _stats = {
+            "fast_steps": 0,
+            "fast_admit": 0.0,
+            "fast_prep": 0.0,
+            "fast_dispatch": 0.0,
+            "fast_wait": 0.0,
+            "fast_finalize": 0.0,
+            "fast_pbar": 0.0,
+            "slow_steps": 0,
+            "slow_admit": 0.0,
+            "slow_call": 0.0,
+            "slow_finalize": 0.0,
+            "slow_pbar": 0.0,
+            "total_decode_tokens": 0,
+            "total_prefill_tokens": 0,
+        }
+
         # Build sequences in input order, plus a seq -> sp lookup (avoids
         # O(N^2) ``all_seqs.index(s)`` calls that dominated the old
         # scheduler at 1000 prompts).
@@ -3252,13 +3501,12 @@ class LlamaEngine:
                 admitted.append(s)
                 tokens_used += seq_tokens
             if admitted:
-                # Batch allocations into a single SHM message: many rapid
-                # ``mr.call("allocate_mamba_state", s)`` (one per seq) at
-                # the start of generation can outrun the worker's spin
-                # loop and corrupt the next pickle frame.  The batch call
-                # consumes a deterministic prefix of the (per-rank)
-                # ``_free_slots`` deque on every rank, so we just attach
-                # slot IDs to ``Sequence`` objects on rank 0.
+                # Allocation must happen on every TP rank so each rank's
+                # local ``MambaStateManager`` agrees on slot ownership;
+                # ``mr.call`` broadcasts via SHM and runs locally on
+                # rank 0.  Batched into a single message to avoid
+                # ``_pickle.UnpicklingError`` race conditions seen with
+                # per-seq ``mr.call`` invocations.
                 slots = mr.call("allocate_mamba_state_batch", len(admitted))
                 for s, slot in zip(admitted, slots):
                     s.state_slot = slot
@@ -3285,9 +3533,11 @@ class LlamaEngine:
             return done
 
         while waiting or running:
+            _t0 = time.perf_counter() if _profile else 0.0
             new_seqs = _admit()
             prefill_seqs = list(new_seqs)
             decode_seqs = list(running)
+            _t_admit = (time.perf_counter() - _t0) if _profile else 0.0
 
             if not prefill_seqs and not decode_seqs:
                 break
@@ -3302,14 +3552,25 @@ class LlamaEngine:
                 and all_greedy
                 and mr.max_num_batched_tokens >= len(decode_seqs)
             ):
+                _t1 = time.perf_counter() if _profile else 0.0
                 decode_data = mr._prepare_mamba_decode_arrays(decode_seqs)
-                has_result, async_n = mr.call_mamba_decode_async(decode_data)
+                _t_prep = (time.perf_counter() - _t1) if _profile else 0.0
 
+                _t1 = time.perf_counter() if _profile else 0.0
+                has_result, async_n = mr.call_mamba_decode_async(decode_data)
+                _t_dispatch = (time.perf_counter() - _t1) if _profile else 0.0
+
+                _t_wait = 0.0
+                _t_finalize = 0.0
                 # Drain any waiting prompts admitted between steps while
                 # we still keep pipelining decodes -- but only on the
                 # rank-0 path that actually owns the result.
                 if has_result:
+                    _t1 = time.perf_counter() if _profile else 0.0
                     token_ids = mr._wait_async_mamba_tokens(async_n)
+                    _t_wait = (time.perf_counter() - _t1) if _profile else 0.0
+
+                    _t1 = time.perf_counter() if _profile else 0.0
                     finished_now: list[Sequence] = []
                     new_running: list[Sequence] = []
                     for s, tok_id in zip(decode_seqs, token_ids):
@@ -3318,8 +3579,9 @@ class LlamaEngine:
                         else:
                             new_running.append(s)
                     if finished_now:
-                        # Batched dealloc: same race-avoidance reasoning
-                        # as ``allocate_mamba_state_batch`` above.
+                        # Broadcast to all TP ranks so every rank
+                        # returns the same slots to its local free pool
+                        # in lock-step.
                         slot_ids = [s.state_slot for s in finished_now]
                         mr.call("deallocate_mamba_state_batch", slot_ids)
                         for s in finished_now:
@@ -3327,22 +3589,38 @@ class LlamaEngine:
                             if pbar is not None:
                                 _pbar_pending += 1
                     running = new_running
+                    _t_finalize = (time.perf_counter() - _t1) if _profile else 0.0
                 else:
                     # Worker rank or graph fell through; treat as no-op.
                     running = decode_seqs
 
+                _t1 = time.perf_counter() if _profile else 0.0
                 if pbar is not None and _pbar_pending:
                     pbar.update(_pbar_pending)
                     _pbar_pending = 0
+                _t_pbar = (time.perf_counter() - _t1) if _profile else 0.0
+
+                if _profile:
+                    _stats["fast_steps"] += 1
+                    _stats["fast_admit"] += _t_admit
+                    _stats["fast_prep"] += _t_prep
+                    _stats["fast_dispatch"] += _t_dispatch
+                    _stats["fast_wait"] += _t_wait
+                    _stats["fast_finalize"] += _t_finalize
+                    _stats["fast_pbar"] += _t_pbar
+                    _stats["total_decode_tokens"] += len(decode_seqs)
                 continue
 
             # =========================================================
             # SLOW PATH: any mixed prefill+decode step (or non-greedy).
             # =========================================================
+            _t1 = time.perf_counter() if _profile else 0.0
             logits = mr.call(
                 "run_mamba_mixed", prefill_seqs, decode_seqs,
             )
+            _t_call = (time.perf_counter() - _t1) if _profile else 0.0
 
+            _t1 = time.perf_counter() if _profile else 0.0
             row = 0
             new_running: list[Sequence] = []
             finished_now: list[Sequence] = []
@@ -3366,13 +3644,87 @@ class LlamaEngine:
                     if pbar is not None:
                         _pbar_pending += 1
             running = new_running
+            _t_finalize_slow = (time.perf_counter() - _t1) if _profile else 0.0
 
+            _t1 = time.perf_counter() if _profile else 0.0
             if pbar is not None and _pbar_pending:
                 pbar.update(_pbar_pending)
                 _pbar_pending = 0
+            _t_pbar = (time.perf_counter() - _t1) if _profile else 0.0
+
+            if _profile:
+                _stats["slow_steps"] += 1
+                _stats["slow_admit"] += _t_admit
+                _stats["slow_call"] += _t_call
+                _stats["slow_finalize"] += _t_finalize_slow
+                _stats["slow_pbar"] += _t_pbar
+                _stats["total_prefill_tokens"] += sum(
+                    len(s.token_ids) - s.num_computed_tokens
+                    for s in prefill_seqs
+                )
+                _stats["total_decode_tokens"] += len(decode_seqs)
 
         if pbar is not None:
             pbar.close()
+
+        if _profile:
+            def _fmt(t):
+                return f"{t * 1000:>9.1f} ms"
+            print("\n=== _generate_mamba per-phase timing ===")
+            n_fast = _stats["fast_steps"]
+            n_slow = _stats["slow_steps"]
+            print(f"  Steps: fast_decode={n_fast}  slow_mixed={n_slow}  "
+                  f"decode_tokens={_stats['total_decode_tokens']}  "
+                  f"prefill_tokens={_stats['total_prefill_tokens']}")
+            if n_fast:
+                tot_fast = sum([
+                    _stats["fast_admit"], _stats["fast_prep"],
+                    _stats["fast_dispatch"], _stats["fast_wait"],
+                    _stats["fast_finalize"], _stats["fast_pbar"],
+                ])
+                print(f"  FAST PATH ({n_fast} steps, total {_fmt(tot_fast)}):")
+                print(f"    admit         {_fmt(_stats['fast_admit'])}  "
+                      f"({100*_stats['fast_admit']/max(tot_fast,1e-9):5.1f}%)")
+                print(f"    decode_prep   {_fmt(_stats['fast_prep'])}  "
+                      f"({100*_stats['fast_prep']/max(tot_fast,1e-9):5.1f}%)")
+                print(f"    gpu_dispatch  {_fmt(_stats['fast_dispatch'])}  "
+                      f"({100*_stats['fast_dispatch']/max(tot_fast,1e-9):5.1f}%)")
+                print(f"    gpu+d2h_wait  {_fmt(_stats['fast_wait'])}  "
+                      f"({100*_stats['fast_wait']/max(tot_fast,1e-9):5.1f}%)")
+                print(f"    finalize      {_fmt(_stats['fast_finalize'])}  "
+                      f"({100*_stats['fast_finalize']/max(tot_fast,1e-9):5.1f}%)")
+                print(f"    pbar          {_fmt(_stats['fast_pbar'])}  "
+                      f"({100*_stats['fast_pbar']/max(tot_fast,1e-9):5.1f}%)")
+                print(f"    avg/step      {_fmt(tot_fast/n_fast)}")
+            if n_slow:
+                tot_slow = sum([
+                    _stats["slow_admit"], _stats["slow_call"],
+                    _stats["slow_finalize"], _stats["slow_pbar"],
+                ])
+                print(f"  SLOW PATH ({n_slow} steps, total {_fmt(tot_slow)}):")
+                print(f"    admit         {_fmt(_stats['slow_admit'])}  "
+                      f"({100*_stats['slow_admit']/max(tot_slow,1e-9):5.1f}%)")
+                print(f"    mr.call(mix)  {_fmt(_stats['slow_call'])}  "
+                      f"({100*_stats['slow_call']/max(tot_slow,1e-9):5.1f}%)")
+                print(f"    finalize      {_fmt(_stats['slow_finalize'])}  "
+                      f"({100*_stats['slow_finalize']/max(tot_slow,1e-9):5.1f}%)")
+                print(f"    pbar          {_fmt(_stats['slow_pbar'])}  "
+                      f"({100*_stats['slow_pbar']/max(tot_slow,1e-9):5.1f}%)")
+                print(f"    avg/step      {_fmt(tot_slow/n_slow)}")
+            print("=" * 50)
+
+        # Release any cached transient activations back to the OS so the
+        # next ``generate()`` call (e.g. the next benchmark scenario)
+        # starts with a clean allocator.  Mirrors how vLLM's
+        # ``LLMEngine`` calls ``empty_cache`` after each batch finishes
+        # to avoid cumulative fragmentation across requests
+        # (``vllm/v1/engine/core.py:_step``).  Without this, Mamba2's
+        # 16384-token prefill activations stay cached on rank 0 and
+        # the second scenario can OOM looking for a contiguous block.
+        if mr.world_size > 1:
+            mr.call("empty_cuda_cache")
+        else:
+            torch.cuda.empty_cache()
 
         return [
             GenerationOutput(
