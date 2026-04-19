@@ -116,6 +116,7 @@ class GLAForCausalLM(nn.Module):
         past_key_values: RecurrentCache | None = None,
         labels: torch.Tensor | None = None,
         use_cache: bool = False,
+        num_logits_to_keep: int = 0,
         **kwargs,
     ) -> CausalLMOutputWithPast:
         hidden_states, past_key_values = self.model(
@@ -125,6 +126,11 @@ class GLAForCausalLM(nn.Module):
             past_key_values=past_key_values,
             use_cache=use_cache,
         )
+        # Generation-time fast path: cap lm_head + fp32 upcast to the
+        # last ``num_logits_to_keep`` positions. Saves several GB of
+        # transient fp32 logits at large prefill batch sizes.
+        if num_logits_to_keep > 0:
+            hidden_states = hidden_states[:, -num_logits_to_keep:, :]
         logits = self.lm_head(hidden_states).float()
         loss = None
         if labels is not None:

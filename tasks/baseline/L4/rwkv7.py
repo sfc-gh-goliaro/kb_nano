@@ -129,6 +129,7 @@ class RWKV7ForCausalLM(nn.Module):
         past_key_values: RecurrentCache | None = None,
         labels: torch.Tensor | None = None,
         use_cache: bool = False,
+        num_logits_to_keep: int = 0,
         **kwargs,
     ) -> CausalLMOutputWithPast:
         hidden_states, past_key_values = self.model(
@@ -138,6 +139,13 @@ class RWKV7ForCausalLM(nn.Module):
             past_key_values=past_key_values,
             use_cache=use_cache,
         )
+        # When the engine only needs the last token's logits (every
+        # generation call), restrict the lm_head + fp32 upcast to a
+        # single position. For batched prefill at B=200, T=1024 with
+        # vocab=65k this saves ~50 GB of fp32 logits memory and the
+        # corresponding compute.
+        if num_logits_to_keep > 0:
+            hidden_states = hidden_states[:, -num_logits_to_keep:, :]
         logits = self.lm_head(hidden_states).float()
         loss = None
         if labels is not None:
