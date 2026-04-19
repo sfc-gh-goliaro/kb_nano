@@ -34,7 +34,7 @@ import torch
 import torch.nn as nn
 from transformers import AutoConfig
 
-from ..L1.rms_norm import RMSNorm
+from ..L1.bitnet_rms_norm import BitNetRMSNorm as RMSNorm
 from ..L1.rotary_emb import RotaryEmbedding
 from ..L2.parallel_embedding import ParallelLMHead, VocabParallelEmbedding
 from ..L3.bitnet_decoder import BitNetDecoderLayer

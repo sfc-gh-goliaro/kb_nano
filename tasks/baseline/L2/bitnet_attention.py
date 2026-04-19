@@ -31,7 +31,7 @@ import torch
 import torch.nn as nn
 
 from ..L1.bitnet_linear import BitLinear, BitLinearMerged
-from ..L1.rms_norm import RMSNorm
+from ..L1.bitnet_rms_norm import BitNetRMSNorm as RMSNorm
 from .attention_impl import Attention
 
 

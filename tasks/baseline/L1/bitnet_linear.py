@@ -156,8 +156,13 @@ class BitLinear(nn.Module):
     def process_weights_after_loading(self) -> None:
         if getattr(self, "bf16_weight", None) is not None:
             return
+        # Always materialize in the LIVE param dtype: load_model casts the
+        # whole module to its target dtype (bf16 by default) AFTER __init__
+        # captured ``scale_dtype``, so reading from ``weight_scale.dtype``
+        # avoids producing a stray fp32 buffer.
+        out_dtype = self.weight_scale.dtype
         ternary = unpack_kn_to_ternary(self.weight.data)
-        bf16 = ternary.to(self.scale_dtype) * self.weight_scale.data.unsqueeze(1)
+        bf16 = ternary.to(out_dtype) * self.weight_scale.data.unsqueeze(1)
         self.register_buffer("bf16_weight", bf16.contiguous(), persistent=False)
 
     # -- forward -----------------------------------------------------------
@@ -285,8 +290,13 @@ class BitLinearMerged(nn.Module):
     def process_weights_after_loading(self) -> None:
         if getattr(self, "bf16_weight", None) is not None:
             return
+        # Always materialize in the LIVE param dtype: load_model casts the
+        # whole module to its target dtype (bf16 by default) AFTER __init__
+        # captured ``scale_dtype``, so reading from ``weight_scale.dtype``
+        # avoids producing a stray fp32 buffer.
+        out_dtype = self.weight_scale.dtype
         ternary = unpack_kn_to_ternary(self.weight.data)
-        bf16 = ternary.to(self.scale_dtype) * self.weight_scale.data.unsqueeze(1)
+        bf16 = ternary.to(out_dtype) * self.weight_scale.data.unsqueeze(1)
         self.register_buffer("bf16_weight", bf16.contiguous(), persistent=False)
 
     # -- forward -----------------------------------------------------------
