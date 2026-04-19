@@ -44,9 +44,16 @@ if not _FA3_AVAILABLE:
     try:
         from flash_attn import flash_attn_varlen_func as _fa2_varlen_func
     except ImportError:
-        from ._flashmla_backend import (
-            flash_attn_varlen_func as _flashmla_varlen_func,
-        )
+        # vLLM vendors FlashMLA; fall back to the standalone ``flash_mla``
+        # package when the vendored copy is unavailable.
+        try:
+            from vllm.third_party.flashmla.flash_mla_interface import (
+                flash_attn_varlen_func as _flashmla_varlen_func,
+            )
+        except ImportError:  # pragma: no cover
+            from flash_mla import (  # type: ignore[no-redef]
+                flash_attn_varlen_func as _flashmla_varlen_func,
+            )
 
 
 class FlashAttnVarlen(nn.Module):

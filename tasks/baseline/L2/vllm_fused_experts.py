@@ -51,7 +51,7 @@ import triton
 import vllm._C  # noqa: F401  - registers torch.ops._C.silu_and_mul + per_token_group_fp8_quant
 
 from ..L1.csrc import _C
-from ..L1.fp8_linear import _per_token_group_quant_fp8
+from ..L1.fp8_linear import PerTokenGroupQuantFp8
 from ..L1.moe_grouped_gemm import MoeGroupedGemm, get_triton_config
 
 _FP8_GROUP_SIZE = 128
@@ -110,6 +110,7 @@ class VllmFusedExperts(nn.Module):
     def __init__(self):
         super().__init__()
         self.moe_grouped_gemm = MoeGroupedGemm()
+        self.per_token_group_quant_fp8 = PerTokenGroupQuantFp8()
 
     def forward(
         self,
@@ -163,7 +164,7 @@ class VllmFusedExperts(nn.Module):
         num_groups = math.ceil(K / _FP8_GROUP_SIZE)
         a1_fp8 = torch.empty(M, K, dtype=torch.float8_e4m3fn, device=device)
         a1_scale = torch.empty(M, num_groups, dtype=torch.float32, device=device)
-        _per_token_group_quant_fp8(hidden_states, a1_fp8, a1_scale)
+        self.per_token_group_quant_fp8(hidden_states, a1_fp8, a1_scale)
 
         # Block alignment.  vLLM uses the ``naive_block_assignment`` fast
         # path when ``num_tokens * top_k * SPARSITY_FACTOR <= num_experts``
@@ -212,7 +213,7 @@ class VllmFusedExperts(nn.Module):
         a2_scale = torch.empty(
             M * top_k, num_groups2, dtype=torch.float32, device=device,
         )
-        _per_token_group_quant_fp8(intermediate_cache2, a2_fp8, a2_scale)
+        self.per_token_group_quant_fp8(intermediate_cache2, a2_fp8, a2_scale)
 
         # GEMM2: a2 @ w2  ->  intermediate_cache3.
         # ``mul_routed_weight=True`` and ``top_k=1`` matches vLLM's

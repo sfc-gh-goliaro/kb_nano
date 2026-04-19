@@ -5,7 +5,11 @@ from __future__ import annotations
 import torch
 import torch.nn as nn
 
-from ._flashmla_backend import flash_mla_sparse_fwd
+# vLLM vendors FlashMLA; fall back to the standalone package if not present.
+try:
+    from vllm.third_party.flashmla.flash_mla_interface import flash_mla_sparse_fwd
+except ImportError:  # pragma: no cover
+    from flash_mla import flash_mla_sparse_fwd  # type: ignore[no-redef]
 
 
 class FlashMLASparsePrefill(nn.Module):

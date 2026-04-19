@@ -22,7 +22,7 @@ import torch.nn as nn
 from ....infra.tp import _tp_rank, _tp_size
 from ..L1.allreduce import AllReduce
 from ..L1.grouped_topk import GroupedTopK
-from ..L1.gate_linear import gate_linear_forward
+from ..L1.gate_linear import GateLinear
 from .fused_experts import FusedExperts
 from .llama_mlp import LlamaMLP
 from .vllm_fused_experts import VllmFusedExperts
@@ -140,6 +140,7 @@ class DeepSeekMoE(nn.Module):
             renormalize=self.norm_topk_prob,
             routed_scaling_factor=1.0,
         )
+        self.gate = GateLinear()
         # FP8 path uses a fresh-allocation, vLLM-mirrored op so it is
         # both bit-identical to vLLM's Triton MoE *and* safe to compose
         # with CUDA graph capture (no shared scratch buffers that an
@@ -247,7 +248,7 @@ class DeepSeekMoE(nn.Module):
         router_out_dtype = (
             torch.float32 if not self.use_fp8 else torch.bfloat16
         )
-        router_logits = gate_linear_forward(
+        router_logits = self.gate(
             hidden_states, self.gate_weight, out_dtype=router_out_dtype,
         )
         topk_weights, topk_ids = self.grouped_topk(

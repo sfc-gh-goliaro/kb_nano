@@ -12,6 +12,7 @@ Matches vLLM's ``silu_mul_per_token_group_quant_fp8_colmajor`` exactly.
 from __future__ import annotations
 
 import torch
+import torch.nn as nn
 import triton
 import triton.language as tl
 
@@ -75,56 +76,68 @@ def _silu_mul_per_token_group_quant_fp8_colmajor(
     tl.store(y_s_ptrs, y_s)
 
 
-def silu_mul_per_token_group_quant_fp8_colmajor(
-    input: torch.Tensor,
-    output: torch.Tensor | None = None,
-    use_ue8m0: bool = True,
-    eps: float = 1e-10,
-) -> tuple[torch.Tensor, torch.Tensor]:
-    """Fused SiLU-mul + per-token-group FP8 quantization.
+class SiluMulQuantFp8(nn.Module):
+    """Fused SiLU-mul + per-token-group FP8 quantization (colmajor scales).
 
-    Args:
-        input: [M, N] where N = 2 * intermediate_size (gate/up concatenated)
-        output: Optional pre-allocated [M, N//2] FP8 output buffer
-        use_ue8m0: Use power-of-two (UE8M0) scales for DeepGEMM
-        eps: Minimum absmax to avoid division by zero
-
-    Returns:
-        (output_fp8, output_scales) where output_fp8 is [M, N//2] in float8_e4m3fn
-        and output_scales is [M, (N//2)//128] in float32 (column-major layout)
+    Stateless wrapper around the Triton kernel
+    :func:`_silu_mul_per_token_group_quant_fp8_colmajor`.  Mirrors vLLM's
+    ``silu_mul_per_token_group_quant_fp8_colmajor`` exactly.
     """
-    assert input.ndim == 2
-    M, N = input.size()
-    N_2 = N // 2
 
-    assert M % _GROUP_SIZE == 0, f"M={M} must be divisible by {_GROUP_SIZE}"
-    assert N_2 % _GROUP_SIZE == 0, f"N//2={N_2} must be divisible by {_GROUP_SIZE}"
+    def forward(
+        self,
+        input: torch.Tensor,
+        output: torch.Tensor | None = None,
+        use_ue8m0: bool = True,
+        eps: float = 1e-10,
+    ) -> tuple[torch.Tensor, torch.Tensor]:
+        """Fused SiLU-mul + per-token-group FP8 quantization.
 
-    if output is None:
-        output = torch.empty((M, N_2), dtype=torch.float8_e4m3fn, device=input.device)
+        Args:
+            input: [M, N] where N = 2 * intermediate_size (gate/up concatenated)
+            output: Optional pre-allocated [M, N//2] FP8 output buffer
+            use_ue8m0: Use power-of-two (UE8M0) scales for DeepGEMM
+            eps: Minimum absmax to avoid division by zero
 
-    output_scales = torch.empty(
-        (N_2 // _GROUP_SIZE, M), dtype=torch.float32, device=input.device
-    ).transpose(0, 1)
+        Returns:
+            (output_fp8, output_scales) where output_fp8 is [M, N//2] in
+            float8_e4m3fn and output_scales is [M, (N//2)//128] in float32
+            (column-major layout)
+        """
+        assert input.ndim == 2
+        M, N = input.size()
+        N_2 = N // 2
 
-    BLOCK_M = 8
-    BLOCK_N = _GROUP_SIZE
-    assert M % BLOCK_M == 0
-    assert N_2 % BLOCK_N == 0
+        assert M % _GROUP_SIZE == 0, f"M={M} must be divisible by {_GROUP_SIZE}"
+        assert N_2 % _GROUP_SIZE == 0, f"N//2={N_2} must be divisible by {_GROUP_SIZE}"
 
-    fp8_min = _FP8_INFO.min
-    fp8_max = _FP8_INFO.max
+        if output is None:
+            output = torch.empty(
+                (M, N_2), dtype=torch.float8_e4m3fn, device=input.device,
+            )
 
-    grid = (M // BLOCK_M, N_2 // BLOCK_N)
+        output_scales = torch.empty(
+            (N_2 // _GROUP_SIZE, M), dtype=torch.float32, device=input.device,
+        ).transpose(0, 1)
 
-    _silu_mul_per_token_group_quant_fp8_colmajor[grid](
-        input, output, output_scales,
-        M, N,
-        output_scales.stride(-1),
-        eps,
-        fp8_min, fp8_max,
-        use_ue8m0,
-        _GROUP_SIZE, BLOCK_M, BLOCK_N,
-    )
+        BLOCK_M = 8
+        BLOCK_N = _GROUP_SIZE
+        assert M % BLOCK_M == 0
+        assert N_2 % BLOCK_N == 0
 
-    return output, output_scales
+        fp8_min = _FP8_INFO.min
+        fp8_max = _FP8_INFO.max
+
+        grid = (M // BLOCK_M, N_2 // BLOCK_N)
+
+        _silu_mul_per_token_group_quant_fp8_colmajor[grid](
+            input, output, output_scales,
+            M, N,
+            output_scales.stride(-1),
+            eps,
+            fp8_min, fp8_max,
+            use_ue8m0,
+            _GROUP_SIZE, BLOCK_M, BLOCK_N,
+        )
+
+        return output, output_scales

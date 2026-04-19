@@ -611,18 +611,18 @@ Throughput (1000 sequences per scenario, `temperature=0`, `max_model_len=1536`):
 
 | Model | TP | Scenario | Input/Output | vLLM (tok/s) | Ours (tok/s) | Ratio | Avg Match Tokens |
 |-------|---:|----------|:------------:|-------------:|-------------:|------:|-----------------:|
-| DeepSeek-V3.2 | 8 | prefill-heavy | 1024/512  | 2,805 | 2,190 | 0.78x | 195.9/512 |
-| DeepSeek-V3.2 | 8 | balanced      |  512/512  | 3,426 | 3,092 | 0.90x | 235.7/512 |
-| DeepSeek-V3.2 | 8 | decode-heavy  |  512/1024 | 3,688 | 2,941 | 0.80x | 434.8/1024 |
+| DeepSeek-V3.2 | 8 | prefill-heavy | 1024/512  | 2,798 | 2,096 | 0.75x | 192.9/512 |
+| DeepSeek-V3.2 | 8 | balanced      |  512/512  | 3,391 | 3,268 | 0.96x | 237.8/512 |
+| DeepSeek-V3.2 | 8 | decode-heavy  |  512/1024 | 3,671 | 2,966 | 0.81x | 451.5/1024 |
 
 Latency (128 output tokens, 5 iterations):
 
 | Model | TP | Scenario | BS | vLLM median | Ours median | ms/tok vLLM | ms/tok Ours | Ratio |
 |-------|---:|----------|---:|------------:|------------:|------------:|------------:|------:|
-| DeepSeek-V3.2 | 8 | single-request  |  1 | 2.131s | 2.543s | 16.65 | 19.87 | 0.84x |
-| DeepSeek-V3.2 | 8 | fixed-batch-32  | 32 | 3.874s | 4.285s |  0.95 |  1.05 | 0.90x |
+| DeepSeek-V3.2 | 8 | single-request  |  1 | 2.132s | 2.511s | 16.66 | 19.62 | 0.85x |
+| DeepSeek-V3.2 | 8 | fixed-batch-32  | 32 | 3.835s | 4.208s |  0.94 |  1.03 | 0.91x |
 
-kb-nano currently runs 10–22% slower than vLLM on DeepSeek-V3.2 across all scenarios. The remaining gap is dominated by (1) per-step CPU launch overhead — kb-nano issues ~7× more uncaptured CUDA kernels than vLLM and its CUDA-graph launches are larger/slower; (2) GEMM kernel selection — kb-nano falls back to `sm90_fp8_gemm_1d2d_impl` on a few decode shapes where vLLM picks the faster `fp8_gemm_kernel_swapAB`; and (3) AllReduce fusion — vLLM fuses TP AllReduce with the surrounding RMSNorm + FP8 quant via flashinfer's `trtllm_allreduce_fusion`, eliminating ~3 kernel launches per AR site. Token match rates are higher than other MoE models in this README because we removed the prior bit-divergence in MLA/MoE routing; the residual divergence comes from FP8 quantization differences in the 256-expert MoE and DSA sparse-attention paths.
+kb-nano currently runs 4–25% slower than vLLM on DeepSeek-V3.2 across all scenarios. The remaining gap is dominated by (1) per-step CPU launch overhead — kb-nano issues ~7× more uncaptured CUDA kernels than vLLM and its CUDA-graph launches are larger/slower; (2) GEMM kernel selection — kb-nano falls back to `sm90_fp8_gemm_1d2d_impl` on a few decode shapes where vLLM picks the faster `fp8_gemm_kernel_swapAB`; and (3) AllReduce fusion — vLLM fuses TP AllReduce with the surrounding RMSNorm + FP8 quant via flashinfer's `trtllm_allreduce_fusion`, eliminating ~3 kernel launches per AR site. Token match rates are higher than other MoE models in this README because we removed the prior bit-divergence in MLA/MoE routing; the residual divergence comes from FP8 quantization differences in the 256-expert MoE and DSA sparse-attention paths.
 
 ### FLUX.1-dev (Diffusion)
 
