@@ -280,18 +280,47 @@ class ModelRunner:
                 set_custom_ar(self.custom_ar)
 
         if dtype is None:
+            # DeepSeek V3.2 checkpoints use ``model_type: "deepseek_v32"`` which
+            # is not yet a registered AutoConfig key in transformers, so load
+            # with ``trust_remote_code=True`` and fall back to raw config.json
+            # parsing if AutoConfig still refuses.
             from transformers import AutoConfig
-            _cfg = AutoConfig.from_pretrained(model_name)
-            cfg_dtype = getattr(_cfg, "torch_dtype", None)
-            if cfg_dtype is not None and isinstance(cfg_dtype, torch.dtype):
-                dtype = cfg_dtype
-            else:
-                dtype = torch.bfloat16
+            _cfg = None
+            try:
+                _cfg = AutoConfig.from_pretrained(
+                    model_name, trust_remote_code=True,
+                )
+            except (ValueError, KeyError):
+                try:
+                    from huggingface_hub import hf_hub_download
+                    import json as _json
+                    if os.path.isdir(model_name):
+                        _cfg_path = os.path.join(model_name, "config.json")
+                    else:
+                        _cfg_path = hf_hub_download(model_name, "config.json")
+                    with open(_cfg_path) as _f:
+                        _cfg_dict = _json.load(_f)
+                    _td = _cfg_dict.get("torch_dtype", None)
+                    cfg_dtype = getattr(torch, _td) if isinstance(_td, str) else None
+                    if isinstance(cfg_dtype, torch.dtype):
+                        dtype = cfg_dtype
+                except Exception:
+                    pass
+            if dtype is None:
+                cfg_dtype = getattr(_cfg, "torch_dtype", None) if _cfg is not None else None
+                if cfg_dtype is not None and isinstance(cfg_dtype, torch.dtype):
+                    dtype = cfg_dtype
+                else:
+                    dtype = torch.bfloat16
         self.dtype = dtype
         default_dtype = torch.get_default_dtype()
         torch.set_default_dtype(dtype)
         torch.set_default_device("cuda")
 
+        import time as _time
+        _t0 = _time.perf_counter()
+        if rank == 0:
+            print(f"  [1/6] Loading model weights...", flush=True)
         self.model, self.config = load_model(
             model_name, torch.device(f"cuda:{rank}"), dtype,
         )
@@ -301,6 +330,7 @@ class ModelRunner:
             getattr(self.config, "vision", None), "deepstack_visual_indexes"
         )
         self.is_whisper = getattr(self.config, "is_encoder_decoder", False)
+        self.is_deepseek_mla = hasattr(self.config, "kv_lora_rank")
         if self.is_whisper:
             self.enforce_eager = True
             self.max_model_len = min(
@@ -311,16 +341,40 @@ class ModelRunner:
         auto_register_no_compile_layers(self.model)
 
         self._compiled = False
+        if rank == 0:
+            print(f"  [1/6] Model loaded in {_time.perf_counter()-_t0:.1f}s", flush=True)
         self._share_trtllm_workspace()
         self._share_activation_buffers()
+        if rank == 0:
+            print(f"  [2/6] Warmup forward pass...", flush=True)
+        _t1 = _time.perf_counter()
         self.warmup_model()
+        if rank == 0:
+            print(f"  [2/6] Warmup done in {_time.perf_counter()-_t1:.1f}s", flush=True)
+            print(f"  [3/6] DeepGEMM warmup...", flush=True)
+        _t2 = _time.perf_counter()
         self._warmup_deepgemm()
+        if rank == 0:
+            print(f"  [3/6] DeepGEMM done in {_time.perf_counter()-_t2:.1f}s", flush=True)
+            print(f"  [4/6] Allocating KV cache...", flush=True)
+        _t3 = _time.perf_counter()
         self.allocate_kv_cache()
         self._init_fa3_decode_buffers()
+        if rank == 0:
+            print(f"  [4/6] KV cache done in {_time.perf_counter()-_t3:.1f}s", flush=True)
         if not self.enforce_eager:
+            if rank == 0:
+                print(f"  [5/6] Compiling + capturing CUDA graphs...", flush=True)
+            _t4 = _time.perf_counter()
             self._compile_model()
             self.capture_cudagraph()
+            if rank == 0:
+                print(f"  [5/6] CUDA graphs done in {_time.perf_counter()-_t4:.1f}s", flush=True)
+        if rank == 0:
+            print(f"  [6/6] Init greedy buffers...", flush=True)
         self._init_greedy_buffers()
+        if rank == 0:
+            print(f"  Engine ready in {_time.perf_counter()-_t0:.1f}s total", flush=True)
         torch.set_default_device("cpu")
         torch.set_default_dtype(default_dtype)
 
@@ -419,20 +473,22 @@ class ModelRunner:
         torch.cuda.empty_cache()
 
     def _share_activation_buffers(self):
-        """Share activation buffers across layers.
+        """No-op (was: share SiluAndMul output buffers across layers).
 
-        Layers execute sequentially so buffers are safe to reuse.
-        Must be called before warmup so only one buffer grows to max size
-        instead of one per layer (saves ~14 GiB for 32-layer models).
+        The previous implementation made all ``SiluAndMul`` instances point
+        to a single ``_ActivationBuffer`` so the output tensor would be
+        reused across layers (saving allocations).  However the underlying
+        CUDA kernel writes to ``out`` assuming a contiguous
+        ``[num_tokens, d]`` layout (row stride == ``d``), and the shared
+        buffer returned a non-contiguous slice ``buf[:rows, :cols]`` whose
+        row stride was the buffer's *full* width.  When two SiluAndMul
+        instances had different ``d`` (e.g. dense MLP at d=9216 and the
+        DeepSeek-V3 shared expert at d=2048), the shared-expert output
+        was silently corrupted — every row past row 0 wrote to the wrong
+        storage offset.  ``SiluAndMul.forward_cuda`` now allocates a
+        fresh contiguous output per call (matches vLLM exactly).
         """
-        from ..tasks.baseline.L1.silu_and_mul import SiluAndMul
-        silu_modules = [
-            m for m in self.model.modules() if isinstance(m, SiluAndMul)
-        ]
-        if len(silu_modules) > 1:
-            shared = silu_modules[0]._act_buf
-            for m in silu_modules[1:]:
-                m.set_shared_buffer(shared)
+        return
 
     def warmup_model(self):
         torch.cuda.empty_cache()
@@ -454,11 +510,18 @@ class ModelRunner:
     def _warmup_deepgemm(self):
         """Pre-JIT DeepGEMM FP8 kernels for all weight shapes at decode and
         prefill batch sizes, pre-allocate decode buffers per instance and
-        shared prefill buffers per unique (K, N) shape."""
+        shared prefill buffers per unique (K, N) shape.
+
+        Respects VLLM_DEEP_GEMM_WARMUP env var: "skip" disables JIT warmup
+        (buffers are still allocated), "relax"/"full" run warmup normally.
+        """
+        import os
         try:
             from ..tasks.baseline.L1.fp8_linear import Fp8Linear, _Fp8PrefillBufs
         except ImportError:
             return
+
+        skip_jit = os.environ.get("VLLM_DEEP_GEMM_WARMUP", "").lower() == "skip"
 
         fp8_modules = []
         for module in self.model.modules():
@@ -494,7 +557,8 @@ class ModelRunner:
                 prefill_bufs[key] = _Fp8PrefillBufs(max_prefill, K, N, device)
             linear_op._pf = prefill_bufs[key]
 
-            if key in seen_shapes:
+            if skip_jit or key in seen_shapes:
+                seen_shapes.add(key)
                 continue
             seen_shapes.add(key)
 
@@ -521,7 +585,11 @@ class ModelRunner:
         torch.cuda.synchronize()
         torch.cuda.empty_cache()
         if self.rank == 0:
-            print(f"  DeepGEMM warmup: {len(seen_shapes)} unique FP8 weight shapes")
+            if skip_jit:
+                print(f"  DeepGEMM warmup: skipped JIT (VLLM_DEEP_GEMM_WARMUP=skip), "
+                      f"{len(seen_shapes)} shapes buffered")
+            else:
+                print(f"  DeepGEMM warmup: {len(seen_shapes)} unique FP8 weight shapes")
 
     def _warmup_whisper(self):
         """Warmup Whisper encoder + decoder with dummy audio input.
@@ -676,6 +744,10 @@ class ModelRunner:
                     else:
                         self._attn_layers.append(module)
 
+        if self.is_deepseek_mla:
+            self._allocate_mla_kv_cache()
+            return
+
         free, total = torch.cuda.mem_get_info()
         used = total - free
         peak = torch.cuda.memory_stats()["allocated_bytes.all.peak"]
@@ -762,6 +834,203 @@ class ModelRunner:
             gc.collect()
             torch.cuda.empty_cache()
 
+    def _allocate_mla_kv_cache(self):
+        """Allocate MLA KV cache + indexer K cache.
+
+        The KV cache layout follows ``MLAAttention.kv_cache_dtype`` (set
+        via ``KB_NANO_KV_CACHE_DTYPE``, default ``"auto"`` = BF16):
+
+        * ``"auto"`` (default): BF16 cache, shape
+          ``[num_blocks, block_size, kv_lora_rank + qk_rope_head_dim]``
+          (1152 bytes/token for DeepSeek-V3.2). Matches stock vLLM's
+          ``kv_cache_dtype=auto`` on DeepSeek-V3.2 so ``topk_indices``
+          and MoE expert ids are bit-comparable.
+        * ``"fp8_ds_mla"``: uint8 cache, shape
+          ``[num_blocks, block_size, 656]`` (656 bytes/token).
+        """
+        from ..tasks.baseline.L2.mla_attention_impl import MLAAttention
+        from ..tasks.baseline.L2.sparse_attn_indexer import SparseAttnIndexer
+
+        _MLA_BLOCK_SIZE = 64  # FlashMLA uses block_size=64
+        _INDEXER_CACHE_BYTES = 132
+        _FP8_CACHE_BYTES = 656
+
+        mla_layers = []
+        indexer_layers = []
+        for module in self.model.modules():
+            if isinstance(module, MLAAttention):
+                mla_layers.append(module)
+            elif isinstance(module, SparseAttnIndexer):
+                indexer_layers.append(module)
+
+        num_layers = len(mla_layers)
+        num_indexer_layers = len(indexer_layers)
+
+        # All MLA layers must agree on the cache layout.
+        if num_layers > 0:
+            kv_cache_dtype = mla_layers[0].kv_cache_dtype
+            for ml in mla_layers[1:]:
+                assert ml.kv_cache_dtype == kv_cache_dtype, (
+                    "Inconsistent kv_cache_dtype across MLA layers"
+                )
+        else:
+            kv_cache_dtype = "auto"
+
+        use_fp8_kv = kv_cache_dtype == "fp8_ds_mla"
+        if use_fp8_kv:
+            cache_last_dim = _FP8_CACHE_BYTES
+            cache_torch_dtype = torch.uint8
+            bytes_per_slot = _FP8_CACHE_BYTES
+            backend_desc = "FP8 KV cache"
+        else:
+            # BF16: shape = (num_blocks, block_size, kv_lora_rank + rope_dim)
+            kv_lora_rank = mla_layers[0].kv_lora_rank if num_layers else 512
+            rope_dim = mla_layers[0].qk_rope_head_dim if num_layers else 64
+            cache_last_dim = kv_lora_rank + rope_dim
+            cache_torch_dtype = torch.bfloat16
+            bytes_per_slot = cache_last_dim * 2  # BF16 = 2 bytes/element
+            backend_desc = "BF16 KV cache"
+
+        free, total = torch.cuda.mem_get_info()
+        used = total - free
+        peak = torch.cuda.memory_stats()["allocated_bytes.all.peak"]
+        current = torch.cuda.memory_stats()["allocated_bytes.all.current"]
+
+        kv_bytes_per_block = num_layers * _MLA_BLOCK_SIZE * bytes_per_slot
+        idx_bytes_per_block = num_indexer_layers * _MLA_BLOCK_SIZE * _INDEXER_CACHE_BYTES
+        total_bytes_per_block = kv_bytes_per_block + idx_bytes_per_block
+
+        num_blocks = int(total * self.gpu_memory_utilization - used - peak + current) // total_bytes_per_block
+        assert num_blocks > 0, f"Not enough GPU memory for MLA KV cache on rank {self.rank}"
+        self.num_blocks = num_blocks
+        self.block_size = _MLA_BLOCK_SIZE
+
+        # Update module-level BLOCK_SIZE so Sequence.num_blocks,
+        # blocks_needed_for, BlockManager, prepare_prefill/decode, etc.
+        # all use the MLA block size consistently.
+        global BLOCK_SIZE
+        BLOCK_SIZE = _MLA_BLOCK_SIZE
+        # Recompute max_model_len with the new block size
+        self.max_model_len = (
+            (self.max_model_len + _MLA_BLOCK_SIZE - 1)
+            // _MLA_BLOCK_SIZE * _MLA_BLOCK_SIZE
+        )
+
+        if self.rank == 0:
+            print(f"  MLA KV cache: {num_blocks} blocks x {_MLA_BLOCK_SIZE} = "
+                  f"{num_blocks * _MLA_BLOCK_SIZE} token slots ({num_layers} layers, "
+                  f"{bytes_per_slot} bytes/token, dtype={kv_cache_dtype})")
+
+        device = f"cuda:{self.rank}"
+        for i, layer in enumerate(mla_layers):
+            cache = torch.zeros(
+                num_blocks, _MLA_BLOCK_SIZE, cache_last_dim,
+                dtype=cache_torch_dtype, device=device,
+            )
+            layer.k_cache = cache
+            layer.v_cache = cache
+
+        if num_indexer_layers > 0:
+            if self.rank == 0:
+                print(f"  Indexer K cache: {num_blocks} blocks x {_MLA_BLOCK_SIZE} = "
+                      f"{num_blocks * _MLA_BLOCK_SIZE} token slots ({num_indexer_layers} layers, "
+                      f"{_INDEXER_CACHE_BYTES} bytes/token)")
+            for i, layer in enumerate(indexer_layers):
+                layer.indexer_k_cache = torch.zeros(
+                    num_blocks, _MLA_BLOCK_SIZE, _INDEXER_CACHE_BYTES,
+                    dtype=torch.uint8, device=device,
+                )
+
+        if self.rank == 0:
+            print(f"  MLA attention backend: FlashMLA (block_size={_MLA_BLOCK_SIZE}, {backend_desc})")
+
+        # Pre-allocate chunked prefill workspace for MLA context gathering.
+        # Matches vllm's MLACommonMetadataBuilder workspace sizing.
+        workspace_tokens = min(
+            max(8 * self.max_model_len,
+                4 * self.max_num_seqs * _MLA_BLOCK_SIZE),
+            64 * 1024,
+        )
+        workspace_tokens = max(workspace_tokens,
+                               self.max_num_seqs * _MLA_BLOCK_SIZE)
+        # Workspace holds BF16 kv_c + k_pe (kv_lora_rank + qk_rope_head_dim
+        # elements per token), regardless of on-disk cache layout.
+        kv_lora_rank_ws = mla_layers[0].kv_lora_rank if num_layers else 512
+        rope_dim_ws = mla_layers[0].qk_rope_head_dim if num_layers else 64
+        self._mla_chunked_prefill_workspace = torch.empty(
+            workspace_tokens, kv_lora_rank_ws + rope_dim_ws,
+            dtype=torch.bfloat16, device=device,
+        )
+        self._mla_workspace_size = workspace_tokens
+
+    def _build_chunked_context(self, prefill_seqs, prefill_chunk_sizes,
+                               block_tables, device):
+        """Build ChunkedContextMetadata for MLA prefill with prior context.
+
+        When a prefill request has already-computed tokens (chunked prefill),
+        those tokens live in the KV cache and must be gathered and attended to
+        in workspace-sized chunks. This matches vllm's
+        MLACommonMetadataBuilder.build() chunked context logic.
+        """
+        from .context import ChunkedContextMetadata
+
+        num_prefills = len(prefill_seqs)
+        context_lens = []
+        for seq, chunk_size in zip(prefill_seqs, prefill_chunk_sizes):
+            context_lens.append(seq.num_computed_tokens)
+        context_lens_cpu = torch.tensor(context_lens, dtype=torch.int32)
+        max_context_len = int(context_lens_cpu.max().item())
+
+        if max_context_len == 0:
+            return None
+
+        num_prefills_with_context = int((context_lens_cpu > 0).sum().item())
+        if num_prefills_with_context == 0:
+            return None
+
+        max_context_chunk = self._mla_workspace_size // num_prefills_with_context
+        block_size = self.block_size
+        max_context_chunk = (max_context_chunk // block_size) * block_size
+        if max_context_chunk == 0:
+            max_context_chunk = block_size
+        num_chunks = (max_context_len + max_context_chunk - 1) // max_context_chunk
+
+        chunk_starts = (
+            torch.arange(num_chunks, dtype=torch.int32)
+            .unsqueeze(1).expand(-1, num_prefills)
+            * max_context_chunk
+        )
+        chunk_ends = torch.min(
+            context_lens_cpu.unsqueeze(0), chunk_starts + max_context_chunk
+        )
+        chunk_seq_lens = (chunk_ends - chunk_starts).clamp(min=0)
+
+        cu_seq_lens_cpu = torch.zeros(
+            num_chunks, num_prefills + 1, dtype=torch.int32)
+        torch.cumsum(chunk_seq_lens, dim=1, out=cu_seq_lens_cpu[:, 1:],
+                     dtype=torch.int32)
+        chunk_total_token = cu_seq_lens_cpu[:, -1]
+
+        max_token_num = int(chunk_total_token.max().item())
+        token_to_seq_cpu = torch.zeros(
+            num_chunks, max_token_num, dtype=torch.int32)
+        range_idx = torch.arange(num_prefills, dtype=torch.int32)
+        for i in range(num_chunks):
+            chunk_t2s = torch.repeat_interleave(range_idx, chunk_seq_lens[i])
+            clen = chunk_t2s.shape[0]
+            token_to_seq_cpu[i, :clen] = chunk_t2s
+
+        return ChunkedContextMetadata(
+            cu_seq_lens=cu_seq_lens_cpu.to(device, non_blocking=True),
+            starts=chunk_starts.to(device, non_blocking=True),
+            seq_tot=chunk_seq_lens.sum(dim=1).tolist(),
+            max_seq_lens=chunk_seq_lens.max(dim=1).values.tolist(),
+            seq_lens=chunk_seq_lens,
+            workspace=self._mla_chunked_prefill_workspace,
+            token_to_seq=token_to_seq_cpu.to(device, non_blocking=True),
+            chunk_total_token=chunk_total_token.tolist(),
+        )
+
     def prepare_prefill(self, seqs):
         input_ids, positions = [], []
         cu_seqlens_q, cu_seqlens_k = [0], [0]
@@ -809,13 +1078,30 @@ class ModelRunner:
                     bt[i, :len(b)] = b
             block_tables = torch.from_numpy(bt).pin_memory().cuda(non_blocking=True)
 
+        # Per-token request id (row into block_tables). Pre-computing this
+        # once per step avoids a Python for-loop + .item() sync inside every
+        # MLA / DSA layer (see ``_forward_sparse_bf16`` fallback in
+        # ``mla_attention_impl.py``).
+        nseqs_pf = len(seqs)
+        seq_lens_np = np.fromiter(
+            (len(s) for s in seqs), dtype=np.int32, count=nseqs_pf,
+        )
+        req_id_np = np.repeat(
+            np.arange(nseqs_pf, dtype=np.int32), seq_lens_np,
+        )
+        req_id_per_token = torch.from_numpy(req_id_np).pin_memory().cuda(
+            non_blocking=True,
+        )
+
         set_context(
             True,
             torch.tensor(cu_seqlens_q, dtype=torch.int32, pin_memory=True).cuda(non_blocking=True),
             torch.tensor(cu_seqlens_k, dtype=torch.int32, pin_memory=True).cuda(non_blocking=True),
             max_sq, max_sk,
-            torch.tensor(slot_mapping, dtype=torch.int32, pin_memory=True).cuda(non_blocking=True),
+            torch.tensor(slot_mapping, dtype=(torch.int64 if self.is_deepseek_mla else torch.int32),
+                         pin_memory=True).cuda(non_blocking=True),
             block_tables=block_tables,
+            req_id_per_token=req_id_per_token,
         )
 
         input_ids_t = torch.tensor(input_ids, dtype=torch.int64, pin_memory=True).cuda(non_blocking=True)
@@ -831,7 +1117,7 @@ class ModelRunner:
         n = len(seqs)
         ids = np.empty(n, dtype=np.int64)
         pos = np.empty(n, dtype=np.int64)
-        sm = np.empty(n, dtype=np.int32)
+        sm = np.empty(n, dtype=np.int64)
         cl = np.empty(n, dtype=np.int32)
         use_mrope = self.is_qwen_vl
         if use_mrope:
@@ -857,12 +1143,25 @@ class ModelRunner:
             b = seq.block_table
             bt[i, :len(b)] = b
         max_cl = int(cl[:n].max())
+        # Pure-decode: one token per request, so token i belongs to request i.
+        # Reuse the persistent arange buffer allocated in
+        # ``capture_cudagraph`` (also referenced by every captured decode
+        # CUDA graph) to avoid allocating a fresh tensor each step.  Falls
+        # back to an inline arange for eager runs where capture was skipped.
+        req_id_per_token = getattr(self, "_decode_req_id_buf", None)
+        if req_id_per_token is not None:
+            req_id_per_token = req_id_per_token[:n]
+        else:
+            req_id_per_token = torch.arange(
+                n, dtype=torch.int32, device=f"cuda:{self.rank}",
+            )
         set_context(
             False,
             slot_mapping=torch.from_numpy(sm).pin_memory().cuda(non_blocking=True),
             context_lens=torch.from_numpy(cl).pin_memory().cuda(non_blocking=True),
             block_tables=torch.from_numpy(bt).pin_memory().cuda(non_blocking=True),
             max_context_len=max_cl,
+            req_id_per_token=req_id_per_token,
         )
         self._apply_pending_cross_ctx()
         if use_mrope:
@@ -967,8 +1266,40 @@ class ModelRunner:
         for j in range(nd):
             logit_idx.append(num_prefill_tokens + j)
 
+        chunked_context = None
+        if self.is_deepseek_mla and num_prefill_seqs > 0:
+            chunked_context = self._build_chunked_context(
+                prefill_seqs, prefill_chunk_sizes, prefill_block_tables,
+                device=torch.device(f"cuda:{self.rank}"),
+            )
+
+        # Per-token request id, aligned with the flat token layout
+        # built above: ``[prefill_tokens..., decode_tokens...]``.
+        # The unified block_table used downstream (see
+        # ``_forward_sparse_bf16``) is laid out as
+        # ``[decode_seqs..., prefill_seqs...]``; hence prefill tokens map
+        # to rows ``num_decode_seqs + r`` and decode tokens to row ``j``.
+        total_tokens = num_prefill_tokens + nd
+        if total_tokens > 0:
+            if num_prefill_tokens > 0:
+                pf_ids_np = np.repeat(
+                    (nd + np.arange(num_prefill_seqs, dtype=np.int32)),
+                    np.asarray(prefill_chunk_sizes, dtype=np.int32),
+                )
+            else:
+                pf_ids_np = np.empty(0, dtype=np.int32)
+            dc_ids_np = np.arange(nd, dtype=np.int32)
+            req_id_np = np.concatenate([pf_ids_np, dc_ids_np])
+            req_id_per_token = torch.from_numpy(req_id_np).pin_memory().cuda(
+                non_blocking=True,
+            )
+        else:
+            req_id_per_token = None
+
         set_mixed_context(
-            slot_mapping=torch.tensor(slot_mapping, dtype=torch.int32, pin_memory=True).cuda(non_blocking=True),
+            slot_mapping=torch.tensor(slot_mapping,
+                                      dtype=(torch.int64 if self.is_deepseek_mla else torch.int32),
+                                      pin_memory=True).cuda(non_blocking=True),
             num_prefill_tokens=num_prefill_tokens,
             num_decode_tokens=nd,
             num_prefill_seqs=num_prefill_seqs,
@@ -981,6 +1312,8 @@ class ModelRunner:
             decode_block_tables=torch.from_numpy(dc_bt).pin_memory().cuda(non_blocking=True) if nd > 0 else None,
             decode_max_context_len=dc_max_cl,
             logit_indices=torch.tensor(logit_idx, dtype=torch.int64, pin_memory=True).cuda(non_blocking=True),
+            chunked_context=chunked_context,
+            req_id_per_token=req_id_per_token,
         )
 
         input_ids_t = torch.tensor(input_ids, dtype=torch.int64, pin_memory=True).cuda(non_blocking=True)
@@ -1139,12 +1472,16 @@ class ModelRunner:
         context_lens = self._eager_context_lens[:n]
         block_tables = self._eager_block_tables[:n, :bt_cols]
 
+        req_id_per_token = getattr(self, "_decode_req_id_buf", None)
+        if req_id_per_token is not None:
+            req_id_per_token = req_id_per_token[:n]
         set_context(
             False,
             slot_mapping=slot_mapping,
             context_lens=context_lens,
             block_tables=block_tables,
             max_context_len=int(cl_np.max()),
+            req_id_per_token=req_id_per_token,
         )
         self._apply_pending_cross_ctx()
         hidden = self.model(input_ids, positions)
@@ -1185,7 +1522,11 @@ class ModelRunner:
             self._np_pos = np.empty((3, max_bs), dtype=np.int64)
         else:
             self._np_pos = np.empty(max_bs, dtype=np.int64)
-        self._np_sm = np.empty(max_bs, dtype=np.int32)
+        # DeepSeek MLA FP8 KV cache stores require int64 slot_mapping;
+        # the FA3 path only needs int32.
+        sm_np_dtype = np.int64 if self.is_deepseek_mla else np.int32
+        sm_torch_dtype = torch.int64 if self.is_deepseek_mla else torch.int32
+        self._np_sm = np.empty(max_bs, dtype=sm_np_dtype)
         self._np_cl = np.empty(max_bs, dtype=np.int32)
         self._np_bt = np.full((max_bs, max_num_blocks), -1, dtype=np.int32)
 
@@ -1194,7 +1535,7 @@ class ModelRunner:
             self._eager_positions = torch.zeros(3, max_bs, dtype=torch.int64, device=dev)
         else:
             self._eager_positions = torch.zeros(max_bs, dtype=torch.int64, device=dev)
-        self._eager_slot_mapping = torch.zeros(max_bs, dtype=torch.int32, device=dev)
+        self._eager_slot_mapping = torch.zeros(max_bs, dtype=sm_torch_dtype, device=dev)
         self._eager_context_lens = torch.zeros(max_bs, dtype=torch.int32, device=dev)
         self._eager_block_tables = torch.zeros(max_bs, max_num_blocks, dtype=torch.int32, device=dev)
 
@@ -1362,7 +1703,15 @@ class ModelRunner:
             off += nb
 
     def _loop_decode_greedy(self):
-        """Worker fast path: read decode arrays from SHM without pickle."""
+        """Worker fast path: read decode arrays from SHM without pickle.
+
+        Must mirror :meth:`_write_decode_shm` exactly. In particular, MLA
+        models write ``slot_mapping`` as ``int64`` (8 bytes per element)
+        because the FP8 paged KV cache stores require it; non-MLA models
+        use ``int32``. Reading the wrong dtype here both garbles ``sm``
+        and shifts every following field, which produces inconsistent
+        decode metadata across ranks and deadlocks TP collectives.
+        """
         buf = self.shm.buf
         n = int.from_bytes(buf[0:2], "little")
         max_bt = int.from_bytes(buf[2:4], "little")
@@ -1372,7 +1721,10 @@ class ModelRunner:
             pos_np = np.frombuffer(buf, dtype=np.int64, count=3*n, offset=off).copy().reshape(3, n); off += 3 * n * 8
         else:
             pos_np = np.frombuffer(buf, dtype=np.int64, count=n, offset=off).copy(); off += n * 8
-        sm_np = np.frombuffer(buf, dtype=np.int32, count=n, offset=off).copy(); off += n * 4
+        if self.is_deepseek_mla:
+            sm_np = np.frombuffer(buf, dtype=np.int64, count=n, offset=off).copy(); off += n * 8
+        else:
+            sm_np = np.frombuffer(buf, dtype=np.int32, count=n, offset=off).copy(); off += n * 4
         cl_np = np.frombuffer(buf, dtype=np.int32, count=n, offset=off).copy(); off += n * 4
         bt_np = np.frombuffer(buf, dtype=np.int32, count=n*max_bt, offset=off).copy().reshape(n, max_bt)
         self.run_decode_greedy_fast((n, ids_np, pos_np, sm_np, cl_np, bt_np))
@@ -1875,6 +2227,7 @@ class ModelRunner:
 
     @torch.inference_mode()
     def capture_cudagraph(self):
+        import gc
         from contextlib import nullcontext
         max_bs = self.max_num_seqs
         max_num_blocks = (self.max_model_len + BLOCK_SIZE - 1) // BLOCK_SIZE
@@ -1883,15 +2236,33 @@ class ModelRunner:
             positions = torch.zeros(3, max_bs + 1, dtype=torch.int64)
         else:
             positions = torch.zeros(max_bs, dtype=torch.int64)
-        slot_mapping = torch.full((max_bs,), -1, dtype=torch.int32)
+        sm_torch_dtype = torch.int64 if self.is_deepseek_mla else torch.int32
+        slot_mapping = torch.full((max_bs,), -1, dtype=sm_torch_dtype)
         context_lens = torch.zeros(max_bs, dtype=torch.int32)
         block_tables = torch.zeros(max_bs, max_num_blocks, dtype=torch.int32)
+        # Persistent arange buffer for per-token request id mapping during
+        # pure-decode (token i -> sequence i).  Captured into decode CUDA
+        # graphs and reused by ``prepare_decode``; kept on-device so the
+        # sparse MLA ``convert_indices`` kernel never falls back to an
+        # all-zeros buffer (see ``_forward_sparse_bf16``).
+        decode_req_id = torch.arange(max_bs, dtype=torch.int32).cuda()
+        self._decode_req_id_buf = decode_req_id
 
-        self.graph_bs_list = sorted(set(
-            [1, 2, 4] +
-            list(range(8, min(max_bs + 1, 256), 8)) +
-            list(range(256, max_bs + 1, 16))
-        ))
+        # Match vLLM's default ``cudagraph_capture_sizes`` for DeepSeek-V3.2:
+        # [1, 2, 4, 8, 16, 24, ..., 256, 272, ..., 512].  vLLM caps captures at
+        # ``max_cudagraph_capture_size=512`` (see logs); larger decode batches
+        # are dispatched to the largest captured graph or fall back to a
+        # piecewise/eager path.  Going past 512 here makes the compile time
+        # dominate (each graph at bs>512 takes seconds) without measurable
+        # decode wins, so we keep the same 512 cap.
+        max_capture = min(max_bs, 512)
+        self.graph_bs_list = [i for i in [1, 2, 4] if i <= max_capture]
+        if max_capture >= 8:
+            self.graph_bs_list += list(range(8, min(max_capture + 1, 256), 8))
+        if max_capture >= 256:
+            self.graph_bs_list += list(range(256, max_capture + 1, 16))
+        if self.graph_bs_list[-1] != max_capture:
+            self.graph_bs_list.append(max_capture)
         self.graphs = {}
         self.graph_pool = None
 
@@ -1918,13 +2289,61 @@ class ModelRunner:
         lm_max_idxs = torch.zeros(max_bs, dtype=torch.int64)
 
         ar_ctx = self.custom_ar.capture() if self.custom_ar is not None else nullcontext()
+        _graph_list = list(reversed(self.graph_bs_list))
+
+        # Single warmup at the largest batch size to trigger all Triton/CUDA
+        # kernel JIT compilation. Subsequent captures reuse compiled kernels.
+        largest_bs = _graph_list[0]
+        set_context(
+            False, slot_mapping=slot_mapping[:largest_bs],
+            context_lens=context_lens[:largest_bs],
+            block_tables=block_tables[:largest_bs],
+            max_context_len=self.max_model_len,
+            req_id_per_token=decode_req_id[:largest_bs],
+        )
+        # Mark batch dim as dynamic BEFORE the first compile-triggering forward
+        # so Dynamo / Inductor produce a single symbolic-shape compiled graph
+        # that works for every batch size we will subsequently capture, instead
+        # of hard-coding the warmup batch size into the compiled subgraphs
+        # (which under ``skip_all_guards_unsafe`` would silently get reused at
+        # the wrong size and trip Inductor's ``assert_size_stride`` checks).
+        warmup_ids = input_ids[:largest_bs]
+        warmup_pos = (positions[:, :largest_bs]
+                      if self.is_qwen_vl else positions[:largest_bs])
+        if self._compiled and not self._mark_dynamic_done:
+            torch._dynamo.mark_dynamic(warmup_ids, 0)
+            if self.is_qwen_vl:
+                torch._dynamo.mark_dynamic(warmup_pos, 1)
+            else:
+                torch._dynamo.mark_dynamic(warmup_pos, 0)
+            self._mark_dynamic_done = True
+        if self.is_qwen_vl:
+            outputs[:largest_bs] = self.model(warmup_ids, warmup_pos)
+        else:
+            outputs[:largest_bs] = self.model(warmup_ids, warmup_pos)
+        lm_logits[:largest_bs] = lm_head.linear_op(
+            outputs[:largest_bs], lm_head.embedding_op.emb.weight).float()
+        lm_max_vals[:largest_bs], lm_max_idxs[:largest_bs] = \
+            lm_logits[:largest_bs].max(dim=-1)
+        reset_context()
+        torch.cuda.synchronize()
+
+        # Freeze GC during capture to avoid Python GC stalls (matches vllm).
+        gc.collect()
+        gc.freeze()
+
         with ar_ctx:
-            for bs in reversed(self.graph_bs_list):
+            for _gi, bs in enumerate(_graph_list):
+                if self.rank == 0 and (_gi % max(1, len(_graph_list) // 5) == 0
+                                       or _gi == len(_graph_list) - 1):
+                    print(f"    CUDA graph {_gi+1}/{len(_graph_list)} (bs={bs})",
+                          flush=True)
                 graph = torch.cuda.CUDAGraph()
                 set_context(
                     False, slot_mapping=slot_mapping[:bs],
                     context_lens=context_lens[:bs], block_tables=block_tables[:bs],
                     max_context_len=self.max_model_len,
+                    req_id_per_token=decode_req_id[:bs],
                 )
 
                 ids_slice = input_ids[:bs]
@@ -1950,11 +2369,8 @@ class ModelRunner:
                     self._mark_dynamic_done = True
 
                 # Warmup forward: for VL, compute inputs_embeds outside and
-                # pass it so the compiled inner Qwen3Model traces the
+                # pass it so the compiled inner model traces the
                 # inputs_embeds branch (never embed_tokens).
-                # deepstack_embeds is intentionally omitted — the compiled
-                # graph traces without it, avoiding zero-add overhead on
-                # every decode step.
                 if ie_slice is not None:
                     ie_slice.copy_(vl_embed_fn(ids_slice))
                     outputs[:bs] = self.model(
@@ -1963,21 +2379,21 @@ class ModelRunner:
                     )
                 else:
                     outputs[:bs] = self.model(ids_slice, pos_slice)
-                lm_logits[:bs] = lm_head.linear_op(outputs[:bs], lm_head.embedding_op.emb.weight).float()
+                lm_logits[:bs] = lm_head.linear_op(
+                    outputs[:bs], lm_head.embedding_op.emb.weight).float()
                 lm_max_vals[:bs], lm_max_idxs[:bs] = lm_logits[:bs].max(dim=-1)
 
                 with torch.cuda.graph(graph, self.graph_pool):
-                    if vl_inputs_embeds is not None:
-                        vl_inputs_embeds[:bs] = vl_embed_fn(input_ids[:bs])
+                    if ie_slice is not None:
+                        ie_slice.copy_(vl_embed_fn(ids_slice))
                         outputs[:bs] = self.model(
-                            input_ids[:bs], positions[:, :bs],
-                            inputs_embeds=vl_inputs_embeds[:bs],
+                            ids_slice, pos_slice,
+                            inputs_embeds=ie_slice,
                         )
-                    elif self.is_qwen_vl:
-                        outputs[:bs] = self.model(input_ids[:bs], positions[:, :bs])
                     else:
-                        outputs[:bs] = self.model(input_ids[:bs], positions[:bs])
-                    lm_logits[:bs] = lm_head.linear_op(outputs[:bs], lm_head.embedding_op.emb.weight).float()
+                        outputs[:bs] = self.model(ids_slice, pos_slice)
+                    lm_logits[:bs] = lm_head.linear_op(
+                        outputs[:bs], lm_head.embedding_op.emb.weight).float()
                     lm_max_vals[:bs], lm_max_idxs[:bs] = lm_logits[:bs].max(dim=-1)
 
                 if self.graph_pool is None:
@@ -1985,6 +2401,9 @@ class ModelRunner:
                 self.graphs[bs] = graph
                 torch.cuda.synchronize()
                 reset_context()
+
+        gc.unfreeze()
+        gc.collect()
 
         self.graph_vars = dict(
             input_ids=input_ids, positions=positions,
@@ -1996,7 +2415,12 @@ class ModelRunner:
         # Pre-compute lookup table: _graph_bs_for_n[n] = smallest graph_bs >= n
         self._graph_bs_for_n = [0] * (max_bs + 1)
         for n in range(max_bs + 1):
-            self._graph_bs_for_n[n] = next(x for x in self.graph_bs_list if x >= n)
+            for x in self.graph_bs_list:
+                if x >= n:
+                    self._graph_bs_for_n[n] = x
+                    break
+            else:
+                self._graph_bs_for_n[n] = max_bs
 
 
 # ---------------------------------------------------------------------------

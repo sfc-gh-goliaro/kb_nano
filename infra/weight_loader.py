@@ -1,12 +1,14 @@
 """
-Weight loader for Llama 3.1, Llama 4, Mixtral, Qwen2-VL, Qwen3-VL,
-GPT-OSS, and Whisper with tensor parallelism.
+Weight loader for Llama 3.1, Llama 4, Mixtral, DeepSeek V3.2, Qwen2-VL,
+Qwen3-VL, GPT-OSS, and Whisper with tensor parallelism.
 
 Loads weights from HuggingFace safetensors and distributes them
 across TP shards using the weight_loader callbacks on each parameter.
 
 GPT-OSS uses a dedicated loader (_load_gpt_oss_weights) that keeps
 expert weights in native MXFP4 packed uint8 format for Triton inference.
+DeepSeek V3.2 FP8 weights are re-quantized in-place to UE8M0 scales
+post-load and MLA absorbed weights are computed before inference.
 """
 
 from __future__ import annotations
@@ -34,6 +36,7 @@ from ..tasks.baseline.L4.llama4 import Llama4Config, Llama4ForCausalLM
 from ..tasks.baseline.L4.mixtral import MixtralConfig, MixtralForCausalLM
 from ..tasks.baseline.L4.qwen2_vl import Qwen2VLConfig, Qwen2VLForConditionalGeneration
 from ..tasks.baseline.L4.qwen3_vl import Qwen3VLConfig, Qwen3VLForConditionalGeneration
+from ..tasks.baseline.L4.deepseek import DeepSeekV3Config, DeepSeekV3ForCausalLM
 from ..tasks.baseline.L4.flux import FluxConfig, FluxPipeline
 from ..tasks.baseline.L4.whisper import WhisperConfig, WhisperForConditionalGeneration
 from ..tasks.baseline.L4.cosyvoice3 import CosyVoice3Config, CosyVoice3ForTTS
@@ -44,6 +47,14 @@ def default_weight_loader(param: torch.nn.Parameter, loaded_weight: torch.Tensor
 
 
 def download_model(model_name: str) -> str:
+    # Accept an already-staged local directory (used by the
+    # ``diff_deepseek_layers`` diagnostic and other fixtures that feed a
+    # truncated checkpoint to the engine).  Without this short-circuit,
+    # ``snapshot_download`` rejects the absolute path as an invalid
+    # ``org/repo`` id, which makes TP>1 worker processes fail on import
+    # since they do not inherit any parent-side monkey-patches.
+    if os.path.isdir(model_name):
+        return model_name
     return snapshot_download(
         model_name, allow_patterns=["*.safetensors", "*.json"],
     )
@@ -51,6 +62,15 @@ def download_model(model_name: str) -> str:
 
 _EXPERT_RE = re.compile(
     r"(.+\.block_sparse_moe)\.experts\.(\d+)\.(w[123])\.weight"
+)
+
+# DeepSeek-V3 per-expert weight and scale pattern
+_DEEPSEEK_EXPERT_RE = re.compile(
+    r"(.+\.mlp)\.experts\.(\d+)\.(gate_proj|up_proj|down_proj)\.(weight_scale_inv|weight)$"
+)
+
+_DEEPSEEK_SHARED_EXPERT_RE = re.compile(
+    r"(.+\.mlp)\.shared_experts\.(gate_proj|up_proj|down_proj)\.(weight|weight_scale_inv)"
 )
 
 # Qwen3-MoE fused expert weight patterns: gate_up_proj [E, 2*inter, hidden], down_proj [E, hidden, inter]
@@ -363,14 +383,36 @@ def _threaded_safetensors_iterator(safetensor_files):
 
 
 def _fastsafetensors_iterator(safetensor_files):
-    """Yield (weight_name, tensor) using fastsafetensors GPU-direct loading."""
-    device = torch.device(f"cuda:{torch.cuda.current_device()}")
-    pg = SingleGroup()
-    sorted_files = sorted(safetensor_files)
+    """Yield (weight_name, tensor) using fastsafetensors GPU-direct loading.
 
-    for f_path in sorted_files:
-        loader = SafeTensorsFileLoader(pg, device, nogds=True)
-        loader.add_filenames({0: [f_path]})
+    Mirrors vLLM's ``fastsafetensors_weights_iterator``
+    (vllm/model_executor/model_loader/weight_utils.py:942) which loads
+    ``pg.size()`` files in parallel across the TP process group.  Each
+    rank reads one file at a time, then broadcasts/redistributes via
+    fastsafetensors' internal collectives.  With TP=8 and 21 shards this
+    is 8x faster than the previous SingleGroup loop that made every rank
+    sequentially read every file.
+    """
+    if torch.distributed.is_initialized():
+        pg = torch.distributed.group.WORLD
+    else:
+        pg = SingleGroup()
+
+    device = torch.device(f"cuda:{torch.cuda.current_device()}")
+    sorted_files = sorted(safetensor_files)
+    world_size = pg.size()
+    file_sub_lists = [
+        sorted_files[i:i + world_size]
+        for i in range(0, len(sorted_files), world_size)
+    ]
+    # vLLM disables GDS for TP>1 to avoid creating CUDA contexts on every
+    # visible GPU (cuFileDriverOpen side-effect).  Match that.
+    nogds = world_size > 1
+
+    for f_list in file_sub_lists:
+        loader = SafeTensorsFileLoader(pg, device, nogds=nogds)
+        rank_file_map = {i: [f] for i, f in enumerate(f_list)}
+        loader.add_filenames(rank_file_map)
         try:
             fb = loader.copy_files_to_device()
             try:
@@ -462,9 +504,61 @@ def _assign_fused_expert(model, key, tensor, scale):
             param.data.copy_(weight[:, :, rank * tp_inter:(rank + 1) * tp_inter])
 
 
+def _weights_iterator(safetensor_files, use_fastsafetensors=True):
+    """Iterate over (weight_name, tensor) from safetensor files.
+
+    Uses fastsafetensors (GPU Direct Storage) when available for fast
+    GPU-direct loading. Falls back to safetensors CPU loading otherwise.
+    Matches vllm's fastsafetensors_weights_iterator / safetensors_weights_iterator.
+    """
+    if use_fastsafetensors and _HAS_FASTSAFETENSORS:
+        import torch.distributed as dist
+        if dist.is_initialized():
+            pg = dist.group.WORLD
+        else:
+            pg = SingleGroup()
+        device = torch.device(f"cuda:{pg.rank()}")
+        batch_size = pg.size()
+        file_batches = [
+            safetensor_files[i:i + batch_size]
+            for i in range(0, len(safetensor_files), batch_size)
+        ]
+        nogds = False
+        for f_list in file_batches:
+            loader = SafeTensorsFileLoader(pg, device, nogds=nogds)
+            rank_file_map = {i: [f] for i, f in enumerate(f_list)}
+            loader.add_filenames(rank_file_map)
+            try:
+                try:
+                    fb = loader.copy_files_to_device()
+                except RuntimeError as e:
+                    if "gds" not in str(e):
+                        raise
+                    loader.close()
+                    nogds = True
+                    loader = SafeTensorsFileLoader(pg, device, nogds=nogds)
+                    loader.add_filenames(rank_file_map)
+                    fb = loader.copy_files_to_device()
+                try:
+                    for k in list(fb.key_to_rank_lidx.keys()):
+                        yield k, fb.get_tensor(k)
+                finally:
+                    fb.close()
+            finally:
+                loader.close()
+    else:
+        for sf_file in safetensor_files:
+            with safe_open(sf_file, "pt", "cpu") as f:
+                for name in f.keys():
+                    yield name, f.get_tensor(name)
+
+
 def load_weights(model, model_path: str, model_type: str = "llama") -> None:
     """Load weights with support for packed modules, MoE experts, vision
     encoder QKV, FP8 weight_scale_inv, and TP sharding.
+
+    Uses fastsafetensors (GPU Direct Storage) when available to load tensors
+    directly to GPU, matching vllm's fastsafetensors_weights_iterator.
     """
     packed = getattr(model, "packed_modules_mapping", {})
     safetensor_files = sorted(glob(os.path.join(model_path, "*.safetensors")))
@@ -480,15 +574,19 @@ def load_weights(model, model_path: str, model_type: str = "llama") -> None:
     if is_llama4:
         llama4_config = model.config
 
+    import time as _time
+    _t_load = _time.perf_counter()
     if _HAS_FASTSAFETENSORS:
         print(f"  Loading weights from {len(safetensor_files)} safetensors file(s) "
-              f"[fastsafetensors GPU-direct]...")
+              f"[fastsafetensors GPU-direct]...", flush=True)
     elif len(safetensor_files) > 1:
         print(f"  Loading weights from {len(safetensor_files)} safetensors file(s) "
-              f"[threaded]...")
+              f"[threaded]...", flush=True)
     else:
-        print(f"  Loading weights from {len(safetensor_files)} safetensors file(s)...")
+        print(f"  Loading weights from {len(safetensor_files)} safetensors file(s)...",
+              flush=True)
     loaded = 0
+    _last_report = _t_load
     _fused_expert_weights = {}
     _fused_expert_scales = {}
 
@@ -507,6 +605,10 @@ def load_weights(model, model_path: str, model_type: str = "llama") -> None:
     for weight_name, _loaded_tensor in _weight_iter:
         def _get_tensor(_t=_loaded_tensor):
             return _t
+        now = _time.perf_counter()
+        if now - _last_report > 5.0:
+            print(f"    {loaded} shards loaded ({now - _t_load:.1f}s)", flush=True)
+            _last_report = now
         # Remap checkpoint names for Qwen VL models
         if is_qwen2_vl:
             mapped_name = _remap_qwen2_vl_name(weight_name)
@@ -514,6 +616,18 @@ def load_weights(model, model_path: str, model_type: str = "llama") -> None:
             mapped_name = _remap_qwen3_vl_name(weight_name)
         else:
             mapped_name = weight_name
+
+        if model_type == "deepseek_v3":
+            mapped_name = mapped_name.replace(
+                ".shared_experts.", ".shared_expert.")
+            mapped_name = mapped_name.replace(
+                ".mlp.gate.weight", ".mlp.gate_weight")
+            # The router's ``e_score_correction_bias`` lives directly on the
+            # ``DeepSeekMoE`` module (not under a ``.gate`` submodule as in
+            # the HuggingFace checkpoint), so strip the ``.gate`` segment.
+            mapped_name = mapped_name.replace(
+                ".mlp.gate.e_score_correction_bias",
+                ".mlp.e_score_correction_bias")
 
         # Whisper: remap checkpoint names
         if is_whisper:
@@ -557,6 +671,7 @@ def load_weights(model, model_path: str, model_type: str = "llama") -> None:
             if not mapped_name.startswith("language_model."):
                 continue
             mapped_name = mapped_name[len("language_model."):]
+
             m_fused = _LLAMA4_FUSED_EXPERT_RE.match(mapped_name)
             if m_fused:
                 prefix_part, proj = m_fused.groups()
@@ -635,6 +750,37 @@ def load_weights(model, model_path: str, model_type: str = "llama") -> None:
                 prefix, wb = m_qkv.groups()
                 loaded += _load_vision_qkv(model, prefix, _get_tensor(), wb)
                 continue
+
+        # DeepSeek MoE expert weights/scales — must be checked BEFORE
+        # _WEIGHT_SCALE_INV_RE to avoid the generic scale handler consuming
+        # expert weight_scale_inv names and silently skipping them.
+        m_ds = _DEEPSEEK_EXPERT_RE.match(mapped_name)
+        if m_ds:
+            moe_prefix, expert_id_str, proj_name, attr = m_ds.groups()
+            expert_id = int(expert_id_str)
+            if proj_name in ("gate_proj", "up_proj"):
+                is_w1 = (proj_name == "gate_proj")
+                if attr == "weight":
+                    param_name = f"{moe_prefix}.w13"
+                else:
+                    param_name = f"{moe_prefix}.w13_weight_scale_inv"
+                try:
+                    param = model.get_parameter(param_name)
+                except AttributeError:
+                    continue
+                param.weight_loader(param, _get_tensor(), expert_id, is_w1=is_w1)
+            else:
+                if attr == "weight":
+                    param_name = f"{moe_prefix}.w2"
+                else:
+                    param_name = f"{moe_prefix}.w2_weight_scale_inv"
+                try:
+                    param = model.get_parameter(param_name)
+                except AttributeError:
+                    continue
+                param.weight_loader(param, _get_tensor(), expert_id)
+            loaded += 1
+            continue
 
         # Handle FP8 weight_scale_inv tensors
         m_scale = _WEIGHT_SCALE_INV_RE.match(mapped_name)
@@ -782,7 +928,7 @@ def load_weights(model, model_path: str, model_type: str = "llama") -> None:
             _assign_fused_expert(model, key, _fused_expert_weights.pop(key), scale)
         del _fused_expert_weights, _fused_expert_scales
 
-    print(f"  Loaded {loaded} weight shards.")
+    print(f"  Loaded {loaded} weight shards ({_time.perf_counter()-_t_load:.1f}s).")
 
 
 def _postprocess_moe_fp8_weights(module) -> int:
@@ -835,26 +981,79 @@ def _postprocess_moe_fp8_weights(module) -> int:
 
 
 def _postprocess_fp8_weights(model: torch.nn.Module) -> None:
-    """Re-quantize FP8 weights to UE8M0 format and transform scale layout for DeepGEMM."""
-    from ..tasks.baseline.L1.fp8_linear import Fp8Linear, postprocess_fp8_weights
-    from ..tasks.baseline.L2.qwen3_moe import Qwen3MoE
+    """Re-quantize FP8 weights to UE8M0 format and transform scale layout for DeepGEMM.
 
-    print("  Post-processing FP8 weights for DeepGEMM...")
-    count = 0
+    Handles both regular Fp8Linear modules (e.g. DeepSeek MLA/MoE gating projections,
+    Qwen3-MoE gate proj) and fused MoE expert stacks (DeepSeek V3 / Qwen3-MoE).
+    """
+    import time as _time
+    from ..tasks.baseline.L1.fp8_linear import (
+        Fp8Linear, postprocess_fp8_weights, postprocess_fp8_weights_batched,
+    )
+
+    _t_pp = _time.perf_counter()
+    print("  Post-processing FP8 weights for DeepGEMM...", flush=True)
+
+    # --- FP8 linear modules (DeepSeek MLA projections, Qwen3 gate proj, etc.) ---
+    linear_modules = [
+        m for m in model.modules()
+        if isinstance(getattr(m, 'linear_op', None), Fp8Linear)
+    ]
+    for module in linear_modules:
+        w = module.weight
+        s = module.weight_scale_inv
+        w_new, s_new = postprocess_fp8_weights(w.data, s.data)
+        module.weight = torch.nn.Parameter(w_new, requires_grad=False)
+        module.weight_scale_inv = torch.nn.Parameter(s_new, requires_grad=False)
+    print(f"    {len(linear_modules)} FP8 linear layers done "
+          f"({_time.perf_counter()-_t_pp:.1f}s)", flush=True)
+
+    # --- MoE expert stacks: DeepSeek V3 uses postprocess_fp8_weights_batched
+    # for in-place UE8M0 requantization + scale layout transform. Qwen3-MoE
+    # keeps its original scales and uses a separate DG-layout buffer. ---
     moe_count = 0
-    for module in model.modules():
-        if isinstance(module.linear_op if hasattr(module, 'linear_op') else None, Fp8Linear):
-            w = module.weight
-            s = module.weight_scale_inv
-            w_new, s_new = postprocess_fp8_weights(w.data, s.data)
-            module.weight = torch.nn.Parameter(w_new, requires_grad=False)
-            module.weight_scale_inv = torch.nn.Parameter(s_new, requires_grad=False)
-            count += 1
-        elif isinstance(module, Qwen3MoE) and getattr(module, 'use_fp8', False):
-            moe_count += _postprocess_moe_fp8_weights(module)
-    if count > 0 or moe_count > 0:
+    deepseek_moe_modules: list = []
+    qwen3_moe_modules: list = []
+    try:
+        from ..tasks.baseline.L2.deepseek_moe import DeepSeekMoE
+        deepseek_moe_modules = [
+            m for m in model.modules()
+            if isinstance(m, DeepSeekMoE) and getattr(m, 'use_fp8', False)
+        ]
+    except ImportError:
+        pass
+    try:
+        from ..tasks.baseline.L2.qwen3_moe import Qwen3MoE
+        qwen3_moe_modules = [
+            m for m in model.modules()
+            if isinstance(m, Qwen3MoE) and getattr(m, 'use_fp8', False)
+        ]
+    except ImportError:
+        pass
+
+    if deepseek_moe_modules:
+        _t_moe = _time.perf_counter()
+        total = len(deepseek_moe_modules)
+        for j, module in enumerate(deepseek_moe_modules):
+            for wname, sname in (("w13", "w13_weight_scale_inv"),
+                                 ("w2", "w2_weight_scale_inv")):
+                w = getattr(module, wname)
+                s = getattr(module, sname)
+                postprocess_fp8_weights_batched(w.data, s.data)
+                moe_count += w.shape[0]
+            if j % max(1, total // 5) == 0 or j == total - 1:
+                print(f"    DeepSeek MoE postprocess {j+1}/{total} "
+                      f"({(j+1)*100//total}%, "
+                      f"{_time.perf_counter()-_t_moe:.1f}s)", flush=True)
+
+    for module in qwen3_moe_modules:
+        moe_count += _postprocess_moe_fp8_weights(module)
+
+    if linear_modules or moe_count > 0:
         torch.cuda.empty_cache()
-    print(f"  Post-processed {count} FP8 linear layers, {moe_count} MoE weight sets.")
+    print(f"  Post-processed {len(linear_modules)} FP8 linear layers, "
+          f"{moe_count} MoE expert weight slices "
+          f"({_time.perf_counter()-_t_pp:.1f}s total).", flush=True)
 
 
 def _is_diffusion_model(model_name: str) -> bool:
@@ -885,18 +1084,41 @@ def _detect_diffusion_type(model_name: str) -> str:
     return "flux"
 
 
+def _load_config_dict(model_name: str) -> dict:
+    """Read ``config.json`` from either a local staging dir or the Hub."""
+    import json
+    if os.path.isdir(model_name):
+        path = os.path.join(model_name, "config.json")
+    else:
+        from huggingface_hub import hf_hub_download
+        path = hf_hub_download(model_name, "config.json")
+    with open(path) as f:
+        return json.load(f)
+
+
 def _detect_model_type(model_name: str) -> str:
     """Detect model architecture from HuggingFace config."""
     if _is_diffusion_model(model_name):
         return _detect_diffusion_type(model_name)
-    hf_config = AutoConfig.from_pretrained(model_name, trust_remote_code=True)
-    model_type = getattr(hf_config, "model_type", "llama")
+    try:
+        hf_config = AutoConfig.from_pretrained(model_name, trust_remote_code=True)
+        model_type = getattr(hf_config, "model_type", "llama")
+    except ValueError:
+        # DeepSeek-V3.2 ships a custom config class not registered with
+        # transformers; fall back to reading config.json directly.
+        model_type = _load_config_dict(model_name).get("model_type", "llama")
+    if model_type == "deepseek_v32":
+        model_type = "deepseek_v3"
     return model_type
 
 
 def _detect_quant_config(model_name: str) -> dict | None:
     """Detect FP8 quantization config from HuggingFace config."""
-    hf_config = AutoConfig.from_pretrained(model_name)
+    try:
+        hf_config = AutoConfig.from_pretrained(model_name, trust_remote_code=True)
+    except ValueError:
+        from types import SimpleNamespace
+        hf_config = SimpleNamespace(**_load_config_dict(model_name))
     qc = getattr(hf_config, "quantization_config", None)
     if qc is None:
         return None
@@ -974,6 +1196,12 @@ def load_model(
         else:
             print("  Allocating Qwen3-VL model...")
         model = Qwen3VLForConditionalGeneration(config, quant_config=quant_config)
+    elif model_type == "deepseek_v3":
+        config = DeepSeekV3Config.from_pretrained(model_name)
+        config.dtype = dtype
+        print(f"  Allocating DeepSeek V3.2 model ({config.n_routed_experts} experts, "
+              f"top-{config.num_experts_per_tok}, DSA topk={config.index_topk})...")
+        model = DeepSeekV3ForCausalLM(config, quant_config=quant_config)
     else:
         config = LlamaConfig.from_pretrained(model_name)
         config.dtype = dtype
@@ -986,7 +1214,9 @@ def load_model(
             f"TP degree {tp} is incompatible with {config.num_attention_heads} Q heads "
             f"(num_attention_heads must be divisible by tensor_parallel_size)"
         )
-    if hasattr(config, "num_key_value_heads") and config.num_key_value_heads % tp != 0:
+    if (model_type != "deepseek_v3"
+            and hasattr(config, "num_key_value_heads")
+            and config.num_key_value_heads % tp != 0):
         raise ValueError(
             f"TP degree {tp} is incompatible with {config.num_key_value_heads} KV heads "
             f"(num_key_value_heads must be divisible by tensor_parallel_size)"
@@ -1019,14 +1249,36 @@ def load_model(
                     param.data = param.data.to(device=device)
             elif "weight_scale_inv" in name or "w13_scale" in name or "w2_scale" in name:
                 param.data = param.data.to(device=device)
+            elif param.dtype == torch.float32:
+                # Preserve FP32 parameters (e.g. the DeepSeek router's
+                # ``e_score_correction_bias``) that were intentionally allocated
+                # in FP32 and must stay FP32 to match vLLM's router bias path.
+                if param.data.device != device:
+                    param.data = param.data.to(device=device)
             elif param.data.device != device or param.dtype != dtype:
                 param.data = param.data.to(device=device, dtype=dtype)
         for name, buf in model.named_buffers():
             if buf.device != device:
                 buf.data = buf.data.to(device=device)
+        if model_type == "deepseek_v3":
+            _compute_mla_absorbed_weights(model)
         _postprocess_fp8_weights(model)
     elif model_type != "gpt_oss":
         model = model.to(device=device, dtype=dtype)
 
+    if model_type == "deepseek_v3" and quant_config is None:
+        _compute_mla_absorbed_weights(model)
+
     model.eval()
     return model, config
+
+
+def _compute_mla_absorbed_weights(model: torch.nn.Module) -> None:
+    """Compute absorbed W_UV weights for MLA decode after loading."""
+    from ..tasks.baseline.L2.deepseek_mla_attention import DeepSeekMLAAttention
+    count = 0
+    for module in model.modules():
+        if isinstance(module, DeepSeekMLAAttention):
+            module.compute_absorbed_weights()
+            count += 1
+    print(f"  Computed absorbed MLA weights for {count} attention layers.")

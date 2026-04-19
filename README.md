@@ -1,11 +1,13 @@
 # kb-nano
 
-A standalone, high-performance inference engine supporting **LLMs** (Llama 3.1, Mixtral-8x7B, GPT-OSS, Qwen2-VL, Qwen3-VL), **diffusion models** (FLUX.1-dev, SDXL, HunyuanVideo-1.5), **detection models** (YOLOv10, RTDetrV2), **vision encoders** (SigLIP-2, DINOv3, SwinV2), **segmentation models** (SAM3.1), **protein structure prediction** (OpenFold3), audio models (Whisper), and **TTS models** (CosyVoice3) with tensor parallelism. No vLLM dependency at runtime — just PyTorch, Triton, and Flash Attention.
+A standalone, high-performance inference engine supporting **LLMs** (Llama 3.1, Llama 4, Mixtral-8x7B, DeepSeek V3.2, GPT-OSS, Qwen2-VL, Qwen3-VL), **diffusion models** (FLUX.1-dev, SDXL, HunyuanVideo-1.5), **detection models** (YOLOv10, RTDetrV2), **vision encoders** (SigLIP-2, DINOv3, SwinV2), **segmentation models** (SAM3.1), **protein structure prediction** (OpenFold3), audio models (Whisper), and **TTS models** (CosyVoice3) with tensor parallelism and FP8 quantization. No vLLM dependency at runtime — just PyTorch, Triton, and Flash Attention.
 
 ## Features
 
 - **Llama 3.1** (8B, 70B) with frequency-scaled RoPE
+- **Llama 4** with fused MoE experts
 - **Mixtral-8x7B** with fused Triton MoE grouped-GEMM kernels
+- **DeepSeek V3.2** with MLA (Multi-head Latent Attention), 256-expert MoE via DeepGEMM FP8, DSA (DeepSeek Sparse Attention), and YARN RoPE — currently **0.78–0.90× of vLLM** throughput on 8×H200 (gap due to kernel-launch overhead, GEMM kernel selection, and AllReduce+RMSNorm fusion)
 - **GPT-OSS** (20B, 120B) MXFP4-quantized MoE with native Triton inference, YaRN RoPE, attention sinks, and sliding window
 - **FLUX.1-dev** diffusion transformer (text-to-image) with Flash Attention
 - **SDXL** (Stable Diffusion XL) UNet-based text-to-image with dual CLIP text encoders
@@ -20,11 +22,13 @@ A standalone, high-performance inference engine supporting **LLMs** (Llama 3.1, 
 - **Whisper** (large-v3) encoder-decoder speech-to-text with batched inference and paged cross-attention KV cache
 - **CosyVoice3** (Fun-CosyVoice3-0.5B-2512) text-to-speech with flow matching DiT + HiFi-GAN vocoder
 - **OpenFold3** (OpenFold/OpenFold3) protein structure prediction with MSA module, PairFormer, diffusion sampling, and atom attention
+- **FP8 inference** with block-scaled FP8 quantization via DeepGEMM, UE8M0 power-of-two scales, and fused SiLU+Mul+FP8 quantization kernels
 - **Tensor parallelism** (TP) with custom IPC-based all-reduce for multi-GPU inference
-- **Paged KV cache** with Triton store kernels (LLM models)
+- **Paged KV cache** with Triton store kernels (LLM models); FP8 MLA KV cache for DeepSeek
 - **CUDA graph capture** for decode steps (LLM models)
-- **Flash Attention** for both prefill/paged decode (LLMs) and non-causal bidirectional attention (diffusion)
+- **Flash Attention** for both prefill/paged decode (LLMs) and non-causal bidirectional attention (diffusion); **FlashMLA** for DeepSeek MLA decode
 - Greedy and top-p sampling (LLMs); flow-match Euler discrete scheduling (diffusion)
+- **fastsafetensors** GPU Direct Storage for fast weight loading
 - **Layered operator architecture** (L1 single-kernel ops through L4 full models) with clean separation of concerns
 - **Benchmarking suite** for evaluating custom CUDA/Triton/PyTorch kernels at 4 abstraction levels
 - **vllm-omni comparison benchmark** for FLUX diffusion and HunyuanVideo-1.5 video diffusion
@@ -596,6 +600,29 @@ Latency (batch size 1, 128 output tokens, 5 iterations):
 | Qwen3-VL-235B-FP8 (MoE) | 4 | single-video | 1.882s | 1.768s | **1.06x** |
 
 FP8 activation quantization uses a custom Triton kernel for single-launch per-token-group UE8M0 quantization. Pre-allocated shared prefill buffers eliminate dynamic allocation during FP8 prefill, and DeepGEMM is JIT-warmed for both decode and prefill batch sizes. The remaining throughput gap vs vLLM is primarily from vLLM's `torch.compile` + Inductor fusion passes (RMSNorm+quant, SiLU+quant).
+
+### DeepSeek V3.2 FP8 (MoE, MLA, DSA)
+
+FP8 support for `deepseek-ai/DeepSeek-V3.2` with block-scaled FP8 MoE experts via DeepGEMM, Multi-head Latent Attention (MLA) with FP8 KV cache via FlashMLA, and DeepSeek Sparse Attention (DSA) indexer.
+
+**Hardware: 8x NVIDIA H200 (NVLink)**
+
+Throughput (1000 sequences per scenario, `temperature=0`, `max_model_len=1536`):
+
+| Model | TP | Scenario | Input/Output | vLLM (tok/s) | Ours (tok/s) | Ratio | Avg Match Tokens |
+|-------|---:|----------|:------------:|-------------:|-------------:|------:|-----------------:|
+| DeepSeek-V3.2 | 8 | prefill-heavy | 1024/512  | 2,798 | 2,096 | 0.75x | 192.9/512 |
+| DeepSeek-V3.2 | 8 | balanced      |  512/512  | 3,391 | 3,268 | 0.96x | 237.8/512 |
+| DeepSeek-V3.2 | 8 | decode-heavy  |  512/1024 | 3,671 | 2,966 | 0.81x | 451.5/1024 |
+
+Latency (128 output tokens, 5 iterations):
+
+| Model | TP | Scenario | BS | vLLM median | Ours median | ms/tok vLLM | ms/tok Ours | Ratio |
+|-------|---:|----------|---:|------------:|------------:|------------:|------------:|------:|
+| DeepSeek-V3.2 | 8 | single-request  |  1 | 2.132s | 2.511s | 16.66 | 19.62 | 0.85x |
+| DeepSeek-V3.2 | 8 | fixed-batch-32  | 32 | 3.835s | 4.208s |  0.94 |  1.03 | 0.91x |
+
+kb-nano currently runs 4–25% slower than vLLM on DeepSeek-V3.2 across all scenarios. The remaining gap is dominated by (1) per-step CPU launch overhead — kb-nano issues ~7× more uncaptured CUDA kernels than vLLM and its CUDA-graph launches are larger/slower; (2) GEMM kernel selection — kb-nano falls back to `sm90_fp8_gemm_1d2d_impl` on a few decode shapes where vLLM picks the faster `fp8_gemm_kernel_swapAB`; and (3) AllReduce fusion — vLLM fuses TP AllReduce with the surrounding RMSNorm + FP8 quant via flashinfer's `trtllm_allreduce_fusion`, eliminating ~3 kernel launches per AR site. Token match rates are higher than other MoE models in this README because we removed the prior bit-divergence in MLA/MoE routing; the residual divergence comes from FP8 quantization differences in the 256-expert MoE and DSA sparse-attention paths.
 
 ### FLUX.1-dev (Diffusion)
 
