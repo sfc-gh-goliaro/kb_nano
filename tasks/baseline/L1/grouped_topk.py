@@ -16,6 +16,9 @@ with full parity for:
   top-k (matches vLLM's batch-invariant mode)
 
 Returns FP32 ``topk_weights`` to match vLLM.
+
+Fast path uses ``_C.grouped_topk`` (verbatim port of vLLM's fused noaux_tc
+CUDA kernel — see ``tasks/baseline/L1/csrc/grouped_topk_kernels.cu``).
 """
 
 from __future__ import annotations
@@ -25,6 +28,8 @@ import os
 import torch
 import torch.nn as nn
 
+from .csrc import _C
+
 
 def _is_batch_invariant() -> bool:
     """Return True when running in batch-invariant mode (matches vLLM's
@@ -32,40 +37,16 @@ def _is_batch_invariant() -> bool:
     return os.environ.get("VLLM_BATCH_INVARIANT", "0") == "1"
 
 
-# Cache the resolved fused kernel reference so we only pay the import +
-# attribute lookup once per process (the lookup is on the hot per-MoE-layer,
-# per-token path).
-_FUSED_GROUPED_TOPK = None
-_FUSED_GROUPED_TOPK_RESOLVED = False
-
-
-def _maybe_get_fused_grouped_topk():
-    """Return ``vllm._custom_ops.grouped_topk`` if the fused CUDA kernel is
-    available on this build, otherwise ``None``.
-
-    Mirrors vLLM's enablement gate in
-    ``vllm/model_executor/layers/fused_moe/router/grouped_topk_router.py:95-101``:
-    ``VLLM_USE_FUSED_MOE_GROUPED_TOPK and is_cuda and num_expert_group<=32 and
-    topk<=32 and e_score_correction_bias is not None``. The first three
-    conditions are checked here; the latter two are checked at call-time.
-    """
-    global _FUSED_GROUPED_TOPK, _FUSED_GROUPED_TOPK_RESOLVED
-    if _FUSED_GROUPED_TOPK_RESOLVED:
-        return _FUSED_GROUPED_TOPK
-    _FUSED_GROUPED_TOPK_RESOLVED = True
-
-    if os.environ.get("VLLM_USE_FUSED_MOE_GROUPED_TOPK", "1") != "1":
-        return None
-    if not torch.cuda.is_available():
-        return None
-    try:
-        # ``vllm._custom_ops.grouped_topk`` wraps ``torch.ops._moe_C.grouped_topk``
-        # — vLLM's fully fused CUDA top-k kernel.
-        from vllm import _custom_ops as _vllm_ops
-        _FUSED_GROUPED_TOPK = _vllm_ops.grouped_topk
-    except Exception:
-        _FUSED_GROUPED_TOPK = None
-    return _FUSED_GROUPED_TOPK
+def _fused_grouped_topk_enabled() -> bool:
+    """Mirrors vLLM's enablement gate in
+    ``grouped_topk_router.py:95-101``: ``VLLM_USE_FUSED_MOE_GROUPED_TOPK``
+    env-var on, CUDA available, fused kernel built into ``_C``.  The
+    per-call gates (``num_expert_group<=32 and topk<=32 and
+    e_score_correction_bias is not None``) are checked at call-time."""
+    return (
+        os.environ.get("VLLM_USE_FUSED_MOE_GROUPED_TOPK", "1") == "1"
+        and torch.cuda.is_available()
+    )
 
 
 class GroupedTopK(nn.Module):
@@ -99,41 +80,41 @@ class GroupedTopK(nn.Module):
         topk_group: int,
         topk: int,
     ) -> tuple[torch.Tensor, torch.Tensor]:
-        # Fast path: vLLM's fully fused CUDA kernel
-        # (``torch.ops._moe_C.grouped_topk``).  Conditions match
+        # Fast path: kb_nano's fused noaux_tc CUDA kernel
+        # (``_C.grouped_topk``, verbatim port of vLLM's
+        # ``torch.ops._moe_C.grouped_topk``).  Conditions match
         # ``grouped_topk_router.py:95-101``.  Saves ~10 separate Triton/PyTorch
         # ops per MoE layer per token vs. the eager fallback.
         if (
             e_score_correction_bias is not None
             and num_expert_group <= 32
             and topk <= 32
+            and _fused_grouped_topk_enabled()
         ):
-            fused = _maybe_get_fused_grouped_topk()
-            if fused is not None:
-                if self.scoring_func == "sigmoid":
-                    # Kernel applies sigmoid internally.
-                    return fused(
-                        gating_output,
-                        num_expert_group,
-                        topk_group,
-                        topk,
-                        self.renormalize,
-                        self.routed_scaling_factor,
-                        e_score_correction_bias,
-                        1,  # scoring_func=1 (sigmoid)
-                    )
-                # Softmax: precompute scores (kernel doesn't have softmax).
-                scores = torch.softmax(gating_output, dim=-1)
-                return fused(
-                    scores,
+            if self.scoring_func == "sigmoid":
+                # Kernel applies sigmoid internally.
+                return _C.grouped_topk(
+                    gating_output,
                     num_expert_group,
                     topk_group,
                     topk,
                     self.renormalize,
                     self.routed_scaling_factor,
                     e_score_correction_bias,
-                    0,  # scoring_func=0 (no activation, scores precomputed)
+                    1,  # scoring_func=1 (sigmoid)
                 )
+            # Softmax: precompute scores (kernel doesn't have softmax).
+            scores = torch.softmax(gating_output, dim=-1)
+            return _C.grouped_topk(
+                scores,
+                num_expert_group,
+                topk_group,
+                topk,
+                self.renormalize,
+                self.routed_scaling_factor,
+                e_score_correction_bias,
+                0,  # scoring_func=0 (no activation, scores precomputed)
+            )
 
         # Score computation in the *gating output* dtype (vLLM does *not*
         # cast to FP32 first — see grouped_topk_router.py:117-119).

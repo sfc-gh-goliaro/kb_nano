@@ -1,18 +1,15 @@
 """DeepSeek MoE with shared expert, grouped routing, and FP8 expert execution.
 
-Uses GroupedTopK for routing, FusedExperts (BF16) or a fused DeepGEMM FP8
-path for expert execution, and a shared expert (``LlamaMLP`` with
-``reduce_results=False``) that runs on a separate CUDA stream for overlap.
+Uses :class:`GroupedTopK` for routing, :class:`VllmFusedExperts` for the
+FP8 expert path (a fresh-allocation port of vLLM's ``fused_experts_impl``
+that mirrors vLLM's Triton oracle for Hopper + block-FP8 + TP),
+:class:`FusedExperts` for the BF16 / unquantized fallback, and a shared
+expert (``LlamaMLP`` with ``reduce_results=False``) that runs on a
+separate CUDA stream for overlap.
 
 Matches vllm's DeepseekV2MoE: routed_scaling_factor is applied post-experts
 (not folded into routing weights), and the shared expert uses
 ``moe_intermediate_size * n_shared_experts`` as its intermediate dimension.
-
-All compute-heavy ops are L1 primitives — :class:`PerTokenGroupQuantFp8`
-for activation quantization, :class:`Fp8GroupedGemmContiguous` for the
-two expert GEMMs, :class:`SiluMulQuantFp8` for the fused SiLU+Mul+FP8
-quant between them, and :class:`MoePermute` / :class:`MoeUnpermuteReduce`
-for scatter/gather.
 """
 
 from __future__ import annotations
@@ -24,16 +21,11 @@ import torch.nn as nn
 
 from ....infra.tp import _tp_rank, _tp_size
 from ..L1.allreduce import AllReduce
-from ..L1.linear import Matmul
 from ..L1.grouped_topk import GroupedTopK
 from ..L1.gate_linear import gate_linear_forward
-from ..L1.moe_permute import MoePermute
-from ..L1.moe_unpermute_reduce import MoeUnpermuteReduce
-from ..L1.silu_mul_quant_fp8 import SiluMulQuantFp8
-from ..L1.fp8_linear import PerTokenGroupQuantFp8
-from ..L1.fp8_grouped_gemm_contiguous import Fp8GroupedGemmContiguous
 from .fused_experts import FusedExperts
 from .llama_mlp import LlamaMLP
+from .vllm_fused_experts import VllmFusedExperts
 
 _FP8_BLOCK = 128
 
@@ -139,7 +131,6 @@ class DeepSeekMoE(nn.Module):
             self.w13_weight_scale_inv.weight_loader = self._w13_scale_loader
             self.w2_weight_scale_inv.weight_loader = self._w2_scale_loader
 
-        self.linear_op = Matmul()
         # Routing weights: vLLM always passes ``routed_scaling_factor=1.0``
         # to ``grouped_topk`` and applies the factor *post-experts* (see
         # ``vllm/model_executor/models/deepseek_v2.py:325`` and L378-379).
@@ -149,13 +140,15 @@ class DeepSeekMoE(nn.Module):
             renormalize=self.norm_topk_prob,
             routed_scaling_factor=1.0,
         )
-        self.fused_experts = FusedExperts()
+        # FP8 path uses a fresh-allocation, vLLM-mirrored op so it is
+        # both bit-identical to vLLM's Triton MoE *and* safe to compose
+        # with CUDA graph capture (no shared scratch buffers that an
+        # eager prefill could reallocate underneath a captured graph).
+        # The BF16 / unquantized path keeps the standard ``FusedExperts``.
         if self.use_fp8:
-            self.moe_permute = MoePermute()
-            self.moe_unpermute_reduce = MoeUnpermuteReduce()
-            self.silu_mul_quant_fp8 = SiluMulQuantFp8()
-            self.fp8_quant = PerTokenGroupQuantFp8()
-            self.fp8_grouped_gemm = Fp8GroupedGemmContiguous()
+            self.fused_experts = VllmFusedExperts()
+        else:
+            self.fused_experts = FusedExperts()
         self.allreduce = AllReduce()
         # Mirrors vLLM's ``VLLM_DISABLE_SHARED_EXPERTS_STREAM`` env knob
         # (default: stream enabled). When disabled, the shared expert runs
@@ -166,9 +159,6 @@ class DeepSeekMoE(nn.Module):
             _os.environ.get("VLLM_DISABLE_SHARED_EXPERTS_STREAM", "0") != "0"
         )
         self._shared_stream: torch.cuda.Stream | None = None
-        self._ws13: torch.Tensor | None = None
-        self._ws2: torch.Tensor | None = None
-        self._out_buf: torch.Tensor | None = None
 
         # Custom-op dispatch scaffolding (matches the other MoE L2 modules).
         # ``_use_custom_op`` is flipped to True by ``enable_custom_ops`` so
@@ -273,8 +263,24 @@ class DeepSeekMoE(nn.Module):
         # Cast to activation dtype only for the BF16 / "unquantized" path,
         # which still uses kb_nano's local FusedExperts wrapper.
         if self.use_fp8:
-            out = self._forward_fp8_experts(
-                hidden_states, topk_weights, topk_ids)
+            # FP8 W8A8 block-quant on Hopper + TP: vLLM's oracle
+            # (``select_fp8_moe_backend`` -> ``_get_priority_backends``
+            # in ``vllm/.../fused_moe/oracle/fp8.py``) explicitly moves
+            # ``TRITON`` to the front for this configuration.  The
+            # DeepGEMM path drifts ~1 BF16 ULP which cascades through
+            # near-tie expert selection in subsequent MoE layers.
+            # ``VllmFusedExperts`` is a fresh-allocation port of vLLM's
+            # ``fused_experts_impl`` Triton path and consumes
+            # ``topk_weights`` in FP32 (vLLM's ``GroupedTopKRouter``
+            # returns FP32 and the Triton kernel scales in FP32 before
+            # the final ``.to(compute_type)`` cast).
+            out = self.fused_experts(
+                hidden_states, self.w13, self.w2,
+                topk_weights, topk_ids, self.num_experts,
+                w13_scale=self.w13_weight_scale_inv,
+                w2_scale=self.w2_weight_scale_inv,
+                block_shape=[_FP8_BLOCK, _FP8_BLOCK],
+            )
         else:
             topk_weights_act = topk_weights.to(hidden_states.dtype)
             out = self.fused_experts(
@@ -295,67 +301,3 @@ class DeepSeekMoE(nn.Module):
             out = self.allreduce(out)
 
         return out.view(orig_shape)
-
-    def _get_workspace(self, name: str, min_bytes: int,
-                        device: torch.device) -> torch.Tensor:
-        """Get or grow a workspace buffer (uint8) for reuse across calls."""
-        buf = getattr(self, name)
-        if buf is None or buf.numel() < min_bytes or buf.device != device:
-            buf = torch.empty(min_bytes, dtype=torch.uint8, device=device)
-            setattr(self, name, buf)
-        return buf
-
-    def _forward_fp8_experts(
-        self,
-        hidden_states: torch.Tensor,
-        topk_weights: torch.Tensor,
-        topk_ids: torch.Tensor,
-    ) -> torch.Tensor:
-        """FP8 MoE expert forward, dispatching to whichever kernel vLLM would
-        pick for this configuration.
-
-        For DeepSeek-V3 on Hopper (SM90) with ``ep_size <= 1`` and FP8
-        block-quantization, vLLM's oracle (``select_fp8_moe_backend`` in
-        ``vllm/model_executor/layers/fused_moe/oracle/fp8.py`` →
-        ``_get_priority_backends``) **explicitly prioritises Triton over
-        DeepGEMM** for small batch sizes — even though DeepGEMM is
-        technically supported. The TP=1 small-prefill regime hits this
-        path. Using DeepGEMM here produces a 1-BF16-ULP drift in routed
-        expert outputs that cascades through subsequent MoE layers and
-        flips a handful of near-tie expert selections from layer ~5
-        onwards.
-
-        To match vLLM bit-exactly we delegate the routed-expert kernel
-        to vLLM's standalone ``fused_experts`` (which routes through the
-        same ``invoke_fused_moe_triton_kernel`` as ``TritonExperts.apply``
-        for the FP8 W8A8 block path).
-        """
-        try:
-            from vllm.model_executor.layers.fused_moe.fused_moe import (
-                fused_experts as _vllm_fused_experts,
-            )
-            from vllm.model_executor.layers.fused_moe.config import (
-                fp8_w8a8_moe_quant_config,
-            )
-        except ImportError as e:
-            raise RuntimeError(
-                "kb_nano FP8 MoE requires vllm.model_executor.layers.fused_moe; "
-                f"import failed: {e}"
-            ) from e
-
-        quant_config = fp8_w8a8_moe_quant_config(
-            w1_scale=self.w13_weight_scale_inv,
-            w2_scale=self.w2_weight_scale_inv,
-            block_shape=[_FP8_BLOCK, _FP8_BLOCK],
-        )
-        return _vllm_fused_experts(
-            hidden_states=hidden_states,
-            w1=self.w13,
-            w2=self.w2,
-            topk_weights=topk_weights,
-            topk_ids=topk_ids,
-            inplace=False,
-            global_num_experts=self.num_experts,
-            expert_map=None,
-            quant_config=quant_config,
-        )

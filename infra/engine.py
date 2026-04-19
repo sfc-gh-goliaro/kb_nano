@@ -345,7 +345,6 @@ class ModelRunner:
             print(f"  [1/6] Model loaded in {_time.perf_counter()-_t0:.1f}s", flush=True)
         self._share_trtllm_workspace()
         self._share_activation_buffers()
-        self._share_moe_workspaces()
         if rank == 0:
             print(f"  [2/6] Warmup forward pass...", flush=True)
         _t1 = _time.perf_counter()
@@ -490,51 +489,6 @@ class ModelRunner:
         fresh contiguous output per call (matches vLLM exactly).
         """
         return
-
-    def _share_moe_workspaces(self):
-        """Pre-allocate and share MoE FP8 expert workspace buffers across layers.
-
-        Each DeepSeekMoE layer has _ws13, _ws2, _out_buf workspace tensors
-        that grow on first use. Since decoder layers execute sequentially,
-        only one set is ever active. Without sharing, each of the ~58 MoE
-        layers allocates its own ~5 GB workspace during warmup, totaling
-        ~285 GB — far exceeding GPU memory. Matches vllm's global
-        WorkspaceManager approach.
-
-        We pre-allocate at the max size (max_num_batched_tokens * top_k,
-        padded for DeepGEMM alignment) and assign the same buffers to all
-        modules so _get_workspace sees them as already big enough.
-        """
-        from ..tasks.baseline.L2.deepseek_moe import DeepSeekMoE
-        moe_modules = [
-            m for m in self.model.modules()
-            if isinstance(m, DeepSeekMoE) and m.use_fp8
-        ]
-        if not moe_modules:
-            return
-
-        ref = moe_modules[0]
-        device = next(self.model.parameters()).device
-        M = self.max_num_batched_tokens
-        K = ref.hidden_size
-        N_gate_up = 2 * ref.intermediate_per_tp
-        top_k = ref.top_k
-
-        import deep_gemm
-        align = int(deep_gemm.get_mk_alignment_for_contiguous_layout())
-        m_sum_upper = (M * top_k) + ref.num_experts * (align - 1)
-        m_sum = ((m_sum_upper + align - 1) // align) * align
-
-        ws13_bytes = m_sum * max(K, N_gate_up) * 2
-        ws2_bytes = m_sum * max(N_gate_up, K) * 2
-        shared_ws13 = torch.empty(ws13_bytes, dtype=torch.uint8, device=device)
-        shared_ws2 = torch.empty(ws2_bytes, dtype=torch.uint8, device=device)
-        shared_out = torch.empty(M, K, dtype=torch.bfloat16, device=device)
-
-        for m in moe_modules:
-            m._ws13 = shared_ws13
-            m._ws2 = shared_ws2
-            m._out_buf = shared_out
 
     def warmup_model(self):
         torch.cuda.empty_cache()

@@ -7,9 +7,11 @@ which has a three-tier dispatch:
 1. **DSV3 specialized kernel** — Hopper/Blackwell, ``num_experts in {256, 384}``,
    ``hidden_size == 7168``, batch ``<= 16``. BF16 x BF16 -> FP32 fused kernel
    that internally accumulates in FP32. Routes to
-   ``vllm._custom_ops.dsv3_router_gemm``.
+   ``_C.dsv3_router_gemm`` (verbatim port of vLLM's CUDA kernel — see
+   ``tasks/baseline/L1/csrc/dsv3_router_gemm_*.cu``).
 2. **cuBLAS BF16 -> FP32** — Hopper/Blackwell + BF16 weight + FP32 out. Routes
-   to ``vllm._custom_ops.router_gemm_bf16_fp32``.
+   to ``_C.router_gemm_bf16_fp32`` (verbatim port of vLLM's cuBLAS wrapper —
+   see ``tasks/baseline/L1/csrc/router_gemm_bf16_fp32.cu``).
 3. **PyTorch fallback** — vanilla ``F.linear`` at the input dtype, with cast
    back to FP32 at the end.
 
@@ -26,33 +28,39 @@ import functools
 
 import torch
 
+from .csrc import _C
 
-# Cache the resolved kernel handles + capability bits so we only pay the
-# import / attribute lookups + capability query once per process.
+
 @functools.cache
-def _maybe_load_router_kernels() -> tuple[
-    object | None,  # dsv3_router_gemm callable
-    object | None,  # router_gemm_bf16_fp32 callable
-    bool,           # is_hopper_or_blackwell
-]:
+def _is_hopper_or_blackwell() -> bool:
+    """Same gate vLLM uses (see ``GateLinear.__init__``):
+    ``current_platform.is_device_capability((9, 0))`` (Hopper) or
+    ``current_platform.is_device_capability_family(100)`` (Blackwell)."""
     if not torch.cuda.is_available():
-        return None, None, False
-
-    try:
-        from vllm import _custom_ops as _vllm_ops
-    except Exception:
-        return None, None, False
-
-    dsv3 = getattr(_vllm_ops, "dsv3_router_gemm", None)
-    bf16_fp32 = getattr(_vllm_ops, "router_gemm_bf16_fp32", None)
-
-    # Same gate vLLM uses (see ``GateLinear.__init__``):
-    # ``current_platform.is_device_capability((9, 0))`` (Hopper) or
-    # ``current_platform.is_device_capability_family(100)`` (Blackwell).
+        return False
     cap = torch.cuda.get_device_capability()
-    is_hopper_or_blackwell = (cap[0], cap[1]) == (9, 0) or cap[0] == 10
+    return (cap[0], cap[1]) == (9, 0) or cap[0] == 10
 
-    return dsv3, bf16_fp32, is_hopper_or_blackwell
+
+def _dsv3_router_gemm(
+    hidden_states: torch.Tensor,
+    router_weight: torch.Tensor,
+    output_dtype: torch.dtype,
+) -> torch.Tensor:
+    """Allocates the output and dispatches to the DSV3 specialized kernel.
+
+    Mirrors vLLM's ``_custom_ops.dsv3_router_gemm`` Python wrapper exactly:
+    the underlying CUDA op takes ``output`` as an in/out parameter, so the
+    allocation lives on the Python side.
+    """
+    output = torch.empty(
+        hidden_states.shape[0],
+        router_weight.shape[0],
+        device=hidden_states.device,
+        dtype=output_dtype,
+    )
+    _C.dsv3_router_gemm(output, hidden_states, router_weight)
+    return output
 
 
 def gate_linear_forward(
@@ -74,8 +82,7 @@ def gate_linear_forward(
     num_experts = weight.shape[0]
     hidden_size = weight.shape[1]
 
-    dsv3, bf16_fp32, is_hopper_or_blackwell = _maybe_load_router_kernels()
-
+    is_hopper_or_blackwell = _is_hopper_or_blackwell()
     bf16_input = x.dtype == torch.bfloat16 and weight.dtype == torch.bfloat16
 
     # Tier 1: DSV3 specialized kernel. Matches vLLM's ``GateLinear.forward``
@@ -87,22 +94,20 @@ def gate_linear_forward(
     # boundary-flipping the grouped-topk at layers 3+.
     if (
         is_hopper_or_blackwell
-        and dsv3 is not None
         and bf16_input
         and num_tokens <= 16
         and num_experts in (256, 384)
         and hidden_size == 7168
     ):
-        return dsv3(x, weight, out_dtype)
+        return _dsv3_router_gemm(x, weight, out_dtype)
 
     # Tier 2: cuBLAS BF16 x BF16 -> FP32.
     if (
         is_hopper_or_blackwell
-        and bf16_fp32 is not None
         and bf16_input
         and out_dtype == torch.float32
     ):
-        return bf16_fp32(x, weight)
+        return _C.router_gemm_bf16_fp32(x, weight)
 
     # Tier 3: F.linear fallback. Match vLLM's behaviour (cast input to
     # weight dtype, then cast output to out_dtype).
