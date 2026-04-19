@@ -31,6 +31,7 @@ from dataclasses import dataclass
 from typing import Any
 
 import torch
+import torch.nn as nn
 import triton
 import triton.language as tl
 
@@ -86,21 +87,6 @@ class Mxfp4MoEQuantConfig:
     w2_bias: torch.Tensor | None = None
 
 
-def mxfp4_w4a16_moe_quant_config(
-    w1_scale: Any,
-    w2_scale: Any,
-    w1_bias: torch.Tensor | None = None,
-    w2_bias: torch.Tensor | None = None,
-) -> Mxfp4MoEQuantConfig:
-    """Construct a quant config for unquantized activations + MXFP4 weights."""
-    return Mxfp4MoEQuantConfig(
-        w1_precision=w1_scale,
-        w2_precision=w2_scale,
-        w1_bias=w1_bias,
-        w2_bias=w2_bias,
-    )
-
-
 # ---------------------------------------------------------------------------
 # Weight swizzling
 # ---------------------------------------------------------------------------
@@ -152,26 +138,6 @@ def _swizzle_mxfp4(quant_tensor: torch.Tensor, scale: torch.Tensor, num_warps: i
         wrap_torch_tensor(scale), scale_layout, **scale_layout_opts
     )
     return quant_tensor, InFlexData(), scale
-
-
-def prepare_mxfp4_weight(
-    quant_tensor: torch.Tensor, scale: torch.Tensor, num_warps: int = 8
-):
-    """Swizzle an MXFP4 expert weight and build its ``PrecisionConfig``.
-
-    Encapsulates the entire ``triton_kernels`` setup so callers (L2)
-    never need to import from ``triton_kernels`` directly. Returns
-    ``(swizzled_weight, precision_config)`` ready to feed into
-    :func:`mxfp4_w4a16_moe_quant_config` and :func:`mxfp4_moe_forward`.
-    """
-    _ensure_triton_kernels_on_path()
-    from triton_kernels.matmul_ogs import FlexCtx, PrecisionConfig
-
-    weight, flex, scale_tensor = _swizzle_mxfp4(quant_tensor, scale, num_warps)
-    precision = PrecisionConfig(
-        weight_scale=scale_tensor, flex_ctx=FlexCtx(rhs_data=flex)
-    )
-    return weight, precision
 
 
 # ---------------------------------------------------------------------------
@@ -344,35 +310,86 @@ def _fused_experts(
     return output_tensor.view(M, K)
 
 
-def mxfp4_moe_forward(
-    hidden_states: torch.Tensor,
-    w1,
-    w2,
-    gating_output: torch.Tensor,
-    topk: int,
-    renormalize: bool,
-    quant_config: Mxfp4MoEQuantConfig,
-    apply_router_weight_on_input: bool = False,
-) -> torch.Tensor:
-    """End-to-end MXFP4 MoE forward (routing + fused experts).
+# ---------------------------------------------------------------------------
+# Public nn.Module interface
+# ---------------------------------------------------------------------------
 
-    ``w1``/``w2`` must already be swizzled (see :func:`swizzle_mxfp4`)
-    and ``quant_config`` must carry the matching precision configs and
-    expert biases. ``hidden_states`` must be bfloat16 and 2D.
+
+class Mxfp4MoE(nn.Module):
+    """MXFP4-quantized fused MoE primitive (routing + matmul_ogs experts).
+
+    The module is stateless -- expert weights, biases, and the
+    :class:`Mxfp4MoEQuantConfig` are passed to ``forward`` so a single
+    instance can serve any number of MoE layers. Weight preparation is
+    exposed as static helpers so the L2 caller does not need to import
+    ``triton_kernels`` directly.
     """
-    routing_data, gather_idx, scatter_idx = _routing_from_logits(
-        gating_output, topk, sm_first=not renormalize
-    )
-    output = torch.empty_like(hidden_states)
-    return _fused_experts(
-        output,
-        hidden_states,
+
+    @staticmethod
+    def prepare_weight(
+        quant_tensor: torch.Tensor,
+        scale: torch.Tensor,
+        num_warps: int = 8,
+    ):
+        """Swizzle an MXFP4 expert weight and build its ``PrecisionConfig``.
+
+        Returns ``(swizzled_weight, precision_config)`` ready to feed
+        into :meth:`make_quant_config` and :meth:`forward`.
+        """
+        _ensure_triton_kernels_on_path()
+        from triton_kernels.matmul_ogs import FlexCtx, PrecisionConfig
+
+        weight, flex, scale_tensor = _swizzle_mxfp4(quant_tensor, scale, num_warps)
+        precision = PrecisionConfig(
+            weight_scale=scale_tensor, flex_ctx=FlexCtx(rhs_data=flex)
+        )
+        return weight, precision
+
+    @staticmethod
+    def make_quant_config(
+        w1_precision: Any,
+        w2_precision: Any,
+        w1_bias: torch.Tensor | None = None,
+        w2_bias: torch.Tensor | None = None,
+    ) -> Mxfp4MoEQuantConfig:
+        """Construct an MXFP4 W4A16 quant config from per-expert precisions/biases."""
+        return Mxfp4MoEQuantConfig(
+            w1_precision=w1_precision,
+            w2_precision=w2_precision,
+            w1_bias=w1_bias,
+            w2_bias=w2_bias,
+        )
+
+    def forward(
+        self,
+        hidden_states: torch.Tensor,
         w1,
         w2,
-        routing_data,
-        gather_idx,
-        scatter_idx,
-        topk=topk,
-        quant_config=quant_config,
-        apply_router_weight_on_input=apply_router_weight_on_input,
-    )
+        gating_output: torch.Tensor,
+        topk: int,
+        renormalize: bool,
+        quant_config: Mxfp4MoEQuantConfig,
+        apply_router_weight_on_input: bool = False,
+    ) -> torch.Tensor:
+        """End-to-end MXFP4 MoE forward (routing + fused experts).
+
+        ``w1``/``w2`` must already be swizzled (see :meth:`prepare_weight`)
+        and ``quant_config`` must carry the matching precision configs and
+        expert biases. ``hidden_states`` must be bfloat16 and 2D.
+        """
+        routing_data, gather_idx, scatter_idx = _routing_from_logits(
+            gating_output, topk, sm_first=not renormalize
+        )
+        output = torch.empty_like(hidden_states)
+        return _fused_experts(
+            output,
+            hidden_states,
+            w1,
+            w2,
+            routing_data,
+            gather_idx,
+            scatter_idx,
+            topk=topk,
+            quant_config=quant_config,
+            apply_router_weight_on_input=apply_router_weight_on_input,
+        )

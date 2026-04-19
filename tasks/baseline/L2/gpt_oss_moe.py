@@ -16,11 +16,7 @@ import torch.nn as nn
 from ....infra.tp import _tp_rank, _tp_size
 from ..L1.allreduce import AllReduce
 from ..L1.linear import Linear
-from ..L1.mxfp4_moe import (
-    mxfp4_moe_forward,
-    mxfp4_w4a16_moe_quant_config,
-    prepare_mxfp4_weight,
-)
+from ..L1.mxfp4_moe import Mxfp4MoE
 
 
 def _round_up(x: int, align: int) -> int:
@@ -90,6 +86,7 @@ class GptOssMoE(nn.Module):
         self.w2_bias.weight_loader = self._w2_bias_loader
 
         self.allreduce = AllReduce()
+        self.mxfp4_moe = Mxfp4MoE()
 
         # Populated after process_weights_after_loading
         self._quant_config = None
@@ -171,14 +168,14 @@ class GptOssMoE(nn.Module):
         self.w13_bias.data = self.w13_bias.data.float()
         self.w2_bias.data = self.w2_bias.data.float()
 
-        w13_weight, w13_precision = prepare_mxfp4_weight(
+        w13_weight, w13_precision = Mxfp4MoE.prepare_weight(
             self.w13_weight.data, self.w13_weight_scale.data
         )
-        w2_weight, w2_precision = prepare_mxfp4_weight(
+        w2_weight, w2_precision = Mxfp4MoE.prepare_weight(
             self.w2_weight.data, self.w2_weight_scale.data
         )
 
-        # prepare_mxfp4_weight returns triton_kernels.Tensor objects, not
+        # prepare_weight returns triton_kernels.Tensor objects, not
         # torch.Tensor; store as plain attributes (the original nn.Parameters
         # are no longer used)
         del self.w13_weight, self.w2_weight
@@ -186,9 +183,9 @@ class GptOssMoE(nn.Module):
         self._w13_swizzled = w13_weight
         self._w2_swizzled = w2_weight
 
-        self._quant_config = mxfp4_w4a16_moe_quant_config(
-            w1_scale=w13_precision,
-            w2_scale=w2_precision,
+        self._quant_config = Mxfp4MoE.make_quant_config(
+            w1_precision=w13_precision,
+            w2_precision=w2_precision,
             w1_bias=self.w13_bias.data,
             w2_bias=self.w2_bias.data,
         )
@@ -203,7 +200,7 @@ class GptOssMoE(nn.Module):
 
         router_logits = self.router(hidden_states)
 
-        output = mxfp4_moe_forward(
+        output = self.mxfp4_moe(
             hidden_states=hidden_states,
             w1=self._w13_swizzled,
             w2=self._w2_swizzled,
