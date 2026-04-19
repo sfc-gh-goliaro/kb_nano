@@ -8,11 +8,11 @@ Modes:
 
 Usage:
     # Full alignment test
-    python tests/test_native_fla_alignment.py \
+    python tests/debug/test_native_fla_alignment.py \
         --model fla-hub/gla-2.7B-100B --max-tokens 32 --seed 42
 
     # Reference only
-    python tests/test_native_fla_alignment.py \
+    python tests/debug/test_native_fla_alignment.py \
         --model fla-hub/gla-2.7B-100B --ref-only --max-tokens 32 --seed 42
 """
 
@@ -230,14 +230,21 @@ def main():
     else:
         raise ValueError(f"Unsupported model for standalone worker: {model_name}")
 
-    # Load weights from safetensors
+    # FLA checkpoints store the token embedding at ``model.embeddings.weight``;
+    # our L1 Embedding nests ``nn.Embedding`` as ``self.emb``, so remap.
+    def _remap(name):
+        if name == "model.embeddings.weight":
+            return "model.embeddings.emb.weight"
+        return name
+
     sf_files = sorted(glob(os.path.join(model_path, "*.safetensors")))
     loaded = 0
     for sf in sf_files:
         with safe_open(sf, "pt", "cpu") as f:
             for name in f.keys():
+                mapped = _remap(name)
                 try:
-                    param = model.get_parameter(name)
+                    param = model.get_parameter(mapped)
                     param.data.copy_(f.get_tensor(name))
                     loaded += 1
                 except AttributeError:

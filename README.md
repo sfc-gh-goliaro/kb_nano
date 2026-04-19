@@ -142,8 +142,9 @@ python tests/bench_fla.py --model fla-hub/rwkv7-2.9B-g1
 python tests/bench_fla.py --model fla-hub/gla-2.7B-100B --skip-fla
 
 # Override sequence count, batch budget, or chunked-prefill size
+# (defaults are tuned for the bench_vllm.py workload: 1000 / 256 / 1024)
 python tests/bench_fla.py --model fla-hub/gla-2.7B-100B \
-    --num-seqs 1000 --max-num-seqs 256 --chunked-prefill-size 256
+    --num-seqs 1000 --max-num-seqs 256 --chunked-prefill-size 1024
 
 # Skip latency phase (throughput + alignment only)
 python tests/bench_fla.py --model fla-hub/gla-2.7B-100B --skip-latency
@@ -652,28 +653,39 @@ Run `tests/bench_fla.py` to reproduce. Workload uses random token IDs with `igno
 
 **Hardware: NVIDIA H200**
 
-Throughput (1000 sequences per scenario, `temperature=0`, `max_num_seqs=256`, `chunked_prefill_size=1024`):
+Throughput (1000 sequences per scenario, `temperature=0`, `max_num_seqs=256`, `chunked_prefill_size=1024`; same shapes as `bench_vllm.py`):
 
 | Model | Scenario | Input/Output | FLA ref (tok/s) | Ours (tok/s) | Ratio | Avg Match Tokens |
 |-------|----------|:------------:|----------------:|-------------:|------:|-----------------:|
-| gla-2.7B-100B    | prefill-heavy | 1024/128 | 4,318 |  5,201 | **1.20x** | 120.2/128 |
-| gla-2.7B-100B    | balanced      |  256/256 | 6,408 | 11,614 | **1.81x** | 236.2/256 |
-| gla-2.7B-100B    | decode-heavy  |   64/512 | 6,647 | 13,227 | **1.99x** | 398.1/512 |
-| retnet-2.7B-100B | prefill-heavy | 1024/128 | 2,771 |  4,299 | **1.55x** | 119.8/128 |
-| retnet-2.7B-100B | balanced      |  256/256 | 3,631 |  6,753 | **1.86x** | 244.2/256 |
-| retnet-2.7B-100B | decode-heavy  |   64/512 | 3,733 |  7,272 | **1.95x** | 444.5/512 |
-| rwkv7-2.9B-g1    | prefill-heavy | 1024/128 | 3,434 |  3,334 | 0.97x     | 111.5/128 |
-| rwkv7-2.9B-g1    | balanced      |  256/256 | 5,781 |  6,173 | **1.07x** | 230.1/256 |
-| rwkv7-2.9B-g1    | decode-heavy  |   64/512 | 6,292 |  6,826 | **1.08x** | 435.5/512 |
+| gla-2.7B-100B    | prefill-heavy | 1024/512 | 5,691 |  9,380 | **1.65x** | 477.8/512  |
+| gla-2.7B-100B    | balanced      |  512/512 | 6,082 | 11,579 | **1.90x** | 482.1/512  |
+| gla-2.7B-100B    | decode-heavy  | 512/1024 | 6,268 | 12,458 | **1.99x** | 976.6/1024 |
+| retnet-2.7B-100B | prefill-heavy | 1024/512 | 3,496 |  6,253 | **1.79x** | 478.0/512  |
+| retnet-2.7B-100B | balanced      |  512/512 | 3,645 |  6,761 | **1.85x** | 484.0/512  |
+| retnet-2.7B-100B | decode-heavy  | 512/1024 | 3,668 |  7,067 | **1.93x** | 978.9/1024 |
+| rwkv7-2.9B-g1    | prefill-heavy | 1024/512 | 4,993 |  5,894 | **1.18x** | 444.3/512  |
+| rwkv7-2.9B-g1    | balanced      |  512/512 | 5,633 |  6,617 | **1.17x** | 441.6/512  |
+| rwkv7-2.9B-g1    | decode-heavy  | 512/1024 | 5,904 |  7,043 | **1.19x** | 895.5/1024 |
 
-`FLAEngine` runs at parity or faster than FLA's reference `transformers.generate` on every scenario except RWKV7 prefill-heavy (0.97x — within noise). Average speedup across all 9 scenarios is ~1.50x; geomean ~1.39x. Token alignment to FLA is bitwise within sampling tolerance: greedy outputs match the reference to ~95% (GLA), ~96% (RetNet), and ~88% (RWKV7) on average across scenarios.
+Latency (median over 3 iters, 128-token input, 128-token output):
+
+| Model | Scenario | Batch | FLA ref (ms/tok) | Ours (ms/tok) | Ratio |
+|-------|----------|------:|-----------------:|--------------:|------:|
+| gla-2.7B-100B    | single-request |  1 | 37.94 | 17.57 | **2.16x** |
+| gla-2.7B-100B    | fixed-batch-32 | 32 |  1.22 |  0.55 | **2.20x** |
+| retnet-2.7B-100B | single-request |  1 | 49.24 | 20.18 | **2.44x** |
+| retnet-2.7B-100B | fixed-batch-32 | 32 |  1.65 |  0.66 | **2.52x** |
+| rwkv7-2.9B-g1    | single-request |  1 | 40.32 | 31.00 | **1.30x** |
+| rwkv7-2.9B-g1    | fixed-batch-32 | 32 |  1.27 |  1.00 | **1.27x** |
+
+`FLAEngine` runs faster than FLA's reference `transformers.generate` on every throughput and latency scenario across all three models (no scenario below 1.0x). Average throughput speedup across the 9 throughput scenarios is ~1.63x; geomean ~1.59x. Latency speedups range from 1.27x (RWKV7 BS=32) to 2.52x (RetNet BS=32). Token alignment to FLA is bitwise within sampling tolerance: greedy outputs match the reference to ~94% (GLA), ~95% (RetNet), and ~87% (RWKV7) on average across scenarios.
 
 The recurrent state machinery is implemented in `infra/fla_engine.py`:
 
 - **Persistent slot-allocated cache** (`_SlotCache`): each in-flight sequence owns a slot in `[max_num_seqs, *state_shape]` buffers (one per L2 layer, lazily allocated on first commit). All gather/scatter is one `index_select` / `index_copy_` per layer per call — a constant number of CUDA launches regardless of batch size, replacing the previous O(layers × batch) per-seq copy loop.
 - **Live-cache reuse**: when the active set is unchanged step-to-step (the common case during steady-state decode of a batch), the previous forward's output cache is fed directly to the next forward with **zero** gather/scatter overhead. Only on membership change (seq finish or admission) do we flush the live cache to slots and re-gather the new active subset.
 - **Batched prefill**: each scheduler iteration runs ONE forward over all currently-prefilling seqs that want the same chunk size (capped by `max_prefill_tokens`, default 192k). For 256 prompts at length 1024 that's a single B=192 forward instead of 256 sequential B=1 forwards — the difference between memory-bandwidth-bound prefill and tensor-core-saturating prefill.
-- **Chunked prefill**: prompts longer than `chunked_prefill_size` (default 256) are split into 64-token-aligned chunks routed through FLA's `chunk_*` kernels; per-layer recurrent state and (for RWKV7) per-module token-shift state are carried across chunks in `RecurrentCache`. The chunk planner absorbs sub-64-token tails so every chunk dispatches to the chunk kernel (not fused-recurrent), matching single-shot prefill bit-for-bit at the chunk boundary.
+- **Chunked prefill**: prompts longer than `chunked_prefill_size` (default 1024) are split into 64-token-aligned chunks routed through FLA's `chunk_*` kernels; per-layer recurrent state and (for RWKV7) per-module token-shift state are carried across chunks in `RecurrentCache`. The chunk planner absorbs sub-64-token tails so every chunk dispatches to the chunk kernel (not fused-recurrent), matching single-shot prefill bit-for-bit at the chunk boundary.
 - **Per-row position offsets**: RetNet's rotary embedding receives an absolute `seq_offsets` per batch row so cached prefill chunks and decode steps see the correct global token position.
 - **Last-token-only logits**: the L4 forward accepts `num_logits_to_keep=1` so lm_head + fp32 upcast operate on a single position. At B=200, T=1024, vocab=65k this saves ~50 GB of fp32 logits memory and the corresponding compute, making single-shot batched prefill of 200 prompts feasible on a single H200.
 

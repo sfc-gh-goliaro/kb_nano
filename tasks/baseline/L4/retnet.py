@@ -20,6 +20,8 @@ from pathlib import Path
 import torch
 import torch.nn as nn
 
+from ..L1.embedding import Embedding
+from ..L1.linear import Linear
 from ..L1.rms_norm import RMSNorm
 from ..L3.retnet_decoder import RetNetDecoderLayer
 from .recurrent_cache import CausalLMOutputWithPast, RecurrentCache
@@ -62,7 +64,7 @@ class RetNetConfig:
 class RetNetModel(nn.Module):
     def __init__(self, config: RetNetConfig):
         super().__init__()
-        self.embeddings = nn.Embedding(config.vocab_size, config.hidden_size)
+        self.embeddings = Embedding(config.vocab_size, config.hidden_size)
         self.layers = nn.ModuleList(
             [RetNetDecoderLayer(config, layer_idx=i) for i in range(config.num_hidden_layers)]
         )
@@ -103,9 +105,9 @@ class RetNetForCausalLM(nn.Module):
         super().__init__()
         self.config = config
         self.model = RetNetModel(config)
-        self.lm_head = nn.Linear(config.hidden_size, config.vocab_size, bias=False)
+        self.lm_head = Linear(config.hidden_size, config.vocab_size, bias=False)
         if config.tie_word_embeddings:
-            self.lm_head.weight = self.model.embeddings.weight
+            self.lm_head.weight = self.model.embeddings.emb.weight
 
     def forward(
         self,
@@ -142,9 +144,3 @@ class RetNetForCausalLM(nn.Module):
         return CausalLMOutputWithPast(
             logits=logits, past_key_values=past_key_values, loss=loss,
         )
-
-    def compute_logits(self, hidden_states: torch.Tensor) -> torch.Tensor:
-        return self.lm_head(hidden_states).float()
-
-    def compute_logits_decode(self, hidden_states: torch.Tensor) -> torch.Tensor:
-        return self.compute_logits(hidden_states)

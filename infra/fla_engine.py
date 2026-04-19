@@ -19,7 +19,7 @@ user code touch:
 
 Scheduling: continuous batching with chunked prefill. Each loop
 iteration runs at most ONE B=1 prefill chunk (fixed
-``chunked_prefill_size``, default 256) AND one B=N batched decode step
+``chunked_prefill_size``, default 1024) AND one B=N batched decode step
 over all sequences whose prefill is complete. New sequences enter the
 decode batch as soon as their final prefill chunk produces a sample,
 without waiting for the rest of the prefill backlog.
@@ -127,13 +127,22 @@ def _load_model(model_name: str, dtype: torch.dtype, device: torch.device):
     config = Config.from_pretrained(model_path)
     model = Model(config)
 
+    # FLA checkpoints store the token embedding at ``model.embeddings.weight``
+    # but the L1 ``Embedding`` op nests ``nn.Embedding`` as ``self.emb``, so
+    # the actual parameter path is ``model.embeddings.emb.weight``. Remap.
+    def _remap(name: str) -> str:
+        if name == "model.embeddings.weight":
+            return "model.embeddings.emb.weight"
+        return name
+
     sf_files = sorted(glob(os.path.join(model_path, "*.safetensors")))
     loaded = 0
     for sf in sf_files:
         with safe_open(sf, "pt", "cpu") as f:
             for name in f.keys():
+                mapped = _remap(name)
                 try:
-                    param = model.get_parameter(name)
+                    param = model.get_parameter(mapped)
                 except AttributeError:
                     continue
                 src = f.get_tensor(name)
@@ -232,7 +241,7 @@ class FLAEngine:
         dtype: torch.dtype = torch.bfloat16,
         seed: int = 42,
         max_num_seqs: int = 256,
-        chunked_prefill_size: int = 256,
+        chunked_prefill_size: int = 1024,
         max_prefill_tokens: int = 196608,
         trust_remote_code: bool = True,
     ):

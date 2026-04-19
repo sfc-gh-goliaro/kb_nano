@@ -68,9 +68,9 @@ from kb_nano.tests.bench_vllm import compute_alignment
 # Same scenario shapes as bench_vllm.py so the workloads are directly
 # comparable to the dense LLM bench.
 SCENARIOS = [
-    {"name": "prefill-heavy", "input_len": 1024, "output_len": 128},
-    {"name": "balanced",      "input_len": 256,  "output_len": 256},
-    {"name": "decode-heavy",  "input_len": 64,   "output_len": 512},
+    {"name": "prefill-heavy", "input_len": 1024, "output_len": 512},
+    {"name": "balanced",      "input_len": 512,  "output_len": 512},
+    {"name": "decode-heavy",  "input_len": 512,  "output_len": 1024},
 ]
 
 LATENCY_SCENARIOS = [
@@ -377,9 +377,11 @@ def main():
     parser.add_argument("--seed", type=int, default=42)
     parser.add_argument("--temperature", type=float, default=0.0)
     parser.add_argument("--max-num-seqs", type=int, default=256,
-                        help="Max concurrent sequences in FLAEngine")
-    parser.add_argument("--chunked-prefill-size", type=int, default=256,
-                        help="Per-chunk prefill size (rounded up to a multiple of 64)")
+                        help="Max concurrent sequences in FLAEngine "
+                             "(default tuned for the bench_vllm.py workload)")
+    parser.add_argument("--chunked-prefill-size", type=int, default=1024,
+                        help="Per-chunk prefill size (rounded up to a multiple "
+                             "of 64). Default tuned for the bench_vllm.py workload.")
     parser.add_argument("--skip-fla", action="store_true",
                         help="Skip the FLA reference (kb-nano only)")
     parser.add_argument("--skip-throughput", action="store_true")
