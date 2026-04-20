@@ -515,23 +515,23 @@ Throughput (1000 sequences per scenario, CUDA graphs enabled):
 
 | Model | TP | Scenario | Input/Output | vLLM (tok/s) | Ours (tok/s) | Ratio | Avg Match Tokens |
 |-------|---:|----------|:------------:|-------------:|-------------:|------:|-----------------:|
-| mamba-2.8b-hf            | 1 | prefill-heavy | 1024/512  |  7,017 |  6,967 | 0.99x | 416.2/512  |
-| mamba-2.8b-hf            | 1 | balanced      |  512/512  |  8,282 |  8,620 | 1.04x | 402.1/512  |
-| mamba-2.8b-hf            | 1 | decode-heavy  |  512/1024 | 11,971 | 13,633 | 1.14x | 818.3/1024 |
-| Mamba-Codestral-7B-v0.1  | 1 | prefill-heavy | 1024/512  |  3,923 |  3,842 | 0.98x |  85.4/512  |
-| Mamba-Codestral-7B-v0.1  | 1 | balanced      |  512/512  |  4,507 |  4,334 | 0.96x |  78.8/512  |
-| Mamba-Codestral-7B-v0.1  | 1 | decode-heavy  |  512/1024 |  4,828 |  4,668 | 0.97x | 250.6/1024 |
+| mamba-2.8b-hf            | 1 | prefill-heavy | 1024/512  |  7,080 |  6,912 | 0.98x | 416.2/512  |
+| mamba-2.8b-hf            | 1 | balanced      |  512/512  |  8,285 |  8,635 | 1.04x | 402.1/512  |
+| mamba-2.8b-hf            | 1 | decode-heavy  |  512/1024 | 12,033 | 13,476 | 1.12x | 805.5/1024 |
+| Mamba-Codestral-7B-v0.1  | 1 | prefill-heavy | 1024/512  |  3,935 |  3,844 | 0.98x | 418.4/512  |
+| Mamba-Codestral-7B-v0.1  | 1 | balanced      |  512/512  |  4,517 |  4,332 | 0.96x | 425.7/512  |
+| Mamba-Codestral-7B-v0.1  | 1 | decode-heavy  |  512/1024 |  4,834 |  4,668 | 0.97x | 823.5/1024 |
 
 Latency (TP=1, 5 timed iterations):
 
 | Model                   | Scenario       | Batch | Output | vLLM (s) | Ours (s) | vLLM (ms/tok) | Ours (ms/tok) | Ratio |
 |-------------------------|----------------|------:|-------:|---------:|---------:|--------------:|--------------:|------:|
-| mamba-2.8b-hf           | single-request |     1 |    128 |   0.4740 |   0.4577 |          3.70 |          3.58 | 1.04x |
-| mamba-2.8b-hf           | fixed-batch-32 |    32 |    128 |   1.5035 |   1.5354 |          0.37 |          0.37 | 0.98x |
-| Mamba-Codestral-7B-v0.1 | single-request |     1 |    128 |   0.7008 |   0.7390 |          5.47 |          5.77 | 0.95x |
-| Mamba-Codestral-7B-v0.1 | fixed-batch-32 |    32 |    128 |   1.5699 |   1.6331 |          0.38 |          0.40 | 0.96x |
+| mamba-2.8b-hf           | single-request |     1 |    128 |   0.4740 |   0.4575 |          3.70 |          3.57 | 1.04x |
+| mamba-2.8b-hf           | fixed-batch-32 |    32 |    128 |   1.5718 |   1.5371 |          0.38 |          0.38 | 1.02x |
+| Mamba-Codestral-7B-v0.1 | single-request |     1 |    128 |   0.7013 |   0.7370 |          5.48 |          5.76 | 0.95x |
+| Mamba-Codestral-7B-v0.1 | fixed-batch-32 |    32 |    128 |   1.5716 |   1.6316 |          0.38 |          0.40 | 0.96x |
 
-Token alignment remains model-dependent for two independent SSM implementations at `temperature=0`: Mamba v1 stays relatively close (416.2/512, 402.1/512, 818.3/1024 average matching tokens across the three scenarios), while Codestral drifts more over long recurrent scans (85.4/512, 78.8/512, 250.6/1024). The recurrent state accumulates small bf16 numerical differences over the full prefill chunk-scan, and those divergences compound across the decode loop. With profile-based state sizing kb-nano now allocates **716 slots** for Codestral and **1024 slots** for Mamba v1 on a single H200 (vLLM reports ~855 concurrent 1536-token requests for Codestral; Mamba v1's per-slot state is much smaller, so its slot count is higher). On the latest H200 rerun, Mamba v1 is effectively at parity with vLLM on throughput (0.99x / 1.04x / 1.14x across the three scenarios) and close on latency (1.04x single-request, 0.98x fixed-batch-32), while Codestral is now near parity as well on both throughput (0.98x / 0.96x / 0.97x) and latency (0.95x / 0.96x). Per-step instrumentation (enable with `KB_NANO_PROFILE_MAMBA=1`) still shows that **97% of decode-step wall time is in GPU + D2H wait**; CPU-side phases (admit, decode prep, finalize, slot bookkeeping) together account for less than 3%, so the remaining optimization work is concentrated more in numerical alignment for the larger Mamba2 path than in Mamba v1 throughput.
+Token alignment is in the expected range for two independent SSM implementations at `temperature=0`: Mamba v1 stays relatively close (416.2/512, 402.1/512, 805.5/1024 average matching tokens across the three scenarios), and Codestral does as well after restoring its original mixed-batch token layout (418.4/512, 425.7/512, 823.5/1024). The recurrent state still accumulates small bf16 numerical differences over the full prefill chunk-scan, and those divergences compound across the decode loop. With profile-based state sizing kb-nano now allocates **716 slots** for Codestral and **1024 slots** for Mamba v1 on a single H200 (vLLM reports ~855 concurrent 1536-token requests for Codestral; Mamba v1's per-slot state is much smaller, so its slot count is higher). On the latest H200 rerun, Mamba v1 is effectively at parity with vLLM on throughput (0.98x / 1.04x / 1.12x across the three scenarios) and slightly ahead on latency (1.04x single-request, 1.02x fixed-batch-32), while Codestral is also near parity on throughput (0.98x / 0.96x / 0.97x) and latency (0.95x / 0.96x). Per-step instrumentation (enable with `KB_NANO_PROFILE_MAMBA=1`) still shows that **97% of decode-step wall time is in GPU + D2H wait**; CPU-side phases (admit, decode prep, finalize, slot bookkeeping) together account for less than 3%, so the remaining optimization work is concentrated in the GPU path and batched-latency tail rather than scheduler overhead.
 
 **Hardware: NVIDIA H200**
 

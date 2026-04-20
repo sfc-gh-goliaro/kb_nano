@@ -1197,7 +1197,9 @@ class ModelRunner:
         """Build flat input_ids / positions and the Mamba(2)Metadata for a
         mixed batch of prefill + decode sequences.
 
-        Mixed layout keeps decode tokens first, then prefill tokens.
+        Mixed layout is model-specific:
+        - Mamba v1 keeps decode tokens first, then prefill tokens.
+        - Mamba2 keeps the original prefill-first, decode-last order.
         Homogeneous prefill/decode batches keep their natural order.
         """
         device = torch.device(f"cuda:{self.rank}")
@@ -1208,8 +1210,9 @@ class ModelRunner:
         query_start_loc: list[int] = [0]
         decode_state_indices: list[int] = []
         has_mixed = bool(prefill_seqs) and bool(decode_seqs)
+        mixed_decode_first = has_mixed and not self.is_mamba2
 
-        if has_mixed:
+        if mixed_decode_first:
             for seq in decode_seqs:
                 input_ids.append(seq.last_token)
                 positions.append(len(seq) - 1)
@@ -1355,11 +1358,22 @@ class ModelRunner:
             indices: list[int] = []
             if prefill_seqs:
                 qsl = meta.query_start_loc_p.to("cpu").tolist()
+                if self.is_mamba2:
+                    indices.extend(qsl[i + 1] - 1 for i in range(len(prefill_seqs)))
+                else:
+                    indices.extend(
+                        meta.num_decode_tokens + qsl[i + 1] - 1
+                        for i in range(len(prefill_seqs))
+                    )
+            if self.is_mamba2:
                 indices.extend(
-                    meta.num_decode_tokens + qsl[i + 1] - 1
-                    for i in range(len(prefill_seqs))
+                    range(
+                        meta.num_prefill_tokens,
+                        meta.num_prefill_tokens + len(decode_seqs),
+                    )
                 )
-            indices.extend(range(meta.num_decode_tokens))
+            else:
+                indices.extend(range(meta.num_decode_tokens))
             idx_t = torch.tensor(indices, dtype=torch.int64,
                                  device=hidden.device)
             hidden_last = hidden.index_select(0, idx_t)
