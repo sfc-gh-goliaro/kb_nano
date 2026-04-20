@@ -155,7 +155,7 @@ class MambaMixer(nn.Module):
 
         x: [N, intermediate_per_rank]
         Returns:
-          dt: [N, intermediate_per_rank]
+          dt: [intermediate_per_rank, N]
           B:  [N, ssm_state_size]
           C:  [N, ssm_state_size]
         """
@@ -169,15 +169,15 @@ class MambaMixer(nn.Module):
         # ColumnParallelLinear adds bias inside; we want it raw, so we
         # call F.linear without the bias and pass the bias separately.
         import torch.nn.functional as F
-        dt = F.linear(dt, self.dt_proj.weight, None)  # [N, intermediate_per_rank]
+        dt = F.linear(dt, self.dt_proj.weight, None).transpose(-2, -1)
         return dt, B, C
 
     def forward(self, hidden_states: torch.Tensor) -> torch.Tensor:
         """Mamba v1 mixer forward.
 
         Reads cache state and per-batch metadata from the global Context.
-        Mirrors vLLM ``MambaMixer.forward_impl`` but uses kb_nano's
-        flat-token (no batch dim) convention with prefill tokens first.
+        Mirrors vLLM ``MambaMixer.forward_impl`` and keeps the mixed
+        batch in decode-first token order.
 
         ``hidden_states`` shape: [num_tokens, hidden_size]
         """
@@ -185,13 +185,12 @@ class MambaMixer(nn.Module):
         mamba_state = getattr(ctx, "mamba_state", None)
         mamba_meta = getattr(ctx, "mamba_metadata", None)
 
-        # in_proj -> packed [x, gate] (per-rank sharded).
-        proj = self.in_proj(hidden_states)  # [N, 2*tp_inter]
-        x, gate = proj.chunk(2, dim=-1)
+        projected_states = self.in_proj(hidden_states).transpose(-2, -1)
+        hidden_states_BC, gate = projected_states.chunk(2, dim=-2)
 
         if mamba_state is None or mamba_meta is None:
             # Profile / warmup path (no cache available).
-            return self.out_proj(x)
+            return self.out_proj(hidden_states_BC.transpose(-2, -1))
 
         # MambaStateManager allocates as ``[N, kernel-1, dim]`` so we
         # transpose to the kernel's expected ``[N, dim, kernel-1]`` view
@@ -205,81 +204,95 @@ class MambaMixer(nn.Module):
         has_decode = num_decode_tokens > 0
         num_actual = num_prefill_tokens + num_decode_tokens
 
-        x_p, x_d = torch.split(
-            x[:num_actual], [num_prefill_tokens, num_decode_tokens], dim=0,
-        )
-        gate_p, gate_d = torch.split(
-            gate[:num_actual], [num_prefill_tokens, num_decode_tokens], dim=0,
-        )
+        if has_prefill and has_decode:
+            hidden_states_BC_d, hidden_states_BC_p = torch.split(
+                hidden_states_BC[:, :num_actual],
+                [num_decode_tokens, num_prefill_tokens],
+                dim=-1,
+            )
+            gate_d, gate_p = torch.split(
+                gate[:, :num_actual],
+                [num_decode_tokens, num_prefill_tokens],
+                dim=-1,
+            )
+        elif has_prefill:
+            hidden_states_BC_p = hidden_states_BC[:, :num_prefill_tokens]
+            gate_p = gate[:, :num_prefill_tokens]
+            hidden_states_BC_d = None
+            gate_d = None
+        else:
+            hidden_states_BC_d = hidden_states_BC[:, :num_decode_tokens]
+            gate_d = gate[:, :num_decode_tokens]
+            hidden_states_BC_p = None
+            gate_p = None
 
         conv_weights = self.conv1d.weight.view(
             self.conv1d.weight.size(0), self.conv1d.weight.size(2),
         )
         ssm_outputs = []
+        time_proj_bias = self.dt_proj.bias.float() if self.dt_proj.bias is not None else None
 
-        if has_prefill:
-            # causal_conv1d_fn expects [dim, total_tokens]
-            x_p_t = x_p.transpose(0, 1).contiguous()
-            conv_out_p = causal_conv1d_fn(
-                x_p_t,
+        if has_decode:
+            conv_out_d = causal_conv1d_update(
+                hidden_states_BC_d.transpose(0, 1),
+                conv_state,
                 conv_weights,
                 self.conv1d.bias,
-                activation=self.activation,
+                self.activation,
+                conv_state_indices=mamba_meta.state_indices_d,
+            ).transpose(0, 1)
+
+            dt_d, B_d, C_d = self._ssm_transform(conv_out_d.transpose(-2, -1))
+            out_d = torch.empty_like(hidden_states_BC_d.transpose(0, 1))
+            selective_state_update(
+                ssm_state,
+                conv_out_d.transpose(0, 1),
+                dt_d.transpose(0, 1),
+                self.A,
+                B_d,
+                C_d,
+                self.D,
+                gate_d.transpose(0, 1),
+                time_proj_bias,
+                dt_softplus=True,
+                state_batch_indices=mamba_meta.state_indices_d,
+                out=out_d,
+            )
+            ssm_outputs.append(out_d.transpose(0, 1))
+
+        if has_prefill:
+            conv_out_p = causal_conv1d_fn(
+                hidden_states_BC_p,
+                conv_weights,
+                self.conv1d.bias,
                 conv_states=conv_state,
-                has_initial_state=mamba_meta.has_initial_states_p,
-                cache_indices=mamba_meta.state_indices_p,
                 query_start_loc=mamba_meta.query_start_loc_p,
-            )  # [dim, total_tokens]
+                cache_indices=mamba_meta.state_indices_p,
+                has_initial_state=mamba_meta.has_initial_states_p,
+                activation=self.activation,
+                metadata=mamba_meta,
+            )
 
-            dt_p, B_p, C_p = self._ssm_transform(conv_out_p.transpose(0, 1))
-            time_proj_bias = self.dt_proj.bias.float() if self.dt_proj.bias is not None else None
-
-            # selective_scan_fn returns y in [dim, total_tokens] layout
+            dt_p, B_p, C_p = self._ssm_transform(conv_out_p.transpose(-2, -1))
             scan_out_p = selective_scan_fn(
                 conv_out_p,
                 ssm_state,
-                dt_p.transpose(0, 1),  # [dim, T]
+                dt_p,
                 self.A,
-                B_p.transpose(0, 1),   # [N_state, T]
-                C_p.transpose(0, 1),   # [N_state, T]
+                B_p.transpose(-2, -1),
+                C_p.transpose(-2, -1),
                 self.D.float(),
-                gate_p.transpose(0, 1),
+                gate_p,
                 time_proj_bias,
                 delta_softplus=True,
                 cache_indices=mamba_meta.state_indices_p,
                 has_initial_state=mamba_meta.has_initial_states_p,
                 query_start_loc=mamba_meta.query_start_loc_p,
             )
-            # Back to [T, dim]
-            ssm_outputs.append(scan_out_p.transpose(0, 1))
+            ssm_outputs.append(scan_out_p)
 
-        if has_decode:
-            # causal_conv1d_update accepts [batch, dim] (single-token decode).
-            conv_out_d = causal_conv1d_update(
-                x_d, conv_state, conv_weights, self.conv1d.bias,
-                self.activation,
-                conv_state_indices=mamba_meta.state_indices_d,
-            )
-
-            dt_d, B_d, C_d = self._ssm_transform(conv_out_d)
-            time_proj_bias = self.dt_proj.bias.float() if self.dt_proj.bias is not None else None
-
-            out_d = torch.empty_like(conv_out_d)
-            selective_state_update(
-                ssm_state,
-                conv_out_d,
-                dt_d,
-                self.A,
-                B_d,
-                C_d,
-                self.D,
-                gate_d,
-                time_proj_bias,
-                dt_softplus=True,
-                state_batch_indices=mamba_meta.state_indices_d,
-                out=out_d,
-            )
-            ssm_outputs.append(out_d)
-
-        y = ssm_outputs[0] if len(ssm_outputs) == 1 else torch.cat(ssm_outputs, dim=0)
-        return self.out_proj(y)
+        scan_outputs = ssm_outputs[0] if len(ssm_outputs) == 1 else torch.cat(
+            ssm_outputs,
+            dim=-1,
+        )
+        return self.out_proj(scan_outputs.transpose(-2, -1))

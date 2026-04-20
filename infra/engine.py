@@ -37,6 +37,7 @@ from .context import (
 )
 from .mamba_state import (
     Mamba2Metadata, MambaMetadata, MambaStateManager, build_chunk_metadata,
+    compute_causal_conv1d_metadata,
 )
 from ..tasks.baseline.L1.allreduce import set_custom_ar
 from .weight_loader import load_model
@@ -294,7 +295,13 @@ class ModelRunner:
             from transformers import AutoConfig
             _cfg = AutoConfig.from_pretrained(model_name)
             cfg_dtype = getattr(_cfg, "torch_dtype", None)
-            if cfg_dtype is not None and isinstance(cfg_dtype, torch.dtype):
+            model_type = getattr(_cfg, "model_type", "")
+            if model_type in ("mamba", "mamba2") and cfg_dtype == torch.float32:
+                # HF Mamba configs often advertise fp32, but the serving path
+                # is intended to run in reduced precision with the recurrent
+                # SSM params restored to fp32 after load.
+                dtype = torch.bfloat16
+            elif cfg_dtype is not None and isinstance(cfg_dtype, torch.dtype):
                 dtype = cfg_dtype
             else:
                 dtype = torch.bfloat16
@@ -916,6 +923,13 @@ class ModelRunner:
             n_seqs, dtype=torch.bool, device=device,
         )
         meta.prep_initial_states = False
+        if not self.is_mamba2:
+            nums_dict, batch_ptr, token_chunk_offset_ptr = (
+                compute_causal_conv1d_metadata(meta.query_start_loc_p)
+            )
+            meta.nums_dict = nums_dict
+            meta.batch_ptr = batch_ptr
+            meta.token_chunk_offset_ptr = token_chunk_offset_ptr
 
         if self.is_mamba2:
             num_computed = torch.zeros(n_seqs, dtype=torch.int32, device=device)
@@ -1183,35 +1197,46 @@ class ModelRunner:
         """Build flat input_ids / positions and the Mamba(2)Metadata for a
         mixed batch of prefill + decode sequences.
 
-        Layout: prefill tokens first (in seq order, full prompt per seq),
-        followed by one decode token per decode seq.
+        Mixed layout keeps decode tokens first, then prefill tokens.
+        Homogeneous prefill/decode batches keep their natural order.
         """
         device = torch.device(f"cuda:{self.rank}")
         input_ids: list[int] = []
         positions: list[int] = []
-
-        # Prefill tokens
         prefill_state_indices: list[int] = []
         prefill_has_initial: list[bool] = []
         query_start_loc: list[int] = [0]
-        for seq in prefill_seqs:
-            start = seq.num_computed_tokens
-            chunk = len(seq.token_ids) - start
-            input_ids.extend(seq.token_ids[start:start + chunk])
-            positions.extend(range(start, start + chunk))
-            query_start_loc.append(query_start_loc[-1] + chunk)
-            prefill_state_indices.append(seq.state_slot)
-            prefill_has_initial.append(start > 0)
-
-        num_prefill_tokens = len(input_ids)
-
-        # Decode tokens (one per seq)
         decode_state_indices: list[int] = []
-        for seq in decode_seqs:
-            input_ids.append(seq.last_token)
-            positions.append(len(seq) - 1)
-            decode_state_indices.append(seq.state_slot)
+        has_mixed = bool(prefill_seqs) and bool(decode_seqs)
 
+        if has_mixed:
+            for seq in decode_seqs:
+                input_ids.append(seq.last_token)
+                positions.append(len(seq) - 1)
+                decode_state_indices.append(seq.state_slot)
+            for seq in prefill_seqs:
+                start = seq.num_computed_tokens
+                chunk = len(seq.token_ids) - start
+                input_ids.extend(seq.token_ids[start:start + chunk])
+                positions.extend(range(start, start + chunk))
+                query_start_loc.append(query_start_loc[-1] + chunk)
+                prefill_state_indices.append(seq.state_slot)
+                prefill_has_initial.append(start > 0)
+        else:
+            for seq in prefill_seqs:
+                start = seq.num_computed_tokens
+                chunk = len(seq.token_ids) - start
+                input_ids.extend(seq.token_ids[start:start + chunk])
+                positions.extend(range(start, start + chunk))
+                query_start_loc.append(query_start_loc[-1] + chunk)
+                prefill_state_indices.append(seq.state_slot)
+                prefill_has_initial.append(start > 0)
+            for seq in decode_seqs:
+                input_ids.append(seq.last_token)
+                positions.append(len(seq) - 1)
+                decode_state_indices.append(seq.state_slot)
+
+        num_prefill_tokens = query_start_loc[-1]
         num_decode_tokens = len(decode_seqs)
         num_actual = num_prefill_tokens + num_decode_tokens
 
@@ -1241,6 +1266,13 @@ class ModelRunner:
                 prefill_has_initial, dtype=torch.bool, device=device,
             )
             meta.prep_initial_states = any(prefill_has_initial)
+            if not self.is_mamba2:
+                nums_dict, batch_ptr, token_chunk_offset_ptr = (
+                    compute_causal_conv1d_metadata(meta.query_start_loc_p)
+                )
+                meta.nums_dict = nums_dict
+                meta.batch_ptr = batch_ptr
+                meta.token_chunk_offset_ptr = token_chunk_offset_ptr
 
             if self.is_mamba2:
                 num_computed = torch.tensor(
@@ -1320,12 +1352,14 @@ class ModelRunner:
         try:
             hidden = self.model(input_ids, positions)
             # Logits at end of each prefill seq + all decode tokens.
-            num_pf_tokens = meta.num_prefill_tokens
             indices: list[int] = []
             if prefill_seqs:
                 qsl = meta.query_start_loc_p.to("cpu").tolist()
-                indices.extend(qsl[i + 1] - 1 for i in range(len(prefill_seqs)))
-            indices.extend(range(num_pf_tokens, num_pf_tokens + len(decode_seqs)))
+                indices.extend(
+                    meta.num_decode_tokens + qsl[i + 1] - 1
+                    for i in range(len(prefill_seqs))
+                )
+            indices.extend(range(meta.num_decode_tokens))
             idx_t = torch.tensor(indices, dtype=torch.int64,
                                  device=hidden.device)
             hidden_last = hidden.index_select(0, idx_t)

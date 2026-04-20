@@ -21,6 +21,72 @@ from dataclasses import dataclass
 import torch
 
 
+def compute_causal_conv1d_metadata(
+    query_start_loc_p: torch.Tensor,
+) -> tuple[dict, torch.Tensor, torch.Tensor]:
+    """Precompute the aux pointers used by vLLM's varlen causal-conv kernel.
+
+    This is Mamba v1 prefill metadata, so it lives with the Mamba state
+    structs rather than in the generic engine.
+    """
+    seqlens = query_start_loc_p.diff().to(device="cpu", dtype=torch.int32)
+    nums_dict: dict = {}
+    batch_ptr = None
+    token_chunk_offset_ptr = None
+    device = query_start_loc_p.device
+
+    for block_m in [8]:
+        nums = torch.div(
+            seqlens + (block_m - 1),
+            block_m,
+            rounding_mode="floor",
+        )
+        nums_dict[block_m] = {}
+        nums_dict[block_m]["nums"] = nums
+        nums_dict[block_m]["tot"] = nums.sum().item()
+
+        mlist = torch.repeat_interleave(
+            torch.arange(len(nums), dtype=torch.int32, device="cpu"),
+            nums.to(dtype=torch.int64),
+        )
+        nums_dict[block_m]["mlist"] = mlist
+        mlist_len = len(mlist)
+        nums_dict[block_m]["mlist_len"] = mlist_len
+        max_num_programs = max(1024, mlist_len) * 2
+
+        offsetlist: list[int] = []
+        for num in nums.tolist():
+            offsetlist.extend(range(num))
+        offsetlist_t = torch.tensor(offsetlist, dtype=torch.int32)
+        nums_dict[block_m]["offsetlist"] = offsetlist_t
+
+        if batch_ptr is None:
+            batch_ptr = torch.full(
+                (max_num_programs,),
+                -1,
+                dtype=torch.int32,
+                device=device,
+            )
+            token_chunk_offset_ptr = torch.full(
+                (max_num_programs,),
+                -1,
+                dtype=torch.int32,
+                device=device,
+            )
+        elif batch_ptr.numel() < max_num_programs:
+            batch_ptr.resize_(max_num_programs).fill_(-1)
+            token_chunk_offset_ptr.resize_(max_num_programs).fill_(-1)
+
+        batch_ptr[:mlist_len].copy_(mlist.to(device=device))
+        token_chunk_offset_ptr[:mlist_len].copy_(
+            offsetlist_t.to(device=device),
+        )
+        nums_dict[block_m]["batch_ptr"] = batch_ptr
+        nums_dict[block_m]["token_chunk_offset_ptr"] = token_chunk_offset_ptr
+
+    return nums_dict, batch_ptr, token_chunk_offset_ptr
+
+
 class MambaSlotCache:
     """Cache view for one sequence slot."""
 
@@ -178,6 +244,9 @@ class MambaMetadata:
     has_initial_states_p: torch.Tensor | None = None  # bool [num_prefills]
     query_start_loc_p: torch.Tensor | None = None     # int32 [num_prefills+1]
     state_indices_p: torch.Tensor | None = None       # int32 [num_prefills]
+    nums_dict: dict | None = None
+    batch_ptr: torch.Tensor | None = None
+    token_chunk_offset_ptr: torch.Tensor | None = None
 
     # Decode-only (None when num_decodes == 0)
     state_indices_d: torch.Tensor | None = None       # int32 [num_decodes]
