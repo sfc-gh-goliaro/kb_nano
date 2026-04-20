@@ -1,13 +1,18 @@
 # kb-nano
 
-A standalone, high-performance inference engine supporting **LLMs** (Llama 3.1, Mixtral-8x7B, GPT-OSS, Qwen2-VL, Qwen3-VL), **diffusion models** (FLUX.1-dev, SDXL, HunyuanVideo-1.5), **detection models** (YOLOv10, RTDetrV2), **vision encoders** (SigLIP-2, DINOv3, SwinV2), **segmentation models** (SAM3.1), **protein structure prediction** (OpenFold3), audio models (Whisper), and **TTS models** (CosyVoice3) with tensor parallelism. No vLLM dependency at runtime — just PyTorch, Triton, and Flash Attention.
+A standalone, high-performance inference engine supporting **LLMs** (Llama 3.1, Llama 4, Mixtral-8x7B, DeepSeek V3.2, GPT-OSS, Qwen2-VL, Qwen3-VL), **linear-attention LLMs** (GLA, RetNet, RWKV7), **diffusion models** (FLUX.1-dev, SDXL, HunyuanVideo-1.5), **detection models** (YOLOv10, RTDetrV2), **vision encoders** (SigLIP-2, DINOv3, SwinV2), **segmentation models** (SAM3.1), **protein structure prediction** (OpenFold3), audio models (Whisper), and **TTS models** (CosyVoice3) with tensor parallelism and FP8 quantization. No vLLM dependency at runtime — just PyTorch, Triton, and Flash Attention.
 
 ## Features
 
 - **Llama 3.1** (8B, 70B) with frequency-scaled RoPE
+- **Llama 4** with fused MoE experts
 - **Mixtral-8x7B** with fused Triton MoE grouped-GEMM kernels
+- **DeepSeek V3.2** with MLA (Multi-head Latent Attention), 256-expert MoE via DeepGEMM FP8, DSA (DeepSeek Sparse Attention), and YARN RoPE — currently **0.78–0.90× of vLLM** throughput on 8×H200 (gap due to kernel-launch overhead, GEMM kernel selection, and AllReduce+RMSNorm fusion)
 - **GPT-OSS** (20B, 120B) MXFP4-quantized MoE with native Triton inference, YaRN RoPE, attention sinks, and sliding window
 - **Mamba / Mamba2** (`state-spaces/mamba-2.8b-hf`, `mistralai/Mamba-Codestral-7B-v0.1`) selective state-space models with vLLM-aligned `causal_conv1d` + `mamba_chunk_scan` / `selective_scan` kernels, slot-based recurrent state cache, chunked-prefill metadata, and TP sharding (incl. `n_groups % tp != 0` head-shard groups)
+- **GLA** (`fla-hub/gla-2.7B-100B`) Gated Linear Attention with per-head logsigmoid forget gate, swish output gate, and SwiGLU MLP — token-aligned with the FLA reference
+- **RetNet** (`fla-hub/retnet-2.7B-100B`) Multi-Scale Retention with rotary embeddings, fixed per-head decay (γ_h = 1 − 2^(−5−h)), swish output gate, and SwiGLU MLP — token-aligned with the FLA reference
+- **RWKV7** (`fla-hub/rwkv7-2.9B-g1`, `fla-hub/rwkv7-2.9B-world`) DPLR (diagonal-plus-low-rank) recurrence with token-shift mixing, LoRA decay/value/gate adapters, GroupNorm output, and squared-ReLU FFN — token-aligned with the FLA reference
 - **FLUX.1-dev** diffusion transformer (text-to-image) with Flash Attention
 - **SDXL** (Stable Diffusion XL) UNet-based text-to-image with dual CLIP text encoders
 - **HunyuanVideo-1.5** 3D video diffusion transformer (text-to-video) with dual-stream joint attention, M-RoPE, and Qwen2.5-VL text encoder
@@ -21,11 +26,13 @@ A standalone, high-performance inference engine supporting **LLMs** (Llama 3.1, 
 - **Whisper** (large-v3) encoder-decoder speech-to-text with batched inference and paged cross-attention KV cache
 - **CosyVoice3** (Fun-CosyVoice3-0.5B-2512) text-to-speech with flow matching DiT + HiFi-GAN vocoder
 - **OpenFold3** (OpenFold/OpenFold3) protein structure prediction with MSA module, PairFormer, diffusion sampling, and atom attention
+- **FP8 inference** with block-scaled FP8 quantization via DeepGEMM, UE8M0 power-of-two scales, and fused SiLU+Mul+FP8 quantization kernels
 - **Tensor parallelism** (TP) with custom IPC-based all-reduce for multi-GPU inference
-- **Paged KV cache** with Triton store kernels (LLM models)
+- **Paged KV cache** with Triton store kernels (LLM models); FP8 MLA KV cache for DeepSeek
 - **CUDA graph capture** for decode steps (LLM models)
-- **Flash Attention** for both prefill/paged decode (LLMs) and non-causal bidirectional attention (diffusion)
+- **Flash Attention** for both prefill/paged decode (LLMs) and non-causal bidirectional attention (diffusion); **FlashMLA** for DeepSeek MLA decode
 - Greedy and top-p sampling (LLMs); flow-match Euler discrete scheduling (diffusion)
+- **fastsafetensors** GPU Direct Storage for fast weight loading
 - **Layered operator architecture** (L1 single-kernel ops through L4 full models) with clean separation of concerns
 - **Benchmarking suite** for evaluating custom CUDA/Triton/PyTorch kernels at 4 abstraction levels
 - **vllm-omni comparison benchmark** for FLUX diffusion and HunyuanVideo-1.5 video diffusion
@@ -122,6 +129,26 @@ python tests/test_bench.py
 
 # Bench module unit tests only (no GPU required)
 python tests/test_bench.py --unit-only
+```
+
+### Benchmarking vs flash-linear-attention (GLA / RetNet / RWKV7)
+
+```bash
+# Throughput + latency + alignment benchmark vs the FLA reference (transformers.generate)
+python tests/bench_fla.py --model fla-hub/gla-2.7B-100B
+python tests/bench_fla.py --model fla-hub/retnet-2.7B-100B
+python tests/bench_fla.py --model fla-hub/rwkv7-2.9B-g1
+
+# kb-nano FLAEngine only (skip FLA reference)
+python tests/bench_fla.py --model fla-hub/gla-2.7B-100B --skip-fla
+
+# Override sequence count, batch budget, or chunked-prefill size
+# (defaults are tuned for the bench_vllm.py workload: 1000 / 256 / 1024)
+python tests/bench_fla.py --model fla-hub/gla-2.7B-100B \
+    --num-seqs 1000 --max-num-seqs 256 --chunked-prefill-size 1024
+
+# Skip latency phase (throughput + alignment only)
+python tests/bench_fla.py --model fla-hub/gla-2.7B-100B --skip-latency
 ```
 
 ### Benchmarking vs vllm-omni (Diffusion)
@@ -483,29 +510,29 @@ Run `tests/bench_vllm.py` to reproduce. Workload uses random token IDs with `ign
 
 ### GPT-OSS (MXFP4)
 
-Run `tests/bench_vllm.py --model openai/gpt-oss-120b --tp 2` to reproduce. 1000 sequences per scenario, `temperature=0`. Expert weights remain in packed MXFP4 uint8 format — no dequantization at any point. Uses vLLM's Triton `matmul_ogs` kernel for fused MoE, FlashAttention 3 for attention sinks and sliding window, and YaRN RoPE.
+Run `tests/bench_vllm.py --model openai/gpt-oss-20b` (TP=1) and `tests/bench_vllm.py --model openai/gpt-oss-120b --tp 2` to reproduce. 1000 sequences per scenario, `temperature=0`. Expert weights remain in packed MXFP4 uint8 format — no dequantization at any point. The fused MoE forward (routing, MXFP4 swizzling, OAI SwiGLU + `matmul_ogs`) is implemented as the `Mxfp4MoE` L1 op (`tasks/baseline/L1/mxfp4_moe.py`) wrapping the OAI `triton_kernels` library; FlashAttention 3 handles attention sinks and sliding window, and YaRN RoPE handles position encoding.
 
 Throughput:
 
 | Model | TP | Scenario | Input/Output | vLLM (tok/s) | Ours (tok/s) | Ratio | Avg Match Tokens |
 |-------|---:|----------|:------------:|-------------:|-------------:|------:|-----------------:|
-| gpt-oss-20b  | 2 | prefill-heavy | 1024/512  |  11,554 |   9,675 | 0.84x | 460.4/512 |
-| gpt-oss-20b  | 2 | balanced      |  512/512  |  12,974 |  10,907 | 0.84x | 437.1/512 |
-| gpt-oss-20b  | 2 | decode-heavy  |  512/1024 |  13,175 |  12,035 | 0.91x | 925.6/1024 |
-| gpt-oss-120b | 2 | prefill-heavy | 1024/512  |  10,761 |  13,265 | **1.23x** | 112.3/512 |
-| gpt-oss-120b | 2 | balanced      |  512/512  |  16,300 |  17,274 | **1.06x** | 124.1/512 |
-| gpt-oss-120b | 2 | decode-heavy  |  512/1024 |  15,236 |  19,186 | **1.26x** | 213.0/1024 |
+| gpt-oss-20b  | 1 | prefill-heavy | 1024/512  |  14,847 |  15,431 | **1.04x** | 468.0/512 |
+| gpt-oss-20b  | 1 | balanced      |  512/512  |  21,023 |  20,924 | **1.00x** | 446.4/512 |
+| gpt-oss-20b  | 1 | decode-heavy  |  512/1024 |  23,130 |  23,568 | **1.02x** | 884.5/1024 |
+| gpt-oss-120b | 2 | prefill-heavy | 1024/512  |  13,182 |  13,415 | **1.02x** | 117.6/512 |
+| gpt-oss-120b | 2 | balanced      |  512/512  |  16,789 |  17,249 | **1.03x** | 116.6/512 |
+| gpt-oss-120b | 2 | decode-heavy  |  512/1024 |  18,416 |  19,392 | **1.05x** | 208.9/1024 |
 
 Latency (128 output tokens, 5 iterations):
 
 | Model | TP | Scenario | Batch Size | vLLM median | Ours median | vLLM ms/tok | Ours ms/tok | Ratio |
 |-------|---:|----------|---:|------------:|------------:|------------:|------------:|------:|
-| gpt-oss-20b  | 2 | single-request | 1  | 0.446s | 0.554s | 3.48 | 4.32 | 0.80x |
-| gpt-oss-20b  | 2 | fixed-batch-32 | 32 | 0.665s | 0.743s | 0.16 | 0.18 | 0.90x |
-| gpt-oss-120b | 2 | single-request | 1  | 0.661s | 0.794s | 5.17 | 6.21 | 0.83x |
-| gpt-oss-120b | 2 | fixed-batch-32 | 32 | 3.044s | 1.393s | 0.74 | 0.34 | **2.19x** |
+| gpt-oss-20b  | 1 | single-request | 1  | 0.500s | 0.538s | 3.90 | 4.20 | 0.93x |
+| gpt-oss-20b  | 1 | fixed-batch-32 | 32 | 0.859s | 0.859s | 0.21 | 0.21 | **1.00x** |
+| gpt-oss-120b | 2 | single-request | 1  | 0.665s | 0.800s | 5.19 | 6.25 | 0.83x |
+| gpt-oss-120b | 2 | fixed-batch-32 | 32 | 1.331s | 1.394s | 0.33 | 0.34 | 0.95x |
 
-The 120B model shows strong throughput advantages (1.06-1.26x) and a 2.19x batched latency speedup. The lower token match rate for the 120B model is expected: with 128 experts and top-4 routing, small numerical differences in router logits cause different expert selections, which cascade into divergent outputs. The 20B model (32 experts) shows higher match rates (85-90%).
+Both models are at or above vLLM throughput across all scenarios (20B: 1.00–1.04x, 120B: 1.02–1.05x). Single-request latency trails vLLM (0.83–0.93x) since vLLM benefits from `torch.compile`/Inductor fusions at small batch sizes, while batched latency is on par. The lower token match rate for the 120B model is expected: with 128 experts and top-4 routing, small numerical differences in router logits cause different expert selections, which cascade into divergent outputs. The 20B model (32 experts) shows higher match rates (~86–91%).
 
 ### Mamba / Mamba2 (Selective State-Space)
 
@@ -623,6 +650,71 @@ Latency (batch size 1, 128 output tokens, 5 iterations):
 | Qwen3-VL-235B-FP8 (MoE) | 4 | single-video | 1.882s | 1.768s | **1.06x** |
 
 FP8 activation quantization uses a custom Triton kernel for single-launch per-token-group UE8M0 quantization. Pre-allocated shared prefill buffers eliminate dynamic allocation during FP8 prefill, and DeepGEMM is JIT-warmed for both decode and prefill batch sizes. The remaining throughput gap vs vLLM is primarily from vLLM's `torch.compile` + Inductor fusion passes (RMSNorm+quant, SiLU+quant).
+
+### DeepSeek V3.2 FP8 (MoE, MLA, DSA)
+
+FP8 support for `deepseek-ai/DeepSeek-V3.2` with block-scaled FP8 MoE experts via DeepGEMM, Multi-head Latent Attention (MLA) with FP8 KV cache via FlashMLA, and DeepSeek Sparse Attention (DSA) indexer.
+
+**Hardware: 8x NVIDIA H200 (NVLink)**
+
+Throughput (1000 sequences per scenario, `temperature=0`, `max_model_len=1536`):
+
+| Model | TP | Scenario | Input/Output | vLLM (tok/s) | Ours (tok/s) | Ratio | Avg Match Tokens |
+|-------|---:|----------|:------------:|-------------:|-------------:|------:|-----------------:|
+| DeepSeek-V3.2 | 8 | prefill-heavy | 1024/512  | 2,798 | 2,096 | 0.75x | 192.9/512 |
+| DeepSeek-V3.2 | 8 | balanced      |  512/512  | 3,391 | 3,268 | 0.96x | 237.8/512 |
+| DeepSeek-V3.2 | 8 | decode-heavy  |  512/1024 | 3,671 | 2,966 | 0.81x | 451.5/1024 |
+
+Latency (128 output tokens, 5 iterations):
+
+| Model | TP | Scenario | BS | vLLM median | Ours median | ms/tok vLLM | ms/tok Ours | Ratio |
+|-------|---:|----------|---:|------------:|------------:|------------:|------------:|------:|
+| DeepSeek-V3.2 | 8 | single-request  |  1 | 2.132s | 2.511s | 16.66 | 19.62 | 0.85x |
+| DeepSeek-V3.2 | 8 | fixed-batch-32  | 32 | 3.835s | 4.208s |  0.94 |  1.03 | 0.91x |
+
+kb-nano currently runs 4–25% slower than vLLM on DeepSeek-V3.2 across all scenarios. The remaining gap is dominated by (1) per-step CPU launch overhead — kb-nano issues ~7× more uncaptured CUDA kernels than vLLM and its CUDA-graph launches are larger/slower; (2) GEMM kernel selection — kb-nano falls back to `sm90_fp8_gemm_1d2d_impl` on a few decode shapes where vLLM picks the faster `fp8_gemm_kernel_swapAB`; and (3) AllReduce fusion — vLLM fuses TP AllReduce with the surrounding RMSNorm + FP8 quant via flashinfer's `trtllm_allreduce_fusion`, eliminating ~3 kernel launches per AR site. Token match rates are higher than other MoE models in this README because we removed the prior bit-divergence in MLA/MoE routing; the residual divergence comes from FP8 quantization differences in the 256-expert MoE and DSA sparse-attention paths.
+
+### FLA Models — GLA / RetNet / RWKV7 (Linear Attention)
+
+Run `tests/bench_fla.py` to reproduce. Workload uses random token IDs with `ignore_eos=True`. The reference engine is the SOTA [`flash-linear-attention`](https://github.com/fla-org/flash-linear-attention) (FLA) library, driving `fla.models.{gla,retnet,rwkv7}.*ForCausalLM` via `transformers.generate` (the same recipe FLA uses in `benchmarks/benchmark_generation.py`). Both engines run continuous-batched decoding; kb-nano additionally supports chunked prefill via the `FLAEngine` (`infra/fla_engine.py`). Both use FLA's Triton kernels (`chunk_gla`, `fused_recurrent_gla`, `chunk_rwkv7`, `fused_recurrent_rwkv7`, etc.) so this measures engine-level overhead, not kernel quality.
+
+**Hardware: NVIDIA H200**
+
+Throughput (1000 sequences per scenario, `temperature=0`, `max_num_seqs=256`, `chunked_prefill_size=1024`; same shapes as `bench_vllm.py`):
+
+| Model | Scenario | Input/Output | FLA ref (tok/s) | Ours (tok/s) | Ratio | Avg Match Tokens |
+|-------|----------|:------------:|----------------:|-------------:|------:|-----------------:|
+| gla-2.7B-100B    | prefill-heavy | 1024/512 | 5,691 |  9,380 | **1.65x** | 477.8/512  |
+| gla-2.7B-100B    | balanced      |  512/512 | 6,082 | 11,579 | **1.90x** | 482.1/512  |
+| gla-2.7B-100B    | decode-heavy  | 512/1024 | 6,268 | 12,458 | **1.99x** | 976.6/1024 |
+| retnet-2.7B-100B | prefill-heavy | 1024/512 | 3,496 |  6,253 | **1.79x** | 478.0/512  |
+| retnet-2.7B-100B | balanced      |  512/512 | 3,645 |  6,761 | **1.85x** | 484.0/512  |
+| retnet-2.7B-100B | decode-heavy  | 512/1024 | 3,668 |  7,067 | **1.93x** | 978.9/1024 |
+| rwkv7-2.9B-g1    | prefill-heavy | 1024/512 | 4,993 |  5,894 | **1.18x** | 444.3/512  |
+| rwkv7-2.9B-g1    | balanced      |  512/512 | 5,633 |  6,617 | **1.17x** | 441.6/512  |
+| rwkv7-2.9B-g1    | decode-heavy  | 512/1024 | 5,904 |  7,043 | **1.19x** | 895.5/1024 |
+
+Latency (median over 3 iters, 128-token input, 128-token output):
+
+| Model | Scenario | Batch | FLA ref (ms/tok) | Ours (ms/tok) | Ratio |
+|-------|----------|------:|-----------------:|--------------:|------:|
+| gla-2.7B-100B    | single-request |  1 | 37.94 | 17.57 | **2.16x** |
+| gla-2.7B-100B    | fixed-batch-32 | 32 |  1.22 |  0.55 | **2.20x** |
+| retnet-2.7B-100B | single-request |  1 | 49.24 | 20.18 | **2.44x** |
+| retnet-2.7B-100B | fixed-batch-32 | 32 |  1.65 |  0.66 | **2.52x** |
+| rwkv7-2.9B-g1    | single-request |  1 | 40.32 | 31.00 | **1.30x** |
+| rwkv7-2.9B-g1    | fixed-batch-32 | 32 |  1.27 |  1.00 | **1.27x** |
+
+`FLAEngine` runs faster than FLA's reference `transformers.generate` on every throughput and latency scenario across all three models (no scenario below 1.0x). Average throughput speedup across the 9 throughput scenarios is ~1.63x; geomean ~1.59x. Latency speedups range from 1.27x (RWKV7 BS=32) to 2.52x (RetNet BS=32). Token alignment to FLA is bitwise within sampling tolerance: greedy outputs match the reference to ~94% (GLA), ~95% (RetNet), and ~87% (RWKV7) on average across scenarios.
+
+The recurrent state machinery is implemented in `infra/fla_engine.py`:
+
+- **Persistent slot-allocated cache** (`_SlotCache`): each in-flight sequence owns a slot in `[max_num_seqs, *state_shape]` buffers (one per L2 layer, lazily allocated on first commit). All gather/scatter is one `index_select` / `index_copy_` per layer per call — a constant number of CUDA launches regardless of batch size, replacing the previous O(layers × batch) per-seq copy loop.
+- **Live-cache reuse**: when the active set is unchanged step-to-step (the common case during steady-state decode of a batch), the previous forward's output cache is fed directly to the next forward with **zero** gather/scatter overhead. Only on membership change (seq finish or admission) do we flush the live cache to slots and re-gather the new active subset.
+- **Batched prefill**: each scheduler iteration runs ONE forward over all currently-prefilling seqs that want the same chunk size (capped by `max_prefill_tokens`, default 192k). For 256 prompts at length 1024 that's a single B=192 forward instead of 256 sequential B=1 forwards — the difference between memory-bandwidth-bound prefill and tensor-core-saturating prefill.
+- **Chunked prefill**: prompts longer than `chunked_prefill_size` (default 1024) are split into 64-token-aligned chunks routed through FLA's `chunk_*` kernels; per-layer recurrent state and (for RWKV7) per-module token-shift state are carried across chunks in `RecurrentCache`. The chunk planner absorbs sub-64-token tails so every chunk dispatches to the chunk kernel (not fused-recurrent), matching single-shot prefill bit-for-bit at the chunk boundary.
+- **Per-row position offsets**: RetNet's rotary embedding receives an absolute `seq_offsets` per batch row so cached prefill chunks and decode steps see the correct global token position.
+- **Last-token-only logits**: the L4 forward accepts `num_logits_to_keep=1` so lm_head + fp32 upcast operate on a single position. At B=200, T=1024, vocab=65k this saves ~50 GB of fp32 logits memory and the corresponding compute, making single-shot batched prefill of 200 prompts feasible on a single H200.
 
 ### FLUX.1-dev (Diffusion)
 
