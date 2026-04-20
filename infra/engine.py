@@ -339,6 +339,8 @@ class ModelRunner:
             # get_kv_cache_configs flow.
             self._profile_mamba_run()
             self.allocate_mamba_state_cache()
+            if self.is_mamba2 and not self.enforce_eager:
+                self._compile_model()
             self._init_mamba_decode_buffers()
             if not self.enforce_eager:
                 self.capture_mamba_cudagraph()
@@ -463,6 +465,8 @@ class ModelRunner:
         instead of one per layer (saves ~14 GiB for 32-layer models).
         """
         from ..tasks.baseline.L1.silu_and_mul import SiluAndMul
+        from ..tasks.baseline.L2.mamba2_mixer import Mamba2Mixer
+
         silu_modules = [
             m for m in self.model.modules() if isinstance(m, SiluAndMul)
         ]
@@ -470,6 +474,19 @@ class ModelRunner:
             shared = silu_modules[0]._act_buf
             for m in silu_modules[1:]:
                 m.set_shared_buffer(shared)
+
+        mamba2_modules = [
+            m for m in self.model.modules() if isinstance(m, Mamba2Mixer)
+        ]
+        if len(mamba2_modules) > 1:
+            shared_ssm_out = torch.empty(
+                self.max_num_batched_tokens,
+                mamba2_modules[0].tped_intermediate_size,
+                dtype=self.dtype,
+                device=f"cuda:{self.rank}",
+            )
+            for module in mamba2_modules:
+                module.set_shared_ssm_out_buffer(shared_ssm_out)
 
     def warmup_model(self):
         torch.cuda.empty_cache()
@@ -1513,6 +1530,11 @@ class ModelRunner:
 
                 # Warmup forward (eager) so the CUDA-graph capture region
                 # only records steady-state kernels.
+                if self._compiled and not self._mark_dynamic_done:
+                    torch._dynamo.mark_dynamic(input_ids, 0)
+                    torch._dynamo.mark_dynamic(positions, 0)
+                    self._mark_dynamic_done = True
+
                 hidden = self.model(input_ids, positions)
                 partial = lm_head.linear_op(hidden, weight).float()
                 mv, mi = partial.max(dim=-1)
@@ -2826,15 +2848,25 @@ class ModelRunner:
         from .compilation import compile_model, configure_post_grad_passes
 
         configure_post_grad_passes()
+        # This only disables the compile stack's generic piecewise
+        # CUDAGraphWrapper. Mamba2 still uses its own decode-only graph
+        # path via capture_mamba_cudagraph().
+        cudagraph_enabled = not self.is_mamba2
         if self.is_qwen_vl:
             # Save the uncompiled inner model for multimodal prefill
             # (which needs deepstack_embeds that the compiled graph
             # doesn't trace).
             self._eager_inner_model = self.model.model
-            self.model.model = compile_model(self.model.model)
+            self.model.model = compile_model(
+                self.model.model,
+                cudagraph_enabled=cudagraph_enabled,
+            )
         else:
             self._eager_model = self.model
-            self.model = compile_model(self.model)
+            self.model = compile_model(
+                self.model,
+                cudagraph_enabled=cudagraph_enabled,
+            )
         self._compiled = True
         self._mark_dynamic_done = False
 
@@ -4524,4 +4556,3 @@ class LlamaEngine:
                     bm.deallocate(seq)
             else:
                 running.append(seq)
-

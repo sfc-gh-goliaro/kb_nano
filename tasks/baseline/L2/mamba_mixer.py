@@ -188,7 +188,6 @@ class MambaMixer(nn.Module):
         # in_proj -> packed [x, gate] (per-rank sharded).
         proj = self.in_proj(hidden_states)  # [N, 2*tp_inter]
         x, gate = proj.chunk(2, dim=-1)
-        tp_inter = x.shape[-1]
 
         if mamba_state is None or mamba_meta is None:
             # Profile / warmup path (no cache available).

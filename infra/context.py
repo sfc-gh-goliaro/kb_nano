@@ -157,13 +157,20 @@ def auto_register_no_compile_layers(model: "nn.Module") -> None:
     fully-qualified prefix so custom ops can find them at runtime.
 
     Recognized types (by class name to avoid circular imports):
-      - ``Qwen3MoE``, ``MixtralMoE``  (MoE blocks)
-      - ``Attention``                  (paged-KV attention impl)
+      - ``Qwen3MoE``, ``MixtralMoE``, ``GptOssMoE``  (MoE blocks)
+      - ``Attention``                                (paged-KV attention impl)
+      - ``Mamba2Mixer``                              (Mamba2 compile boundary)
 
     Also sets ``_layer_name`` on each module so it knows its own key.
     ``_use_custom_op`` remains ``False`` until compilation is enabled.
     """
-    _TARGET_NAMES = {"Qwen3MoE", "MixtralMoE", "GptOssMoE", "Attention"}
+    _TARGET_NAMES = {
+        "Qwen3MoE",
+        "MixtralMoE",
+        "GptOssMoE",
+        "Attention",
+        "Mamba2Mixer",
+    }
     layers: dict[str, "nn.Module"] = {}
     for name, mod in model.named_modules():
         if type(mod).__name__ in _TARGET_NAMES:

@@ -341,12 +341,19 @@ class Mamba2Mixer(nn.Module):
             intermediate_size, n_groups, use_rms_norm=use_rms_norm,
             eps=rms_norm_eps,
         )
+        self._use_custom_op = False
+        self._layer_name = ""
 
         # Pre-computed per-rank sizes used for splitting in forward.
         self.tped_intermediate_size = intermediate_size // self.tp_size
         self.tped_conv_size = self.conv_dim // self.tp_size
         self.tped_dt_size = num_heads // self.tp_size
         self.tped_groups_state = self.groups_ssm_state_size // self.tp_size
+        self.register_buffer(
+            "_ssm_out_buf",
+            torch.empty(0, self.tped_intermediate_size),
+            persistent=False,
+        )
 
     # ------------------------------------------------------------------
     # Forward
@@ -360,38 +367,53 @@ class Mamba2Mixer(nn.Module):
             dim=-1,
         )
 
-    def forward(self, hidden_states: torch.Tensor) -> torch.Tensor:
-        """Mamba2 mixer forward.
+    def set_shared_ssm_out_buffer(self, buffer: torch.Tensor) -> None:
+        self._ssm_out_buf = buffer
 
-        Reads cache state and per-batch metadata from the global Context,
-        following kb_nano's pattern (parallels vLLM ``ForwardContext``).
+    def _get_ssm_out_buffer(
+        self,
+        num_tokens: int,
+        device: torch.device,
+        dtype: torch.dtype,
+    ) -> torch.Tensor:
+        buf = self._ssm_out_buf
+        if (
+            buf.device != device
+            or buf.dtype != dtype
+            or buf.shape[-1] != self.tped_intermediate_size
+            or buf.shape[0] < num_tokens
+        ):
+            buf = torch.empty(
+                max(1, num_tokens),
+                self.tped_intermediate_size,
+                dtype=dtype,
+                device=device,
+            )
+            self._ssm_out_buf = buf
+        return buf[:num_tokens]
 
-        Expected on context (set by infra/engine.py):
-          - ``mamba_state``: ``MambaStateManager`` providing
-            ``conv_states[layer_idx]`` and ``ssm_states[layer_idx]``.
-          - ``mamba_meta``: ``Mamba2Metadata`` for the current batch (slot
-            indices, prefill/decode split, chunked-prefill helpers).
-          - ``is_prefill``: True for prefill, False for decode-only batch
-            (mixed batches set ``mamba_meta`` with both populated).
-        """
+    def conv_ssm_forward(
+        self,
+        projected_states: torch.Tensor,
+        output: torch.Tensor,
+    ) -> None:
+        """Run the conv + SSM core and write the result into ``output``."""
+        hsBC, dt = torch.split(
+            projected_states[..., self.tped_intermediate_size:],
+            [self.tped_conv_size, self.tped_dt_size],
+            dim=-1,
+        )
+
         ctx = get_context()
         mamba_state = getattr(ctx, "mamba_state", None)
         mamba_meta = getattr(ctx, "mamba_metadata", None)
-
-        # Project input -> [gate, x, B, C, dt] (per-rank sharded along last dim).
-        proj = self.in_proj(hidden_states)  # [N, gate + conv + dt]
-        gate, hsBC, dt = torch.split(
-            proj,
-            [self.tped_intermediate_size, self.tped_conv_size, self.tped_dt_size],
-            dim=-1,
-        )
 
         if mamba_state is None or mamba_meta is None:
             # Profile / warmup path: no cache available, skip SSM state IO.
             hsBC = hsBC.contiguous()
             x, _B, _C = self._split_BC(hsBC)
-            y = self.norm(x, gate)
-            return self.out_proj(y)
+            output.copy_(x)
+            return
 
         # MambaStateManager allocates as ``[N, kernel-1, conv_dim]``;
         # transpose to ``[N, conv_dim, kernel-1]`` so the conv kernels'
@@ -412,21 +434,11 @@ class Mamba2Mixer(nn.Module):
         dt_p, dt_d = torch.split(
             dt[:num_actual], [num_prefill_tokens, num_decode_tokens], dim=0,
         )
-        gate_p, gate_d = torch.split(
-            gate[:num_actual], [num_prefill_tokens, num_decode_tokens], dim=0,
-        )
 
-        # Pre-allocate SSM output for in-place writes by varlen kernels.
-        ssm_out = torch.empty(
-            num_actual,
-            self.tped_intermediate_size,
-            dtype=hidden_states.dtype, device=hidden_states.device,
-        )
+        ssm_out = output[:num_actual]
         ssm_out_p, ssm_out_d = torch.split(
             ssm_out, [num_prefill_tokens, num_decode_tokens], dim=0,
         )
-        gate_full = torch.cat([gate_p, gate_d], dim=0) if (has_prefill and has_decode) \
-            else (gate_p if has_prefill else gate_d)
 
         if has_prefill:
             x_in = hsBC_p.transpose(0, 1)  # [conv_dim_per_rank, T_p]
@@ -515,6 +527,21 @@ class Mamba2Mixer(nn.Module):
                 out=ssm_out_d.view(num_decode_tokens, -1, self.head_dim),
             )
 
-        # Gated RMS norm + output projection (out_proj does TP all-reduce).
-        y = self.norm(ssm_out, gate_full)
-        return self.out_proj(y)
+    def forward(self, hidden_states: torch.Tensor) -> torch.Tensor:
+        projected_states = self.in_proj(hidden_states)
+        ssm_output = self._get_ssm_out_buffer(
+            projected_states.shape[0],
+            device=hidden_states.device,
+            dtype=hidden_states.dtype,
+        )
+        if self._use_custom_op:
+            torch.ops.kb_nano.mamba2_conv_ssm_forward(
+                projected_states,
+                ssm_output,
+                self._layer_name,
+            )
+        else:
+            self.conv_ssm_forward(projected_states=projected_states, output=ssm_output)
+        gate = projected_states[..., : self.tped_intermediate_size]
+        hidden_states = self.norm(ssm_output, gate)
+        return self.out_proj(hidden_states)

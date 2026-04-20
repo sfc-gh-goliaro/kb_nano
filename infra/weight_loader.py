@@ -926,6 +926,41 @@ def _detect_quant_config(model_name: str) -> dict | None:
     return qc.to_dict() if hasattr(qc, "to_dict") else {"quant_method": "fp8"}
 
 
+def _restore_mamba_ssm_params(
+    model: torch.nn.Module,
+    model_type: str,
+    device: torch.device,
+) -> None:
+    # vLLM keeps the SSM recurrence parameters in fp32 even when the
+    # surrounding model weights run in reduced precision. The custom
+    # selective-scan kernels rely on that contract.
+    if model_type == "mamba":
+        from ..tasks.baseline.L2.mamba_mixer import MambaMixer
+
+        for module in model.modules():
+            if isinstance(module, MambaMixer):
+                module.A.data = module.A.data.to(
+                    device=device, dtype=torch.float32,
+                )
+                module.D.data = module.D.data.to(
+                    device=device, dtype=torch.float32,
+                )
+    elif model_type == "mamba2":
+        from ..tasks.baseline.L2.mamba2_mixer import Mamba2Mixer
+
+        for module in model.modules():
+            if isinstance(module, Mamba2Mixer):
+                module.A.data = module.A.data.to(
+                    device=device, dtype=torch.float32,
+                )
+                module.D.data = module.D.data.to(
+                    device=device, dtype=torch.float32,
+                )
+                module.dt_bias.data = module.dt_bias.data.to(
+                    device=device, dtype=torch.float32,
+                )
+
+
 def load_model(
     model_name: str,
     device: torch.device = torch.device("cuda"),
@@ -1074,6 +1109,9 @@ def load_model(
         _postprocess_fp8_weights(model)
     elif model_type != "gpt_oss":
         model = model.to(device=device, dtype=dtype)
+
+    if model_type in ("mamba", "mamba2") and dtype != torch.float32:
+        _restore_mamba_ssm_params(model, model_type, device)
 
     model.eval()
     return model, config
