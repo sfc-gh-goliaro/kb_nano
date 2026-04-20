@@ -416,7 +416,17 @@ def _fastsafetensors_iterator(safetensor_files):
         rank_file_map = {i: [f] for i, f in enumerate(f_list)}
         loader.add_filenames(rank_file_map)
         try:
-            fb = loader.copy_files_to_device()
+            try:
+                fb = loader.copy_files_to_device()
+            except RuntimeError as e:
+                msg = str(e).lower()
+                if nogds or ("gds" not in msg and "cufile" not in msg):
+                    raise
+                loader.close()
+                nogds = True
+                loader = SafeTensorsFileLoader(pg, device, nogds=nogds)
+                loader.add_filenames(rank_file_map)
+                fb = loader.copy_files_to_device()
             try:
                 for k in list(fb.key_to_rank_lidx.keys()):
                     yield k, fb.get_tensor(k)
