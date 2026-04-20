@@ -114,9 +114,24 @@ class MergedColumnParallelLinear(nn.Module):
             self.weight.weight_loader = self._weight_loader
 
         self.bias = None
+        if bias:
+            self.bias = nn.Parameter(torch.empty(total // tp))
+            self.bias.weight_loader = self._weight_loader
 
-    def _weight_loader(self, param, loaded_weight, shard_id: int):
+    def _weight_loader(self, param, loaded_weight, shard_id: int | None = None):
         tp, rank = _tp_size(), _tp_rank()
+        if shard_id is None:
+            # Fused weight: ``loaded_weight`` is the full ``[sum(output_sizes), in]``
+            # tensor.  Recurse per-shard so each output block is sharded across
+            # TP ranks independently (mirrors vLLM's ``MergedColumnParallelLinear``
+            # weight loader when called without an explicit shard id).
+            offset = 0
+            for sid, sz in enumerate(self.output_sizes):
+                self._weight_loader(
+                    param, loaded_weight.narrow(0, offset, sz), sid,
+                )
+                offset += sz
+            return
         effective_tp = 1 if self.disable_tp else tp
         shard_offset = sum(self.output_sizes[:shard_id]) // effective_tp
         shard_size = self.output_sizes[shard_id] // effective_tp
@@ -156,10 +171,13 @@ class QKVParallelLinear(nn.Module):
         tp = _tp_size()
         self.head_size = head_size
         self.num_heads = total_num_heads // tp
-        if total_num_kv_heads >= tp:
+        # Replicate KV heads when not evenly divisible by TP
+        if total_num_kv_heads % tp == 0:
             self.num_kv_heads = total_num_kv_heads // tp
+            self._replicate_kv = False
         else:
-            self.num_kv_heads = 1
+            self.num_kv_heads = total_num_kv_heads
+            self._replicate_kv = True
         output_size = (self.num_heads + 2 * self.num_kv_heads) * head_size
         self.use_fp8 = quant_config is not None
 
@@ -189,14 +207,16 @@ class QKVParallelLinear(nn.Module):
         if shard_id == "q":
             shard_size = self.num_heads * self.head_size
             shard_offset = 0
+            src = loaded_weight.chunk(tp, 0)[rank]
         elif shard_id == "k":
             shard_size = self.num_kv_heads * self.head_size
             shard_offset = self.num_heads * self.head_size
+            src = loaded_weight if self._replicate_kv else loaded_weight.chunk(tp, 0)[rank]
         else:
             shard_size = self.num_kv_heads * self.head_size
             shard_offset = self.num_heads * self.head_size + self.num_kv_heads * self.head_size
+            src = loaded_weight if self._replicate_kv else loaded_weight.chunk(tp, 0)[rank]
         dst = param.data.narrow(0, shard_offset, shard_size)
-        src = loaded_weight.chunk(tp, 0)[rank]
         dst.copy_(src)
 
     def _scale_loader(self, param, loaded_weight, shard_id: str):

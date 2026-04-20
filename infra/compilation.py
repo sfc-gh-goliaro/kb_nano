@@ -64,6 +64,7 @@ logger = logging.getLogger(__name__)
 
 SPLITTING_OPS: list[str] = [
     "kb_nano::unified_attention",
+    "kb_nano::mamba2_conv_ssm_forward",
     "kb_nano::unified_mla_attention",
     "kb_nano::sparse_attn_indexer",
 ]
@@ -101,6 +102,23 @@ def _unified_attention_fake(
     layer_name: str,
 ) -> torch.Tensor:
     return torch.empty_like(query)
+
+
+def _mamba2_conv_ssm_forward_impl(
+    projected_states: torch.Tensor,
+    output: torch.Tensor,
+    layer_name: str,
+) -> None:
+    layer = get_no_compile_layers()[layer_name]
+    layer.conv_ssm_forward(projected_states, output)
+
+
+def _mamba2_conv_ssm_forward_fake(
+    projected_states: torch.Tensor,
+    output: torch.Tensor,
+    layer_name: str,
+) -> None:
+    return None
 
 
 def _unified_mla_attention_impl(
@@ -179,6 +197,14 @@ def ensure_custom_ops_registered() -> None:
     lib.impl("unified_attention", _unified_attention_impl, "CUDA")
     lib.impl("unified_attention", _unified_attention_impl, "CPU")
     abstract_lib.impl("unified_attention", _unified_attention_fake)
+
+    lib.define(
+        "mamba2_conv_ssm_forward(Tensor projected_states, Tensor(a!) output, "
+        "str layer_name) -> ()"
+    )
+    lib.impl("mamba2_conv_ssm_forward", _mamba2_conv_ssm_forward_impl, "CUDA")
+    lib.impl("mamba2_conv_ssm_forward", _mamba2_conv_ssm_forward_impl, "CPU")
+    abstract_lib.impl("mamba2_conv_ssm_forward", _mamba2_conv_ssm_forward_fake)
 
     lib.define(
         "unified_mla_attention(Tensor q, Tensor kv_c_normed, Tensor k_pe, "

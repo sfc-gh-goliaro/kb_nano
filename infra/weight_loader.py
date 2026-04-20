@@ -33,6 +33,8 @@ from concurrent.futures import ThreadPoolExecutor
 from .tp import _tp_size
 from ..tasks.baseline.L4.llama import LlamaConfig, LlamaForCausalLM
 from ..tasks.baseline.L4.llama4 import Llama4Config, Llama4ForCausalLM
+from ..tasks.baseline.L4.mamba import MambaConfig, MambaForCausalLM
+from ..tasks.baseline.L4.mamba2 import Mamba2Config, Mamba2ForCausalLM
 from ..tasks.baseline.L4.mixtral import MixtralConfig, MixtralForCausalLM
 from ..tasks.baseline.L4.qwen2_vl import Qwen2VLConfig, Qwen2VLForConditionalGeneration
 from ..tasks.baseline.L4.qwen3_vl import Qwen3VLConfig, Qwen3VLForConditionalGeneration
@@ -414,7 +416,17 @@ def _fastsafetensors_iterator(safetensor_files):
         rank_file_map = {i: [f] for i, f in enumerate(f_list)}
         loader.add_filenames(rank_file_map)
         try:
-            fb = loader.copy_files_to_device()
+            try:
+                fb = loader.copy_files_to_device()
+            except RuntimeError as e:
+                msg = str(e).lower()
+                if nogds or ("gds" not in msg and "cufile" not in msg):
+                    raise
+                loader.close()
+                nogds = True
+                loader = SafeTensorsFileLoader(pg, device, nogds=nogds)
+                loader.add_filenames(rank_file_map)
+                fb = loader.copy_files_to_device()
             try:
                 for k in list(fb.key_to_rank_lidx.keys()):
                     yield k, fb.get_tensor(k)
@@ -571,6 +583,7 @@ def load_weights(model, model_path: str, model_type: str = "llama") -> None:
     is_qwen3_vl_moe = model_type == "qwen3_vl_moe"
     is_qwen_vl = is_qwen2_vl or is_qwen3_vl
     is_llama4 = model_type == "llama4"
+    is_mamba = model_type in ("mamba", "mamba2")
     if is_llama4:
         llama4_config = model.config
 
@@ -616,6 +629,18 @@ def load_weights(model, model_path: str, model_type: str = "llama") -> None:
             mapped_name = _remap_qwen3_vl_name(weight_name)
         else:
             mapped_name = weight_name
+
+        # Mamba / Mamba2 checkpoint remaps:
+        #  - A_log -> A   (we negate-exp at load time via the param's
+        #    weight_loader, matching vLLM's MambaMixer/MambaMixer2)
+        #  - backbone.embeddings.weight -> backbone.embeddings.embedding_op.emb.weight
+        #    (kb_nano's VocabParallelEmbedding wraps the weight inside
+        #    embedding_op.emb)
+        if is_mamba:
+            if "A_log" in mapped_name:
+                mapped_name = mapped_name.replace("A_log", "A")
+            if mapped_name == "backbone.embeddings.weight":
+                mapped_name = "backbone.embeddings.embedding_op.emb.weight"
 
         if model_type == "deepseek_v3":
             mapped_name = mapped_name.replace(
@@ -1133,6 +1158,41 @@ def _detect_quant_config(model_name: str) -> dict | None:
     return qc.to_dict() if hasattr(qc, "to_dict") else {"quant_method": "fp8"}
 
 
+def _restore_mamba_ssm_params(
+    model: torch.nn.Module,
+    model_type: str,
+    device: torch.device,
+) -> None:
+    # vLLM keeps the SSM recurrence parameters in fp32 even when the
+    # surrounding model weights run in reduced precision. The custom
+    # selective-scan kernels rely on that contract.
+    if model_type == "mamba":
+        from ..tasks.baseline.L2.mamba_mixer import MambaMixer
+
+        for module in model.modules():
+            if isinstance(module, MambaMixer):
+                module.A.data = module.A.data.to(
+                    device=device, dtype=torch.float32,
+                )
+                module.D.data = module.D.data.to(
+                    device=device, dtype=torch.float32,
+                )
+    elif model_type == "mamba2":
+        from ..tasks.baseline.L2.mamba2_mixer import Mamba2Mixer
+
+        for module in model.modules():
+            if isinstance(module, Mamba2Mixer):
+                module.A.data = module.A.data.to(
+                    device=device, dtype=torch.float32,
+                )
+                module.D.data = module.D.data.to(
+                    device=device, dtype=torch.float32,
+                )
+                module.dt_bias.data = module.dt_bias.data.to(
+                    device=device, dtype=torch.float32,
+                )
+
+
 def load_model(
     model_name: str,
     device: torch.device = torch.device("cuda"),
@@ -1196,6 +1256,21 @@ def load_model(
         else:
             print("  Allocating Qwen3-VL model...")
         model = Qwen3VLForConditionalGeneration(config, quant_config=quant_config)
+    elif model_type == "mamba2":
+        config = Mamba2Config.from_pretrained(model_path)
+        config.dtype = dtype
+        print(f"  Allocating Mamba2 model "
+              f"(L={config.num_hidden_layers}, hidden={config.hidden_size}, "
+              f"heads={config.num_heads}, head_dim={config.head_dim}, "
+              f"groups={config.n_groups}, state={config.state_size})...")
+        model = Mamba2ForCausalLM(config)
+    elif model_type == "mamba":
+        config = MambaConfig.from_pretrained(model_path)
+        config.dtype = dtype
+        print(f"  Allocating Mamba model "
+              f"(L={config.num_hidden_layers}, hidden={config.hidden_size}, "
+              f"intermediate={config.intermediate_size}, state={config.state_size})...")
+        model = MambaForCausalLM(config)
     elif model_type == "deepseek_v3":
         config = DeepSeekV3Config.from_pretrained(model_name)
         config.dtype = dtype
@@ -1220,6 +1295,23 @@ def load_model(
         raise ValueError(
             f"TP degree {tp} is incompatible with {config.num_key_value_heads} KV heads "
             f"(num_key_value_heads must be divisible by tensor_parallel_size)"
+        )
+    # Mamba2 num_heads must be divisible by TP world size
+    if model_type == "mamba2":
+        if config.num_heads % tp != 0:
+            raise ValueError(
+                f"TP degree {tp} is incompatible with {config.num_heads} Mamba2 heads "
+                f"(num_heads must be divisible by tensor_parallel_size)"
+            )
+        if config.n_groups % tp != 0 and config.n_groups != 1:
+            raise ValueError(
+                f"TP degree {tp} requires n_groups ({config.n_groups}) to be divisible "
+                f"by tp or equal to 1 (extra-groups replication only supported when n_groups==1)."
+            )
+    if model_type == "mamba" and config.intermediate_size % tp != 0:
+        raise ValueError(
+            f"TP degree {tp} is incompatible with Mamba intermediate_size "
+            f"{config.intermediate_size}."
         )
 
     if model_type == "gpt_oss":
@@ -1265,6 +1357,9 @@ def load_model(
         _postprocess_fp8_weights(model)
     elif model_type != "gpt_oss":
         model = model.to(device=device, dtype=dtype)
+
+    if model_type in ("mamba", "mamba2") and dtype != torch.float32:
+        _restore_mamba_ssm_params(model, model_type, device)
 
     if model_type == "deepseek_v3" and quant_config is None:
         _compute_mla_absorbed_weights(model)

@@ -9,6 +9,7 @@ A standalone, high-performance inference engine supporting **LLMs** (Llama 3.1, 
 - **Mixtral-8x7B** with fused Triton MoE grouped-GEMM kernels
 - **DeepSeek V3.2** with MLA (Multi-head Latent Attention), 256-expert MoE via DeepGEMM FP8, DSA (DeepSeek Sparse Attention), and YARN RoPE — currently **0.78–0.90× of vLLM** throughput on 8×H200 (gap due to kernel-launch overhead, GEMM kernel selection, and AllReduce+RMSNorm fusion)
 - **GPT-OSS** (20B, 120B) MXFP4-quantized MoE with native Triton inference, YaRN RoPE, attention sinks, and sliding window
+- **Mamba / Mamba2** (`state-spaces/mamba-2.8b-hf`, `mistralai/Mamba-Codestral-7B-v0.1`) selective state-space models with vLLM-aligned `causal_conv1d` + `mamba_chunk_scan` / `selective_scan` kernels, slot-based recurrent state cache, chunked-prefill metadata, and TP sharding (incl. `n_groups % tp != 0` head-shard groups)
 - **GLA** (`fla-hub/gla-2.7B-100B`) Gated Linear Attention with per-head logsigmoid forget gate, swish output gate, and SwiGLU MLP — token-aligned with the FLA reference
 - **RetNet** (`fla-hub/retnet-2.7B-100B`) Multi-Scale Retention with rotary embeddings, fixed per-head decay (γ_h = 1 − 2^(−5−h)), swish output gate, and SwiGLU MLP — token-aligned with the FLA reference
 - **RWKV7** (`fla-hub/rwkv7-2.9B-g1`, `fla-hub/rwkv7-2.9B-world`) DPLR (diagonal-plus-low-rank) recurrence with token-shift mixing, LoRA decay/value/gate adapters, GroupNorm output, and squared-ReLU FFN — token-aligned with the FLA reference
@@ -533,7 +534,33 @@ Latency (128 output tokens, 5 iterations):
 
 Both models are at or above vLLM throughput across all scenarios (20B: 1.00–1.04x, 120B: 1.02–1.05x). Single-request latency trails vLLM (0.83–0.93x) since vLLM benefits from `torch.compile`/Inductor fusions at small batch sizes, while batched latency is on par. The lower token match rate for the 120B model is expected: with 128 experts and top-4 routing, small numerical differences in router logits cause different expert selections, which cascade into divergent outputs. The 20B model (32 experts) shows higher match rates (~86–91%).
 
-**Hardware: 4x NVIDIA B200 (NVLink)**
+### Mamba / Mamba2 (Selective State-Space)
+
+Run `tests/bench_vllm.py --model state-spaces/mamba-2.8b-hf` and `tests/bench_vllm.py --model mistralai/Mamba-Codestral-7B-v0.1` to reproduce. 1000 sequences per scenario, `temperature=0`. kb-nano reuses vLLM's `causal_conv1d_fn` / `causal_conv1d_update`, `mamba_chunk_scan_combined_varlen` / `selective_scan_fn`, and `selective_state_update` Triton kernels behind a slot-based recurrent state cache, a chunked-prefill scheduler with a `max_num_batched_tokens` budget, **decode-only CUDA graphs at bucketed batch sizes (1, 2, 4, 8, …, 256)** with `PAD_SLOT_ID = -1` padding, **GPU greedy argmax + async D2H** of next-token IDs (a Mamba mirror of the attention engine's fast greedy path), **batched per-step state slot allocation/deallocation** broadcast over SHM, and **profile-based state pool sizing** that runs a synthetic worst-case prefill before allocating slots (mirrors vLLM's `determine_available_memory` → `get_kv_cache_configs` flow) so the slot count tracks vLLM's KV cache concurrency.
+
+Throughput (1000 sequences per scenario, CUDA graphs enabled):
+
+| Model | TP | Scenario | Input/Output | vLLM (tok/s) | Ours (tok/s) | Ratio | Avg Match Tokens |
+|-------|---:|----------|:------------:|-------------:|-------------:|------:|-----------------:|
+| mamba-2.8b-hf            | 1 | prefill-heavy | 1024/512  |  7,080 |  6,912 | 0.98x | 416.2/512  |
+| mamba-2.8b-hf            | 1 | balanced      |  512/512  |  8,285 |  8,635 | 1.04x | 402.1/512  |
+| mamba-2.8b-hf            | 1 | decode-heavy  |  512/1024 | 12,033 | 13,476 | 1.12x | 805.5/1024 |
+| Mamba-Codestral-7B-v0.1  | 1 | prefill-heavy | 1024/512  |  3,935 |  3,844 | 0.98x | 418.4/512  |
+| Mamba-Codestral-7B-v0.1  | 1 | balanced      |  512/512  |  4,517 |  4,332 | 0.96x | 425.7/512  |
+| Mamba-Codestral-7B-v0.1  | 1 | decode-heavy  |  512/1024 |  4,834 |  4,668 | 0.97x | 823.5/1024 |
+
+Latency (TP=1, 5 timed iterations):
+
+| Model                   | Scenario       | Batch | Output | vLLM (s) | Ours (s) | vLLM (ms/tok) | Ours (ms/tok) | Ratio |
+|-------------------------|----------------|------:|-------:|---------:|---------:|--------------:|--------------:|------:|
+| mamba-2.8b-hf           | single-request |     1 |    128 |   0.4740 |   0.4575 |          3.70 |          3.57 | 1.04x |
+| mamba-2.8b-hf           | fixed-batch-32 |    32 |    128 |   1.5718 |   1.5371 |          0.38 |          0.38 | 1.02x |
+| Mamba-Codestral-7B-v0.1 | single-request |     1 |    128 |   0.7013 |   0.7370 |          5.48 |          5.76 | 0.95x |
+| Mamba-Codestral-7B-v0.1 | fixed-batch-32 |    32 |    128 |   1.5716 |   1.6316 |          0.38 |          0.40 | 0.96x |
+
+Token alignment is in the expected range for two independent SSM implementations at `temperature=0`: Mamba v1 stays relatively close (416.2/512, 402.1/512, 805.5/1024 average matching tokens across the three scenarios), and Codestral does as well after restoring its original mixed-batch token layout (418.4/512, 425.7/512, 823.5/1024). The recurrent state still accumulates small bf16 numerical differences over the full prefill chunk-scan, and those divergences compound across the decode loop. With profile-based state sizing kb-nano now allocates **716 slots** for Codestral and **1024 slots** for Mamba v1 on a single H200 (vLLM reports ~855 concurrent 1536-token requests for Codestral; Mamba v1's per-slot state is much smaller, so its slot count is higher). On the latest H200 rerun, Mamba v1 is effectively at parity with vLLM on throughput (0.98x / 1.04x / 1.12x across the three scenarios) and slightly ahead on latency (1.04x single-request, 1.02x fixed-batch-32), while Codestral is also near parity on throughput (0.98x / 0.96x / 0.97x) and latency (0.95x / 0.96x). Per-step instrumentation (enable with `KB_NANO_PROFILE_MAMBA=1`) still shows that **97% of decode-step wall time is in GPU + D2H wait**; CPU-side phases (admit, decode prep, finalize, slot bookkeeping) together account for less than 3%, so the remaining optimization work is concentrated in the GPU path and batched-latency tail rather than scheduler overhead.
+
+**Hardware: NVIDIA H200**
 
 Run `tests/bench_vllm.py` to reproduce. Three scenarios per model, 1000 sequences each, `temperature=0`.
 
