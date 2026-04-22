@@ -32,7 +32,12 @@ from transformers import AutoTokenizer
 from .context import (
     AttnBackendConfig, CUDAGraphMode, auto_register_no_compile_layers,
     get_attn_backend_config, get_context,
-    reset_context, set_context, set_forward_context, set_mixed_context,
+    reset_context, set_context, set_forward_context, set_mamba_context,
+    set_mixed_context,
+)
+from .mamba_state import (
+    Mamba2Metadata, MambaMetadata, MambaStateManager, build_chunk_metadata,
+    compute_causal_conv1d_metadata,
 )
 from ..tasks.baseline.L1.allreduce import set_custom_ar
 from .weight_loader import load_model
@@ -128,6 +133,9 @@ class Sequence:
         self.encoder_seq_len: int = 0  # num encoder tokens (after conv)
         self.cross_block_table: list[int] = []  # paged KV blocks for cross-attn
         self.encoder_computed: bool = False  # True after encoder has run
+        # Mamba/SSM models: index into MambaStateManager's slot pool.
+        # Allocated for the lifetime of the sequence; None for non-mamba models.
+        self.state_slot: int | None = None
 
     def __len__(self):
         if self.token_ids is not None:
@@ -171,6 +179,8 @@ class Sequence:
         self.cross_block_table.clear()
         self.num_computed_tokens = 0
         self.encoder_computed = False
+        # state_slot is freed by the engine before preempt(); leave the
+        # field as-is so callers can detect it.
         self.status = SeqStatus.WAITING
 
     def append_token(self, token_id):
@@ -181,10 +191,12 @@ class Sequence:
         """Minimal pickling for shared memory transfer to non-rank-0 workers."""
         return (len(self), len(self.prompt_ids), self.block_table,
                 self.num_computed_tokens,
+                self.state_slot,
                 self.token_ids if not self.generated_ids else self.last_token)
 
     def __setstate__(self, state):
-        self._num_tokens, num_prompt, self.block_table, self.num_computed_tokens = state[:-1]
+        (self._num_tokens, num_prompt, self.block_table,
+         self.num_computed_tokens, self.state_slot) = state[:-1]
         if isinstance(state[-1], list):
             self.token_ids = state[-1]
         else:
@@ -280,27 +292,69 @@ class ModelRunner:
                 set_custom_ar(self.custom_ar)
 
         if dtype is None:
+            # DeepSeek V3.2 checkpoints use ``model_type: "deepseek_v32"`` which
+            # is not yet a registered AutoConfig key in transformers, so load
+            # with ``trust_remote_code=True`` and fall back to raw config.json
+            # parsing if AutoConfig still refuses.
             from transformers import AutoConfig
-            _cfg = AutoConfig.from_pretrained(model_name)
-            cfg_dtype = getattr(_cfg, "torch_dtype", None)
-            if cfg_dtype is not None and isinstance(cfg_dtype, torch.dtype):
+            _cfg = None
+            cfg_dtype = None
+            model_type = ""
+            try:
+                _cfg = AutoConfig.from_pretrained(
+                    model_name, trust_remote_code=True,
+                )
+                cfg_dtype = getattr(_cfg, "torch_dtype", None)
+                model_type = getattr(_cfg, "model_type", "")
+            except (ValueError, KeyError):
+                try:
+                    from huggingface_hub import hf_hub_download
+                    import json as _json
+                    if os.path.isdir(model_name):
+                        _cfg_path = os.path.join(model_name, "config.json")
+                    else:
+                        _cfg_path = hf_hub_download(model_name, "config.json")
+                    with open(_cfg_path) as _f:
+                        _cfg_dict = _json.load(_f)
+                    _td = _cfg_dict.get("torch_dtype", None)
+                    cfg_dtype = getattr(torch, _td) if isinstance(_td, str) else None
+                    model_type = _cfg_dict.get("model_type", "")
+                    if isinstance(cfg_dtype, torch.dtype):
+                        dtype = cfg_dtype
+                except Exception:
+                    pass
+            if model_type in ("mamba", "mamba2") and cfg_dtype == torch.float32:
+                # HF Mamba configs often advertise fp32, but the serving path
+                # restores only the recurrent SSM parameters to fp32 after load
+                # and keeps the main activations/weights in reduced precision.
+                dtype = torch.bfloat16
+            elif dtype is None and isinstance(cfg_dtype, torch.dtype):
                 dtype = cfg_dtype
-            else:
+            elif dtype is None:
                 dtype = torch.bfloat16
         self.dtype = dtype
         default_dtype = torch.get_default_dtype()
         torch.set_default_dtype(dtype)
         torch.set_default_device("cuda")
 
+        import time as _time
+        _t0 = _time.perf_counter()
+        if rank == 0:
+            print(f"  [1/6] Loading model weights...", flush=True)
         self.model, self.config = load_model(
             model_name, torch.device(f"cuda:{rank}"), dtype,
         )
+        model_type = getattr(self.config, "model_type", "")
+        self.is_mamba2 = model_type == "mamba2"
+        self.is_mamba = model_type in ("mamba", "mamba2")
+        self.model_family = "mamba" if self.is_mamba else "attention"
         self.is_moe = hasattr(self.config, "num_local_experts") or getattr(self.config, "is_moe", False)
         self.is_qwen_vl = hasattr(self.config, "mrope_section")
         self.is_qwen3_vl = self.is_qwen_vl and hasattr(
             getattr(self.config, "vision", None), "deepstack_visual_indexes"
         )
         self.is_whisper = getattr(self.config, "is_encoder_decoder", False)
+        self.is_deepseek_mla = hasattr(self.config, "kv_lora_rank")
         if self.is_whisper:
             self.enforce_eager = True
             self.max_model_len = min(
@@ -311,16 +365,71 @@ class ModelRunner:
         auto_register_no_compile_layers(self.model)
 
         self._compiled = False
-        self._share_trtllm_workspace()
-        self._share_activation_buffers()
-        self.warmup_model()
-        self._warmup_deepgemm()
-        self.allocate_kv_cache()
-        self._init_fa3_decode_buffers()
-        if not self.enforce_eager:
-            self._compile_model()
-            self.capture_cudagraph()
-        self._init_greedy_buffers()
+        self.num_blocks = 0  # set by allocate_kv_cache (attention) only
+        self.mamba_state_manager: MambaStateManager | None = None
+        if rank == 0:
+            print(f"  [1/6] Model loaded in {_time.perf_counter()-_t0:.1f}s", flush=True)
+        if self.is_mamba:
+            # Mamba models use slot-based recurrent state instead of paged
+            # KV cache.  Skip attention-specific setup (kv cache, fa3 decode
+            # buffers, torch.compile, CUDA graphs, fast greedy buffers --
+            # those all hardcode kv_cache / context_lens / block_tables).
+            if rank == 0:
+                print("  [2/6] Sharing activation buffers...", flush=True)
+            self._share_activation_buffers()
+            # Tier 1A: profile pass before sizing the state pool, mirroring
+            # vLLM's profile_run -> determine_available_memory ->
+            # get_kv_cache_configs flow.
+            if rank == 0:
+                print("  [3/6] Profiling Mamba state cache...", flush=True)
+            self._profile_mamba_run()
+            self.allocate_mamba_state_cache()
+            if self.is_mamba2 and not self.enforce_eager:
+                if rank == 0:
+                    print("  [4/6] Compiling Mamba2...", flush=True)
+                self._compile_model()
+            if rank == 0:
+                print("  [5/6] Preparing Mamba decode buffers...", flush=True)
+            self._init_mamba_decode_buffers()
+            if not self.enforce_eager:
+                if rank == 0:
+                    print("  [6/6] Capturing Mamba CUDA graphs...", flush=True)
+                self.capture_mamba_cudagraph()
+            if rank == 0:
+                print(f"  Engine ready in {_time.perf_counter()-_t0:.1f}s total", flush=True)
+        else:
+            self._share_trtllm_workspace()
+            self._share_activation_buffers()
+            if rank == 0:
+                print(f"  [2/6] Warmup forward pass...", flush=True)
+            _t1 = _time.perf_counter()
+            self.warmup_model()
+            if rank == 0:
+                print(f"  [2/6] Warmup done in {_time.perf_counter()-_t1:.1f}s", flush=True)
+                print(f"  [3/6] DeepGEMM warmup...", flush=True)
+            _t2 = _time.perf_counter()
+            self._warmup_deepgemm()
+            if rank == 0:
+                print(f"  [3/6] DeepGEMM done in {_time.perf_counter()-_t2:.1f}s", flush=True)
+                print(f"  [4/6] Allocating KV cache...", flush=True)
+            _t3 = _time.perf_counter()
+            self.allocate_kv_cache()
+            self._init_fa3_decode_buffers()
+            if rank == 0:
+                print(f"  [4/6] KV cache done in {_time.perf_counter()-_t3:.1f}s", flush=True)
+            if not self.enforce_eager:
+                if rank == 0:
+                    print(f"  [5/6] Compiling + capturing CUDA graphs...", flush=True)
+                _t4 = _time.perf_counter()
+                self._compile_model()
+                self.capture_cudagraph()
+                if rank == 0:
+                    print(f"  [5/6] CUDA graphs done in {_time.perf_counter()-_t4:.1f}s", flush=True)
+            if rank == 0:
+                print(f"  [6/6] Init greedy buffers...", flush=True)
+            self._init_greedy_buffers()
+            if rank == 0:
+                print(f"  Engine ready in {_time.perf_counter()-_t0:.1f}s total", flush=True)
         torch.set_default_device("cpu")
         torch.set_default_dtype(default_dtype)
 
@@ -352,7 +461,8 @@ class ModelRunner:
         dist.destroy_process_group()
 
     # SHM layout for spin-wait signaling:
-    # byte[-1] (_SHM_FLAG_OFFSET): 0=generic, 1=decode_greedy, 2=exit marker
+    # byte[-1] (_SHM_FLAG_OFFSET): 0=generic, 1=attn decode_greedy,
+    #                              2=mamba decode_greedy
     # bytes[-5:-1] (_SHM_SEQ_OFFSET): 4-byte little-endian sequence counter
     _SHM_FLAG_OFFSET = 2**20 - 1
     _SHM_SEQ_OFFSET = 2**20 - 5
@@ -367,8 +477,12 @@ class ModelRunner:
             cur_seq = int.from_bytes(buf[seq_off:seq_off+4], "little")
             if cur_seq != last_seq:
                 last_seq = cur_seq
-                if buf[flag_off] != 0:
-                    self._loop_decode_greedy()
+                flag = buf[flag_off]
+                if flag != 0:
+                    if flag == 1:
+                        self._loop_decode_greedy()
+                    elif flag == 2:
+                        self._loop_mamba_decode_greedy()
                     continue
                 n = int.from_bytes(buf[0:4], "little")
                 method_name, *args = pickle.loads(buf[4:n+4])
@@ -419,20 +533,35 @@ class ModelRunner:
         torch.cuda.empty_cache()
 
     def _share_activation_buffers(self):
-        """Share activation buffers across layers.
+        """No-op (was: share SiluAndMul output buffers across layers).
 
-        Layers execute sequentially so buffers are safe to reuse.
-        Must be called before warmup so only one buffer grows to max size
-        instead of one per layer (saves ~14 GiB for 32-layer models).
+        The previous implementation made all ``SiluAndMul`` instances point
+        to a single ``_ActivationBuffer`` so the output tensor would be
+        reused across layers (saving allocations).  However the underlying
+        CUDA kernel writes to ``out`` assuming a contiguous
+        ``[num_tokens, d]`` layout (row stride == ``d``), and the shared
+        buffer returned a non-contiguous slice ``buf[:rows, :cols]`` whose
+        row stride was the buffer's *full* width.  When two SiluAndMul
+        instances had different ``d`` (e.g. dense MLP at d=9216 and the
+        DeepSeek-V3 shared expert at d=2048), the shared-expert output
+        was silently corrupted — every row past row 0 wrote to the wrong
+        storage offset.  ``SiluAndMul.forward_cuda`` now allocates a
+        fresh contiguous output per call (matches vLLM exactly).
         """
-        from ..tasks.baseline.L1.silu_and_mul import SiluAndMul
-        silu_modules = [
-            m for m in self.model.modules() if isinstance(m, SiluAndMul)
+        from ..tasks.baseline.L2.mamba2_mixer import Mamba2Mixer
+
+        mamba2_modules = [
+            m for m in self.model.modules() if isinstance(m, Mamba2Mixer)
         ]
-        if len(silu_modules) > 1:
-            shared = silu_modules[0]._act_buf
-            for m in silu_modules[1:]:
-                m.set_shared_buffer(shared)
+        if len(mamba2_modules) > 1:
+            shared_ssm_out = torch.empty(
+                self.max_num_batched_tokens,
+                mamba2_modules[0].tped_intermediate_size,
+                dtype=self.dtype,
+                device=f"cuda:{self.rank}",
+            )
+            for module in mamba2_modules:
+                module.set_shared_ssm_out_buffer(shared_ssm_out)
 
     def warmup_model(self):
         torch.cuda.empty_cache()
@@ -454,11 +583,18 @@ class ModelRunner:
     def _warmup_deepgemm(self):
         """Pre-JIT DeepGEMM FP8 kernels for all weight shapes at decode and
         prefill batch sizes, pre-allocate decode buffers per instance and
-        shared prefill buffers per unique (K, N) shape."""
+        shared prefill buffers per unique (K, N) shape.
+
+        Respects VLLM_DEEP_GEMM_WARMUP env var: "skip" disables JIT warmup
+        (buffers are still allocated), "relax"/"full" run warmup normally.
+        """
+        import os
         try:
             from ..tasks.baseline.L1.fp8_linear import Fp8Linear, _Fp8PrefillBufs
         except ImportError:
             return
+
+        skip_jit = os.environ.get("VLLM_DEEP_GEMM_WARMUP", "").lower() == "skip"
 
         fp8_modules = []
         for module in self.model.modules():
@@ -494,7 +630,8 @@ class ModelRunner:
                 prefill_bufs[key] = _Fp8PrefillBufs(max_prefill, K, N, device)
             linear_op._pf = prefill_bufs[key]
 
-            if key in seen_shapes:
+            if skip_jit or key in seen_shapes:
+                seen_shapes.add(key)
                 continue
             seen_shapes.add(key)
 
@@ -521,7 +658,11 @@ class ModelRunner:
         torch.cuda.synchronize()
         torch.cuda.empty_cache()
         if self.rank == 0:
-            print(f"  DeepGEMM warmup: {len(seen_shapes)} unique FP8 weight shapes")
+            if skip_jit:
+                print(f"  DeepGEMM warmup: skipped JIT (VLLM_DEEP_GEMM_WARMUP=skip), "
+                      f"{len(seen_shapes)} shapes buffered")
+            else:
+                print(f"  DeepGEMM warmup: {len(seen_shapes)} unique FP8 weight shapes")
 
     def _warmup_whisper(self):
         """Warmup Whisper encoder + decoder with dummy audio input.
@@ -676,6 +817,10 @@ class ModelRunner:
                     else:
                         self._attn_layers.append(module)
 
+        if self.is_deepseek_mla:
+            self._allocate_mla_kv_cache()
+            return
+
         free, total = torch.cuda.mem_get_info()
         used = total - free
         peak = torch.cuda.memory_stats()["allocated_bytes.all.peak"]
@@ -762,6 +907,1175 @@ class ModelRunner:
             gc.collect()
             torch.cuda.empty_cache()
 
+    # ------------------------------------------------------------------
+    # Mamba / SSM model support (slot-based recurrent state)
+    # ------------------------------------------------------------------
+    # Memory reserved for the CUDA-graph private pool (decode buckets).
+    # Mirrors vLLM's ``profile_cudagraph_memory`` headroom, but without
+    # the temp-graph capture pass: empirically ~1.0-1.5 GiB covers up to
+    # 14 buckets at bs=256 for both Mamba v1 (2.8B) and Mamba2 (Codestral
+    # 7B) on H200.  Tunable via env if a model needs more.
+    _MAMBA_GRAPH_RESERVE_BYTES = int(
+        os.environ.get("KB_NANO_MAMBA_GRAPH_RESERVE_BYTES", 1500 * 1024 * 1024)
+    )
+
+    def _compute_mamba_state_shapes(self):
+        """Compute per-slot conv/ssm state shapes for the configured model.
+
+        Factored out so both ``_profile_mamba_run`` (temp pool) and
+        ``allocate_mamba_state_cache`` (final pool) use identical
+        sizing -- mirrors how vLLM's MambaSpec is computed once and
+        reused (``vllm/v1/attention/backends/mamba2_attn.py:get_kv_cache_shape``).
+
+        Returns ``(conv_dim, ssm_state_shape, conv_kernel, per_slot_bytes)``.
+        """
+        cfg = self.config
+        elem_size = torch.finfo(self.dtype).bits // 8
+
+        if self.is_mamba2:
+            n_groups = getattr(cfg, "n_groups", 1)
+            tp = self.world_size
+            if n_groups % tp != 0 and n_groups == 1:
+                effective_groups = tp
+            elif n_groups % tp != 0:
+                raise ValueError(
+                    f"Mamba2 n_groups={n_groups} not divisible by tp={tp}"
+                )
+            else:
+                effective_groups = n_groups
+            intermediate_size = getattr(
+                cfg, "intermediate_size", cfg.num_heads * cfg.head_dim,
+            )
+            assert cfg.num_heads % tp == 0, (
+                f"num_heads={cfg.num_heads} not divisible by tp={tp}"
+            )
+            num_heads_per_rank = cfg.num_heads // tp
+            intermediate_per_rank = intermediate_size // tp
+            groups_per_rank = max(1, effective_groups // tp)
+            conv_dim = (
+                intermediate_per_rank + 2 * groups_per_rank * cfg.state_size
+            )
+            ssm_state_shape = (
+                num_heads_per_rank,
+                cfg.head_dim,
+                cfg.state_size,
+            )
+            per_layer_bytes = (
+                conv_dim * cfg.conv_kernel
+                + num_heads_per_rank * cfg.head_dim * cfg.state_size
+            ) * elem_size
+            conv_kernel = cfg.conv_kernel
+        else:
+            intermediate_size = cfg.intermediate_size
+            conv_dim = intermediate_size
+            state_size = getattr(cfg, "state_size", cfg.hidden_size)
+            ssm_state_shape = (intermediate_size, state_size)
+            conv_kernel = getattr(cfg, "conv_kernel", 4)
+            per_layer_bytes = (
+                conv_dim * conv_kernel + intermediate_size * state_size
+            ) * elem_size
+
+        return conv_dim, ssm_state_shape, conv_kernel, per_layer_bytes
+
+    def _build_profile_mamba_metadata(self, n_seqs: int, tokens_per_seq: int):
+        """Construct a synthetic prefill-only ``Mamba(2)Metadata`` for profiling.
+
+        Mirrors ``_mamba_prepare_tensors`` for ``n_seqs`` prefill seqs
+        of equal length, with state slot indices ``[0..n_seqs-1]``.
+        """
+        device = torch.device(f"cuda:{self.rank}")
+        chunk_size = getattr(self.config, "chunk_size", 256)
+
+        if self.is_mamba2:
+            meta = Mamba2Metadata(chunk_size=chunk_size)
+        else:
+            meta = MambaMetadata()
+
+        meta.num_prefill_tokens = n_seqs * tokens_per_seq
+        meta.num_decode_tokens = 0
+        meta.num_prefills = n_seqs
+        meta.num_decodes = 0
+
+        qsl = [i * tokens_per_seq for i in range(n_seqs + 1)]
+        meta.query_start_loc_p = torch.tensor(
+            qsl, dtype=torch.int32, device=device,
+        )
+        meta.state_indices_p = torch.arange(
+            n_seqs, dtype=torch.int32, device=device,
+        )
+        meta.has_initial_states_p = torch.zeros(
+            n_seqs, dtype=torch.bool, device=device,
+        )
+        meta.prep_initial_states = False
+        if not self.is_mamba2:
+            nums_dict, batch_ptr, token_chunk_offset_ptr = (
+                compute_causal_conv1d_metadata(meta.query_start_loc_p)
+            )
+            meta.nums_dict = nums_dict
+            meta.batch_ptr = batch_ptr
+            meta.token_chunk_offset_ptr = token_chunk_offset_ptr
+
+        if self.is_mamba2:
+            num_computed = torch.zeros(n_seqs, dtype=torch.int32, device=device)
+            cu_chunk, seq_idx, last_idx = build_chunk_metadata(
+                meta.query_start_loc_p,
+                chunk_size=chunk_size,
+                num_computed_tokens_p=num_computed,
+            )
+            meta.cu_chunk_seqlen_p = cu_chunk
+            meta.seq_idx_p = seq_idx
+            meta.last_chunk_indices_p = last_idx
+
+        return meta
+
+    @torch.inference_mode()
+    def _profile_mamba_run(self):
+        """Measure peak activation memory of a worst-case Mamba prefill.
+
+        Mirrors vLLM's ``GPUWorker.determine_available_memory`` ->
+        ``GPUModelRunner.profile_run`` -> ``_dummy_run(max_num_tokens,
+        is_profile=True)`` chain (``vllm/v1/worker/gpu_worker.py:401-441``,
+        ``vllm/v1/worker/gpu_model_runner.py:5456-5528``).
+
+        Allocates a *temporary* small Mamba state cache (just enough
+        slots to host the synthetic batch) so the SSM kernels
+        (``chunk_scan_combined_varlen``, ``selective_state_update``,
+        ``causal_conv1d_fn``) are exercised on the real path -- skipping
+        the mixer's profile/warmup branch which would otherwise
+        underestimate the peak by ~10x for Mamba2 (the chunk-scan kernel,
+        residual stack, and float32 ``silu(gate)`` cast in
+        ``Mixer2RMSNormGated`` together dominate the activation
+        working set at 16384 tokens).
+
+        ``@torch.inference_mode`` is critical: without it the forward
+        records an autograd graph, pinning every layer's intermediate
+        activation and inflating the peak by 50-100x.
+
+        Records ``self._profile_peak_bytes``.
+        """
+        torch.cuda.empty_cache()
+        torch.cuda.synchronize()
+        torch.cuda.reset_peak_memory_stats()
+        baseline_alloc = torch.cuda.memory_stats()["allocated_bytes.all.current"]
+
+        n_tokens = int(self.max_num_batched_tokens)
+        device = torch.device(f"cuda:{self.rank}")
+
+        # Spread max_num_batched_tokens across multiple synthetic seqs so
+        # the chunk-scan kernel sees a realistic ``query_start_loc``
+        # layout.  vLLM's profile_run uses one synthetic seq per
+        # max_num_seqs slot; we use a small constant since Mamba's
+        # activation peak is dominated by total token count, not seq
+        # count (chunk_scan operates over the flat token axis).
+        n_seqs = max(1, min(8, n_tokens // 256))
+        tokens_per_seq = n_tokens // n_seqs
+        n_tokens = n_seqs * tokens_per_seq  # round to exact multiple
+
+        # Allocate a temporary state pool (just n_seqs slots) so the
+        # SSM kernels run on a real cache.  Mirrors vLLM's
+        # ``_init_minimal_kv_cache_for_profiling``
+        # (``vllm/v1/worker/gpu_model_runner.py:5531-5550``).
+        conv_dim, ssm_state_shape, conv_kernel, _ = self._compute_mamba_state_shapes()
+        temp_state = MambaStateManager(
+            num_hidden_layers=self.config.num_hidden_layers,
+            conv_dim=conv_dim,
+            ssm_state_shape=ssm_state_shape,
+            conv_kernel=conv_kernel,
+            num_slots=n_seqs,
+            dtype=self.dtype,
+            device=device,
+        )
+
+        input_ids = torch.zeros(n_tokens, dtype=torch.int64, device=device)
+        positions = torch.zeros(n_tokens, dtype=torch.int64, device=device)
+        for i in range(n_seqs):
+            positions[i * tokens_per_seq:(i + 1) * tokens_per_seq] = (
+                torch.arange(tokens_per_seq, dtype=torch.int64, device=device)
+            )
+
+        meta = self._build_profile_mamba_metadata(n_seqs, tokens_per_seq)
+
+        set_mamba_context(
+            is_prefill=True,
+            mamba_state=temp_state,
+            mamba_metadata=meta,
+        )
+        try:
+            hidden = self.model(input_ids, positions)
+            # Run lm_head on the largest plausible logits batch so its
+            # activation peak is also captured.  In real serving we
+            # pick last-token-per-seq; here we just pass max_num_seqs
+            # rows which is the upper bound.
+            n_logits = min(self.max_num_seqs, n_tokens)
+            logits_in = hidden[:n_logits]
+            _ = self.model.compute_logits(logits_in)
+            del logits_in
+        finally:
+            reset_context()
+        torch.cuda.synchronize()
+
+        peak = torch.cuda.memory_stats()["allocated_bytes.all.peak"]
+        self._profile_peak_bytes = max(0, int(peak - baseline_alloc))
+
+        del input_ids, positions, hidden, meta, temp_state
+        torch.cuda.empty_cache()
+        torch.cuda.synchronize()
+
+        if self.rank == 0:
+            print(
+                f"  Mamba profile pass: activation peak "
+                f"{self._profile_peak_bytes / (1<<20):.1f} MiB "
+                f"(at {n_tokens} tokens, {n_seqs} synthetic prefill seqs)"
+            )
+
+    def allocate_mamba_state_cache(self):
+        """Size and allocate the global Mamba conv/ssm state pool.
+
+        Tier 1A: profile-based sizing modeled on vLLM's
+        ``determine_available_memory`` (``vllm/v1/worker/gpu_worker.py:
+        349-441``):
+
+        ``num_slots = (total*gpu_memory_utilization
+                       - currently_allocated_bytes
+                       - profile_activation_peak
+                       - graph_reserve) / per_slot_bytes``
+
+        ``currently_allocated_bytes`` covers model parameters; the
+        profile peak (measured by ``_profile_mamba_run``) covers
+        worst-case prefill activations; ``graph_reserve`` covers the
+        CUDA-graph private pool.  Replaces the previous static
+        ``state_cache_fraction`` heuristic.
+        """
+        # ``free`` is what the OS sees as available; ``current_alloc`` is
+        # what PyTorch's caching allocator reports as actively held
+        # (including activations from previous transient ops that were
+        # freed but cached).  We want to size against actually-needed
+        # memory, not allocator cache; mirrors vLLM's approach which uses
+        # ``allocated_bytes.all.peak`` rather than ``mem_get_info``
+        # (``vllm/utils/mem_utils.py:252-281``,
+        # ``vllm/v1/worker/gpu_worker.py:401-441``).
+        free, total = torch.cuda.mem_get_info()
+        current_alloc = torch.cuda.memory_stats()["allocated_bytes.all.current"]
+        num_layers = self.config.num_hidden_layers
+
+        conv_dim, ssm_state_shape, conv_kernel, per_layer_bytes = (
+            self._compute_mamba_state_shapes()
+        )
+        per_slot_bytes = num_layers * per_layer_bytes
+
+        # Profile-based sizing (mirrors vLLM ``gpu_worker.py:437-441``):
+        #   requested_bytes = total * gpu_memory_utilization
+        #   non_kv_bytes    = current_alloc           # model params + persistent buffers
+        #                   + non_torch_overhead       # NCCL workspace, custom AR, ...
+        #                   + profile_peak_increase    # worst-case prefill activations
+        #                   + graph_reserve            # CUDA-graph private pool
+        #   budget          = requested_bytes - non_kv_bytes
+        #
+        # ``current_alloc`` (PyTorch allocator) is what the model + buffers
+        # actually need; ``non_torch_overhead`` is the gap between
+        # ``mem_get_info(used)`` and ``current_alloc``, which captures
+        # things outside PyTorch's allocator (NCCL/Gloo workspaces,
+        # fastsafetensors temp buffers, custom_ar staging, etc.).
+        # ``profile_peak`` comes from ``_profile_mamba_run`` and is
+        # already a *delta over baseline_alloc*, so it can be added on
+        # top of ``current_alloc`` directly.
+        profile_peak = getattr(self, "_profile_peak_bytes", 0)
+        graph_reserve = self._MAMBA_GRAPH_RESERVE_BYTES
+        requested_bytes = int(total * self.gpu_memory_utilization)
+        non_torch_overhead = max(0, (total - free) - current_alloc)
+        non_kv_bytes = (
+            current_alloc + non_torch_overhead + profile_peak + graph_reserve
+        )
+        budget = max(0, requested_bytes - non_kv_bytes)
+        num_slots = max(1, min(self.max_num_seqs, budget // max(1, per_slot_bytes)))
+
+        if self.rank == 0:
+            print(
+                f"  Mamba memory budget: total={total / (1<<30):.1f} GiB, "
+                f"requested={requested_bytes / (1<<30):.1f} GiB | "
+                f"params={current_alloc / (1<<30):.2f} GiB, "
+                f"non_torch={non_torch_overhead / (1<<30):.2f} GiB, "
+                f"profile_peak={profile_peak / (1<<30):.2f} GiB, "
+                f"graph_reserve={graph_reserve / (1<<30):.2f} GiB | "
+                f"slot_budget={budget / (1<<30):.2f} GiB"
+            )
+
+        self.mamba_state_manager = MambaStateManager(
+            num_hidden_layers=num_layers,
+            conv_dim=conv_dim,
+            ssm_state_shape=ssm_state_shape,
+            conv_kernel=conv_kernel,
+            num_slots=num_slots,
+            dtype=self.dtype,
+            device=torch.device(f"cuda:{self.rank}"),
+        )
+        self.num_state_slots = num_slots
+        # Cap engine-level scheduling on slot count -- one slot per live seq.
+        self.max_num_seqs = min(self.max_num_seqs, num_slots)
+        if self.rank == 0:
+            print(f"  Mamba state cache: {num_slots} sequence slots "
+                  f"({per_slot_bytes / (1<<20):.1f} MiB/slot)")
+
+    def can_allocate_mamba_state(self):
+        return self.mamba_state_manager is not None and \
+            self.mamba_state_manager.has_free_slot()
+
+    def allocate_mamba_state(self, seq):
+        return self.mamba_state_manager.allocate(seq)
+
+    def deallocate_mamba_state(self, seq):
+        if self.mamba_state_manager is not None:
+            self.mamba_state_manager.deallocate(seq)
+
+    def empty_cuda_cache(self):
+        """Drop the PyTorch caching allocator's cached blocks.
+
+        Called via ``mr.call`` between ``generate()`` invocations to
+        mirror vLLM's per-step ``empty_cache`` and avoid cumulative
+        fragmentation across benchmark scenarios.  Returns the freed
+        bytes for diagnostics.
+        """
+        before = torch.cuda.memory_stats()["reserved_bytes.all.current"]
+        torch.cuda.empty_cache()
+        after = torch.cuda.memory_stats()["reserved_bytes.all.current"]
+        return before - after
+
+    def allocate_mamba_state_batch(self, n: int) -> list[int]:
+        """Pop ``n`` free slots in deque order on every rank.
+
+        Called from ``mr.call(...)`` so all TP ranks pop the same
+        ``n`` slots in lock-step (the deque is identical across
+        ranks).  Batched into a single SHM message to avoid the
+        race conditions seen with per-seq ``mr.call`` invocations
+        (``_pickle.UnpicklingError`` when the worker spin-loop
+        outruns the writer).
+        """
+        sm = self.mamba_state_manager
+        slots: list[int] = []
+        for _ in range(n):
+            if not sm._free_slots:
+                raise RuntimeError("No free Mamba state slots")
+            slot = sm._free_slots.popleft()
+            sm._in_use.add(slot)
+            sm.reset_slot(slot)
+            slots.append(slot)
+        return slots
+
+    def deallocate_mamba_state_batch(self, slot_ids: list[int]) -> None:
+        """Return specific slots to the free pool on every rank.
+
+        Batched counterpart of ``allocate_mamba_state_batch`` -- all
+        ranks remove the same slot ids from ``_in_use`` and re-append
+        them to ``_free_slots`` in lock-step.
+        """
+        sm = self.mamba_state_manager
+        if sm is None:
+            return
+        for slot in slot_ids:
+            if slot in sm._in_use:
+                sm._in_use.remove(slot)
+                sm.reset_slot(slot)
+                sm._free_slots.append(slot)
+
+    def _mamba_prepare_tensors(self, prefill_seqs, decode_seqs, chunk_size):
+        """Build flat input_ids / positions and the Mamba(2)Metadata for a
+        mixed batch of prefill + decode sequences.
+
+        Mixed layout is model-specific:
+        - Mamba v1 keeps decode tokens first, then prefill tokens.
+        - Mamba2 keeps the original prefill-first, decode-last order.
+        Homogeneous prefill/decode batches keep their natural order.
+        """
+        device = torch.device(f"cuda:{self.rank}")
+        input_ids: list[int] = []
+        positions: list[int] = []
+        prefill_state_indices: list[int] = []
+        prefill_has_initial: list[bool] = []
+        query_start_loc: list[int] = [0]
+        decode_state_indices: list[int] = []
+        has_mixed = bool(prefill_seqs) and bool(decode_seqs)
+        mixed_decode_first = has_mixed and not self.is_mamba2
+
+        if mixed_decode_first:
+            for seq in decode_seqs:
+                input_ids.append(seq.last_token)
+                positions.append(len(seq) - 1)
+                decode_state_indices.append(seq.state_slot)
+            for seq in prefill_seqs:
+                start = seq.num_computed_tokens
+                chunk = len(seq.token_ids) - start
+                input_ids.extend(seq.token_ids[start:start + chunk])
+                positions.extend(range(start, start + chunk))
+                query_start_loc.append(query_start_loc[-1] + chunk)
+                prefill_state_indices.append(seq.state_slot)
+                prefill_has_initial.append(start > 0)
+        else:
+            for seq in prefill_seqs:
+                start = seq.num_computed_tokens
+                chunk = len(seq.token_ids) - start
+                input_ids.extend(seq.token_ids[start:start + chunk])
+                positions.extend(range(start, start + chunk))
+                query_start_loc.append(query_start_loc[-1] + chunk)
+                prefill_state_indices.append(seq.state_slot)
+                prefill_has_initial.append(start > 0)
+            for seq in decode_seqs:
+                input_ids.append(seq.last_token)
+                positions.append(len(seq) - 1)
+                decode_state_indices.append(seq.state_slot)
+
+        num_prefill_tokens = query_start_loc[-1]
+        num_decode_tokens = len(decode_seqs)
+        num_actual = num_prefill_tokens + num_decode_tokens
+
+        input_ids_t = torch.tensor(input_ids, dtype=torch.int64,
+                                   pin_memory=True).cuda(non_blocking=True)
+        positions_t = torch.tensor(positions, dtype=torch.int64,
+                                   pin_memory=True).cuda(non_blocking=True)
+
+        # Build per-batch Mamba metadata
+        if self.is_mamba2:
+            meta = Mamba2Metadata(chunk_size=chunk_size)
+        else:
+            meta = MambaMetadata()
+        meta.num_prefill_tokens = num_prefill_tokens
+        meta.num_decode_tokens = num_decode_tokens
+        meta.num_prefills = len(prefill_seqs)
+        meta.num_decodes = len(decode_seqs)
+
+        if prefill_seqs:
+            meta.query_start_loc_p = torch.tensor(
+                query_start_loc, dtype=torch.int32, device=device,
+            )
+            meta.state_indices_p = torch.tensor(
+                prefill_state_indices, dtype=torch.int32, device=device,
+            )
+            meta.has_initial_states_p = torch.tensor(
+                prefill_has_initial, dtype=torch.bool, device=device,
+            )
+            meta.prep_initial_states = any(prefill_has_initial)
+            if not self.is_mamba2:
+                nums_dict, batch_ptr, token_chunk_offset_ptr = (
+                    compute_causal_conv1d_metadata(meta.query_start_loc_p)
+                )
+                meta.nums_dict = nums_dict
+                meta.batch_ptr = batch_ptr
+                meta.token_chunk_offset_ptr = token_chunk_offset_ptr
+
+            if self.is_mamba2:
+                num_computed = torch.tensor(
+                    [s.num_computed_tokens for s in prefill_seqs],
+                    dtype=torch.int32, device=device,
+                )
+                cu_chunk, seq_idx, last_idx = build_chunk_metadata(
+                    meta.query_start_loc_p,
+                    chunk_size=chunk_size,
+                    num_computed_tokens_p=num_computed,
+                )
+                meta.cu_chunk_seqlen_p = cu_chunk
+                meta.seq_idx_p = seq_idx
+                meta.last_chunk_indices_p = last_idx
+
+        if decode_seqs:
+            meta.state_indices_d = torch.tensor(
+                decode_state_indices, dtype=torch.int32, device=device,
+            )
+
+        return input_ids_t, positions_t, meta, num_actual
+
+    def prepare_mamba_prefill(self, seqs):
+        chunk_size = getattr(self.config, "chunk_size", 256)
+        return self._mamba_prepare_tensors(seqs, [], chunk_size)
+
+    def prepare_mamba_decode(self, seqs):
+        chunk_size = getattr(self.config, "chunk_size", 256)
+        return self._mamba_prepare_tensors([], seqs, chunk_size)
+
+    def prepare_mamba_mixed(self, prefill_seqs, decode_seqs):
+        chunk_size = getattr(self.config, "chunk_size", 256)
+        return self._mamba_prepare_tensors(prefill_seqs, decode_seqs, chunk_size)
+
+    @torch.inference_mode()
+    def run_mamba(self, seqs, is_prefill: bool):
+        """Run a Mamba/Mamba2 forward pass for a homogeneous batch.
+
+        Mirrors the attention-side ``run`` entry point: builds metadata,
+        installs it on the global Context, runs the model + LM head,
+        returns logits (one per seq) on rank 0 or ``None`` on workers.
+        """
+        if is_prefill:
+            input_ids, positions, meta, num_actual = self.prepare_mamba_prefill(seqs)
+        else:
+            input_ids, positions, meta, num_actual = self.prepare_mamba_decode(seqs)
+
+        set_mamba_context(
+            is_prefill=is_prefill,
+            mamba_state=self.mamba_state_manager,
+            mamba_metadata=meta,
+        )
+        try:
+            hidden = self.model(input_ids, positions)
+            # Pick last-token hidden per seq for logits
+            if is_prefill:
+                last_idx = (meta.query_start_loc_p[1:] - 1).to(torch.int64)
+                hidden_last = hidden.index_select(0, last_idx)
+            else:
+                hidden_last = hidden  # one token per decode seq
+            logits = self.model.compute_logits(hidden_last)
+        finally:
+            reset_context()
+        return logits
+
+    @torch.inference_mode()
+    def run_mamba_mixed(self, prefill_seqs, decode_seqs):
+        """Run a mixed prefill+decode batch through the Mamba model."""
+        input_ids, positions, meta, num_actual = self.prepare_mamba_mixed(
+            prefill_seqs, decode_seqs,
+        )
+        set_mamba_context(
+            is_prefill=True,
+            mamba_state=self.mamba_state_manager,
+            mamba_metadata=meta,
+        )
+        try:
+            hidden = self.model(input_ids, positions)
+            # Logits at end of each prefill seq + all decode tokens.
+            indices: list[int] = []
+            if prefill_seqs:
+                qsl = meta.query_start_loc_p.to("cpu").tolist()
+                if self.is_mamba2:
+                    indices.extend(qsl[i + 1] - 1 for i in range(len(prefill_seqs)))
+                else:
+                    indices.extend(
+                        meta.num_decode_tokens + qsl[i + 1] - 1
+                        for i in range(len(prefill_seqs))
+                    )
+            if self.is_mamba2:
+                indices.extend(
+                    range(
+                        meta.num_prefill_tokens,
+                        meta.num_prefill_tokens + len(decode_seqs),
+                    )
+                )
+            else:
+                indices.extend(range(meta.num_decode_tokens))
+            idx_t = torch.tensor(indices, dtype=torch.int64,
+                                 device=hidden.device)
+            hidden_last = hidden.index_select(0, idx_t)
+            logits = self.model.compute_logits(hidden_last)
+        finally:
+            reset_context()
+        return logits
+
+    # ------------------------------------------------------------------
+    # Mamba decode fast path: pre-allocated buffers, GPU greedy argmax,
+    # async D2H copy, and CUDA graph capture for decode-only steps.
+    # Mirrors the attention engine's _init_greedy_buffers / capture_cudagraph
+    # pattern (see ``vllm/v1/worker/gpu_model_runner.py`` and
+    # ``vllm/v1/attention/backends/mamba_attn.py`` for the upstream
+    # equivalent: vLLM only captures decode-only Mamba graphs and pads
+    # state_indices_d with PAD_SLOT_ID = -1; the kernels skip those rows).
+    # ------------------------------------------------------------------
+    _MAMBA_PAD_SLOT_ID = -1
+
+    def _init_mamba_decode_buffers(self):
+        """Pre-allocate persistent buffers for the Mamba decode fast path.
+
+        Creates GPU input buffers (input_ids, positions, state_indices_d),
+        numpy staging buffers, greedy local-argmax outputs, async D2H
+        plumbing, and TP cross-rank gather buffers.  These buffers are
+        reused across all Mamba decode steps and are also the buffers
+        that ``capture_mamba_cudagraph`` records.
+        """
+        max_bs = self.max_num_seqs
+        dev = f"cuda:{self.rank}"
+
+        self._md_input_ids = torch.zeros(max_bs, dtype=torch.int64, device=dev)
+        self._md_positions = torch.zeros(max_bs, dtype=torch.int64, device=dev)
+        self._md_state_indices = torch.full(
+            (max_bs,), self._MAMBA_PAD_SLOT_ID,
+            dtype=torch.int32, device=dev,
+        )
+        if hasattr(torch, "_dynamo") and hasattr(
+            torch._dynamo, "mark_static_address"
+        ):
+            torch._dynamo.mark_static_address(self._md_input_ids)
+            torch._dynamo.mark_static_address(self._md_positions)
+            torch._dynamo.mark_static_address(self._md_state_indices)
+
+        # Numpy views over pinned-CPU torch tensors so ``copy_(...,
+        # non_blocking=True)`` into the GPU buffers is truly async.
+        self._md_input_ids_cpu = torch.empty(
+            max_bs, dtype=torch.int64, device="cpu", pin_memory=True,
+        )
+        self._md_positions_cpu = torch.empty(
+            max_bs, dtype=torch.int64, device="cpu", pin_memory=True,
+        )
+        self._md_state_indices_cpu = torch.full(
+            (max_bs,), self._MAMBA_PAD_SLOT_ID,
+            dtype=torch.int32, device="cpu", pin_memory=True,
+        )
+        self._md_input_ids_np = self._md_input_ids_cpu.numpy()
+        self._md_positions_np = self._md_positions_cpu.numpy()
+        self._md_state_indices_np = self._md_state_indices_cpu.numpy()
+
+        # Outputs of local greedy argmax (set every step / replay).
+        self._md_lm_max_vals = torch.zeros(
+            max_bs, dtype=torch.float32, device=dev,
+        )
+        self._md_lm_max_idxs = torch.zeros(
+            max_bs, dtype=torch.int64, device=dev,
+        )
+
+        # Async D2H staging.
+        self._md_pinned_token_ids = torch.empty(
+            max_bs, dtype=torch.int64, device="cpu", pin_memory=True,
+        )
+        self._md_copy_stream = torch.cuda.Stream(device=dev)
+        self._md_copy_event = torch.cuda.Event()
+
+        # TP cross-rank greedy gather buffers (mirror _init_greedy_buffers).
+        self._md_greedy_info = torch.zeros(
+            max_bs, 2, dtype=torch.float32, device=dev,
+        )
+        self._md_greedy_gathered = [
+            torch.zeros(max_bs, 2, dtype=torch.float32, device=dev)
+            for _ in range(self.world_size)
+        ]
+        self._md_greedy_all_info = torch.zeros(
+            self.world_size, max_bs, 2, dtype=torch.float32, device=dev,
+        )
+        self._md_greedy_arange = torch.arange(max_bs, device=dev)
+
+        # Filled in by capture_mamba_cudagraph (None -> eager only).
+        self._mamba_graphs: dict[int, torch.cuda.CUDAGraph] = {}
+        self._mamba_graph_metas: dict[int, object] = {}
+        self._mamba_graph_bs_list: list[int] = []
+        self._mamba_graph_bs_for_n: list[int] | None = None
+        self._mamba_graph_pool = None
+
+    def _prepare_mamba_decode_arrays(self, seqs):
+        """Fill numpy staging buffers for a Mamba decode batch.
+
+        Returns ``(n, ids_np, pos_np, si_np)`` where the arrays are
+        sliced views of the persistent staging buffers.  Avoids the
+        per-step ``torch.tensor(...)`` allocation that the slow
+        ``_mamba_prepare_tensors`` path incurs.
+        """
+        n = len(seqs)
+        ids = self._md_input_ids_np
+        pos = self._md_positions_np
+        si = self._md_state_indices_np
+        for i, s in enumerate(seqs):
+            tids = s.token_ids
+            if tids is not None:
+                ids[i] = tids[-1]
+                pos[i] = len(tids) - 1
+            else:
+                ids[i] = s._last_token
+                pos[i] = s._num_tokens - 1
+            si[i] = s.state_slot
+        return n, ids[:n], pos[:n], si[:n]
+
+    def _mamba_make_decode_meta(self, n: int, state_indices: torch.Tensor):
+        """Construct a per-step ``(Mamba|Mamba2)Metadata`` for decode.
+
+        The metadata's tensors are *views into our persistent buffers*
+        so a captured CUDA graph reads the same memory at replay time.
+        """
+        if self.is_mamba2:
+            meta = Mamba2Metadata(
+                chunk_size=getattr(self.config, "chunk_size", 256),
+            )
+        else:
+            meta = MambaMetadata()
+        meta.num_prefill_tokens = 0
+        meta.num_decode_tokens = n
+        meta.num_prefills = 0
+        meta.num_decodes = n
+        meta.state_indices_d = state_indices
+        return meta
+
+    @torch.inference_mode()
+    def capture_mamba_cudagraph(self):
+        """Capture decode-only CUDA graphs for Mamba/Mamba2 at bucket sizes.
+
+        Mirrors vLLM's approach (see
+        ``vllm/v1/worker/gpu_model_runner.py`` and
+        ``BaseMambaAttentionMetadataBuilder.build_for_cudagraph_capture``):
+        only decode-only steps are captured, and unused rows in the
+        padded batch get ``state_indices_d = PAD_SLOT_ID (-1)`` so the
+        ``causal_conv1d_update`` / ``selective_state_update`` /
+        ``selective_scan_fn`` Triton kernels skip those slots.
+
+        Each bucket records the model forward + the LM head's local
+        ``linear_op`` + ``max(dim=-1)`` (just like the attention path).
+        For TP > 1, the cross-rank ``(max_val, max_idx)`` gather happens
+        outside the graph in ``_run_mamba_decode_graph``.
+        """
+        from contextlib import nullcontext
+
+        # Cap the largest captured graph: capturing huge buckets (e.g.
+        # bs=1024) eats large amounts of CUDA-graph private-pool memory
+        # for big Mamba2 models (Codestral allocates ~4 GB of conv/ssm
+        # activations per layer at bs=1024 -- 64 layers ⇒ several
+        # hundred GB nominal, even when shared across buckets the peak
+        # working set still OOMs alongside the slot pool).  vLLM defaults
+        # to capturing only up to ``cudagraph_capture_sizes`` (typically
+        # <= 512) for the same reason.
+        max_bs = min(self.max_num_seqs, 256)
+        self._mamba_graph_bs_list = sorted(set(
+            [1, 2, 4, 8, 16, 32, 48, 64, 96, 128, 160, 192, 224, 256]
+        ))
+        self._mamba_graph_bs_list = [
+            b for b in self._mamba_graph_bs_list if b <= max_bs
+        ]
+        if not self._mamba_graph_bs_list:
+            self._mamba_graph_bs_for_n = None
+            return
+
+        lm_head = self.model.lm_head
+        weight = lm_head.embedding_op.emb.weight
+
+        ar_ctx = (
+            self.custom_ar.capture()
+            if self.custom_ar is not None else nullcontext()
+        )
+        with ar_ctx:
+            for bs in reversed(self._mamba_graph_bs_list):
+                input_ids = self._md_input_ids[:bs]
+                positions = self._md_positions[:bs]
+                state_indices = self._md_state_indices[:bs]
+                # Initialise to PAD so warmup is safe and any bucket-only
+                # tail at runtime that we forget to fill stays a PAD.
+                state_indices.fill_(self._MAMBA_PAD_SLOT_ID)
+                input_ids.zero_()
+                positions.zero_()
+
+                meta = self._mamba_make_decode_meta(bs, state_indices)
+                self._mamba_graph_metas[bs] = meta
+
+                set_mamba_context(
+                    is_prefill=False,
+                    mamba_state=self.mamba_state_manager,
+                    mamba_metadata=meta,
+                )
+
+                # Warmup forward (eager) so the CUDA-graph capture region
+                # only records steady-state kernels.
+                if self._compiled and not self._mark_dynamic_done:
+                    torch._dynamo.mark_dynamic(input_ids, 0)
+                    torch._dynamo.mark_dynamic(positions, 0)
+                    self._mark_dynamic_done = True
+
+                hidden = self.model(input_ids, positions)
+                partial = lm_head.linear_op(hidden, weight).float()
+                mv, mi = partial.max(dim=-1)
+                self._md_lm_max_vals[:bs].copy_(mv)
+                self._md_lm_max_idxs[:bs].copy_(mi)
+                torch.cuda.synchronize()
+
+                graph = torch.cuda.CUDAGraph()
+                with torch.cuda.graph(graph, self._mamba_graph_pool):
+                    hidden = self.model(input_ids, positions)
+                    partial = lm_head.linear_op(hidden, weight).float()
+                    mv, mi = partial.max(dim=-1)
+                    self._md_lm_max_vals[:bs].copy_(mv)
+                    self._md_lm_max_idxs[:bs].copy_(mi)
+
+                if self._mamba_graph_pool is None:
+                    self._mamba_graph_pool = graph.pool()
+                self._mamba_graphs[bs] = graph
+                torch.cuda.synchronize()
+                reset_context()
+
+        # ``self.max_num_seqs`` may exceed the largest captured bucket --
+        # those steps fall back to eager.  We still build the lookup over
+        # the full range but clamp to the largest bucket above it.
+        max_bucket = self._mamba_graph_bs_list[-1]
+        self._mamba_graph_bs_for_n = [0] * (self.max_num_seqs + 1)
+        for n in range(self.max_num_seqs + 1):
+            self._mamba_graph_bs_for_n[n] = next(
+                (x for x in self._mamba_graph_bs_list if x >= n),
+                max_bucket,
+            )
+        if self.rank == 0:
+            print(
+                f"  Mamba CUDA graphs: {len(self._mamba_graphs)} buckets "
+                f"(min={self._mamba_graph_bs_list[0]}, "
+                f"max={self._mamba_graph_bs_list[-1]})"
+            )
+
+    @torch.inference_mode()
+    def _run_mamba_decode_eager(self, n, ids_np, pos_np, si_np):
+        """Eager-mode Mamba decode + greedy local argmax."""
+        self._md_input_ids[:n].copy_(
+            self._md_input_ids_cpu[:n], non_blocking=True,
+        )
+        self._md_positions[:n].copy_(
+            self._md_positions_cpu[:n], non_blocking=True,
+        )
+        self._md_state_indices[:n].copy_(
+            self._md_state_indices_cpu[:n], non_blocking=True,
+        )
+
+        meta = self._mamba_make_decode_meta(n, self._md_state_indices[:n])
+        set_mamba_context(
+            is_prefill=False,
+            mamba_state=self.mamba_state_manager,
+            mamba_metadata=meta,
+        )
+        try:
+            hidden = self.model(
+                self._md_input_ids[:n], self._md_positions[:n],
+            )
+            lm_head = self.model.lm_head
+            partial = lm_head.linear_op(
+                hidden, lm_head.embedding_op.emb.weight,
+            ).float()
+            max_vals, max_idxs = partial.max(dim=-1)
+        finally:
+            reset_context()
+
+        if self.world_size == 1:
+            return max_idxs
+
+        return self._mamba_greedy_gather(n, max_vals, max_idxs)
+
+    @torch.inference_mode()
+    def _run_mamba_decode_graph(self, n, ids_np, pos_np, si_np):
+        """Run a captured CUDA graph for Mamba decode at bucket >= n."""
+        bucket = self._mamba_graph_bs_for_n[n]
+        # Stage inputs into the persistent buffers the graph captured.
+        self._md_input_ids[:n].copy_(
+            self._md_input_ids_cpu[:n], non_blocking=True,
+        )
+        self._md_positions[:n].copy_(
+            self._md_positions_cpu[:n], non_blocking=True,
+        )
+        self._md_state_indices[:n].copy_(
+            self._md_state_indices_cpu[:n], non_blocking=True,
+        )
+        if bucket > n:
+            # Pad tail rows so kernels skip them (PAD_SLOT_ID = -1).
+            self._md_input_ids[n:bucket].zero_()
+            self._md_positions[n:bucket].zero_()
+            self._md_state_indices[n:bucket].fill_(self._MAMBA_PAD_SLOT_ID)
+
+        self._mamba_graphs[bucket].replay()
+
+        if self.world_size == 1:
+            return self._md_lm_max_idxs[:n]
+
+        return self._mamba_greedy_gather(
+            n, self._md_lm_max_vals[:n], self._md_lm_max_idxs[:n],
+        )
+
+    def _mamba_greedy_gather(
+        self, n: int, max_vals: torch.Tensor, max_idxs: torch.Tensor,
+    ):
+        """TP cross-rank greedy gather (mirrors attention's _greedy_from_hidden).
+
+        Every rank participates in the all-gather (it's a collective),
+        but only rank 0 returns the resulting token-id tensor; workers
+        return ``None`` so ``run_mamba_decode_fast_async`` skips the
+        async D2H copy on those ranks.
+        """
+        lm_head = self.model.lm_head
+        info = self._md_greedy_info[:n]
+        info[:, 0] = max_vals
+        info[:, 1] = max_idxs.float()
+        info[:, 1] += lm_head.per_partition * self.rank
+
+        gathered = [g[:n] for g in self._md_greedy_gathered]
+        dist.all_gather(gathered, info)
+        if self.rank != 0:
+            return None
+        all_info = self._md_greedy_all_info[:, :n]
+        torch.stack(gathered, out=all_info)
+        best_rank = all_info[:, :n, 0].argmax(dim=0)
+        return all_info[best_rank, self._md_greedy_arange[:n], 1].long()
+
+    @torch.inference_mode()
+    def run_mamba_decode_fast_async(self, decode_data):
+        """Greedy Mamba decode step + async D2H copy of token IDs.
+
+        Returns ``(has_result, n)`` -- caller must call
+        ``_wait_async_mamba_tokens(n)`` later to get the token ID list.
+        """
+        n, ids_np, pos_np, si_np = decode_data
+        use_graph = (
+            not self.enforce_eager
+            and self._mamba_graph_bs_for_n is not None
+            and n <= self._mamba_graph_bs_list[-1]
+        )
+        if use_graph:
+            token_ids = self._run_mamba_decode_graph(n, ids_np, pos_np, si_np)
+        else:
+            token_ids = self._run_mamba_decode_eager(n, ids_np, pos_np, si_np)
+
+        if token_ids is None:
+            # Non-rank-0 worker (TP > 1).
+            return False, n
+        main_stream = torch.cuda.current_stream()
+        cs = self._md_copy_stream
+        with torch.cuda.stream(cs):
+            cs.wait_stream(main_stream)
+            self._md_pinned_token_ids[:n].copy_(token_ids, non_blocking=True)
+            self._md_copy_event.record(cs)
+        return True, n
+
+    def _wait_async_mamba_tokens(self, n: int) -> list[int]:
+        """Wait for the async D2H copy and return the Python token list."""
+        self._md_copy_event.synchronize()
+        return self._md_pinned_token_ids[:n].tolist()
+
+    def _write_mamba_decode_shm(self, n, ids_np, pos_np, si_np):
+        """Pack a Mamba decode batch into SHM (TP > 1 dispatch).
+
+        Layout: ``[n(2)][_(2)][ids(n*8)][pos(n*8)][si(n*4)]``.  The
+        2-byte ``_`` slot mirrors the attention path's ``max_bt`` field.
+        """
+        buf = self.shm.buf
+        buf[0:2] = n.to_bytes(2, "little")
+        buf[2:4] = (0).to_bytes(2, "little")
+        off = 4
+        for arr in (ids_np, pos_np, si_np):
+            nb = arr.nbytes
+            buf[off:off + nb] = arr.tobytes()
+            off += nb
+
+    @torch.inference_mode()
+    def _loop_mamba_decode_greedy(self):
+        """Worker fast path for Mamba: read decode arrays from SHM into
+        the pinned-CPU staging buffers, then dispatch the same fast path
+        as rank 0 (the kernels read state_indices_d which we just wrote)."""
+        buf = self.shm.buf
+        n = int.from_bytes(buf[0:2], "little")
+        off = 4
+        ids = np.frombuffer(buf, dtype=np.int64, count=n, offset=off)
+        off += n * 8
+        pos = np.frombuffer(buf, dtype=np.int64, count=n, offset=off)
+        off += n * 8
+        si = np.frombuffer(buf, dtype=np.int32, count=n, offset=off)
+        # Land into the persistent pinned buffers (numpy views).
+        self._md_input_ids_np[:n] = ids
+        self._md_positions_np[:n] = pos
+        self._md_state_indices_np[:n] = si
+        self.run_mamba_decode_fast_async(
+            (n,
+             self._md_input_ids_np[:n],
+             self._md_positions_np[:n],
+             self._md_state_indices_np[:n]),
+        )
+
+    @torch.inference_mode()
+    def call_mamba_decode_async(self, decode_data):
+        """Launch a greedy Mamba decode from precomputed arrays + async D2H.
+
+        Returns ``(has_result, n)``; rank 0 callers must follow up with
+        ``_wait_async_mamba_tokens(n)``.
+        """
+        if self.world_size > 1 and self.rank == 0:
+            self._write_mamba_decode_shm(*decode_data)
+            self.shm.buf[self._SHM_FLAG_OFFSET] = 2  # mamba_decode_greedy
+            self._signal_workers()
+        return self.run_mamba_decode_fast_async(decode_data)
+    def _allocate_mla_kv_cache(self):
+        """Allocate MLA KV cache + indexer K cache.
+
+        The KV cache layout follows ``MLAAttention.kv_cache_dtype`` (set
+        via ``KB_NANO_KV_CACHE_DTYPE``, default ``"auto"`` = BF16):
+
+        * ``"auto"`` (default): BF16 cache, shape
+          ``[num_blocks, block_size, kv_lora_rank + qk_rope_head_dim]``
+          (1152 bytes/token for DeepSeek-V3.2). Matches stock vLLM's
+          ``kv_cache_dtype=auto`` on DeepSeek-V3.2 so ``topk_indices``
+          and MoE expert ids are bit-comparable.
+        * ``"fp8_ds_mla"``: uint8 cache, shape
+          ``[num_blocks, block_size, 656]`` (656 bytes/token).
+        """
+        from ..tasks.baseline.L2.mla_attention_impl import MLAAttention
+        from ..tasks.baseline.L2.sparse_attn_indexer import SparseAttnIndexer
+
+        _MLA_BLOCK_SIZE = 64  # FlashMLA uses block_size=64
+        _INDEXER_CACHE_BYTES = 132
+        _FP8_CACHE_BYTES = 656
+
+        mla_layers = []
+        indexer_layers = []
+        for module in self.model.modules():
+            if isinstance(module, MLAAttention):
+                mla_layers.append(module)
+            elif isinstance(module, SparseAttnIndexer):
+                indexer_layers.append(module)
+
+        num_layers = len(mla_layers)
+        num_indexer_layers = len(indexer_layers)
+
+        # All MLA layers must agree on the cache layout.
+        if num_layers > 0:
+            kv_cache_dtype = mla_layers[0].kv_cache_dtype
+            for ml in mla_layers[1:]:
+                assert ml.kv_cache_dtype == kv_cache_dtype, (
+                    "Inconsistent kv_cache_dtype across MLA layers"
+                )
+        else:
+            kv_cache_dtype = "auto"
+
+        use_fp8_kv = kv_cache_dtype == "fp8_ds_mla"
+        if use_fp8_kv:
+            cache_last_dim = _FP8_CACHE_BYTES
+            cache_torch_dtype = torch.uint8
+            bytes_per_slot = _FP8_CACHE_BYTES
+            backend_desc = "FP8 KV cache"
+        else:
+            # BF16: shape = (num_blocks, block_size, kv_lora_rank + rope_dim)
+            kv_lora_rank = mla_layers[0].kv_lora_rank if num_layers else 512
+            rope_dim = mla_layers[0].qk_rope_head_dim if num_layers else 64
+            cache_last_dim = kv_lora_rank + rope_dim
+            cache_torch_dtype = torch.bfloat16
+            bytes_per_slot = cache_last_dim * 2  # BF16 = 2 bytes/element
+            backend_desc = "BF16 KV cache"
+
+        free, total = torch.cuda.mem_get_info()
+        used = total - free
+        peak = torch.cuda.memory_stats()["allocated_bytes.all.peak"]
+        current = torch.cuda.memory_stats()["allocated_bytes.all.current"]
+
+        kv_bytes_per_block = num_layers * _MLA_BLOCK_SIZE * bytes_per_slot
+        idx_bytes_per_block = num_indexer_layers * _MLA_BLOCK_SIZE * _INDEXER_CACHE_BYTES
+        total_bytes_per_block = kv_bytes_per_block + idx_bytes_per_block
+
+        num_blocks = int(total * self.gpu_memory_utilization - used - peak + current) // total_bytes_per_block
+        assert num_blocks > 0, f"Not enough GPU memory for MLA KV cache on rank {self.rank}"
+        self.num_blocks = num_blocks
+        self.block_size = _MLA_BLOCK_SIZE
+
+        # Update module-level BLOCK_SIZE so Sequence.num_blocks,
+        # blocks_needed_for, BlockManager, prepare_prefill/decode, etc.
+        # all use the MLA block size consistently.
+        global BLOCK_SIZE
+        BLOCK_SIZE = _MLA_BLOCK_SIZE
+        # Recompute max_model_len with the new block size
+        self.max_model_len = (
+            (self.max_model_len + _MLA_BLOCK_SIZE - 1)
+            // _MLA_BLOCK_SIZE * _MLA_BLOCK_SIZE
+        )
+
+        if self.rank == 0:
+            print(f"  MLA KV cache: {num_blocks} blocks x {_MLA_BLOCK_SIZE} = "
+                  f"{num_blocks * _MLA_BLOCK_SIZE} token slots ({num_layers} layers, "
+                  f"{bytes_per_slot} bytes/token, dtype={kv_cache_dtype})")
+
+        device = f"cuda:{self.rank}"
+        for i, layer in enumerate(mla_layers):
+            cache = torch.zeros(
+                num_blocks, _MLA_BLOCK_SIZE, cache_last_dim,
+                dtype=cache_torch_dtype, device=device,
+            )
+            layer.k_cache = cache
+            layer.v_cache = cache
+
+        if num_indexer_layers > 0:
+            if self.rank == 0:
+                print(f"  Indexer K cache: {num_blocks} blocks x {_MLA_BLOCK_SIZE} = "
+                      f"{num_blocks * _MLA_BLOCK_SIZE} token slots ({num_indexer_layers} layers, "
+                      f"{_INDEXER_CACHE_BYTES} bytes/token)")
+            for i, layer in enumerate(indexer_layers):
+                layer.indexer_k_cache = torch.zeros(
+                    num_blocks, _MLA_BLOCK_SIZE, _INDEXER_CACHE_BYTES,
+                    dtype=torch.uint8, device=device,
+                )
+
+        if self.rank == 0:
+            print(f"  MLA attention backend: FlashMLA (block_size={_MLA_BLOCK_SIZE}, {backend_desc})")
+
+        # Pre-allocate chunked prefill workspace for MLA context gathering.
+        # Matches vllm's MLACommonMetadataBuilder workspace sizing.
+        workspace_tokens = min(
+            max(8 * self.max_model_len,
+                4 * self.max_num_seqs * _MLA_BLOCK_SIZE),
+            64 * 1024,
+        )
+        workspace_tokens = max(workspace_tokens,
+                               self.max_num_seqs * _MLA_BLOCK_SIZE)
+        # Workspace holds BF16 kv_c + k_pe (kv_lora_rank + qk_rope_head_dim
+        # elements per token), regardless of on-disk cache layout.
+        kv_lora_rank_ws = mla_layers[0].kv_lora_rank if num_layers else 512
+        rope_dim_ws = mla_layers[0].qk_rope_head_dim if num_layers else 64
+        self._mla_chunked_prefill_workspace = torch.empty(
+            workspace_tokens, kv_lora_rank_ws + rope_dim_ws,
+            dtype=torch.bfloat16, device=device,
+        )
+        self._mla_workspace_size = workspace_tokens
+
+    def _build_chunked_context(self, prefill_seqs, prefill_chunk_sizes,
+                               block_tables, device):
+        """Build ChunkedContextMetadata for MLA prefill with prior context.
+
+        When a prefill request has already-computed tokens (chunked prefill),
+        those tokens live in the KV cache and must be gathered and attended to
+        in workspace-sized chunks. This matches vllm's
+        MLACommonMetadataBuilder.build() chunked context logic.
+        """
+        from .context import ChunkedContextMetadata
+
+        num_prefills = len(prefill_seqs)
+        context_lens = []
+        for seq, chunk_size in zip(prefill_seqs, prefill_chunk_sizes):
+            context_lens.append(seq.num_computed_tokens)
+        context_lens_cpu = torch.tensor(context_lens, dtype=torch.int32)
+        max_context_len = int(context_lens_cpu.max().item())
+
+        if max_context_len == 0:
+            return None
+
+        num_prefills_with_context = int((context_lens_cpu > 0).sum().item())
+        if num_prefills_with_context == 0:
+            return None
+
+        max_context_chunk = self._mla_workspace_size // num_prefills_with_context
+        block_size = self.block_size
+        max_context_chunk = (max_context_chunk // block_size) * block_size
+        if max_context_chunk == 0:
+            max_context_chunk = block_size
+        num_chunks = (max_context_len + max_context_chunk - 1) // max_context_chunk
+
+        chunk_starts = (
+            torch.arange(num_chunks, dtype=torch.int32)
+            .unsqueeze(1).expand(-1, num_prefills)
+            * max_context_chunk
+        )
+        chunk_ends = torch.min(
+            context_lens_cpu.unsqueeze(0), chunk_starts + max_context_chunk
+        )
+        chunk_seq_lens = (chunk_ends - chunk_starts).clamp(min=0)
+
+        cu_seq_lens_cpu = torch.zeros(
+            num_chunks, num_prefills + 1, dtype=torch.int32)
+        torch.cumsum(chunk_seq_lens, dim=1, out=cu_seq_lens_cpu[:, 1:],
+                     dtype=torch.int32)
+        chunk_total_token = cu_seq_lens_cpu[:, -1]
+
+        max_token_num = int(chunk_total_token.max().item())
+        token_to_seq_cpu = torch.zeros(
+            num_chunks, max_token_num, dtype=torch.int32)
+        range_idx = torch.arange(num_prefills, dtype=torch.int32)
+        for i in range(num_chunks):
+            chunk_t2s = torch.repeat_interleave(range_idx, chunk_seq_lens[i])
+            clen = chunk_t2s.shape[0]
+            token_to_seq_cpu[i, :clen] = chunk_t2s
+
+        return ChunkedContextMetadata(
+            cu_seq_lens=cu_seq_lens_cpu.to(device, non_blocking=True),
+            starts=chunk_starts.to(device, non_blocking=True),
+            seq_tot=chunk_seq_lens.sum(dim=1).tolist(),
+            max_seq_lens=chunk_seq_lens.max(dim=1).values.tolist(),
+            seq_lens=chunk_seq_lens,
+            workspace=self._mla_chunked_prefill_workspace,
+            token_to_seq=token_to_seq_cpu.to(device, non_blocking=True),
+            chunk_total_token=chunk_total_token.tolist(),
+        )
     def prepare_prefill(self, seqs):
         input_ids, positions = [], []
         cu_seqlens_q, cu_seqlens_k = [0], [0]
@@ -809,13 +2123,30 @@ class ModelRunner:
                     bt[i, :len(b)] = b
             block_tables = torch.from_numpy(bt).pin_memory().cuda(non_blocking=True)
 
+        # Per-token request id (row into block_tables). Pre-computing this
+        # once per step avoids a Python for-loop + .item() sync inside every
+        # MLA / DSA layer (see ``_forward_sparse_bf16`` fallback in
+        # ``mla_attention_impl.py``).
+        nseqs_pf = len(seqs)
+        seq_lens_np = np.fromiter(
+            (len(s) for s in seqs), dtype=np.int32, count=nseqs_pf,
+        )
+        req_id_np = np.repeat(
+            np.arange(nseqs_pf, dtype=np.int32), seq_lens_np,
+        )
+        req_id_per_token = torch.from_numpy(req_id_np).pin_memory().cuda(
+            non_blocking=True,
+        )
+
         set_context(
             True,
             torch.tensor(cu_seqlens_q, dtype=torch.int32, pin_memory=True).cuda(non_blocking=True),
             torch.tensor(cu_seqlens_k, dtype=torch.int32, pin_memory=True).cuda(non_blocking=True),
             max_sq, max_sk,
-            torch.tensor(slot_mapping, dtype=torch.int32, pin_memory=True).cuda(non_blocking=True),
+            torch.tensor(slot_mapping, dtype=(torch.int64 if self.is_deepseek_mla else torch.int32),
+                         pin_memory=True).cuda(non_blocking=True),
             block_tables=block_tables,
+            req_id_per_token=req_id_per_token,
         )
 
         input_ids_t = torch.tensor(input_ids, dtype=torch.int64, pin_memory=True).cuda(non_blocking=True)
@@ -831,7 +2162,7 @@ class ModelRunner:
         n = len(seqs)
         ids = np.empty(n, dtype=np.int64)
         pos = np.empty(n, dtype=np.int64)
-        sm = np.empty(n, dtype=np.int32)
+        sm = np.empty(n, dtype=np.int64)
         cl = np.empty(n, dtype=np.int32)
         use_mrope = self.is_qwen_vl
         if use_mrope:
@@ -857,12 +2188,25 @@ class ModelRunner:
             b = seq.block_table
             bt[i, :len(b)] = b
         max_cl = int(cl[:n].max())
+        # Pure-decode: one token per request, so token i belongs to request i.
+        # Reuse the persistent arange buffer allocated in
+        # ``capture_cudagraph`` (also referenced by every captured decode
+        # CUDA graph) to avoid allocating a fresh tensor each step.  Falls
+        # back to an inline arange for eager runs where capture was skipped.
+        req_id_per_token = getattr(self, "_decode_req_id_buf", None)
+        if req_id_per_token is not None:
+            req_id_per_token = req_id_per_token[:n]
+        else:
+            req_id_per_token = torch.arange(
+                n, dtype=torch.int32, device=f"cuda:{self.rank}",
+            )
         set_context(
             False,
             slot_mapping=torch.from_numpy(sm).pin_memory().cuda(non_blocking=True),
             context_lens=torch.from_numpy(cl).pin_memory().cuda(non_blocking=True),
             block_tables=torch.from_numpy(bt).pin_memory().cuda(non_blocking=True),
             max_context_len=max_cl,
+            req_id_per_token=req_id_per_token,
         )
         self._apply_pending_cross_ctx()
         if use_mrope:
@@ -967,8 +2311,40 @@ class ModelRunner:
         for j in range(nd):
             logit_idx.append(num_prefill_tokens + j)
 
+        chunked_context = None
+        if self.is_deepseek_mla and num_prefill_seqs > 0:
+            chunked_context = self._build_chunked_context(
+                prefill_seqs, prefill_chunk_sizes, prefill_block_tables,
+                device=torch.device(f"cuda:{self.rank}"),
+            )
+
+        # Per-token request id, aligned with the flat token layout
+        # built above: ``[prefill_tokens..., decode_tokens...]``.
+        # The unified block_table used downstream (see
+        # ``_forward_sparse_bf16``) is laid out as
+        # ``[decode_seqs..., prefill_seqs...]``; hence prefill tokens map
+        # to rows ``num_decode_seqs + r`` and decode tokens to row ``j``.
+        total_tokens = num_prefill_tokens + nd
+        if total_tokens > 0:
+            if num_prefill_tokens > 0:
+                pf_ids_np = np.repeat(
+                    (nd + np.arange(num_prefill_seqs, dtype=np.int32)),
+                    np.asarray(prefill_chunk_sizes, dtype=np.int32),
+                )
+            else:
+                pf_ids_np = np.empty(0, dtype=np.int32)
+            dc_ids_np = np.arange(nd, dtype=np.int32)
+            req_id_np = np.concatenate([pf_ids_np, dc_ids_np])
+            req_id_per_token = torch.from_numpy(req_id_np).pin_memory().cuda(
+                non_blocking=True,
+            )
+        else:
+            req_id_per_token = None
+
         set_mixed_context(
-            slot_mapping=torch.tensor(slot_mapping, dtype=torch.int32, pin_memory=True).cuda(non_blocking=True),
+            slot_mapping=torch.tensor(slot_mapping,
+                                      dtype=(torch.int64 if self.is_deepseek_mla else torch.int32),
+                                      pin_memory=True).cuda(non_blocking=True),
             num_prefill_tokens=num_prefill_tokens,
             num_decode_tokens=nd,
             num_prefill_seqs=num_prefill_seqs,
@@ -981,6 +2357,8 @@ class ModelRunner:
             decode_block_tables=torch.from_numpy(dc_bt).pin_memory().cuda(non_blocking=True) if nd > 0 else None,
             decode_max_context_len=dc_max_cl,
             logit_indices=torch.tensor(logit_idx, dtype=torch.int64, pin_memory=True).cuda(non_blocking=True),
+            chunked_context=chunked_context,
+            req_id_per_token=req_id_per_token,
         )
 
         input_ids_t = torch.tensor(input_ids, dtype=torch.int64, pin_memory=True).cuda(non_blocking=True)
@@ -1139,12 +2517,16 @@ class ModelRunner:
         context_lens = self._eager_context_lens[:n]
         block_tables = self._eager_block_tables[:n, :bt_cols]
 
+        req_id_per_token = getattr(self, "_decode_req_id_buf", None)
+        if req_id_per_token is not None:
+            req_id_per_token = req_id_per_token[:n]
         set_context(
             False,
             slot_mapping=slot_mapping,
             context_lens=context_lens,
             block_tables=block_tables,
             max_context_len=int(cl_np.max()),
+            req_id_per_token=req_id_per_token,
         )
         self._apply_pending_cross_ctx()
         hidden = self.model(input_ids, positions)
@@ -1185,7 +2567,11 @@ class ModelRunner:
             self._np_pos = np.empty((3, max_bs), dtype=np.int64)
         else:
             self._np_pos = np.empty(max_bs, dtype=np.int64)
-        self._np_sm = np.empty(max_bs, dtype=np.int32)
+        # DeepSeek MLA FP8 KV cache stores require int64 slot_mapping;
+        # the FA3 path only needs int32.
+        sm_np_dtype = np.int64 if self.is_deepseek_mla else np.int32
+        sm_torch_dtype = torch.int64 if self.is_deepseek_mla else torch.int32
+        self._np_sm = np.empty(max_bs, dtype=sm_np_dtype)
         self._np_cl = np.empty(max_bs, dtype=np.int32)
         self._np_bt = np.full((max_bs, max_num_blocks), -1, dtype=np.int32)
 
@@ -1194,7 +2580,7 @@ class ModelRunner:
             self._eager_positions = torch.zeros(3, max_bs, dtype=torch.int64, device=dev)
         else:
             self._eager_positions = torch.zeros(max_bs, dtype=torch.int64, device=dev)
-        self._eager_slot_mapping = torch.zeros(max_bs, dtype=torch.int32, device=dev)
+        self._eager_slot_mapping = torch.zeros(max_bs, dtype=sm_torch_dtype, device=dev)
         self._eager_context_lens = torch.zeros(max_bs, dtype=torch.int32, device=dev)
         self._eager_block_tables = torch.zeros(max_bs, max_num_blocks, dtype=torch.int32, device=dev)
 
@@ -1362,7 +2748,15 @@ class ModelRunner:
             off += nb
 
     def _loop_decode_greedy(self):
-        """Worker fast path: read decode arrays from SHM without pickle."""
+        """Worker fast path: read decode arrays from SHM without pickle.
+
+        Must mirror :meth:`_write_decode_shm` exactly. In particular, MLA
+        models write ``slot_mapping`` as ``int64`` (8 bytes per element)
+        because the FP8 paged KV cache stores require it; non-MLA models
+        use ``int32``. Reading the wrong dtype here both garbles ``sm``
+        and shifts every following field, which produces inconsistent
+        decode metadata across ranks and deadlocks TP collectives.
+        """
         buf = self.shm.buf
         n = int.from_bytes(buf[0:2], "little")
         max_bt = int.from_bytes(buf[2:4], "little")
@@ -1372,7 +2766,10 @@ class ModelRunner:
             pos_np = np.frombuffer(buf, dtype=np.int64, count=3*n, offset=off).copy().reshape(3, n); off += 3 * n * 8
         else:
             pos_np = np.frombuffer(buf, dtype=np.int64, count=n, offset=off).copy(); off += n * 8
-        sm_np = np.frombuffer(buf, dtype=np.int32, count=n, offset=off).copy(); off += n * 4
+        if self.is_deepseek_mla:
+            sm_np = np.frombuffer(buf, dtype=np.int64, count=n, offset=off).copy(); off += n * 8
+        else:
+            sm_np = np.frombuffer(buf, dtype=np.int32, count=n, offset=off).copy(); off += n * 4
         cl_np = np.frombuffer(buf, dtype=np.int32, count=n, offset=off).copy(); off += n * 4
         bt_np = np.frombuffer(buf, dtype=np.int32, count=n*max_bt, offset=off).copy().reshape(n, max_bt)
         self.run_decode_greedy_fast((n, ids_np, pos_np, sm_np, cl_np, bt_np))
@@ -1861,20 +3258,31 @@ class ModelRunner:
         from .compilation import compile_model, configure_post_grad_passes
 
         configure_post_grad_passes()
+        # This only disables the compile stack's generic piecewise
+        # CUDAGraphWrapper. Mamba2 still uses its own decode-only graph
+        # path via capture_mamba_cudagraph().
+        cudagraph_enabled = not self.is_mamba2
         if self.is_qwen_vl:
             # Save the uncompiled inner model for multimodal prefill
             # (which needs deepstack_embeds that the compiled graph
             # doesn't trace).
             self._eager_inner_model = self.model.model
-            self.model.model = compile_model(self.model.model)
+            self.model.model = compile_model(
+                self.model.model,
+                cudagraph_enabled=cudagraph_enabled,
+            )
         else:
             self._eager_model = self.model
-            self.model = compile_model(self.model)
+            self.model = compile_model(
+                self.model,
+                cudagraph_enabled=cudagraph_enabled,
+            )
         self._compiled = True
         self._mark_dynamic_done = False
 
     @torch.inference_mode()
     def capture_cudagraph(self):
+        import gc
         from contextlib import nullcontext
         max_bs = self.max_num_seqs
         max_num_blocks = (self.max_model_len + BLOCK_SIZE - 1) // BLOCK_SIZE
@@ -1883,15 +3291,33 @@ class ModelRunner:
             positions = torch.zeros(3, max_bs + 1, dtype=torch.int64)
         else:
             positions = torch.zeros(max_bs, dtype=torch.int64)
-        slot_mapping = torch.full((max_bs,), -1, dtype=torch.int32)
+        sm_torch_dtype = torch.int64 if self.is_deepseek_mla else torch.int32
+        slot_mapping = torch.full((max_bs,), -1, dtype=sm_torch_dtype)
         context_lens = torch.zeros(max_bs, dtype=torch.int32)
         block_tables = torch.zeros(max_bs, max_num_blocks, dtype=torch.int32)
+        # Persistent arange buffer for per-token request id mapping during
+        # pure-decode (token i -> sequence i).  Captured into decode CUDA
+        # graphs and reused by ``prepare_decode``; kept on-device so the
+        # sparse MLA ``convert_indices`` kernel never falls back to an
+        # all-zeros buffer (see ``_forward_sparse_bf16``).
+        decode_req_id = torch.arange(max_bs, dtype=torch.int32).cuda()
+        self._decode_req_id_buf = decode_req_id
 
-        self.graph_bs_list = sorted(set(
-            [1, 2, 4] +
-            list(range(8, min(max_bs + 1, 256), 8)) +
-            list(range(256, max_bs + 1, 16))
-        ))
+        # Match vLLM's default ``cudagraph_capture_sizes`` for DeepSeek-V3.2:
+        # [1, 2, 4, 8, 16, 24, ..., 256, 272, ..., 512].  vLLM caps captures at
+        # ``max_cudagraph_capture_size=512`` (see logs); larger decode batches
+        # are dispatched to the largest captured graph or fall back to a
+        # piecewise/eager path.  Going past 512 here makes the compile time
+        # dominate (each graph at bs>512 takes seconds) without measurable
+        # decode wins, so we keep the same 512 cap.
+        max_capture = min(max_bs, 512)
+        self.graph_bs_list = [i for i in [1, 2, 4] if i <= max_capture]
+        if max_capture >= 8:
+            self.graph_bs_list += list(range(8, min(max_capture + 1, 256), 8))
+        if max_capture >= 256:
+            self.graph_bs_list += list(range(256, max_capture + 1, 16))
+        if self.graph_bs_list[-1] != max_capture:
+            self.graph_bs_list.append(max_capture)
         self.graphs = {}
         self.graph_pool = None
 
@@ -1918,13 +3344,61 @@ class ModelRunner:
         lm_max_idxs = torch.zeros(max_bs, dtype=torch.int64)
 
         ar_ctx = self.custom_ar.capture() if self.custom_ar is not None else nullcontext()
+        _graph_list = list(reversed(self.graph_bs_list))
+
+        # Single warmup at the largest batch size to trigger all Triton/CUDA
+        # kernel JIT compilation. Subsequent captures reuse compiled kernels.
+        largest_bs = _graph_list[0]
+        set_context(
+            False, slot_mapping=slot_mapping[:largest_bs],
+            context_lens=context_lens[:largest_bs],
+            block_tables=block_tables[:largest_bs],
+            max_context_len=self.max_model_len,
+            req_id_per_token=decode_req_id[:largest_bs],
+        )
+        # Mark batch dim as dynamic BEFORE the first compile-triggering forward
+        # so Dynamo / Inductor produce a single symbolic-shape compiled graph
+        # that works for every batch size we will subsequently capture, instead
+        # of hard-coding the warmup batch size into the compiled subgraphs
+        # (which under ``skip_all_guards_unsafe`` would silently get reused at
+        # the wrong size and trip Inductor's ``assert_size_stride`` checks).
+        warmup_ids = input_ids[:largest_bs]
+        warmup_pos = (positions[:, :largest_bs]
+                      if self.is_qwen_vl else positions[:largest_bs])
+        if self._compiled and not self._mark_dynamic_done:
+            torch._dynamo.mark_dynamic(warmup_ids, 0)
+            if self.is_qwen_vl:
+                torch._dynamo.mark_dynamic(warmup_pos, 1)
+            else:
+                torch._dynamo.mark_dynamic(warmup_pos, 0)
+            self._mark_dynamic_done = True
+        if self.is_qwen_vl:
+            outputs[:largest_bs] = self.model(warmup_ids, warmup_pos)
+        else:
+            outputs[:largest_bs] = self.model(warmup_ids, warmup_pos)
+        lm_logits[:largest_bs] = lm_head.linear_op(
+            outputs[:largest_bs], lm_head.embedding_op.emb.weight).float()
+        lm_max_vals[:largest_bs], lm_max_idxs[:largest_bs] = \
+            lm_logits[:largest_bs].max(dim=-1)
+        reset_context()
+        torch.cuda.synchronize()
+
+        # Freeze GC during capture to avoid Python GC stalls (matches vllm).
+        gc.collect()
+        gc.freeze()
+
         with ar_ctx:
-            for bs in reversed(self.graph_bs_list):
+            for _gi, bs in enumerate(_graph_list):
+                if self.rank == 0 and (_gi % max(1, len(_graph_list) // 5) == 0
+                                       or _gi == len(_graph_list) - 1):
+                    print(f"    CUDA graph {_gi+1}/{len(_graph_list)} (bs={bs})",
+                          flush=True)
                 graph = torch.cuda.CUDAGraph()
                 set_context(
                     False, slot_mapping=slot_mapping[:bs],
                     context_lens=context_lens[:bs], block_tables=block_tables[:bs],
                     max_context_len=self.max_model_len,
+                    req_id_per_token=decode_req_id[:bs],
                 )
 
                 ids_slice = input_ids[:bs]
@@ -1950,11 +3424,8 @@ class ModelRunner:
                     self._mark_dynamic_done = True
 
                 # Warmup forward: for VL, compute inputs_embeds outside and
-                # pass it so the compiled inner Qwen3Model traces the
+                # pass it so the compiled inner model traces the
                 # inputs_embeds branch (never embed_tokens).
-                # deepstack_embeds is intentionally omitted — the compiled
-                # graph traces without it, avoiding zero-add overhead on
-                # every decode step.
                 if ie_slice is not None:
                     ie_slice.copy_(vl_embed_fn(ids_slice))
                     outputs[:bs] = self.model(
@@ -1963,21 +3434,21 @@ class ModelRunner:
                     )
                 else:
                     outputs[:bs] = self.model(ids_slice, pos_slice)
-                lm_logits[:bs] = lm_head.linear_op(outputs[:bs], lm_head.embedding_op.emb.weight).float()
+                lm_logits[:bs] = lm_head.linear_op(
+                    outputs[:bs], lm_head.embedding_op.emb.weight).float()
                 lm_max_vals[:bs], lm_max_idxs[:bs] = lm_logits[:bs].max(dim=-1)
 
                 with torch.cuda.graph(graph, self.graph_pool):
-                    if vl_inputs_embeds is not None:
-                        vl_inputs_embeds[:bs] = vl_embed_fn(input_ids[:bs])
+                    if ie_slice is not None:
+                        ie_slice.copy_(vl_embed_fn(ids_slice))
                         outputs[:bs] = self.model(
-                            input_ids[:bs], positions[:, :bs],
-                            inputs_embeds=vl_inputs_embeds[:bs],
+                            ids_slice, pos_slice,
+                            inputs_embeds=ie_slice,
                         )
-                    elif self.is_qwen_vl:
-                        outputs[:bs] = self.model(input_ids[:bs], positions[:, :bs])
                     else:
-                        outputs[:bs] = self.model(input_ids[:bs], positions[:bs])
-                    lm_logits[:bs] = lm_head.linear_op(outputs[:bs], lm_head.embedding_op.emb.weight).float()
+                        outputs[:bs] = self.model(ids_slice, pos_slice)
+                    lm_logits[:bs] = lm_head.linear_op(
+                        outputs[:bs], lm_head.embedding_op.emb.weight).float()
                     lm_max_vals[:bs], lm_max_idxs[:bs] = lm_logits[:bs].max(dim=-1)
 
                 if self.graph_pool is None:
@@ -1985,6 +3456,9 @@ class ModelRunner:
                 self.graphs[bs] = graph
                 torch.cuda.synchronize()
                 reset_context()
+
+        gc.unfreeze()
+        gc.collect()
 
         self.graph_vars = dict(
             input_ids=input_ids, positions=positions,
@@ -1996,7 +3470,12 @@ class ModelRunner:
         # Pre-compute lookup table: _graph_bs_for_n[n] = smallest graph_bs >= n
         self._graph_bs_for_n = [0] * (max_bs + 1)
         for n in range(max_bs + 1):
-            self._graph_bs_for_n[n] = next(x for x in self.graph_bs_list if x >= n)
+            for x in self.graph_bs_list:
+                if x >= n:
+                    self._graph_bs_for_n[n] = x
+                    break
+            else:
+                self._graph_bs_for_n[n] = max_bs
 
 
 # ---------------------------------------------------------------------------
@@ -2054,7 +3533,12 @@ class LlamaEngine:
             enforce_eager, self.events, shm_name,
             **mr_kwargs,
         )
-        self.block_manager = BlockManager(self.model_runner.num_blocks)
+        self.is_mamba = self.model_runner.is_mamba
+        if self.is_mamba:
+            # Mamba uses MambaStateManager (slot-based) not paged KV blocks.
+            self.block_manager = BlockManager(0)
+        else:
+            self.block_manager = BlockManager(self.model_runner.num_blocks)
         if hasattr(self.model_runner, '_cross_free_block_ids_init'):
             n = self.model_runner._cross_free_block_ids_init
             self.block_manager.cross_free_block_ids = deque(range(n))
@@ -2407,6 +3891,369 @@ class LlamaEngine:
 
         return inputs_embeds, None
 
+    # ------------------------------------------------------------------
+    # Mamba / SSM scheduling loop
+    # ------------------------------------------------------------------
+    @torch.inference_mode()
+    def _generate_mamba(
+        self,
+        prompts,
+        sp_list,
+        collect_logits: bool = False,
+        use_tqdm: bool = False,
+    ):
+        """Scheduler for Mamba / Mamba2 models.
+
+        Mamba state lives in a slot pool (one slot per live sequence) so
+        scheduling reduces to: while there is a free slot and a waiting
+        seq, admit it; each step runs a mixed prefill + decode batch
+        through the model, with per-batch ``(Mamba|Mamba2)Metadata``
+        carrying the slot indices and prefill/decode split.
+
+        Hot loop optimisations (mirroring vLLM's GPUModelRunner):
+          - When the step is *pure decode* and all sequences are greedy,
+            we use a captured CUDA graph + GPU local argmax + async D2H
+            copy of the next token IDs (``run_mamba_decode_fast_async``)
+            and **pipeline** the next step's CPU prep with the previous
+            step's tokens still in flight.  This is the steady state for
+            most of generation once all prompts have been admitted.
+          - When the step needs prefill (admitting new sequences) we
+            fall back to ``run_mamba_mixed`` which builds the heavier
+            varlen metadata once.
+          - We pre-build a ``seq -> (sp, idx)`` lookup so we never call
+            the O(N) ``all_seqs.index(s)`` per token per step.
+        """
+        eos = self.tokenizer.eos_token_id
+        mr = self.model_runner
+
+        # Optional per-step instrumentation -- enable with
+        # ``KB_NANO_PROFILE_MAMBA=1``.  Records wall-clock time spent
+        # in each phase (admit, decode-array prep, GPU dispatch, D2H
+        # wait, finalize/dealloc) and prints a summary at the end so
+        # we can see which phase dominates without resorting to a full
+        # CUDA profiler.
+        _profile = os.environ.get("KB_NANO_PROFILE_MAMBA", "0") == "1"
+        _stats = {
+            "fast_steps": 0,
+            "fast_admit": 0.0,
+            "fast_prep": 0.0,
+            "fast_dispatch": 0.0,
+            "fast_wait": 0.0,
+            "fast_finalize": 0.0,
+            "fast_pbar": 0.0,
+            "slow_steps": 0,
+            "slow_admit": 0.0,
+            "slow_call": 0.0,
+            "slow_finalize": 0.0,
+            "slow_pbar": 0.0,
+            "total_decode_tokens": 0,
+            "total_prefill_tokens": 0,
+        }
+
+        # Build sequences in input order, plus a seq -> sp lookup (avoids
+        # O(N^2) ``all_seqs.index(s)`` calls that dominated the old
+        # scheduler at 1000 prompts).
+        all_seqs: list[Sequence] = []
+        seq_sp: dict[int, "SamplingParams"] = {}
+        for i, prompt in enumerate(prompts):
+            sp = sp_list[i]
+            ids = prompt if isinstance(prompt, list) else self.tokenizer.encode(prompt)
+            seq = Sequence(ids, max_tokens=sp.max_tokens, ignore_eos=sp.ignore_eos)
+            all_seqs.append(seq)
+            seq_sp[id(seq)] = sp
+
+        seq_logits: dict[int, list[torch.Tensor]] = {
+            id(s): [] for s in all_seqs
+        } if collect_logits else {}
+
+        waiting: deque[Sequence] = deque(all_seqs)
+        running: list[Sequence] = []
+
+        pbar = None
+        if use_tqdm:
+            from tqdm import tqdm as _tqdm
+            pbar = _tqdm(total=len(prompts), desc="Processed prompts",
+                         dynamic_ncols=True)
+        _pbar_pending = 0
+
+        # Whether we can use the GPU greedy fast path for decode steps.
+        # Multi-/non-greedy sampling falls back to the slow CPU path.
+        all_greedy = (
+            not collect_logits
+            and all(sp.temperature == 0.0 for sp in sp_list)
+        )
+
+        def _admit():
+            """Allocate state slots for as many waiting seqs as fit.
+
+            Respects both the slot pool (``can_allocate_mamba_state``)
+            and a per-step token budget (sum of admitted prompt lengths
+            plus one decode token per already-running seq).  Token
+            budgeting prevents a single forward pass from ballooning
+            into kernel OOM at large batch sizes.
+
+            Allocation must happen on every TP rank so each rank's local
+            ``MambaStateManager`` agrees on slot ownership; ``call``
+            broadcasts via SHM and runs locally on rank 0.
+            """
+            admitted: list[Sequence] = []
+            token_budget = max(
+                getattr(mr, "max_num_batched_tokens", 16384), 1,
+            )
+            tokens_used = len(running)
+            max_seqs = self.max_num_seqs
+            while (
+                waiting
+                and mr.can_allocate_mamba_state()
+                and len(running) + len(admitted) < max_seqs
+            ):
+                s = waiting[0]
+                seq_tokens = len(s.token_ids) - s.num_computed_tokens
+                if admitted and tokens_used + seq_tokens > token_budget:
+                    break
+                waiting.popleft()
+                admitted.append(s)
+                tokens_used += seq_tokens
+            if admitted:
+                # Allocation must happen on every TP rank so each rank's
+                # local ``MambaStateManager`` agrees on slot ownership;
+                # ``mr.call`` broadcasts via SHM and runs locally on
+                # rank 0.  Batched into a single message to avoid
+                # ``_pickle.UnpicklingError`` race conditions seen with
+                # per-seq ``mr.call`` invocations.
+                slots = mr.call("allocate_mamba_state_batch", len(admitted))
+                for s, slot in zip(admitted, slots):
+                    s.state_slot = slot
+            return admitted
+
+        def _sample(logits_row: torch.Tensor, sp) -> int:
+            if sp.temperature == 0.0:
+                return int(logits_row.argmax().item())
+            probs = torch.softmax(logits_row.float() / sp.temperature, dim=-1)
+            top_k = getattr(sp, "top_k", None)
+            if top_k is not None and top_k > 0:
+                top_v, top_i = torch.topk(probs, k=min(top_k, probs.numel()))
+                probs = torch.zeros_like(probs).scatter_(0, top_i, top_v)
+                probs = probs / probs.sum()
+            return int(torch.multinomial(probs, num_samples=1).item())
+
+        def _finalize(seq, tok_id):
+            """Append a token to ``seq`` and report whether it finished."""
+            seq.append_token(tok_id)
+            seq.num_computed_tokens = len(seq)
+            done = len(seq.generated_ids) >= seq.max_tokens
+            if not seq.ignore_eos:
+                done = done or tok_id == eos
+            return done
+
+        while waiting or running:
+            _t0 = time.perf_counter() if _profile else 0.0
+            new_seqs = _admit()
+            prefill_seqs = list(new_seqs)
+            decode_seqs = list(running)
+            _t_admit = (time.perf_counter() - _t0) if _profile else 0.0
+
+            if not prefill_seqs and not decode_seqs:
+                break
+
+            # =========================================================
+            # FAST PATH: pure decode + greedy + CUDA-graph capture set up.
+            # Steady-state for the bulk of decode-heavy / balanced runs.
+            # =========================================================
+            if (
+                not prefill_seqs
+                and decode_seqs
+                and all_greedy
+                and mr.max_num_batched_tokens >= len(decode_seqs)
+            ):
+                _t1 = time.perf_counter() if _profile else 0.0
+                decode_data = mr._prepare_mamba_decode_arrays(decode_seqs)
+                _t_prep = (time.perf_counter() - _t1) if _profile else 0.0
+
+                _t1 = time.perf_counter() if _profile else 0.0
+                has_result, async_n = mr.call_mamba_decode_async(decode_data)
+                _t_dispatch = (time.perf_counter() - _t1) if _profile else 0.0
+
+                _t_wait = 0.0
+                _t_finalize = 0.0
+                # Drain any waiting prompts admitted between steps while
+                # we still keep pipelining decodes -- but only on the
+                # rank-0 path that actually owns the result.
+                if has_result:
+                    _t1 = time.perf_counter() if _profile else 0.0
+                    token_ids = mr._wait_async_mamba_tokens(async_n)
+                    _t_wait = (time.perf_counter() - _t1) if _profile else 0.0
+
+                    _t1 = time.perf_counter() if _profile else 0.0
+                    finished_now: list[Sequence] = []
+                    new_running: list[Sequence] = []
+                    for s, tok_id in zip(decode_seqs, token_ids):
+                        if _finalize(s, tok_id):
+                            finished_now.append(s)
+                        else:
+                            new_running.append(s)
+                    if finished_now:
+                        # Broadcast to all TP ranks so every rank
+                        # returns the same slots to its local free pool
+                        # in lock-step.
+                        slot_ids = [s.state_slot for s in finished_now]
+                        mr.call("deallocate_mamba_state_batch", slot_ids)
+                        for s in finished_now:
+                            s.state_slot = None
+                            if pbar is not None:
+                                _pbar_pending += 1
+                    running = new_running
+                    _t_finalize = (time.perf_counter() - _t1) if _profile else 0.0
+                else:
+                    # Worker rank or graph fell through; treat as no-op.
+                    running = decode_seqs
+
+                _t1 = time.perf_counter() if _profile else 0.0
+                if pbar is not None and _pbar_pending:
+                    pbar.update(_pbar_pending)
+                    _pbar_pending = 0
+                _t_pbar = (time.perf_counter() - _t1) if _profile else 0.0
+
+                if _profile:
+                    _stats["fast_steps"] += 1
+                    _stats["fast_admit"] += _t_admit
+                    _stats["fast_prep"] += _t_prep
+                    _stats["fast_dispatch"] += _t_dispatch
+                    _stats["fast_wait"] += _t_wait
+                    _stats["fast_finalize"] += _t_finalize
+                    _stats["fast_pbar"] += _t_pbar
+                    _stats["total_decode_tokens"] += len(decode_seqs)
+                continue
+
+            # =========================================================
+            # SLOW PATH: any mixed prefill+decode step (or non-greedy).
+            # =========================================================
+            _t1 = time.perf_counter() if _profile else 0.0
+            logits = mr.call(
+                "run_mamba_mixed", prefill_seqs, decode_seqs,
+            )
+            _t_call = (time.perf_counter() - _t1) if _profile else 0.0
+
+            _t1 = time.perf_counter() if _profile else 0.0
+            row = 0
+            new_running: list[Sequence] = []
+            finished_now: list[Sequence] = []
+            for s in prefill_seqs + decode_seqs:
+                logit_row = logits[row]
+                sp = seq_sp[id(s)]
+                tok_id = _sample(logit_row, sp)
+                if collect_logits:
+                    seq_logits[id(s)].append(logit_row.detach().cpu())
+                row += 1
+                if _finalize(s, tok_id):
+                    finished_now.append(s)
+                else:
+                    new_running.append(s)
+
+            if finished_now:
+                slot_ids = [s.state_slot for s in finished_now]
+                mr.call("deallocate_mamba_state_batch", slot_ids)
+                for s in finished_now:
+                    s.state_slot = None
+                    if pbar is not None:
+                        _pbar_pending += 1
+            running = new_running
+            _t_finalize_slow = (time.perf_counter() - _t1) if _profile else 0.0
+
+            _t1 = time.perf_counter() if _profile else 0.0
+            if pbar is not None and _pbar_pending:
+                pbar.update(_pbar_pending)
+                _pbar_pending = 0
+            _t_pbar = (time.perf_counter() - _t1) if _profile else 0.0
+
+            if _profile:
+                _stats["slow_steps"] += 1
+                _stats["slow_admit"] += _t_admit
+                _stats["slow_call"] += _t_call
+                _stats["slow_finalize"] += _t_finalize_slow
+                _stats["slow_pbar"] += _t_pbar
+                _stats["total_prefill_tokens"] += sum(
+                    len(s.token_ids) - s.num_computed_tokens
+                    for s in prefill_seqs
+                )
+                _stats["total_decode_tokens"] += len(decode_seqs)
+
+        if pbar is not None:
+            pbar.close()
+
+        if _profile:
+            def _fmt(t):
+                return f"{t * 1000:>9.1f} ms"
+            print("\n=== _generate_mamba per-phase timing ===")
+            n_fast = _stats["fast_steps"]
+            n_slow = _stats["slow_steps"]
+            print(f"  Steps: fast_decode={n_fast}  slow_mixed={n_slow}  "
+                  f"decode_tokens={_stats['total_decode_tokens']}  "
+                  f"prefill_tokens={_stats['total_prefill_tokens']}")
+            if n_fast:
+                tot_fast = sum([
+                    _stats["fast_admit"], _stats["fast_prep"],
+                    _stats["fast_dispatch"], _stats["fast_wait"],
+                    _stats["fast_finalize"], _stats["fast_pbar"],
+                ])
+                print(f"  FAST PATH ({n_fast} steps, total {_fmt(tot_fast)}):")
+                print(f"    admit         {_fmt(_stats['fast_admit'])}  "
+                      f"({100*_stats['fast_admit']/max(tot_fast,1e-9):5.1f}%)")
+                print(f"    decode_prep   {_fmt(_stats['fast_prep'])}  "
+                      f"({100*_stats['fast_prep']/max(tot_fast,1e-9):5.1f}%)")
+                print(f"    gpu_dispatch  {_fmt(_stats['fast_dispatch'])}  "
+                      f"({100*_stats['fast_dispatch']/max(tot_fast,1e-9):5.1f}%)")
+                print(f"    gpu+d2h_wait  {_fmt(_stats['fast_wait'])}  "
+                      f"({100*_stats['fast_wait']/max(tot_fast,1e-9):5.1f}%)")
+                print(f"    finalize      {_fmt(_stats['fast_finalize'])}  "
+                      f"({100*_stats['fast_finalize']/max(tot_fast,1e-9):5.1f}%)")
+                print(f"    pbar          {_fmt(_stats['fast_pbar'])}  "
+                      f"({100*_stats['fast_pbar']/max(tot_fast,1e-9):5.1f}%)")
+                print(f"    avg/step      {_fmt(tot_fast/n_fast)}")
+            if n_slow:
+                tot_slow = sum([
+                    _stats["slow_admit"], _stats["slow_call"],
+                    _stats["slow_finalize"], _stats["slow_pbar"],
+                ])
+                print(f"  SLOW PATH ({n_slow} steps, total {_fmt(tot_slow)}):")
+                print(f"    admit         {_fmt(_stats['slow_admit'])}  "
+                      f"({100*_stats['slow_admit']/max(tot_slow,1e-9):5.1f}%)")
+                print(f"    mr.call(mix)  {_fmt(_stats['slow_call'])}  "
+                      f"({100*_stats['slow_call']/max(tot_slow,1e-9):5.1f}%)")
+                print(f"    finalize      {_fmt(_stats['slow_finalize'])}  "
+                      f"({100*_stats['slow_finalize']/max(tot_slow,1e-9):5.1f}%)")
+                print(f"    pbar          {_fmt(_stats['slow_pbar'])}  "
+                      f"({100*_stats['slow_pbar']/max(tot_slow,1e-9):5.1f}%)")
+                print(f"    avg/step      {_fmt(tot_slow/n_slow)}")
+            print("=" * 50)
+
+        # Release any cached transient activations back to the OS so the
+        # next ``generate()`` call (e.g. the next benchmark scenario)
+        # starts with a clean allocator.  Mirrors how vLLM's
+        # ``LLMEngine`` calls ``empty_cache`` after each batch finishes
+        # to avoid cumulative fragmentation across requests
+        # (``vllm/v1/engine/core.py:_step``).  Without this, Mamba2's
+        # 16384-token prefill activations stay cached on rank 0 and
+        # the second scenario can OOM looking for a contiguous block.
+        if mr.world_size > 1:
+            mr.call("empty_cuda_cache")
+        else:
+            torch.cuda.empty_cache()
+
+        return [
+            GenerationOutput(
+                prompt=(prompts[i] if isinstance(prompts[i], str) else ""),
+                generated_text=self.tokenizer.decode(
+                    all_seqs[i].generated_ids, skip_special_tokens=True,
+                ),
+                token_ids=all_seqs[i].generated_ids,
+                logits_history=(
+                    seq_logits.get(id(all_seqs[i])) if collect_logits else None
+                ),
+            )
+            for i in range(len(prompts))
+        ]
+
     @torch.inference_mode()
     def generate(self, prompts, sampling_params, collect_logits: bool = False,
                  images=None, videos=None, audio_features=None,
@@ -2432,6 +4279,12 @@ class LlamaEngine:
         seed = sp_list[0].seed
         if seed is not None:
             self._set_seeds(seed)
+
+        if self.is_mamba:
+            return self._generate_mamba(
+                prompts, sp_list, collect_logits=collect_logits,
+                use_tqdm=use_tqdm,
+            )
 
         eos = self.tokenizer.eos_token_id
         waiting: deque[Sequence] = deque()
@@ -3185,4 +5038,3 @@ class LlamaEngine:
                     bm.deallocate(seq)
             else:
                 running.append(seq)
-

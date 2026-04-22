@@ -219,7 +219,8 @@ if __name__ == "__main__":
 # Multi-scenario kb-nano subprocess worker
 # ---------------------------------------------------------------------------
 KB_NANO_WORKER = r'''
-import json, sys, time
+import json, os, sys, time
+os.environ.setdefault("VLLM_DEEP_GEMM_WARMUP", "skip")
 
 def main():
     with open(sys.argv[1]) as f:
@@ -680,7 +681,8 @@ if __name__ == "__main__":
 # Multi-scenario kb-nano subprocess worker (VLM, multi-modal)
 # ---------------------------------------------------------------------------
 KB_NANO_VLM_WORKER = _MM_PRELOAD_FN + r'''
-import json, sys, time
+import json, os, sys, time
+os.environ.setdefault("VLLM_DEEP_GEMM_WARMUP", "skip")
 
 
 def main():
@@ -1265,6 +1267,11 @@ def main():
         choices=["all", "text", "image", "video"],
         help="Run only scenarios matching this modality (VLM models only, default: all)",
     )
+    parser.add_argument(
+        "--scenario", type=str, default=None,
+        help="Run only the throughput scenario with this name (e.g. "
+             "'balanced'). Default: run all scenarios for the model type.",
+    )
     args = parser.parse_args()
 
     if args.num_seqs is None:
@@ -1298,6 +1305,16 @@ def main():
             s for s in latency_scenarios
             if s.get("modality", "text") == args.modality
         ]
+
+    if args.scenario is not None:
+        throughput_scenarios = [
+            s for s in throughput_scenarios if s["name"] == args.scenario
+        ]
+        if not throughput_scenarios:
+            raise SystemExit(
+                f"--scenario={args.scenario!r} did not match any throughput "
+                f"scenario for this model type."
+            )
 
     # Pre-generate all scenario data
     scenario_data = []
@@ -1473,6 +1490,7 @@ def main():
         vllm_raw = run_worker(
             vllm_worker, vllm_config,
             f"vLLM [{short_name}] all scenarios (TP={args.tp})",
+            timeout=10800,
         )
 
     # -- Run kb-nano (one subprocess, all scenarios) --
@@ -1494,6 +1512,7 @@ def main():
     kb_raw = run_worker(
         kb_worker, kb_config,
         f"kb-nano [{short_name}] all scenarios (TP={args.tp})",
+        timeout=10800,
     )
     if kb_raw is None:
         print("  ERROR: kb-nano subprocess failed.")
