@@ -15,7 +15,14 @@ import sys
 import tempfile
 
 
-def run_worker(script: str, config: dict, label: str, timeout: int = 3600) -> dict | None:
+def run_worker(
+    script: str,
+    config: dict,
+    label: str,
+    timeout: int = 3600,
+    *,
+    python_executable: str | None = None,
+) -> dict | None:
     """Run a worker script in a subprocess and return parsed JSON output.
 
     Args:
@@ -24,11 +31,14 @@ def run_worker(script: str, config: dict, label: str, timeout: int = 3600) -> di
                 An ``output_file`` key is added automatically.
         label: Human-readable label printed before/after execution.
         timeout: Maximum wall-clock seconds before the subprocess is killed.
+        python_executable: Interpreter to use (default: ``sys.executable``).
+            Use a separate env for optional deps (e.g. OpenPI) that conflict with kb-nano.
 
     Returns:
         Parsed JSON dict written by the worker to ``output_file``, or None on
         failure.
     """
+    py = python_executable or sys.executable
     with tempfile.NamedTemporaryFile(
         mode="w", suffix=".py", delete=False, dir="/tmp",
     ) as f:
@@ -50,9 +60,15 @@ def run_worker(script: str, config: dict, label: str, timeout: int = 3600) -> di
         print(f"  {label}")
         print(f"{'─' * 70}", flush=True)
 
+        env = os.environ.copy()
+        bindir = os.path.dirname(os.path.abspath(py))
+        if bindir:
+            env["PATH"] = bindir + os.pathsep + env.get("PATH", "")
+
         result = subprocess.run(
-            [sys.executable, "-u", script_path, config_path],
+            [py, "-u", script_path, config_path],
             timeout=timeout,
+            env=env,
         )
         if result.returncode != 0:
             print(f"  ERROR: {label} failed with exit code {result.returncode}")

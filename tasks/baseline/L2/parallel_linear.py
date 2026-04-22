@@ -16,7 +16,6 @@ import torch.nn as nn
 import torch.nn.functional as F
 
 from ....infra.tp import _tp_size, _tp_rank
-from ..L1.fp8_linear import Fp8Linear
 from ..L1.allreduce import AllReduce
 
 

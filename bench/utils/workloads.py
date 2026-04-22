@@ -300,6 +300,76 @@ ALL_TTS_WORKLOADS = {
 
 
 # ---------------------------------------------------------------------------
+# Robotics / VLA workloads (Pi0 action generation)
+# ---------------------------------------------------------------------------
+
+@dataclass(frozen=True)
+class RoboticsModelConfig:
+    num_inference_steps: int
+    chunk_size: int
+    max_action_dim: int
+    max_state_dim: int
+    image_resolution: tuple[int, int]
+
+PI0_CONFIG = RoboticsModelConfig(
+    num_inference_steps=10,
+    chunk_size=50,
+    max_action_dim=32,
+    max_state_dim=32,
+    image_resolution=(224, 224),
+)
+
+
+@dataclass(frozen=True)
+class RoboticsThroughputWorkload:
+    """Robotics VLA throughput workload.
+
+    Uses real robotics datasets (e.g. DROID, Libero) for representative
+    image/instruction/state inputs.
+    """
+    name: str
+    num_cameras: int
+    num_requests: int
+    dataset_name: str
+    dataset_split: str = "train"
+
+@dataclass(frozen=True)
+class RoboticsLatencyWorkload:
+    name: str
+    num_cameras: int
+    batch_size: int = 1
+    dataset_name: str = ""
+    num_warmup: int = 3
+    num_iters: int = 10
+
+
+ROBOTICS_THROUGHPUT_WORKLOADS: list[RoboticsThroughputWorkload] = [
+    RoboticsThroughputWorkload(
+        "libero-1cam", num_cameras=1, num_requests=100,
+        dataset_name="lerobot/libero",
+    ),
+    RoboticsThroughputWorkload(
+        "libero-3cam", num_cameras=3, num_requests=100,
+        dataset_name="lerobot/libero",
+    ),
+]
+
+ROBOTICS_LATENCY_WORKLOADS: list[RoboticsLatencyWorkload] = [
+    RoboticsLatencyWorkload(
+        "single-3cam", num_cameras=3, batch_size=1,
+    ),
+    RoboticsLatencyWorkload(
+        "single-1cam", num_cameras=1, batch_size=1,
+    ),
+]
+
+ALL_ROBOTICS_WORKLOADS = {
+    "throughput": ROBOTICS_THROUGHPUT_WORKLOADS,
+    "latency": ROBOTICS_LATENCY_WORKLOADS,
+}
+
+
+# ---------------------------------------------------------------------------
 # Object detection workloads (COCO val2017)
 # ---------------------------------------------------------------------------
 
