@@ -67,7 +67,74 @@ _DEFAULT_MAX_NUM_BATCHED_TOKENS, _DEFAULT_MAX_NUM_SEQS = (
     _detect_scheduling_defaults()
 )
 
+# Optional override: shrink ``max_num_batched_tokens`` to free non-KV memory
+# (FP8 prefill scratch buffers, sparse-prefill q_pad, attention workspaces all
+# scale linearly with this).  Useful for decode-heavy workloads whose actual
+# prefill tokens are far below the default 16384 budget.  Read from
+# ``KB_NANO_MAX_BATCHED_TOKENS`` (positive int).
+_MBT_ENV = os.environ.get("KB_NANO_MAX_BATCHED_TOKENS", "")
+if _MBT_ENV:
+    try:
+        _mbt = int(_MBT_ENV)
+        if _mbt > 0:
+            _DEFAULT_MAX_NUM_BATCHED_TOKENS = _mbt
+    except ValueError:
+        pass
+
 _PROFILE = os.environ.get("KB_NANO_PROFILE", "0") == "1"
+
+
+def _kv_cache_extra_bytes() -> int:
+    """Optional KV-cache budget override (positive = allocate MORE KV cache).
+
+    Read from ``KB_NANO_KV_CACHE_EXTRA_GB`` (float, GiB per rank).  This is a
+    safety knob layered on top of the proper memory-profiling flow defined
+    below; it is normally unused (default 0).  Positive values add GiB to
+    the available KV-cache budget on each rank; negative values reserve
+    additional headroom.
+    """
+    try:
+        gb = float(os.environ.get("KB_NANO_KV_CACHE_EXTRA_GB", "0"))
+    except ValueError:
+        gb = 0.0
+    return int(gb * (1 << 30))
+
+
+# ---------------------------------------------------------------------------
+# Memory profiling — port of vLLM's MemorySnapshot + memory_profiling helpers
+# (vllm.utils.mem_utils, vllm.v1.worker.gpu_worker.determine_available_memory)
+# ---------------------------------------------------------------------------
+@dataclass
+class _MemSnapshot:
+    """GPU memory snapshot at a single instant on one device.
+
+    ``cuda_memory``  = total - free (everything the device currently holds)
+    ``torch_memory`` = ``torch.cuda.memory_reserved`` (PyTorch caching pool)
+    ``non_torch_memory`` = cuda_memory - torch_memory (NCCL, attn workspaces,
+    FlashInfer/DeepGEMM buffers, other processes, base CUDA context, ...).
+    ``torch_peak`` = ``allocated_bytes.all.peak`` since the last reset.
+    """
+    torch_peak: int = 0
+    free_memory: int = 0
+    total_memory: int = 0
+    cuda_memory: int = 0
+    torch_memory: int = 0
+    non_torch_memory: int = 0
+
+    @classmethod
+    def measure(cls, device: int) -> "_MemSnapshot":
+        torch_peak = torch.cuda.memory_stats(device).get(
+            "allocated_bytes.all.peak", 0
+        )
+        free, total = torch.cuda.mem_get_info(device)
+        cuda_memory = total - free
+        torch_memory = torch.cuda.memory_reserved(device)
+        non_torch_memory = cuda_memory - torch_memory
+        return cls(
+            torch_peak=torch_peak, free_memory=free, total_memory=total,
+            cuda_memory=cuda_memory, torch_memory=torch_memory,
+            non_torch_memory=non_torch_memory,
+        )
 
 
 ATTN_BACKEND_CONFIG = get_attn_backend_config()
@@ -275,6 +342,21 @@ class ModelRunner:
         self.max_num_batched_tokens = max_num_batched_tokens if max_num_batched_tokens is not None else _DEFAULT_MAX_NUM_BATCHED_TOKENS
 
         torch.cuda.set_device(rank)
+        # vLLM-style memory profiling: take a baseline snapshot BEFORE any
+        # engine-driven allocations so we can later subtract them from the
+        # KV-cache budget.  Mirrors vLLM's `init_snapshot` captured in
+        # ``Worker.__init__`` (see vllm/v1/worker/gpu_worker.py).
+        import gc as _gc
+        _gc.collect()
+        torch.cuda.empty_cache()
+        self._baseline_snapshot = _MemSnapshot.measure(rank)
+        # Filled in later: weights memory after model load, transient peak
+        # during profile run, non-torch increase from NCCL/workspaces.
+        self._weights_memory: int = 0
+        self._torch_peak_increase: int = 0
+        self._non_torch_increase: int = 0
+        self._memory_profile_done: bool = False
+
         dist.init_process_group(
             "nccl", f"tcp://localhost:{NCCL_PORT}",
             world_size=world_size, rank=rank,
@@ -344,6 +426,10 @@ class ModelRunner:
         self.model, self.config = load_model(
             model_name, torch.device(f"cuda:{rank}"), dtype,
         )
+        # Weights memory = currently-allocated torch bytes after load.
+        # Mirrors vLLM's ``model_runner.model_memory_usage`` argument to
+        # ``memory_profiling(weights_memory=...)``.
+        self._weights_memory = torch.cuda.memory_allocated(rank)
         model_type = getattr(self.config, "model_type", "")
         self.is_mamba2 = model_type == "mamba2"
         self.is_mamba = model_type in ("mamba", "mamba2")
@@ -367,6 +453,8 @@ class ModelRunner:
         self._compiled = False
         self.num_blocks = 0  # set by allocate_kv_cache (attention) only
         self.mamba_state_manager: MambaStateManager | None = None
+        self._indexer_schedule_buf: torch.Tensor | None = None
+        self._num_sms = 0
         if rank == 0:
             print(f"  [1/6] Model loaded in {_time.perf_counter()-_t0:.1f}s", flush=True)
         if self.is_mamba:
@@ -413,6 +501,7 @@ class ModelRunner:
                 print(f"  [3/6] DeepGEMM done in {_time.perf_counter()-_t2:.1f}s", flush=True)
                 print(f"  [4/6] Allocating KV cache...", flush=True)
             _t3 = _time.perf_counter()
+            self.finalize_memory_profile()
             self.allocate_kv_cache()
             self._init_fa3_decode_buffers()
             if rank == 0:
@@ -564,8 +653,20 @@ class ModelRunner:
                 module.set_shared_ssm_out_buffer(shared_ssm_out)
 
     def warmup_model(self):
+        # vLLM-style memory profiling around the warmup forward pass.  Mirrors
+        # ``memory_profiling()`` from vllm/utils/mem_utils.py:
+        #   1. gc + empty_cache + reset_peak_memory_stats
+        #   2. snapshot before profile run
+        #   3. run the worst-case prefill (== vLLM's profile_run)
+        #   4. let downstream init steps (DeepGEMM warmup, etc.) keep
+        #      accumulating; ``finalize_memory_profile()`` (called right
+        #      before allocate_kv_cache) captures the cumulative peak +
+        #      non-torch increase so the KV-cache budget matches vLLM.
+        import gc as _gc
+        _gc.collect()
         torch.cuda.empty_cache()
         torch.cuda.reset_peak_memory_stats()
+        self._before_profile_snapshot = _MemSnapshot.measure(self.rank)
 
         if self.is_qwen_vl:
             self._warmup_vision_encoder()
@@ -573,12 +674,83 @@ class ModelRunner:
         if self.is_whisper:
             self._warmup_whisper()
         else:
-            warmup_len = min(self.max_model_len, self.max_num_batched_tokens)
-            num_seqs = min(self.max_num_batched_tokens // warmup_len, self.max_num_seqs)
-            seqs = [Sequence([0] * warmup_len) for _ in range(num_seqs)]
+            # Match vLLM's ``profile_run``: the worst-case prefill exercises
+            # the full ``max_num_batched_tokens`` budget (16384 by default).
+            # Capping at ``max_model_len`` per-sequence used to under-profile
+            # transient activations whenever ``max_model_len <
+            # max_num_batched_tokens`` (DeepSeek-V3.2 with max_model_len=4352
+            # only ran 13056 of the 16384 budget, missing ~1 GiB of scratch).
+            #
+            # Build a list of sequences whose total token count equals
+            # ``max_num_batched_tokens`` (or is as close to it as possible
+            # without exceeding ``max_num_seqs``).  Each sequence is at most
+            # ``max_model_len`` tokens long.
+            budget = int(self.max_num_batched_tokens)
+            cap = int(self.max_model_len)
+            max_seqs = int(self.max_num_seqs)
+            seqs: list[Sequence] = []
+            remaining = budget
+            while remaining > 0 and len(seqs) < max_seqs:
+                take = min(cap, remaining)
+                seqs.append(Sequence([0] * take))
+                remaining -= take
+            if not seqs:
+                seqs.append(Sequence([0] * min(cap, budget)))
             self.run(seqs, True)
 
+        # Note: do NOT compute the increases here.  We let DeepGEMM warmup
+        # and any other post-warmup init step keep growing the peak/non-torch
+        # measurements; finalize_memory_profile() picks up the cumulative
+        # state right before allocate_kv_cache.
+
+    def finalize_memory_profile(self) -> None:
+        """Compute torch_peak_increase and non_torch_increase, then mark
+        the profile complete.  Called RIGHT BEFORE allocate_kv_cache so the
+        snapshot includes everything that grows non-torch memory between
+        warmup and KV-cache sizing — most importantly the DeepGEMM JIT
+        kernel cache and any post-warmup workspace allocations.
+
+        ``allocated_bytes.all.peak`` accumulates since the last reset
+        (which we did at the start of warmup_model), so it captures the
+        max torch peak across warmup AND DeepGEMM warmup automatically.
+        """
+        if not hasattr(self, "_before_profile_snapshot"):
+            raise RuntimeError(
+                "finalize_memory_profile() called before warmup_model()"
+            )
+        if self._memory_profile_done:
+            return
+        import gc as _gc
+        # Capture peak BEFORE empty_cache so transient activation peaks are
+        # preserved even after caching allocator releases segments.
+        profile_torch_peak = torch.cuda.memory_stats(self.rank).get(
+            "allocated_bytes.all.peak", 0
+        )
+        _gc.collect()
         torch.cuda.empty_cache()
+        after_profile = _MemSnapshot.measure(self.rank)
+        self._torch_peak_increase = max(
+            0, profile_torch_peak - self._before_profile_snapshot.torch_peak
+        )
+        self._non_torch_increase = max(
+            0,
+            after_profile.non_torch_memory
+            - self._baseline_snapshot.non_torch_memory,
+        )
+        self._memory_profile_done = True
+        if self.rank == 0:
+            non_kv = (
+                self._non_torch_increase
+                + self._torch_peak_increase
+                + self._weights_memory
+            )
+            _GiB = 1 << 30
+            print(
+                f"  Memory profile (rank0): weights={self._weights_memory / _GiB:.2f} GiB, "
+                f"peak_activation={self._torch_peak_increase / _GiB:.2f} GiB, "
+                f"non_torch={self._non_torch_increase / _GiB:.2f} GiB, "
+                f"non_kv_total={non_kv / _GiB:.2f} GiB"
+            )
 
     def _warmup_deepgemm(self):
         """Pre-JIT DeepGEMM FP8 kernels for all weight shapes at decode and
@@ -609,6 +781,27 @@ class ModelRunner:
 
         max_decode = self.max_num_seqs
         max_prefill = self.max_num_batched_tokens
+        # Optional override: shrink the per-(K,N) FP8 prefill buffer cap to
+        # free non-KV memory for additional KV slots.  Read from
+        # ``KB_NANO_FP8_PREFILL_MAX_TOKENS`` (int, tokens).  Prefill batches
+        # larger than this fall back to per-call ``torch.empty`` allocations
+        # (slow path inside ``Fp8Linear.forward``) -- only meaningful for
+        # decode-heavy workloads where prefill latency is amortized but
+        # decode KV concurrency dominates throughput.
+        _pf_cap_env = os.environ.get("KB_NANO_FP8_PREFILL_MAX_TOKENS", "")
+        if _pf_cap_env:
+            try:
+                _pf_cap = int(_pf_cap_env)
+                if _pf_cap > 0:
+                    max_prefill = min(max_prefill, _pf_cap)
+                    if self.rank == 0:
+                        print(
+                            f"  FP8 prefill buffer cap overridden to "
+                            f"{max_prefill} tokens (env "
+                            f"KB_NANO_FP8_PREFILL_MAX_TOKENS)"
+                        )
+            except ValueError:
+                pass
         device = next(self.model.parameters()).device
 
         decode_bs = [1, 2, 4, 8] + list(range(16, max_decode + 1, 16))
@@ -616,6 +809,15 @@ class ModelRunner:
                       if s <= max_prefill and s > max_decode]
 
         prefill_bufs: dict[tuple[int, int], _Fp8PrefillBufs] = {}
+        # Shared FP8 input + scale buffers per unique input dim ``K``.  The
+        # original layout allocated a fresh ``a`` (max_tokens × K, FP8) and
+        # ``s`` (max_tokens × K/128, FP32) for *every* unique (N, K) pair,
+        # which duplicated up to ~117 MiB per pair on K=7168 layers.  Sharing
+        # by K trims ~240 MiB of persistent activation footprint on
+        # DeepSeek-V3.2 TP=8 (3 distinct K=7168 (N, K) pairs) which feeds
+        # straight back into the KV cache budget.
+        shared_a_by_k: dict[int, torch.Tensor] = {}
+        shared_s_by_k: dict[int, torch.Tensor] = {}
 
         seen_shapes = set()
         for module, linear_op in fp8_modules:
@@ -623,11 +825,33 @@ class ModelRunner:
             ws = module.weight_scale_inv
             N, K = w.shape
 
-            linear_op._ensure_buffers(max_decode, K, N, device)
+            # Per-Fp8Linear ``_a_buf``/``_s_buf``/``_o_buf`` (sized to
+            # ``max_num_seqs``) used to be allocated here for every one of
+            # the ~488 FP8 linear layers, costing ~5 GiB of persistent
+            # decode scratch on DeepSeek-V3.2 TP=8.  vLLM allocates these
+            # fresh per call (no persistence) and survives because
+            # PyTorch's caching allocator keeps the same address across
+            # CUDA-graph capture/replay for transient tensors.  We keep a
+            # single shared buffer per ``(N, K)`` (sized to
+            # ``max_num_batched_tokens``, which is always >= max_decode)
+            # via ``_pf`` and re-use it for the decode path too —
+            # eliminating the per-instance allocations entirely.
 
             key = (N, K)
             if key not in prefill_bufs:
-                prefill_bufs[key] = _Fp8PrefillBufs(max_prefill, K, N, device)
+                if K not in shared_a_by_k:
+                    pf_full = _Fp8PrefillBufs(max_prefill, K, N, device)
+                    shared_a_by_k[K] = pf_full.a
+                    shared_s_by_k[K] = pf_full.s
+                    prefill_bufs[key] = pf_full
+                else:
+                    pf = _Fp8PrefillBufs.__new__(_Fp8PrefillBufs)
+                    pf.a = shared_a_by_k[K]
+                    pf.s = shared_s_by_k[K]
+                    pf.o = torch.empty(
+                        max_prefill, N, dtype=torch.bfloat16, device=device,
+                    )
+                    prefill_bufs[key] = pf
             linear_op._pf = prefill_bufs[key]
 
             if skip_jit or key in seen_shapes:
@@ -635,19 +859,20 @@ class ModelRunner:
                 continue
             seen_shapes.add(key)
 
-            a_fp8 = linear_op._a_buf
-            a_scale = linear_op._s_buf
-            out = linear_op._o_buf
+            pf = prefill_bufs[key]
+            # JIT-warm both the decode and prefill batch sizes against the
+            # same shared buffer (pf.a / pf.s / pf.o).  The prefill buffer
+            # is always at least ``max_decode`` rows, so the slice is
+            # legal for every ``num_tokens`` in either list.
             for num_tokens in decode_bs:
                 if num_tokens > max_decode:
                     break
                 deep_gemm.fp8_gemm_nt(
-                    (a_fp8[:num_tokens], a_scale[:num_tokens]),
+                    (pf.a[:num_tokens], pf.s[:num_tokens]),
                     (w, ws),
-                    out[:num_tokens],
+                    pf.o[:num_tokens],
                 )
 
-            pf = prefill_bufs[key]
             for num_tokens in prefill_bs:
                 deep_gemm.fp8_gemm_nt(
                     (pf.a[:num_tokens], pf.s[:num_tokens]),
@@ -806,6 +1031,61 @@ class ModelRunner:
                     device=f"cuda:{self.rank}",
                 )
 
+    def _compute_available_kv_cache_bytes(self) -> int:
+        """Return KV-cache budget in bytes — port of vLLM's
+        ``determine_available_memory()`` (vllm/v1/worker/gpu_worker.py).
+
+        Formula::
+
+            requested_memory   = total * gpu_memory_utilization
+            non_kv_cache_bytes = non_torch_increase
+                               + torch_peak_increase     (peak activations)
+                               + weights_memory
+            available_kv       = requested_memory - non_kv_cache_bytes
+
+        ``non_torch_increase`` is the increase of CUDA-but-not-torch memory
+        from baseline (before engine init) to after the warmup pass —
+        captures NCCL workspaces, attention backend scratch (TRTLLM, FA3),
+        FlashInfer/DeepGEMM static buffers, etc.
+
+        ``torch_peak_increase`` is the peak torch allocation observed during
+        the warmup forward, minus what was already allocated before warmup
+        (i.e. the worst-case transient activation memory).
+
+        ``weights_memory`` is the torch allocation right after model load.
+
+        This intentionally does NOT subtract a separate CUDA-graph estimate
+        — vLLM only does so when ``VLLM_MEMORY_PROFILER_ESTIMATE_CUDAGRAPHS``
+        is set (off by default), which means the captured graph pool eats
+        into the (1 - gpu_memory_utilization) headroom.  We match that
+        behaviour exactly so KV-cache sizes are directly comparable.
+        """
+        if not self._memory_profile_done:
+            raise RuntimeError(
+                "_compute_available_kv_cache_bytes() called before warmup_model()"
+                " — memory profile has not been captured yet."
+            )
+        total = self._baseline_snapshot.total_memory
+        non_kv_cache_bytes = (
+            self._non_torch_increase
+            + self._torch_peak_increase
+            + self._weights_memory
+        )
+        available = int(total * self.gpu_memory_utilization) - non_kv_cache_bytes
+        # Optional override knob (default 0).  Lets users trade headroom for
+        # extra KV cache when their workload doesn't hit the profiled peak.
+        available += _kv_cache_extra_bytes()
+        if available <= 0:
+            raise RuntimeError(
+                f"Computed KV cache budget is non-positive: {available} bytes "
+                f"(total={total}, gmu={self.gpu_memory_utilization}, "
+                f"weights={self._weights_memory}, peak_act={self._torch_peak_increase}, "
+                f"non_torch={self._non_torch_increase}). "
+                f"Consider lowering gpu_memory_utilization or freeing other GPU "
+                f"processes."
+            )
+        return available
+
     def allocate_kv_cache(self):
         if not hasattr(self, '_attn_layers') or not self._attn_layers:
             self._attn_layers = []
@@ -821,17 +1101,13 @@ class ModelRunner:
             self._allocate_mla_kv_cache()
             return
 
-        free, total = torch.cuda.mem_get_info()
-        used = total - free
-        peak = torch.cuda.memory_stats()["allocated_bytes.all.peak"]
-        current = torch.cuda.memory_stats()["allocated_bytes.all.current"]
         num_kv_heads = self.config.num_key_value_heads // self.world_size
         head_dim = self.config.head_dim
         num_self_attn_layers = len(self._attn_layers)
         num_cross_attn_layers = len(self._cross_attn_layers)
         elem_size = torch.finfo(torch.get_default_dtype()).bits // 8
 
-        available_bytes = int(total * self.gpu_memory_utilization - used - peak + current)
+        available_bytes = self._compute_available_kv_cache_bytes()
 
         if num_cross_attn_layers > 0:
             max_encoder_tokens = getattr(self.config, 'max_source_positions', 1500)
@@ -882,7 +1158,13 @@ class ModelRunner:
         assert num_blocks > 0, f"Not enough GPU memory for KV cache on rank {self.rank}"
         self.num_blocks = num_blocks
         if self.rank == 0:
-            print(f"  KV cache: {num_blocks} blocks x {BLOCK_SIZE} = {num_blocks * BLOCK_SIZE} token slots")
+            extra_gb = _kv_cache_extra_bytes() / (1 << 30)
+            extra_msg = f" [override: {extra_gb:+.2f} GiB]" if extra_gb else ""
+            print(
+                f"  KV cache: {num_blocks} blocks x {BLOCK_SIZE} = "
+                f"{num_blocks * BLOCK_SIZE} token slots "
+                f"({available_bytes / (1 << 30):.2f} GiB budget){extra_msg}"
+            )
 
         if ATTN_BACKEND_CONFIG.kv_layout == "HND":
             self.kv_cache = torch.empty(
@@ -1937,16 +2219,12 @@ class ModelRunner:
             bytes_per_slot = cache_last_dim * 2  # BF16 = 2 bytes/element
             backend_desc = "BF16 KV cache"
 
-        free, total = torch.cuda.mem_get_info()
-        used = total - free
-        peak = torch.cuda.memory_stats()["allocated_bytes.all.peak"]
-        current = torch.cuda.memory_stats()["allocated_bytes.all.current"]
-
         kv_bytes_per_block = num_layers * _MLA_BLOCK_SIZE * bytes_per_slot
         idx_bytes_per_block = num_indexer_layers * _MLA_BLOCK_SIZE * _INDEXER_CACHE_BYTES
         total_bytes_per_block = kv_bytes_per_block + idx_bytes_per_block
 
-        num_blocks = int(total * self.gpu_memory_utilization - used - peak + current) // total_bytes_per_block
+        budget_bytes = self._compute_available_kv_cache_bytes()
+        num_blocks = budget_bytes // total_bytes_per_block
         assert num_blocks > 0, f"Not enough GPU memory for MLA KV cache on rank {self.rank}"
         self.num_blocks = num_blocks
         self.block_size = _MLA_BLOCK_SIZE
@@ -1963,9 +2241,14 @@ class ModelRunner:
         )
 
         if self.rank == 0:
-            print(f"  MLA KV cache: {num_blocks} blocks x {_MLA_BLOCK_SIZE} = "
-                  f"{num_blocks * _MLA_BLOCK_SIZE} token slots ({num_layers} layers, "
-                  f"{bytes_per_slot} bytes/token, dtype={kv_cache_dtype})")
+            extra_gb = _kv_cache_extra_bytes() / (1 << 30)
+            extra_msg = f" [override: {extra_gb:+.2f} GiB]" if extra_gb else ""
+            print(
+                f"  MLA KV cache: {num_blocks} blocks x {_MLA_BLOCK_SIZE} = "
+                f"{num_blocks * _MLA_BLOCK_SIZE} token slots ({num_layers} layers, "
+                f"{bytes_per_slot} bytes/token, dtype={kv_cache_dtype}, "
+                f"budget={budget_bytes / (1 << 30):.2f} GiB){extra_msg}"
+            )
 
         device = f"cuda:{self.rank}"
         for i, layer in enumerate(mla_layers):
@@ -1986,6 +2269,23 @@ class ModelRunner:
                     num_blocks, _MLA_BLOCK_SIZE, _INDEXER_CACHE_BYTES,
                     dtype=torch.uint8, device=device,
                 )
+            # Persistent paged-MQA-logits scheduler buffer, shared by every
+            # indexer layer for an entire decode step.  Allocated HERE
+            # (after KV cache, BEFORE CUDA-graph capture) so its address
+            # lives in the default mempool, not in the captured graph pool.
+            # The engine writes fresh contents into this buffer eagerly
+            # before each ``graph.replay()``; the captured kernels read
+            # from the same data_ptr at run time.  Mirrors vLLM's
+            # IndexerMetadataBuilder schedule_metadata tensor.
+            self._num_sms = (
+                torch.cuda.get_device_properties(device).multi_processor_count
+            )
+            self._indexer_schedule_buf = torch.empty(
+                self._num_sms + 1, 2, dtype=torch.int32, device=device,
+            )
+        else:
+            self._num_sms = 0
+            self._indexer_schedule_buf = None
 
         if self.rank == 0:
             print(f"  MLA attention backend: FlashMLA (block_size={_MLA_BLOCK_SIZE}, {backend_desc})")
@@ -2442,11 +2742,37 @@ class ModelRunner:
         """
         n, ids_np, pos_np, sm_np, cl_np, bt_np = decode_data
 
-        if self.enforce_eager:
+        # CUDA graphs are only captured up to graph_bs_list[-1] (e.g. 512 for
+        # the DeepSeek/Llama defaults). Larger decode batches cannot use a
+        # captured graph and must use the eager path -- mirrors the same check
+        # in run_model() for the prefill/oversize fallback.
+        if self.enforce_eager or n > self.graph_bs_list[-1]:
             return self._run_decode_greedy_eager(n, ids_np, pos_np, sm_np, cl_np, bt_np)
 
         self._run_graph_from_numpy(n, ids_np, pos_np, sm_np, cl_np, bt_np)
         return self._greedy_from_hidden(n)
+
+    def _update_indexer_schedule(self, context_lens: torch.Tensor) -> None:
+        """Refresh the persistent paged-MQA-logits scheduler buffer for
+        the current decode step.
+
+        Computed eagerly on the current CUDA stream (NOT inside any captured
+        graph) and ``copy_``-ed into ``self._indexer_schedule_buf`` whose
+        data_ptr is what every SparseAttnIndexer layer kernel reads at
+        replay time.  Mirrors vLLM's IndexerMetadataBuilder.build()
+        which builds schedule_metadata once per scheduler step and
+        broadcasts it to every layer.
+
+        ``context_lens`` may be padded to the captured graph batch size
+        (slots beyond the active batch are zero-filled by the engine), so
+        the schedule covers the full padded length — matching what vLLM
+        does for its decode-only batches.
+        """
+        import deep_gemm
+        sched = deep_gemm.get_paged_mqa_logits_metadata(
+            context_lens, self.block_size, self._num_sms,
+        )
+        self._indexer_schedule_buf.copy_(sched, non_blocking=True)
 
     def _run_graph_from_numpy(self, n, ids_np, pos_np, sm_np, cl_np, bt_np):
         """Copy numpy arrays into graph vars and replay the CUDA graph."""
@@ -2467,6 +2793,10 @@ class ModelRunner:
         gv["block_tables"][:n, :bt_np.shape[1]].copy_(
             torch.from_numpy(bt_np), non_blocking=True
         )
+        # Refresh the indexer schedule buffer (out-of-graph) so the
+        # captured kernels read fresh paged-MQA metadata at replay.
+        if self._indexer_schedule_buf is not None:
+            self._update_indexer_schedule(gv["context_lens"][:graph_bs])
         self._prev_decode_n = n
         self.graphs[graph_bs].replay()
 
@@ -2479,7 +2809,9 @@ class ModelRunner:
         """
         n, ids_np, pos_np, sm_np, cl_np, bt_np = decode_data
 
-        if self.enforce_eager:
+        # See run_decode_greedy_fast: batches larger than the largest captured
+        # CUDA graph must use the eager path (no graph exists for them).
+        if self.enforce_eager or n > self.graph_bs_list[-1]:
             result = self._run_decode_greedy_eager(n, ids_np, pos_np, sm_np, cl_np, bt_np)
             if result is not None:
                 main_stream = torch.cuda.current_stream()
@@ -2520,6 +2852,8 @@ class ModelRunner:
         req_id_per_token = getattr(self, "_decode_req_id_buf", None)
         if req_id_per_token is not None:
             req_id_per_token = req_id_per_token[:n]
+        if self._indexer_schedule_buf is not None:
+            self._update_indexer_schedule(context_lens)
         set_context(
             False,
             slot_mapping=slot_mapping,
@@ -2527,6 +2861,7 @@ class ModelRunner:
             block_tables=block_tables,
             max_context_len=int(cl_np.max()),
             req_id_per_token=req_id_per_token,
+            indexer_paged_mqa_schedule=self._indexer_schedule_buf,
         )
         self._apply_pending_cross_ctx()
         hidden = self.model(input_ids, positions)
@@ -3349,12 +3684,20 @@ class ModelRunner:
         # Single warmup at the largest batch size to trigger all Triton/CUDA
         # kernel JIT compilation. Subsequent captures reuse compiled kernels.
         largest_bs = _graph_list[0]
+        # If the model has DSA indexer layers, populate the persistent
+        # schedule buffer eagerly using the warmup context_lens so the
+        # warmup forward (which JIT-compiles the indexer kernels) sees
+        # valid metadata; the captured graphs will read from the same
+        # buffer at replay time.
+        if self._indexer_schedule_buf is not None:
+            self._update_indexer_schedule(context_lens[:largest_bs])
         set_context(
             False, slot_mapping=slot_mapping[:largest_bs],
             context_lens=context_lens[:largest_bs],
             block_tables=block_tables[:largest_bs],
             max_context_len=self.max_model_len,
             req_id_per_token=decode_req_id[:largest_bs],
+            indexer_paged_mqa_schedule=self._indexer_schedule_buf,
         )
         # Mark batch dim as dynamic BEFORE the first compile-triggering forward
         # so Dynamo / Inductor produce a single symbolic-shape compiled graph
@@ -3394,11 +3737,14 @@ class ModelRunner:
                     print(f"    CUDA graph {_gi+1}/{len(_graph_list)} (bs={bs})",
                           flush=True)
                 graph = torch.cuda.CUDAGraph()
+                if self._indexer_schedule_buf is not None:
+                    self._update_indexer_schedule(context_lens[:bs])
                 set_context(
                     False, slot_mapping=slot_mapping[:bs],
                     context_lens=context_lens[:bs], block_tables=block_tables[:bs],
                     max_context_len=self.max_model_len,
                     req_id_per_token=decode_req_id[:bs],
+                    indexer_paged_mqa_schedule=self._indexer_schedule_buf,
                 )
 
                 ids_slice = input_ids[:bs]
@@ -3467,7 +3813,13 @@ class ModelRunner:
             lm_logits=lm_logits, lm_max_vals=lm_max_vals,
             lm_max_idxs=lm_max_idxs,
         )
-        # Pre-compute lookup table: _graph_bs_for_n[n] = smallest graph_bs >= n
+        # Pre-compute lookup table: _graph_bs_for_n[n] = smallest graph_bs >= n.
+        # When n exceeds the largest captured bucket (max_capture, may be < max_bs
+        # because compile time blows up past 512), clamp to the largest captured
+        # bucket. Callers must independently fall back to the eager decode path
+        # for n > graph_bs_list[-1] (see run_decode_greedy_fast); clamping here
+        # prevents a KeyError if that guard is ever missed.
+        largest_captured = self.graph_bs_list[-1]
         self._graph_bs_for_n = [0] * (max_bs + 1)
         for n in range(max_bs + 1):
             for x in self.graph_bs_list:
@@ -3475,7 +3827,7 @@ class ModelRunner:
                     self._graph_bs_for_n[n] = x
                     break
             else:
-                self._graph_bs_for_n[n] = max_bs
+                self._graph_bs_for_n[n] = largest_captured
 
 
 # ---------------------------------------------------------------------------
@@ -4975,6 +5327,23 @@ class LlamaEngine:
             print(f"  pure_mm_prefill:   {sp['pure_mm_prefill']:6d} steps, {sp['mm_prefill_tokens']:10d} tokens, {sp['mm_prefill_time']:.3f}s")
             print(f"  mixed_text:        {sp['mixed_text']:6d} steps, pf={sp['mixed_text_pf_tokens']:10d} dc={sp['mixed_text_dc_tokens']:10d}")
             print(f"  mixed_mm:          {sp['mixed_mm']:6d} steps, pf={sp['mixed_mm_pf_tokens']:10d} dc={sp['mixed_mm_dc_tokens']:10d}, {sp['mixed_mm_time']:.3f}s")
+            _fp = getattr(self, '_fast_path_profile', None)
+            if _fp is not None and _fp['n'] > 0:
+                n = _fp['n']
+                tot = (_fp['prep'] + _fp['gpu'] + _fp['tolist'] + _fp['post']) * 1e6 / n
+                print(
+                    f"  fast_path per-step (us, n={n}): "
+                    f"prep={_fp['prep'] * 1e6 / n:.1f}, "
+                    f"launch={_fp['gpu'] * 1e6 / n:.1f}, "
+                    f"wait+tolist={_fp['tolist'] * 1e6 / n:.1f}, "
+                    f"post={_fp['post'] * 1e6 / n:.1f}, "
+                    f"total={tot:.1f}"
+                )
+                print(
+                    f"  fast_path overlappable CPU per step: "
+                    f"~{(_fp['prep'] + _fp['post']) * 1e6 / n:.1f} us "
+                    f"({(_fp['prep'] + _fp['post']) / (_fp['prep'] + _fp['gpu'] + _fp['tolist'] + _fp['post']) * 100:.1f}% of step)"
+                )
 
         # Return in original order
         return [

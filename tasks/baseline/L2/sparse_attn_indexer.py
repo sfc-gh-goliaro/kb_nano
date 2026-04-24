@@ -174,14 +174,16 @@ class SparseAttnIndexer(nn.Module):
         k_pe = k[:, :self.rope_dim]  # [M, rope_dim]
         k_nope = k[:, self.rope_dim:]  # [M, head_dim - rope_dim]
 
-        # RoPE on pe components
-        q_pe, k_pe_out = rope_emb(positions, q_pe, k_pe.unsqueeze(1))
-        q_pe = q_pe.reshape(M, self.n_head, self.rope_dim)
-        k_pe_out = k_pe_out.reshape(M, 1, self.rope_dim)
-
-        # Concat pe + nope
-        q = torch.cat([q_pe, q_nope], dim=-1)  # [M, n_head, head_dim]
-        k = torch.cat([k_pe_out.squeeze(1), k_nope], dim=-1)  # [M, head_dim]
+        # RoPE on pe components: rope_emb writes in-place into the slices
+        # ``q_pe = q[..., :rope_dim]`` and ``k[:, :rope_dim]`` (both views).
+        # After the call, the original ``q`` and ``k`` tensors already contain
+        # ``[pe_rotated || nope]`` on dim=-1, so the explicit ``torch.cat`` to
+        # rebuild q/k is redundant — eliding it saves two CatArrayBatchedCopy
+        # kernel launches per layer per step (3904 launches @ ~32 ms total in
+        # DeepSeek-V3.2 TP=8 BS=128 decode-32).  The kb_nano_rope CUDA kernel
+        # (and FlashInfer's flashinfer_rotary_embedding) both pass strides
+        # explicitly and support non-contiguous head-dim slices.
+        rope_emb(positions, q_pe, k_pe.unsqueeze(1))
 
         # FP8 quantize Q via the public L1 op
         q_flat = q.reshape(-1, self.head_dim).contiguous()
@@ -297,11 +299,22 @@ class SparseAttnIndexer(nn.Module):
         B = ctx.decode_context_lens.shape[0]
         next_n = M // B if B > 0 else 1
 
-        schedule = self.paged_mqa_metadata(
-            ctx.decode_context_lens,
-            block_size,
-            num_sms,
-        )
+        # Per-step paged-MQA-logits scheduler metadata.  The engine
+        # populates ``ctx.indexer_paged_mqa_schedule`` once per decode
+        # step (out-of-graph, before any captured ``graph.replay()``)
+        # and shares the SAME persistent buffer across every indexer
+        # layer — same pattern as vLLM's IndexerMetadataBuilder.  When
+        # the schedule is missing (mixed prefill+decode batches that
+        # bypass the engine builder, smoke tests, or eager fallback
+        # paths that the engine plumbing has not been extended to)
+        # we fall back to computing it inline.
+        schedule = ctx.indexer_paged_mqa_schedule
+        if schedule is None:
+            schedule = self.paged_mqa_metadata(
+                ctx.decode_context_lens,
+                block_size,
+                num_sms,
+            )
         q_fp8_4d = q_fp8.view(B, next_n, self.n_head, self.head_dim)
         kv_cache_4d = self.indexer_k_cache.unsqueeze(-2)
         logits = self.fp8_mqa_logits.forward_decode(

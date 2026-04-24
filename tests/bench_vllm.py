@@ -3,7 +3,13 @@
 Throughput and alignment benchmark: kb-nano baseline vs vLLM.
 
 For LLM models: runs three text-only scenarios (prefill-heavy, balanced,
-decode-heavy) with random token IDs.
+decode-heavy) using real prompts downloaded from the Hugging Face Hub at
+``sfc-gh-goliaro/kb-nano-{scenario}`` (built from LongBench, WildChat-1M,
+and OpenThoughts-114k respectively, tokenized with Llama-3.1-8B-Instruct).
+Each request's prompt and per-request decode length come from the dataset;
+generation runs with ``ignore_eos=True`` so the decode budget is honored
+exactly. Pass ``--workload random`` to fall back to the legacy synthetic
+random-token scenarios.
 
 For VLM models (Qwen2-VL, Qwen3-VL): runs three throughput scenarios
 (text-only, image, video) and two latency scenarios (single-image,
@@ -13,8 +19,12 @@ Each engine (vLLM, kb-nano) is loaded once in a single long-lived subprocess
 that processes all scenarios sequentially, avoiding repeated model loading.
 
 Usage:
-    # LLM benchmark
+    # LLM benchmark (real prompts by default)
     python tests/bench_vllm.py --model meta-llama/Llama-3.1-8B-Instruct
+
+    # LLM benchmark with the legacy synthetic random-token scenarios
+    python tests/bench_vllm.py --model meta-llama/Llama-3.1-8B-Instruct \
+        --workload random
 
     # VLM benchmark (auto-detected from model name)
     python tests/bench_vllm.py --model Qwen/Qwen2-VL-7B-Instruct
@@ -61,6 +71,12 @@ from kb_nano.bench.utils.worker import run_worker
 
 
 SCENARIOS = [
+    {"name": "prefill-heavy", "source": "real"},
+    {"name": "balanced",      "source": "real"},
+    {"name": "decode-heavy",  "source": "real"},
+]
+
+RANDOM_SCENARIOS = [
     {"name": "prefill-heavy", "input_len": 1024, "output_len": 512},
     {"name": "balanced",      "input_len": 512,  "output_len": 512},
     {"name": "decode-heavy",  "input_len": 512,  "output_len": 1024},
@@ -1272,6 +1288,13 @@ def main():
         help="Run only the throughput scenario with this name (e.g. "
              "'balanced'). Default: run all scenarios for the model type.",
     )
+    parser.add_argument(
+        "--workload", type=str, default="real",
+        choices=["real", "random"],
+        help="LLM workload type: 'real' (default) downloads the published "
+             "prompts from sfc-gh-goliaro/kb-nano-{scenario} on the HF Hub; "
+             "'random' uses the legacy synthetic random-token scenarios.",
+    )
     args = parser.parse_args()
 
     if args.num_seqs is None:
@@ -1293,7 +1316,9 @@ def main():
         throughput_scenarios = VLM_SCENARIOS
         latency_scenarios = VLM_LATENCY_SCENARIOS
     else:
-        throughput_scenarios = SCENARIOS
+        throughput_scenarios = (
+            SCENARIOS if args.workload == "real" else RANDOM_SCENARIOS
+        )
         latency_scenarios = LATENCY_SCENARIOS
 
     if is_vlm and not is_whisper and args.modality != "all":
@@ -1339,7 +1364,82 @@ def main():
                 continue
 
             modality = scenario.get("modality", "text") if is_vlm else "text"
-            if modality == "text":
+            if modality == "text" and scenario.get("source") == "real":
+                from kb_nano.bench.utils.datasets import (
+                    load_real_prompt_workload,
+                )
+                from transformers import AutoTokenizer
+                wl = load_real_prompt_workload(scenario["name"])
+                cfg = wl["config"]
+                prompt_cap = cfg.get("prompt_cap")  # may be None for bands
+                decode_cap = int(cfg["decode_cap"])
+                # Tokenize each request with the *target* model's tokenizer
+                # so the same workload is portable across models. The chat
+                # template is applied per-request; oversized prompts are
+                # left-truncated to prompt_cap (preserving the trailing
+                # assistant header), and the decode budget is
+                # min(len(tokenize(assistant_text)), decode_cap).
+                tok = AutoTokenizer.from_pretrained(args.model)
+                if getattr(tok, "chat_template", None) is None:
+                    # Some base / completion-style models (e.g.
+                    # deepseek-ai/DeepSeek-V3.2) ship without a chat_template.
+                    # For throughput benchmarking we only need realistic token
+                    # sequences, so install a minimal completion-style template
+                    # that concatenates message contents (no role markers) and
+                    # appends a blank line as the generation prompt.
+                    tok.chat_template = (
+                        "{% for m in messages %}{{ m['content'] }}"
+                        "{% if not loop.last %}\n\n{% endif %}{% endfor %}"
+                        "{% if add_generation_prompt %}\n\n{% endif %}"
+                    )
+                    print(
+                        f"[bench] {args.model} has no chat_template; using a "
+                        f"plain completion-style fallback for prompt construction."
+                    )
+                prompt_token_ids = []
+                output_lens = []
+                n_truncated = 0
+                for msgs, asst in zip(wl["messages"], wl["assistant_texts"]):
+                    ids = tok.apply_chat_template(
+                        msgs, tokenize=True, add_generation_prompt=True,
+                    )
+                    if prompt_cap is not None and len(ids) > prompt_cap:
+                        ids = list(ids[-prompt_cap:])
+                        n_truncated += 1
+                    prompt_token_ids.append(list(ids))
+                    ans_ids = tok.encode(
+                        asst or " ", add_special_tokens=False)
+                    output_lens.append(max(1, min(len(ans_ids), decode_cap)))
+                max_seq_len = max(
+                    len(p) + ol
+                    for p, ol in zip(prompt_token_ids, output_lens)
+                )
+                if max_seq_len > global_max_seq_len:
+                    global_max_seq_len = max_seq_len
+                p_mean = int(round(
+                    sum(len(p) for p in prompt_token_ids)
+                    / max(1, len(prompt_token_ids))
+                ))
+                o_mean = int(round(
+                    sum(output_lens) / max(1, len(output_lens))
+                ))
+                print(
+                    f"[{scenario['name']}] tokenized with {args.model}: "
+                    f"n={len(prompt_token_ids)} "
+                    f"mean_prompt={p_mean} mean_decode={o_mean} "
+                    f"max_seq={max_seq_len} truncated={n_truncated}"
+                )
+                scenario_data.append({
+                    "name": scenario["name"],
+                    "modality": "text",
+                    "input_len": p_mean,
+                    "output_len": o_mean,
+                    "prompt_token_ids": prompt_token_ids,
+                    "output_lens": output_lens,
+                    "source": "real",
+                    "stats": wl["stats"],
+                })
+            elif modality == "text":
                 rng_seed = args.seed + i
                 random.seed(rng_seed)
                 np.random.seed(rng_seed)
@@ -1530,20 +1630,28 @@ def main():
         for i, scenario in enumerate(throughput_scenarios):
             kb_data = kb_results[i]
             kb_tps = kb_data["total_output_tokens"] / kb_data["elapsed"]
+            sdata = scenario_data[i] if i < len(scenario_data) else {}
 
             result = {
                 "scenario": scenario["name"],
-                "num_seqs": kb_data.get("num_seqs", args.num_seqs),
+                "num_seqs": kb_data.get(
+                    "num_seqs", len(sdata.get("output_lens", []))
+                    or args.num_seqs),
                 "kb_nano_elapsed": kb_data["elapsed"],
                 "kb_nano_output_tokens": kb_data["total_output_tokens"],
                 "kb_nano_tok_per_s": kb_tps,
             }
-            if "input_len" in scenario:
-                result["input_len"] = scenario["input_len"]
+            in_len = scenario.get("input_len", sdata.get("input_len"))
+            if in_len is not None:
+                result["input_len"] = in_len
             if is_whisper:
                 result["total_audio_duration_s"] = kb_data.get(
                     "total_audio_duration_s", 0)
-            result["output_len"] = scenario["output_len"]
+            result["output_len"] = scenario.get(
+                "output_len", sdata.get("output_len", 0))
+            if sdata.get("source") == "real":
+                result["source"] = "real"
+                result["stats"] = sdata.get("stats", {})
 
             if vllm_results is not None:
                 v_data = vllm_results[i]

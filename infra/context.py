@@ -131,6 +131,21 @@ class Context:
     # Per-token request ID mapping (for sparse indexer index conversion)
     req_id_per_token: torch.Tensor | None = None
 
+    # Pre-computed paged-MQA-logits scheduler metadata for the DSA indexer.
+    # Built ONCE per decode step by the engine (out of any CUDA graph) and
+    # shared by all 58 SparseAttnIndexer layers, mirroring vLLM's
+    # ``IndexerMetadataBuilder`` (vllm/v1/attention/backends/mla/indexer.py).
+    # When non-None, ``SparseAttnIndexer._decode_topk`` skips its own
+    # ``deep_gemm.get_paged_mqa_logits_metadata`` call and reads from this
+    # tensor directly — saves ``num_layers - 1`` metadata kernel launches
+    # per step (~35 ms over 32 steps on DeepSeek-V3.2 TP=8 BS=128).
+    #
+    # The tensor MUST be allocated outside any CUDA-graph mempool so its
+    # data_ptr is stable across capture and replay; the engine writes
+    # to it eagerly before each ``graph.replay()`` so the captured kernels
+    # observe fresh contents at run time.
+    indexer_paged_mqa_schedule: torch.Tensor | None = None
+
     # Cross-attention metadata (encoder-decoder models like Whisper)
     # Slot mapping for writing encoder K/V to paged cache
     cross_slot_mapping: torch.Tensor | None = None
@@ -225,7 +240,8 @@ def set_context(is_prefill, cu_seqlens_q=None, cu_seqlens_k=None,
                 max_seqlen_q=0, max_seqlen_k=0, slot_mapping=None,
                 context_lens=None, block_tables=None,
                 max_context_len=0, chunked_context=None,
-                req_id_per_token=None):
+                req_id_per_token=None,
+                indexer_paged_mqa_schedule=None):
     global _CONTEXT
     # For pure-decode batches (``is_prefill=False`` with no mixed fields),
     # mirror the generic ``context_lens`` / ``block_tables`` / ``max_context_len``
@@ -245,7 +261,8 @@ def set_context(is_prefill, cu_seqlens_q=None, cu_seqlens_k=None,
                        no_compile_layers=_STATIC_NO_COMPILE_LAYERS,
                        decode_context_lens=dc_cl,
                        decode_block_tables=dc_bt,
-                       decode_max_context_len=dc_max)
+                       decode_max_context_len=dc_max,
+                       indexer_paged_mqa_schedule=indexer_paged_mqa_schedule)
 
 
 def set_mixed_context(
