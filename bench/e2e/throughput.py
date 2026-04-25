@@ -7,14 +7,14 @@ tokens/s.
 Usage (standalone):
     python -m kb_nano.bench.e2e throughput \\
         --model meta-llama/Llama-3.1-8B-Instruct \\
-        --dataset-name random --random-input-len 512 --random-output-len 128 \\
+        --dataset-name kb_nano \\
         --num-prompts 100
 
 Usage (with subprocess isolation):
     python -m kb_nano.bench.e2e throughput \\
         --model meta-llama/Llama-3.1-8B-Instruct \\
-        --subprocess \\
-        --dataset-name random --random-input-len 512 --random-output-len 128
+        --dataset-name kb_nano \\
+        --subprocess
 """
 
 from __future__ import annotations
@@ -28,6 +28,7 @@ import time
 import warnings
 from datetime import datetime
 from pathlib import Path
+from types import SimpleNamespace
 
 import numpy as np
 import torch
@@ -38,6 +39,7 @@ from kb_nano.bench.utils.datasets import (
     add_dataset_parser,
     get_samples,
 )
+from kb_nano.bench.utils.real_prompts import load_real_prompt_workload
 from kb_nano.bench.utils.worker import KB_NANO_WORKER, run_worker
 from kb_nano.infra.kernel_swapper import (
     apply_candidates,
@@ -178,6 +180,9 @@ def validate_args(args: argparse.Namespace):
     dataset_name = getattr(args, "dataset_name", "random")
     dataset_path = getattr(args, "dataset_path", None)
 
+    if dataset_name == "kb_nano":
+        return
+
     if dataset_name in ("random", "random-mm", "random-rerank"):
         random_input_len = getattr(args, "random_input_len", None)
         input_len = getattr(args, "input_len", None)
@@ -264,6 +269,12 @@ def add_cli_args(parser: argparse.ArgumentParser):
         "--no-candidate-kernels", action="store_true", default=False,
         help="Disable candidate kernel auto-detection; use only baseline kernels",
     )
+    parser.add_argument(
+        "--kb-nano-scenario", type=str, default="balanced",
+        choices=["prefill-heavy", "balanced", "decode-heavy"],
+        help="kb-nano WildChat-derived scenario to use with "
+             "--dataset-name=kb_nano.",
+    )
 
     add_dataset_parser(parser)
     parser.set_defaults(seed=42)
@@ -303,7 +314,28 @@ def main(args: argparse.Namespace):
     if not hasattr(args, "request_id_prefix"):
         args.request_id_prefix = ""
 
-    requests = get_samples(args, tokenizer)
+    dataset_name = getattr(args, "dataset_name", "random")
+    use_real_workload = dataset_name == "kb_nano"
+
+    if use_real_workload:
+        scenario_name = args.kb_nano_scenario
+        samples = load_real_prompt_workload(
+            scenario_name,
+            tokenizer,
+            num_requests=args.num_prompts,
+            decode_cap=args.output_len,
+            seed=args.seed,
+        )
+        requests = [
+            SimpleNamespace(
+                prompt=s.prompt_token_ids,
+                prompt_len=len(s.prompt_token_ids),
+                expected_output_len=s.output_len,
+            )
+            for s in samples
+        ]
+    else:
+        requests = get_samples(args, tokenizer)
     total_input_tokens = sum(r.prompt_len for r in requests)
     total_expected_output = sum(r.expected_output_len for r in requests)
 

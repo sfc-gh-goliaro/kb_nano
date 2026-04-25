@@ -3,7 +3,8 @@
 Throughput and alignment benchmark: kb-nano baseline vs vLLM.
 
 For LLM models: runs three text-only scenarios (prefill-heavy, balanced,
-decode-heavy) with random token IDs.
+decode-heavy) using WildChat-derived HuggingFace datasets, tokenized with
+the target model's chat template.
 
 For VLM models (Qwen2-VL, Qwen3-VL): runs three throughput scenarios
 (text-only, image, video) and two latency scenarios (single-image,
@@ -35,6 +36,7 @@ from random import randint
 import subprocess
 
 import numpy as np
+from transformers import AutoTokenizer
 
 
 def _detect_gpu_name() -> str:
@@ -58,12 +60,25 @@ _PROJECT_ROOT = _PACKAGE_DIR.parent
 sys.path.insert(0, str(_PROJECT_ROOT))
 
 from kb_nano.bench.utils.worker import run_worker
+from kb_nano.bench.utils.real_prompts import (
+    DEFAULT_WORKLOAD_DATASETS,
+    load_real_prompt_workload,
+)
 
 
 SCENARIOS = [
-    {"name": "prefill-heavy", "input_len": 1024, "output_len": 512},
-    {"name": "balanced",      "input_len": 512,  "output_len": 512},
-    {"name": "decode-heavy",  "input_len": 512,  "output_len": 1024},
+    {
+        "name": "prefill-heavy",
+        "dataset": DEFAULT_WORKLOAD_DATASETS["prefill-heavy"],
+    },
+    {
+        "name": "balanced",
+        "dataset": DEFAULT_WORKLOAD_DATASETS["balanced"],
+    },
+    {
+        "name": "decode-heavy",
+        "dataset": DEFAULT_WORKLOAD_DATASETS["decode-heavy"],
+    },
 ]
 
 LATENCY_SCENARIOS = [
@@ -72,7 +87,10 @@ LATENCY_SCENARIOS = [
 ]
 
 VLM_SCENARIOS = [
-    {"name": "text-only",  "modality": "text",  "input_len": 512, "output_len": 1024},
+    {
+        "name": "text-only", "modality": "text",
+        "dataset": DEFAULT_WORKLOAD_DATASETS["decode-heavy"],
+    },
     {"name": "image",      "modality": "image", "output_len": 512,
      "dataset": "lmarena-ai/VisionArena-Chat", "dataset_split": "train"},
     {"name": "video",      "modality": "video", "output_len": 512,
@@ -186,8 +204,15 @@ def main():
     latency_results = []
     for ls in cfg.get("latency_scenarios", []):
         prompts = [dict(prompt_token_ids=p) for p in ls["prompt_token_ids"]]
-        sp = SamplingParams(temperature=0.0,
-                            ignore_eos=True, max_tokens=ls["output_len"])
+        output_lens = ls.get("output_lens")
+        if output_lens is None:
+            sp = SamplingParams(temperature=0.0,
+                                ignore_eos=True, max_tokens=ls["output_len"])
+        else:
+            sp = [
+                SamplingParams(temperature=0.0, ignore_eos=True, max_tokens=ol)
+                for ol in output_lens
+            ]
         num_warmup = ls.get("num_warmup", 3)
         num_iters = ls.get("num_iters", 5)
         for _ in range(num_warmup):
@@ -293,8 +318,15 @@ def main():
     latency_results = []
     for ls in cfg.get("latency_scenarios", []):
         prompts = ls["prompt_token_ids"]
-        sp = SamplingParams(temperature=0.0,
-                            ignore_eos=True, max_tokens=ls["output_len"])
+        output_lens = ls.get("output_lens")
+        if output_lens is None:
+            sp = SamplingParams(temperature=0.0,
+                                ignore_eos=True, max_tokens=ls["output_len"])
+        else:
+            sp = [
+                SamplingParams(temperature=0.0, ignore_eos=True, max_tokens=ol)
+                for ol in output_lens
+            ]
         num_warmup = ls.get("num_warmup", 3)
         num_iters = ls.get("num_iters", 5)
         for _ in range(num_warmup):
@@ -627,8 +659,15 @@ def main():
 
         if modality == "text":
             prompts = [dict(prompt_token_ids=p) for p in ls["prompt_token_ids"]]
-            sp = SamplingParams(temperature=0.0,
-                                ignore_eos=True, max_tokens=ls["output_len"])
+            output_lens = ls.get("output_lens")
+            if output_lens is None:
+                sp = SamplingParams(temperature=0.0,
+                                    ignore_eos=True, max_tokens=ls["output_len"])
+            else:
+                sp = [
+                    SamplingParams(temperature=0.0, ignore_eos=True, max_tokens=ol)
+                    for ol in output_lens
+                ]
             run_fn = lambda: llm.generate(prompts, sp, use_tqdm=False)
         else:
             mm_data = _preload_mm_data(
@@ -802,8 +841,15 @@ def main():
 
         if modality == "text":
             prompts = ls["prompt_token_ids"]
-            sp = SamplingParams(temperature=0.0, ignore_eos=True,
-                                max_tokens=ls["output_len"])
+            output_lens = ls.get("output_lens")
+            if output_lens is None:
+                sp = SamplingParams(temperature=0.0, ignore_eos=True,
+                                    max_tokens=ls["output_len"])
+            else:
+                sp = [
+                    SamplingParams(temperature=0.0, ignore_eos=True, max_tokens=ol)
+                    for ol in output_lens
+                ]
             def run_fn():
                 engine.block_manager.reset()
                 torch.cuda.synchronize()
@@ -1319,6 +1365,11 @@ def main():
     # Pre-generate all scenario data
     scenario_data = []
     global_max_seq_len = 0
+    tokenizer = None
+    if not is_whisper:
+        tokenizer = AutoTokenizer.from_pretrained(
+            args.model, trust_remote_code=True,
+        )
     if not args.skip_throughput:
         for i, scenario in enumerate(throughput_scenarios):
             if is_whisper:
@@ -1340,24 +1391,37 @@ def main():
 
             modality = scenario.get("modality", "text") if is_vlm else "text"
             if modality == "text":
-                rng_seed = args.seed + i
-                random.seed(rng_seed)
-                np.random.seed(rng_seed)
-                input_len = scenario["input_len"]
-                output_len = scenario["output_len"]
-                prompt_token_ids = [
-                    [randint(0, 10000) for _ in range(input_len)]
-                    for _ in range(args.num_seqs)
-                ]
-                output_lens = [output_len] * args.num_seqs
-                max_seq_len = input_len + output_len
+                if scenario.get("dataset") is not None:
+                    samples = load_real_prompt_workload(
+                        scenario["name"],
+                        tokenizer,
+                        num_requests=args.num_seqs,
+                        decode_cap=None,
+                        dataset_name=scenario["dataset"],
+                        seed=args.seed + i,
+                    )
+                    prompt_token_ids = [s.prompt_token_ids for s in samples]
+                    output_lens = [s.output_len for s in samples]
+                else:
+                    input_len = scenario["input_len"]
+                    output_len = scenario["output_len"]
+                    rng_seed = args.seed + i
+                    random.seed(rng_seed)
+                    np.random.seed(rng_seed)
+                    prompt_token_ids = [
+                        [randint(0, 10000) for _ in range(input_len)]
+                        for _ in range(args.num_seqs)
+                    ]
+                    output_lens = [output_len] * args.num_seqs
+                max_seq_len = max(
+                    len(p) + ol
+                    for p, ol in zip(prompt_token_ids, output_lens)
+                )
                 if max_seq_len > global_max_seq_len:
                     global_max_seq_len = max_seq_len
                 scenario_data.append({
                     "name": scenario["name"],
                     "modality": "text",
-                    "input_len": input_len,
-                    "output_len": output_len,
                     "prompt_token_ids": prompt_token_ids,
                     "output_lens": output_lens,
                 })
@@ -1397,15 +1461,20 @@ def main():
 
             modality = ls.get("modality", "text") if is_vlm else "text"
             if modality == "text":
-                rng_seed = args.seed + 100 + j
-                random.seed(rng_seed)
-                np.random.seed(rng_seed)
                 bs = ls["batch_size"]
-                prompt_token_ids = [
-                    [randint(0, 10000) for _ in range(ls["input_len"])]
-                    for _ in range(bs)
-                ]
-                seq_len = ls["input_len"] + ls["output_len"]
+                samples = load_real_prompt_workload(
+                    "balanced",
+                    tokenizer,
+                    num_requests=bs,
+                    decode_cap=None,
+                    seed=args.seed + 100 + j,
+                )
+                prompt_token_ids = [s.prompt_token_ids for s in samples]
+                output_lens = [s.output_len for s in samples]
+                seq_len = max(
+                    len(p) + ol
+                    for p, ol in zip(prompt_token_ids, output_lens)
+                )
                 if seq_len > global_max_seq_len:
                     global_max_seq_len = seq_len
                 latency_data.append({
@@ -1415,6 +1484,7 @@ def main():
                     "output_len": ls["output_len"],
                     "batch_size": bs,
                     "prompt_token_ids": prompt_token_ids,
+                    "output_lens": output_lens,
                     "num_warmup": 3,
                     "num_iters": args.latency_iters,
                 })
@@ -1540,10 +1610,16 @@ def main():
             }
             if "input_len" in scenario:
                 result["input_len"] = scenario["input_len"]
+            if "output_len" in scenario:
+                result["output_len"] = scenario["output_len"]
+            elif kb_data.get("num_seqs", args.num_seqs):
+                result["avg_output_len"] = (
+                    kb_data["total_output_tokens"]
+                    / kb_data.get("num_seqs", args.num_seqs)
+                )
             if is_whisper:
                 result["total_audio_duration_s"] = kb_data.get(
                     "total_audio_duration_s", 0)
-            result["output_len"] = scenario["output_len"]
 
             if vllm_results is not None:
                 v_data = vllm_results[i]
@@ -1618,21 +1694,33 @@ def main():
                 total_audio_s = r.get("total_audio_duration_s", 0)
                 audio_min = total_audio_s / 60.0
                 audio_str = f"{audio_min:.1f}m"
+                out_str = f"{r.get('output_len', r.get('avg_output_len', 0)):>5.0f}"
                 print(
                     f"  {r['scenario']:<16} {r['num_seqs']:>5} {audio_str:>8} "
-                    f"{r['output_len']:>5} "
+                    f"{out_str} "
                     f"{kb_tps_str:>15} {v_tps_str:>12} {speedup_str:>8} "
                     f"{match_str:>15}"
                 )
             elif is_vlm:
+                out_str = (
+                    f"{r['output_len']:>5}"
+                    if "output_len" in r
+                    else f"{r.get('avg_output_len', 0):>5.0f}"
+                )
                 print(
-                    f"  {r['scenario']:<16} {r['output_len']:>5} "
+                    f"  {r['scenario']:<16} {out_str} "
                     f"{kb_tps_str:>15} {v_tps_str:>12} {speedup_str:>8} "
                     f"{match_str:>15}"
                 )
             else:
+                out_str = (
+                    f"{r['output_len']:>5}"
+                    if "output_len" in r
+                    else f"{r.get('avg_output_len', 0):>5.0f}"
+                )
+                in_str = f"{r['input_len']:>5}" if "input_len" in r else f"{'var':>5}"
                 print(
-                    f"  {r['scenario']:<16} {r['input_len']:>5} {r['output_len']:>5} "
+                    f"  {r['scenario']:<16} {in_str} {out_str} "
                     f"{kb_tps_str:>15} {v_tps_str:>12} {speedup_str:>8} "
                     f"{match_str:>15}"
                 )

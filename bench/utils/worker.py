@@ -246,8 +246,15 @@ def main():
     latency_results = []
     for ls in cfg.get("latency_scenarios", []):
         prompts = ls["prompt_token_ids"]
-        sp = SamplingParams(temperature=0.0,
-                            ignore_eos=True, max_tokens=ls["output_len"])
+        output_lens = ls.get("output_lens")
+        if output_lens is None:
+            sp = SamplingParams(temperature=0.0,
+                                ignore_eos=True, max_tokens=ls["output_len"])
+        else:
+            sp = [
+                SamplingParams(temperature=0.0, ignore_eos=True, max_tokens=ol)
+                for ol in output_lens
+            ]
         num_warmup = ls.get("num_warmup", 3)
         num_iters = ls.get("num_iters", 5)
         for _ in range(num_warmup):

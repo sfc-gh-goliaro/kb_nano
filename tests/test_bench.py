@@ -490,18 +490,18 @@ def test_section_4():
         )
         ph = THROUGHPUT_WORKLOADS[0]
         check(
-            ph.input_len == 1024 and ph.output_len == 512,
-            "4a. prefill-heavy: 1024/512",
+            ph.dataset_name.endswith("prefill-heavy-1k"),
+            "4a. prefill-heavy dataset configured",
         )
         bal = THROUGHPUT_WORKLOADS[1]
         check(
-            bal.input_len == 512 and bal.output_len == 512,
-            "4a. balanced: 512/512",
+            bal.dataset_name.endswith("balanced-1k"),
+            "4a. balanced dataset configured",
         )
         dh = THROUGHPUT_WORKLOADS[2]
         check(
-            dh.input_len == 512 and dh.output_len == 1024,
-            "4a. decode-heavy: 512/1024",
+            dh.dataset_name.endswith("decode-heavy-1k"),
+            "4a. decode-heavy dataset configured",
         )
 
     # 4b. Latency workload constants
@@ -523,7 +523,7 @@ def test_section_4():
     # 4c. Immutability (frozen dataclasses)
     with _Timeout(30):
         try:
-            THROUGHPUT_WORKLOADS[0].input_len = 999
+            THROUGHPUT_WORKLOADS[0].dataset_name = "other"
             check(False, "4c. throughput workloads should be immutable")
         except AttributeError:
             check(True, "4c. throughput workloads are frozen (immutable)")
@@ -537,8 +537,8 @@ def test_section_4():
     with _Timeout(30):
         max_len = get_max_seq_len()
         check(
-            max_len == 1536,
-            f"4d. max_seq_len = {max_len} (expected 1536 = 512+1024)",
+            max_len == 256,
+            f"4d. static max_seq_len = {max_len} (expected 256 = 128+128)",
         )
 
 
