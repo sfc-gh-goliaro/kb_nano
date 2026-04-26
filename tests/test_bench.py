@@ -280,8 +280,11 @@ def test_section_2():
         with torch.no_grad():
             out1 = m1(inp)
             out2 = m2(inp)
-        correct, diff = _compare_outputs(out1, out2)
-        check(correct and diff == 0.0, "2a. identical modules -> correct=True, diff=0")
+        correct, error_ratio, diff = _compare_outputs(out1, out2)
+        check(
+            correct and error_ratio == 0.0 and diff == 0.0,
+            "2a. identical modules -> correct=True, error_ratio=0, diff=0",
+        )
 
     # 2b. Different modules
     with _Timeout(30):
@@ -299,8 +302,11 @@ def test_section_2():
         with torch.no_grad():
             out_b = baseline(inp)
             out_c = candidate(inp)
-        correct, diff = _compare_outputs(out_b, out_c)
-        check(not correct or diff > 0, "2b. different modules -> correct=False or diff>0")
+        correct, error_ratio, diff = _compare_outputs(out_b, out_c)
+        check(
+            not correct or error_ratio > 1.0,
+            "2b. different modules -> correct=False or error_ratio>1",
+        )
         check(diff > 0, f"2b. mean_abs_diff={diff:.4f} > 0")
 
     # 2c. Weight copying
@@ -381,9 +387,9 @@ def test_section_3():
     # 3a. KernelBenchResult construction
     with _Timeout(30):
         scenarios_a = [
-            ScenarioResult("s1", True, 1e-7, 0.1, 0.08, 1.25),
-            ScenarioResult("s2", True, 2e-7, 0.12, 0.10, 1.20),
-            ScenarioResult("s3", False, 5e-4, 0.1, 0.09, 1.11),
+            ScenarioResult("s1", True, 0.1, 1e-7, 0.1, 0.08, 1.25),
+            ScenarioResult("s2", True, 0.2, 2e-7, 0.12, 0.10, 1.20),
+            ScenarioResult("s3", False, 2.5, 5e-4, 0.1, 0.09, 1.11),
         ]
         op_a = OperatorResult(
             target="rms_norm", level=1,
@@ -391,8 +397,8 @@ def test_section_3():
             scenarios=scenarios_a,
         )
         scenarios_b = [
-            ScenarioResult("s4", True, 3e-7, 0.2, 0.18, 1.11),
-            ScenarioResult("s5", True, 1e-7, 0.15, 0.14, 1.07),
+            ScenarioResult("s4", True, 0.3, 3e-7, 0.2, 0.18, 1.11),
+            ScenarioResult("s5", True, 0.1, 1e-7, 0.15, 0.14, 1.07),
         ]
         op_b = OperatorResult(
             target="silu_and_mul", level=1,
@@ -407,6 +413,10 @@ def test_section_3():
         check(result.total_scenarios == 5, "3a. total_scenarios == 5")
         check(result.passed == 4, "3a. passed == 4")
         check(result.failed == 1, "3a. failed == 1")
+        check(
+            result.avg_max_error_ratio > 0.0,
+            f"3a. avg_max_error_ratio={result.avg_max_error_ratio:.2e} > 0",
+        )
         check(result.avg_speedup > 1.0, f"3a. avg_speedup={result.avg_speedup:.2f} > 1.0")
 
     # 3b. JSON round-trip
@@ -461,6 +471,7 @@ def test_section_3():
         sys.stdout = old_stdout
         output = buf.getvalue()
         check("CORRECT" in output or "PASS" in output, "3e. table contains PASS/CORRECT")
+        check("ERR_RATIO" in output, "3e. table contains ERR_RATIO")
         check("SPEEDUP" in output or "speedup" in output, "3e. table contains SPEEDUP")
         check("OVERALL" in output, "3e. table contains OVERALL summary")
         check("ALL OPERATORS SUMMARY" in output, "3e. multi-operator table has summary")
@@ -833,6 +844,7 @@ print(json.dumps({{
     'passed': result.passed,
     'failed': result.failed,
     'total': result.total_scenarios,
+    'avg_error_ratio': result.avg_max_error_ratio,
     'avg_diff': result.avg_mean_abs_diff,
     'avg_speedup': result.avg_speedup,
 }}))
@@ -846,8 +858,8 @@ print(json.dumps({{
             else:
                 data = json.loads(result.stdout.strip().split("\n")[-1])
                 check(
-                    data["avg_diff"] < 1e-5,
-                    f"7a. identity: avg_diff={data['avg_diff']:.2e} < 1e-5",
+                    data["avg_error_ratio"] == 0.0,
+                    f"7a. identity: avg_error_ratio={data['avg_error_ratio']:.2e} == 0",
                 )
                 check(
                     data["failed"] == 0,
@@ -887,6 +899,7 @@ result = run_kernel_benchmark(
 print(json.dumps({{
     'passed': result.passed,
     'failed': result.failed,
+    'avg_error_ratio': result.avg_max_error_ratio,
     'avg_diff': result.avg_mean_abs_diff,
 }}))
 """],
@@ -899,8 +912,8 @@ print(json.dumps({{
             else:
                 data = json.loads(result.stdout.strip().split("\n")[-1])
                 check(
-                    data["avg_diff"] > 0.01,
-                    f"7b. broken: avg_diff={data['avg_diff']:.4f} > 0.01",
+                    data["avg_error_ratio"] > 1.0,
+                    f"7b. broken: avg_error_ratio={data['avg_error_ratio']:.2e} > 1",
                 )
                 check(
                     data["failed"] > 0,

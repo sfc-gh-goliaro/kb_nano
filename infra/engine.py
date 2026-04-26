@@ -2444,6 +2444,8 @@ class ModelRunner:
 
         if self.enforce_eager:
             return self._run_decode_greedy_eager(n, ids_np, pos_np, sm_np, cl_np, bt_np)
+        if n > self.graph_bs_list[-1]:
+            return self._run_decode_greedy_eager(n, ids_np, pos_np, sm_np, cl_np, bt_np)
 
         self._run_graph_from_numpy(n, ids_np, pos_np, sm_np, cl_np, bt_np)
         return self._greedy_from_hidden(n)
@@ -2480,6 +2482,17 @@ class ModelRunner:
         n, ids_np, pos_np, sm_np, cl_np, bt_np = decode_data
 
         if self.enforce_eager:
+            result = self._run_decode_greedy_eager(n, ids_np, pos_np, sm_np, cl_np, bt_np)
+            if result is not None:
+                main_stream = torch.cuda.current_stream()
+                cs = self._copy_stream
+                with torch.cuda.stream(cs):
+                    cs.wait_stream(main_stream)
+                    self._pinned_token_ids[:n].copy_(result, non_blocking=True)
+                    self._copy_event.record(cs)
+                return True, n
+            return False, n
+        if n > self.graph_bs_list[-1]:
             result = self._run_decode_greedy_eager(n, ids_np, pos_np, sm_np, cl_np, bt_np)
             if result is not None:
                 main_stream = torch.cuda.current_stream()

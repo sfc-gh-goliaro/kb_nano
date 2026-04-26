@@ -26,10 +26,13 @@ Usage:
 from __future__ import annotations
 
 import argparse
+import fcntl
 import json
 import os
 import random
+import socket
 import sys
+import time
 from pathlib import Path
 from random import randint
 
@@ -53,6 +56,115 @@ def _detect_gpu_name() -> str:
     except Exception:
         return "unknown"
 
+
+def _parse_port_env(name: str) -> int | None:
+    value = os.environ.get(name)
+    if value is None or value == "":
+        return None
+    try:
+        port = int(value)
+    except ValueError as exc:
+        raise SystemExit(f"{name} must be an integer TCP port, got {value!r}") from exc
+    if not (1 <= port <= 65535):
+        raise SystemExit(f"{name} must be between 1 and 65535, got {port}")
+    return port
+
+
+def _reserve_tcp_port(preferred: int | None = None) -> tuple[int, object]:
+    """Reserve a local TCP port across concurrent benchmark processes.
+
+    The lock avoids two copies of this script choosing the same port before
+    their subprocesses initialize torch/vLLM distributed state.
+    """
+    min_port = int(os.environ.get("KB_NANO_BENCH_PORT_MIN", "20000"))
+    max_port = int(os.environ.get("KB_NANO_BENCH_PORT_MAX", "60999"))
+    if min_port > max_port:
+        raise SystemExit("KB_NANO_BENCH_PORT_MIN must be <= KB_NANO_BENCH_PORT_MAX")
+
+    lock_dir = Path(os.environ.get(
+        "KB_NANO_BENCH_PORT_LOCK_DIR",
+        "/tmp/kb_nano_bench_ports",
+    ))
+    lock_dir.mkdir(parents=True, exist_ok=True)
+
+    candidates: list[int] = []
+    if preferred is not None:
+        candidates.append(preferred)
+    rng = random.Random((os.getpid() << 16) ^ time.time_ns())
+    candidates.extend(rng.sample(range(min_port, max_port + 1),
+                                 max_port - min_port + 1))
+
+    for port in candidates:
+        lock = open(lock_dir / f"{port}.lock", "w")
+        try:
+            fcntl.flock(lock, fcntl.LOCK_EX | fcntl.LOCK_NB)
+        except BlockingIOError:
+            lock.close()
+            continue
+
+        with socket.socket(socket.AF_INET, socket.SOCK_STREAM) as sock:
+            try:
+                sock.bind(("127.0.0.1", port))
+            except OSError:
+                fcntl.flock(lock, fcntl.LOCK_UN)
+                lock.close()
+                continue
+
+        return port, lock
+
+    raise SystemExit(
+        f"Could not reserve a free local TCP port in {min_port}-{max_port}"
+    )
+
+
+def _make_run_id(requested: str | None) -> str:
+    run_id = requested or f"{time.strftime('%Y%m%d-%H%M%S')}-pid{os.getpid()}"
+    safe = "".join(c if c.isalnum() or c in "._-" else "-" for c in run_id)
+    safe = safe.strip(".-_")
+    if not safe:
+        raise SystemExit("--run-id must contain at least one path-safe character")
+    return safe
+
+
+def _install_flashinfer_sitecustomize() -> None:
+    """Patch FlashInfer IPC socket IDs in every spawned vLLM rank."""
+    site_dir = Path(os.environ.get(
+        "KB_NANO_FLASHINFER_SITECUSTOMIZE_DIR",
+        "/tmp/kb_nano_flashinfer_sitecustomize",
+    ))
+    site_dir.mkdir(parents=True, exist_ok=True)
+    (site_dir / "sitecustomize.py").write_text(r'''
+import os
+
+namespace = os.environ.get("KB_NANO_FLASHINFER_SOCKET_NAMESPACE")
+if namespace:
+    try:
+        import hashlib
+        from flashinfer.comm import mnnvl
+    except Exception:
+        pass
+    else:
+        if not getattr(mnnvl.IpcSocket, "_kb_nano_namespaced", False):
+            original_init = mnnvl.IpcSocket.__init__
+            namespace_bits = int.from_bytes(
+                hashlib.blake2b(namespace.encode(), digest_size=8).digest(),
+                "little",
+            )
+
+            def namespaced_init(self, rank, op_id, use_abstract=True):
+                if isinstance(op_id, int):
+                    op_id = (op_id ^ namespace_bits) & ((1 << 64) - 1)
+                original_init(self, rank, op_id, use_abstract)
+
+            mnnvl.IpcSocket.__init__ = namespaced_init
+            mnnvl.IpcSocket._kb_nano_namespaced = True
+''')
+
+    current = os.environ.get("PYTHONPATH", "")
+    parts = [p for p in current.split(os.pathsep) if p]
+    if str(site_dir) not in parts:
+        os.environ["PYTHONPATH"] = os.pathsep.join([str(site_dir), *parts])
+
 _THIS_DIR = Path(__file__).resolve().parent
 _PACKAGE_DIR = _THIS_DIR.parent
 _PROJECT_ROOT = _PACKAGE_DIR.parent
@@ -64,6 +176,8 @@ from kb_nano.bench.utils.real_prompts import (
     DEFAULT_WORKLOAD_DATASETS,
     load_real_prompt_workload,
 )
+
+_HELD_PORT_LOCKS: list[object] = []
 
 
 SCENARIOS = [
@@ -135,6 +249,34 @@ VLLM_WORKER = r'''
 import json, os, sys, time
 os.environ.setdefault("VLLM_WORKER_MULTIPROC_METHOD", "spawn")
 os.environ.setdefault("VLLM_DEEP_GEMM_WARMUP", "skip")
+
+def _configure_parallel_safe_flashinfer():
+    namespace = os.environ.get("KB_NANO_FLASHINFER_SOCKET_NAMESPACE")
+    if not namespace:
+        return
+    try:
+        import hashlib
+        from flashinfer.comm import mnnvl
+    except Exception:
+        return
+    if getattr(mnnvl.IpcSocket, "_kb_nano_namespaced", False):
+        return
+
+    original_init = mnnvl.IpcSocket.__init__
+    namespace_bits = int.from_bytes(
+        hashlib.blake2b(namespace.encode(), digest_size=8).digest(),
+        "little",
+    )
+
+    def namespaced_init(self, rank, op_id, use_abstract=True):
+        if isinstance(op_id, int):
+            op_id = (op_id ^ namespace_bits) & ((1 << 64) - 1)
+        original_init(self, rank, op_id, use_abstract)
+
+    mnnvl.IpcSocket.__init__ = namespaced_init
+    mnnvl.IpcSocket._kb_nano_namespaced = True
+
+_configure_parallel_safe_flashinfer()
 
 def main():
     from vllm import LLM, SamplingParams
@@ -551,6 +693,34 @@ import json, os, sys, time
 os.environ.setdefault("VLLM_WORKER_MULTIPROC_METHOD", "spawn")
 os.environ.setdefault("VLLM_DEEP_GEMM_WARMUP", "skip")
 
+def _configure_parallel_safe_flashinfer():
+    namespace = os.environ.get("KB_NANO_FLASHINFER_SOCKET_NAMESPACE")
+    if not namespace:
+        return
+    try:
+        import hashlib
+        from flashinfer.comm import mnnvl
+    except Exception:
+        return
+    if getattr(mnnvl.IpcSocket, "_kb_nano_namespaced", False):
+        return
+
+    original_init = mnnvl.IpcSocket.__init__
+    namespace_bits = int.from_bytes(
+        hashlib.blake2b(namespace.encode(), digest_size=8).digest(),
+        "little",
+    )
+
+    def namespaced_init(self, rank, op_id, use_abstract=True):
+        if isinstance(op_id, int):
+            op_id = (op_id ^ namespace_bits) & ((1 << 64) - 1)
+        original_init(self, rank, op_id, use_abstract)
+
+    mnnvl.IpcSocket.__init__ = namespaced_init
+    mnnvl.IpcSocket._kb_nano_namespaced = True
+
+_configure_parallel_safe_flashinfer()
+
 
 def main():
     from vllm import LLM, SamplingParams
@@ -920,6 +1090,34 @@ import json, os, sys, time
 import numpy as np
 os.environ.setdefault("VLLM_WORKER_MULTIPROC_METHOD", "spawn")
 os.environ.setdefault("VLLM_DEEP_GEMM_WARMUP", "skip")
+
+def _configure_parallel_safe_flashinfer():
+    namespace = os.environ.get("KB_NANO_FLASHINFER_SOCKET_NAMESPACE")
+    if not namespace:
+        return
+    try:
+        import hashlib
+        from flashinfer.comm import mnnvl
+    except Exception:
+        return
+    if getattr(mnnvl.IpcSocket, "_kb_nano_namespaced", False):
+        return
+
+    original_init = mnnvl.IpcSocket.__init__
+    namespace_bits = int.from_bytes(
+        hashlib.blake2b(namespace.encode(), digest_size=8).digest(),
+        "little",
+    )
+
+    def namespaced_init(self, rank, op_id, use_abstract=True):
+        if isinstance(op_id, int):
+            op_id = (op_id ^ namespace_bits) & ((1 << 64) - 1)
+        original_init(self, rank, op_id, use_abstract)
+
+    mnnvl.IpcSocket.__init__ = namespaced_init
+    mnnvl.IpcSocket._kb_nano_namespaced = True
+
+_configure_parallel_safe_flashinfer()
 
 def _load_librispeech(dataset_name, dataset_split, num_seqs, seed):
     """Load audio samples from LibriSpeech and return as list of numpy arrays."""
@@ -1306,7 +1504,13 @@ def main():
     parser.add_argument(
         "--output-dir", type=str, default=None,
         help="Directory to save per-scenario outputs and results JSON "
-             "(default: tests/results/<gpu>/<model>_tp<tp>)",
+             "(default: tests/results/<gpu>/<model>_tp<tp>/<run-id>)",
+    )
+    parser.add_argument(
+        "--run-id", type=str, default=None,
+        help="Run subdirectory appended to the default output dir. Defaults "
+             "to a timestamp+pid so concurrent runs do not overwrite each "
+             "other. Ignored when --output-dir is provided.",
     )
     parser.add_argument(
         "--modality", type=str, default="all",
@@ -1329,8 +1533,38 @@ def main():
 
     if args.output_dir is None:
         short = args.model.split("/")[-1]
+        run_id = _make_run_id(args.run_id)
         repo_root = Path(__file__).resolve().parent.parent
-        args.output_dir = str(repo_root / "tests" / "results" / gpu / f"{short}_tp{args.tp}")
+        args.output_dir = str(
+            repo_root / "tests" / "results" / gpu / f"{short}_tp{args.tp}" / run_id
+        )
+    elif args.run_id is not None:
+        print("  NOTE: --run-id is ignored because --output-dir was provided.")
+
+    kb_nccl_port, kb_nccl_lock = _reserve_tcp_port(
+        preferred=_parse_port_env("KB_NANO_NCCL_PORT"),
+    )
+    _HELD_PORT_LOCKS.append(kb_nccl_lock)
+    os.environ["KB_NANO_NCCL_PORT"] = str(kb_nccl_port)
+
+    vllm_port = None
+    flashinfer_namespace = None
+    previous_flashinfer_namespace_env = os.environ.get(
+        "KB_NANO_FLASHINFER_SOCKET_NAMESPACE",
+    )
+    if not args.skip_vllm:
+        vllm_port, vllm_port_lock = _reserve_tcp_port(
+            preferred=_parse_port_env("VLLM_PORT"),
+        )
+        _HELD_PORT_LOCKS.append(vllm_port_lock)
+        os.environ["VLLM_PORT"] = str(vllm_port)
+        if args.tp > 1:
+            flashinfer_namespace = (
+                os.environ.get("KB_NANO_FLASHINFER_SOCKET_NAMESPACE")
+                or f"bench-vllm-{os.getpid()}-{vllm_port}"
+            )
+            os.environ["KB_NANO_FLASHINFER_SOCKET_NAMESPACE"] = flashinfer_namespace
+            _install_flashinfer_sitecustomize()
 
     if is_whisper:
         throughput_scenarios = WHISPER_SCENARIOS
@@ -1519,6 +1753,11 @@ def main():
     print(f"  Enforce eager  : {args.enforce_eager}")
     print(f"  Seed           : {args.seed}")
     print(f"  Max seq len    : {global_max_seq_len}")
+    print(f"  kb-nano port   : {kb_nccl_port}")
+    if vllm_port is not None:
+        print(f"  vLLM port      : {vllm_port}")
+        if flashinfer_namespace is not None:
+            print(f"  vLLM FI ns     : {flashinfer_namespace}")
     print(f"  Output dir     : {args.output_dir}")
     if not args.skip_throughput:
         print(f"  Scenarios      : {', '.join(s['name'] for s in throughput_scenarios)}")
@@ -1557,11 +1796,19 @@ def main():
             "latency_scenarios": latency_data,
             "load_format": "fastsafetensors",
         }
+        os.environ["MASTER_ADDR"] = "127.0.0.1"
+        os.environ["MASTER_PORT"] = str(vllm_port)
         vllm_raw = run_worker(
             vllm_worker, vllm_config,
             f"vLLM [{short_name}] all scenarios (TP={args.tp})",
             timeout=10800,
         )
+        if previous_flashinfer_namespace_env is None:
+            os.environ.pop("KB_NANO_FLASHINFER_SOCKET_NAMESPACE", None)
+        else:
+            os.environ["KB_NANO_FLASHINFER_SOCKET_NAMESPACE"] = (
+                previous_flashinfer_namespace_env
+            )
 
     # -- Run kb-nano (one subprocess, all scenarios) --
     kb_root = str(_PROJECT_ROOT)
@@ -1579,6 +1826,8 @@ def main():
         "latency_scenarios": latency_data,
     }
     short_name = args.model.split("/")[-1]
+    os.environ["MASTER_ADDR"] = "127.0.0.1"
+    os.environ["MASTER_PORT"] = str(kb_nccl_port)
     kb_raw = run_worker(
         kb_worker, kb_config,
         f"kb-nano [{short_name}] all scenarios (TP={args.tp})",
@@ -1804,7 +2053,11 @@ def main():
             "temperature": args.temperature,
             "num_seqs": args.num_seqs,
             "enforce_eager": args.enforce_eager,
+            "kb_nano_nccl_port": kb_nccl_port,
+            "vllm_flashinfer_socket_namespace": flashinfer_namespace,
         }
+        if vllm_port is not None:
+            combined["vllm_port"] = vllm_port
         if all_results:
             combined["scenarios"] = all_results
         if latency_combined:

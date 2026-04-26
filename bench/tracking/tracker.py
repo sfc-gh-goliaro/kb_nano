@@ -165,6 +165,9 @@ def log_kernel_bench(result: KernelBenchResult) -> None:
         _mlflow.log_metric(f"{op.target}_passed", op.passed)
         _mlflow.log_metric(f"{op.target}_failed", op.failed)
         _mlflow.log_metric(
+            f"{op.target}_avg_max_error_ratio", op.avg_max_error_ratio
+        )
+        _mlflow.log_metric(
             f"{op.target}_avg_mean_abs_diff", op.avg_mean_abs_diff
         )
         for s in op.scenarios:
@@ -174,6 +177,7 @@ def log_kernel_bench(result: KernelBenchResult) -> None:
                 key = key[:240]
             _mlflow.log_metric(f"{key}_speedup", s.speedup)
             _mlflow.log_metric(f"{key}_correct", int(s.correct))
+            _mlflow.log_metric(f"{key}_max_error_ratio", s.max_error_ratio)
 
         # Store candidate kernel source as artifact
         candidate_file = CANDIDATE_DIR / f"L{op.level}" / f"{op.target}.py"
@@ -186,6 +190,7 @@ def log_kernel_bench(result: KernelBenchResult) -> None:
     _mlflow.log_metric("total_failed", result.failed)
     _mlflow.log_metric("total_operators", result.total_operators)
     _mlflow.log_metric("total_scenarios", result.total_scenarios)
+    _mlflow.log_metric("avg_max_error_ratio", result.avg_max_error_ratio)
     _mlflow.log_metric("avg_mean_abs_diff", result.avg_mean_abs_diff)
 
 

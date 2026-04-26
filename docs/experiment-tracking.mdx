@@ -6,7 +6,7 @@ description: Track kernel generations, benchmark results, and agent runs with ML
 Every `kb_nano agent`, `kb_nano kernels`, `kb_nano eval`, and `kb_nano e2e` run is automatically logged to [MLflow](https://mlflow.org). This gives you:
 
 - **Kernel lineage** — every generated kernel is stored as an MLflow artifact, linked to the run parameters that produced it
-- **Benchmark history** — speedup, correctness, and mean absolute difference for every operator across every run
+- **Benchmark history** — speedup, correctness, and max error ratio for every operator across every run
 - **Run comparison** — compare runs side-by-side and visualize how metrics evolve across iterations
 
 Tracking data is stored locally in `mlruns/` (gitignored). If `mlflow` is not installed, all tracking calls silently become no-ops.
@@ -68,7 +68,7 @@ kb_nano history --limit 50
 ======================================================================
   TRACKING HISTORY: rms_norm
 ======================================================================
-  TIMESTAMP          RUN NAME                      SPEEDUP   PASS  MEAN_DIFF     RUN ID
+  TIMESTAMP          RUN NAME                      SPEEDUP   PASS  ERR_RATIO     RUN ID
   ──────────────────────────────────────────────────────────────────
   2026-03-16 17:03   agent_L2_Llama-3.1-8B-Inst         --     --         --   797bf661
   2026-03-16 16:55   agent_L1_Llama-3.1-8B-Inst         -- gen=FAIL         --   4f879e0a

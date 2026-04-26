@@ -20,6 +20,12 @@ from kb_nano.infra.kernel_swapper import BenchTarget, discover_targets, get, loa
 from .result import KernelBenchResult, OperatorResult, ScenarioResult
 
 _DEFAULT_REGISTRY = None
+_FP32_ATOL = 1e-5
+_FP32_RTOL = 1e-3
+_LOW_PRECISION_ATOL = 1e-2
+_LOW_PRECISION_RTOL = 1e-2
+_FP8_ATOL = 1.25e-1
+_FP8_RTOL = 1.25e-1
 
 
 def _get_registry() -> InputRegistry:
@@ -84,35 +90,53 @@ def _time_forward(
     return output, median_ms
 
 
-def _compare_outputs(baseline_out: Any, candidate_out: Any) -> tuple[bool, float]:
-    """Compare outputs: return (allclose_pass, mean_abs_diff)."""
+def _tolerances_for_dtype(dtype: torch.dtype) -> tuple[float, float]:
+    """Return (atol, rtol) for tolerance-normalized correctness."""
+    dtype_name = str(dtype)
+    if dtype in (torch.float16, torch.bfloat16):
+        return _LOW_PRECISION_ATOL, _LOW_PRECISION_RTOL
+    if "float8" in dtype_name:
+        return _FP8_ATOL, _FP8_RTOL
+    return _FP32_ATOL, _FP32_RTOL
+
+
+def _compare_outputs(baseline_out: Any, candidate_out: Any) -> tuple[bool, float, float]:
+    """Compare outputs: return (pass, max_error_ratio, mean_abs_diff)."""
     if isinstance(baseline_out, torch.Tensor) and isinstance(candidate_out, torch.Tensor):
         if baseline_out.shape != candidate_out.shape:
-            return False, float("inf")
-        diff = (baseline_out.float() - candidate_out.float()).abs()
+            return False, float("inf"), float("inf")
+
+        baseline = baseline_out.float()
+        candidate = candidate_out.float()
+        if not torch.isfinite(baseline).all() or not torch.isfinite(candidate).all():
+            return False, float("inf"), float("inf")
+
+        diff = (baseline - candidate).abs()
         mean_diff = diff.mean().item()
-        passed = torch.allclose(
-            baseline_out.float(), candidate_out.float(),
-            atol=1e-5, rtol=1e-3,
-        )
-        return passed, mean_diff
+        atol, rtol = _tolerances_for_dtype(baseline_out.dtype)
+        tolerance = atol + rtol * baseline.abs()
+        max_error_ratio = (diff / tolerance).max().item()
+        passed = max_error_ratio <= 1.0
+        return passed, max_error_ratio, mean_diff
 
     if isinstance(baseline_out, (tuple, list)) and isinstance(candidate_out, (tuple, list)):
         if len(baseline_out) != len(candidate_out):
-            return False, float("inf")
+            return False, float("inf"), float("inf")
         all_pass = True
+        max_error_ratio = 0.0
         total_diff = 0.0
         count = 0
         for b, c in zip(baseline_out, candidate_out):
             if isinstance(b, torch.Tensor) and isinstance(c, torch.Tensor):
-                p, d = _compare_outputs(b, c)
+                p, ratio, d = _compare_outputs(b, c)
                 all_pass = all_pass and p
+                max_error_ratio = max(max_error_ratio, ratio)
                 total_diff += d
                 count += 1
         mean_diff = total_diff / count if count > 0 else 0.0
-        return all_pass, mean_diff
+        return all_pass, max_error_ratio, mean_diff
 
-    return True, 0.0
+    return True, 0.0, 0.0
 
 
 def run_kernel_benchmark(
@@ -133,7 +157,7 @@ def run_kernel_benchmark(
     3. Prepare inputs (random or golden)
     4. Warmup both
     5. Time both (median of num_runs)
-    6. Compare outputs: allclose pass/fail, mean abs diff
+    6. Compare outputs: max error ratio pass/fail, mean abs diff
 
     The candidate implementation is auto-discovered from
     tasks/candidate/L{level}/{target_name}.py.
@@ -202,12 +226,13 @@ def run_kernel_benchmark(
                 candidate_mod, inputs, num_warmup, num_runs,
             )
 
-            correct, mean_diff = _compare_outputs(baseline_out, candidate_out)
+            correct, max_error_ratio, mean_diff = _compare_outputs(baseline_out, candidate_out)
             speedup = baseline_ms / candidate_ms if candidate_ms > 0 else float("inf")
 
             scenario_results.append(ScenarioResult(
                 name=scenario.name,
                 correct=correct,
+                max_error_ratio=max_error_ratio,
                 mean_abs_diff=mean_diff,
                 baseline_ms=baseline_ms,
                 candidate_ms=candidate_ms,
@@ -219,6 +244,7 @@ def run_kernel_benchmark(
             scenario_results.append(ScenarioResult(
                 name=scenario.name,
                 correct=False,
+                max_error_ratio=float("inf"),
                 mean_abs_diff=float("inf"),
                 baseline_ms=0.0,
                 candidate_ms=0.0,

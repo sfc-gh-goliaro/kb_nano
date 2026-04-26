@@ -47,7 +47,7 @@ kb_nano kernels --map
 | `--num-runs` | 100 | Timed iterations for median |
 | `--output-json` | `bench/results/kernels.json` | Results path |
 
-A scenario **passes** if max-abs-error < 0.01 (bfloat16 tolerance). Speedup > 1.0 means faster than baseline.
+A scenario **passes** if its max error ratio is <= 1.0, where each element's error is normalized by `atol + rtol * abs(baseline)`. Speedup > 1.0 means faster than baseline.
 
 ---
 
