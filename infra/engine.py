@@ -348,6 +348,7 @@ class ModelRunner:
         self.is_mamba2 = model_type == "mamba2"
         self.is_mamba = model_type in ("mamba", "mamba2")
         self.model_family = "mamba" if self.is_mamba else "attention"
+        self.is_gpt_oss = model_type == "gpt_oss" or "gpt-oss" in model_name.lower()
         self.is_moe = hasattr(self.config, "num_local_experts") or getattr(self.config, "is_moe", False)
         self.is_qwen_vl = hasattr(self.config, "mrope_section")
         self.is_qwen3_vl = self.is_qwen_vl and hasattr(
@@ -3316,14 +3317,12 @@ class ModelRunner:
         decode_req_id = torch.arange(max_bs, dtype=torch.int32).cuda()
         self._decode_req_id_buf = decode_req_id
 
-        # Match vLLM's default ``cudagraph_capture_sizes`` for DeepSeek-V3.2:
-        # [1, 2, 4, 8, 16, 24, ..., 256, 272, ..., 512].  vLLM caps captures at
-        # ``max_cudagraph_capture_size=512`` (see logs); larger decode batches
-        # are dispatched to the largest captured graph or fall back to a
-        # piecewise/eager path.  Going past 512 here makes the compile time
-        # dominate (each graph at bs>512 takes seconds) without measurable
-        # decode wins, so we keep the same 512 cap.
-        max_capture = min(max_bs, 512)
+        # Match vLLM's default ``cudagraph_capture_sizes``:
+        # [1, 2, 4, 8, 16, 24, ..., 256, 272, ..., max_capture].
+        # vLLM normally caps captures at 512, but GPT-OSS overrides this to
+        # 1024 for better high-concurrency decode throughput.
+        max_capture_limit = 1024 if self.is_gpt_oss else 512
+        max_capture = min(max_bs, max_capture_limit)
         self.graph_bs_list = [i for i in [1, 2, 4] if i <= max_capture]
         if max_capture >= 8:
             self.graph_bs_list += list(range(8, min(max_capture + 1, 256), 8))
