@@ -488,7 +488,7 @@ The engine auto-selects the attention backend based on GPU compute capability:
 
 ## Performance
 
-Run `tests/bench_vllm.py` to reproduce. Workload uses random token IDs with `ignore_eos=True`, both engines with full optimizations (`enforce_eager=False`).
+Run `tests/bench_vllm.py` to reproduce. LLM workloads use the WildChat-derived `sfc-gh-goliaro/wildchat-kb-nano-{prefill-heavy,balanced,decode-heavy}-1k` datasets, with each target model's chat template applied before tokenization and `ignore_eos=True`.
 
 **Hardware: 4x NVIDIA H200 (NVLink)**
 

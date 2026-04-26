@@ -45,9 +45,9 @@ kb_nano kernels --map
 | `--category` | all | Filter by category (e.g. `llm`) |
 | `--num-warmup` | 10 | Warmup iterations |
 | `--num-runs` | 100 | Timed iterations for median |
-| `--output-json` | `bench/results/kernels.json` | Results path |
+| `--output-json` | `bench/results/kernels_<timestamp>.json` | Results path |
 
-A scenario **passes** if max-abs-error < 0.01 (bfloat16 tolerance). Speedup > 1.0 means faster than baseline.
+A scenario **passes** if its max error ratio is <= 1.0, where each element's error is normalized by `atol + rtol * abs(baseline)`. FP8 outputs that return `(fp8_tensor, scale)` pairs are compared after dequantization with scale-derived tolerances. Speedup > 1.0 means faster than baseline.
 
 ---
 
@@ -102,7 +102,7 @@ kb_nano eval --num-prompts 500 --gpu-pool 4
 | `--num-prompts` | 1000 | Prompts per throughput workload |
 | `--gpu-pool` | 8 | GPUs available for scheduling |
 | `--seed` | 42 | Random seed |
-| `--output-json` | `bench/results/eval.json` | Results path |
+| `--output-json` | `bench/results/eval_<timestamp>.json` | Results path |
 
 ### Standardized workloads
 
@@ -117,11 +117,20 @@ Eval uses fixed, non-configurable workloads for reproducibility:
 - `single-request` — batch 1, 128 in/out tokens
 - `fixed-batch-32` — batch 32, 128 in/out tokens
 
+### MacroEval metrics
+
+Tier 3 reports MacroEval leaderboard metrics in addition to the legacy averages:
+
+- `macro_speedup` — macro-geometric speedup across architecture families. Each valid item blends throughput and latency speedups with `lambda=0.5`, then families and the overall report use geometric means.
+- `macro_correctness` — macro-averaged calibrated correctness across families. LLM eval currently uses deterministic token alignment as the calibrated correctness signal.
+- `macro_coverage` — macro-averaged fraction of valid items per family. Invalid or failed items receive no speedup credit.
+- `macro_score` — default product score: `macro_speedup * macro_correctness * macro_coverage`.
+
 ---
 
 ## Input Registry
 
-Kernel benchmarks (Tier 1) draw input shapes from a YAML manifest at `bench/utils/inputs/llm.yaml`. Each entry specifies tensor shapes, dtypes, and init args for a given operator × model × TP × sequence-length combination.
+Kernel benchmarks (Tier 1) draw input shapes from YAML manifests under `bench/utils/inputs/`. Each entry specifies tensor shapes, dtypes, and init args for a given operator × model × TP × sequence-length combination. FP8 inputs should be declared as coherent FP8+scale pairs with `quantize: fp8` and `scale_arg`; the registry generates the FP8 tensor by quantizing a random source tensor and stores the matching scale tensor under `scale_arg`. Use golden `.pt` inputs for data-dependent FP8 paths such as MoE routing or packed cache layouts.
 
 ```bash
 # Regenerate the manifest from HuggingFace model configs
