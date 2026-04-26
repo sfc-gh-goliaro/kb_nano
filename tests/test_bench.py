@@ -258,6 +258,50 @@ rms_norm:
             reg = InputRegistry(inputs_dir=inputs_dir)
             check(len(reg.operators()) == 0, "1f. empty YAML -> zero operators")
 
+    # 1g. Coherent FP8 + scale input generation
+    with _Timeout(30):
+        if not hasattr(torch, "float8_e4m3fn"):
+            check(True, "1g. FP8 dtype unavailable, skipping")
+        else:
+            fp8_yaml = """
+fp8_grouped_gemm:
+  scenarios:
+    - name: "toy/fp8/tp1"
+      init_args: {}
+      inputs:
+        a_fp8:
+          shape: [2, 256]
+          dtype: float8_e4m3fn
+          quantize: fp8
+          scale_arg: a_scale
+          group_size: 128
+        b_fp8:
+          shape: [4, 256, 256]
+          dtype: float8_e4m3fn
+          quantize: fp8
+          scale_arg: b_scale
+          scale_layout: per_block
+          block_shape: [128, 128]
+"""
+            with tempfile.TemporaryDirectory() as tmpdir:
+                inputs_dir = Path(tmpdir) / "inputs"
+                inputs_dir.mkdir()
+                (inputs_dir / "test.yaml").write_text(fp8_yaml)
+                reg = InputRegistry(inputs_dir=inputs_dir)
+                inputs = reg.get_inputs("fp8_grouped_gemm", "toy/fp8/tp1", device="cpu")
+                check(
+                    inputs["a_fp8"].dtype == torch.float8_e4m3fn
+                    and inputs["a_scale"].shape == (2, 2),
+                    "1g. per-token FP8 input and scale generated",
+                )
+                check(
+                    inputs["b_fp8"].dtype == torch.float8_e4m3fn
+                    and inputs["b_scale"].shape == (4, 2, 2),
+                    "1g. per-block FP8 input and scale generated",
+                )
+                dequant = inputs["a_fp8"].float() * inputs["a_scale"].repeat_interleave(128, dim=-1)
+                check(torch.isfinite(dequant).all(), "1g. dequantized FP8 input is finite")
+
 
 # ===========================================================================
 # Section 2: KernelRunner (unit, no GPU — uses CPU mock modules)
@@ -309,27 +353,48 @@ def test_section_2():
         )
         check(diff > 0, f"2b. mean_abs_diff={diff:.4f} > 0")
 
-    # 2c. Weight copying
+    # 2c. FP8 output pairs compare in dequantized value space
+    with _Timeout(30):
+        if not hasattr(torch, "float8_e4m3fn"):
+            check(True, "2c. FP8 dtype unavailable, skipping")
+        else:
+            fp8 = torch.ones(1, 256, dtype=torch.float32).to(torch.float8_e4m3fn)
+            scale = torch.ones(1, 2, dtype=torch.float32)
+            correct, error_ratio, diff = _compare_outputs((fp8, scale), (fp8, scale))
+            check(
+                correct and error_ratio == 0.0 and diff == 0.0,
+                "2c. identical FP8 pairs -> correct=True, error_ratio=0",
+            )
+            bad_scale = scale * 2.0
+            correct, error_ratio, diff = _compare_outputs(
+                (fp8, scale), (fp8, bad_scale),
+            )
+            check(
+                not correct and error_ratio > 1.0 and diff > 0.0,
+                "2c. changed FP8 scale fails dequantized comparison",
+            )
+
+    # 2d. Weight copying
     with _Timeout(30):
         torch.manual_seed(42)
         m1 = nn.Linear(8, 4, bias=False)
         m2 = nn.Linear(8, 4, bias=False)
         check(
             not torch.equal(m1.weight, m2.weight),
-            "2c. before copy, weights differ",
+            "2d. before copy, weights differ",
         )
         m2.load_state_dict(m1.state_dict())
         check(
             torch.equal(m1.weight, m2.weight),
-            "2c. after load_state_dict, weights match",
+            "2d. after load_state_dict, weights match",
         )
         inp = torch.randn(2, 8)
         with torch.no_grad():
             out1 = m1(inp)
             out2 = m2(inp)
-        check(torch.allclose(out1, out2), "2c. after copy, outputs match")
+        check(torch.allclose(out1, out2), "2d. after copy, outputs match")
 
-    # 2d. init_args propagation
+    # 2e. init_args propagation
     with _Timeout(30):
         class ConfigModule(nn.Module):
             def __init__(self, hidden_size: int = 10, eps: float = 1e-6):
@@ -341,10 +406,10 @@ def test_section_2():
 
         from kb_nano.bench.kernels.runner import _instantiate_module
         mod = _instantiate_module(ConfigModule, {"hidden_size": 32, "eps": 1e-5}, device="cpu")
-        check(mod.hidden_size == 32, "2d. hidden_size=32 propagated")
-        check(mod.eps == 1e-5, "2d. eps=1e-5 propagated")
+        check(mod.hidden_size == 32, "2e. hidden_size=32 propagated")
+        check(mod.eps == 1e-5, "2e. eps=1e-5 propagated")
 
-    # 2e. Scenario filtering
+    # 2f. Scenario filtering
     with _Timeout(30):
         from kb_nano.bench.utils.input_registry import InputRegistry
 
@@ -365,9 +430,9 @@ rms_norm:
             (inputs_dir / "test.yaml").write_text(filter_yaml)
             reg = InputRegistry(inputs_dir=inputs_dir)
             all_s = reg.scenarios("rms_norm")
-            check(len(all_s) == 10, "2e. total 10 scenarios")
+            check(len(all_s) == 10, "2f. total 10 scenarios")
             filtered = reg.scenarios("rms_norm", models=["llama"])
-            check(len(filtered) == 3, "2e. model=llama -> 3 scenarios")
+            check(len(filtered) == 3, "2f. model=llama -> 3 scenarios")
 
 
 # ===========================================================================
@@ -795,15 +860,21 @@ def test_section_6():
 
     # 6d. Default JSON output path
     with _Timeout(30):
-        from kb_nano.bench.kernels.__main__ import _DEFAULT_OUTPUT as kernels_default
+        from kb_nano import RESULTS_DIR, run_output_path
+
+        kernels_default = run_output_path("kernels")
         check(
-            kernels_default == "bench/results/kernels.json",
+            kernels_default.parent == RESULTS_DIR
+            and kernels_default.name.startswith("kernels_")
+            and kernels_default.suffix == ".json",
             f"6d. kernels default output: {kernels_default}",
         )
 
-        from kb_nano.bench.eval.__main__ import _DEFAULT_OUTPUT as eval_default
+        eval_default = run_output_path("eval")
         check(
-            eval_default == "bench/results/eval.json",
+            eval_default.parent == RESULTS_DIR
+            and eval_default.name.startswith("eval_")
+            and eval_default.suffix == ".json",
             f"6d. eval default output: {eval_default}",
         )
 
@@ -1162,10 +1233,14 @@ finally:
 
     # 9c. JSON default save path
     with _Timeout(30):
-        from kb_nano.bench.eval.__main__ import _DEFAULT_OUTPUT
+        from kb_nano import RESULTS_DIR, run_output_path
+
+        default_output = run_output_path("eval")
         check(
-            _DEFAULT_OUTPUT == "bench/results/eval.json",
-            f"9c. eval default output: {_DEFAULT_OUTPUT}",
+            default_output.parent == RESULTS_DIR
+            and default_output.name.startswith("eval_")
+            and default_output.suffix == ".json",
+            f"9c. eval default output: {default_output}",
         )
 
 

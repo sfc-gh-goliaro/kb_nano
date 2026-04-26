@@ -26,6 +26,7 @@ _LOW_PRECISION_ATOL = 1e-2
 _LOW_PRECISION_RTOL = 1e-2
 _FP8_ATOL = 1.25e-1
 _FP8_RTOL = 1.25e-1
+_FP8_GROUP_SIZE = 128
 
 
 def _get_registry() -> InputRegistry:
@@ -100,6 +101,79 @@ def _tolerances_for_dtype(dtype: torch.dtype) -> tuple[float, float]:
     return _FP32_ATOL, _FP32_RTOL
 
 
+def _ceil_div(a: int, b: int) -> int:
+    return (a + b - 1) // b
+
+
+def _is_fp8_tensor(tensor: Any) -> bool:
+    return isinstance(tensor, torch.Tensor) and "float8" in str(tensor.dtype)
+
+
+def _fp8_rtol(dtype: torch.dtype) -> float:
+    if "e5m2" in str(dtype):
+        return 0.25
+    return 0.125
+
+
+def _expand_fp8_scale(
+    fp8: torch.Tensor,
+    scale: torch.Tensor,
+    *,
+    group_size: int = _FP8_GROUP_SIZE,
+) -> torch.Tensor | None:
+    """Broadcast FP8 per-group/per-block scales to the FP8 tensor shape."""
+    if not isinstance(scale, torch.Tensor) or not scale.is_floating_point():
+        return None
+
+    shape = tuple(fp8.shape)
+    scale_shape = tuple(scale.shape)
+    per_group_shape = (*shape[:-1], _ceil_div(shape[-1], group_size))
+    if scale_shape == per_group_shape:
+        return scale.float().repeat_interleave(group_size, dim=-1)[..., :shape[-1]]
+
+    if fp8.ndim >= 2:
+        per_block_shape = (
+            *shape[:-2],
+            _ceil_div(shape[-2], group_size),
+            _ceil_div(shape[-1], group_size),
+        )
+        if scale_shape == per_block_shape:
+            expanded = scale.float().repeat_interleave(group_size, dim=-2)
+            expanded = expanded.repeat_interleave(group_size, dim=-1)
+            return expanded[..., :shape[-2], :shape[-1]]
+
+    return None
+
+
+def _compare_fp8_scaled_outputs(
+    baseline_fp8: torch.Tensor,
+    baseline_scale: torch.Tensor,
+    candidate_fp8: torch.Tensor,
+    candidate_scale: torch.Tensor,
+) -> tuple[bool, float, float]:
+    """Compare FP8 tensors in dequantized value space using local scales."""
+    if baseline_fp8.shape != candidate_fp8.shape:
+        return False, float("inf"), float("inf")
+
+    baseline_scale_expanded = _expand_fp8_scale(baseline_fp8, baseline_scale)
+    candidate_scale_expanded = _expand_fp8_scale(candidate_fp8, candidate_scale)
+    if baseline_scale_expanded is None or candidate_scale_expanded is None:
+        return False, float("inf"), float("inf")
+
+    baseline = baseline_fp8.float() * baseline_scale_expanded
+    candidate = candidate_fp8.float() * candidate_scale_expanded
+    if not torch.isfinite(baseline).all() or not torch.isfinite(candidate).all():
+        return False, float("inf"), float("inf")
+
+    diff = (baseline - candidate).abs()
+    mean_diff = diff.mean().item()
+    atol = 0.5 * baseline_scale_expanded.abs().clamp_min(1e-12)
+    tolerance = atol + _fp8_rtol(baseline_fp8.dtype) * baseline.abs()
+    max_error_ratio = (diff / tolerance).max().item()
+    passed = max_error_ratio <= 1.0
+    return passed, max_error_ratio, mean_diff
+
+
 def _compare_outputs(baseline_out: Any, candidate_out: Any) -> tuple[bool, float, float]:
     """Compare outputs: return (pass, max_error_ratio, mean_abs_diff)."""
     if isinstance(baseline_out, torch.Tensor) and isinstance(candidate_out, torch.Tensor):
@@ -126,13 +200,40 @@ def _compare_outputs(baseline_out: Any, candidate_out: Any) -> tuple[bool, float
         max_error_ratio = 0.0
         total_diff = 0.0
         count = 0
-        for b, c in zip(baseline_out, candidate_out):
+        i = 0
+        while i < len(baseline_out):
+            b = baseline_out[i]
+            c = candidate_out[i]
+            if (
+                i + 1 < len(baseline_out)
+                and _is_fp8_tensor(b)
+                and _is_fp8_tensor(c)
+                and isinstance(baseline_out[i + 1], torch.Tensor)
+                and isinstance(candidate_out[i + 1], torch.Tensor)
+            ):
+                baseline_scale = baseline_out[i + 1]
+                candidate_scale = candidate_out[i + 1]
+                if (
+                    _expand_fp8_scale(b, baseline_scale) is not None
+                    and _expand_fp8_scale(c, candidate_scale) is not None
+                ):
+                    p, ratio, d = _compare_fp8_scaled_outputs(
+                        b, baseline_scale, c, candidate_scale,
+                    )
+                    all_pass = all_pass and p
+                    max_error_ratio = max(max_error_ratio, ratio)
+                    total_diff += d
+                    count += 1
+                    i += 2
+                    continue
+
             if isinstance(b, torch.Tensor) and isinstance(c, torch.Tensor):
                 p, ratio, d = _compare_outputs(b, c)
                 all_pass = all_pass and p
                 max_error_ratio = max(max_error_ratio, ratio)
                 total_diff += d
                 count += 1
+            i += 1
         mean_diff = total_diff / count if count > 0 else 0.0
         return all_pass, max_error_ratio, mean_diff
 

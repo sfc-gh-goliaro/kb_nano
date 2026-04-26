@@ -41,7 +41,7 @@ kb_nano eval \
 
 ### Kernel Benchmark CLI
 
-`kb_nano kernels` benchmarks a single operator replacement. It instantiates the baseline and candidate modules, compares their `forward()` outputs with a tolerance-normalized max error ratio, and measures wall-clock speedup.
+`kb_nano kernels` benchmarks a single operator replacement. It instantiates the baseline and candidate modules, compares their `forward()` outputs with a tolerance-normalized max error ratio, and measures wall-clock speedup. FP8 `(tensor, scale)` output pairs are compared after dequantization with scale-derived tolerances.
 
 ```bash
 # List all benchmarkable targets
