@@ -127,7 +127,7 @@ Every `kb_nano agent`, `kb_nano kernels`, `kb_nano eval`, and `kb_nano e2e` run 
 |---------|-------------|
 | `kb_nano agent` | Run params, per-op generation success/attempts, unit test results, e2e speedup, kernel source code |
 | `kb_nano kernels` | Bench params, per-operator per-scenario speedup/correctness, kernel source code |
-| `kb_nano eval` | Per-model throughput/latency speedup, alignment rate, wall-clock time |
+| `kb_nano eval` | Per-model throughput/latency speedup, alignment rate, MacroEval speedup/correctness/coverage/score, wall-clock time |
 | `kb_nano e2e` | Throughput (tokens/s), latency (percentiles), serve metrics (TTFT, TPOT, ITL) |
 
 ### Querying from the CLI
@@ -274,7 +274,7 @@ Each run is tagged with a `tier` that indicates its source:
 |-----|---------------|-------------|
 | `agent` | `kb_nano agent` | `gen_{op}_success`, `utest_{op}_success`, `e2e_speedup`, `e2e_token_match_rate` |
 | `kernel` | `kb_nano kernels` | `{op}_avg_speedup`, `{op}_passed`, `{op}_failed`, `avg_speedup` |
-| `eval` | `kb_nano eval` | `avg_throughput_speedup`, `avg_latency_speedup`, `alignment_rate` |
+| `eval` | `kb_nano eval` | `avg_throughput_speedup`, `avg_latency_speedup`, `alignment_rate`, `macro_speedup`, `macro_correctness`, `macro_coverage`, `macro_score` |
 | `e2e` | `kb_nano e2e` | `tokens_per_second`, `avg_latency`, `mean_ttft_ms` (varies by bench type) |
 
 ### Disabling tracking

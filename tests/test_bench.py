@@ -7,7 +7,6 @@ Sections 7-9: Integration tests (GPU required).
 
 Usage:
     python tests/test_bench.py                 # all tests
-    python tests/test_bench.py --unit-only      # no GPU required
     python tests/test_bench.py --section 3      # run only section 3
 """
 
@@ -17,6 +16,7 @@ import argparse
 import io
 import importlib
 import json
+import math
 import os
 import signal
 import subprocess
@@ -541,6 +541,203 @@ def test_section_3():
         check("OVERALL" in output, "3e. table contains OVERALL summary")
         check("ALL OPERATORS SUMMARY" in output, "3e. multi-operator table has summary")
 
+    # 3f. MacroEval aggregation
+    with _Timeout(30):
+        from kb_nano.bench.eval.aggregator import Aggregator
+        from kb_nano.bench.eval.runner import JobResult
+
+        llm_valid = JobResult(
+            model="model-a",
+            tp=1,
+            category="llm",
+            throughput_results=[
+                {"speedup": 2.0, "aligned_matches": 1, "aligned_total": 1},
+                {"speedup": 8.0, "aligned_matches": 1, "aligned_total": 1},
+            ],
+            latency_results=[{"speedup": 1.0}],
+        )
+        llm_invalid = JobResult(
+            model="model-b",
+            tp=1,
+            category="llm",
+            throughput_results=[
+                {"speedup": 16.0, "aligned_matches": 1, "aligned_total": 2},
+            ],
+            latency_results=[{"speedup": 16.0}],
+        )
+        diffusion_valid = JobResult(
+            model="model-c",
+            tp=1,
+            category="diffusion",
+            throughput_results=[{"speedup": 1.0}],
+            latency_results=[{"speedup": 4.0}],
+        )
+
+        report = Aggregator.aggregate(
+            [llm_valid, llm_invalid, diffusion_valid],
+            wall_clock_seconds=12.0,
+        )
+        cats = {c.name: c for c in report.categories}
+
+        check(
+            abs(cats["llm"].macro_correctness - 0.75) < 1e-9,
+            f"3f. llm macro correctness={cats['llm'].macro_correctness:.3f}",
+        )
+        check(
+            abs(cats["llm"].macro_coverage - 0.5) < 1e-9,
+            f"3f. llm macro coverage={cats['llm'].macro_coverage:.3f}",
+        )
+        check(
+            abs(report.macro_correctness - 0.875) < 1e-9,
+            f"3f. macro correctness={report.macro_correctness:.3f}",
+        )
+        check(
+            abs(report.macro_coverage - 0.75) < 1e-9,
+            f"3f. macro coverage={report.macro_coverage:.3f}",
+        )
+        check(
+            abs(report.macro_speedup - 2.0) < 1e-9,
+            f"3f. macro speedup={report.macro_speedup:.3f}",
+        )
+        check(
+            abs(report.macro_score - 1.3125) < 1e-9,
+            f"3f. macro score={report.macro_score:.4f}",
+        )
+
+    # 3g. MacroEval excludes invalid/failed items from speedup credit
+    with _Timeout(30):
+        from kb_nano.bench.eval.aggregator import Aggregator
+        from kb_nano.bench.eval.runner import JobResult
+
+        llm_valid = JobResult(
+            model="llm-valid",
+            tp=1,
+            category="llm",
+            throughput_results=[
+                {"speedup": 4.0, "aligned_matches": 2, "aligned_total": 2},
+                {"speedup": 9.0, "aligned_matches": 2, "aligned_total": 2},
+            ],
+            latency_results=[
+                {"speedup": 1.0},
+                {"speedup": 4.0},
+            ],
+        )
+        llm_invalid_fast = JobResult(
+            model="llm-invalid-fast",
+            tp=1,
+            category="llm",
+            throughput_results=[
+                {"speedup": 100.0, "aligned_matches": 0, "aligned_total": 1},
+            ],
+            latency_results=[{"speedup": 100.0}],
+        )
+        vision_failed = JobResult(
+            model="vision-failed",
+            tp=1,
+            category="vision",
+            status="FAILED",
+            error="synthetic failure",
+        )
+
+        report = Aggregator.aggregate([llm_valid, llm_invalid_fast, vision_failed])
+        cats = {c.name: c for c in report.categories}
+        expected_llm_thru = 6.0
+        expected_llm_lat = 2.0
+        expected_llm_blend = math.sqrt(expected_llm_thru * expected_llm_lat)
+
+        check(
+            abs(cats["llm"].models[0].throughput_speedup - expected_llm_thru) < 1e-9,
+            f"3g. per-item throughput geomean={cats['llm'].models[0].throughput_speedup:.3f}",
+        )
+        check(
+            abs(cats["llm"].models[0].latency_speedup - expected_llm_lat) < 1e-9,
+            f"3g. per-item latency geomean={cats['llm'].models[0].latency_speedup:.3f}",
+        )
+        check(
+            abs(cats["llm"].models[0].blended_speedup - expected_llm_blend) < 1e-9,
+            f"3g. blended speedup={cats['llm'].models[0].blended_speedup:.3f}",
+        )
+        check(
+            not cats["llm"].models[1].valid
+            and cats["llm"].models[1].blended_speedup == 0.0,
+            "3g. invalid fast item receives no speedup credit",
+        )
+        check(
+            cats["vision"].macro_coverage == 0.0
+            and cats["vision"].macro_correctness == 0.0
+            and cats["vision"].macro_speedup == 1.0,
+            "3g. failed-only family affects coverage/correctness but not speedup",
+        )
+        check(
+            abs(report.macro_speedup - expected_llm_blend) < 1e-9,
+            f"3g. macro speedup excludes failed-only family: {report.macro_speedup:.3f}",
+        )
+        check(
+            abs(report.macro_correctness - 0.25) < 1e-9
+            and abs(report.macro_coverage - 0.25) < 1e-9,
+            f"3g. macro correctness/coverage={report.macro_correctness:.2f}/{report.macro_coverage:.2f}",
+        )
+
+    # 3h. MacroEval JSON schema and terminal output
+    with _Timeout(30):
+        from kb_nano.bench.eval.aggregator import Aggregator
+        from kb_nano.bench.eval.runner import JobResult
+
+        report = Aggregator.aggregate([
+            JobResult(
+                model="macro-json-model",
+                tp=1,
+                category="llm",
+                throughput_results=[
+                    {"speedup": 1.5, "aligned_matches": 3, "aligned_total": 3},
+                ],
+                latency_results=[{"speedup": 2.0}],
+            )
+        ])
+        d = report.to_dict()
+        check(
+            all(k in d for k in (
+                "macro_speedup", "macro_correctness",
+                "macro_coverage", "macro_score",
+            )),
+            "3h. EvalReport JSON contains top-level MacroEval fields",
+        )
+        check(
+            all(k in d["categories"][0] for k in (
+                "macro_speedup", "macro_correctness",
+                "macro_coverage", "macro_score",
+            )),
+            "3h. Category JSON contains MacroEval fields",
+        )
+        check(
+            all(k in d["categories"][0]["models"][0] for k in (
+                "correctness_score", "valid", "blended_speedup",
+            )),
+            "3h. Model JSON contains MacroEval item fields",
+        )
+
+        with tempfile.TemporaryDirectory() as tmpdir:
+            path = os.path.join(tmpdir, "eval.json")
+            report.save_json(path)
+            with open(path) as f:
+                loaded = json.load(f)
+            check(
+                loaded["macro_score"] == d["macro_score"],
+                "3h. MacroEval fields persist through save_json",
+            )
+
+        old_stdout = sys.stdout
+        sys.stdout = buf = io.StringIO()
+        report.print_table()
+        sys.stdout = old_stdout
+        output = buf.getvalue()
+        check(
+            "MacroEval speedup" in output
+            and "MacroEval correctness" in output
+            and "MacroEval score" in output,
+            "3h. terminal output includes MacroEval summary",
+        )
+
 
 # ===========================================================================
 # Section 4: Standardized workloads (unit, no GPU)
@@ -889,17 +1086,21 @@ def test_section_7():
 
     candidate_dir = os.path.join(PACKAGE_DIR, "tasks", "candidate", "L1")
     candidate_file = os.path.join(candidate_dir, "rms_norm.py")
-    baseline_file = os.path.join(PACKAGE_DIR, "tasks", "baseline", "L1", "rms_norm.py")
     had_candidate = os.path.exists(candidate_file)
     if had_candidate:
         original_candidate = open(candidate_file).read()
 
-    # 7a. Identity replacement via the new runner (copy baseline as candidate)
+    def _write_identity_rms_candidate():
+        with open(candidate_file, "w") as f:
+            f.write(f"""\
+from {PACKAGE_NAME}.tasks.baseline.L1.rms_norm import RMSNorm
+""")
+
+    # 7a. Identity replacement via the new runner
     with _Timeout(120):
         try:
-            import shutil
             os.makedirs(candidate_dir, exist_ok=True)
-            shutil.copy2(baseline_file, candidate_file)
+            _write_identity_rms_candidate()
             result = subprocess.run(
                 [sys.executable, "-c", f"""
 import sys, json
@@ -996,8 +1197,7 @@ print(json.dumps({{
     # 7c. JSON output file via CLI (baseline as candidate in candidates folder)
     with _Timeout(180):
         try:
-            import shutil
-            shutil.copy2(baseline_file, candidate_file)
+            _write_identity_rms_candidate()
             with tempfile.TemporaryDirectory() as tmpdir:
                 json_path = os.path.join(tmpdir, "kernels.json")
                 result = subprocess.run(
@@ -1243,6 +1443,51 @@ finally:
             f"9c. eval default output: {default_output}",
         )
 
+    # 9d. MacroEval report integration schema
+    with _Timeout(30):
+        from kb_nano.bench.eval.aggregator import Aggregator
+        from kb_nano.bench.eval.runner import JobResult
+
+        report = Aggregator.aggregate([
+            JobResult(
+                model="integration-a",
+                tp=1,
+                category="llm",
+                throughput_results=[
+                    {"speedup": 2.0, "aligned_matches": 2, "aligned_total": 2},
+                ],
+                latency_results=[{"speedup": 2.0}],
+            ),
+            JobResult(
+                model="integration-b",
+                tp=1,
+                category="vlm",
+                status="FAILED",
+                error="synthetic failure",
+            ),
+        ])
+
+        with tempfile.TemporaryDirectory() as tmpdir:
+            json_path = os.path.join(tmpdir, "eval_macro.json")
+            report.save_json(json_path)
+            with open(json_path) as f:
+                data = json.load(f)
+        check(
+            abs(data["macro_speedup"] - 2.0) < 1e-9,
+            f"9d. macro_speedup={data['macro_speedup']:.2f}",
+        )
+        check(
+            abs(data["macro_correctness"] - 0.5) < 1e-9
+            and abs(data["macro_coverage"] - 0.5) < 1e-9
+            and abs(data["macro_score"] - 0.5) < 1e-9,
+            "9d. MacroEval correctness/coverage/score persisted",
+        )
+        check(
+            len(data["categories"]) == 2
+            and all("macro_score" in c for c in data["categories"]),
+            "9d. category MacroEval schema persisted",
+        )
+
 
 # ===========================================================================
 # Main
@@ -1250,10 +1495,6 @@ finally:
 def main():
     parser = argparse.ArgumentParser(
         description="Test the kb-nano benchmarking infrastructure",
-    )
-    parser.add_argument(
-        "--unit-only", action="store_true",
-        help="Skip GPU integration tests (sections 7-9)",
     )
     parser.add_argument(
         "--section", type=int, default=None,
@@ -1266,24 +1507,19 @@ def main():
     print("=" * 60)
 
     sections = {
-        1: ("Input Registry", test_section_1, False),
-        2: ("KernelRunner", test_section_2, False),
-        3: ("Result dataclasses", test_section_3, False),
-        4: ("Standardized workloads", test_section_4, False),
-        5: ("Conflict resolution", test_section_5, False),
-        6: ("CLI argument parsing", test_section_6, False),
-        7: ("Kernel integration", test_section_7, True),
-        8: ("E2E integration", test_section_8, True),
-        9: ("Eval integration", test_section_9, True),
+        1: ("Input Registry", test_section_1),
+        2: ("KernelRunner", test_section_2),
+        3: ("Result dataclasses", test_section_3),
+        4: ("Standardized workloads", test_section_4),
+        5: ("Conflict resolution", test_section_5),
+        6: ("CLI argument parsing", test_section_6),
+        7: ("Kernel integration", test_section_7),
+        8: ("E2E integration", test_section_8),
+        9: ("Eval integration", test_section_9),
     }
 
-    for num, (name, func, needs_gpu) in sorted(sections.items()):
+    for num, (name, func) in sorted(sections.items()):
         if args.section is not None and args.section != num:
-            continue
-        if args.unit_only and needs_gpu:
-            print(f"\n{'=' * 60}")
-            print(f"  SKIPPED: Section {num} ({name}) -- requires GPU")
-            print(f"{'=' * 60}")
             continue
         try:
             func()

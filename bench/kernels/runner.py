@@ -45,6 +45,7 @@ def _instantiate_module(
     cls: type,
     init_args: dict[str, Any],
     device: str = "cuda",
+    dtype: torch.dtype | None = None,
 ) -> nn.Module:
     """Create an nn.Module instance with init_args, handling common patterns."""
     try:
@@ -53,8 +54,45 @@ def _instantiate_module(
         module = cls()
 
     module = module.to(device)
+    if dtype is not None:
+        module = module.to(dtype=dtype)
     module.eval()
     return module
+
+
+def _first_floating_dtype(value: Any) -> torch.dtype | None:
+    if isinstance(value, torch.Tensor) and value.is_floating_point():
+        if "float8" not in str(value.dtype):
+            return value.dtype
+        return None
+    if isinstance(value, dict):
+        for v in value.values():
+            dtype = _first_floating_dtype(v)
+            if dtype is not None:
+                return dtype
+    if isinstance(value, (tuple, list)):
+        for v in value:
+            dtype = _first_floating_dtype(v)
+            if dtype is not None:
+                return dtype
+    return None
+
+
+def _clone_input_value(value: Any) -> Any:
+    """Clone tensors in an input tree so in-place kernels cannot cross-contaminate runs."""
+    if isinstance(value, torch.Tensor):
+        return value.clone()
+    if isinstance(value, tuple):
+        return tuple(_clone_input_value(v) for v in value)
+    if isinstance(value, list):
+        return [_clone_input_value(v) for v in value]
+    if isinstance(value, dict):
+        return {k: _clone_input_value(v) for k, v in value.items()}
+    return value
+
+
+def _clone_inputs(inputs: dict[str, Any]) -> dict[str, Any]:
+    return {k: _clone_input_value(v) for k, v in inputs.items()}
 
 
 def _time_forward(
@@ -309,8 +347,15 @@ def run_kernel_benchmark(
 
     for scenario in all_scenarios:
         try:
-            baseline_mod = _instantiate_module(target.target_cls, scenario.init_args, device)
-            candidate_mod = _instantiate_module(user_impl, scenario.init_args, device)
+            inputs = registry.get_inputs(target_name, scenario.name, device=device)
+            input_dtype = _first_floating_dtype(inputs)
+
+            baseline_mod = _instantiate_module(
+                target.target_cls, scenario.init_args, device, dtype=input_dtype,
+            )
+            candidate_mod = _instantiate_module(
+                user_impl, scenario.init_args, device, dtype=input_dtype,
+            )
 
             if hasattr(baseline_mod, "state_dict") and len(baseline_mod.state_dict()) > 0:
                 try:
@@ -318,13 +363,11 @@ def run_kernel_benchmark(
                 except Exception:
                     pass
 
-            inputs = registry.get_inputs(target_name, scenario.name, device=device)
-
             baseline_out, baseline_ms = _time_forward(
-                baseline_mod, inputs, num_warmup, num_runs,
+                baseline_mod, _clone_inputs(inputs), num_warmup, num_runs,
             )
             candidate_out, candidate_ms = _time_forward(
-                candidate_mod, inputs, num_warmup, num_runs,
+                candidate_mod, _clone_inputs(inputs), num_warmup, num_runs,
             )
 
             correct, max_error_ratio, mean_diff = _compare_outputs(baseline_out, candidate_out)

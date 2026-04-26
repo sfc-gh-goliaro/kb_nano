@@ -117,6 +117,15 @@ Eval uses fixed, non-configurable workloads for reproducibility:
 - `single-request` — batch 1, 128 in/out tokens
 - `fixed-batch-32` — batch 32, 128 in/out tokens
 
+### MacroEval metrics
+
+Tier 3 reports MacroEval leaderboard metrics in addition to the legacy averages:
+
+- `macro_speedup` — macro-geometric speedup across architecture families. Each valid item blends throughput and latency speedups with `lambda=0.5`, then families and the overall report use geometric means.
+- `macro_correctness` — macro-averaged calibrated correctness across families. LLM eval currently uses deterministic token alignment as the calibrated correctness signal.
+- `macro_coverage` — macro-averaged fraction of valid items per family. Invalid or failed items receive no speedup credit.
+- `macro_score` — default product score: `macro_speedup * macro_correctness * macro_coverage`.
+
 ---
 
 ## Input Registry

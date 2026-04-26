@@ -221,6 +221,10 @@ def log_eval(report: EvalReport) -> None:
     )
     _mlflow.log_metric("avg_latency_speedup", report.avg_latency_speedup)
     _mlflow.log_metric("alignment_rate", report.alignment_rate)
+    _mlflow.log_metric("macro_speedup", report.macro_speedup)
+    _mlflow.log_metric("macro_correctness", report.macro_correctness)
+    _mlflow.log_metric("macro_coverage", report.macro_coverage)
+    _mlflow.log_metric("macro_score", report.macro_score)
     _mlflow.log_metric("wall_clock_seconds", report.wall_clock_seconds)
     _mlflow.log_metric("failed_jobs", report.failed_jobs)
 
