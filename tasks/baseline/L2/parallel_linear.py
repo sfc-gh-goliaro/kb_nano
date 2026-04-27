@@ -86,48 +86,74 @@ class MergedColumnParallelLinear(nn.Module):
     """gate_proj + up_proj merged into one linear, sharded across TP."""
 
     def __init__(self, input_size: int, output_sizes: list[int], bias: bool = False,
-                 quant_config: dict | None = None):
+                 quant_config: dict | None = None, disable_tp: bool = False):
         super().__init__()
         tp = _tp_size()
+        self.disable_tp = disable_tp
         self.output_sizes = output_sizes
         total = sum(output_sizes)
-        assert all(s % tp == 0 for s in output_sizes)
+        if not disable_tp:
+            assert all(s % tp == 0 for s in output_sizes)
         self.use_fp8 = quant_config is not None
 
+        effective_tp = 1 if disable_tp else tp
         if self.use_fp8:
             self.weight = nn.Parameter(
-                torch.empty(total // tp, input_size, dtype=torch.float8_e4m3fn),
+                torch.empty(total // effective_tp, input_size, dtype=torch.float8_e4m3fn),
                 requires_grad=False,
             )
             self.weight_scale_inv = nn.Parameter(
-                torch.empty(*_scale_shape(total // tp, input_size), dtype=torch.float32),
+                torch.empty(*_scale_shape(total // effective_tp, input_size), dtype=torch.float32),
                 requires_grad=False,
             )
             self.weight.weight_loader = self._weight_loader
             self.weight_scale_inv.weight_loader = self._scale_loader
             self.linear_op = _get_fp8_linear_cls()()
         else:
-            self.weight = nn.Parameter(torch.empty(total // tp, input_size))
+            self.weight = nn.Parameter(torch.empty(total // effective_tp, input_size))
             self.weight.weight_loader = self._weight_loader
 
         self.bias = None
+        if bias:
+            self.bias = nn.Parameter(torch.empty(total // tp))
+            self.bias.weight_loader = self._weight_loader
 
-    def _weight_loader(self, param, loaded_weight, shard_id: int):
+    def _weight_loader(self, param, loaded_weight, shard_id: int | None = None):
         tp, rank = _tp_size(), _tp_rank()
-        shard_offset = sum(self.output_sizes[:shard_id]) // tp
-        shard_size = self.output_sizes[shard_id] // tp
+        if shard_id is None:
+            # Fused weight: ``loaded_weight`` is the full ``[sum(output_sizes), in]``
+            # tensor.  Recurse per-shard so each output block is sharded across
+            # TP ranks independently (mirrors vLLM's ``MergedColumnParallelLinear``
+            # weight loader when called without an explicit shard id).
+            offset = 0
+            for sid, sz in enumerate(self.output_sizes):
+                self._weight_loader(
+                    param, loaded_weight.narrow(0, offset, sz), sid,
+                )
+                offset += sz
+            return
+        effective_tp = 1 if self.disable_tp else tp
+        shard_offset = sum(self.output_sizes[:shard_id]) // effective_tp
+        shard_size = self.output_sizes[shard_id] // effective_tp
         dst = param.data.narrow(0, shard_offset, shard_size)
-        src = loaded_weight.chunk(tp, 0)[rank]
-        dst.copy_(src)
+        if self.disable_tp:
+            dst.copy_(loaded_weight)
+        else:
+            src = loaded_weight.chunk(tp, 0)[rank]
+            dst.copy_(src)
 
     def _scale_loader(self, param, loaded_weight, shard_id: int):
         tp, rank = _tp_size(), _tp_rank()
-        shard_size_out = self.output_sizes[shard_id] // tp
+        effective_tp = 1 if self.disable_tp else tp
+        shard_size_out = self.output_sizes[shard_id] // effective_tp
         scale_rows = math.ceil(shard_size_out / _FP8_BLOCK)
-        shard_offset_out = sum(self.output_sizes[:shard_id]) // tp
+        shard_offset_out = sum(self.output_sizes[:shard_id]) // effective_tp
         scale_offset = math.ceil(shard_offset_out / _FP8_BLOCK)
-        src = loaded_weight.chunk(tp, 0)[rank]
-        param.data.narrow(0, scale_offset, scale_rows).copy_(src)
+        if self.disable_tp:
+            param.data.narrow(0, scale_offset, scale_rows).copy_(loaded_weight)
+        else:
+            src = loaded_weight.chunk(tp, 0)[rank]
+            param.data.narrow(0, scale_offset, scale_rows).copy_(src)
 
     def forward(self, x):
         if self.use_fp8:
@@ -145,10 +171,13 @@ class QKVParallelLinear(nn.Module):
         tp = _tp_size()
         self.head_size = head_size
         self.num_heads = total_num_heads // tp
-        if total_num_kv_heads >= tp:
+        # Replicate KV heads when not evenly divisible by TP
+        if total_num_kv_heads % tp == 0:
             self.num_kv_heads = total_num_kv_heads // tp
+            self._replicate_kv = False
         else:
-            self.num_kv_heads = 1
+            self.num_kv_heads = total_num_kv_heads
+            self._replicate_kv = True
         output_size = (self.num_heads + 2 * self.num_kv_heads) * head_size
         self.use_fp8 = quant_config is not None
 
@@ -178,14 +207,16 @@ class QKVParallelLinear(nn.Module):
         if shard_id == "q":
             shard_size = self.num_heads * self.head_size
             shard_offset = 0
+            src = loaded_weight.chunk(tp, 0)[rank]
         elif shard_id == "k":
             shard_size = self.num_kv_heads * self.head_size
             shard_offset = self.num_heads * self.head_size
+            src = loaded_weight if self._replicate_kv else loaded_weight.chunk(tp, 0)[rank]
         else:
             shard_size = self.num_kv_heads * self.head_size
             shard_offset = self.num_heads * self.head_size + self.num_kv_heads * self.head_size
+            src = loaded_weight if self._replicate_kv else loaded_weight.chunk(tp, 0)[rank]
         dst = param.data.narrow(0, shard_offset, shard_size)
-        src = loaded_weight.chunk(tp, 0)[rank]
         dst.copy_(src)
 
     def _scale_loader(self, param, loaded_weight, shard_id: str):
@@ -249,13 +280,14 @@ class RowParallelLinear(nn.Module):
     """Splits input dim across TP ranks, all-reduces output."""
 
     def __init__(self, input_size: int, output_size: int, bias: bool = False,
-                 quant_config: dict | None = None):
+                 quant_config: dict | None = None, reduce_results: bool = True):
         super().__init__()
         tp = _tp_size()
         assert input_size % tp == 0
         self.input_size_per_partition = input_size // tp
         self.tp_size = tp
         self.tp_rank = _tp_rank()
+        self.reduce_results = reduce_results
         self.use_fp8 = quant_config is not None
 
         if self.use_fp8:
@@ -299,6 +331,6 @@ class RowParallelLinear(nn.Module):
                                self.bias if self.tp_rank == 0 else None)
         else:
             y = F.linear(x, self.weight, self.bias if self.tp_rank == 0 else None)
-        if self.tp_size > 1:
+        if self.reduce_results and self.tp_size > 1:
             y = self.allreduce(y)
         return y
