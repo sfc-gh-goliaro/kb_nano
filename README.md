@@ -1,6 +1,6 @@
 # kb-nano
 
-A standalone, high-performance inference engine supporting **LLMs** (Llama 3.1, Llama 4, Mixtral-8x7B, DeepSeek V3.2, GPT-OSS, Qwen2-VL, Qwen3-VL), **linear-attention LLMs** (GLA, RetNet, RWKV7), **diffusion models** (FLUX.1-dev, SDXL, HunyuanVideo-1.5), **detection models** (YOLOv10, RTDetrV2), **vision encoders** (SigLIP-2, DINOv3, SwinV2), **segmentation models** (SAM3.1), **protein structure prediction** (OpenFold3), audio models (Whisper), and **TTS models** (CosyVoice3) with tensor parallelism and FP8 quantization. No vLLM dependency at runtime — just PyTorch, Triton, and Flash Attention.
+A standalone, high-performance inference engine supporting **LLMs** (Llama 3.1, Llama 4, Mixtral-8x7B, DeepSeek V3.2, GPT-OSS, Kimi Linear, Qwen3-Next, Qwen2-VL, Qwen3-VL), **linear-attention LLMs** (GLA, RetNet, RWKV7), **diffusion models** (FLUX.1-dev, SDXL, HunyuanVideo-1.5), **detection models** (YOLOv10, RTDetrV2), **vision encoders** (SigLIP-2, DINOv3, SwinV2), **segmentation models** (SAM3.1), **protein structure prediction** (OpenFold3), audio models (Whisper), and **TTS models** (CosyVoice3) with tensor parallelism and FP8 quantization. No vLLM dependency at runtime — just PyTorch, Triton, and Flash Attention.
 
 ## Features
 
@@ -9,6 +9,8 @@ A standalone, high-performance inference engine supporting **LLMs** (Llama 3.1, 
 - **Mixtral-8x7B** with fused Triton MoE grouped-GEMM kernels
 - **DeepSeek V3.2** with MLA (Multi-head Latent Attention), 256-expert MoE via DeepGEMM FP8, DSA (DeepSeek Sparse Attention), and YARN RoPE — currently **0.78–0.90× of vLLM** throughput on 8×H200 (gap due to kernel-launch overhead, GEMM kernel selection, and AllReduce+RMSNorm fusion)
 - **GPT-OSS** (20B, 120B) MXFP4-quantized MoE with native Triton inference, YaRN RoPE, attention sinks, and sliding window
+- **Kimi Linear** (`moonshotai/Kimi-Linear-48B-A3B-Instruct`) hybrid KDA + MLA language model with 20 KDA layers, 7 MLA layers, and 256-expert MoE
+- **Qwen3-Next** (`Qwen/Qwen3-Next-80B-A3B-Instruct`) hybrid Gated DeltaNet + full-attention language model with 36 GDN layers, 12 MHA layers, and 512-expert MoE
 - **Mamba / Mamba2** (`state-spaces/mamba-2.8b-hf`, `mistralai/Mamba-Codestral-7B-v0.1`) selective state-space models with vLLM-aligned `causal_conv1d` + `mamba_chunk_scan` / `selective_scan` kernels, slot-based recurrent state cache, chunked-prefill metadata, and TP sharding (incl. `n_groups % tp != 0` head-shard groups)
 - **GLA** (`fla-hub/gla-2.7B-100B`) Gated Linear Attention with per-head logsigmoid forget gate, swish output gate, and SwiGLU MLP — token-aligned with the FLA reference
 - **RetNet** (`fla-hub/retnet-2.7B-100B`) Multi-Scale Retention with rotary embeddings, fixed per-head decay (γ_h = 1 − 2^(−5−h)), swish output gate, and SwiGLU MLP — token-aligned with the FLA reference
@@ -120,6 +122,13 @@ python tests/bench_vllm.py \
 # GPT-OSS MoE (MXFP4 quantized)
 python tests/bench_vllm.py \
     --model openai/gpt-oss-120b --tp 2
+
+# Kimi Linear and Qwen3-Next hybrid linear-attention MoE models
+python tests/bench_vllm.py \
+    --model moonshotai/Kimi-Linear-48B-A3B-Instruct --tp 2
+
+python tests/bench_vllm.py \
+    --model Qwen/Qwen3-Next-80B-A3B-Instruct --tp 2
 
 # Whisper speech-to-text
 python tests/bench_vllm.py --model openai/whisper-large-v3
@@ -533,6 +542,53 @@ Latency (128 output tokens, 5 iterations):
 | gpt-oss-120b | 2 | fixed-batch-32 | 32 | 1.331s | 1.394s | 0.33 | 0.34 | 0.95x |
 
 Both models are at or above vLLM throughput across all scenarios (20B: 1.00–1.04x, 120B: 1.02–1.05x). Single-request latency trails vLLM (0.83–0.93x) since vLLM benefits from `torch.compile`/Inductor fusions at small batch sizes, while batched latency is on par. The lower token match rate for the 120B model is expected: with 128 experts and top-4 routing, small numerical differences in router logits cause different expert selections, which cascade into divergent outputs. The 20B model (32 experts) shows higher match rates (~86–91%).
+
+### Kimi Linear / Qwen3-Next
+
+Run `tests/bench_vllm.py --model moonshotai/Kimi-Linear-48B-A3B-Instruct --tp 2` and `tests/bench_vllm.py --model Qwen/Qwen3-Next-80B-A3B-Instruct --tp 2` to reproduce. 1000 sequences per throughput scenario, `temperature=0`, full vLLM/kb-nano optimizations enabled.
+
+Throughput:
+
+| Model | TP | Scenario | Input/Output | vLLM (tok/s) | Ours (tok/s) | Ratio | Avg Match Tokens |
+|-------|---:|----------|:------------:|-------------:|-------------:|------:|-----------------:|
+| Kimi-Linear-48B-A3B | 2 | prefill-heavy | 1024/512  | 13,043 | 15,554 | **1.19x** | 69.1/512 |
+| Kimi-Linear-48B-A3B | 2 | balanced      |  512/512  | 16,331 | 19,450 | **1.19x** | 71.7/512 |
+| Kimi-Linear-48B-A3B | 2 | decode-heavy  |  512/1024 | 18,325 | 22,326 | **1.22x** | 42.0/1024 |
+| Qwen3-Next-80B-A3B | 2 | prefill-heavy | 1024/512  |  8,684 | 10,697 | **1.23x** | 447.5/512 |
+| Qwen3-Next-80B-A3B | 2 | balanced      |  512/512  | 10,339 | 12,679 | **1.23x** | 451.0/512 |
+| Qwen3-Next-80B-A3B | 2 | decode-heavy  |  512/1024 | 11,257 | 14,141 | **1.26x** | 563.7/1024 |
+
+Latency (128 output tokens, 5 iterations):
+
+| Model | TP | Scenario | Batch Size | vLLM median | Ours median | vLLM ms/tok | Ours ms/tok | Ratio |
+|-------|---:|----------|---:|------------:|------------:|------------:|------------:|------:|
+| Kimi-Linear-48B-A3B | 2 | single-request | 1  | 0.568s | 0.672s | 4.44 | 5.25 | 0.85x |
+| Kimi-Linear-48B-A3B | 2 | fixed-batch-32 | 32 | 1.345s | 1.248s | 0.33 | 0.30 | **1.08x** |
+| Qwen3-Next-80B-A3B | 2 | single-request | 1  | 0.709s | 1.066s | 5.54 | 8.33 | 0.67x |
+| Qwen3-Next-80B-A3B | 2 | fixed-batch-32 | 32 | 1.336s | 1.769s | 0.33 | 0.43 | 0.76x |
+
+Kimi Linear alignment:
+
+The throughput table reports strict generated-token equality against vLLM. For Kimi Linear this is intentionally conservative: small bf16 differences in recurrent/linear-attention state can change one early greedy token, and exact continuation match then counts all downstream tokens as different. The stronger check is to feed each generated continuation back into vLLM as `prompt + generated_token_ids` and measure the rank of each generated token under vLLM prefill:
+
+```bash
+python tests/analyze_prefill_token_ranks.py \
+    --model moonshotai/Kimi-Linear-48B-A3B-Instruct \
+    --bench-output-dir tmp/readme_kimi_linear_full_vs_vllm_rerun \
+    --tp 2 --max-model-len 2048 --load-format fastsafetensors \
+    --limit 512
+```
+
+This scores 512 requests per scenario per engine (`512 x 3 x 2 = 3072` requests, 2,097,152 generated tokens total) with vLLM CUDA graphs enabled. kb-nano generated tokens rank as valid vLLM continuations, with no missing tokens and median rank 1:
+
+| Scenario | Engine | Scored Tokens | Top-1 | Top-20 | Median Rank |
+|----------|--------|--------------:|------:|-------:|------------:|
+| prefill-heavy | kb-nano | 262,144 | 0.9525 | 0.9921 | 1 |
+| prefill-heavy | vLLM self | 262,144 | 0.9298 | 0.9668 | 1 |
+| balanced | kb-nano | 262,144 | 0.9525 | 0.9930 | 1 |
+| balanced | vLLM self | 262,144 | 0.9141 | 0.9543 | 1 |
+| decode-heavy | kb-nano | 524,288 | 0.9409 | 0.9914 | 1 |
+| decode-heavy | vLLM self | 524,288 | 0.6348 | 0.9347 | 1 |
 
 ### Mamba / Mamba2 (Selective State-Space)
 

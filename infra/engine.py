@@ -30,21 +30,20 @@ import torch.multiprocessing as mp
 from transformers import AutoTokenizer
 
 from .context import (
-    AttnBackendConfig, CUDAGraphMode, auto_register_no_compile_layers,
+    AttnBackendConfig, auto_register_no_compile_layers,
     get_attn_backend_config, get_context,
-    reset_context, set_context, set_forward_context, set_mamba_context,
-    set_mixed_context,
+    KimiLinearMetadata, reset_context, set_context, set_forward_context,
+    set_mamba_context, set_mixed_context,
 )
 from .mamba_state import (
-    Mamba2Metadata, MambaMetadata, MambaStateManager, build_chunk_metadata,
-    compute_causal_conv1d_metadata,
+    KimiLinearStateManager, Mamba2Metadata, MambaMetadata, MambaStateManager,
+    build_chunk_metadata, compute_causal_conv1d_metadata,
 )
 from ..tasks.baseline.L1.allreduce import set_custom_ar
 from .weight_loader import load_model
 
 MAX_MODEL_LEN = 131072
 NCCL_PORT = int(os.environ.get("KB_NANO_NCCL_PORT", "29501"))
-
 
 
 def _detect_scheduling_defaults() -> tuple[int, int]:
@@ -345,8 +344,14 @@ class ModelRunner:
             model_name, torch.device(f"cuda:{rank}"), dtype,
         )
         model_type = getattr(self.config, "model_type", "")
+        self.is_kimi_linear = model_type == "kimi_linear"
+        self.is_qwen3_next = model_type == "qwen3_next"
         self.is_mamba2 = model_type == "mamba2"
-        self.is_mamba = model_type in ("mamba", "mamba2")
+        self.is_mamba = (
+            model_type in ("mamba", "mamba2")
+            or self.is_kimi_linear
+            or self.is_qwen3_next
+        )
         self.model_family = "mamba" if self.is_mamba else "attention"
         self.is_moe = hasattr(self.config, "num_local_experts") or getattr(self.config, "is_moe", False)
         self.is_qwen_vl = hasattr(self.config, "mrope_section")
@@ -355,6 +360,13 @@ class ModelRunner:
         )
         self.is_whisper = getattr(self.config, "is_encoder_decoder", False)
         self.is_deepseek_mla = hasattr(self.config, "kv_lora_rank")
+        if self.is_qwen3_next:
+            if self.max_num_batched_tokens <= _DEFAULT_MAX_NUM_BATCHED_TOKENS:
+                _, total_mem = torch.cuda.mem_get_info()
+                if total_mem >= 70 * (1 << 30):
+                    self.max_num_batched_tokens = max(
+                        self.max_num_batched_tokens, 32768,
+                    )
         if self.is_whisper:
             self.enforce_eager = True
             self.max_model_len = min(
@@ -370,31 +382,53 @@ class ModelRunner:
         if rank == 0:
             print(f"  [1/6] Model loaded in {_time.perf_counter()-_t0:.1f}s", flush=True)
         if self.is_mamba:
-            # Mamba models use slot-based recurrent state instead of paged
-            # KV cache.  Skip attention-specific setup (kv cache, fa3 decode
-            # buffers, torch.compile, CUDA graphs, fast greedy buffers --
-            # those all hardcode kv_cache / context_lens / block_tables).
             if rank == 0:
                 print("  [2/6] Sharing activation buffers...", flush=True)
             self._share_activation_buffers()
-            # Tier 1A: profile pass before sizing the state pool, mirroring
-            # vLLM's profile_run -> determine_available_memory ->
-            # get_kv_cache_configs flow.
-            if rank == 0:
-                print("  [3/6] Profiling Mamba state cache...", flush=True)
-            self._profile_mamba_run()
-            self.allocate_mamba_state_cache()
-            if self.is_mamba2 and not self.enforce_eager:
+            if self.is_kimi_linear:
                 if rank == 0:
-                    print("  [4/6] Compiling Mamba2...", flush=True)
-                self._compile_model()
-            if rank == 0:
-                print("  [5/6] Preparing Mamba decode buffers...", flush=True)
-            self._init_mamba_decode_buffers()
-            if not self.enforce_eager:
+                    print("  [3/6] Allocating MLA KV cache...", flush=True)
+                self._allocate_mla_kv_cache()
                 if rank == 0:
-                    print("  [6/6] Capturing Mamba CUDA graphs...", flush=True)
-                self.capture_mamba_cudagraph()
+                    print("  [4/6] Allocating Kimi-Linear state cache...", flush=True)
+                self.allocate_mamba_state_cache()
+                if not self.enforce_eager:
+                    if rank == 0:
+                        print("  [5/6] Preparing Kimi decode buffers...", flush=True)
+                    self._init_kimi_decode_buffers()
+                    if rank == 0:
+                        print("  [6/6] Capturing Kimi CUDA graphs...", flush=True)
+                    self.capture_kimi_cudagraph()
+            elif self.is_qwen3_next:
+                if rank == 0:
+                    print("  [3/6] Allocating Qwen3-Next state/KV cache...", flush=True)
+                self.allocate_mamba_state_cache()
+                if not self.enforce_eager:
+                    if rank == 0:
+                        print("  [4/6] Preparing Qwen3-Next decode buffers...", flush=True)
+                    self._init_kimi_decode_buffers()
+                    if rank == 0:
+                        print("  [5/6] Capturing Qwen3-Next CUDA graphs...", flush=True)
+                    self.capture_kimi_cudagraph()
+                if rank == 0:
+                    print("  [6/6] Warming Qwen3-Next prefill kernels...", flush=True)
+                self._warmup_qwen3_next_prefill()
+            else:
+                if rank == 0:
+                    print("  [3/6] Profiling Mamba state cache...", flush=True)
+                self._profile_mamba_run()
+                self.allocate_mamba_state_cache()
+                if self.is_mamba2 and not self.enforce_eager:
+                    if rank == 0:
+                        print("  [4/6] Compiling Mamba2...", flush=True)
+                    self._compile_model()
+                if rank == 0:
+                    print("  [5/6] Preparing Mamba decode buffers...", flush=True)
+                self._init_mamba_decode_buffers()
+                if not self.enforce_eager:
+                    if rank == 0:
+                        print("  [6/6] Capturing Mamba CUDA graphs...", flush=True)
+                    self.capture_mamba_cudagraph()
             if rank == 0:
                 print(f"  Engine ready in {_time.perf_counter()-_t0:.1f}s total", flush=True)
         else:
@@ -462,7 +496,8 @@ class ModelRunner:
 
     # SHM layout for spin-wait signaling:
     # byte[-1] (_SHM_FLAG_OFFSET): 0=generic, 1=attn decode_greedy,
-    #                              2=mamba decode_greedy
+    #                              2=mamba decode_greedy,
+    #                              3=hybrid recurrent decode_greedy
     # bytes[-5:-1] (_SHM_SEQ_OFFSET): 4-byte little-endian sequence counter
     _SHM_FLAG_OFFSET = 2**20 - 1
     _SHM_SEQ_OFFSET = 2**20 - 5
@@ -483,6 +518,8 @@ class ModelRunner:
                         self._loop_decode_greedy()
                     elif flag == 2:
                         self._loop_mamba_decode_greedy()
+                    elif flag == 3:
+                        self._loop_kimi_decode_greedy()
                     continue
                 n = int.from_bytes(buf[0:4], "little")
                 method_name, *args = pickle.loads(buf[4:n+4])
@@ -1128,6 +1165,25 @@ class ModelRunner:
                 f"(at {n_tokens} tokens, {n_seqs} synthetic prefill seqs)"
             )
 
+    def _kimi_state_cache_bytes(self, num_slots: int) -> int:
+        cfg = self.config
+        local_heads = cfg.kda_num_heads // self.world_size
+        local_proj = cfg.kda_num_heads * cfg.kda_head_dim // self.world_size
+        kernel = cfg.short_conv_kernel_size
+        dtype_bytes = torch.empty((), dtype=self.dtype).element_size()
+        num_kda_layers = sum(
+            1 for i in range(cfg.num_hidden_layers) if cfg.is_kda_layer(i)
+        )
+        conv_elems = 3 * num_kda_layers * num_slots * (kernel - 1) * local_proj
+        recurrent_elems = (
+            num_kda_layers
+            * num_slots
+            * local_heads
+            * cfg.kda_head_dim
+            * cfg.kda_head_dim
+        )
+        return conv_elems * dtype_bytes + recurrent_elems * 4
+
     def allocate_mamba_state_cache(self):
         """Size and allocate the global Mamba conv/ssm state pool.
 
@@ -1146,6 +1202,143 @@ class ModelRunner:
         CUDA-graph private pool.  Replaces the previous static
         ``state_cache_fraction`` heuristic.
         """
+        if self.is_kimi_linear:
+            usable_slots = max(1, self.max_num_seqs)
+            use_decode_graph = not self.enforce_eager
+            num_slots = usable_slots + (1 if use_decode_graph else 0)
+            device = torch.device(f"cuda:{self.rank}")
+            dtype = self.dtype
+            mla_layer_count = sum(
+                1
+                for i in range(self.config.num_hidden_layers)
+                if not self.config.is_kda_layer(i)
+            )
+            num_mla_blocks = self.num_blocks if mla_layer_count > 0 else 0
+
+            self.mamba_state_manager = KimiLinearStateManager(
+                config=self.config,
+                num_slots=num_slots,
+                block_size=BLOCK_SIZE,
+                num_mla_blocks=num_mla_blocks,
+                allocate_mla_kv_tensors=False,
+                tp_size=self.world_size,
+                device=device,
+                dtype=dtype,
+            )
+            if use_decode_graph:
+                self._kimi_pad_state_slot = usable_slots
+                self.mamba_state_manager._free_slots = deque(range(usable_slots))
+            else:
+                self._kimi_pad_state_slot = self._KIMI_PAD_SLOT_ID
+            self.num_state_slots = usable_slots
+            self.max_num_seqs = min(self.max_num_seqs, usable_slots)
+            if self.rank == 0:
+                scratch = " + 1 scratch" if use_decode_graph else ""
+                print(
+                    f"  Kimi-Linear state cache: {usable_slots} sequence slots{scratch}, "
+                    f"{num_mla_blocks} MLA blocks "
+                    f"(x {BLOCK_SIZE} = {num_mla_blocks * BLOCK_SIZE} KV token slots, "
+                    f"{mla_layer_count} MLA layers)"
+                )
+            return
+
+        if self.is_qwen3_next:
+            usable_slots = min(self.max_num_seqs, 512)
+            use_decode_graph = not self.enforce_eager
+            num_slots = usable_slots + (1 if use_decode_graph else 0)
+            device = torch.device(f"cuda:{self.rank}")
+            dtype = self.dtype
+            cfg = self.config
+            qwen_block_size = self.block_size
+            full_attn_layers = [
+                i for i in range(cfg.num_hidden_layers)
+                if not cfg.is_linear_attn_layer(i)
+            ]
+
+            local_kv_heads = (
+                cfg.num_key_value_heads // self.world_size
+                if cfg.num_key_value_heads % self.world_size == 0
+                else cfg.num_key_value_heads
+            )
+            head_dim = getattr(
+                cfg, "head_dim", cfg.hidden_size // cfg.num_attention_heads,
+            )
+            elem_size = torch.finfo(dtype).bits // 8
+            block_bytes_total = (
+                len(full_attn_layers)
+                * qwen_block_size
+                * 2
+                * local_kv_heads
+                * head_dim
+                * elem_size
+            )
+
+            free, total = torch.cuda.mem_get_info()
+            used = total - free
+            peak = torch.cuda.memory_stats()["allocated_bytes.all.peak"]
+            current = torch.cuda.memory_stats()["allocated_bytes.all.current"]
+            available_bytes = int(
+                total * self.gpu_memory_utilization - used - peak + current
+            )
+
+            # Measure slotted GDN state before sizing the paged MHA block pool.
+            self.mamba_state_manager = KimiLinearStateManager(
+                config=cfg,
+                num_slots=num_slots,
+                block_size=qwen_block_size,
+                num_mla_blocks=0,
+                allocate_mla_kv_tensors=False,
+                tp_size=self.world_size,
+                device=device,
+                dtype=dtype,
+            )
+            slotted_bytes = (
+                torch.cuda.memory_stats()["allocated_bytes.all.current"] - current
+            )
+            del self.mamba_state_manager
+            torch.cuda.empty_cache()
+
+            kv_budget = max(0, available_bytes - slotted_bytes)
+            num_mha_blocks = (
+                max(1, kv_budget // block_bytes_total)
+                if block_bytes_total > 0 else 0
+            )
+            self.mamba_state_manager = KimiLinearStateManager(
+                config=cfg,
+                num_slots=num_slots,
+                block_size=qwen_block_size,
+                num_mla_blocks=num_mha_blocks,
+                allocate_mla_kv_tensors=True,
+                tp_size=self.world_size,
+                device=device,
+                dtype=dtype,
+            )
+            if use_decode_graph:
+                self._kimi_pad_state_slot = usable_slots
+                self.mamba_state_manager._free_slots = deque(range(usable_slots))
+                if self.mamba_state_manager._free_blocks is not None:
+                    self._kimi_pad_block_id = self.mamba_state_manager._free_blocks.pop()
+                else:
+                    self._kimi_pad_block_id = self._KIMI_PAD_SLOT_ID
+            else:
+                self._kimi_pad_state_slot = self._KIMI_PAD_SLOT_ID
+                self._kimi_pad_block_id = self._KIMI_PAD_SLOT_ID
+            self.num_state_slots = usable_slots
+            self.max_num_seqs = min(self.max_num_seqs, usable_slots)
+            self.num_blocks = num_mha_blocks
+            if self.rank == 0:
+                scratch = " + 1 scratch" if use_decode_graph else ""
+                kv_scratch = " (1 scratch block reserved)" if (
+                    use_decode_graph and num_mha_blocks > 0
+                ) else ""
+                print(
+                    f"  Qwen3-Next state cache: {usable_slots} sequence slots{scratch}, "
+                    f"{num_mha_blocks} MHA blocks{kv_scratch} "
+                    f"(x {qwen_block_size} = {num_mha_blocks * qwen_block_size} KV token slots, "
+                    f"{len(full_attn_layers)} full-attn layers)"
+                )
+            return
+
         # ``free`` is what the OS sees as available; ``current_alloc`` is
         # what PyTorch's caching allocator reports as actively held
         # (including activations from previous transient ops that were
@@ -1227,6 +1420,26 @@ class ModelRunner:
         if self.mamba_state_manager is not None:
             self.mamba_state_manager.deallocate(seq)
 
+    def reset_kimi_state_cache(self):
+        if (
+            (self.is_kimi_linear or self.is_qwen3_next)
+            and self.mamba_state_manager is not None
+        ):
+            sm = self.mamba_state_manager
+            pad_slot = getattr(self, "_kimi_pad_state_slot", self._KIMI_PAD_SLOT_ID)
+            sm._free_slots = deque(
+                slot for slot in range(sm.num_slots) if slot != pad_slot
+            )
+            sm._in_use.clear()
+            if sm._free_blocks is not None:
+                pad_block = getattr(
+                    self, "_kimi_pad_block_id", self._KIMI_PAD_SLOT_ID,
+                )
+                sm._free_blocks = deque(
+                    block for block in range(sm.num_mla_blocks)
+                    if block != pad_block
+                )
+
     def empty_cuda_cache(self):
         """Drop the PyTorch caching allocator's cached blocks.
 
@@ -1261,7 +1474,7 @@ class ModelRunner:
             slots.append(slot)
         return slots
 
-    def deallocate_mamba_state_batch(self, slot_ids: list[int]) -> None:
+    def deallocate_mamba_state_batch(self, slot_ids: list[int] | list[tuple[int, list[int]]]) -> None:
         """Return specific slots to the free pool on every rank.
 
         Batched counterpart of ``allocate_mamba_state_batch`` -- all
@@ -1271,11 +1484,1036 @@ class ModelRunner:
         sm = self.mamba_state_manager
         if sm is None:
             return
-        for slot in slot_ids:
+        for item in slot_ids:
+            if isinstance(item, tuple):
+                slot, block_table = item
+            else:
+                slot, block_table = item, []
             if slot in sm._in_use:
                 sm._in_use.remove(slot)
                 sm.reset_slot(slot)
                 sm._free_slots.append(slot)
+            if getattr(sm, "_free_blocks", None) is not None and block_table:
+                sm._free_blocks.extend(block_table)
+
+    def allocate_kimi_mla_blocks_batch(self, new_block_counts: list[int]) -> list[list[int]]:
+        """Pop paged-attention KV cache blocks for hybrid decode on every rank."""
+        sm = self.mamba_state_manager
+        if (
+            sm is None
+            or not (self.is_kimi_linear or self.is_qwen3_next)
+            or sm._free_blocks is None
+        ):
+            return [[] for _ in new_block_counts]
+        out: list[list[int]] = []
+        for count in new_block_counts:
+            blocks: list[int] = []
+            for _ in range(int(count)):
+                if not sm._free_blocks:
+                    raise RuntimeError("No free MLA KV cache blocks")
+                blocks.append(sm._free_blocks.popleft())
+            out.append(blocks)
+        return out
+
+    # ------------------------------------------------------------------
+    # Hybrid recurrent decode CUDA-graph fast path
+    # ------------------------------------------------------------------
+    _KIMI_PAD_SLOT_ID = -1
+
+    def _init_kimi_decode_buffers(self):
+        """Pre-allocate persistent buffers for hybrid decode CUDA graphs."""
+        max_bs = self.max_num_seqs
+        block_size = self.mamba_state_manager.block_size
+        # max blocks any seq could possibly need at decode time
+        max_blocks = (self.max_model_len + block_size - 1) // block_size
+        dev = f"cuda:{self.rank}"
+
+        self._kd_max_bs = max_bs
+        self._kd_block_size = block_size
+        self._kd_max_blocks = max_blocks
+        pad_state_slot = getattr(
+            self, "_kimi_pad_state_slot", self._KIMI_PAD_SLOT_ID,
+        )
+
+        # GPU side persistent buffers (graph captured)
+        self._kd_input_ids = torch.zeros(max_bs, dtype=torch.int64, device=dev)
+        self._kd_positions = torch.zeros(max_bs, dtype=torch.int64, device=dev)
+        self._kd_state_indices = torch.full(
+            (max_bs,), pad_state_slot, dtype=torch.int32, device=dev,
+        )
+        self._kd_seq_lens = torch.ones(max_bs, dtype=torch.int32, device=dev)
+        self._kd_has_init = torch.ones(max_bs, dtype=torch.bool, device=dev)
+        # MLA path uses int32 slot in KimiLinearMetadata, int64 in attention ctx
+        self._kd_slot_mapping_int32 = torch.full(
+            (max_bs,), self._KIMI_PAD_SLOT_ID, dtype=torch.int32, device=dev,
+        )
+        self._kd_slot_mapping_int64 = torch.full(
+            (max_bs,), self._KIMI_PAD_SLOT_ID, dtype=torch.int64, device=dev,
+        )
+        self._kd_block_tables = torch.full(
+            (max_bs, max_blocks), self._KIMI_PAD_SLOT_ID,
+            dtype=torch.int32, device=dev,
+        )
+        # Decode is 1-token-per-seq, so cu_seqlens_q = arange(max_bs+1)
+        self._kd_cu_seqlens_q = torch.arange(
+            max_bs + 1, dtype=torch.int32, device=dev,
+        )
+        # Logit indices for decode: position of last token of each seq's slice
+        # = arange(max_bs).
+        self._kd_logit_idx = torch.arange(max_bs, dtype=torch.int64, device=dev)
+
+        # CPU pinned staging for fast async copy
+        self._kd_input_ids_cpu = torch.zeros(
+            max_bs, dtype=torch.int64, device="cpu", pin_memory=True,
+        )
+        self._kd_positions_cpu = torch.zeros(
+            max_bs, dtype=torch.int64, device="cpu", pin_memory=True,
+        )
+        self._kd_state_indices_cpu = torch.full(
+            (max_bs,), pad_state_slot,
+            dtype=torch.int32, device="cpu", pin_memory=True,
+        )
+        self._kd_seq_lens_cpu = torch.ones(
+            max_bs, dtype=torch.int32, device="cpu", pin_memory=True,
+        )
+        self._kd_slot_mapping_int32_cpu = torch.full(
+            (max_bs,), self._KIMI_PAD_SLOT_ID,
+            dtype=torch.int32, device="cpu", pin_memory=True,
+        )
+        self._kd_slot_mapping_int64_cpu = torch.full(
+            (max_bs,), self._KIMI_PAD_SLOT_ID,
+            dtype=torch.int64, device="cpu", pin_memory=True,
+        )
+        self._kd_block_tables_cpu = torch.full(
+            (max_bs, max_blocks), self._KIMI_PAD_SLOT_ID,
+            dtype=torch.int32, device="cpu", pin_memory=True,
+        )
+        self._kd_input_ids_np = self._kd_input_ids_cpu.numpy()
+        self._kd_positions_np = self._kd_positions_cpu.numpy()
+        self._kd_state_indices_np = self._kd_state_indices_cpu.numpy()
+        self._kd_seq_lens_np = self._kd_seq_lens_cpu.numpy()
+        self._kd_slot_mapping_int32_np = self._kd_slot_mapping_int32_cpu.numpy()
+        self._kd_slot_mapping_int64_np = self._kd_slot_mapping_int64_cpu.numpy()
+        self._kd_block_tables_np = self._kd_block_tables_cpu.numpy()
+
+        # Mark all as static for cudagraph
+        if hasattr(torch, "_dynamo") and hasattr(torch._dynamo, "mark_static_address"):
+            for t in [
+                self._kd_input_ids, self._kd_positions, self._kd_state_indices,
+                self._kd_seq_lens, self._kd_has_init, self._kd_slot_mapping_int32,
+                self._kd_slot_mapping_int64, self._kd_block_tables,
+                self._kd_cu_seqlens_q, self._kd_logit_idx,
+            ]:
+                torch._dynamo.mark_static_address(t)
+
+        # Will be filled in by capture_kimi_cudagraph
+        self._kimi_graphs: dict = {}
+        self._kimi_graph_metas: dict = {}
+        self._kimi_graph_pool = None
+        self._kimi_graph_bs_list: list[int] = []
+        self._kimi_graph_bs_for_n: list[int] | None = None
+        # Output buffers: model produces hidden_states of shape (n, hidden);
+        # then we extract last_hidden of shape (n, hidden). Persistent so
+        # graphs can write to it.
+        hidden_size = self.config.hidden_size
+        self._kd_last_hidden = torch.zeros(
+            max_bs, hidden_size,
+            dtype=self.dtype, device=dev,
+        )
+        self._kd_lm_max_vals = torch.zeros(
+            max_bs, dtype=torch.float32, device=dev,
+        )
+        self._kd_lm_max_idxs = torch.zeros(
+            max_bs, dtype=torch.int64, device=dev,
+        )
+        self._kd_pinned_token_ids = torch.empty(
+            max_bs, dtype=torch.int64, device="cpu", pin_memory=True,
+        )
+        self._kd_copy_stream = torch.cuda.Stream(device=dev)
+        self._kd_copy_event = torch.cuda.Event()
+        self._kd_greedy_info = torch.zeros(
+            max_bs, 2, dtype=torch.float32, device=dev,
+        )
+        self._kd_greedy_gathered = [
+            torch.zeros(max_bs, 2, dtype=torch.float32, device=dev)
+            for _ in range(self.world_size)
+        ]
+        self._kd_greedy_all_info = torch.zeros(
+            self.world_size, max_bs, 2, dtype=torch.float32, device=dev,
+        )
+        self._kd_greedy_arange = torch.arange(max_bs, device=dev)
+
+    def _prepare_kimi_decode_arrays(self, seqs, copy_block_tables: bool = True):
+        """Fill pinned staging buffers for hybrid greedy decode fast path."""
+        n = len(seqs)
+        ids = self._kd_input_ids_np
+        pos = self._kd_positions_np
+        si = self._kd_state_indices_np
+        sl = self._kd_seq_lens_np
+        slot32 = self._kd_slot_mapping_int32_np
+        slot64 = self._kd_slot_mapping_int64_np
+        bt = self._kd_block_tables_np
+        max_blocks = self._kd_max_blocks
+        block_size = self._kd_block_size
+
+        for i, seq in enumerate(seqs):
+            ids[i] = seq.last_token
+            start_pos = seq.num_computed_tokens
+            pos[i] = start_pos
+            si[i] = seq.state_slot
+            seq_total = start_pos + 1
+            sl[i] = seq_total
+            block_idx = start_pos // block_size
+            if block_idx < len(seq.block_table):
+                block_id = seq.block_table[block_idx]
+                slot = block_id * block_size + (start_pos % block_size)
+            else:
+                slot = self._KIMI_PAD_SLOT_ID
+            slot32[i] = slot
+            slot64[i] = slot
+            if copy_block_tables:
+                row = seq.block_table
+                n_blocks = len(row)
+                if n_blocks > 0:
+                    bt[i, :n_blocks] = row
+                if n_blocks < max_blocks:
+                    bt[i, n_blocks:max_blocks] = self._KIMI_PAD_SLOT_ID
+
+        return (
+            n,
+            ids[:n],
+            pos[:n],
+            si[:n],
+            sl[:n],
+            slot32[:n],
+            bt[:n, :max_blocks if copy_block_tables else 0],
+            copy_block_tables,
+        )
+
+    @torch.inference_mode()
+    def capture_kimi_cudagraph(self):
+        """Capture decode-only CUDA graphs for hybrid recurrent models.
+
+        Mirrors capture_mamba_cudagraph. Each bucket records:
+          model.forward(input_ids, positions, state_manager) ->
+          last_hidden[arange(bs)] ->
+          lm_head.project(last_hidden) -> local logits
+
+        TP cross-rank gather + sampling happens OUTSIDE the graph in
+        ``_run_kimi_decode_graph_greedy``.
+        """
+        from contextlib import nullcontext
+
+        graph_max_default = 512 if self.is_qwen3_next else self.max_num_seqs
+        max_bs = min(self.max_num_seqs, graph_max_default)
+        bs_candidates = [
+            1, 2, 4, 8, 16, 32, 48, 64, 96, 128, 160, 192, 224, 256,
+        ]
+        if max_bs > 256:
+            bs_candidates.extend(range(272, max_bs + 1, 16))
+            if bs_candidates[-1] != max_bs:
+                bs_candidates.append(max_bs)
+        bs_list = sorted(set(bs_candidates))
+        bs_list = [b for b in bs_list if b <= max_bs]
+        if not bs_list:
+            return
+        self._kimi_graph_bs_list = bs_list
+
+        sm_ = self.mamba_state_manager
+        max_blocks = self._kd_max_blocks
+        block_size = self._kd_block_size
+        pad_state_slot = getattr(
+            self, "_kimi_pad_state_slot", self._KIMI_PAD_SLOT_ID,
+        )
+        pad_block_id = getattr(
+            self, "_kimi_pad_block_id", self._KIMI_PAD_SLOT_ID,
+        )
+        pad_kv_slot = (
+            pad_block_id * block_size
+            if pad_block_id != self._KIMI_PAD_SLOT_ID
+            else self._KIMI_PAD_SLOT_ID
+        )
+        ar_ctx = (
+            self.custom_ar.capture()
+            if self.custom_ar is not None else nullcontext()
+        )
+        with ar_ctx:
+            for bs in reversed(bs_list):
+                # Prepare static views into the persistent buffers
+                input_ids_v   = self._kd_input_ids[:bs]
+                positions_v   = self._kd_positions[:bs]
+                state_idx_v   = self._kd_state_indices[:bs]
+                seq_lens_v    = self._kd_seq_lens[:bs]
+                has_init_v    = self._kd_has_init[:bs]
+                slot32_v      = self._kd_slot_mapping_int32[:bs]
+                slot64_v      = self._kd_slot_mapping_int64[:bs]
+                bt_v          = self._kd_block_tables[:bs, :max_blocks]
+                cu_q_v        = self._kd_cu_seqlens_q[:bs + 1]
+                logit_idx_v   = self._kd_logit_idx[:bs]
+
+                # Reset to PAD so warmup doesn't index real sequence state.
+                state_idx_v.fill_(pad_state_slot)
+                slot32_v.fill_(pad_kv_slot)
+                slot64_v.fill_(pad_kv_slot)
+                bt_v.fill_(pad_block_id)
+                input_ids_v.zero_()
+                positions_v.zero_()
+                seq_lens_v.fill_(1)
+                has_init_v.fill_(True)
+
+                md = KimiLinearMetadata(
+                    num_actual_tokens=bs,
+                    query_start_loc=cu_q_v,
+                    max_query_len=1,
+                    seq_lens=seq_lens_v,
+                    max_seq_len=self.max_model_len,
+                    state_indices=state_idx_v,
+                    num_prefills=0,
+                    num_prefill_tokens=0,
+                    num_decodes=bs,
+                    num_decode_tokens=bs,
+                    has_initial_state=has_init_v,
+                    slot_mapping=slot32_v,
+                    block_tables=bt_v,
+                )
+                self._kimi_graph_metas[bs] = md
+
+                set_context(
+                    False,
+                    cu_seqlens_q=cu_q_v,
+                    cu_seqlens_k=cu_q_v,
+                    max_seqlen_q=1,
+                    max_seqlen_k=self.max_model_len,
+                    slot_mapping=slot64_v,
+                    context_lens=seq_lens_v,
+                    block_tables=bt_v,
+                    max_context_len=self.max_model_len,
+                )
+                ctx = get_context()
+                ctx.kda_state = sm_
+                ctx.kda_metadata = md
+
+                # Warmup eager so kernels autotune outside the graph
+                hidden = self.model(input_ids_v, positions=positions_v, state_manager=sm_)
+                last_h = hidden.index_select(0, logit_idx_v)
+                self._kd_last_hidden[:bs].copy_(last_h)
+                logits_local = self.model.lm_head.project(self._kd_last_hidden[:bs])
+                max_vals, max_idxs = logits_local.max(dim=-1)
+                self._kd_lm_max_vals[:bs].copy_(max_vals.float())
+                self._kd_lm_max_idxs[:bs].copy_(max_idxs)
+                torch.cuda.synchronize()
+
+                graph = torch.cuda.CUDAGraph()
+                with torch.cuda.graph(graph, self._kimi_graph_pool):
+                    hidden = self.model(input_ids_v, positions=positions_v, state_manager=sm_)
+                    last_h = hidden.index_select(0, logit_idx_v)
+                    self._kd_last_hidden[:bs].copy_(last_h)
+                    logits_local = self.model.lm_head.project(
+                        self._kd_last_hidden[:bs],
+                    )
+                    max_vals, max_idxs = logits_local.max(dim=-1)
+                    self._kd_lm_max_vals[:bs].copy_(max_vals.float())
+                    self._kd_lm_max_idxs[:bs].copy_(max_idxs)
+
+                if self._kimi_graph_pool is None:
+                    self._kimi_graph_pool = graph.pool()
+                self._kimi_graphs[bs] = graph
+                torch.cuda.synchronize()
+                reset_context()
+
+        # Build bucket lookup: smallest bucket >= n
+        max_bucket = self._kimi_graph_bs_list[-1]
+        self._kimi_graph_bs_for_n = [0] * (self.max_num_seqs + 1)
+        for n in range(self.max_num_seqs + 1):
+            self._kimi_graph_bs_for_n[n] = next(
+                (x for x in self._kimi_graph_bs_list if x >= n),
+                max_bucket,
+            )
+        if self.rank == 0:
+            graph_label = "Qwen3-Next" if self.is_qwen3_next else "Kimi"
+            print(
+                f"  {graph_label} CUDA graphs: {len(self._kimi_graphs)} buckets "
+                f"(min={bs_list[0]}, max={bs_list[-1]})",
+                flush=True,
+            )
+
+    def _stage_kimi_decode_graph_inputs(
+        self, n: int, copy_block_tables: bool = True,
+    ) -> int:
+        """Copy CPU-staged hybrid decode metadata into graph input buffers."""
+        bucket = self._kimi_graph_bs_for_n[n]
+        max_blocks = self._kd_max_blocks
+        block_size = self._kd_block_size
+        pad_state_slot = getattr(
+            self, "_kimi_pad_state_slot", self._KIMI_PAD_SLOT_ID,
+        )
+        pad_block_id = getattr(
+            self, "_kimi_pad_block_id", self._KIMI_PAD_SLOT_ID,
+        )
+        pad_kv_slot = (
+            pad_block_id * block_size
+            if pad_block_id != self._KIMI_PAD_SLOT_ID
+            else self._KIMI_PAD_SLOT_ID
+        )
+
+        if bucket > n:
+            self._kd_input_ids_cpu[n:bucket].zero_()
+            self._kd_positions_cpu[n:bucket].zero_()
+            self._kd_state_indices_cpu[n:bucket].fill_(pad_state_slot)
+            self._kd_seq_lens_cpu[n:bucket].fill_(1)
+            self._kd_slot_mapping_int32_cpu[n:bucket].fill_(pad_kv_slot)
+            self._kd_slot_mapping_int64_cpu[n:bucket].fill_(pad_kv_slot)
+            if copy_block_tables:
+                self._kd_block_tables_np[n:bucket, :max_blocks] = pad_block_id
+
+        self._kd_input_ids[:bucket].copy_(
+            self._kd_input_ids_cpu[:bucket], non_blocking=True,
+        )
+        self._kd_positions[:bucket].copy_(
+            self._kd_positions_cpu[:bucket], non_blocking=True,
+        )
+        self._kd_state_indices[:bucket].copy_(
+            self._kd_state_indices_cpu[:bucket], non_blocking=True,
+        )
+        self._kd_seq_lens[:bucket].copy_(
+            self._kd_seq_lens_cpu[:bucket], non_blocking=True,
+        )
+        self._kd_slot_mapping_int32[:bucket].copy_(
+            self._kd_slot_mapping_int32_cpu[:bucket], non_blocking=True,
+        )
+        self._kd_slot_mapping_int64[:bucket].copy_(
+            self._kd_slot_mapping_int64_cpu[:bucket], non_blocking=True,
+        )
+        if copy_block_tables:
+            self._kd_block_tables[:bucket, :max_blocks].copy_(
+                self._kd_block_tables_cpu[:bucket, :max_blocks], non_blocking=True,
+            )
+        return bucket
+
+    @torch.inference_mode()
+    def _replay_kimi_decode_graph_greedy(
+        self, n: int, return_all_ranks: bool = False,
+    ):
+        """Replay already-staged hybrid decode graph and return greedy token ids."""
+        bucket = self._kimi_graph_bs_for_n[n]
+        self._kimi_graphs[bucket].replay()
+
+        if self.world_size == 1:
+            return self._kd_lm_max_idxs[:n]
+        return self._kimi_greedy_gather(
+            n, self._kd_lm_max_vals[:n], self._kd_lm_max_idxs[:n],
+            return_all_ranks=return_all_ranks,
+        )
+
+    @torch.inference_mode()
+    def _run_kimi_decode_graph_greedy(
+        self, n: int, copy_block_tables: bool = True,
+        return_all_ranks: bool = False,
+    ):
+        """Stage inputs, replay hybrid decode graph, and return greedy token ids."""
+        self._stage_kimi_decode_graph_inputs(n, copy_block_tables)
+        return self._replay_kimi_decode_graph_greedy(
+            n, return_all_ranks=return_all_ranks,
+        )
+
+    def _kimi_greedy_gather(
+        self, n: int, max_vals: torch.Tensor, max_idxs: torch.Tensor,
+        return_all_ranks: bool = False,
+    ):
+        """TP cross-rank greedy gather without materializing full logits."""
+        lm_head = self.model.lm_head
+        info = self._kd_greedy_info[:n]
+        info[:, 0] = max_vals
+        info[:, 1] = max_idxs.float()
+        info[:, 1] += lm_head.per_partition * self.rank
+
+        gathered = [g[:n] for g in self._kd_greedy_gathered]
+        dist.all_gather(gathered, info)
+        if self.rank != 0 and not return_all_ranks:
+            return None
+        all_info = self._kd_greedy_all_info[:, :n]
+        torch.stack(gathered, out=all_info)
+        best_rank = all_info[:, :n, 0].argmax(dim=0)
+        return all_info[best_rank, self._kd_greedy_arange[:n], 1].long()
+
+    @torch.inference_mode()
+    def run_kimi_decode_fast_async(self, decode_data):
+        """Greedy hybrid decode graph + async D2H copy of token IDs."""
+        n = decode_data[0]
+        copy_block_tables = bool(decode_data[-1]) if len(decode_data) > 1 else True
+        token_ids = self._run_kimi_decode_graph_greedy(n, copy_block_tables)
+        if token_ids is None:
+            return False, n
+        main_stream = torch.cuda.current_stream()
+        cs = self._kd_copy_stream
+        with torch.cuda.stream(cs):
+            cs.wait_stream(main_stream)
+            self._kd_pinned_token_ids[:n].copy_(token_ids, non_blocking=True)
+            self._kd_copy_event.record(cs)
+        return True, n
+
+    def _wait_async_kimi_tokens(self, n: int) -> list[int]:
+        self._kd_copy_event.synchronize()
+        return self._kd_pinned_token_ids[:n].tolist()
+
+    @torch.inference_mode()
+    def run_kimi_decode_many(self, seqs, steps: int):
+        """Run fixed-batch greedy decode for ``steps`` tokens on all ranks."""
+        if not seqs or steps <= 0:
+            return [] if self.rank == 0 else None
+
+        final_tokens = max(seq.num_computed_tokens + steps for seq in seqs)
+        for seq in seqs:
+            self.mamba_state_manager.ensure_blocks_for(seq, final_tokens)
+
+        decode_data = self._prepare_kimi_decode_arrays(
+            seqs, copy_block_tables=True,
+        )
+        n = decode_data[0]
+        self._stage_kimi_decode_graph_inputs(n, copy_block_tables=True)
+
+        dev = self._kd_input_ids.device
+        outputs_dev = (
+            torch.empty((steps, n), dtype=torch.int64, device=dev)
+            if self.rank == 0 else None
+        )
+        arange = self._kd_greedy_arange[:n]
+        block_size = int(self._kd_block_size)
+        start_positions = [seq.num_computed_tokens for seq in seqs]
+        uniform_positions = min(start_positions) == max(start_positions)
+        start_pos0 = start_positions[0]
+        for step in range(steps):
+            # Keep the decode loop device-resident. Pulling token ids back to
+            # CPU every step is a hard sync and dominates long fixed-batch decode.
+            token_ids_t = self._replay_kimi_decode_graph_greedy(
+                n, return_all_ranks=True,
+            )
+            if outputs_dev is not None:
+                outputs_dev[step].copy_(token_ids_t)
+            if step + 1 < steps:
+                self._kd_input_ids[:n].copy_(token_ids_t)
+                self._kd_positions[:n].add_(1)
+                self._kd_seq_lens[:n].add_(1)
+                if uniform_positions:
+                    self._kd_slot_mapping_int32[:n].add_(1)
+                    self._kd_slot_mapping_int64[:n].add_(1)
+                    next_pos = start_pos0 + step + 1
+                    if next_pos % block_size == 0:
+                        block_idx = next_pos // block_size
+                        block_ids = self._kd_block_tables[arange, block_idx]
+                        slots = block_ids * block_size
+                        self._kd_slot_mapping_int32[:n].copy_(
+                            slots.to(torch.int32),
+                        )
+                        self._kd_slot_mapping_int64[:n].copy_(
+                            slots.to(torch.int64),
+                        )
+                else:
+                    block_idx = torch.div(
+                        self._kd_positions[:n], block_size, rounding_mode="floor",
+                    )
+                    block_ids = self._kd_block_tables[arange, block_idx]
+                    slots = block_ids * block_size + (
+                        self._kd_positions[:n] - block_idx * block_size
+                    )
+                    self._kd_slot_mapping_int32[:n].copy_(slots.to(torch.int32))
+                    self._kd_slot_mapping_int64[:n].copy_(slots.to(torch.int64))
+
+        if self.rank == 0:
+            outputs = outputs_dev.transpose(0, 1).cpu().tolist()
+        else:
+            outputs = None
+
+        for i, seq in enumerate(seqs):
+            if self.rank == 0:
+                toks = outputs[i]
+                if seq.token_ids is not None:
+                    seq.token_ids.extend(toks)
+                    seq.generated_ids.extend(toks)
+                else:
+                    seq._last_token = toks[-1]
+                    seq._num_tokens += len(toks)
+            else:
+                if seq.token_ids is None:
+                    seq._num_tokens += steps
+            seq.num_computed_tokens += steps
+        return outputs if self.rank == 0 else None
+
+    def _write_kimi_decode_shm(
+        self, n, ids_np, pos_np, si_np, sl_np, slot_np, bt_np,
+        copy_block_tables: bool,
+    ):
+        """Pack a hybrid decode batch into SHM for the worker ranks."""
+        max_blocks = bt_np.shape[1] if copy_block_tables else 0
+        payload_bytes = (
+            4
+            + n * 8
+            + n * 8
+            + n * 4
+            + n * 4
+            + n * 4
+            + (n * max_blocks * 4 if copy_block_tables else 0)
+        )
+        if payload_bytes > self._SHM_SEQ_OFFSET:
+            raise RuntimeError(
+                f"Hybrid decode SHM payload too large: {payload_bytes} bytes",
+            )
+
+        buf = self.shm.buf
+        buf[0:2] = n.to_bytes(2, "little")
+        buf[2:4] = max_blocks.to_bytes(2, "little")
+        off = 4
+        arrays = (ids_np, pos_np, si_np, sl_np, slot_np)
+        for arr in arrays:
+            raw = arr.tobytes()
+            buf[off:off + len(raw)] = raw
+            off += len(raw)
+        if copy_block_tables:
+            raw = bt_np.tobytes()
+            buf[off:off + len(raw)] = raw
+
+    @torch.inference_mode()
+    def _loop_kimi_decode_greedy(self):
+        """Worker fast path for hybrid greedy decode."""
+        buf = self.shm.buf
+        n = int.from_bytes(buf[0:2], "little")
+        max_blocks = int.from_bytes(buf[2:4], "little")
+        off = 4
+        ids = np.frombuffer(buf, dtype=np.int64, count=n, offset=off)
+        off += n * 8
+        pos = np.frombuffer(buf, dtype=np.int64, count=n, offset=off)
+        off += n * 8
+        si = np.frombuffer(buf, dtype=np.int32, count=n, offset=off)
+        off += n * 4
+        sl = np.frombuffer(buf, dtype=np.int32, count=n, offset=off)
+        off += n * 4
+        slot = np.frombuffer(buf, dtype=np.int32, count=n, offset=off)
+        off += n * 4
+        bt = None
+        if max_blocks > 0:
+            bt = np.frombuffer(
+                buf, dtype=np.int32, count=n * max_blocks, offset=off,
+            ).reshape(n, max_blocks)
+
+        self._kd_input_ids_np[:n] = ids
+        self._kd_positions_np[:n] = pos
+        self._kd_state_indices_np[:n] = si
+        self._kd_seq_lens_np[:n] = sl
+        self._kd_slot_mapping_int32_np[:n] = slot
+        self._kd_slot_mapping_int64_np[:n] = slot
+        if max_blocks > 0:
+            self._kd_block_tables_np[:n, :max_blocks] = bt
+        self.run_kimi_decode_fast_async((n, max_blocks > 0))
+
+    @torch.inference_mode()
+    def call_kimi_decode_async(self, decode_data):
+        """Launch a greedy hybrid decode from precomputed staging arrays."""
+        if self.world_size > 1 and self.rank == 0:
+            self._write_kimi_decode_shm(*decode_data)
+            self.shm.buf[self._SHM_FLAG_OFFSET] = 3
+            self._signal_workers()
+        return self.run_kimi_decode_fast_async(decode_data)
+
+    @torch.inference_mode()
+    def _run_kimi_linear_batch(self, seqs, is_prefill: bool):
+        if not seqs:
+            return None
+
+        reset_context()
+
+        device = torch.device(f"cuda:{self.rank}")
+        sm_ = self.mamba_state_manager
+
+        for seq in seqs:
+            if seq.state_slot is None:
+                raise RuntimeError("Kimi-Linear sequence has no allocated state slot")
+            total_after = (
+                len(seq.token_ids) if is_prefill
+                else seq.num_computed_tokens + 1
+            )
+            sm_.ensure_blocks_for(seq, total_after)
+
+        ids: list[int] = []
+        positions: list[int] = []
+        cu: list[int] = [0]
+        slot_mapping: list[int] = []
+        state_indices: list[int] = []
+        seq_lens: list[int] = []
+        has_initial_state: list[bool] = []
+        block_tables_rows: list[list[int]] = []
+        max_query_len = 0
+        max_seq_len = 0
+        max_blocks = 0
+        block_size = sm_.block_size
+
+        for seq in seqs:
+            if is_prefill:
+                tokens = list(seq.token_ids)
+                start_pos = 0
+                init_state = False
+            else:
+                tokens = [seq.last_token]
+                start_pos = seq.num_computed_tokens
+                init_state = True
+
+            n_tok = len(tokens)
+            ids.extend(tokens)
+            positions.extend(range(start_pos, start_pos + n_tok))
+            cu.append(cu[-1] + n_tok)
+            state_indices.append(seq.state_slot)
+            seq_total = start_pos + n_tok
+            seq_lens.append(seq_total)
+            has_initial_state.append(init_state)
+            max_query_len = max(max_query_len, n_tok)
+            max_seq_len = max(max_seq_len, seq_total)
+
+            for t in range(n_tok):
+                global_pos = start_pos + t
+                block_idx = global_pos // block_size
+                if block_idx < len(seq.block_table):
+                    block_id = seq.block_table[block_idx]
+                    slot_mapping.append(
+                        block_id * block_size + (global_pos % block_size),
+                    )
+                else:
+                    slot_mapping.append(-1)
+            block_tables_rows.append(list(seq.block_table))
+            max_blocks = max(max_blocks, len(seq.block_table))
+
+        n_tokens = len(ids)
+        batch_size = len(seqs)
+
+        ids_t = torch.tensor(ids, dtype=torch.int64, pin_memory=True).to(
+            device, non_blocking=True,
+        )
+        pos_t = torch.tensor(positions, dtype=torch.int64, pin_memory=True).to(
+            device, non_blocking=True,
+        )
+        cu_cpu = torch.tensor(cu, dtype=torch.int64, pin_memory=True)
+        cu_gpu = cu_cpu.to(device, non_blocking=True)
+        state_idx_t = torch.tensor(
+            state_indices, dtype=torch.int32, pin_memory=True,
+        ).to(device, non_blocking=True)
+        seq_lens_t = torch.tensor(
+            seq_lens, dtype=torch.int32, pin_memory=True,
+        ).to(device, non_blocking=True)
+        has_init_t = torch.tensor(
+            has_initial_state, dtype=torch.bool, pin_memory=True,
+        ).to(device, non_blocking=True)
+        slot_t = torch.tensor(
+            slot_mapping, dtype=torch.int32, pin_memory=True,
+        ).to(device, non_blocking=True)
+        slot_t_mla = torch.tensor(
+            slot_mapping, dtype=torch.int64, pin_memory=True,
+        ).to(device, non_blocking=True)
+
+        if max_blocks == 0:
+            block_tables_t = torch.zeros(
+                (batch_size, 1), dtype=torch.int32, device=device,
+            )
+        else:
+            bt = np.full((batch_size, max_blocks), -1, dtype=np.int32)
+            for i, row in enumerate(block_tables_rows):
+                if row:
+                    bt[i, :len(row)] = row
+            block_tables_t = torch.from_numpy(bt).pin_memory().to(
+                device, non_blocking=True,
+            )
+
+        logit_idx_cpu = (cu_cpu[1:] - 1).to(torch.int64)
+        logit_idx_t = logit_idx_cpu.to(device, non_blocking=True)
+
+        if is_prefill:
+            num_decodes = 0
+            num_decode_tokens = 0
+            num_prefills = batch_size
+            num_prefill_tokens = n_tokens
+        else:
+            num_decodes = batch_size
+            num_decode_tokens = n_tokens
+            num_prefills = 0
+            num_prefill_tokens = 0
+
+        md = KimiLinearMetadata(
+            num_actual_tokens=n_tokens,
+            query_start_loc=cu_gpu,
+            max_query_len=max_query_len,
+            seq_lens=seq_lens_t,
+            max_seq_len=max_seq_len,
+            state_indices=state_idx_t,
+            num_prefills=num_prefills,
+            num_prefill_tokens=num_prefill_tokens,
+            num_decodes=num_decodes,
+            num_decode_tokens=num_decode_tokens,
+            has_initial_state=has_init_t,
+            slot_mapping=slot_t,
+            block_tables=block_tables_t,
+        )
+        if num_prefills > 0:
+            nums_dict, batch_ptr, token_chunk_offset_ptr = (
+                compute_causal_conv1d_metadata(md.non_spec_query_start_loc)
+            )
+            md.nums_dict = nums_dict
+            md.batch_ptr = batch_ptr
+            md.token_chunk_offset_ptr = token_chunk_offset_ptr
+
+        set_context(
+            is_prefill,
+            cu_seqlens_q=cu_gpu.to(torch.int32),
+            cu_seqlens_k=cu_gpu.to(torch.int32),
+            max_seqlen_q=max_query_len,
+            max_seqlen_k=max_seq_len,
+            slot_mapping=slot_t_mla,
+            context_lens=seq_lens_t,
+            block_tables=block_tables_t,
+            max_context_len=max_seq_len,
+        )
+        ctx = get_context()
+        ctx.kda_state = sm_
+        ctx.kda_metadata = md
+        try:
+            hidden_states = self.model(
+                ids_t, positions=pos_t, state_manager=sm_,
+            )
+        finally:
+            reset_context()
+
+        last_hidden = hidden_states.index_select(0, logit_idx_t)
+        logits = self.model.compute_logits(last_hidden)
+
+        for seq in seqs:
+            if is_prefill:
+                seq.num_computed_tokens = len(seq.token_ids)
+            else:
+                seq.num_computed_tokens += 1
+        return logits
+
+    @torch.inference_mode()
+    def run_qwen3_next_mixed(self, prefill_seqs, decode_seqs):
+        """Run Qwen3-Next with flat GDN state and paged MHA KV cache.
+
+        If a batch contains any prefill sequence, all sequences in the step
+        use the GDN chunk path. This mirrors vLLM's GDN metadata behavior for
+        mixed batches and avoids a separate decode-first token layout.
+        """
+        seqs = list(prefill_seqs) + list(decode_seqs)
+        if not seqs:
+            return None
+
+        reset_context()
+        device = torch.device(f"cuda:{self.rank}")
+        sm_ = self.mamba_state_manager
+        block_size = sm_.block_size
+        use_prefill_path = bool(prefill_seqs)
+
+        ids: list[int] = []
+        positions: list[int] = []
+        cu: list[int] = [0]
+        slot_mapping: list[int] = []
+        state_indices: list[int] = []
+        seq_lens: list[int] = []
+        has_initial_state: list[bool] = []
+        block_tables_rows: list[list[int]] = []
+        max_query_len = 0
+        max_seq_len = 0
+        max_blocks = 0
+
+        for seq in seqs:
+            if seq.state_slot is None:
+                raise RuntimeError("Qwen3-Next sequence has no allocated state slot")
+            if seq in prefill_seqs:
+                start_pos = seq.num_computed_tokens
+                tokens = list(seq.token_ids[start_pos:])
+                if not tokens:
+                    continue
+                seq_total = start_pos + len(tokens)
+            else:
+                start_pos = len(seq) - 1
+                tokens = [seq.last_token]
+                seq_total = len(seq)
+
+            sm_.ensure_blocks_for(seq, seq_total)
+
+            n_tok = len(tokens)
+            ids.extend(tokens)
+            positions.extend(range(start_pos, start_pos + n_tok))
+            cu.append(cu[-1] + n_tok)
+            state_indices.append(seq.state_slot)
+            seq_lens.append(seq_total)
+            has_initial_state.append(start_pos > 0)
+            max_query_len = max(max_query_len, n_tok)
+            max_seq_len = max(max_seq_len, seq_total)
+
+            for t in range(n_tok):
+                global_pos = start_pos + t
+                block_idx = global_pos // block_size
+                if block_idx < len(seq.block_table):
+                    block_id = seq.block_table[block_idx]
+                    slot_mapping.append(
+                        block_id * block_size + (global_pos % block_size),
+                    )
+                else:
+                    slot_mapping.append(-1)
+            block_tables_rows.append(list(seq.block_table))
+            max_blocks = max(max_blocks, len(seq.block_table))
+
+        if not ids:
+            return None
+
+        n_tokens = len(ids)
+        batch_size = len(state_indices)
+
+        ids_t = torch.tensor(ids, dtype=torch.int64, pin_memory=True).to(
+            device, non_blocking=True,
+        )
+        pos_t = torch.tensor(positions, dtype=torch.int64, pin_memory=True).to(
+            device, non_blocking=True,
+        )
+        cu_cpu = torch.tensor(cu, dtype=torch.int64, pin_memory=True)
+        cu_gpu = cu_cpu.to(device, non_blocking=True)
+        state_idx_t = torch.tensor(
+            state_indices, dtype=torch.int32, pin_memory=True,
+        ).to(device, non_blocking=True)
+        seq_lens_t = torch.tensor(
+            seq_lens, dtype=torch.int32, pin_memory=True,
+        ).to(device, non_blocking=True)
+        has_init_t = torch.tensor(
+            has_initial_state, dtype=torch.bool, pin_memory=True,
+        ).to(device, non_blocking=True)
+        slot_t = torch.tensor(
+            slot_mapping, dtype=torch.int32, pin_memory=True,
+        ).to(device, non_blocking=True)
+        slot_t_mha = torch.tensor(
+            slot_mapping, dtype=torch.int64, pin_memory=True,
+        ).to(device, non_blocking=True)
+
+        if max_blocks == 0:
+            block_tables_t = torch.zeros(
+                (batch_size, 1), dtype=torch.int32, device=device,
+            )
+        else:
+            bt = np.full((batch_size, max_blocks), -1, dtype=np.int32)
+            for i, row in enumerate(block_tables_rows):
+                if row:
+                    bt[i, :len(row)] = row
+            block_tables_t = torch.from_numpy(bt).pin_memory().to(
+                device, non_blocking=True,
+            )
+
+        logit_idx_t = (cu_gpu[1:] - 1).to(torch.int64)
+        if use_prefill_path:
+            num_prefills = batch_size
+            num_prefill_tokens = n_tokens
+            num_decodes = 0
+            num_decode_tokens = 0
+        else:
+            num_prefills = 0
+            num_prefill_tokens = 0
+            num_decodes = batch_size
+            num_decode_tokens = n_tokens
+
+        md = KimiLinearMetadata(
+            num_actual_tokens=n_tokens,
+            query_start_loc=cu_gpu,
+            max_query_len=max_query_len,
+            seq_lens=seq_lens_t,
+            max_seq_len=max_seq_len,
+            state_indices=state_idx_t,
+            num_prefills=num_prefills,
+            num_prefill_tokens=num_prefill_tokens,
+            num_decodes=num_decodes,
+            num_decode_tokens=num_decode_tokens,
+            has_initial_state=has_init_t,
+            slot_mapping=slot_t,
+            block_tables=block_tables_t,
+        )
+        if num_prefills > 0:
+            nums_dict, batch_ptr, token_chunk_offset_ptr = (
+                compute_causal_conv1d_metadata(md.non_spec_query_start_loc)
+            )
+            md.nums_dict = nums_dict
+            md.batch_ptr = batch_ptr
+            md.token_chunk_offset_ptr = token_chunk_offset_ptr
+
+        set_context(
+            use_prefill_path,
+            cu_seqlens_q=cu_gpu.to(torch.int32),
+            cu_seqlens_k=cu_gpu.to(torch.int32),
+            max_seqlen_q=max_query_len,
+            max_seqlen_k=max_seq_len,
+            slot_mapping=slot_t_mha,
+            context_lens=seq_lens_t,
+            block_tables=block_tables_t,
+            max_context_len=max_seq_len,
+        )
+        ctx = get_context()
+        ctx.kda_state = sm_
+        ctx.kda_metadata = md
+        try:
+            hidden_states = self.model(
+                ids_t, positions=pos_t, state_manager=sm_,
+            )
+        finally:
+            reset_context()
+
+        last_hidden = hidden_states.index_select(0, logit_idx_t)
+        logits = self.model.compute_logits(last_hidden)
+
+        prefill_ids = {id(seq) for seq in prefill_seqs}
+        for seq in seqs:
+            if id(seq) in prefill_ids:
+                seq.num_computed_tokens = len(seq.token_ids)
+            else:
+                seq.num_computed_tokens += 1
+        return logits
+
+    def _run_qwen3_next_batch(self, seqs, is_prefill: bool):
+        return self.run_qwen3_next_mixed(seqs if is_prefill else [], [] if is_prefill else seqs)
+
+    @torch.inference_mode()
+    def _warmup_qwen3_next_prefill(self):
+        """Warm Qwen3-Next prefill kernels at benchmark-relevant chunk sizes."""
+        if not self.is_qwen3_next or self.mamba_state_manager is None:
+            return
+
+        warmup_lens = [512, 1024]
+        warmup_lens = sorted({
+            max(1, min(int(length), int(self.max_model_len)))
+            for length in warmup_lens
+            if int(length) > 0
+        })
+
+        total_tokens = int(self.max_num_batched_tokens)
+        warmed: list[tuple[int, int]] = []
+        for seq_len in warmup_lens:
+            n_seqs = max(1, min(self.max_num_seqs, total_tokens // seq_len))
+            if n_seqs <= 0:
+                continue
+            seqs = [
+                Sequence([0] * seq_len, max_tokens=1, ignore_eos=True)
+                for _ in range(n_seqs)
+            ]
+            slots = self.allocate_mamba_state_batch(n_seqs)
+            for seq, slot in zip(seqs, slots):
+                seq.state_slot = slot
+            try:
+                _ = self.run_qwen3_next_mixed(seqs, [])
+                torch.cuda.synchronize()
+                warmed.append((n_seqs, seq_len))
+            finally:
+                payloads = [
+                    (seq.state_slot, list(seq.block_table))
+                    for seq in seqs
+                    if seq.state_slot is not None
+                ]
+                self.deallocate_mamba_state_batch(payloads)
+                for seq in seqs:
+                    seq.block_table = []
+                    seq.state_slot = None
+
+        if self.rank == 0 and warmed:
+            desc = ", ".join(f"{n}x{l}" for n, l in warmed)
+            print(f"  Qwen3-Next prefill warmup: {desc}", flush=True)
 
     def _mamba_prepare_tensors(self, prefill_seqs, decode_seqs, chunk_size):
         """Build flat input_ids / positions and the Mamba(2)Metadata for a
@@ -1946,7 +3184,20 @@ class ModelRunner:
         idx_bytes_per_block = num_indexer_layers * _MLA_BLOCK_SIZE * _INDEXER_CACHE_BYTES
         total_bytes_per_block = kv_bytes_per_block + idx_bytes_per_block
 
-        num_blocks = int(total * self.gpu_memory_utilization - used - peak + current) // total_bytes_per_block
+        reserve_bytes = 0
+        if self.is_kimi_linear:
+            reserve_bytes = self._kimi_state_cache_bytes(
+                max(1, self.max_num_seqs),
+            )
+
+        available_bytes = int(
+            total * self.gpu_memory_utilization
+            - used
+            - peak
+            + current
+            - reserve_bytes
+        )
+        num_blocks = available_bytes // total_bytes_per_block
         assert num_blocks > 0, f"Not enough GPU memory for MLA KV cache on rank {self.rank}"
         self.num_blocks = num_blocks
         self.block_size = _MLA_BLOCK_SIZE
@@ -2821,6 +4072,10 @@ class ModelRunner:
         return self.run_decode_greedy_fast_async(decode_data)
 
     def run(self, seqs, is_prefill):
+        if self.is_kimi_linear:
+            return self._run_kimi_linear_batch(seqs, is_prefill)
+        if self.is_qwen3_next:
+            return self._run_qwen3_next_batch(seqs, is_prefill)
         input_ids, positions = (
             self.prepare_prefill(seqs) if is_prefill
             else self.prepare_decode(seqs)
@@ -3258,9 +4513,8 @@ class ModelRunner:
         from .compilation import compile_model, configure_post_grad_passes
 
         configure_post_grad_passes()
-        # This only disables the compile stack's generic piecewise
-        # CUDAGraphWrapper. Mamba2 still uses its own decode-only graph
-        # path via capture_mamba_cudagraph().
+        # Mamba2 owns a dedicated decode-cudagraph path, so keep the
+        # compile stack's generic cudagraph wrapper off for it.
         cudagraph_enabled = not self.is_mamba2
         if self.is_qwen_vl:
             # Save the uncompiled inner model for multimodal prefill
@@ -3534,6 +4788,8 @@ class LlamaEngine:
             **mr_kwargs,
         )
         self.is_mamba = self.model_runner.is_mamba
+        self.is_kimi_linear = self.model_runner.is_kimi_linear
+        self.is_qwen3_next = self.model_runner.is_qwen3_next
         if self.is_mamba:
             # Mamba uses MambaStateManager (slot-based) not paged KV blocks.
             self.block_manager = BlockManager(0)
@@ -3546,10 +4802,17 @@ class LlamaEngine:
         if hasattr(self.model_runner, 'cross_blocks_per_seq'):
             self.cross_blocks_per_seq = self.model_runner.cross_blocks_per_seq
         self.max_num_seqs = self.model_runner.max_num_seqs
+        self.max_num_batched_tokens = self.model_runner.max_num_batched_tokens
         print(f"  Scheduling: max_num_seqs={self.max_num_seqs}, "
               f"max_num_batched_tokens={self.max_num_batched_tokens}")
 
-        self.tokenizer = AutoTokenizer.from_pretrained(model_name)
+        tokenizer_kwargs = {}
+        if self.model_runner.is_kimi_linear:
+            tokenizer_kwargs["trust_remote_code"] = True
+        self.tokenizer = AutoTokenizer.from_pretrained(
+            model_name,
+            **tokenizer_kwargs,
+        )
         if self.tokenizer.pad_token_id is None:
             self.tokenizer.pad_token_id = self.tokenizer.eos_token_id
 
@@ -3894,6 +5157,265 @@ class LlamaEngine:
     # ------------------------------------------------------------------
     # Mamba / SSM scheduling loop
     # ------------------------------------------------------------------
+    @torch.inference_mode()
+    def _generate_kimi_linear(
+        self,
+        prompts,
+        sp_list,
+        collect_logits: bool = False,
+        use_tqdm: bool = False,
+    ):
+        eos = self.tokenizer.eos_token_id
+        mr = self.model_runner
+        max_num_seqs = self.max_num_seqs
+        max_batched_tokens = self.max_num_batched_tokens
+        mr.call("reset_kimi_state_cache")
+
+        all_seqs: list[Sequence] = []
+        seq_sp: dict[int, "SamplingParams"] = {}
+        for i, prompt in enumerate(prompts):
+            sp = sp_list[i]
+            ids = prompt if isinstance(prompt, list) else self.tokenizer.encode(prompt)
+            seq = Sequence(ids, max_tokens=sp.max_tokens, ignore_eos=sp.ignore_eos)
+            all_seqs.append(seq)
+            seq_sp[id(seq)] = sp
+
+        seq_logits: dict[int, list[torch.Tensor]] = {
+            id(s): [] for s in all_seqs
+        } if collect_logits else {}
+
+        waiting: deque[Sequence] = deque(all_seqs)
+        running: list[Sequence] = []
+        all_greedy = (
+            not collect_logits
+            and all(sp.temperature == 0.0 for sp in sp_list)
+        )
+
+        def _ensure_decode_blocks(seqs: list[Sequence]) -> bool:
+            block_size = mr.mamba_state_manager.block_size
+            new_block_counts: list[int] = []
+            needs_blocks = False
+            for seq in seqs:
+                total_after = seq.num_computed_tokens + 1
+                blocks_needed = (total_after + block_size - 1) // block_size
+                count = max(0, blocks_needed - len(seq.block_table))
+                new_block_counts.append(count)
+                needs_blocks = needs_blocks or count > 0
+            if not needs_blocks:
+                return False
+            new_blocks = mr.call("allocate_kimi_mla_blocks_batch", new_block_counts)
+            for seq, blocks in zip(seqs, new_blocks):
+                if blocks:
+                    seq.block_table.extend(blocks)
+            return True
+
+        pbar = None
+        if use_tqdm:
+            from tqdm import tqdm as _tqdm
+            pbar = _tqdm(
+                total=len(prompts), desc="Processed prompts", dynamic_ncols=True,
+            )
+        decode_bt_dirty = True
+
+        while waiting or running:
+            prefill_seqs: list[Sequence] = []
+            prefill_tokens = 0
+            while (
+                waiting
+                and len(prefill_seqs) < max_num_seqs
+                and len(running) + len(prefill_seqs) < max_num_seqs
+                and mr.can_allocate_mamba_state()
+            ):
+                seq_len = len(waiting[0].token_ids)
+                if (
+                    prefill_seqs
+                    and prefill_tokens + seq_len > max_batched_tokens
+                ):
+                    break
+                seq = waiting.popleft()
+                prefill_seqs.append(seq)
+                prefill_tokens += seq_len
+
+            if prefill_seqs:
+                decode_bt_dirty = True
+                slots = mr.call("allocate_mamba_state_batch", len(prefill_seqs))
+                for seq, slot in zip(prefill_seqs, slots):
+                    seq.state_slot = slot
+
+                logits = mr.call("run", prefill_seqs, True)
+                if logits is not None:
+                    if collect_logits:
+                        for i, seq in enumerate(prefill_seqs):
+                            seq_logits[id(seq)].append(logits[i:i + 1].cpu())
+                    finished_payloads: list[tuple[int, list[int]]] = []
+                    next_running: list[Sequence] = list(running)
+                    for i, seq in enumerate(prefill_seqs):
+                        tid = self._sample(logits[i:i + 1], seq_sp[id(seq)])[0]
+                        seq.append_token(tid)
+                        done = len(seq.generated_ids) >= seq.max_tokens
+                        if not seq.ignore_eos:
+                            done = done or tid == eos
+                        if done:
+                            finished_payloads.append((seq.state_slot, list(seq.block_table)))
+                        else:
+                            next_running.append(seq)
+                    if finished_payloads:
+                        mr.call("deallocate_mamba_state_batch", finished_payloads)
+                        finished_slots = {slot for slot, _ in finished_payloads}
+                        for seq in prefill_seqs:
+                            if seq.state_slot in finished_slots:
+                                seq.block_table = []
+                                seq.state_slot = None
+                                if pbar is not None:
+                                    pbar.update(1)
+                    running = next_running
+
+            if not running:
+                continue
+
+            if (
+                waiting
+                and all_greedy
+                and all(seq.ignore_eos for seq in running)
+                and len(running) < max_num_seqs
+            ):
+                # Throughput mode: admit/prefill all fixed-length requests
+                # first so the steady-state decode batch has uniform length
+                # and can use the bulk graph replay path below.
+                continue
+
+            if (
+                (not waiting or len(running) >= max_num_seqs)
+                and running
+                and all_greedy
+                and not mr.enforce_eager
+                and getattr(mr, "_kimi_graph_bs_for_n", None) is not None
+                and all(seq.ignore_eos for seq in running)
+            ):
+                remaining = [
+                    seq.max_tokens - len(seq.generated_ids)
+                    for seq in running
+                ]
+                if remaining and min(remaining) == max(remaining) and remaining[0] > 1:
+                    graph_max = mr._kimi_graph_bs_list[-1]
+                    for start in range(0, len(running), graph_max):
+                        mr.call(
+                            "run_kimi_decode_many",
+                            running[start:start + graph_max],
+                            remaining[0],
+                        )
+                    finished_payloads = [
+                        (seq.state_slot, list(seq.block_table))
+                        for seq in running
+                    ]
+                    mr.call("deallocate_mamba_state_batch", finished_payloads)
+                    for seq in running:
+                        seq.block_table = []
+                        seq.state_slot = None
+                        if pbar is not None:
+                            pbar.update(1)
+                    running = []
+                    continue
+
+            decode_seqs = list(running)
+            if (
+                all_greedy
+                and not mr.enforce_eager
+                and getattr(mr, "_kimi_graph_bs_for_n", None) is not None
+                and len(decode_seqs) <= mr._kimi_graph_bs_list[-1]
+            ):
+                if _ensure_decode_blocks(decode_seqs):
+                    decode_bt_dirty = True
+                decode_data = mr._prepare_kimi_decode_arrays(
+                    decode_seqs, copy_block_tables=decode_bt_dirty,
+                )
+                has_result, async_n = mr.call_kimi_decode_async(decode_data)
+                if has_result:
+                    token_ids = mr._wait_async_kimi_tokens(async_n)
+                    finished_payloads: list[tuple[int, list[int]]] = []
+                    next_running = []
+                    any_finished = False
+                    for seq, tid in zip(decode_seqs, token_ids):
+                        seq.append_token(tid)
+                        seq.num_computed_tokens += 1
+                        done = len(seq.generated_ids) >= seq.max_tokens
+                        if not seq.ignore_eos:
+                            done = done or tid == eos
+                        if done:
+                            any_finished = True
+                            finished_payloads.append(
+                                (seq.state_slot, list(seq.block_table)),
+                            )
+                        else:
+                            next_running.append(seq)
+                    if finished_payloads:
+                        mr.call("deallocate_mamba_state_batch", finished_payloads)
+                        finished_slots = {slot for slot, _ in finished_payloads}
+                        for seq in decode_seqs:
+                            if seq.state_slot in finished_slots:
+                                seq.block_table = []
+                                seq.state_slot = None
+                                if pbar is not None:
+                                    pbar.update(1)
+                    running = next_running
+                    decode_bt_dirty = any_finished
+                    continue
+
+            logits = mr.call("run", decode_seqs, False)
+            if logits is None:
+                continue
+            decode_bt_dirty = True
+            if collect_logits:
+                for i, seq in enumerate(decode_seqs):
+                    seq_logits[id(seq)].append(logits[i:i + 1].cpu())
+
+            finished_payloads: list[tuple[int, list[int]]] = []
+            next_running = []
+            for i, seq in enumerate(decode_seqs):
+                tid = self._sample(logits[i:i + 1], seq_sp[id(seq)])[0]
+                seq.append_token(tid)
+                done = len(seq.generated_ids) >= seq.max_tokens
+                if not seq.ignore_eos:
+                    done = done or tid == eos
+                if done:
+                    finished_payloads.append((seq.state_slot, list(seq.block_table)))
+                else:
+                    next_running.append(seq)
+
+            if finished_payloads:
+                mr.call("deallocate_mamba_state_batch", finished_payloads)
+                finished_slots = {slot for slot, _ in finished_payloads}
+                for seq in decode_seqs:
+                    if seq.state_slot in finished_slots:
+                        seq.block_table = []
+                        seq.state_slot = None
+                        if pbar is not None:
+                            pbar.update(1)
+            running = next_running
+
+        if pbar is not None:
+            pbar.close()
+
+        return [
+            GenerationOutput(
+                prompt=(prompts[i] if isinstance(prompts[i], str) else ""),
+                generated_text=(
+                    self.tokenizer.decode(
+                        all_seqs[i].generated_ids, skip_special_tokens=True,
+                    )
+                    if (
+                        isinstance(prompts[i], str)
+                    )
+                    else ""
+                ),
+                token_ids=all_seqs[i].generated_ids,
+                logits_history=(
+                    seq_logits.get(id(all_seqs[i])) if collect_logits else None
+                ),
+            )
+            for i in range(len(prompts))
+        ]
+
     @torch.inference_mode()
     def _generate_mamba(
         self,
@@ -4279,6 +5801,12 @@ class LlamaEngine:
         seed = sp_list[0].seed
         if seed is not None:
             self._set_seeds(seed)
+
+        if self.is_kimi_linear or self.is_qwen3_next:
+            return self._generate_kimi_linear(
+                prompts, sp_list, collect_logits=collect_logits,
+                use_tqdm=use_tqdm,
+            )
 
         if self.is_mamba:
             return self._generate_mamba(
