@@ -26,8 +26,11 @@ torch.set_grad_enabled(False)
 def test_fused_norm_quant():
     import math
     from kb_nano.tasks.baseline.L1.csrc import _C
-    from kb_nano.tasks.baseline.L1.fp8_linear import _per_token_group_quant_fp8
-    from kb_nano.tasks.baseline.L1.rmsnorm_quant import rmsnorm_fp8_quant
+    from kb_nano.tasks.baseline.L1.fp8_linear import PerTokenGroupQuantFp8
+    from kb_nano.tasks.baseline.L1.rmsnorm_quant import RMSNormFP8Quant
+
+    per_token_group_quant_fp8 = PerTokenGroupQuantFp8()
+    rmsnorm_fp8_quant = RMSNormFP8Quant()
 
     GROUP_SIZE = 128
     device = "cuda"
@@ -49,7 +52,7 @@ def test_fused_norm_quant():
             _C.rmsnorm(norm_out, x, weight, eps)
             fp8_ref = torch.empty(bs, hidden_size, dtype=torch.float8_e4m3fn, device=device)
             scales_ref = torch.empty(bs, num_groups, dtype=torch.float32, device=device)
-            _per_token_group_quant_fp8(norm_out, fp8_ref, scales_ref)
+            per_token_group_quant_fp8(norm_out, fp8_ref, scales_ref)
 
             # Fused kernel
             fp8_fused, scales_fused = rmsnorm_fp8_quant(x, weight, eps)
@@ -96,7 +99,7 @@ def test_fused_norm_quant():
     for _ in range(10):
         norm_out = torch.empty_like(x)
         _C.rmsnorm(norm_out, x, weight, eps)
-        _per_token_group_quant_fp8(norm_out, fp8_buf, scales_buf)
+        per_token_group_quant_fp8(norm_out, fp8_buf, scales_buf)
     for _ in range(10):
         rmsnorm_fp8_quant(x, weight, eps)
 
@@ -109,7 +112,7 @@ def test_fused_norm_quant():
     for _ in range(1000):
         norm_out = torch.empty_like(x)
         _C.rmsnorm(norm_out, x, weight, eps)
-        _per_token_group_quant_fp8(norm_out, fp8_buf, scales_buf)
+        per_token_group_quant_fp8(norm_out, fp8_buf, scales_buf)
     end.record()
     torch.cuda.synchronize()
     two_kernel_ms = start.elapsed_time(end) / 1000

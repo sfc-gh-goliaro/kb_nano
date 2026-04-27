@@ -27,6 +27,12 @@ _DTYPE_MAP: dict[str, torch.dtype] = {
     "int64": torch.int64,
     "bool": torch.bool,
 }
+if hasattr(torch, "float8_e4m3fn"):
+    _DTYPE_MAP["float8_e4m3fn"] = torch.float8_e4m3fn
+if hasattr(torch, "float8_e5m2"):
+    _DTYPE_MAP["float8_e5m2"] = torch.float8_e5m2
+
+_FP8_GROUP_SIZE = 128
 
 
 def _parse_dtype(s: str) -> torch.dtype:
@@ -34,6 +40,95 @@ def _parse_dtype(s: str) -> torch.dtype:
     if dt is None:
         raise ValueError(f"Unknown dtype {s!r}. Supported: {list(_DTYPE_MAP)}")
     return dt
+
+
+def _is_fp8_dtype(dtype: torch.dtype) -> bool:
+    return "float8" in str(dtype)
+
+
+def _ceil_div(a: int, b: int) -> int:
+    return (a + b - 1) // b
+
+
+def _round_scale_to_power_of_two(scale: torch.Tensor) -> torch.Tensor:
+    return torch.pow(2.0, torch.ceil(torch.log2(scale)))
+
+
+def _quantize_fp8_per_token_group(
+    source: torch.Tensor,
+    dtype: torch.dtype,
+    *,
+    group_size: int = _FP8_GROUP_SIZE,
+    use_ue8m0: bool = True,
+    eps: float = 1e-10,
+) -> tuple[torch.Tensor, torch.Tensor]:
+    """Quantize the last dimension and return coherent FP8 values + scales."""
+    fp8_info = torch.finfo(dtype)
+    orig_shape = source.shape
+    hidden = orig_shape[-1]
+    groups = _ceil_div(hidden, group_size)
+    padded_hidden = groups * group_size
+    flat = source.reshape(-1, hidden).float()
+
+    if padded_hidden != hidden:
+        padded = torch.zeros(
+            flat.shape[0], padded_hidden, dtype=flat.dtype, device=flat.device,
+        )
+        padded[:, :hidden] = flat
+        flat_for_scale = padded
+    else:
+        flat_for_scale = flat
+
+    grouped = flat_for_scale.view(flat.shape[0], groups, group_size)
+    scale = grouped.abs().amax(dim=-1).clamp_min(eps) / fp8_info.max
+    if use_ue8m0:
+        scale = _round_scale_to_power_of_two(scale)
+
+    expanded = scale.repeat_interleave(group_size, dim=-1)[:, :hidden]
+    quantized = torch.clamp(
+        flat / expanded, fp8_info.min, fp8_info.max,
+    ).to(dtype).reshape(orig_shape)
+    scale = scale.reshape(*orig_shape[:-1], groups)
+    return quantized, scale
+
+
+def _quantize_fp8_per_block(
+    source: torch.Tensor,
+    dtype: torch.dtype,
+    *,
+    block_shape: list[int] | tuple[int, int] = (_FP8_GROUP_SIZE, _FP8_GROUP_SIZE),
+    use_ue8m0: bool = True,
+    eps: float = 1e-10,
+) -> tuple[torch.Tensor, torch.Tensor]:
+    """Quantize the last two dimensions with block scales."""
+    fp8_info = torch.finfo(dtype)
+    block_m, block_n = int(block_shape[0]), int(block_shape[1])
+    orig_shape = source.shape
+    rows, cols = orig_shape[-2], orig_shape[-1]
+    row_blocks = _ceil_div(rows, block_m)
+    col_blocks = _ceil_div(cols, block_n)
+    padded_rows = row_blocks * block_m
+    padded_cols = col_blocks * block_n
+    flat = source.reshape(-1, rows, cols).float()
+
+    padded = torch.zeros(
+        flat.shape[0], padded_rows, padded_cols, dtype=flat.dtype, device=flat.device,
+    )
+    padded[:, :rows, :cols] = flat
+    grouped = padded.view(
+        flat.shape[0], row_blocks, block_m, col_blocks, block_n,
+    )
+    scale = grouped.abs().amax(dim=(2, 4)).clamp_min(eps) / fp8_info.max
+    if use_ue8m0:
+        scale = _round_scale_to_power_of_two(scale)
+
+    expanded = scale.repeat_interleave(block_m, dim=-2).repeat_interleave(block_n, dim=-1)
+    expanded = expanded[:, :rows, :cols]
+    quantized = torch.clamp(
+        flat / expanded, fp8_info.min, fp8_info.max,
+    ).to(dtype).reshape(orig_shape)
+    scale = scale.reshape(*orig_shape[:-2], row_blocks, col_blocks)
+    return quantized, scale
 
 
 class Scenario:
@@ -161,14 +256,67 @@ class InputRegistry:
             return golden_data
 
         result: dict[str, Any] = {}
+        generated_scale_args: set[str] = set()
         for arg_name, spec in scenario.inputs.items():
+            if arg_name in generated_scale_args:
+                continue
             if isinstance(spec, dict) and "shape" in spec:
                 dtype = _parse_dtype(spec["dtype"])
                 shape = spec["shape"]
-                if dtype in (torch.int32, torch.int64):
+                quantize = spec.get("quantize")
+                if quantize == "fp8":
+                    if not _is_fp8_dtype(dtype):
+                        raise ValueError(
+                            f"Input {arg_name!r} requests quantize=fp8 "
+                            f"but dtype is {spec['dtype']!r}"
+                        )
+                    scale_arg = spec.get("scale_arg")
+                    if not scale_arg:
+                        raise ValueError(
+                            f"Input {arg_name!r} with quantize=fp8 requires scale_arg"
+                        )
+                    source_dtype = _parse_dtype(spec.get("source_dtype", "bfloat16"))
+                    source = torch.randn(shape, dtype=source_dtype, device=device)
+                    scale_layout = spec.get("scale_layout", "per_token_group")
+                    if scale_layout == "per_token_group":
+                        tensor, scale = _quantize_fp8_per_token_group(
+                            source,
+                            dtype,
+                            group_size=int(spec.get("group_size", _FP8_GROUP_SIZE)),
+                            use_ue8m0=bool(spec.get("use_ue8m0", True)),
+                            eps=float(spec.get("eps", 1e-10)),
+                        )
+                    elif scale_layout == "per_block":
+                        if len(shape) < 2:
+                            raise ValueError(
+                                f"Input {arg_name!r} needs rank >= 2 for per_block FP8"
+                            )
+                        tensor, scale = _quantize_fp8_per_block(
+                            source,
+                            dtype,
+                            block_shape=spec.get(
+                                "block_shape",
+                                [_FP8_GROUP_SIZE, _FP8_GROUP_SIZE],
+                            ),
+                            use_ue8m0=bool(spec.get("use_ue8m0", True)),
+                            eps=float(spec.get("eps", 1e-10)),
+                        )
+                    else:
+                        raise ValueError(
+                            f"Unknown FP8 scale_layout {scale_layout!r} for {arg_name!r}"
+                        )
+                    result[arg_name] = tensor
+                    result[scale_arg] = scale
+                    generated_scale_args.add(scale_arg)
+                elif dtype in (torch.int32, torch.int64):
                     result[arg_name] = torch.randint(0, 100, shape, dtype=dtype, device=device)
                 elif dtype == torch.bool:
                     result[arg_name] = torch.randint(0, 2, shape, dtype=torch.uint8, device=device).bool()
+                elif _is_fp8_dtype(dtype):
+                    source_dtype = _parse_dtype(spec.get("source_dtype", "bfloat16"))
+                    result[arg_name] = torch.randn(
+                        shape, dtype=source_dtype, device=device,
+                    ).to(dtype)
                 else:
                     result[arg_name] = torch.randn(shape, dtype=dtype, device=device)
             elif spec is None:
