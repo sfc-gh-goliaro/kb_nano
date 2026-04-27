@@ -7,7 +7,6 @@ Sections 7-9: Integration tests (GPU required).
 
 Usage:
     python tests/test_bench.py                 # all tests
-    python tests/test_bench.py --unit-only      # no GPU required
     python tests/test_bench.py --section 3      # run only section 3
 """
 
@@ -17,6 +16,7 @@ import argparse
 import io
 import importlib
 import json
+import math
 import os
 import signal
 import subprocess
@@ -258,6 +258,50 @@ rms_norm:
             reg = InputRegistry(inputs_dir=inputs_dir)
             check(len(reg.operators()) == 0, "1f. empty YAML -> zero operators")
 
+    # 1g. Coherent FP8 + scale input generation
+    with _Timeout(30):
+        if not hasattr(torch, "float8_e4m3fn"):
+            check(True, "1g. FP8 dtype unavailable, skipping")
+        else:
+            fp8_yaml = """
+fp8_grouped_gemm:
+  scenarios:
+    - name: "toy/fp8/tp1"
+      init_args: {}
+      inputs:
+        a_fp8:
+          shape: [2, 256]
+          dtype: float8_e4m3fn
+          quantize: fp8
+          scale_arg: a_scale
+          group_size: 128
+        b_fp8:
+          shape: [4, 256, 256]
+          dtype: float8_e4m3fn
+          quantize: fp8
+          scale_arg: b_scale
+          scale_layout: per_block
+          block_shape: [128, 128]
+"""
+            with tempfile.TemporaryDirectory() as tmpdir:
+                inputs_dir = Path(tmpdir) / "inputs"
+                inputs_dir.mkdir()
+                (inputs_dir / "test.yaml").write_text(fp8_yaml)
+                reg = InputRegistry(inputs_dir=inputs_dir)
+                inputs = reg.get_inputs("fp8_grouped_gemm", "toy/fp8/tp1", device="cpu")
+                check(
+                    inputs["a_fp8"].dtype == torch.float8_e4m3fn
+                    and inputs["a_scale"].shape == (2, 2),
+                    "1g. per-token FP8 input and scale generated",
+                )
+                check(
+                    inputs["b_fp8"].dtype == torch.float8_e4m3fn
+                    and inputs["b_scale"].shape == (4, 2, 2),
+                    "1g. per-block FP8 input and scale generated",
+                )
+                dequant = inputs["a_fp8"].float() * inputs["a_scale"].repeat_interleave(128, dim=-1)
+                check(torch.isfinite(dequant).all(), "1g. dequantized FP8 input is finite")
+
 
 # ===========================================================================
 # Section 2: KernelRunner (unit, no GPU — uses CPU mock modules)
@@ -280,8 +324,11 @@ def test_section_2():
         with torch.no_grad():
             out1 = m1(inp)
             out2 = m2(inp)
-        correct, diff = _compare_outputs(out1, out2)
-        check(correct and diff == 0.0, "2a. identical modules -> correct=True, diff=0")
+        correct, error_ratio, diff = _compare_outputs(out1, out2)
+        check(
+            correct and error_ratio == 0.0 and diff == 0.0,
+            "2a. identical modules -> correct=True, error_ratio=0, diff=0",
+        )
 
     # 2b. Different modules
     with _Timeout(30):
@@ -299,31 +346,55 @@ def test_section_2():
         with torch.no_grad():
             out_b = baseline(inp)
             out_c = candidate(inp)
-        correct, diff = _compare_outputs(out_b, out_c)
-        check(not correct or diff > 0, "2b. different modules -> correct=False or diff>0")
+        correct, error_ratio, diff = _compare_outputs(out_b, out_c)
+        check(
+            not correct or error_ratio > 1.0,
+            "2b. different modules -> correct=False or error_ratio>1",
+        )
         check(diff > 0, f"2b. mean_abs_diff={diff:.4f} > 0")
 
-    # 2c. Weight copying
+    # 2c. FP8 output pairs compare in dequantized value space
+    with _Timeout(30):
+        if not hasattr(torch, "float8_e4m3fn"):
+            check(True, "2c. FP8 dtype unavailable, skipping")
+        else:
+            fp8 = torch.ones(1, 256, dtype=torch.float32).to(torch.float8_e4m3fn)
+            scale = torch.ones(1, 2, dtype=torch.float32)
+            correct, error_ratio, diff = _compare_outputs((fp8, scale), (fp8, scale))
+            check(
+                correct and error_ratio == 0.0 and diff == 0.0,
+                "2c. identical FP8 pairs -> correct=True, error_ratio=0",
+            )
+            bad_scale = scale * 2.0
+            correct, error_ratio, diff = _compare_outputs(
+                (fp8, scale), (fp8, bad_scale),
+            )
+            check(
+                not correct and error_ratio > 1.0 and diff > 0.0,
+                "2c. changed FP8 scale fails dequantized comparison",
+            )
+
+    # 2d. Weight copying
     with _Timeout(30):
         torch.manual_seed(42)
         m1 = nn.Linear(8, 4, bias=False)
         m2 = nn.Linear(8, 4, bias=False)
         check(
             not torch.equal(m1.weight, m2.weight),
-            "2c. before copy, weights differ",
+            "2d. before copy, weights differ",
         )
         m2.load_state_dict(m1.state_dict())
         check(
             torch.equal(m1.weight, m2.weight),
-            "2c. after load_state_dict, weights match",
+            "2d. after load_state_dict, weights match",
         )
         inp = torch.randn(2, 8)
         with torch.no_grad():
             out1 = m1(inp)
             out2 = m2(inp)
-        check(torch.allclose(out1, out2), "2c. after copy, outputs match")
+        check(torch.allclose(out1, out2), "2d. after copy, outputs match")
 
-    # 2d. init_args propagation
+    # 2e. init_args propagation
     with _Timeout(30):
         class ConfigModule(nn.Module):
             def __init__(self, hidden_size: int = 10, eps: float = 1e-6):
@@ -335,10 +406,10 @@ def test_section_2():
 
         from kb_nano.bench.kernels.runner import _instantiate_module
         mod = _instantiate_module(ConfigModule, {"hidden_size": 32, "eps": 1e-5}, device="cpu")
-        check(mod.hidden_size == 32, "2d. hidden_size=32 propagated")
-        check(mod.eps == 1e-5, "2d. eps=1e-5 propagated")
+        check(mod.hidden_size == 32, "2e. hidden_size=32 propagated")
+        check(mod.eps == 1e-5, "2e. eps=1e-5 propagated")
 
-    # 2e. Scenario filtering
+    # 2f. Scenario filtering
     with _Timeout(30):
         from kb_nano.bench.utils.input_registry import InputRegistry
 
@@ -359,9 +430,9 @@ rms_norm:
             (inputs_dir / "test.yaml").write_text(filter_yaml)
             reg = InputRegistry(inputs_dir=inputs_dir)
             all_s = reg.scenarios("rms_norm")
-            check(len(all_s) == 10, "2e. total 10 scenarios")
+            check(len(all_s) == 10, "2f. total 10 scenarios")
             filtered = reg.scenarios("rms_norm", models=["llama"])
-            check(len(filtered) == 3, "2e. model=llama -> 3 scenarios")
+            check(len(filtered) == 3, "2f. model=llama -> 3 scenarios")
 
 
 # ===========================================================================
@@ -381,9 +452,9 @@ def test_section_3():
     # 3a. KernelBenchResult construction
     with _Timeout(30):
         scenarios_a = [
-            ScenarioResult("s1", True, 1e-7, 0.1, 0.08, 1.25),
-            ScenarioResult("s2", True, 2e-7, 0.12, 0.10, 1.20),
-            ScenarioResult("s3", False, 5e-4, 0.1, 0.09, 1.11),
+            ScenarioResult("s1", True, 0.1, 1e-7, 0.1, 0.08, 1.25),
+            ScenarioResult("s2", True, 0.2, 2e-7, 0.12, 0.10, 1.20),
+            ScenarioResult("s3", False, 2.5, 5e-4, 0.1, 0.09, 1.11),
         ]
         op_a = OperatorResult(
             target="rms_norm", level=1,
@@ -391,8 +462,8 @@ def test_section_3():
             scenarios=scenarios_a,
         )
         scenarios_b = [
-            ScenarioResult("s4", True, 3e-7, 0.2, 0.18, 1.11),
-            ScenarioResult("s5", True, 1e-7, 0.15, 0.14, 1.07),
+            ScenarioResult("s4", True, 0.3, 3e-7, 0.2, 0.18, 1.11),
+            ScenarioResult("s5", True, 0.1, 1e-7, 0.15, 0.14, 1.07),
         ]
         op_b = OperatorResult(
             target="silu_and_mul", level=1,
@@ -407,6 +478,10 @@ def test_section_3():
         check(result.total_scenarios == 5, "3a. total_scenarios == 5")
         check(result.passed == 4, "3a. passed == 4")
         check(result.failed == 1, "3a. failed == 1")
+        check(
+            result.avg_max_error_ratio > 0.0,
+            f"3a. avg_max_error_ratio={result.avg_max_error_ratio:.2e} > 0",
+        )
         check(result.avg_speedup > 1.0, f"3a. avg_speedup={result.avg_speedup:.2f} > 1.0")
 
     # 3b. JSON round-trip
@@ -461,9 +536,207 @@ def test_section_3():
         sys.stdout = old_stdout
         output = buf.getvalue()
         check("CORRECT" in output or "PASS" in output, "3e. table contains PASS/CORRECT")
+        check("ERR_RATIO" in output, "3e. table contains ERR_RATIO")
         check("SPEEDUP" in output or "speedup" in output, "3e. table contains SPEEDUP")
         check("OVERALL" in output, "3e. table contains OVERALL summary")
         check("ALL OPERATORS SUMMARY" in output, "3e. multi-operator table has summary")
+
+    # 3f. MacroEval aggregation
+    with _Timeout(30):
+        from kb_nano.bench.eval.aggregator import Aggregator
+        from kb_nano.bench.eval.runner import JobResult
+
+        llm_valid = JobResult(
+            model="model-a",
+            tp=1,
+            category="llm",
+            throughput_results=[
+                {"speedup": 2.0, "aligned_matches": 1, "aligned_total": 1},
+                {"speedup": 8.0, "aligned_matches": 1, "aligned_total": 1},
+            ],
+            latency_results=[{"speedup": 1.0}],
+        )
+        llm_invalid = JobResult(
+            model="model-b",
+            tp=1,
+            category="llm",
+            throughput_results=[
+                {"speedup": 16.0, "aligned_matches": 1, "aligned_total": 2},
+            ],
+            latency_results=[{"speedup": 16.0}],
+        )
+        diffusion_valid = JobResult(
+            model="model-c",
+            tp=1,
+            category="diffusion",
+            throughput_results=[{"speedup": 1.0}],
+            latency_results=[{"speedup": 4.0}],
+        )
+
+        report = Aggregator.aggregate(
+            [llm_valid, llm_invalid, diffusion_valid],
+            wall_clock_seconds=12.0,
+        )
+        cats = {c.name: c for c in report.categories}
+
+        check(
+            abs(cats["llm"].macro_correctness - 0.75) < 1e-9,
+            f"3f. llm macro correctness={cats['llm'].macro_correctness:.3f}",
+        )
+        check(
+            abs(cats["llm"].macro_coverage - 0.5) < 1e-9,
+            f"3f. llm macro coverage={cats['llm'].macro_coverage:.3f}",
+        )
+        check(
+            abs(report.macro_correctness - 0.875) < 1e-9,
+            f"3f. macro correctness={report.macro_correctness:.3f}",
+        )
+        check(
+            abs(report.macro_coverage - 0.75) < 1e-9,
+            f"3f. macro coverage={report.macro_coverage:.3f}",
+        )
+        check(
+            abs(report.macro_speedup - 2.0) < 1e-9,
+            f"3f. macro speedup={report.macro_speedup:.3f}",
+        )
+        check(
+            abs(report.macro_score - 1.3125) < 1e-9,
+            f"3f. macro score={report.macro_score:.4f}",
+        )
+
+    # 3g. MacroEval excludes invalid/failed items from speedup credit
+    with _Timeout(30):
+        from kb_nano.bench.eval.aggregator import Aggregator
+        from kb_nano.bench.eval.runner import JobResult
+
+        llm_valid = JobResult(
+            model="llm-valid",
+            tp=1,
+            category="llm",
+            throughput_results=[
+                {"speedup": 4.0, "aligned_matches": 2, "aligned_total": 2},
+                {"speedup": 9.0, "aligned_matches": 2, "aligned_total": 2},
+            ],
+            latency_results=[
+                {"speedup": 1.0},
+                {"speedup": 4.0},
+            ],
+        )
+        llm_invalid_fast = JobResult(
+            model="llm-invalid-fast",
+            tp=1,
+            category="llm",
+            throughput_results=[
+                {"speedup": 100.0, "aligned_matches": 0, "aligned_total": 1},
+            ],
+            latency_results=[{"speedup": 100.0}],
+        )
+        vision_failed = JobResult(
+            model="vision-failed",
+            tp=1,
+            category="vision",
+            status="FAILED",
+            error="synthetic failure",
+        )
+
+        report = Aggregator.aggregate([llm_valid, llm_invalid_fast, vision_failed])
+        cats = {c.name: c for c in report.categories}
+        expected_llm_thru = 6.0
+        expected_llm_lat = 2.0
+        expected_llm_blend = math.sqrt(expected_llm_thru * expected_llm_lat)
+
+        check(
+            abs(cats["llm"].models[0].throughput_speedup - expected_llm_thru) < 1e-9,
+            f"3g. per-item throughput geomean={cats['llm'].models[0].throughput_speedup:.3f}",
+        )
+        check(
+            abs(cats["llm"].models[0].latency_speedup - expected_llm_lat) < 1e-9,
+            f"3g. per-item latency geomean={cats['llm'].models[0].latency_speedup:.3f}",
+        )
+        check(
+            abs(cats["llm"].models[0].blended_speedup - expected_llm_blend) < 1e-9,
+            f"3g. blended speedup={cats['llm'].models[0].blended_speedup:.3f}",
+        )
+        check(
+            not cats["llm"].models[1].valid
+            and cats["llm"].models[1].blended_speedup == 0.0,
+            "3g. invalid fast item receives no speedup credit",
+        )
+        check(
+            cats["vision"].macro_coverage == 0.0
+            and cats["vision"].macro_correctness == 0.0
+            and cats["vision"].macro_speedup == 1.0,
+            "3g. failed-only family affects coverage/correctness but not speedup",
+        )
+        check(
+            abs(report.macro_speedup - expected_llm_blend) < 1e-9,
+            f"3g. macro speedup excludes failed-only family: {report.macro_speedup:.3f}",
+        )
+        check(
+            abs(report.macro_correctness - 0.25) < 1e-9
+            and abs(report.macro_coverage - 0.25) < 1e-9,
+            f"3g. macro correctness/coverage={report.macro_correctness:.2f}/{report.macro_coverage:.2f}",
+        )
+
+    # 3h. MacroEval JSON schema and terminal output
+    with _Timeout(30):
+        from kb_nano.bench.eval.aggregator import Aggregator
+        from kb_nano.bench.eval.runner import JobResult
+
+        report = Aggregator.aggregate([
+            JobResult(
+                model="macro-json-model",
+                tp=1,
+                category="llm",
+                throughput_results=[
+                    {"speedup": 1.5, "aligned_matches": 3, "aligned_total": 3},
+                ],
+                latency_results=[{"speedup": 2.0}],
+            )
+        ])
+        d = report.to_dict()
+        check(
+            all(k in d for k in (
+                "macro_speedup", "macro_correctness",
+                "macro_coverage", "macro_score",
+            )),
+            "3h. EvalReport JSON contains top-level MacroEval fields",
+        )
+        check(
+            all(k in d["categories"][0] for k in (
+                "macro_speedup", "macro_correctness",
+                "macro_coverage", "macro_score",
+            )),
+            "3h. Category JSON contains MacroEval fields",
+        )
+        check(
+            all(k in d["categories"][0]["models"][0] for k in (
+                "correctness_score", "valid", "blended_speedup",
+            )),
+            "3h. Model JSON contains MacroEval item fields",
+        )
+
+        with tempfile.TemporaryDirectory() as tmpdir:
+            path = os.path.join(tmpdir, "eval.json")
+            report.save_json(path)
+            with open(path) as f:
+                loaded = json.load(f)
+            check(
+                loaded["macro_score"] == d["macro_score"],
+                "3h. MacroEval fields persist through save_json",
+            )
+
+        old_stdout = sys.stdout
+        sys.stdout = buf = io.StringIO()
+        report.print_table()
+        sys.stdout = old_stdout
+        output = buf.getvalue()
+        check(
+            "MacroEval speedup" in output
+            and "MacroEval correctness" in output
+            and "MacroEval score" in output,
+            "3h. terminal output includes MacroEval summary",
+        )
 
 
 # ===========================================================================
@@ -490,18 +763,18 @@ def test_section_4():
         )
         ph = THROUGHPUT_WORKLOADS[0]
         check(
-            ph.input_len == 1024 and ph.output_len == 512,
-            "4a. prefill-heavy: 1024/512",
+            ph.dataset_name.endswith("prefill-heavy-1k"),
+            "4a. prefill-heavy dataset configured",
         )
         bal = THROUGHPUT_WORKLOADS[1]
         check(
-            bal.input_len == 512 and bal.output_len == 512,
-            "4a. balanced: 512/512",
+            bal.dataset_name.endswith("balanced-1k"),
+            "4a. balanced dataset configured",
         )
         dh = THROUGHPUT_WORKLOADS[2]
         check(
-            dh.input_len == 512 and dh.output_len == 1024,
-            "4a. decode-heavy: 512/1024",
+            dh.dataset_name.endswith("decode-heavy-1k"),
+            "4a. decode-heavy dataset configured",
         )
 
     # 4b. Latency workload constants
@@ -523,7 +796,7 @@ def test_section_4():
     # 4c. Immutability (frozen dataclasses)
     with _Timeout(30):
         try:
-            THROUGHPUT_WORKLOADS[0].input_len = 999
+            THROUGHPUT_WORKLOADS[0].dataset_name = "other"
             check(False, "4c. throughput workloads should be immutable")
         except AttributeError:
             check(True, "4c. throughput workloads are frozen (immutable)")
@@ -537,8 +810,8 @@ def test_section_4():
     with _Timeout(30):
         max_len = get_max_seq_len()
         check(
-            max_len == 1536,
-            f"4d. max_seq_len = {max_len} (expected 1536 = 512+1024)",
+            max_len == 256,
+            f"4d. static max_seq_len = {max_len} (expected 256 = 128+128)",
         )
 
 
@@ -784,15 +1057,21 @@ def test_section_6():
 
     # 6d. Default JSON output path
     with _Timeout(30):
-        from kb_nano.bench.kernels.__main__ import _DEFAULT_OUTPUT as kernels_default
+        from kb_nano import RESULTS_DIR, run_output_path
+
+        kernels_default = run_output_path("kernels")
         check(
-            kernels_default == "bench/results/kernels.json",
+            kernels_default.parent == RESULTS_DIR
+            and kernels_default.name.startswith("kernels_")
+            and kernels_default.suffix == ".json",
             f"6d. kernels default output: {kernels_default}",
         )
 
-        from kb_nano.bench.eval.__main__ import _DEFAULT_OUTPUT as eval_default
+        eval_default = run_output_path("eval")
         check(
-            eval_default == "bench/results/eval.json",
+            eval_default.parent == RESULTS_DIR
+            and eval_default.name.startswith("eval_")
+            and eval_default.suffix == ".json",
             f"6d. eval default output: {eval_default}",
         )
 
@@ -807,17 +1086,21 @@ def test_section_7():
 
     candidate_dir = os.path.join(PACKAGE_DIR, "tasks", "candidate", "L1")
     candidate_file = os.path.join(candidate_dir, "rms_norm.py")
-    baseline_file = os.path.join(PACKAGE_DIR, "tasks", "baseline", "L1", "rms_norm.py")
     had_candidate = os.path.exists(candidate_file)
     if had_candidate:
         original_candidate = open(candidate_file).read()
 
-    # 7a. Identity replacement via the new runner (copy baseline as candidate)
+    def _write_identity_rms_candidate():
+        with open(candidate_file, "w") as f:
+            f.write(f"""\
+from {PACKAGE_NAME}.tasks.baseline.L1.rms_norm import RMSNorm
+""")
+
+    # 7a. Identity replacement via the new runner
     with _Timeout(120):
         try:
-            import shutil
             os.makedirs(candidate_dir, exist_ok=True)
-            shutil.copy2(baseline_file, candidate_file)
+            _write_identity_rms_candidate()
             result = subprocess.run(
                 [sys.executable, "-c", f"""
 import sys, json
@@ -833,6 +1116,7 @@ print(json.dumps({{
     'passed': result.passed,
     'failed': result.failed,
     'total': result.total_scenarios,
+    'avg_error_ratio': result.avg_max_error_ratio,
     'avg_diff': result.avg_mean_abs_diff,
     'avg_speedup': result.avg_speedup,
 }}))
@@ -846,8 +1130,8 @@ print(json.dumps({{
             else:
                 data = json.loads(result.stdout.strip().split("\n")[-1])
                 check(
-                    data["avg_diff"] < 1e-5,
-                    f"7a. identity: avg_diff={data['avg_diff']:.2e} < 1e-5",
+                    data["avg_error_ratio"] == 0.0,
+                    f"7a. identity: avg_error_ratio={data['avg_error_ratio']:.2e} == 0",
                 )
                 check(
                     data["failed"] == 0,
@@ -887,6 +1171,7 @@ result = run_kernel_benchmark(
 print(json.dumps({{
     'passed': result.passed,
     'failed': result.failed,
+    'avg_error_ratio': result.avg_max_error_ratio,
     'avg_diff': result.avg_mean_abs_diff,
 }}))
 """],
@@ -899,8 +1184,8 @@ print(json.dumps({{
             else:
                 data = json.loads(result.stdout.strip().split("\n")[-1])
                 check(
-                    data["avg_diff"] > 0.01,
-                    f"7b. broken: avg_diff={data['avg_diff']:.4f} > 0.01",
+                    data["avg_error_ratio"] > 1.0,
+                    f"7b. broken: avg_error_ratio={data['avg_error_ratio']:.2e} > 1",
                 )
                 check(
                     data["failed"] > 0,
@@ -912,8 +1197,7 @@ print(json.dumps({{
     # 7c. JSON output file via CLI (baseline as candidate in candidates folder)
     with _Timeout(180):
         try:
-            import shutil
-            shutil.copy2(baseline_file, candidate_file)
+            _write_identity_rms_candidate()
             with tempfile.TemporaryDirectory() as tmpdir:
                 json_path = os.path.join(tmpdir, "kernels.json")
                 result = subprocess.run(
@@ -1149,10 +1433,59 @@ finally:
 
     # 9c. JSON default save path
     with _Timeout(30):
-        from kb_nano.bench.eval.__main__ import _DEFAULT_OUTPUT
+        from kb_nano import RESULTS_DIR, run_output_path
+
+        default_output = run_output_path("eval")
         check(
-            _DEFAULT_OUTPUT == "bench/results/eval.json",
-            f"9c. eval default output: {_DEFAULT_OUTPUT}",
+            default_output.parent == RESULTS_DIR
+            and default_output.name.startswith("eval_")
+            and default_output.suffix == ".json",
+            f"9c. eval default output: {default_output}",
+        )
+
+    # 9d. MacroEval report integration schema
+    with _Timeout(30):
+        from kb_nano.bench.eval.aggregator import Aggregator
+        from kb_nano.bench.eval.runner import JobResult
+
+        report = Aggregator.aggregate([
+            JobResult(
+                model="integration-a",
+                tp=1,
+                category="llm",
+                throughput_results=[
+                    {"speedup": 2.0, "aligned_matches": 2, "aligned_total": 2},
+                ],
+                latency_results=[{"speedup": 2.0}],
+            ),
+            JobResult(
+                model="integration-b",
+                tp=1,
+                category="vlm",
+                status="FAILED",
+                error="synthetic failure",
+            ),
+        ])
+
+        with tempfile.TemporaryDirectory() as tmpdir:
+            json_path = os.path.join(tmpdir, "eval_macro.json")
+            report.save_json(json_path)
+            with open(json_path) as f:
+                data = json.load(f)
+        check(
+            abs(data["macro_speedup"] - 2.0) < 1e-9,
+            f"9d. macro_speedup={data['macro_speedup']:.2f}",
+        )
+        check(
+            abs(data["macro_correctness"] - 0.5) < 1e-9
+            and abs(data["macro_coverage"] - 0.5) < 1e-9
+            and abs(data["macro_score"] - 0.5) < 1e-9,
+            "9d. MacroEval correctness/coverage/score persisted",
+        )
+        check(
+            len(data["categories"]) == 2
+            and all("macro_score" in c for c in data["categories"]),
+            "9d. category MacroEval schema persisted",
         )
 
 
@@ -1162,10 +1495,6 @@ finally:
 def main():
     parser = argparse.ArgumentParser(
         description="Test the kb-nano benchmarking infrastructure",
-    )
-    parser.add_argument(
-        "--unit-only", action="store_true",
-        help="Skip GPU integration tests (sections 7-9)",
     )
     parser.add_argument(
         "--section", type=int, default=None,
@@ -1178,24 +1507,19 @@ def main():
     print("=" * 60)
 
     sections = {
-        1: ("Input Registry", test_section_1, False),
-        2: ("KernelRunner", test_section_2, False),
-        3: ("Result dataclasses", test_section_3, False),
-        4: ("Standardized workloads", test_section_4, False),
-        5: ("Conflict resolution", test_section_5, False),
-        6: ("CLI argument parsing", test_section_6, False),
-        7: ("Kernel integration", test_section_7, True),
-        8: ("E2E integration", test_section_8, True),
-        9: ("Eval integration", test_section_9, True),
+        1: ("Input Registry", test_section_1),
+        2: ("KernelRunner", test_section_2),
+        3: ("Result dataclasses", test_section_3),
+        4: ("Standardized workloads", test_section_4),
+        5: ("Conflict resolution", test_section_5),
+        6: ("CLI argument parsing", test_section_6),
+        7: ("Kernel integration", test_section_7),
+        8: ("E2E integration", test_section_8),
+        9: ("Eval integration", test_section_9),
     }
 
-    for num, (name, func, needs_gpu) in sorted(sections.items()):
+    for num, (name, func) in sorted(sections.items()):
         if args.section is not None and args.section != num:
-            continue
-        if args.unit_only and needs_gpu:
-            print(f"\n{'=' * 60}")
-            print(f"  SKIPPED: Section {num} ({name}) -- requires GPU")
-            print(f"{'=' * 60}")
             continue
         try:
             func()

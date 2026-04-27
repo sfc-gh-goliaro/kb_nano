@@ -10,9 +10,30 @@ from __future__ import annotations
 
 import json
 import os
+import signal
 import subprocess
 import sys
 import tempfile
+
+
+def _terminate_process_group(pid: int) -> None:
+    """Best-effort cleanup for worker grandchildren such as vLLM ranks."""
+    try:
+        os.killpg(pid, signal.SIGTERM)
+    except ProcessLookupError:
+        return
+    except OSError:
+        return
+    try:
+        os.waitpid(pid, os.WNOHANG)
+    except ChildProcessError:
+        pass
+    try:
+        os.killpg(pid, signal.SIGKILL)
+    except ProcessLookupError:
+        pass
+    except OSError:
+        pass
 
 
 def run_worker(script: str, config: dict, label: str, timeout: int = 3600) -> dict | None:
@@ -50,19 +71,24 @@ def run_worker(script: str, config: dict, label: str, timeout: int = 3600) -> di
         print(f"  {label}")
         print(f"{'─' * 70}", flush=True)
 
-        result = subprocess.run(
+        proc = subprocess.Popen(
             [sys.executable, "-u", script_path, config_path],
-            timeout=timeout,
+            start_new_session=True,
         )
-        if result.returncode != 0:
-            print(f"  ERROR: {label} failed with exit code {result.returncode}")
+        try:
+            returncode = proc.wait(timeout=timeout)
+        except subprocess.TimeoutExpired:
+            _terminate_process_group(proc.pid)
+            print(f"  ERROR: {label} timed out after {timeout}s")
+            return None
+
+        if returncode != 0:
+            _terminate_process_group(proc.pid)
+            print(f"  ERROR: {label} failed with exit code {returncode}")
             return None
 
         with open(output_path) as f:
             return json.loads(f.read())
-    except subprocess.TimeoutExpired:
-        print(f"  ERROR: {label} timed out after {timeout}s")
-        return None
     finally:
         os.unlink(script_path)
         os.unlink(config_path)
@@ -246,8 +272,15 @@ def main():
     latency_results = []
     for ls in cfg.get("latency_scenarios", []):
         prompts = ls["prompt_token_ids"]
-        sp = SamplingParams(temperature=0.0,
-                            ignore_eos=True, max_tokens=ls["output_len"])
+        output_lens = ls.get("output_lens")
+        if output_lens is None:
+            sp = SamplingParams(temperature=0.0,
+                                ignore_eos=True, max_tokens=ls["output_len"])
+        else:
+            sp = [
+                SamplingParams(temperature=0.0, ignore_eos=True, max_tokens=ol)
+                for ol in output_lens
+            ]
         num_warmup = ls.get("num_warmup", 3)
         num_iters = ls.get("num_iters", 5)
         for _ in range(num_warmup):
