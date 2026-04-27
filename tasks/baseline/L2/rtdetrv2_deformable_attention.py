@@ -9,7 +9,7 @@ import torch.nn as nn
 
 from ..L1.linear import Linear
 from ..L1.softmax import Softmax
-from ..L1.rtdetrv2_deformable_attention import multi_scale_deformable_attention_v2
+from ..L1.rtdetrv2_deformable_attention import MultiScaleDeformableAttentionV2
 
 
 class RTDetrV2MultiscaleDeformableAttention(nn.Module):
@@ -38,6 +38,7 @@ class RTDetrV2MultiscaleDeformableAttention(nn.Module):
         self.value_proj = Linear(config.d_model, config.d_model)
         self.output_proj = Linear(config.d_model, config.d_model)
         self._softmax = Softmax(dim=-1)
+        self.msdeform_attn = MultiScaleDeformableAttentionV2()
 
         self.offset_scale = config.decoder_offset_scale
         self.method = config.decoder_method
@@ -93,7 +94,7 @@ class RTDetrV2MultiscaleDeformableAttention(nn.Module):
         else:
             raise ValueError(f"Last dim of reference_points must be 2 or 4, but got {reference_points.shape[-1]}")
 
-        output = multi_scale_deformable_attention_v2(
+        output = self.msdeform_attn(
             value,
             spatial_shapes_list,
             sampling_locations,
