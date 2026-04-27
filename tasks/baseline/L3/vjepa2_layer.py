@@ -7,7 +7,6 @@ from typing import Optional
 import torch
 import torch.nn as nn
 
-from ..L1.layer_norm import LayerNorm
 from ..L2.vjepa2_attention import VJEPA2RopeAttention
 from ..L2.vjepa2_mlp import VJEPA2MLP
 
@@ -43,10 +42,10 @@ class VJEPA2Layer(nn.Module):
         mlp_ratio: float = 4.0,
     ):
         super().__init__()
-        self.norm1 = LayerNorm(hidden_size, eps=config.layer_norm_eps)
+        self.norm1 = nn.LayerNorm(hidden_size, eps=config.layer_norm_eps)
         self.attention = VJEPA2RopeAttention(config, hidden_size, num_attention_heads)
         self.drop_path = VJEPA2DropPath(drop_path_rate) if drop_path_rate > 0.0 else nn.Identity()
-        self.norm2 = LayerNorm(hidden_size, eps=config.layer_norm_eps)
+        self.norm2 = nn.LayerNorm(hidden_size, eps=config.layer_norm_eps)
         self.mlp = VJEPA2MLP(config, hidden_size=hidden_size, mlp_ratio=mlp_ratio)
 
     def forward(

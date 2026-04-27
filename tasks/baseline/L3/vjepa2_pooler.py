@@ -5,7 +5,6 @@ from __future__ import annotations
 import torch
 import torch.nn as nn
 
-from ..L1.layer_norm import LayerNorm
 from ..L2.vjepa2_attention import VJEPA2PoolerCrossAttention, VJEPA2PoolerSelfAttention
 from ..L2.vjepa2_mlp import VJEPA2MLP
 
@@ -13,9 +12,9 @@ from ..L2.vjepa2_mlp import VJEPA2MLP
 class VJEPA2PoolerSelfAttentionLayer(nn.Module):
     def __init__(self, config):
         super().__init__()
-        self.layer_norm1 = LayerNorm(config.hidden_size, eps=config.layer_norm_eps)
+        self.layer_norm1 = nn.LayerNorm(config.hidden_size, eps=config.layer_norm_eps)
         self.self_attn = VJEPA2PoolerSelfAttention(config)
-        self.layer_norm2 = LayerNorm(config.hidden_size, eps=config.layer_norm_eps)
+        self.layer_norm2 = nn.LayerNorm(config.hidden_size, eps=config.layer_norm_eps)
         self.mlp = VJEPA2MLP(config, hidden_size=config.hidden_size, mlp_ratio=config.mlp_ratio)
 
     def forward(
@@ -47,9 +46,9 @@ class VJEPA2PoolerSelfAttentionLayer(nn.Module):
 class VJEPA2PoolerCrossAttentionLayer(nn.Module):
     def __init__(self, config):
         super().__init__()
-        self.layer_norm1 = LayerNorm(config.hidden_size, eps=config.layer_norm_eps)
+        self.layer_norm1 = nn.LayerNorm(config.hidden_size, eps=config.layer_norm_eps)
         self.cross_attn = VJEPA2PoolerCrossAttention(config)
-        self.layer_norm2 = LayerNorm(config.hidden_size, eps=config.layer_norm_eps)
+        self.layer_norm2 = nn.LayerNorm(config.hidden_size, eps=config.layer_norm_eps)
         self.mlp = VJEPA2MLP(config, hidden_size=config.hidden_size, mlp_ratio=config.mlp_ratio)
 
     def forward(

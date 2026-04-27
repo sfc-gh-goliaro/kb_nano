@@ -64,17 +64,17 @@ class VJEPA2RotaryEmbedding(nn.Module):
         if half_dim == 0:
             return x
 
-        omega = torch.arange(half_dim, device=x.device, dtype=torch.float32)
+        omega = torch.arange(half_dim, device=x.device, dtype=x.dtype)
         omega /= half_dim
         omega = 1.0 / (10000 ** omega)
 
-        freq = pos.to(torch.float32).unsqueeze(-1) * omega
+        freq = pos.to(x.device).unsqueeze(-1) * omega
         emb_sin = freq.sin()
         emb_cos = freq.cos()
         repeat_shape = [1] * emb_sin.dim()
         repeat_shape[-1] = 2
-        emb_sin = emb_sin.repeat(*repeat_shape).to(dtype=x.dtype)
-        emb_cos = emb_cos.repeat(*repeat_shape).to(dtype=x.dtype)
+        emb_sin = emb_sin.repeat(*repeat_shape)
+        emb_cos = emb_cos.repeat(*repeat_shape)
 
         rotated = x.unflatten(-1, (-1, 2))
         x1, x2 = rotated.unbind(dim=-1)

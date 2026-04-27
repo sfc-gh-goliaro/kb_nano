@@ -5,7 +5,6 @@ from __future__ import annotations
 import torch
 import torch.nn as nn
 
-from ..L1.layer_norm import LayerNorm
 from ..L1.linear import Linear
 from ..L3.vjepa2_layer import VJEPA2Layer
 
@@ -74,7 +73,7 @@ class VJEPA2Predictor(nn.Module):
             )
             for i in range(config.pred_num_hidden_layers)
         ])
-        self.layernorm = LayerNorm(config.pred_hidden_size, eps=config.layer_norm_eps)
+        self.layernorm = nn.LayerNorm(config.pred_hidden_size, eps=config.layer_norm_eps)
         self.proj = Linear(config.pred_hidden_size, config.hidden_size, bias=True)
 
     def sort_tokens(

@@ -83,7 +83,6 @@ A standalone, high-performance inference engine supporting **LLMs** (Llama 3.1, 
     ├── bench_diffusers.py     # SDXL diffusion benchmark: kb-nano vs diffusers + torch.compile
     ├── bench_timm.py          # Vision encoder benchmark: kb-nano vs timm (SigLIP-2, DINOv3, SwinV2)
     ├── bench_vjepa2.py        # V-JEPA 2 predictor benchmark: kb-nano vs transformers
-    ├── bench_timm.py          # Vision encoder benchmark: kb-nano vs timm (SigLIP-2, DINOv3, SwinV2)
     ├── test_sam.py            # SAM3 segmentation benchmark: kb-nano vs facebook/sam3 reference
     ├── bench_openfold3.py     # OpenFold3 protein structure benchmark: kb-nano vs OpenFold reference
     ├── utils/                  # Post-processing and visualization
@@ -811,9 +810,15 @@ Correctness is measured in decoded pixel space (both engines produce PIL video f
 
 ### V-JEPA 2 (Predictive Video)
 
-Run `python -m pip install av` once, then `tests/bench_vjepa2.py --model facebook/vjepa2-vitl-fpc64-256` to reproduce the default predictor benchmark. Reference engine: `transformers` 4.57.6. By default all three tasks use real videos from `nateraw/kinetics-mini` (`validation`), decoded via PyAV/torchvision and preprocessed with `VJEPA2VideoProcessor`. Predictor and encoder use the V-JEPA 2 pretraining geometry (64 frames, 256x256), bf16 precision, `context_ratio=0.75`, and `target_ratio=0.25`. Classification uses `facebook/vjepa2-vitl-fpc16-256-ssv2` on the same real-video dataset for pipeline parity, not task-accuracy measurement. Use `--input-source synthetic` to revert to the old random-video path.
+Run `python -m pip install av` once, then `tests/bench_vjepa2.py --model facebook/vjepa2-vitl-fpc64-256` to reproduce the default predictor benchmark. Reference engine: `transformers` 4.57.6. By default all three tasks use real videos from `nateraw/kinetics-mini` (`validation`), decoded via PyAV/torchvision and preprocessed with `VJEPA2VideoProcessor`. Predictor and encoder use the V-JEPA 2 pretraining geometry (64 frames, 256x256), bf16 precision, `context_ratio=0.75`, and `target_ratio=0.25`. Classification uses the real `facebook/vjepa2-vitl-fpc16-256-ssv2` checkpoint on the same real-video dataset for pipeline parity, not task-accuracy measurement. Use `--input-source synthetic` to revert to the old random-video path.
 
-The results below use near-maximal non-repeating real-data workloads from the `kinetics-mini` validation split: `40` videos for predictor/encoder and `48` videos for classification.
+The results below use near-maximal non-repeating real-data workloads from the 50-video `kinetics-mini` validation split: `40` videos for predictor/encoder and `48` videos for classification. Reproduce them with:
+
+```bash
+python tests/bench_vjepa2.py --model facebook/vjepa2-vitl-fpc64-256 --num-videos 40 --latency-iters 10
+python tests/bench_vjepa2.py --model facebook/vjepa2-vitl-fpc64-256 --task encoder --num-videos 40 --latency-iters 10
+python tests/bench_vjepa2.py --model facebook/vjepa2-vitl-fpc16-256-ssv2 --task classification --num-videos 48 --batch-size 4 --latency-batch-sizes 1,4 --latency-iters 10
+```
 
 **Hardware: NVIDIA H200**
 
@@ -821,31 +826,31 @@ Throughput (videos/sec):
 
 | Model | Task | Videos | Batch | transformers | Ours | Ratio |
 |-------|------|-------:|------:|-------------:|-----:|------:|
-| facebook/vjepa2-vitl-fpc64-256 | predictor | 40 | 2 | 13.79 | 16.23 | **1.18x** |
-| facebook/vjepa2-vitl-fpc64-256 | encoder | 40 | 2 | 17.37 | 20.08 | **1.16x** |
-| facebook/vjepa2-vitl-fpc16-256-ssv2 | classification | 48 | 4 | 114.39 | 108.36 | 0.95x |
+| facebook/vjepa2-vitl-fpc64-256 | predictor | 40 | 2 | 16.14 | 16.30 | **1.01x** |
+| facebook/vjepa2-vitl-fpc64-256 | encoder | 40 | 2 | 21.56 | 21.35 | 0.99x |
+| facebook/vjepa2-vitl-fpc16-256-ssv2 | classification | 48 | 4 | 108.72 | 111.65 | **1.03x** |
 
 Latency (median of 10 iterations):
 
 | Task | Batch | transformers | Ours | Ratio |
 |------|------:|-------------:|-----:|------:|
-| predictor | 1 | 0.0688s | 0.0715s | 0.96x |
-| predictor | 2 | 0.1224s | 0.1216s | **1.01x** |
-| encoder | 1 | 0.0516s | 0.0516s | **1.00x** |
-| encoder | 2 | 0.1115s | 0.0925s | **1.20x** |
-| classification | 1 | 0.0282s | 0.0331s | 0.85x |
+| predictor | 1 | 0.0694s | 0.0705s | 0.98x |
+| predictor | 2 | 0.1222s | 0.1228s | 0.99x |
+| encoder | 1 | 0.0502s | 0.0510s | 0.98x |
+| encoder | 2 | 0.0927s | 0.0934s | 0.99x |
+| classification | 1 | 0.0304s | 0.0311s | 0.98x |
 | classification | 4 | 0.0352s | 0.0361s | 0.97x |
 
 Alignment:
 
 | Task | Output | Cosine | Mean Abs Diff |
 |------|--------|-------:|--------------:|
-| predictor | last_hidden_state | 1.000000 | 1.53e-01 |
-| predictor | masked_hidden_state | 1.000000 | 1.53e-01 |
-| predictor | predictor_hidden_state | 1.000000 | 1.03e-02 |
-| predictor | target_hidden_state | 0.996423 | 1.55e-01 |
-| encoder | last_hidden_state | 1.000000 | 1.53e-01 |
-| classification | logits | 0.999562 | 4.34e-02 |
+| predictor | last_hidden_state | 1.000000 | 0.00e+00 |
+| predictor | masked_hidden_state | 1.000000 | 0.00e+00 |
+| predictor | predictor_hidden_state | 1.000000 | 0.00e+00 |
+| predictor | target_hidden_state | 1.000000 | 0.00e+00 |
+| encoder | last_hidden_state | 1.000000 | 0.00e+00 |
+| classification | logits | 1.000000 | 0.00e+00 |
 
 ### CosyVoice3 (TTS)
 

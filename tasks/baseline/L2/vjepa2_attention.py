@@ -8,7 +8,6 @@ import torch
 import torch.nn as nn
 import torch.nn.functional as F
 
-from ..L1.dense_attention import DenseAttention
 from ..L1.linear import Linear
 from ..L1.vjepa2_rope import VJEPA2RotaryEmbedding
 
@@ -46,8 +45,6 @@ class VJEPA2RopeAttention(nn.Module):
         self.value = Linear(hidden_size, self.all_head_size, bias=config.qkv_bias)
         self.proj = Linear(hidden_size, hidden_size, bias=True)
         self.scaling = self.attention_head_size ** -0.5
-        self.attention = DenseAttention(backend="auto")
-        self.sdpa_seq_len_threshold = 2048
         self.rope = VJEPA2RotaryEmbedding(
             crop_size=config.crop_size,
             patch_size=config.patch_size,
@@ -82,7 +79,7 @@ class VJEPA2RopeAttention(nn.Module):
                 query_layer, key_layer, value_layer, self.scaling, head_mask=head_mask,
             )
             context_layer = context_layer.transpose(1, 2).contiguous()
-        elif seq_length <= self.sdpa_seq_len_threshold:
+        else:
             context_layer = F.scaled_dot_product_attention(
                 query_layer,
                 key_layer,
@@ -92,15 +89,6 @@ class VJEPA2RopeAttention(nn.Module):
                 scale=self.scaling,
             )
             context_layer = context_layer.transpose(1, 2).contiguous()
-            attention_probs = None
-        else:
-            context_layer = self.attention(
-                query_layer.transpose(1, 2),
-                key_layer.transpose(1, 2),
-                value_layer.transpose(1, 2),
-                softmax_scale=self.scaling,
-                causal=False,
-            )
             attention_probs = None
 
         context_layer = context_layer.reshape(batch_size, seq_length, self.all_head_size)

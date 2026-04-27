@@ -13,7 +13,6 @@ from huggingface_hub import snapshot_download
 from safetensors.torch import load_file
 from transformers import VJEPA2Config as HFVJEPA2Config
 
-from ..L1.layer_norm import LayerNorm
 from ..L2.vjepa2_embeddings import VJEPA2Embeddings, VJEPA2PatchEmbeddings3D
 from ..L3.vjepa2_layer import VJEPA2Layer
 from ..L3.vjepa2_pooler import VJEPA2AttentivePooler
@@ -65,7 +64,7 @@ class VJEPA2Encoder(nn.Module):
             )
             for i in range(config.num_hidden_layers)
         ])
-        self.layernorm = LayerNorm(config.hidden_size, eps=config.layer_norm_eps)
+        self.layernorm = nn.LayerNorm(config.hidden_size, eps=config.layer_norm_eps)
 
     def forward(
         self,
@@ -134,6 +133,15 @@ def _load_vjepa2_state_dict(weight_dir: str) -> dict[str, torch.Tensor]:
             new_name = name.replace(".patch_embeddings.proj.bias", ".patch_embeddings.proj.conv.bias")
         remapped[new_name] = tensor
     return remapped
+
+
+def _load_weights_checked(model: nn.Module, state_dict: dict[str, torch.Tensor], model_name: str) -> None:
+    missing, unexpected = model.load_state_dict(state_dict, strict=False)
+    if missing or unexpected:
+        raise RuntimeError(
+            f"Unexpected V-JEPA 2 checkpoint mapping for {model_name}: "
+            f"missing={missing[:20]}, unexpected={unexpected[:20]}"
+        )
 
 
 class VJEPA2Model(nn.Module):
@@ -228,7 +236,7 @@ class VJEPA2Model(nn.Module):
         model = cls(config)
         weight_dir = _snapshot_dir(model_name, local_files_only=local_files_only)
         state_dict = _load_vjepa2_state_dict(weight_dir)
-        model.load_state_dict(state_dict, strict=False)
+        _load_weights_checked(model, state_dict, model_name)
         return model
 
 
@@ -290,5 +298,5 @@ class VJEPA2ForVideoClassification(nn.Module):
         model = cls(config)
         weight_dir = _snapshot_dir(model_name, local_files_only=local_files_only)
         state_dict = _load_vjepa2_state_dict(weight_dir)
-        model.load_state_dict(state_dict, strict=False)
+        _load_weights_checked(model, state_dict, model_name)
         return model
