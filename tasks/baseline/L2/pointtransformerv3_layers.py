@@ -15,7 +15,7 @@ from timm.layers import DropPath
 
 from ..L1.pointtransformerv3_offsets import Batch2Offset, Offset2Batch, Offset2Bincount
 from ..L1.segment_csr import SegmentCSR
-from ..L1.pointtransformerv3_serialization import encode
+from ..L1.pointtransformerv3_serialization import PointTransformerV3Serialization
 
 try:
     import flash_attn
@@ -27,6 +27,7 @@ _BATCH2OFFSET = Batch2Offset()
 _OFFSET2BATCH = Offset2Batch()
 _OFFSET2BINCOUNT = Offset2Bincount()
 _SEGMENT_CSR = SegmentCSR()
+_SERIALIZE = PointTransformerV3Serialization()
 
 
 class Point(Dict):
@@ -51,7 +52,7 @@ class Point(Dict):
         self["serialized_depth"] = depth
         assert depth * 3 + len(self.offset).bit_length() <= 63
         assert depth <= 16
-        code = [encode(self.grid_coord, self.batch, depth, order=order_) for order_ in order]
+        code = [_SERIALIZE(self.grid_coord, self.batch, depth=depth, order=order_) for order_ in order]
         code = torch.stack(code)
         order = torch.argsort(code)
         inverse = torch.zeros_like(order).scatter_(

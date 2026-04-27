@@ -5,6 +5,7 @@ from __future__ import annotations
 from typing import Optional, Union
 
 import torch
+import torch.nn as nn
 
 
 class _KeyLUT:
@@ -203,3 +204,14 @@ def encode(grid_coord: torch.Tensor, batch: torch.Tensor | None = None, depth: i
     if batch is not None:
         code = batch.long() << depth * 3 | code
     return code
+
+
+class PointTransformerV3Serialization(nn.Module):
+    def forward(
+        self,
+        grid_coord: torch.Tensor,
+        batch: torch.Tensor | None = None,
+        depth: int = 16,
+        order: str = "z",
+    ) -> torch.Tensor:
+        return encode(grid_coord, batch=batch, depth=depth, order=order)

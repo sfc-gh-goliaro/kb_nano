@@ -10,6 +10,10 @@ from pathlib import Path
 import torch
 
 
+DEFAULT_PTV3_CHECKPOINT_REPO = "Pointcept/PointTransformerV3"
+DEFAULT_PTV3_CHECKPOINT_FILE = "scannet-semseg-pt-v3m1-0-base/model/model_best.pth"
+
+
 def is_pointtransv3_model(model_name: str) -> bool:
     name = model_name.lower()
     return "pointtransformerv3" in name or "pointtransv3" in name or "ptv3" in name
@@ -89,3 +93,51 @@ def load_ours_point_model(model_name: str, device: str = "cuda", dtype: torch.dt
 
     model = PointTransformerV3(**model_kwargs).to(device=device, dtype=dtype).eval()
     return model
+
+
+def resolve_point_checkpoint(checkpoint_file: str) -> str:
+    local_path = Path(checkpoint_file).expanduser()
+    if local_path.is_file():
+        return str(local_path)
+
+    if local_path.is_absolute():
+        raise FileNotFoundError(f"PointTransformerV3 checkpoint not found: {checkpoint_file}")
+
+    from huggingface_hub import hf_hub_download
+
+    return hf_hub_download(
+        DEFAULT_PTV3_CHECKPOINT_REPO,
+        checkpoint_file,
+        repo_type="model",
+    )
+
+
+def load_point_backbone_checkpoint(model: torch.nn.Module, checkpoint_file: str) -> dict:
+    checkpoint_path = resolve_point_checkpoint(checkpoint_file)
+    checkpoint = torch.load(checkpoint_path, map_location="cpu", weights_only=False)
+    state_dict = checkpoint.get("state_dict", checkpoint) if isinstance(checkpoint, dict) else checkpoint
+    if not isinstance(state_dict, dict):
+        raise TypeError(f"Unsupported PointTransformerV3 checkpoint format: {type(state_dict)}")
+
+    model_keys = set(model.state_dict().keys())
+    backbone_state = {}
+    for key, value in state_dict.items():
+        if key.startswith("module.backbone."):
+            backbone_state[key.removeprefix("module.backbone.")] = value
+        elif key.startswith("backbone."):
+            backbone_state[key.removeprefix("backbone.")] = value
+
+    if not backbone_state:
+        stripped_state = {key.removeprefix("module."): value for key, value in state_dict.items()}
+        backbone_state = {key: value for key, value in stripped_state.items() if key in model_keys}
+
+    if not backbone_state:
+        raise ValueError(f"No PointTransformerV3 backbone weights found in checkpoint: {checkpoint_file}")
+
+    missing, unexpected = model.load_state_dict(backbone_state, strict=True)
+    return {
+        "checkpoint_file": str(checkpoint_path),
+        "loaded_tensors": len(backbone_state),
+        "missing_keys": list(missing),
+        "unexpected_keys": list(unexpected),
+    }

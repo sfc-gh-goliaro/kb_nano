@@ -233,8 +233,8 @@ python tests/test_sam.py --skip-latency
 # Clone detached PointTransformerV3 reference once
 git clone https://github.com/Pointcept/PointTransformerV3.git third_party/PointTransformerV3
 
-# PointTransformerV3: throughput + alignment benchmark vs official detached implementation
-# First run auto-downloads jxie/scanobjectnn to data/scanobjectnn
+# PointTransformerV3: throughput + final-feature alignment vs official detached implementation
+# First run auto-downloads jxie/scanobjectnn and the default ScanNet PTv3 checkpoint
 python tests/bench_pointcloud.py --use-fp16
 
 # Heavier ScanObjectNN workload used for README numbers
@@ -877,7 +877,7 @@ The remaining numerical divergence is expected from SDPA vs Flash Attention nume
 
 ### PointTransformerV3 (Point Cloud)
 
-Run `tests/bench_pointcloud.py` to reproduce. The benchmark uses the public `jxie/scanobjectnn` dataset from Hugging Face and auto-downloads it on first run into `data/scanobjectnn`. Inputs are deterministically voxel-deduplicated before building the sparse tensor so both the official detached implementation and kb-nano see the same valid voxel set. Reported correctness is feature-space alignment on the final point features.
+Run `tests/bench_pointcloud.py` to reproduce. The benchmark uses the public `jxie/scanobjectnn` dataset from Hugging Face and auto-downloads it on first run into `data/scanobjectnn`. Inputs are deterministically voxel-deduplicated before building the sparse tensor so both the official detached implementation and kb-nano see the same valid voxel set. By default, the benchmark loads the official `Pointcept/PointTransformerV3` ScanNet checkpoint file `scannet-semseg-pt-v3m1-0-base/model/model_best.pth`, strips the `module.backbone.` prefix, and compares final backbone features. This is a real pretrained backbone throughput/alignment benchmark on ScanObjectNN inputs; it still does not report ScanObjectNN classification accuracy.
 
 **Hardware: NVIDIA H200**
 
@@ -885,13 +885,13 @@ Throughput (points/sec):
 
 | Dataset Split | Requested Points/Sample | Avg Points After Voxelization | Batch | Official Detached | Ours | Ratio |
 |---------------|------------------------:|------------------------------:|------:|------------------:|-----:|------:|
-| ScanObjectNN `nobg_test` | 2048 | 1941.47 | 8 | 306,047 | 302,902 | 0.99x |
+| ScanObjectNN `nobg_test` | 2048 | 1941.47 | 8 | 367,144 | 366,602 | 1.00x |
 
-Correctness (feature space, first alignment batch):
+Correctness (feature space, all alignment batches):
 
 | Dataset Split | Feature CosSim | Feature MAE | Feature Shape |
 |---------------|---------------:|------------:|:-------------:|
-| ScanObjectNN `nobg_test` | 0.999813 | 0.02536 | 15702x64 |
+| ScanObjectNN `nobg_test` | 0.979595 | 0.14804 | 15702x64 |
 
 ### YOLOv10 (Detection)
 

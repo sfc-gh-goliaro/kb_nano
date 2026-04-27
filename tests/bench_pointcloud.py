@@ -14,6 +14,7 @@ if str(_KB_ROOT) not in sys.path:
 
 import torch
 
+from infra.pointcloud_loader import DEFAULT_PTV3_CHECKPOINT_FILE
 from bench.utils.worker import run_worker
 
 POINTCLOUD_WORKER = r'''
@@ -30,6 +31,7 @@ sys.path.insert(0, cfg["kb_root"])
 
 from infra.pointcloud_loader import (
     default_ptv3_kwargs,
+    load_point_backbone_checkpoint,
     load_ours_point_model,
     load_reference_point_model,
 )
@@ -94,7 +96,6 @@ def load_scanobjectnn(dataset_root: str, split: str, points_per_sample: int, max
                 "pos": pos,
                 "normal": torch.zeros_like(pos),
                 "grid_coord": grid_coord,
-                "y": torch.tensor(int(row["label"]), dtype=torch.long),
                 "sample_id": f"{split}:{idx}",
             }
         )
@@ -138,18 +139,18 @@ def build_batches(
     feat_dim: int,
     device: str,
     dtype: torch.dtype,
+    drop_last: bool = True,
 ):
     batches = []
     for batch_start in range(0, len(samples), batch_size):
         batch_samples = samples[batch_start : batch_start + batch_size]
-        if len(batch_samples) < batch_size:
+        if drop_last and len(batch_samples) < batch_size:
             break
 
         coords = []
         feats = []
         grid_coords = []
         counts = []
-        labels = []
         sample_ids = []
         for local_idx, sample in enumerate(batch_samples):
             coord = _to_tensor(_sample_get(sample, "pos")).float()
@@ -164,8 +165,6 @@ def build_batches(
             if grid_coord is not None:
                 grid_coords.append(grid_coord.long())
             counts.append(coord.shape[0])
-            label = _sample_get(sample, "y")
-            labels.append(int(label.item()) if label is not None else -1)
             sample_ids.append(str(_sample_get(sample, "sample_id", f"{dataset_name}:{batch_start + local_idx}")))
 
         coord = torch.cat(coords, dim=0).to(device=device, dtype=dtype)
@@ -177,7 +176,6 @@ def build_batches(
             "grid_size": float(grid_size),
             "offset": offset,
             "sample_ids": sample_ids,
-            "labels": labels,
         }
         if grid_coords:
             batch["grid_coord"] = torch.cat(grid_coords, dim=0).to(device=device, dtype=torch.int32)
@@ -191,21 +189,49 @@ def forward_model(model, batch):
 
 
 def measure(model, batches, warmup_iters: int, measure_iters: int):
-    for _ in range(warmup_iters):
-        for batch in batches:
-            forward_model(model, batch)
-    if torch.cuda.is_available():
-        torch.cuda.synchronize()
-    start = time.perf_counter()
-    total_points = 0
-    for _ in range(measure_iters):
-        for batch in batches:
-            forward_model(model, batch)
-            total_points += int(batch["coord"].shape[0])
-    if torch.cuda.is_available():
-        torch.cuda.synchronize()
+    with torch.inference_mode():
+        for _ in range(warmup_iters):
+            for batch in batches:
+                forward_model(model, batch)
+        if torch.cuda.is_available():
+            torch.cuda.synchronize()
+        start = time.perf_counter()
+        total_points = 0
+        for _ in range(measure_iters):
+            for batch in batches:
+                forward_model(model, batch)
+                total_points += int(batch["coord"].shape[0])
+        if torch.cuda.is_available():
+            torch.cuda.synchronize()
     elapsed = time.perf_counter() - start
     return total_points / elapsed
+
+
+def alignment_stats(ours, ref, align_batches):
+    ours_feats = []
+    ref_feats = []
+    sample_ids = []
+    with torch.inference_mode():
+        for batch in align_batches:
+            ours_feats.append(forward_model(ours, batch).float())
+            ref_feats.append(forward_model(ref, batch).float())
+            sample_ids.extend(batch["sample_ids"])
+    if not ours_feats:
+        raise RuntimeError("No alignment batches could be built from dataset samples")
+    ours_feat = torch.cat(ours_feats, dim=0)
+    ref_feat = torch.cat(ref_feats, dim=0)
+    feat_cos = torch.nn.functional.cosine_similarity(
+        ours_feat.reshape(1, -1), ref_feat.reshape(1, -1)
+    ).item()
+    feat_mae = torch.mean(torch.abs(ours_feat - ref_feat)).item()
+    return {
+        "feat_cosine": feat_cos,
+        "feat_mae": feat_mae,
+        "feat_shape": list(ours_feat.shape),
+        "alignment_num_batches": len(align_batches),
+        "alignment_num_samples": len(sample_ids),
+        "alignment_sample_ids": sample_ids,
+    }
 
 
 def main():
@@ -240,6 +266,7 @@ def main():
         feat_dim=cfg["feat_dim"],
         device=device,
         dtype=dtype,
+        drop_last=True,
     )
     align_batches = build_batches(
         samples=samples[:align_count],
@@ -249,12 +276,16 @@ def main():
         feat_dim=cfg["feat_dim"],
         device=device,
         dtype=dtype,
+        drop_last=False,
     )
     if not throughput_batches:
         raise RuntimeError("No full batches could be built from dataset samples")
 
     set_seed(cfg["seed"])
     ours = load_ours_point_model(cfg["model"], device=device, dtype=dtype, **model_kwargs)
+    checkpoint_info = None
+    if cfg.get("checkpoint_file"):
+        checkpoint_info = load_point_backbone_checkpoint(ours, cfg["checkpoint_file"])
     set_seed(cfg["seed"])
     ref = None
     if not cfg.get("skip_reference", False):
@@ -276,25 +307,18 @@ def main():
         "points_per_sample": cfg["points_per_sample"],
         "avg_points_after_voxelization": sum(_sample_point_count(sample) for sample in samples) / len(samples),
         "enable_flash": enable_flash,
+        "weight_source": "checkpoint" if checkpoint_info is not None else "synchronized_random_init",
+        "checkpoint_file": checkpoint_info["checkpoint_file"] if checkpoint_info is not None else None,
+        "checkpoint_loaded_tensors": checkpoint_info["loaded_tensors"] if checkpoint_info is not None else 0,
+        "correctness_metric": "final_feature_alignment",
         "ours": {"baseline_name": "kb-nano", "points_per_second": ours_tps},
     }
 
     if ref is not None:
         ref_tps = measure(ref, throughput_batches, cfg["warmup_iters"], cfg["measure_iters"])
-        with torch.no_grad():
-            ours_feat = forward_model(ours, align_batches[0]).float()
-            ref_feat = forward_model(ref, align_batches[0]).float()
-        feat_cos = torch.nn.functional.cosine_similarity(
-            ours_feat.reshape(1, -1), ref_feat.reshape(1, -1)
-        ).item()
-        feat_mae = torch.mean(torch.abs(ours_feat - ref_feat)).item()
         result["reference"] = {"baseline_name": "official-detached", "points_per_second": ref_tps}
-        result["comparison"] = {
+        result["comparison"] = alignment_stats(ours, ref, align_batches) | {
             "throughput_ratio": ours_tps / ref_tps if ref_tps > 0 else float("inf"),
-            "feat_cosine": feat_cos,
-            "feat_mae": feat_mae,
-            "feat_shape": list(ours_feat.shape),
-            "alignment_sample_ids": align_batches[0]["sample_ids"],
         }
 
     with open(cfg["output_file"], "w") as f:
@@ -332,6 +356,7 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--warmup-iters", type=int, default=5)
     parser.add_argument("--measure-iters", type=int, default=20)
     parser.add_argument("--seed", type=int, default=1234)
+    parser.add_argument("--checkpoint-file", default=DEFAULT_PTV3_CHECKPOINT_FILE)
     parser.add_argument("--use-fp16", action="store_true")
     parser.add_argument("--enable-flash", action="store_true")
     parser.add_argument("--skip-reference", action="store_true")
@@ -360,6 +385,7 @@ def main() -> None:
         "warmup_iters": args.warmup_iters,
         "measure_iters": args.measure_iters,
         "seed": args.seed,
+        "checkpoint_file": args.checkpoint_file,
         "use_fp16": bool(args.use_fp16 and device == "cuda"),
         "enable_flash": args.enable_flash,
         "skip_reference": args.skip_reference,
