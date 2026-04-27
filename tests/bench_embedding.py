@@ -482,7 +482,7 @@ def _prepare_colbert_dataset_workload(
 
 
 def _compute_alignment(local_outputs: dict, ref_outputs: dict) -> dict:
-    """Compute dense/sparse alignment metrics."""
+    """Compute BGE-M3 dense/sparse/ColBERT-head alignment metrics."""
     result: dict[str, dict] = {}
 
     local_dense = local_outputs.get("dense_vecs")
@@ -541,6 +541,11 @@ def _compute_alignment(local_outputs: dict, ref_outputs: dict) -> dict:
             "avg_mean_abs_diff": float(np.mean(mean_abs_diffs)) if mean_abs_diffs else 0.0,
             "max_abs_diff": float(np.max(max_abs_diffs)) if max_abs_diffs else 0.0,
         }
+
+    local_colbert = local_outputs.get("colbert_vecs")
+    ref_colbert = ref_outputs.get("colbert_vecs")
+    if local_colbert is not None and ref_colbert is not None:
+        result["colbert"] = _compute_colbert_vec_alignment(local_colbert, ref_colbert)
 
     return result
 
@@ -1962,6 +1967,7 @@ def _run_bge_benchmark(args, gpu: str, device: str, lengths: list[int], latency_
         print(f"{'=' * 88}")
         dense = alignment_summary.get("dense")
         sparse = alignment_summary.get("sparse")
+        colbert = alignment_summary.get("colbert")
         if dense:
             print(
                 f"  Dense  : avg cosine={dense.get('avg_cosine_similarity', 0.0):.8f}, "
@@ -1974,6 +1980,13 @@ def _run_bge_benchmark(args, gpu: str, device: str, lengths: list[int], latency_
                 f"  Sparse : avg key jaccard={sparse['avg_key_jaccard']:.6f}, "
                 f"avg mean abs diff={sparse['avg_mean_abs_diff']:.8e}, "
                 f"max abs diff={sparse['max_abs_diff']:.8e}",
+            )
+        if colbert:
+            print(
+                f"  ColBERT: avg cosine={colbert.get('avg_cosine_similarity', 0.0):.8f}, "
+                f"min cosine={colbert.get('min_cosine_similarity', 0.0):.8f}, "
+                f"avg mean abs diff={colbert.get('avg_mean_abs_diff', 0.0):.8e}, "
+                f"max abs diff={colbert.get('max_abs_diff', 0.0):.8e}",
             )
         print(f"{'=' * 88}")
 

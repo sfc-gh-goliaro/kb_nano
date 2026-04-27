@@ -309,11 +309,11 @@ python -m pip install datasets==4.8.4 peft==0.18.1 GitPython==3.1.46 ujson==5.12
 python -m pip install --no-deps FlagEmbedding==1.3.5 colbert-ai==0.2.22
 ```
 
-After that, the following commands can be run directly from the repo root. By default, the embedding benchmark uses real `mteb/scifact` query/document samples, runs fp16 on CUDA, measures dataset-backed throughput on 128 sampled texts per scenario, runs latency at batch sizes 1 and 4, and checks alignment on 32 sampled texts/pairs. You can switch datasets with `--dataset <hf-retrieval-dataset>` as long as the dataset exposes `queries`, `corpus`, and qrels-style `default/test` splits. `--lengths` adds optional fixed-length stress scenarios:
+After that, the following commands can be run directly from the repo root. By default, the embedding benchmark uses sampled real `mteb/scifact` query/document text and qrels positive pairs, runs fp16 on CUDA, measures dataset-backed throughput on 128 sampled texts per scenario, runs latency at batch sizes 1 and 4, and checks embedding alignment on 32 sampled texts/pairs. It does not run full-corpus retrieval metrics such as NDCG@10 or MRR@10. You can switch datasets with `--dataset <hf-retrieval-dataset>` as long as the dataset exposes `queries`, `corpus`, and qrels-style `default/test` splits. `--lengths` adds optional fixed-length stress scenarios:
 
 ```bash
-# BGE-M3: throughput + latency + alignment benchmark vs FlagEmbedding
-python tests/bench_embedding.py --model BAAI/bge-m3
+# BGE-M3: dense + sparse + ColBERT-vector throughput/latency/alignment vs FlagEmbedding
+python tests/bench_embedding.py --model BAAI/bge-m3 --return-colbert-vecs
 
 # ColBERTv2: query/doc throughput + latency + alignment benchmark vs official ColBERT
 python tests/bench_embedding.py --model colbert-ir/colbertv2.0
@@ -328,7 +328,7 @@ python tests/bench_embedding.py --model BAAI/bge-m3 --skip-reference
 python tests/bench_embedding.py --model BAAI/bge-m3 --skip-latency
 
 # Save results to a specific directory
-python tests/bench_embedding.py --model BAAI/bge-m3 --output-dir tests/results/H200/bge-m3_embedding
+python tests/bench_embedding.py --model BAAI/bge-m3 --return-colbert-vecs --output-dir tests/results/H200/bge-m3_embedding
 python tests/bench_embedding.py --model colbert-ir/colbertv2.0 --output-dir tests/results/H200/colbertv2.0_embedding
 ```
 
@@ -690,22 +690,22 @@ FP8 activation quantization uses a custom Triton kernel for single-launch per-to
 
 ### BGE-M3 (Embedding)
 
-Run `python tests/bench_embedding.py --model BAAI/bge-m3` to reproduce. Reference baseline: FlagEmbedding / BGEM3FlagModel.
+Run `python tests/bench_embedding.py --model BAAI/bge-m3 --return-colbert-vecs` to reproduce. Reference baseline: FlagEmbedding / BGEM3FlagModel.
 
 **Hardware: NVIDIA H200**
 
-Throughput (real docs from `mteb/scifact`, fp16):
+Throughput (sampled real docs from `mteb/scifact`, fp16; dense + sparse + ColBERT-vector outputs):
 
 | Scenario | BS | Samples | FlagEmbedding (docs/s) | Ours (docs/s) | Ratio |
 |----------|---:|--------:|-----------------------:|--------------:|------:|
-| mteb/scifact-doc | 4 | 128 | 167.72 | 261.68 | **1.56x** |
+| mteb/scifact-doc | 4 | 128 | 176.61 | 192.12 | **1.09x** |
 
 Latency (median of 5 runs, fp16):
 
 | BS | Samples | Len | FlagEmbedding median | Ours median | Ratio |
 |---:|--------:|----:|---------------------:|------------:|------:|
-| 1 | 1 | 128 | 0.0178s | 0.0059s | **3.03x** |
-| 4 | 4 | 128 | 0.0200s | 0.0069s | **2.90x** |
+| 1 | 1 | 128 | 0.0187s | 0.0079s | **2.35x** |
+| 4 | 4 | 128 | 0.0217s | 0.0092s | **2.37x** |
 
 Alignment:
 
@@ -713,28 +713,29 @@ Alignment:
 |--------|:-------|------------------:|:------|
 | Dense | cosine=0.99999821 | 4.40e-05 | PASS |
 | Sparse | key jaccard=0.999572 | 1.41e-04 | PASS |
+| ColBERT vectors | cosine=0.99991202 | 1.06e-04 | PASS |
 
 ### ColBERTv2 (Retrieval)
 
-Run `python tests/bench_embedding.py --model colbert-ir/colbertv2.0` to reproduce. Reference baseline: official ColBERT / HF_ColBERT.
+Run `python tests/bench_embedding.py --model colbert-ir/colbertv2.0` to reproduce. Reference baseline: official ColBERT / HF_ColBERT. This benchmark uses sampled real query/doc text and qrels positive pairs for throughput/alignment; it is not a full-corpus ranking eval.
 
 **Hardware: NVIDIA H200**
 
-Throughput (real query/doc samples from `mteb/scifact`, fp16):
+Throughput (sampled real query/doc texts from `mteb/scifact`, fp16):
 
 | Scenario | BS | Samples | Reference (docs/s) | Ours (docs/s) | Ratio |
 |----------|---:|--------:|-------------------:|--------------:|------:|
-| mteb/scifact-query | 4 | 128 | 893.65 | 1180.66 | **1.32x** |
-| mteb/scifact-doc | 4 | 128 | 321.51 | 380.84 | **1.18x** |
+| mteb/scifact-query | 4 | 128 | 876.71 | 900.26 | **1.03x** |
+| mteb/scifact-doc | 4 | 128 | 321.20 | 341.21 | **1.06x** |
 
 Latency (median of 5 runs, fp16):
 
 | Mode | BS | Samples | Len | Reference median | Ours median | Ratio |
 |------|---:|--------:|----:|-----------------:|------------:|------:|
-| Query | 1 | 1 | 32 | 0.0037s | 0.0034s | **1.09x** |
-| Query | 4 | 4 | 32 | 0.0044s | 0.0044s | **1.01x** |
-| Doc | 1 | 1 | 128 | 0.0044s | 0.0040s | **1.11x** |
-| Doc | 4 | 4 | 128 | 0.0057s | 0.0047s | **1.21x** |
+| Query | 1 | 1 | 32 | 0.0037s | 0.0038s | 0.98x |
+| Query | 4 | 4 | 32 | 0.0045s | 0.0042s | **1.06x** |
+| Doc | 1 | 1 | 128 | 0.0044s | 0.0047s | 0.94x |
+| Doc | 4 | 4 | 128 | 0.0056s | 0.0057s | 0.99x |
 
 Alignment:
 
