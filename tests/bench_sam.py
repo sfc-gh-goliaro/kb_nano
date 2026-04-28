@@ -495,6 +495,17 @@ def main():
         sys.path.insert(0, cfg["project_root"])
         from kb_nano.tasks.baseline.L4.sam3 import Sam3Config, Sam3Model, load_sam3_checkpoint
 
+    if cfg.get("pytorch_reference", False):
+        from kb_nano.infra.kernel_swapper import (
+            apply_candidates,
+            discover_references,
+            print_reference_summary,
+        )
+        references = discover_references()
+        if references:
+            print_reference_summary(references)
+            apply_candidates(references)
+
     print("  Building kb-nano SAM3 model ...", flush=True)
     config = Sam3Config.from_pretrained(cfg["model"])
     model = Sam3Model(config)
@@ -970,6 +981,17 @@ def main():
         from kb_nano.tasks.baseline.L4.sam3 import Sam3Config, Sam3Model, load_sam3_checkpoint
         from kb_nano.tasks.baseline.L4.sam3_tracker import Sam3TrackerPredictor, build_tracker_components
 
+    if cfg.get("pytorch_reference", False):
+        from kb_nano.infra.kernel_swapper import (
+            apply_candidates,
+            discover_references,
+            print_reference_summary,
+        )
+        references = discover_references()
+        if references:
+            print_reference_summary(references)
+            apply_candidates(references)
+
     print("  Building kb-nano SAM3 video model ...", flush=True)
 
     # Build detector
@@ -1188,6 +1210,10 @@ def main():
                         help="Number of images for throughput AND correctness")
     parser.add_argument("--seed", type=int, default=42)
     parser.add_argument("--skip-reference", action="store_true")
+    parser.add_argument(
+        "--pytorch-reference", action="store_true", default=False,
+        help="Patch semantic PyTorch references from tasks/reference/L*/ into kb-nano.",
+    )
     parser.add_argument("--skip-latency", action="store_true")
     parser.add_argument("--latency-iters", type=int, default=20)
     parser.add_argument("--output-dir", type=str, default=None)
@@ -1360,6 +1386,7 @@ def main():
         "feats_dir": feats_dir,
         "checkpoint_path": checkpoint_path,
         "manifest_path": manifest_path,
+        "pytorch_reference": args.pytorch_reference,
     }
     kb_raw = run_worker(
         KB_NANO_SAM3_WORKER, kb_config,
@@ -1425,6 +1452,7 @@ def main():
                 "video_clips": video_clips,
                 "feats_dir": feats_dir,
                 "checkpoint_path": checkpoint_path,
+                "pytorch_reference": args.pytorch_reference,
             }
             kb_video_raw = run_worker(
                 KB_NANO_SAM3_VIDEO_WORKER, kb_video_config,

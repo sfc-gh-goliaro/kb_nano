@@ -26,6 +26,9 @@ BASELINE_DIR = TASKS_DIR / "baseline"
 CANDIDATE_DIR = Path(
     os.environ.get("KB_NANO_CANDIDATE_DIR", str(TASKS_DIR / "candidate"))
 )
+REFERENCE_DIR = Path(
+    os.environ.get("KB_NANO_REFERENCE_DIR", str(TASKS_DIR / "reference"))
+)
 PREV_ATTEMPTS_DIR = CANDIDATE_DIR / "prev-attempts"
 
 # --- Benchmark input data ---

@@ -27,6 +27,17 @@ def main():
     torch.set_default_device("cuda")
     torch.set_default_dtype(torch.bfloat16)
 
+    if cfg.get("pytorch_reference", False):
+        from kb_nano.infra.kernel_swapper import (
+            apply_candidates,
+            discover_references,
+            print_reference_summary,
+        )
+        references = discover_references()
+        if references:
+            print_reference_summary(references)
+            apply_candidates(references)
+
     from kb_nano.tasks.baseline.L2.mixtral_moe import MixtralMoE
     from kb_nano.tasks.baseline.L4.mixtral import MixtralConfig
 
@@ -104,6 +115,10 @@ def main():
     parser.add_argument("--warmup", type=int, default=10)
     parser.add_argument("--iters", type=int, default=100)
     parser.add_argument("--tp", type=int, default=1)
+    parser.add_argument(
+        "--pytorch-reference", action="store_true", default=False,
+        help="Patch semantic PyTorch references from tasks/reference/L*/ into kb-nano.",
+    )
     args = parser.parse_args()
 
     this_dir = os.path.dirname(os.path.abspath(__file__))
@@ -125,6 +140,7 @@ def main():
         "warmup": args.warmup,
         "iters": args.iters,
         "tp": args.tp,
+        "pytorch_reference": args.pytorch_reference,
         "output_file": output_path,
     }
 

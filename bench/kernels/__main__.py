@@ -82,6 +82,10 @@ def main():
         "--output-json", type=str, default=None,
         help="Path to save JSON results (default: bench/results/kernels_<timestamp>.json)",
     )
+    parser.add_argument(
+        "--pytorch-reference", action="store_true", default=False,
+        help="Compare production baseline against tasks/reference/L*/ PyTorch reference",
+    )
     args = parser.parse_args()
 
     if args.map:
@@ -115,6 +119,7 @@ def main():
         "category": args.category,
         "num_warmup": args.num_warmup,
         "num_runs": args.num_runs,
+        "pytorch_reference": args.pytorch_reference,
     }
 
     with tracker.start_run(run_name, params=bench_params, tags={"tier": "kernel"}):
@@ -126,6 +131,7 @@ def main():
                 category=args.category,
                 num_warmup=args.num_warmup,
                 num_runs=args.num_runs,
+                pytorch_reference=args.pytorch_reference,
             )
 
             result = KernelBenchResult(operators=[op_result])
@@ -137,6 +143,7 @@ def main():
                 category=args.category,
                 num_warmup=args.num_warmup,
                 num_runs=args.num_runs,
+                pytorch_reference=args.pytorch_reference,
             )
 
         tracker.log_kernel_bench(result)

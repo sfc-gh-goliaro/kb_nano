@@ -15,7 +15,14 @@ import torch
 import torch.nn as nn
 
 from kb_nano.bench.utils.input_registry import InputRegistry
-from kb_nano.infra.kernel_swapper import BenchTarget, discover_targets, get, load_candidate
+from kb_nano.infra.kernel_swapper import (
+    BenchTarget,
+    discover_references,
+    discover_targets,
+    get,
+    load_candidate,
+    load_reference,
+)
 
 from .result import KernelBenchResult, OperatorResult, ScenarioResult
 
@@ -39,6 +46,11 @@ def _get_registry() -> InputRegistry:
 def _find_candidate_path(target_name: str, level: int) -> str:
     """Return the relative path to the candidate file for display."""
     return f"tasks/candidate/L{level}/{target_name}.py"
+
+
+def _find_reference_path(target_name: str, level: int) -> str:
+    """Return the relative path to the semantic reference file for display."""
+    return f"tasks/reference/L{level}/{target_name}.py"
 
 
 def _instantiate_module(
@@ -287,6 +299,7 @@ def run_kernel_benchmark(
     num_warmup: int = 10,
     num_runs: int = 100,
     device: str = "cuda",
+    pytorch_reference: bool = False,
 ) -> OperatorResult:
     """Run isolated kernel benchmark for a single operator.
 
@@ -316,11 +329,13 @@ def run_kernel_benchmark(
     """
     target = get(target_name)
 
-    user_impl = load_candidate(target_name)
+    user_impl = load_reference(target_name) if pytorch_reference else load_candidate(target_name)
     if user_impl is None:
+        impl_kind = "PyTorch reference" if pytorch_reference else "candidate kernel"
+        impl_dir = "reference" if pytorch_reference else "candidate"
         raise ValueError(
-            f"No candidate kernel found for {target_name!r}. "
-            f"Place kernel in tasks/candidate/L{target.level}/{target_name}.py"
+            f"No {impl_kind} found for {target_name!r}. "
+            f"Place implementation in tasks/{impl_dir}/L{target.level}/{target_name}.py"
         )
 
     registry = _get_registry()
@@ -339,10 +354,18 @@ def run_kernel_benchmark(
         return OperatorResult(
             target=target_name,
             level=target.level,
-            candidate_path=_find_candidate_path(target_name, target.level),
+            candidate_path=(
+                _find_reference_path(target_name, target.level)
+                if pytorch_reference
+                else _find_candidate_path(target_name, target.level)
+            ),
         )
 
-    candidate_path = _find_candidate_path(target_name, target.level)
+    candidate_path = (
+        _find_reference_path(target_name, target.level)
+        if pytorch_reference
+        else _find_candidate_path(target_name, target.level)
+    )
     scenario_results: list[ScenarioResult] = []
 
     for scenario in all_scenarios:
@@ -417,6 +440,7 @@ def run_all_kernel_benchmarks(
     num_warmup: int = 10,
     num_runs: int = 100,
     device: str = "cuda",
+    pytorch_reference: bool = False,
 ) -> KernelBenchResult:
     """Run kernel benchmarks for all operators that have candidate implementations.
 
@@ -424,16 +448,20 @@ def run_all_kernel_benchmarks(
     """
     from kb_nano.infra.kernel_swapper import discover_candidates
 
-    candidates = discover_candidates()
+    candidates = discover_references() if pytorch_reference else discover_candidates()
     if not candidates:
-        print("No candidate kernels found in tasks/candidate/.")
+        if pytorch_reference:
+            print("No PyTorch references found in tasks/reference/.")
+        else:
+            print("No candidate kernels found in tasks/candidate/.")
         result = KernelBenchResult()
         result.compute_aggregates()
         return result
 
     operators: list[OperatorResult] = []
     for target, _ in candidates:
-        print(f"\n  Benchmarking {target.name} (L{target.level})...")
+        label = "PyTorch reference" if pytorch_reference else "candidate"
+        print(f"\n  Benchmarking {target.name} (L{target.level}, {label})...")
         op_result = run_kernel_benchmark(
             target.name,
             models=models,
@@ -442,6 +470,7 @@ def run_all_kernel_benchmarks(
             num_warmup=num_warmup,
             num_runs=num_runs,
             device=device,
+            pytorch_reference=pytorch_reference,
         )
         operators.append(op_result)
 

@@ -160,6 +160,17 @@ def main():
         run_reference_detector,
     )
 
+    if cfg.get("pytorch_reference", False) and cfg.get("backend") == "ours":
+        from kb_nano.infra.kernel_swapper import (
+            apply_candidates,
+            discover_references,
+            print_reference_summary,
+        )
+        references = discover_references()
+        if references:
+            print_reference_summary(references)
+            apply_candidates(references)
+
     def _run_model(model, backend, model_name, pixel_values, image_size, max_det):
         if backend == "ours":
             return run_ours_detector(
@@ -451,6 +462,10 @@ def main():
     ap.add_argument("--max-detections", type=int, default=100)
     ap.add_argument("--use-fp16", action="store_true", default=True)
     ap.add_argument("--skip-reference", action="store_true")
+    ap.add_argument(
+        "--pytorch-reference", action="store_true", default=False,
+        help="Patch semantic PyTorch references from tasks/reference/L*/ into kb-nano.",
+    )
     ap.add_argument("--skip-throughput", action="store_true")
     ap.add_argument("--skip-latency", action="store_true")
     ap.add_argument("--seed", type=int, default=42)
@@ -544,7 +559,7 @@ def main():
     # -- Run kb-nano --
     kb_raw = run_worker(
         DETECTION_WORKER,
-        {**common, "backend": "ours"},
+        {**common, "backend": "ours", "pytorch_reference": args.pytorch_reference},
         f"kb-nano [{args.model.split('/')[-1]}]",
         timeout=3600,
     )

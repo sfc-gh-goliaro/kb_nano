@@ -84,9 +84,14 @@ class KernelBenchResult:
     def print_table(self, single_target: bool = False) -> None:
         """Print human-readable terminal output."""
         for op in self.operators:
+            impl_label = (
+                "PyTorch reference"
+                if op.candidate_path.startswith("tasks/reference/")
+                else "Candidate"
+            )
             print(f"\n{'=' * 70}")
             print(f"  Kernel Benchmark: {op.target}")
-            print(f"  Candidate: {op.candidate_path}")
+            print(f"  {impl_label}: {op.candidate_path}")
             print(f"  Scenarios: {op.total_scenarios} (from InputRegistry)")
             print(f"{'=' * 70}")
             print()

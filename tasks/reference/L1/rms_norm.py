@@ -1,3 +1,38 @@
+"""Self-contained RMSNorm reference with embedded CUDA kernels.
+
+This file is used for specification/prompting and optional validation only.
+It is not the production baseline and should not be used for reported speed.
+
+The CUDA kernels below are copied from ``tasks/baseline/L1/csrc/rmsnorm.cu``
+and ``utils.h`` so this reference does not import vLLM or kb-nano's external
+compiled csrc package. The Python dispatch mirrors the baseline RMSNorm module,
+except eager CUDA calls route to the inline extension compiled from this file.
+"""
+
+from __future__ import annotations
+
+import os
+
+import torch
+import torch.nn as nn
+import torch.nn.functional as F
+from torch.utils.cpp_extension import load_inline
+
+
+_CPP_SRC = r"""
+#include <torch/extension.h>
+
+void rmsnorm(torch::Tensor& output, torch::Tensor& input, torch::Tensor& weight, double eps);
+void fused_add_rmsnorm(torch::Tensor input, torch::Tensor residual, torch::Tensor weight, double eps);
+
+PYBIND11_MODULE(TORCH_EXTENSION_NAME, m) {
+  m.def("rmsnorm", &rmsnorm, "RMSNorm");
+  m.def("fused_add_rmsnorm", &fused_add_rmsnorm, "Fused add RMSNorm");
+}
+"""
+
+
+_CUDA_SRC = r"""
 // Standalone RMSNorm and fused-add-RMSNorm CUDA kernels for kb_nano.
 #include <ATen/cuda/CUDAContext.h>
 #include <c10/cuda/CUDAGuard.h>
@@ -7,9 +42,29 @@
 #include <numeric>
 #include <type_traits>
 #include <torch/all.h>
-#include "utils.h"
+
+#define CHECK_CUDA(x) TORCH_CHECK(x.is_cuda(), #x " must be a CUDA tensor")
+#define CHECK_CONTIGUOUS(x) TORCH_CHECK(x.is_contiguous(), #x " must be contiguous")
+#define CHECK_INPUT(x) \
+  CHECK_CUDA(x);       \
+  CHECK_CONTIGUOUS(x)
+
+#define DISPATCH_CASE_FLOAT_TYPES(...)                 \
+  AT_DISPATCH_CASE(at::ScalarType::Float, __VA_ARGS__) \
+  AT_DISPATCH_CASE(at::ScalarType::Half, __VA_ARGS__)  \
+  AT_DISPATCH_CASE(at::ScalarType::BFloat16, __VA_ARGS__)
+
+#define DISPATCH_FLOAT_TYPES(TYPE, NAME, ...) \
+  AT_DISPATCH_SWITCH(TYPE, NAME, DISPATCH_CASE_FLOAT_TYPES(__VA_ARGS__))
 
 namespace {
+
+struct CubAddOp {
+  template <typename T>
+  __device__ __forceinline__ T operator()(const T& a, const T& b) const {
+    return a + b;
+  }
+};
 
 template <typename scalar_t, size_t vec_size>
 struct __align__(vec_size * sizeof(scalar_t)) vec_n_t {
@@ -200,7 +255,7 @@ __global__ void rmsnorm_kernel(
 
   using BlockReduce = cub::BlockReduce<float, 1024>;
   __shared__ typename BlockReduce::TempStorage reduce_store;
-  sum_sq = BlockReduce(reduce_store).Sum(sum_sq);
+  sum_sq = BlockReduce(reduce_store).Reduce(sum_sq, CubAddOp{}, blockDim.x);
 
   __shared__ float s_rms_inv;
   if (threadIdx.x == 0) {
@@ -268,7 +323,7 @@ __global__ void fused_add_rmsnorm_kernel(
 
   using BlockReduce = cub::BlockReduce<float, 1024>;
   __shared__ typename BlockReduce::TempStorage reduce_store;
-  sum_sq = BlockReduce(reduce_store).Sum(sum_sq);
+  sum_sq = BlockReduce(reduce_store).Reduce(sum_sq, CubAddOp{}, blockDim.x);
 
   __shared__ float s_rms_inv;
   if (threadIdx.x == 0) {
@@ -311,7 +366,7 @@ fused_add_rmsnorm_vec_kernel(
 
   using BlockReduce = cub::BlockReduce<float, 1024>;
   __shared__ typename BlockReduce::TempStorage reduce_store;
-  sum_sq = BlockReduce(reduce_store).Sum(sum_sq);
+  sum_sq = BlockReduce(reduce_store).Reduce(sum_sq, CubAddOp{}, blockDim.x);
 
   __shared__ float s_rms_inv;
   if (threadIdx.x == 0) {
@@ -390,3 +445,101 @@ void fused_add_rmsnorm(
         hidden_size);
   });
 }
+"""
+
+
+_INLINE_EXT = None
+
+
+def _load_inline_ext():
+    global _INLINE_EXT
+    if _INLINE_EXT is None:
+        extra_cuda_cflags = [
+            "-O3",
+            "-U__CUDA_NO_HALF_OPERATORS__",
+            "-U__CUDA_NO_HALF_CONVERSIONS__",
+            "-U__CUDA_NO_HALF2_OPERATORS__",
+            "-U__CUDA_NO_BFLOAT16_OPERATORS__",
+            "-U__CUDA_NO_BFLOAT16_CONVERSIONS__",
+        ]
+        build_directory = os.path.join(
+            os.environ.get("TORCH_EXTENSIONS_DIR", "/tmp/torch_extensions"),
+            "kb_nano_reference_rmsnorm_inline",
+        )
+        os.makedirs(build_directory, exist_ok=True)
+        _INLINE_EXT = load_inline(
+            name="kb_nano_reference_rmsnorm_inline",
+            cpp_sources=[_CPP_SRC],
+            cuda_sources=[_CUDA_SRC],
+            extra_cuda_cflags=extra_cuda_cflags,
+            build_directory=build_directory,
+            verbose=bool(int(os.environ.get("KB_NANO_VERBOSE_EXT", "0"))),
+        )
+    return _INLINE_EXT
+
+
+class RMSNorm(nn.Module):
+    def __init__(
+        self,
+        hidden_size: int,
+        eps: float = 1e-6,
+        elementwise_affine: bool = True,
+    ):
+        super().__init__()
+        self.hidden_size = hidden_size
+        self.eps = eps
+        self.elementwise_affine = elementwise_affine
+        if elementwise_affine:
+            self.weight = nn.Parameter(torch.ones(hidden_size))
+
+    @staticmethod
+    def forward_native(
+        x: torch.Tensor,
+        weight: torch.Tensor | None,
+        eps: float,
+        hidden_size: int,
+        residual: torch.Tensor | None = None,
+    ) -> torch.Tensor | tuple[torch.Tensor, torch.Tensor]:
+        orig_dtype = x.dtype
+        if residual is not None:
+            residual_tensor = residual
+            residual = (x + residual).to(orig_dtype)
+            residual_tensor.copy_(residual)
+            x_float = residual.float()
+        else:
+            x_float = x.float()
+        variance = x_float.pow(2).mean(dim=-1, keepdim=True)
+        out = (x_float * torch.rsqrt(variance + eps)).to(orig_dtype)
+        if weight is not None:
+            out = out * weight
+        if residual is None:
+            return out
+        x.copy_(out)
+        return out, residual
+
+    @staticmethod
+    def forward_cuda(
+        x: torch.Tensor,
+        weight: torch.Tensor | None,
+        eps: float,
+        residual: torch.Tensor | None = None,
+    ) -> torch.Tensor | tuple[torch.Tensor, torch.Tensor]:
+        if weight is not None and x.is_cuda:
+            ext = _load_inline_ext()
+            if residual is None:
+                out = torch.empty_like(x)
+                ext.rmsnorm(out, x, weight, eps)
+                return out
+            ext.fused_add_rmsnorm(x, residual, weight, eps)
+            return x, residual
+        if weight is None and residual is None:
+            return F.rms_norm(x, (x.size(-1),), eps=eps)
+        return RMSNorm.forward_native(x, weight, eps, x.size(-1), residual)
+
+    def forward(self, x, residual=None):
+        return self.forward_cuda(
+            x,
+            self.weight if self.elementwise_affine else None,
+            self.eps,
+            residual,
+        )
