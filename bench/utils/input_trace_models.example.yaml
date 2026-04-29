@@ -1,0 +1,28 @@
+# Example config for `kb_nano trace-inputs`.
+# Copy/edit this file for the model, TP, dtype, and workload mix you want to
+# use as the source of truth for generated InputRegistry entries.
+
+models:
+  - key: llama31-8b
+    hf_name: meta-llama/Llama-3.1-8B-Instruct
+    tp: 1
+    dtype: bfloat16
+    prompts:
+      - "What is machine learning?"
+      - "Write a Python hello world program."
+      - "Explain quantum computing in simple terms."
+      - "Describe the water cycle."
+    output_lens: [32, 32, 32, 32]
+    workloads:
+      - name: smoke-balanced
+
+  - key: mixtral-8x7b
+    hf_name: mistralai/Mixtral-8x7B-Instruct-v0.1
+    tp: 1
+    dtype: bfloat16
+    prompts:
+      - "Summarize mixture-of-experts routing in one paragraph."
+      - "List three benefits of sparse models."
+    output_lens: [32, 32]
+    workloads:
+      - name: smoke-moe

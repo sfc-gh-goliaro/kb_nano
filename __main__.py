@@ -8,6 +8,9 @@ Dispatches to the appropriate subcommand:
     kb_nano agent [args...]
     kb_nano generate-inputs [args...]
     kb_nano capture-golden [args...]
+    kb_nano trace-inputs [args...]
+    kb_nano build-input-registry [args...]
+    kb_nano validate-input-registry [args...]
     kb_nano create-stubs [args...]
 """
 
@@ -43,6 +46,15 @@ def main():
     elif command == "capture-golden":
         from kb_nano.bench.utils.capture_golden import main as cap_main
         cap_main()
+    elif command == "trace-inputs":
+        from kb_nano.bench.utils.trace_inputs import main as trace_main
+        trace_main()
+    elif command == "build-input-registry":
+        from kb_nano.bench.utils.build_input_registry import main as build_main
+        build_main()
+    elif command == "validate-input-registry":
+        from kb_nano.bench.utils.validate_input_registry import main as validate_main
+        validate_main()
     elif command == "create-stubs":
         from kb_nano.agent.create_stubs import main as stubs_main
         stubs_main()
@@ -73,6 +85,11 @@ def _print_usage():
     print("  mlflow-ui        Launch the MLflow web UI")
     print("  generate-inputs  Generate YAML input manifests")
     print("  capture-golden   Capture golden tensor data for data-dependent ops")
+    print("  trace-inputs     Trace real workloads into raw input metadata JSONL")
+    print("  build-input-registry")
+    print("                   Build generated YAML and FlashInfer-style workloads")
+    print("  validate-input-registry")
+    print("                   Validate registry loadability and golden coverage")
     print()
     print("Run 'kb_nano <command> --help' for command-specific options.")
 

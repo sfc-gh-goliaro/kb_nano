@@ -35,6 +35,9 @@ INPUTS_DIR = Path(
 GOLDEN_DIR = Path(
     os.environ.get("KB_NANO_GOLDEN_DIR", str(KB_ROOT / "bench" / "utils" / "golden_data"))
 )
+TRACE_DIR = Path(
+    os.environ.get("KB_NANO_TRACE_DIR", str(KB_ROOT / "bench" / "utils" / "traces"))
+)
 
 # --- Benchmark results ---
 RESULTS_DIR = Path(

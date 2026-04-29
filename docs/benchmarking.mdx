@@ -132,13 +132,21 @@ Tier 3 reports MacroEval leaderboard metrics in addition to the legacy averages:
 
 Kernel benchmarks (Tier 1) draw input shapes from YAML manifests under `bench/utils/inputs/`. Each entry specifies tensor shapes, dtypes, and init args for a given operator × model × TP × sequence-length combination. FP8 inputs should be declared as coherent FP8+scale pairs with `quantize: fp8` and `scale_arg`; the registry generates the FP8 tensor by quantizing a random source tensor and stores the matching scale tensor under `scale_arg`. Use golden `.pt` inputs for data-dependent FP8 paths such as MoE routing or packed cache layouts.
 
+The preferred registry path is workload-derived:
+
+1. `trace-inputs` runs real workloads and records raw operator-call JSONL traces with shapes, dtypes, strides, module path, occurrence order, TP degree, model key, and workload provenance.
+2. First-seen inputs for data/control-flow dependent operators are saved as `safetensors` golden data plus a JSON scalar sidecar.
+3. `build-input-registry` deduplicates exact signatures, selects a small representative subset per operator/model/TP/dtype group, writes backward-compatible YAML, and also exports FlashInfer-style workload-only trace JSONL.
+4. `validate-input-registry` checks loadability and golden coverage.
+
 ```bash
-# Regenerate the manifest from HuggingFace model configs
+# Legacy config-derived manifest generator
 kb_nano generate-inputs
 
-# Capture golden data for data-dependent operators
-kb_nano capture-golden \
-    --model meta-llama/Llama-3.1-8B-Instruct
+# Workload-derived registry pipeline
+kb_nano trace-inputs --config bench/utils/input_trace_models.example.yaml
+kb_nano build-input-registry
+kb_nano validate-input-registry
 ```
 
 ---

@@ -13,6 +13,7 @@ from typing import Any
 
 import torch
 import yaml
+from safetensors.torch import load_file as load_safetensors
 
 from kb_nano import GOLDEN_DIR, INPUTS_DIR
 
@@ -252,7 +253,17 @@ class InputRegistry:
                     f"Run bench/utils/capture_golden.py to generate it, "
                     f"or download from HuggingFace Hub."
                 )
-            golden_data = torch.load(golden_file, map_location=device, weights_only=True)
+            if golden_file.suffix == ".safetensors":
+                golden_data = {
+                    k: v.to(device)
+                    for k, v in load_safetensors(golden_file).items()
+                }
+                sidecar = golden_file.with_suffix(".json")
+                if sidecar.is_file():
+                    with open(sidecar) as f:
+                        golden_data.update(yaml.safe_load(f) or {})
+            else:
+                golden_data = torch.load(golden_file, map_location=device, weights_only=True)
             return golden_data
 
         result: dict[str, Any] = {}
