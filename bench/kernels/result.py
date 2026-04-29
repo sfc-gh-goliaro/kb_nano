@@ -17,6 +17,8 @@ class ScenarioResult:
     baseline_ms: float
     candidate_ms: float
     speedup: float
+    failure_reason: str | None = None
+    classification: str | None = None
 
 
 @dataclass

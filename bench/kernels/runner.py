@@ -36,6 +36,13 @@ _FP8_RTOL = 1.25e-1
 _FP8_GROUP_SIZE = 128
 
 
+def _short_exception(exc: BaseException) -> str:
+    message = str(exc).strip()
+    if not message:
+        message = exc.__class__.__name__
+    return f"{exc.__class__.__name__}: {message}"
+
+
 def _get_registry() -> InputRegistry:
     global _DEFAULT_REGISTRY
     if _DEFAULT_REGISTRY is None:
@@ -60,6 +67,13 @@ def _instantiate_module(
     dtype: torch.dtype | None = None,
 ) -> nn.Module:
     """Create an nn.Module instance with init_args, handling common patterns."""
+    init_args = dict(init_args)
+    if "head_size" in init_args and "head_dim" not in init_args:
+        init_args["head_dim"] = init_args.pop("head_size")
+    if "base" in init_args and "rope_theta" not in init_args:
+        init_args["rope_theta"] = init_args.pop("base")
+    init_args.pop("rotary_dim", None)
+    init_args.pop("is_neox_style", None)
     try:
         module = cls(**init_args)
     except TypeError:
@@ -67,7 +81,12 @@ def _instantiate_module(
 
     module = module.to(device)
     if dtype is not None:
-        module = module.to(dtype=dtype)
+        # Cast learnable parameters to the scenario dtype without changing
+        # precision-sensitive buffers such as RoPE/YARN cos/sin caches.
+        with torch.no_grad():
+            for param in module.parameters(recurse=True):
+                if param.is_floating_point():
+                    param.data = param.data.to(dtype=dtype)
     module.eval()
     return module
 
@@ -138,6 +157,8 @@ def _time_forward(
 
     times.sort()
     median_ms = times[len(times) // 2]
+    if output is None:
+        output = {k: v for k, v in tensor_inputs.items()}
     return output, median_ms
 
 
@@ -287,6 +308,25 @@ def _compare_outputs(baseline_out: Any, candidate_out: Any) -> tuple[bool, float
         mean_diff = total_diff / count if count > 0 else 0.0
         return all_pass, max_error_ratio, mean_diff
 
+    if isinstance(baseline_out, dict) and isinstance(candidate_out, dict):
+        if set(baseline_out) != set(candidate_out):
+            return False, float("inf"), float("inf")
+        all_pass = True
+        max_error_ratio = 0.0
+        total_diff = 0.0
+        count = 0
+        for key in sorted(baseline_out):
+            b = baseline_out[key]
+            c = candidate_out[key]
+            if isinstance(b, torch.Tensor) and isinstance(c, torch.Tensor):
+                p, ratio, d = _compare_outputs(b, c)
+                all_pass = all_pass and p
+                max_error_ratio = max(max_error_ratio, ratio)
+                total_diff += d
+                count += 1
+        mean_diff = total_diff / count if count > 0 else 0.0
+        return all_pass, max_error_ratio, mean_diff
+
     return True, 0.0, 0.0
 
 
@@ -300,6 +340,7 @@ def run_kernel_benchmark(
     num_runs: int = 100,
     device: str = "cuda",
     pytorch_reference: bool = False,
+    validation_mode: str = "candidate",
 ) -> OperatorResult:
     """Run isolated kernel benchmark for a single operator.
 
@@ -329,10 +370,19 @@ def run_kernel_benchmark(
     """
     target = get(target_name)
 
-    user_impl = load_reference(target_name) if pytorch_reference else load_candidate(target_name)
+    if pytorch_reference:
+        validation_mode = "pytorch_reference"
+
+    if validation_mode == "baseline_identity":
+        user_impl = target.target_cls
+    elif validation_mode == "pytorch_reference":
+        user_impl = load_reference(target_name)
+    else:
+        user_impl = load_candidate(target_name)
+
     if user_impl is None:
-        impl_kind = "PyTorch reference" if pytorch_reference else "candidate kernel"
-        impl_dir = "reference" if pytorch_reference else "candidate"
+        impl_kind = "PyTorch reference" if validation_mode == "pytorch_reference" else "candidate kernel"
+        impl_dir = "reference" if validation_mode == "pytorch_reference" else "candidate"
         raise ValueError(
             f"No {impl_kind} found for {target_name!r}. "
             f"Place implementation in tasks/{impl_dir}/L{target.level}/{target_name}.py"
@@ -361,11 +411,12 @@ def run_kernel_benchmark(
             ),
         )
 
-    candidate_path = (
-        _find_reference_path(target_name, target.level)
-        if pytorch_reference
-        else _find_candidate_path(target_name, target.level)
-    )
+    if validation_mode == "baseline_identity":
+        candidate_path = f"tasks/baseline/L{target.level}/{target_name}.py"
+    elif validation_mode == "pytorch_reference":
+        candidate_path = _find_reference_path(target_name, target.level)
+    else:
+        candidate_path = _find_candidate_path(target_name, target.level)
     scenario_results: list[ScenarioResult] = []
 
     for scenario in all_scenarios:
@@ -386,15 +437,32 @@ def run_kernel_benchmark(
                 except Exception:
                     pass
 
-            baseline_out, baseline_ms = _time_forward(
-                baseline_mod, _clone_inputs(inputs), num_warmup, num_runs,
+            timing_warmup = 0 if validation_mode == "candidate_smoke" else num_warmup
+            timing_runs = 1 if validation_mode == "candidate_smoke" else num_runs
+
+            baseline_out, _ = _time_forward(
+                baseline_mod, _clone_inputs(inputs), 0, 1,
             )
-            candidate_out, candidate_ms = _time_forward(
-                candidate_mod, _clone_inputs(inputs), num_warmup, num_runs,
+            candidate_out, _ = _time_forward(
+                candidate_mod, _clone_inputs(inputs), 0, 1,
+            )
+            _, baseline_ms = _time_forward(
+                baseline_mod, _clone_inputs(inputs), timing_warmup, timing_runs,
+            )
+            _, candidate_ms = _time_forward(
+                candidate_mod, _clone_inputs(inputs), timing_warmup, timing_runs,
             )
 
             correct, max_error_ratio, mean_diff = _compare_outputs(baseline_out, candidate_out)
             speedup = baseline_ms / candidate_ms if candidate_ms > 0 else float("inf")
+            classification = (
+                "harness_validation_passed"
+                if validation_mode in ("baseline_identity", "pytorch_reference")
+                and correct
+                else "candidate_correct_and_timed"
+                if correct
+                else "candidate_correctness_failure"
+            )
 
             scenario_results.append(ScenarioResult(
                 name=scenario.name,
@@ -404,10 +472,13 @@ def run_kernel_benchmark(
                 baseline_ms=baseline_ms,
                 candidate_ms=candidate_ms,
                 speedup=speedup,
+                failure_reason=None if correct else "output_mismatch",
+                classification=classification,
             ))
 
         except Exception as e:
-            print(f"  ERROR in scenario {scenario.name}: {e}")
+            failure_reason = _short_exception(e)
+            print(f"  ERROR in scenario {scenario.name}: {failure_reason}")
             scenario_results.append(ScenarioResult(
                 name=scenario.name,
                 correct=False,
@@ -416,6 +487,8 @@ def run_kernel_benchmark(
                 baseline_ms=0.0,
                 candidate_ms=0.0,
                 speedup=0.0,
+                failure_reason=failure_reason,
+                classification="harness_or_candidate_exception",
             ))
 
         finally:
@@ -441,6 +514,7 @@ def run_all_kernel_benchmarks(
     num_runs: int = 100,
     device: str = "cuda",
     pytorch_reference: bool = False,
+    validation_mode: str = "candidate",
 ) -> KernelBenchResult:
     """Run kernel benchmarks for all operators that have candidate implementations.
 
@@ -448,9 +522,12 @@ def run_all_kernel_benchmarks(
     """
     from kb_nano.infra.kernel_swapper import discover_candidates
 
-    candidates = discover_references() if pytorch_reference else discover_candidates()
+    if pytorch_reference:
+        validation_mode = "pytorch_reference"
+
+    candidates = discover_references() if validation_mode == "pytorch_reference" else discover_candidates()
     if not candidates:
-        if pytorch_reference:
+        if validation_mode == "pytorch_reference":
             print("No PyTorch references found in tasks/reference/.")
         else:
             print("No candidate kernels found in tasks/candidate/.")
@@ -460,7 +537,15 @@ def run_all_kernel_benchmarks(
 
     operators: list[OperatorResult] = []
     for target, _ in candidates:
-        label = "PyTorch reference" if pytorch_reference else "candidate"
+        label = (
+            "baseline identity"
+            if validation_mode == "baseline_identity"
+            else "PyTorch reference"
+            if validation_mode == "pytorch_reference"
+            else "candidate smoke"
+            if validation_mode == "candidate_smoke"
+            else "candidate"
+        )
         print(f"\n  Benchmarking {target.name} (L{target.level}, {label})...")
         op_result = run_kernel_benchmark(
             target.name,
@@ -471,6 +556,7 @@ def run_all_kernel_benchmarks(
             num_runs=num_runs,
             device=device,
             pytorch_reference=pytorch_reference,
+            validation_mode=validation_mode,
         )
         operators.append(op_result)
 

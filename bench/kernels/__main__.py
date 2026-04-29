@@ -86,6 +86,16 @@ def main():
         "--pytorch-reference", action="store_true", default=False,
         help="Compare production baseline against tasks/reference/L*/ PyTorch reference",
     )
+    parser.add_argument(
+        "--validation-mode",
+        choices=["candidate", "baseline_identity", "pytorch_reference", "candidate_smoke"],
+        default="candidate",
+        help=(
+            "What to compare against the production baseline. "
+            "baseline_identity validates the harness, pytorch_reference validates "
+            "semantic references, and candidate_smoke does a one-run candidate check."
+        ),
+    )
     args = parser.parse_args()
 
     if args.map:
@@ -120,6 +130,7 @@ def main():
         "num_warmup": args.num_warmup,
         "num_runs": args.num_runs,
         "pytorch_reference": args.pytorch_reference,
+        "validation_mode": args.validation_mode,
     }
 
     with tracker.start_run(run_name, params=bench_params, tags={"tier": "kernel"}):
@@ -132,6 +143,7 @@ def main():
                 num_warmup=args.num_warmup,
                 num_runs=args.num_runs,
                 pytorch_reference=args.pytorch_reference,
+                validation_mode=args.validation_mode,
             )
 
             result = KernelBenchResult(operators=[op_result])
@@ -144,6 +156,7 @@ def main():
                 num_warmup=args.num_warmup,
                 num_runs=args.num_runs,
                 pytorch_reference=args.pytorch_reference,
+                validation_mode=args.validation_mode,
             )
 
         tracker.log_kernel_bench(result)
