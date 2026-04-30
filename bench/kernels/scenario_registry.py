@@ -13,6 +13,7 @@ from typing import Any
 
 import torch
 import yaml
+from safetensors.torch import load_file as load_safetensors
 
 from kb_nano import GOLDEN_DIR, INPUTS_DIR
 
@@ -52,6 +53,95 @@ def _ceil_div(a: int, b: int) -> int:
 
 def _round_scale_to_power_of_two(scale: torch.Tensor) -> torch.Tensor:
     return torch.pow(2.0, torch.ceil(torch.log2(scale)))
+
+
+def _input_shape(inputs: dict[str, Any], name: str) -> list[int] | None:
+    spec = inputs.get(name)
+    if isinstance(spec, dict) and "shape" in spec:
+        return list(spec["shape"])
+    return None
+
+
+def _input_scalar(inputs: dict[str, Any], name: str) -> Any | None:
+    value = inputs.get(name)
+    if isinstance(value, dict):
+        return None
+    return value
+
+
+def _infer_num_experts(scenario: "Scenario", result: dict[str, Any]) -> int | None:
+    for source in (result, scenario.inputs, scenario.init_args):
+        value = source.get("num_experts") if isinstance(source, dict) else None
+        if isinstance(value, int) and value > 0:
+            return value
+    for name in ("B", "w13", "w2"):
+        shape = _input_shape(scenario.inputs, name)
+        if shape:
+            return int(shape[0])
+    return None
+
+
+def _infer_cache_slots(scenario: "Scenario") -> int | None:
+    shape = _input_shape(scenario.inputs, "k_cache") or _input_shape(scenario.inputs, "kv_cache")
+    if not shape:
+        return None
+    page_size = scenario.init_args.get("page_size")
+    if isinstance(page_size, int) and page_size > 0:
+        return int(shape[0]) * page_size
+    if len(shape) >= 2:
+        return int(shape[0]) * int(shape[1])
+    return int(shape[0])
+
+
+def _infer_num_valid_tokens(scenario: "Scenario") -> int | None:
+    for name in ("A", "hidden_states", "key", "router_logits", "gating_output"):
+        shape = _input_shape(scenario.inputs, name)
+        if shape:
+            return int(shape[0])
+    topk_shape = _input_shape(scenario.inputs, "topk_ids")
+    if topk_shape:
+        return int(topk_shape[0])
+    return None
+
+
+def _constrained_integer_tensor(
+    *,
+    operator: str,
+    arg_name: str,
+    shape: list[int],
+    dtype: torch.dtype,
+    scenario: "Scenario",
+    result: dict[str, Any],
+    device: str,
+) -> torch.Tensor | None:
+    if operator == "store_kvcache" and arg_name == "slot_mapping":
+        num_slots = _infer_cache_slots(scenario)
+        if num_slots is not None and num_slots > 0:
+            return torch.randint(0, num_slots, shape, dtype=dtype, device=device)
+
+    if arg_name == "topk_ids":
+        num_experts = _infer_num_experts(scenario, result)
+        if num_experts is not None and num_experts > 0:
+            return torch.randint(0, num_experts, shape, dtype=dtype, device=device)
+
+    if operator == "moe_grouped_gemm" and arg_name == "expert_ids":
+        num_experts = _infer_num_experts(scenario, result)
+        if num_experts is not None and num_experts > 0:
+            return torch.randint(0, num_experts, shape, dtype=dtype, device=device)
+
+    if operator == "moe_grouped_gemm" and arg_name == "sorted_token_ids":
+        num_valid_tokens = _infer_num_valid_tokens(scenario)
+        top_k = int(_input_scalar(scenario.inputs, "top_k") or scenario.init_args.get("top_k") or 1)
+        upper = max(1, num_valid_tokens * max(1, top_k)) if num_valid_tokens else None
+        if upper is not None:
+            return torch.randint(0, upper, shape, dtype=dtype, device=device)
+
+    if operator == "moe_grouped_gemm" and arg_name == "num_tokens_post_padded":
+        sorted_shape = _input_shape(scenario.inputs, "sorted_token_ids")
+        value = int(sorted_shape[0]) if sorted_shape else max(1, int(torch.tensor(shape).prod().item()))
+        return torch.full(shape, value, dtype=dtype, device=device)
+
+    return None
 
 
 def _quantize_fp8_per_token_group(
@@ -134,7 +224,7 @@ def _quantize_fp8_per_block(
 class Scenario:
     """A single test scenario for an operator."""
 
-    __slots__ = ("name", "init_args", "inputs", "golden_path")
+    __slots__ = ("name", "init_args", "inputs", "golden_path", "golden_inputs")
 
     def __init__(
         self,
@@ -142,11 +232,13 @@ class Scenario:
         init_args: dict[str, Any],
         inputs: dict[str, Any],
         golden_path: str | None = None,
+        golden_inputs: list[str] | None = None,
     ):
         self.name = name
         self.init_args = init_args
         self.inputs = inputs
         self.golden_path = golden_path
+        self.golden_inputs = golden_inputs or []
 
     def __repr__(self) -> str:
         return f"Scenario({self.name!r})"
@@ -173,6 +265,8 @@ class InputRegistry:
             if not data:
                 continue
             for op_name, op_spec in data.items():
+                if not isinstance(op_spec, dict) or "scenarios" not in op_spec:
+                    continue
                 scenarios = []
                 for s in op_spec.get("scenarios", []):
                     scenarios.append(Scenario(
@@ -180,6 +274,7 @@ class InputRegistry:
                         init_args=s.get("init_args", {}),
                         inputs=s.get("inputs", {}),
                         golden_path=s.get("golden"),
+                        golden_inputs=s.get("golden_inputs", []),
                     ))
                 self._operators.setdefault(op_name, []).extend(scenarios)
 
@@ -244,17 +339,33 @@ class InputRegistry:
                 f"Scenario {scenario_name!r} not found for operator {operator!r}"
             )
 
+        result = self._materialize_shape_inputs(operator, scenario, device)
+
         if scenario.golden_path:
             golden_file = self._golden_dir / scenario.golden_path
             if not golden_file.is_file():
                 raise FileNotFoundError(
                     f"Golden data file not found: {golden_file}\n"
-                    f"Run bench/utils/capture_golden.py to generate it, "
+                    f"Run kb_nano capture-golden to generate it, "
                     f"or download from HuggingFace Hub."
                 )
-            golden_data = torch.load(golden_file, map_location=device, weights_only=True)
-            return golden_data
+            if golden_file.suffix == ".safetensors":
+                golden_data = {
+                    k: v.to(device)
+                    for k, v in load_safetensors(golden_file).items()
+                }
+                sidecar = golden_file.with_suffix(".json")
+                if sidecar.is_file():
+                    with open(sidecar) as f:
+                        golden_data.update(yaml.safe_load(f) or {})
+            else:
+                golden_data = torch.load(golden_file, map_location=device, weights_only=True)
+            result.update(golden_data)
+            return result
 
+        return result
+
+    def _materialize_shape_inputs(self, operator: str, scenario: Scenario, device: str) -> dict[str, Any]:
         result: dict[str, Any] = {}
         generated_scale_args: set[str] = set()
         for arg_name, spec in scenario.inputs.items():
@@ -309,7 +420,19 @@ class InputRegistry:
                     result[scale_arg] = scale
                     generated_scale_args.add(scale_arg)
                 elif dtype in (torch.int32, torch.int64):
-                    result[arg_name] = torch.randint(0, 100, shape, dtype=dtype, device=device)
+                    constrained = _constrained_integer_tensor(
+                        operator=operator,
+                        arg_name=arg_name,
+                        shape=shape,
+                        dtype=dtype,
+                        scenario=scenario,
+                        result=result,
+                        device=device,
+                    )
+                    if constrained is not None:
+                        result[arg_name] = constrained
+                    else:
+                        result[arg_name] = torch.randint(0, 100, shape, dtype=dtype, device=device)
                 elif dtype == torch.bool:
                     result[arg_name] = torch.randint(0, 2, shape, dtype=torch.uint8, device=device).bool()
                 elif _is_fp8_dtype(dtype):
