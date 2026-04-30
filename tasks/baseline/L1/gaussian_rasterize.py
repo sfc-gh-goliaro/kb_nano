@@ -4,7 +4,6 @@ from __future__ import annotations
 
 import torch
 import torch.nn as nn
-from gsplat.rendering import rasterize_to_pixels
 
 
 class GaussianRasterize(nn.Module):
@@ -24,6 +23,8 @@ class GaussianRasterize(nn.Module):
         flatten_ids: torch.Tensor,
         backgrounds: torch.Tensor | None = None,
     ) -> tuple[torch.Tensor, torch.Tensor]:
+        from gsplat.rendering import rasterize_to_pixels
+
         return rasterize_to_pixels(
             means2d,
             conics,

@@ -4,7 +4,6 @@ from __future__ import annotations
 
 import torch
 import torch.nn as nn
-from gsplat.rendering import fully_fused_projection
 
 
 class GaussianProjection(nn.Module):
@@ -32,6 +31,8 @@ class GaussianProjection(nn.Module):
         width: int,
         height: int,
     ) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor]:
+        from gsplat.rendering import fully_fused_projection
+
         radii, means2d, depths, conics, _ = fully_fused_projection(
             means,
             None,

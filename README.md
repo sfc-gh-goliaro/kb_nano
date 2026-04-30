@@ -16,7 +16,7 @@ A standalone, high-performance inference engine supporting **LLMs** (Llama 3.1, 
 - **FLUX.1-dev** diffusion transformer (text-to-image) with Flash Attention
 - **SDXL** (Stable Diffusion XL) UNet-based text-to-image with dual CLIP text encoders
 - **HunyuanVideo-1.5** 3D video diffusion transformer (text-to-video) with dual-stream joint attention, M-RoPE, and Qwen2.5-VL text encoder
-- **3D Gaussian Splatting** (poster scene) with native projection / tile intersection / rasterization path over `gsplat` CUDA primitives
+- **3D Gaussian Splatting** (`Voxel51/gaussian_splatting` pretrained `train` scene) with native projection / tile intersection / rasterization path over `gsplat` CUDA primitives
 - **InstantNGP** (`fox` scene) with repo wrapper over official `pyngp` bindings plus kernel-level `HashGrid` / `FullyFusedMLP` field benchmarks on real fox training-view samples
 - **YOLOv10** (`jameslahm/yolov10n`) NMS-free object detection with rank sorting
 - **RTDetrV2** (`PekingU/rtdetr_v2_r101vd`) real-time detection transformer with deformable attention
@@ -305,33 +305,63 @@ The protein structure benchmark measures:
 ### Benchmarking vs gsplat (3D Gaussian Splatting)
 
 ```bash
-# 3DGS poster scene: throughput + correctness benchmark vs gsplat
-python tests/bench_3dgs.py --scene poster --num-cameras 2 --max-points 8000
+# 3DGS pretrained train scene: throughput + latency + correctness benchmark vs gsplat
+python tests/bench_3dgs.py \
+    --scene train \
+    --num-cameras 2 \
+    --max-points 100000 \
+    --target-measure-seconds 10 \
+    --latency-iters 20
 
 # Same benchmark (flag kept for CLI parity; current low-level projection path runs in float32)
-python tests/bench_3dgs.py --scene poster --num-cameras 2 --max-points 8000 --use-fp16
+python tests/bench_3dgs.py \
+    --scene train \
+    --num-cameras 2 \
+    --max-points 100000 \
+    --target-measure-seconds 10 \
+    --latency-iters 20 \
+    --use-fp16
 
 # kb-nano only (skip reference comparison)
-python tests/bench_3dgs.py --scene poster --num-cameras 2 --max-points 8000 --skip-reference
+python tests/bench_3dgs.py \
+    --scene train \
+    --num-cameras 2 \
+    --max-points 100000 \
+    --target-measure-seconds 10 \
+    --latency-iters 20 \
+    --skip-reference
 
 # Save results to a specific directory
-python tests/bench_3dgs.py --scene poster --num-cameras 2 --max-points 8000 --output-dir tests/results/H200/3dgs-poster
+python tests/bench_3dgs.py \
+    --scene train \
+    --num-cameras 2 \
+    --max-points 100000 \
+    --target-measure-seconds 10 \
+    --latency-iters 20 \
+    --output-dir tests/results/H200/3dgs-train
 ```
 
 ### Benchmarking vs pyngp (InstantNGP)
 
 ```bash
-# InstantNGP fox scene: render throughput + correctness benchmark vs official pyngp
-python tests/bench_instantngp.py
+# InstantNGP fox scene: render throughput + latency + correctness benchmark vs official pyngp
+python tests/bench_instantngp.py --target-measure-seconds 10 --latency-iters 20
 
 # Faster smoke run at reduced resolution
-python tests/bench_instantngp.py --width 540 --height 960
+python tests/bench_instantngp.py \
+    --width 540 \
+    --height 960 \
+    --target-measure-seconds 10 \
+    --latency-iters 20
 
 # kb-nano only (skip reference comparison)
-python tests/bench_instantngp.py --skip-reference
+python tests/bench_instantngp.py --target-measure-seconds 10 --latency-iters 20 --skip-reference
 
 # Save results to a specific directory
-python tests/bench_instantngp.py --output-dir tests/results/H200/instantngp-fox
+python tests/bench_instantngp.py \
+    --target-measure-seconds 10 \
+    --latency-iters 20 \
+    --output-dir tests/results/H200/instantngp-fox
 ```
 
 ### Benchmarking kernel-level InstantNGP field vs direct tinycudann
@@ -339,13 +369,23 @@ python tests/bench_instantngp.py --output-dir tests/results/H200/instantngp-fox
 ```bash
 # HashGrid + direction encoding + fully fused MLP field benchmark
 # Defaults use real fox training-view sampled field inputs
-python tests/bench_instantngp_kernels.py --num-samples 131072
+python tests/bench_instantngp_kernels.py \
+    --num-samples 131072 \
+    --target-measure-seconds 10 \
+    --latency-iters 20
 
 # Larger kernel batch
-python tests/bench_instantngp_kernels.py --num-samples 262144
+python tests/bench_instantngp_kernels.py \
+    --num-samples 262144 \
+    --target-measure-seconds 10 \
+    --latency-iters 20
 
 # Save results to a specific directory
-python tests/bench_instantngp_kernels.py --num-samples 131072 --output-dir tests/results/H200/instantngp-kernels
+python tests/bench_instantngp_kernels.py \
+    --num-samples 131072 \
+    --target-measure-seconds 10 \
+    --latency-iters 20 \
+    --output-dir tests/results/H200/instantngp-kernels
 ```
 
 The diffusion benchmark measures:
@@ -545,7 +585,7 @@ The engine auto-selects the attention backend based on GPU compute capability:
 pip install gsplat
 ```
 
-The 3DGS benchmark downloads the COLMAP sparse scene metadata for `poster` from `nerfstudioteam/datasets` on first run. The current low-level `gsplat` projection primitive used by kb-nano runs in `float32`, so `--use-fp16` is accepted for CLI consistency but the benchmark reports `dtype=float32`.
+The 3DGS benchmark downloads the pretrained `FO_dataset/train/point_cloud/iteration_30000/point_cloud.ply` checkpoint from `Voxel51/gaussian_splatting` on first run, then renders a deterministic 100k-Gaussian subset with fixed orbit cameras. The current low-level `gsplat` projection primitive used by kb-nano runs in `float32`, so `--use-fp16` is accepted for CLI consistency but the benchmark reports `dtype=float32`.
 
 ### Optional graphics / InstantNGP dependencies
 
@@ -559,7 +599,7 @@ cd third_party/instant-ngp/dependencies/tiny-cuda-nn/bindings/torch
 TCNN_CUDA_ARCHITECTURES=90 python setup.py install
 ```
 
-The InstantNGP benchmark uses the official `fox` sample scene bundled with `instant-ngp`, trains a cached snapshot for `50` steps on first run, and then compares kb-nano's wrapper path against direct `pyngp` rendering on the same training views.
+The InstantNGP benchmark uses the official `fox` sample scene bundled with `instant-ngp`, reuses the cached `fox_50steps.ingp` snapshot when present, trains it locally for `50` steps only if the cache is missing, and then compares kb-nano's wrapper path against direct `pyngp` rendering on the same training views.
 The kernel-level InstantNGP benchmark uses the same `tiny-cuda-nn` stack, but samples positions and directions from real `fox` training-view rays derived from the cached snapshot metadata before comparing kb-nano's `HashGrid` / direction encoding / `FullyFusedMLP` wrappers against direct `tinycudann` modules.
 
 ## Performance
@@ -850,28 +890,34 @@ Correctness (eager mode, decoded video frames, per-prompt cosine similarity):
 
 Correctness is measured in decoded pixel space (both engines produce PIL video frames which are compared as uint8 numpy arrays). The pixel-level cosine similarity of ~0.92 is expected for two independent bf16 implementations: numerical differences in the 30-step denoising loop are amplified by the VAE decoder. For reference, latent-space comparison between kb-nano and HF diffusers yields CosSim=0.986, confirming the transformer backbone is correctly implemented. The pixel-space divergence is dominated by VAE decode amplification and different text encoder implementations (kb-nano uses a custom Qwen2.5-VL paged-attention encoder vs vllm-omni's HuggingFace-based encoder).
 
-### 3D Gaussian Splatting (poster scene)
+### 3D Gaussian Splatting (pretrained train scene)
 
-Run `tests/bench_3dgs.py` to reproduce. The benchmark uses the `poster` COLMAP sparse scene from `nerfstudioteam/datasets`, initializes Gaussians from sparse 3D points, and compares kb-nano's native low-level render path against `gsplat.rasterization`.
+Run `tests/bench_3dgs.py` to reproduce. The benchmark uses the pretrained `FO_dataset/train/point_cloud/iteration_30000/point_cloud.ply` checkpoint from `Voxel51/gaussian_splatting`, renders a deterministic 100k-Gaussian subset with 2 fixed orbit cameras, and compares kb-nano's native low-level render path against `gsplat.rasterization`. The reported run uses `--target-measure-seconds 10 --latency-iters 20`.
 
 **Hardware: NVIDIA H200**
 
 Throughput (images/sec, float32):
 
-| Scene | Cameras | Points | gsplat | Ours | Ratio |
-|-------|--------:|-------:|-------:|-----:|------:|
-| poster | 2 | 8,000 | 4,126 | 4,217 | 1.02x |
+| Scene | Cameras | Loaded / Total Gaussians | gsplat | Ours | Ratio |
+|-------|--------:|-------------------------:|-------:|-----:|------:|
+| train | 2 | 100,000 / 1,074,761 | 556.81 | 553.08 | 0.993x |
+
+Latency (median):
+
+| Scene | gsplat | Ours |
+|-------|-------:|-----:|
+| train | 1.828 ms/image | 1.827 ms/image |
 
 Correctness:
 
 | Output | CosSim | MAE | Shape |
 |--------|-------:|----:|:-----:|
-| RGB image | 1.000000 | 0.0 | 2x1920x1080x3 |
-| Alpha map | 1.000000 | 0.0 | 2x1920x1080x1 |
+| RGB image | 1.000000 | 0.0 | 2x1080x1920x3 |
+| Alpha map | 1.000000 | 0.0 | 2x1080x1920x1 |
 
 ### InstantNGP (fox scene)
 
-Run `tests/bench_instantngp.py` to reproduce. The benchmark uses the official `instant-ngp` `fox` sample scene, caches a snapshot after `50` training steps, and compares kb-nano's wrapper path against direct `pyngp` rendering on the same training views.
+Run `tests/bench_instantngp.py` to reproduce. The benchmark uses the official `instant-ngp` `fox` sample scene, reuses the cached `fox_50steps.ingp` snapshot when present, trains it locally for `50` steps only if missing, and compares kb-nano's wrapper path against direct `pyngp` rendering on the same training views. The reported run uses `--target-measure-seconds 10 --latency-iters 20`.
 
 **Hardware: NVIDIA H200**
 
@@ -879,7 +925,13 @@ Throughput (images/sec, spp=1):
 
 | Scene | Views | Resolution | pyngp | Ours | Ratio |
 |-------|------:|-----------:|------:|-----:|------:|
-| fox | 2 | 1920x1080 | 13.16 | 13.41 | 1.02x |
+| fox | 2 | 1920x1080 | 13.55 | 13.16 | 0.971x |
+
+Latency (median):
+
+| Scene | pyngp | Ours |
+|-------|------:|-----:|
+| fox | 73.48 ms/image | 75.48 ms/image |
 
 Correctness:
 
@@ -889,7 +941,7 @@ Correctness:
 
 ### InstantNGP kernels
 
-Run `tests/bench_instantngp_kernels.py` to reproduce. This benchmark drops below the render wrapper, samples positions and directions from real `fox` training-view rays using the cached snapshot metadata, and compares kb-nano's kernel-level `HashGrid` + direction encoding + `FullyFusedMLP` field wiring against direct `tinycudann` modules with synchronized weights.
+Run `tests/bench_instantngp_kernels.py` to reproduce. This benchmark drops below the render wrapper, samples positions and directions from real `fox` training-view rays using the cached snapshot metadata, and compares kb-nano's kernel-level `HashGrid` + direction encoding + `FullyFusedMLP` field wiring against direct `tinycudann` modules with synchronized weights. The reported run uses `--target-measure-seconds 10 --latency-iters 20`.
 
 **Hardware: NVIDIA H200**
 
@@ -897,7 +949,13 @@ Throughput (samples/sec):
 
 | Samples | tinycudann | Ours | Ratio |
 |--------:|-----------:|-----:|------:|
-| 131072 | 428,227,937 | 427,416,206 | 1.00x |
+| 131072 | 430,294,625 | 430,248,490 | 1.000x |
+
+Latency (median):
+
+| Samples | tinycudann | Ours |
+|--------:|-----------:|-----:|
+| 131072 | 0.326 ms/call | 0.329 ms/call |
 
 Correctness:
 

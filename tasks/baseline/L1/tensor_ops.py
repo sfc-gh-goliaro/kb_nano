@@ -24,3 +24,21 @@ class OneHot(nn.Module):
 
     def forward(self, x: torch.Tensor, num_classes: int) -> torch.Tensor:
         return F.one_hot(x, num_classes)
+
+
+class Cat(nn.Module):
+    """Tensor concatenation op."""
+
+    def __init__(self, dim: int = 0):
+        super().__init__()
+        self.dim = dim
+
+    def forward(self, tensors: list[torch.Tensor] | tuple[torch.Tensor, ...]) -> torch.Tensor:
+        return torch.cat(tensors, dim=self.dim)
+
+
+class Exp(nn.Module):
+    """Elementwise exponential op."""
+
+    def forward(self, x: torch.Tensor) -> torch.Tensor:
+        return torch.exp(x)

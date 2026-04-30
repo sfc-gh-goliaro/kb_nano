@@ -6,7 +6,6 @@ import math
 
 import torch
 import torch.nn as nn
-from gsplat.rendering import isect_offset_encode, isect_tiles
 
 
 class GaussianTileIntersection(nn.Module):
@@ -23,6 +22,8 @@ class GaussianTileIntersection(nn.Module):
         height: int,
         n_images: int,
     ) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor, int, int]:
+        from gsplat.rendering import isect_offset_encode, isect_tiles
+
         tile_width = math.ceil(width / float(self.tile_size))
         tile_height = math.ceil(height / float(self.tile_size))
         _, isect_ids, flatten_ids = isect_tiles(

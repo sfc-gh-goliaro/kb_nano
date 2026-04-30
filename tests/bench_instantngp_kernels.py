@@ -16,7 +16,7 @@ from bench.utils.worker import run_worker
 
 
 INSTANTNGP_KERNEL_WORKER = r'''
-import json, sys, time
+import json, math, sys, time
 import torch
 import torch.nn.functional as F
 
@@ -64,16 +64,50 @@ class ReferenceField(torch.nn.Module):
         rgb = self.rgb_mlp(torch.cat([density_features, self.direction_encoding(directions)], dim=-1))
         return sigma, geo_feat, rgb
 
-def measure(fn, positions, directions, warmup_iters, measure_iters):
+def _measure_iters(fn, positions, directions, iters):
+    start = time.perf_counter()
+    for _ in range(iters):
+        fn(positions, directions)
+    torch.cuda.synchronize()
+    return time.perf_counter() - start
+
+def measure(fn, positions, directions, warmup_iters, measure_iters, target_measure_seconds):
     for _ in range(warmup_iters):
         fn(positions, directions)
     torch.cuda.synchronize()
-    start = time.perf_counter()
-    for _ in range(measure_iters):
+    elapsed = _measure_iters(fn, positions, directions, measure_iters)
+    total_iters = measure_iters
+    while elapsed < target_measure_seconds:
+        per_iter = elapsed / max(total_iters, 1)
+        extra_iters = max(measure_iters, math.ceil((target_measure_seconds - elapsed) / max(per_iter, 1e-9)))
+        elapsed += _measure_iters(fn, positions, directions, extra_iters)
+        total_iters += extra_iters
+    total_samples = total_iters * positions.shape[0]
+    return {
+        "samples_per_second": total_samples / elapsed,
+        "elapsed": elapsed,
+        "iterations": total_iters,
+        "samples": total_samples,
+    }
+
+def measure_latency(fn, positions, directions, latency_iters):
+    samples = []
+    for _ in range(latency_iters):
+        torch.cuda.synchronize()
+        start = time.perf_counter()
         fn(positions, directions)
-    torch.cuda.synchronize()
-    elapsed = time.perf_counter() - start
-    return (measure_iters * positions.shape[0]) / elapsed
+        torch.cuda.synchronize()
+        samples.append(time.perf_counter() - start)
+    samples = sorted(samples)
+    median = samples[len(samples) // 2]
+    mean = sum(samples) / len(samples)
+    return {
+        "iterations": latency_iters,
+        "mean_seconds_per_iter": mean,
+        "median_seconds_per_iter": median,
+        "mean_seconds_per_sample": mean / positions.shape[0],
+        "median_seconds_per_sample": median / positions.shape[0],
+    }
 
 def main():
     device = "cuda"
@@ -98,8 +132,24 @@ def main():
         ours_out = ours(positions, directions)
         ref_sigma, ref_geo, ref_rgb = ref(positions, directions)
 
-    ours_ips = measure(lambda p, d: ours(p, d), positions, directions, cfg["warmup_iters"], cfg["measure_iters"])
-    ref_ips = measure(lambda p, d: ref(p, d), positions, directions, cfg["warmup_iters"], cfg["measure_iters"])
+    ours_perf = measure(
+        lambda p, d: ours(p, d),
+        positions,
+        directions,
+        cfg["warmup_iters"],
+        cfg["measure_iters"],
+        cfg["target_measure_seconds"],
+    )
+    ref_perf = measure(
+        lambda p, d: ref(p, d),
+        positions,
+        directions,
+        cfg["warmup_iters"],
+        cfg["measure_iters"],
+        cfg["target_measure_seconds"],
+    )
+    ours_latency = measure_latency(lambda p, d: ours(p, d), positions, directions, cfg["latency_iters"])
+    ref_latency = measure_latency(lambda p, d: ref(p, d), positions, directions, cfg["latency_iters"])
 
     def cosine(a, b):
         return F.cosine_similarity(a.reshape(1, -1), b.reshape(1, -1)).item()
@@ -114,14 +164,16 @@ def main():
         "num_samples": cfg["num_samples"],
         "ours": {
             "baseline_name": "kb-nano-kernel",
-            "samples_per_second": ours_ips,
+            **ours_perf,
+            "latency": ours_latency,
         },
         "reference": {
             "baseline_name": "tinycudann-direct",
-            "samples_per_second": ref_ips,
+            **ref_perf,
+            "latency": ref_latency,
         },
         "comparison": {
-            "throughput_ratio": ours_ips / ref_ips if ref_ips > 0 else float("inf"),
+            "throughput_ratio": ours_perf["samples_per_second"] / ref_perf["samples_per_second"] if ref_perf["samples_per_second"] > 0 else float("inf"),
             "sigma_cosine": cosine(ours_out.sigma.float(), ref_sigma.float()),
             "sigma_mae": mae(ours_out.sigma.float(), ref_sigma.float()),
             "geo_feat_cosine": cosine(ours_out.geo_feat.float(), ref_geo.float()),
@@ -148,6 +200,8 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--seed", type=int, default=1337)
     parser.add_argument("--warmup-iters", type=int, default=10)
     parser.add_argument("--measure-iters", type=int, default=50)
+    parser.add_argument("--target-measure-seconds", type=float, default=10.0)
+    parser.add_argument("--latency-iters", type=int, default=20)
     parser.add_argument("--output-dir", default="/tmp/instantngp_kernel_bench")
     return parser.parse_args()
 
@@ -164,6 +218,8 @@ def main() -> None:
         "seed": args.seed,
         "warmup_iters": args.warmup_iters,
         "measure_iters": args.measure_iters,
+        "target_measure_seconds": args.target_measure_seconds,
+        "latency_iters": args.latency_iters,
     }
     data = run_worker(
         INSTANTNGP_KERNEL_WORKER,

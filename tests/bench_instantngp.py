@@ -18,7 +18,7 @@ from bench.utils.worker import run_worker
 
 
 INSTANTNGP_WORKER = r'''
-import json, sys, time
+import json, math, sys, time
 import torch
 
 with open(sys.argv[1]) as f:
@@ -35,18 +35,54 @@ def render_views(model, view_indices):
             outputs.append(model(view_index=idx))
     return outputs
 
-def measure(model, view_indices, warmup_iters, measure_iters):
+def _measure_iters(model, view_indices, iters):
+    start = time.perf_counter()
+    for _ in range(iters):
+        render_views(model, view_indices)
+    if torch.cuda.is_available():
+        torch.cuda.synchronize()
+    return time.perf_counter() - start
+
+def measure(model, view_indices, warmup_iters, measure_iters, target_measure_seconds):
     for _ in range(warmup_iters):
         render_views(model, view_indices)
     if torch.cuda.is_available():
         torch.cuda.synchronize()
-    start = time.perf_counter()
-    for _ in range(measure_iters):
+    elapsed = _measure_iters(model, view_indices, measure_iters)
+    total_iters = measure_iters
+    while elapsed < target_measure_seconds:
+        per_iter = elapsed / max(total_iters, 1)
+        extra_iters = max(measure_iters, math.ceil((target_measure_seconds - elapsed) / max(per_iter, 1e-9)))
+        elapsed += _measure_iters(model, view_indices, extra_iters)
+        total_iters += extra_iters
+    total_images = total_iters * len(view_indices)
+    return {
+        "images_per_second": total_images / elapsed,
+        "elapsed": elapsed,
+        "iterations": total_iters,
+        "images": total_images,
+    }
+
+def measure_latency(model, view_indices, latency_iters):
+    samples = []
+    for _ in range(latency_iters):
+        if torch.cuda.is_available():
+            torch.cuda.synchronize()
+        start = time.perf_counter()
         render_views(model, view_indices)
-    if torch.cuda.is_available():
-        torch.cuda.synchronize()
-    elapsed = time.perf_counter() - start
-    return (measure_iters * len(view_indices)) / elapsed
+        if torch.cuda.is_available():
+            torch.cuda.synchronize()
+        samples.append(time.perf_counter() - start)
+    samples = sorted(samples)
+    median = samples[len(samples) // 2]
+    mean = sum(samples) / len(samples)
+    return {
+        "iterations": latency_iters,
+        "mean_seconds_per_iter": mean,
+        "median_seconds_per_iter": median,
+        "mean_seconds_per_image": mean / len(view_indices),
+        "median_seconds_per_image": median / len(view_indices),
+    }
 
 def main():
     scene = load_fox_scene(cfg["scene"])
@@ -83,14 +119,22 @@ def main():
         "backend": cfg["backend"],
     }
 
-    ips = measure(model, view_indices, cfg["warmup_iters"], cfg["measure_iters"])
+    perf = measure(
+        model,
+        view_indices,
+        cfg["warmup_iters"],
+        cfg["measure_iters"],
+        cfg["target_measure_seconds"],
+    )
+    latency = measure_latency(model, view_indices, cfg["latency_iters"])
     with torch.inference_mode():
         imgs = render_views(model, view_indices)
     rgba = torch.stack([img.float() for img in imgs], dim=0)
     torch.save(rgba.cpu(), cfg["rgba_file"])
     result["result"] = {
         "baseline_name": baseline_name,
-        "images_per_second": ips,
+        **perf,
+        "latency": latency,
         "rgba_file": cfg["rgba_file"],
         "image_shape": list(rgba.shape),
     }
@@ -113,6 +157,8 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--spp", type=int, default=1)
     parser.add_argument("--warmup-iters", type=int, default=5)
     parser.add_argument("--measure-iters", type=int, default=20)
+    parser.add_argument("--target-measure-seconds", type=float, default=10.0)
+    parser.add_argument("--latency-iters", type=int, default=20)
     parser.add_argument("--skip-reference", action="store_true")
     parser.add_argument("--output-dir", default="/tmp/instantngp_bench")
     return parser.parse_args()
@@ -131,6 +177,8 @@ def main() -> None:
         "spp": args.spp,
         "warmup_iters": args.warmup_iters,
         "measure_iters": args.measure_iters,
+        "target_measure_seconds": args.target_measure_seconds,
+        "latency_iters": args.latency_iters,
     }
     ours_cfg = dict(cfg, backend="ours", rgba_file=os.path.join(args.output_dir, "ours_rgba.pt"))
     ours_data = run_worker(INSTANTNGP_WORKER, ours_cfg, "InstantNGP ours benchmark", timeout=7200)
@@ -146,6 +194,9 @@ def main() -> None:
         "ours": {
             "baseline_name": ours_data["result"]["baseline_name"],
             "images_per_second": ours_data["result"]["images_per_second"],
+            "elapsed": ours_data["result"]["elapsed"],
+            "images": ours_data["result"]["images"],
+            "latency": ours_data["result"]["latency"],
         },
     }
 
@@ -169,6 +220,9 @@ def main() -> None:
         result["reference"] = {
             "baseline_name": ref_data["result"]["baseline_name"],
             "images_per_second": ref_data["result"]["images_per_second"],
+            "elapsed": ref_data["result"]["elapsed"],
+            "images": ref_data["result"]["images"],
+            "latency": ref_data["result"]["latency"],
         }
         result["comparison"] = {
             "throughput_ratio": (

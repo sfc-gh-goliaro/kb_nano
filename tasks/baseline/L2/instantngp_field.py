@@ -7,19 +7,20 @@ from dataclasses import dataclass
 import torch
 import torch.nn as nn
 
-from tasks.baseline.L1.instantngp_direction_encoding import (
+from ..L1.instantngp_direction_encoding import (
     DEFAULT_DIRECTION_ENCODING_CONFIG,
     InstantNGPDirectionEncoding,
 )
-from tasks.baseline.L1.instantngp_fused_mlp import (
+from ..L1.instantngp_fused_mlp import (
     DEFAULT_DENSITY_NETWORK_CONFIG,
     DEFAULT_RGB_NETWORK_CONFIG,
     InstantNGPFullyFusedMLP,
 )
-from tasks.baseline.L1.instantngp_hashgrid import (
+from ..L1.instantngp_hashgrid import (
     DEFAULT_HASHGRID_CONFIG,
     InstantNGPHashGrid,
 )
+from ..L1.tensor_ops import Cat, Exp
 
 
 @dataclass(frozen=True)
@@ -74,6 +75,8 @@ class InstantNGPField(nn.Module):
             config=self.rgb_network_config,
             seed=seed,
         )
+        self.cat_features = Cat(dim=-1)
+        self.exp = Exp()
 
     @property
     def n_flat_params(self) -> int:
@@ -110,10 +113,10 @@ class InstantNGPField(nn.Module):
         dir_features = self.direction_encoding(directions)
         # instant-ngp feeds the full density MLP output (raw sigma + geo features)
         # followed by the direction encoding into the color MLP.
-        rgb_input = torch.cat([density_features, dir_features], dim=-1)
+        rgb_input = self.cat_features([density_features, dir_features])
         rgb = self.rgb_mlp(rgb_input)
         return InstantNGPFieldOutput(sigma=sigma, geo_feat=geo_feat, rgb=rgb)
 
     def query_density(self, positions: torch.Tensor) -> torch.Tensor:
         density_features = self.density_mlp(self.position_encoding(positions))
-        return torch.exp(density_features[..., :1].to(torch.float32))
+        return self.exp(density_features[..., :1].to(torch.float32))
