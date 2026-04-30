@@ -1,12 +1,13 @@
 # kb-nano
 
-A standalone, high-performance inference engine supporting **LLMs** (Llama 3.1, Llama 4, Mixtral-8x7B, DeepSeek V3.2, GPT-OSS, Qwen2-VL, Qwen3-VL), **linear-attention LLMs** (GLA, RetNet, RWKV7), **diffusion models** (FLUX.1-dev, SDXL, HunyuanVideo-1.5), **detection models** (YOLOv10, RTDetrV2), **vision encoders** (SigLIP-2, DINOv3, SwinV2), **segmentation models** (SAM3.1), **protein structure prediction** (OpenFold3), audio models (Whisper), and **TTS models** (CosyVoice3) with tensor parallelism and FP8 quantization. No vLLM dependency at runtime — just PyTorch, Triton, and Flash Attention.
+A standalone, high-performance inference engine supporting **LLMs** (Llama 3.1, Llama 4, Mixtral-8x7B, DeepSeek V3.2, GPT-OSS, Qwen2-VL, Qwen3-VL), **text diffusion models** (LLaDA / Fast-dLLM-style decoding), **linear-attention LLMs** (GLA, RetNet, RWKV7), **diffusion models** (FLUX.1-dev, SDXL, HunyuanVideo-1.5), **detection models** (YOLOv10, RTDetrV2), **vision encoders** (SigLIP-2, DINOv3, SwinV2), **segmentation models** (SAM3.1), **protein structure prediction** (OpenFold3), audio models (Whisper), and **TTS models** (CosyVoice3) with tensor parallelism and FP8 quantization. No vLLM dependency at runtime — just PyTorch, Triton, and Flash Attention.
 
 ## Features
 
 - **Llama 3.1** (8B, 70B) with frequency-scaled RoPE
 - **Llama 4** with fused MoE experts
 - **Mixtral-8x7B** with fused Triton MoE grouped-GEMM kernels
+- **LLaDA-8B-Instruct** with vanilla / prefix-cache / dual-cache masked diffusion decoding
 - **DeepSeek V3.2** with MLA (Multi-head Latent Attention), 256-expert MoE via DeepGEMM FP8, DSA (DeepSeek Sparse Attention), and YARN RoPE — currently **0.78–0.90× of vLLM** throughput on 8×H200 (gap due to kernel-launch overhead, GEMM kernel selection, and AllReduce+RMSNorm fusion)
 - **GPT-OSS** (20B, 120B) MXFP4-quantized MoE with native Triton inference, YaRN RoPE, attention sinks, and sliding window
 - **Mamba / Mamba2** (`state-spaces/mamba-2.8b-hf`, `mistralai/Mamba-Codestral-7B-v0.1`) selective state-space models with vLLM-aligned `causal_conv1d` + `mamba_chunk_scan` / `selective_scan` kernels, slot-based recurrent state cache, chunked-prefill metadata, and TP sharding (incl. `n_groups % tp != 0` head-shard groups)
@@ -129,6 +130,36 @@ python tests/test_bench.py
 
 # Bench module unit tests only (no GPU required)
 python tests/test_bench.py --unit-only
+```
+
+### Benchmarking vs HF / Fast-dLLM (Text Diffusion)
+
+```bash
+# Optional: clone the official Fast-dLLM baseline locally
+git clone https://github.com/NVlabs/Fast-dLLM.git third_party/Fast-dLLM
+
+# Extra packages only needed for Fast-dLLM comparison runs
+pip install lm_eval==0.4.8 antlr4-python3-runtime==4.11 math_verify gradio
+
+# Default protocol now follows the official Fast-dLLM evaluation style more closely:
+# real task prompts, variable-length batching with left padding, and token counting
+# after generation/post-processing. The default task is HumanEval 0-shot.
+
+# Default: kb-nano dual-cache + parallel vs official Fast-dLLM dual-cache + parallel
+python tests/bench_dllm.py
+
+# Prefix-cache + parallel vs official Fast-dLLM prefix-cache + parallel
+python tests/bench_dllm.py --ours-backend prefix
+
+# Vanilla decoding vs official HF LLaDA
+python tests/bench_dllm.py --ours-backend vanilla --reference-backends hf --no-threshold
+
+# Switch to GSM8K 5-shot under the same official-style protocol
+# Use batch size 8 here because batch size 32 can OOM on long 5-shot prompts.
+python tests/bench_dllm.py --task gsm8k --batch-size 8
+
+# kb-nano only
+python tests/bench_dllm.py --skip-reference
 ```
 
 ### Benchmarking vs flash-linear-attention (GLA / RetNet / RWKV7)
@@ -455,6 +486,7 @@ Each run is tagged with a `tier` (`agent`, `kernel`, `eval`, or `e2e`) indicatin
 - MLflow (experiment tracking — gracefully skipped if not installed)
 - timm (pytorch-image-models — only needed for vision encoder comparison tests)
 - vLLM (only needed for running comparison tests)
+- lm_eval, antlr4-python3-runtime, math_verify, gradio (only needed for Fast-dLLM comparison tests)
 - matplotlib (only needed for benchmark plotting)
 - ultralytics (YOLOv10 baseline benchmarking)
 
@@ -585,6 +617,23 @@ Run `tests/bench_vllm.py` to reproduce. Three scenarios per model, 1000 sequence
 | Mixtral-8x7B | 4 | prefill-heavy | 1024/512  | 15,060 | 23,064 | **1.53x** |
 | Mixtral-8x7B | 4 | balanced      |  512/512  | 20,530 | 33,443 | **1.63x** |
 | Mixtral-8x7B | 4 | decode-heavy  |  512/1024 | 24,728 | 37,761 | **1.53x** |
+
+### LLaDA / Fast-dLLM (Text Diffusion)
+
+Run `tests/bench_dllm.py` to reproduce. The benchmark now defaults to a Fast-dLLM official-style protocol on real task prompts instead of the previous Alpaca prompt microbenchmark: HumanEval 0-shot by default, left-padded variable-length batches, and throughput counted from post-processed generated tokens.
+
+Throughput (`temperature=0`, `gen_length=256`, `steps=8`, `block_length=32`, dual-cache + parallel decoding):
+
+| Model | Task | Few-shot | Samples | BS | Fast-dLLM (tok/s) | Ours (tok/s) | Ratio | Token Match | Logits Cosine |
+|-------|------|---------:|--------:|---:|------------------:|-------------:|------:|------------:|--------------:|
+| LLaDA-8B-Instruct | HumanEval | 0 | 164 | 32 | 1,592 | 1,684 | **1.06x** | 97.10% | 0.99972 |
+| LLaDA-8B-Instruct | GSM8K | 5 | 1,319 | 8 | 584 | 624 | **1.07x** | 99.60% | 0.99994 |
+
+Notes:
+
+- `python tests/bench_dllm.py` runs the default HumanEval 0-shot comparison against official Fast-dLLM dual-cache.
+- `python tests/bench_dllm.py --task gsm8k --batch-size 8` runs the GSM8K 5-shot comparison against official Fast-dLLM dual-cache.
+- GSM8K is documented with `BS=8` because `BS=32` can OOM on long 5-shot prompts under the current full-vocab confidence computation path.
 
 ### Qwen2-VL / Qwen3-VL (VLM)
 
