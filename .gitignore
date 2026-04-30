@@ -229,3 +229,5 @@ tasks/candidate/prev-attempts/
 mlruns/
 
 data/
+
+.codex
