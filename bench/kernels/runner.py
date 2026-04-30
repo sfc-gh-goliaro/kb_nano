@@ -14,7 +14,7 @@ from typing import Any
 import torch
 import torch.nn as nn
 
-from kb_nano.bench.utils.input_registry import InputRegistry
+from kb_nano.bench.kernels.scenario_registry import InputRegistry
 from kb_nano.infra.kernel_swapper import BenchTarget, discover_targets, get, load_candidate
 
 from .result import KernelBenchResult, OperatorResult, ScenarioResult

@@ -29,14 +29,20 @@ CANDIDATE_DIR = Path(
 PREV_ATTEMPTS_DIR = CANDIDATE_DIR / "prev-attempts"
 
 # --- Benchmark input data ---
+INPUT_REGISTRY_DIR = Path(
+    os.environ.get(
+        "KB_NANO_INPUT_REGISTRY_DIR",
+        str(KB_ROOT / "bench" / "kernels" / "benchmark_scenarios" / "small"),
+    )
+)
 INPUTS_DIR = Path(
-    os.environ.get("KB_NANO_INPUTS_DIR", str(KB_ROOT / "bench" / "utils" / "inputs"))
+    os.environ.get("KB_NANO_INPUTS_DIR", str(INPUT_REGISTRY_DIR))
 )
 GOLDEN_DIR = Path(
-    os.environ.get("KB_NANO_GOLDEN_DIR", str(KB_ROOT / "bench" / "utils" / "golden_data"))
+    os.environ.get("KB_NANO_GOLDEN_DIR", str(INPUT_REGISTRY_DIR / "captured_inputs"))
 )
 TRACE_DIR = Path(
-    os.environ.get("KB_NANO_TRACE_DIR", str(KB_ROOT / "bench" / "utils" / "traces"))
+    os.environ.get("KB_NANO_TRACE_DIR", str(INPUT_REGISTRY_DIR / "traces"))
 )
 
 # --- Benchmark results ---

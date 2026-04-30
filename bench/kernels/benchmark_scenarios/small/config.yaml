@@ -1,0 +1,21 @@
+# Cluster workload scenarios for real workload-derived kernel benchmark scenarios.
+# Workload names resolve through bench/utils/workloads.py and real_prompts.py.
+
+models:
+  - key: llama31-8b
+    hf_name: meta-llama/Llama-3.1-8B-Instruct
+    tp: 1
+    dtype: bfloat16
+    num_requests: 100
+    workloads:
+      - name: prefill-heavy
+      - name: decode-heavy
+
+  - key: mixtral-8x7b
+    hf_name: mistralai/Mixtral-8x7B-Instruct-v0.1
+    tp: 2
+    dtype: bfloat16
+    num_requests: 100
+    workloads:
+      - name: prefill-heavy
+      - name: decode-heavy

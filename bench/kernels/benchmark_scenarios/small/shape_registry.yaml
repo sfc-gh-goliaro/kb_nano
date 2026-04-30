@@ -1,0 +1,487 @@
+rms_norm:
+  scenarios:
+  - name: tokens-1/8d461ffb
+    init_args:
+      elementwise_affine: true
+      eps: 1.0e-05
+      hidden_size: 4096
+      training: false
+    inputs:
+      x:
+        shape:
+        - 1
+        - 4096
+        dtype: bfloat16
+  - name: tokens-4/0297ed69
+    init_args:
+      elementwise_affine: true
+      eps: 1.0e-05
+      hidden_size: 4096
+      training: false
+    inputs:
+      x:
+        shape:
+        - 4
+        - 4096
+        dtype: bfloat16
+  - name: tokens-8/73fe89b9
+    init_args:
+      elementwise_affine: true
+      eps: 1.0e-05
+      hidden_size: 4096
+      training: false
+    inputs:
+      x:
+        shape:
+        - 8
+        - 4096
+        dtype: bfloat16
+  - name: tokens-64/32275774
+    init_args:
+      elementwise_affine: true
+      eps: 1.0e-05
+      hidden_size: 4096
+      training: false
+    inputs:
+      x:
+        shape:
+        - 64
+        - 4096
+        dtype: bfloat16
+  - name: tokens-16384/2d89df12
+    init_args:
+      elementwise_affine: true
+      eps: 1.0e-05
+      hidden_size: 4096
+      training: false
+    inputs:
+      x:
+        shape:
+        - 16384
+        - 4096
+        dtype: bfloat16
+  - name: tokens-1/61d18358
+    init_args:
+      elementwise_affine: true
+      eps: 1.0e-05
+      hidden_size: 4096
+      training: false
+    inputs:
+      residual:
+        shape:
+        - 1
+        - 4096
+        dtype: bfloat16
+      x:
+        shape:
+        - 1
+        - 4096
+        dtype: bfloat16
+  - name: tokens-4/bdd57b13
+    init_args:
+      elementwise_affine: true
+      eps: 1.0e-05
+      hidden_size: 4096
+      training: false
+    inputs:
+      residual:
+        shape:
+        - 4
+        - 4096
+        dtype: bfloat16
+      x:
+        shape:
+        - 4
+        - 4096
+        dtype: bfloat16
+  - name: tokens-8/14df6125
+    init_args:
+      elementwise_affine: true
+      eps: 1.0e-05
+      hidden_size: 4096
+      training: false
+    inputs:
+      residual:
+        shape:
+        - 8
+        - 4096
+        dtype: bfloat16
+      x:
+        shape:
+        - 8
+        - 4096
+        dtype: bfloat16
+  - name: tokens-64/8dc356d8
+    init_args:
+      elementwise_affine: true
+      eps: 1.0e-05
+      hidden_size: 4096
+      training: false
+    inputs:
+      residual:
+        shape:
+        - 64
+        - 4096
+        dtype: bfloat16
+      x:
+        shape:
+        - 64
+        - 4096
+        dtype: bfloat16
+  - name: tokens-16384/610b6608
+    init_args:
+      elementwise_affine: true
+      eps: 1.0e-05
+      hidden_size: 4096
+      training: false
+    inputs:
+      residual:
+        shape:
+        - 16384
+        - 4096
+        dtype: bfloat16
+      x:
+        shape:
+        - 16384
+        - 4096
+        dtype: bfloat16
+moe_align:
+  scenarios:
+  - name: tokens-1/806d4dd0
+    init_args:
+      training: false
+    inputs:
+      block_size: 16
+      naive: true
+      num_experts: 8
+      topk_ids:
+        shape:
+        - 1
+        - 2
+        dtype: int32
+    golden: mixtral-8x7b/tp2/bfloat16/moe_align/ce0e01fd4384ebf6.safetensors
+  - name: tokens-4/8552d5a2
+    init_args:
+      training: false
+    inputs:
+      block_size: 16
+      naive: false
+      num_experts: 8
+      topk_ids:
+        shape:
+        - 4
+        - 2
+        dtype: int32
+    golden: mixtral-8x7b/tp2/bfloat16/moe_align/fe8f7ab5dc83d2f7.safetensors
+  - name: tokens-5/0909c597
+    init_args:
+      training: false
+    inputs:
+      block_size: 32
+      naive: false
+      num_experts: 8
+      topk_ids:
+        shape:
+        - 5
+        - 2
+        dtype: int32
+    golden: mixtral-8x7b/tp2/bfloat16/moe_align/c1e58943e742642e.safetensors
+  - name: tokens-50/06d2f3dd
+    init_args:
+      training: false
+    inputs:
+      block_size: 32
+      naive: false
+      num_experts: 8
+      topk_ids:
+        shape:
+        - 50
+        - 2
+        dtype: int32
+    golden: mixtral-8x7b/tp2/bfloat16/moe_align/83ec2ab49b31d535.safetensors
+  - name: tokens-63/42d05cd1
+    init_args:
+      training: false
+    inputs:
+      block_size: 32
+      naive: false
+      num_experts: 8
+      topk_ids:
+        shape:
+        - 63
+        - 2
+        dtype: int32
+    golden: mixtral-8x7b/tp2/bfloat16/moe_align/492b594c0a8dcc02.safetensors
+  - name: tokens-16384/6de0a9e3
+    init_args:
+      training: false
+    inputs:
+      block_size: 128
+      naive: false
+      num_experts: 8
+      topk_ids:
+        shape:
+        - 16384
+        - 2
+        dtype: int32
+    golden: mixtral-8x7b/tp2/bfloat16/moe_align/929d1f6047f928b0.safetensors
+moe_grouped_gemm:
+  scenarios:
+  - name: tokens-70/c2f0871c
+    init_args:
+      training: false
+    inputs:
+      A:
+        shape:
+        - 70
+        - 7168
+        dtype: bfloat16
+      B:
+        shape:
+        - 8
+        - 4096
+        - 7168
+        dtype: bfloat16
+      C:
+        shape:
+        - 70
+        - 4096
+        dtype: bfloat16
+      a_scale: null
+      b_scale: null
+      block_shape: null
+      expert_ids:
+        shape:
+        - 10
+        dtype: int32
+      mul_routed_weight: true
+      num_tokens_post_padded:
+        shape:
+        - 1
+        dtype: int32
+      sorted_token_ids:
+        shape:
+        - 318
+        dtype: int32
+      top_k: 1
+      topk_weights:
+        shape:
+        - 35
+        - 2
+        dtype: bfloat16
+      use_fp8_w8a8: false
+    golden: mixtral-8x7b/tp2/bfloat16/moe_grouped_gemm/3c6104200aa5911e.safetensors
+  - name: tokens-75/d1aab6fb
+    init_args:
+      training: false
+    inputs:
+      A:
+        shape:
+        - 75
+        - 4096
+        dtype: bfloat16
+      B:
+        shape:
+        - 8
+        - 14336
+        - 4096
+        dtype: bfloat16
+      C:
+        shape:
+        - 150
+        - 14336
+        dtype: bfloat16
+      a_scale: null
+      b_scale: null
+      block_shape: null
+      expert_ids:
+        shape:
+        - 10
+        dtype: int32
+      mul_routed_weight: false
+      num_tokens_post_padded:
+        shape:
+        - 1
+        dtype: int32
+      sorted_token_ids:
+        shape:
+        - 1166
+        dtype: int32
+      top_k: 2
+      topk_weights:
+        shape:
+        - 75
+        - 2
+        dtype: bfloat16
+      use_fp8_w8a8: false
+    golden: mixtral-8x7b/tp2/bfloat16/moe_grouped_gemm/5ac70600bce21fca.safetensors
+  - name: tokens-100/1d6d9bb4
+    init_args:
+      training: false
+    inputs:
+      A:
+        shape:
+        - 100
+        - 4096
+        dtype: bfloat16
+      B:
+        shape:
+        - 8
+        - 14336
+        - 4096
+        dtype: bfloat16
+      C:
+        shape:
+        - 200
+        - 14336
+        dtype: bfloat16
+      a_scale: null
+      b_scale: null
+      block_shape: null
+      expert_ids:
+        shape:
+        - 10
+        dtype: int32
+      mul_routed_weight: false
+      num_tokens_post_padded:
+        shape:
+        - 1
+        dtype: int32
+      sorted_token_ids:
+        shape:
+        - 1216
+        dtype: int32
+      top_k: 2
+      topk_weights:
+        shape:
+        - 100
+        - 2
+        dtype: bfloat16
+      use_fp8_w8a8: false
+    golden: mixtral-8x7b/tp2/bfloat16/moe_grouped_gemm/dbb7d783e37aaddc.safetensors
+  - name: tokens-32768/2ec2f164
+    init_args:
+      training: false
+    inputs:
+      A:
+        shape:
+        - 32768
+        - 7168
+        dtype: bfloat16
+      B:
+        shape:
+        - 8
+        - 4096
+        - 7168
+        dtype: bfloat16
+      C:
+        shape:
+        - 32768
+        - 4096
+        dtype: bfloat16
+      a_scale: null
+      b_scale: null
+      block_shape: null
+      expert_ids:
+        shape:
+        - 264
+        dtype: int32
+      mul_routed_weight: true
+      num_tokens_post_padded:
+        shape:
+        - 1
+        dtype: int32
+      sorted_token_ids:
+        shape:
+        - 33784
+        dtype: int32
+      top_k: 1
+      topk_weights:
+        shape:
+        - 16384
+        - 2
+        dtype: bfloat16
+      use_fp8_w8a8: false
+    golden: mixtral-8x7b/tp2/bfloat16/moe_grouped_gemm/38ff4fe559d7b66f.safetensors
+  - name: tokens-1/60354553
+    init_args:
+      training: false
+    inputs:
+      A:
+        shape:
+        - 1
+        - 4096
+        dtype: bfloat16
+      B:
+        shape:
+        - 8
+        - 14336
+        - 4096
+        dtype: bfloat16
+      C:
+        shape:
+        - 2
+        - 14336
+        dtype: bfloat16
+      a_scale: null
+      b_scale: null
+      block_shape: null
+      expert_ids:
+        shape:
+        - 2
+        dtype: int32
+      mul_routed_weight: false
+      num_tokens_post_padded:
+        shape:
+        - 1
+        dtype: int32
+      sorted_token_ids: null
+      top_k: 2
+      topk_weights:
+        shape:
+        - 1
+        - 2
+        dtype: bfloat16
+      use_fp8_w8a8: false
+    golden: mixtral-8x7b/tp2/bfloat16/moe_grouped_gemm/6f1adaf894ca322f.safetensors
+  - name: tokens-2/04e017fa
+    init_args:
+      training: false
+    inputs:
+      A:
+        shape:
+        - 2
+        - 7168
+        dtype: bfloat16
+      B:
+        shape:
+        - 8
+        - 4096
+        - 7168
+        dtype: bfloat16
+      C:
+        shape:
+        - 2
+        - 4096
+        dtype: bfloat16
+      a_scale: null
+      b_scale: null
+      block_shape: null
+      expert_ids:
+        shape:
+        - 2
+        dtype: int32
+      mul_routed_weight: true
+      num_tokens_post_padded:
+        shape:
+        - 1
+        dtype: int32
+      sorted_token_ids: null
+      top_k: 1
+      topk_weights:
+        shape:
+        - 1
+        - 2
+        dtype: bfloat16
+      use_fp8_w8a8: false
+    golden: mixtral-8x7b/tp2/bfloat16/moe_grouped_gemm/2aee7fb7a28483bf.safetensors

@@ -58,8 +58,6 @@ class TraceEvent:
     def canonical_key(self) -> str:
         payload = {
             "op": self.op,
-            "tp": self.tp,
-            "dtype": self.dtype,
             "inputs": _canonical_for_key(self.inputs),
             "init_args": _canonical_for_key(self.init_args),
         }

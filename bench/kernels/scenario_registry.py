@@ -174,6 +174,8 @@ class InputRegistry:
             if not data:
                 continue
             for op_name, op_spec in data.items():
+                if not isinstance(op_spec, dict) or "scenarios" not in op_spec:
+                    continue
                 scenarios = []
                 for s in op_spec.get("scenarios", []):
                     scenarios.append(Scenario(
@@ -250,7 +252,7 @@ class InputRegistry:
             if not golden_file.is_file():
                 raise FileNotFoundError(
                     f"Golden data file not found: {golden_file}\n"
-                    f"Run bench/utils/capture_golden.py to generate it, "
+                    f"Run kb_nano capture-golden to generate it, "
                     f"or download from HuggingFace Hub."
                 )
             if golden_file.suffix == ".safetensors":
