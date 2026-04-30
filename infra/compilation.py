@@ -64,6 +64,9 @@ logger = logging.getLogger(__name__)
 
 SPLITTING_OPS: list[str] = [
     "kb_nano::unified_attention",
+    "kb_nano::mamba2_conv_ssm_forward",
+    "kb_nano::unified_mla_attention",
+    "kb_nano::sparse_attn_indexer",
 ]
 
 
@@ -101,6 +104,71 @@ def _unified_attention_fake(
     return torch.empty_like(query)
 
 
+def _mamba2_conv_ssm_forward_impl(
+    projected_states: torch.Tensor,
+    output: torch.Tensor,
+    layer_name: str,
+) -> None:
+    layer = get_no_compile_layers()[layer_name]
+    layer.conv_ssm_forward(projected_states, output)
+
+
+def _mamba2_conv_ssm_forward_fake(
+    projected_states: torch.Tensor,
+    output: torch.Tensor,
+    layer_name: str,
+) -> None:
+    return None
+
+
+def _unified_mla_attention_impl(
+    q: torch.Tensor,
+    kv_c_normed: torch.Tensor,
+    k_pe: torch.Tensor,
+    topk_indices: torch.Tensor | None,
+    layer_name: str,
+) -> torch.Tensor:
+    layer = get_no_compile_layers()[layer_name]
+    return layer.forward_impl(q, kv_c_normed, k_pe, topk_indices)
+
+
+def _unified_mla_attention_fake(
+    q: torch.Tensor,
+    kv_c_normed: torch.Tensor,
+    k_pe: torch.Tensor,
+    topk_indices: torch.Tensor | None,
+    layer_name: str,
+) -> torch.Tensor:
+    layer = get_no_compile_layers()[layer_name]
+    # Output shape is (N, num_heads * v_head_dim) where N is the (possibly
+    # symbolic) batch dim of ``q``. Using ``q.new_empty`` propagates the
+    # symbolic dim so torch.compile can keep the batch dim dynamic.
+    return q.new_empty((q.shape[0], layer.num_heads * layer.v_head_dim))
+
+
+def _sparse_attn_indexer_impl(
+    hidden_states: torch.Tensor,
+    q_latent: torch.Tensor,
+    positions: torch.Tensor,
+    layer_name: str,
+) -> torch.Tensor:
+    layer = get_no_compile_layers()[layer_name]
+    return layer.forward_impl(hidden_states, q_latent, positions)
+
+
+def _sparse_attn_indexer_fake(
+    hidden_states: torch.Tensor,
+    q_latent: torch.Tensor,
+    positions: torch.Tensor,
+    layer_name: str,
+) -> torch.Tensor:
+    layer = get_no_compile_layers()[layer_name]
+    M = hidden_states.shape[0]
+    return torch.empty(
+        (M, layer.topk_tokens), dtype=torch.int32, device=hidden_states.device,
+    )
+
+
 _registered = False
 
 
@@ -129,6 +197,30 @@ def ensure_custom_ops_registered() -> None:
     lib.impl("unified_attention", _unified_attention_impl, "CUDA")
     lib.impl("unified_attention", _unified_attention_impl, "CPU")
     abstract_lib.impl("unified_attention", _unified_attention_fake)
+
+    lib.define(
+        "mamba2_conv_ssm_forward(Tensor projected_states, Tensor(a!) output, "
+        "str layer_name) -> ()"
+    )
+    lib.impl("mamba2_conv_ssm_forward", _mamba2_conv_ssm_forward_impl, "CUDA")
+    lib.impl("mamba2_conv_ssm_forward", _mamba2_conv_ssm_forward_impl, "CPU")
+    abstract_lib.impl("mamba2_conv_ssm_forward", _mamba2_conv_ssm_forward_fake)
+
+    lib.define(
+        "unified_mla_attention(Tensor q, Tensor kv_c_normed, Tensor k_pe, "
+        "Tensor? topk_indices, str layer_name) -> Tensor"
+    )
+    lib.impl("unified_mla_attention", _unified_mla_attention_impl, "CUDA")
+    lib.impl("unified_mla_attention", _unified_mla_attention_impl, "CPU")
+    abstract_lib.impl("unified_mla_attention", _unified_mla_attention_fake)
+
+    lib.define(
+        "sparse_attn_indexer(Tensor hidden_states, Tensor q_latent, "
+        "Tensor positions, str layer_name) -> Tensor"
+    )
+    lib.impl("sparse_attn_indexer", _sparse_attn_indexer_impl, "CUDA")
+    lib.impl("sparse_attn_indexer", _sparse_attn_indexer_impl, "CPU")
+    abstract_lib.impl("sparse_attn_indexer", _sparse_attn_indexer_fake)
 
     # Keep references alive for the lifetime of the process.
     ensure_custom_ops_registered._lib = lib  # type: ignore[attr-defined]

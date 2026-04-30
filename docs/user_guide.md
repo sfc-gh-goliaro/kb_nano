@@ -41,7 +41,7 @@ kb_nano eval \
 
 ### Kernel Benchmark CLI
 
-`kb_nano kernels` benchmarks a single operator replacement. It instantiates the baseline and candidate modules, compares their `forward()` outputs for correctness (`allclose` + mean absolute difference), and measures wall-clock speedup.
+`kb_nano kernels` benchmarks a single operator replacement. It instantiates the baseline and candidate modules, compares their `forward()` outputs with a tolerance-normalized max error ratio, and measures wall-clock speedup. FP8 `(tensor, scale)` output pairs are compared after dequantization with scale-derived tolerances.
 
 ```bash
 # List all benchmarkable targets
@@ -60,7 +60,7 @@ kb_nano kernels \
     --tp 1
 ```
 
-A benchmark is **PASS** if the candidate output passes `allclose` against the baseline. Speedup > 1.0 means your kernel is faster than the baseline.
+A benchmark is **PASS** if the candidate output's max error ratio is <= 1.0 against the baseline. Speedup > 1.0 means your kernel is faster than the baseline.
 
 ### vLLM Alignment Test
 
@@ -118,7 +118,7 @@ Generated kernels are saved to `tasks/candidate/L{level}/{op_name}.py`.
 Every `kb_nano agent`, `kb_nano kernels`, `kb_nano eval`, and `kb_nano e2e` run is automatically logged to [MLflow](https://mlflow.org). This provides:
 
 - **Kernel lineage**: Every generated kernel is stored as an MLflow artifact, linked to the run parameters that produced it.
-- **Benchmark history**: Speedup, correctness, and mean absolute difference for every operator across every benchmark run.
+- **Benchmark history**: Speedup, correctness, and max error ratio for every operator across every benchmark run.
 - **Comparison**: Use the MLflow UI to compare runs side-by-side and visualize speedup trends.
 
 ### What gets logged
@@ -127,7 +127,7 @@ Every `kb_nano agent`, `kb_nano kernels`, `kb_nano eval`, and `kb_nano e2e` run 
 |---------|-------------|
 | `kb_nano agent` | Run params, per-op generation success/attempts, unit test results, e2e speedup, kernel source code |
 | `kb_nano kernels` | Bench params, per-operator per-scenario speedup/correctness, kernel source code |
-| `kb_nano eval` | Per-model throughput/latency speedup, alignment rate, wall-clock time |
+| `kb_nano eval` | Per-model throughput/latency speedup, alignment rate, MacroEval speedup/correctness/coverage/score, wall-clock time |
 | `kb_nano e2e` | Throughput (tokens/s), latency (percentiles), serve metrics (TTFT, TPOT, ITL) |
 
 ### Querying from the CLI
@@ -159,11 +159,11 @@ kb_nano history --limit 50       # show more results
 ======================================================================
   TRACKING HISTORY: rms_norm
 ======================================================================
-  TIMESTAMP          RUN NAME                     SPEEDUP   PASS  MEAN_DIFF     RUN ID
+  TIMESTAMP          RUN NAME                     SPEEDUP   PASS  ERR_RATIO     RUN ID
   ──────────────────────────────────────────────────────────────────
-  2026-03-16 16:44   kernels_rms_norm               1.64x    2/2    1.2e-06   a1b2c3d4
-  2026-03-15 14:20   kernels_rms_norm               1.31x    2/2    2.1e-06   e5f6a7b8
-  2026-03-14 09:55   agent_L1_Llama-3.1-8B          1.12x    2/2    3.4e-05   c9d0e1f2
+  2026-03-16 16:44   kernels_rms_norm               1.64x    2/2   1.20e-04   a1b2c3d4
+  2026-03-15 14:20   kernels_rms_norm               1.31x    2/2   2.10e-04   e5f6a7b8
+  2026-03-14 09:55   agent_L1_Llama-3.1-8B          1.12x    2/2   3.40e-03   c9d0e1f2
 ======================================================================
 ```
 
@@ -274,7 +274,7 @@ Each run is tagged with a `tier` that indicates its source:
 |-----|---------------|-------------|
 | `agent` | `kb_nano agent` | `gen_{op}_success`, `utest_{op}_success`, `e2e_speedup`, `e2e_token_match_rate` |
 | `kernel` | `kb_nano kernels` | `{op}_avg_speedup`, `{op}_passed`, `{op}_failed`, `avg_speedup` |
-| `eval` | `kb_nano eval` | `avg_throughput_speedup`, `avg_latency_speedup`, `alignment_rate` |
+| `eval` | `kb_nano eval` | `avg_throughput_speedup`, `avg_latency_speedup`, `alignment_rate`, `macro_speedup`, `macro_correctness`, `macro_coverage`, `macro_score` |
 | `e2e` | `kb_nano e2e` | `tokens_per_second`, `avg_latency`, `mean_ttft_ms` (varies by bench type) |
 
 ### Disabling tracking

@@ -11,6 +11,7 @@ Output format: JSON (machine-readable) + formatted table (human-readable).
 from __future__ import annotations
 
 import json
+import math
 import os
 import subprocess
 from dataclasses import asdict, dataclass, field
@@ -19,6 +20,9 @@ from typing import TYPE_CHECKING
 
 if TYPE_CHECKING:
     from .runner import JobResult
+
+_DEFAULT_LAMBDA = 0.5
+_DEFAULT_CORRECTNESS_THRESHOLD = 1.0
 
 
 def _detect_gpu_name() -> str:
@@ -35,6 +39,30 @@ def _detect_gpu_name() -> str:
         return "unknown"
 
 
+def _valid_speedup(value: float) -> bool:
+    return math.isfinite(value) and value > 0.0
+
+
+def _geomean(values: list[float], default: float = 1.0) -> float:
+    valid = [v for v in values if _valid_speedup(v)]
+    if not valid:
+        return default
+    return math.exp(sum(math.log(v) for v in valid) / len(valid))
+
+
+def _blend_speedup(
+    throughput_speedup: float,
+    latency_speedup: float,
+    lambda_weight: float = _DEFAULT_LAMBDA,
+) -> float:
+    if not _valid_speedup(throughput_speedup) or not _valid_speedup(latency_speedup):
+        return 0.0
+    return (
+        throughput_speedup ** lambda_weight
+        * latency_speedup ** (1.0 - lambda_weight)
+    )
+
+
 @dataclass
 class ModelResult:
     model: str
@@ -43,6 +71,9 @@ class ModelResult:
     throughput_speedup: float = 1.0
     latency_speedup: float = 1.0
     alignment_rate: float = 1.0
+    correctness_score: float = 1.0
+    valid: bool = True
+    blended_speedup: float = 1.0
     error: str | None = None
 
 
@@ -53,6 +84,10 @@ class CategoryResult:
     avg_throughput_speedup: float = 1.0
     avg_latency_speedup: float = 1.0
     alignment_rate: float = 1.0
+    macro_correctness: float = 1.0
+    macro_coverage: float = 1.0
+    macro_speedup: float = 1.0
+    macro_score: float = 1.0
     models: list[ModelResult] = field(default_factory=list)
 
 
@@ -67,6 +102,10 @@ class EvalReport:
     avg_throughput_speedup: float = 1.0
     avg_latency_speedup: float = 1.0
     alignment_rate: float = 1.0
+    macro_correctness: float = 1.0
+    macro_coverage: float = 1.0
+    macro_speedup: float = 1.0
+    macro_score: float = 1.0
     failed_jobs: int = 0
     categories: list[CategoryResult] = field(default_factory=list)
 
@@ -137,6 +176,10 @@ class EvalReport:
         print(f"  Avg throughput speedup : {self.avg_throughput_speedup:.2f}x")
         print(f"  Avg latency speedup    : {self.avg_latency_speedup:.2f}x")
         print(f"  Overall alignment      : {self.alignment_rate:.1%}")
+        print(f"  MacroEval speedup      : {self.macro_speedup:.2f}x")
+        print(f"  MacroEval correctness  : {self.macro_correctness:.1%}")
+        print(f"  MacroEval coverage     : {self.macro_coverage:.1%}")
+        print(f"  MacroEval score        : {self.macro_score:.2f}")
         print(f"  Failed jobs            : {self.failed_jobs}")
         print(f"  Wall-clock time        : {wall_str}")
         print(f"{'=' * 70}")
@@ -162,7 +205,16 @@ class Aggregator:
         for jr in results:
             if jr.status == "FAILED":
                 mr = ModelResult(
-                    model=jr.model, tp=jr.tp, status="FAILED", error=jr.error,
+                    model=jr.model,
+                    tp=jr.tp,
+                    status="FAILED",
+                    throughput_speedup=0.0,
+                    latency_speedup=0.0,
+                    alignment_rate=0.0,
+                    correctness_score=0.0,
+                    valid=False,
+                    blended_speedup=0.0,
+                    error=jr.error,
                 )
                 category_map.setdefault(jr.category, []).append(mr)
                 failed += 1
@@ -170,12 +222,18 @@ class Aggregator:
 
             thru_speedups = [t["speedup"] for t in jr.throughput_results]
             lat_speedups = [l["speedup"] for l in jr.latency_results]
-            avg_thru = sum(thru_speedups) / len(thru_speedups) if thru_speedups else 1.0
-            avg_lat = sum(lat_speedups) / len(lat_speedups) if lat_speedups else 1.0
+            avg_thru = _geomean(thru_speedups)
+            avg_lat = _geomean(lat_speedups)
 
             total_aligned = sum(t.get("aligned_matches", 0) for t in jr.throughput_results)
             total_align_denom = sum(t.get("aligned_total", 0) for t in jr.throughput_results)
             align_rate = total_aligned / total_align_denom if total_align_denom > 0 else 1.0
+            correctness_score = max(0.0, min(1.0, align_rate))
+            valid = correctness_score >= _DEFAULT_CORRECTNESS_THRESHOLD
+            blended_speedup = (
+                _blend_speedup(avg_thru, avg_lat)
+                if valid else 0.0
+            )
 
             mr = ModelResult(
                 model=jr.model,
@@ -184,6 +242,9 @@ class Aggregator:
                 throughput_speedup=avg_thru,
                 latency_speedup=avg_lat,
                 alignment_rate=align_rate,
+                correctness_score=correctness_score,
+                valid=valid,
+                blended_speedup=blended_speedup,
             )
             category_map.setdefault(jr.category, []).append(mr)
             all_throughput_speedups.append(avg_thru)
@@ -195,19 +256,34 @@ class Aggregator:
         for cat_name in sorted(category_map):
             cat_models = category_map[cat_name]
             ok_models = [m for m in cat_models if m.status == "OK"]
+            valid_models = [m for m in ok_models if m.valid]
             cat_thru = (
-                sum(m.throughput_speedup for m in ok_models) / len(ok_models)
-                if ok_models else 1.0
+                _geomean([m.throughput_speedup for m in ok_models])
+                if ok_models else 0.0
             )
             cat_lat = (
-                sum(m.latency_speedup for m in ok_models) / len(ok_models)
-                if ok_models else 1.0
+                _geomean([m.latency_speedup for m in ok_models])
+                if ok_models else 0.0
             )
-            cat_align_num = sum(
-                int(m.alignment_rate * 1000) for m in ok_models
+            cat_align = (
+                sum(m.alignment_rate for m in ok_models) / len(ok_models)
+                if ok_models else 0.0
             )
-            cat_align_den = len(ok_models) * 1000 if ok_models else 1
-            cat_align = cat_align_num / cat_align_den if cat_align_den > 0 else 1.0
+            cat_correctness = (
+                sum(m.correctness_score for m in cat_models) / len(cat_models)
+                if cat_models else 0.0
+            )
+            cat_coverage = (
+                sum(1 for m in cat_models if m.valid) / len(cat_models)
+                if cat_models else 0.0
+            )
+            cat_macro_speedup = _geomean(
+                [m.blended_speedup for m in valid_models],
+                default=1.0,
+            )
+            if not valid_models:
+                cat_macro_speedup = 1.0
+            cat_score = cat_macro_speedup * cat_correctness * cat_coverage
 
             categories.append(CategoryResult(
                 name=cat_name,
@@ -215,15 +291,19 @@ class Aggregator:
                 avg_throughput_speedup=cat_thru,
                 avg_latency_speedup=cat_lat,
                 alignment_rate=cat_align,
+                macro_correctness=cat_correctness,
+                macro_coverage=cat_coverage,
+                macro_speedup=cat_macro_speedup,
+                macro_score=cat_score,
                 models=cat_models,
             ))
 
         overall_thru = (
-            sum(all_throughput_speedups) / len(all_throughput_speedups)
+            _geomean(all_throughput_speedups)
             if all_throughput_speedups else 1.0
         )
         overall_lat = (
-            sum(all_latency_speedups) / len(all_latency_speedups)
+            _geomean(all_latency_speedups)
             if all_latency_speedups else 1.0
         )
         overall_align_num = sum(all_alignment_nums)
@@ -233,6 +313,22 @@ class Aggregator:
         unique_models = set()
         for jr in results:
             unique_models.add(jr.model)
+
+        macro_correctness = (
+            sum(c.macro_correctness for c in categories) / len(categories)
+            if categories else 1.0
+        )
+        macro_coverage = (
+            sum(c.macro_coverage for c in categories) / len(categories)
+            if categories else 1.0
+        )
+        speedup_categories = [
+            c.macro_speedup
+            for c in categories
+            if any(m.valid for m in c.models)
+        ]
+        macro_speedup = _geomean(speedup_categories) if speedup_categories else 1.0
+        macro_score = macro_speedup * macro_correctness * macro_coverage
 
         return EvalReport(
             timestamp=datetime.now().isoformat(),
@@ -244,6 +340,10 @@ class Aggregator:
             avg_throughput_speedup=overall_thru,
             avg_latency_speedup=overall_lat,
             alignment_rate=overall_align,
+            macro_correctness=macro_correctness,
+            macro_coverage=macro_coverage,
+            macro_speedup=macro_speedup,
+            macro_score=macro_score,
             failed_jobs=failed,
             categories=categories,
         )
