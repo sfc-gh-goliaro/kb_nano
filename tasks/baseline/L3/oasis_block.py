@@ -7,10 +7,11 @@ import torch.nn as nn
 
 from ..L1.layer_norm import LayerNorm
 from ..L1.linear import Linear
-from ..L1.oasis_rotary import RotaryEmbedding
+from ..L1.oasis_rotary import OasisRotaryEmbedding
 from ..L1.silu import SiLU
-from ..L2.oasis_attention import SpatialAxialAttention, TemporalAxialAttention
 from ..L2.oasis_mlp import OasisMLP
+from ..L2.oasis_spatial_axial_attention import OasisSpatialAxialAttention
+from ..L2.oasis_temporal_axial_attention import OasisTemporalAxialAttention
 
 
 def _modulate(x: torch.Tensor, shift: torch.Tensor, scale: torch.Tensor) -> torch.Tensor:
@@ -39,12 +40,12 @@ class SpatioTemporalDiTBlock(nn.Module):
         *,
         mlp_ratio: float = 4.0,
         is_causal: bool = True,
-        spatial_rotary_emb: RotaryEmbedding,
-        temporal_rotary_emb: RotaryEmbedding,
+        spatial_rotary_emb: OasisRotaryEmbedding,
+        temporal_rotary_emb: OasisRotaryEmbedding,
     ):
         super().__init__()
         self.s_norm1 = LayerNorm(hidden_size, eps=1e-6, elementwise_affine=False)
-        self.s_attn = SpatialAxialAttention(
+        self.s_attn = OasisSpatialAxialAttention(
             hidden_size,
             heads=num_heads,
             dim_head=hidden_size // num_heads,
@@ -62,7 +63,7 @@ class SpatioTemporalDiTBlock(nn.Module):
         )
 
         self.t_norm1 = LayerNorm(hidden_size, eps=1e-6, elementwise_affine=False)
-        self.t_attn = TemporalAxialAttention(
+        self.t_attn = OasisTemporalAxialAttention(
             hidden_size,
             heads=num_heads,
             dim_head=hidden_size // num_heads,

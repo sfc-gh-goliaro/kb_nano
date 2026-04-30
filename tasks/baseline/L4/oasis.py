@@ -12,11 +12,13 @@ from safetensors.torch import load_file
 
 from ..L1.layer_norm import LayerNorm
 from ..L1.linear import Linear
-from ..L1.oasis_rotary import RotaryEmbedding
+from ..L1.oasis_rotary import OasisRotaryEmbedding
 from ..L1.silu import SiLU
-from ..L2.oasis_attention import OasisVAEAttentionBlock
-from ..L2.oasis_embeddings import FinalLayer, PatchEmbed, TimestepEmbedder
+from ..L2.oasis_final_layer import OasisFinalLayer
+from ..L2.oasis_patch_embed import OasisPatchEmbed
+from ..L2.oasis_timestep_embedder import OasisTimestepEmbedder
 from ..L3.oasis_block import SpatioTemporalDiTBlock
+from ..L3.oasis_vae_attention_block import OasisVAEAttentionBlock
 
 
 def sigmoid_beta_schedule(timesteps: int, start: float = -3, end: float = 3, tau: float = 1, clamp_min: float = 1e-5):
@@ -76,7 +78,7 @@ class AutoencoderKL(nn.Module):
         self.latent_dim = latent_dim
         self.use_variational = use_variational
 
-        self.patch_embed = PatchEmbed(input_height, input_width, patch_size, 3, enc_dim)
+        self.patch_embed = OasisPatchEmbed(input_height, input_width, patch_size, 3, enc_dim)
         self.encoder = nn.ModuleList(
             [
                 OasisVAEAttentionBlock(
@@ -177,11 +179,11 @@ class DiT(nn.Module):
         self.num_heads = num_heads
         self.max_frames = max_frames
 
-        self.x_embedder = PatchEmbed(input_h, input_w, patch_size, in_channels, hidden_size, flatten=False)
-        self.t_embedder = TimestepEmbedder(hidden_size)
+        self.x_embedder = OasisPatchEmbed(input_h, input_w, patch_size, in_channels, hidden_size, flatten=False)
+        self.t_embedder = OasisTimestepEmbedder(hidden_size)
         head_dim = hidden_size // num_heads
-        self.spatial_rotary_emb = RotaryEmbedding(dim=head_dim // 2, freqs_for="pixel", max_freq=256)
-        self.temporal_rotary_emb = RotaryEmbedding(dim=head_dim, freqs_for="lang")
+        self.spatial_rotary_emb = OasisRotaryEmbedding(dim=head_dim // 2, freqs_for="pixel", max_freq=256)
+        self.temporal_rotary_emb = OasisRotaryEmbedding(dim=head_dim, freqs_for="lang")
         self.external_cond = Linear(external_cond_dim, hidden_size, bias=True) if external_cond_dim > 0 else nn.Identity()
         self.blocks = nn.ModuleList(
             [
@@ -196,7 +198,7 @@ class DiT(nn.Module):
                 for _ in range(depth)
             ]
         )
-        self.final_layer = FinalLayer(hidden_size, patch_size, self.out_channels)
+        self.final_layer = OasisFinalLayer(hidden_size, patch_size, self.out_channels)
         self.initialize_weights()
 
     def initialize_weights(self) -> None:

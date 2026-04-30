@@ -15,24 +15,24 @@ import torch.nn as nn
 from einops import rearrange, repeat
 
 
-def rotate_half(x: torch.Tensor) -> torch.Tensor:
+def oasis_rotate_half(x: torch.Tensor) -> torch.Tensor:
     x = rearrange(x, "... (d r) -> ... d r", r=2)
     x1, x2 = x.unbind(dim=-1)
     x = torch.stack((-x2, x1), dim=-1)
     return rearrange(x, "... d r -> ... (d r)")
 
 
-def apply_rotary_emb(freqs: torch.Tensor, t: torch.Tensor) -> torch.Tensor:
+def oasis_apply_rotary_emb(freqs: torch.Tensor, t: torch.Tensor) -> torch.Tensor:
     dtype = t.dtype
     rot_dim = freqs.shape[-1]
     t_left = t[..., :0]
     t_middle = t[..., :rot_dim]
     t_right = t[..., rot_dim:]
-    t_transformed = (t_middle * freqs.cos()) + (rotate_half(t_middle) * freqs.sin())
+    t_transformed = (t_middle * freqs.cos()) + (oasis_rotate_half(t_middle) * freqs.sin())
     return torch.cat((t_left, t_transformed, t_right), dim=-1).to(dtype)
 
 
-class RotaryEmbedding(nn.Module):
+class OasisRotaryEmbedding(nn.Module):
     def __init__(
         self,
         dim: int,
@@ -65,7 +65,7 @@ class RotaryEmbedding(nn.Module):
         seq_len = t.shape[-2]
         positions = torch.arange(seq_len, device=t.device, dtype=t.dtype)
         seq_freqs = self._forward_freqs(positions, freqs)
-        return apply_rotary_emb(seq_freqs, t)
+        return oasis_apply_rotary_emb(seq_freqs, t)
 
     def get_axial_freqs(self, *dims: int) -> torch.Tensor:
         colon = slice(None)
