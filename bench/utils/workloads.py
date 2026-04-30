@@ -414,6 +414,65 @@ ALL_VIDEO_DIFFUSION_WORKLOADS = {
 
 
 # ---------------------------------------------------------------------------
+# Oasis workloads (autoregressive video diffusion)
+# ---------------------------------------------------------------------------
+
+@dataclass(frozen=True)
+class OasisWorkload:
+    name: str
+    batch_clips: int
+    num_frames: int
+    ddim_steps: int
+    n_prompt_frames: int = 1
+    kind: str = "throughput"
+    dataset_name: str = "TESS-Computer/minecraft-vla-stage1"
+    dataset_split: str = "train"
+
+
+OASIS_THROUGHPUT_WORKLOADS: list[OasisWorkload] = [
+    OasisWorkload(
+        name="short-bs4-16f-4ddim",
+        batch_clips=4,
+        num_frames=16,
+        ddim_steps=4,
+    ),
+    OasisWorkload(
+        name="medium-bs8-24f-4ddim",
+        batch_clips=8,
+        num_frames=24,
+        ddim_steps=4,
+    ),
+    OasisWorkload(
+        name="long-bs8-32f-4ddim",
+        batch_clips=8,
+        num_frames=32,
+        ddim_steps=4,
+    ),
+    OasisWorkload(
+        name="denoise-bs4-16f-8ddim",
+        batch_clips=4,
+        num_frames=16,
+        ddim_steps=8,
+    ),
+]
+
+OASIS_LATENCY_WORKLOADS: list[OasisWorkload] = [
+    OasisWorkload(
+        name="latency-bs1-8f-4ddim",
+        batch_clips=1,
+        num_frames=8,
+        ddim_steps=4,
+        kind="latency",
+    ),
+]
+
+ALL_OASIS_WORKLOADS = {
+    "throughput": OASIS_THROUGHPUT_WORKLOADS,
+    "latency": OASIS_LATENCY_WORKLOADS,
+}
+
+
+# ---------------------------------------------------------------------------
 # Vision encoder workloads (pure image feature extraction, e.g. SigLIP-2, DINOv3)
 # ---------------------------------------------------------------------------
 

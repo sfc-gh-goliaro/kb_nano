@@ -30,7 +30,6 @@ import sys
 import time
 from collections import deque
 from contextlib import nullcontext
-from dataclasses import dataclass
 from pathlib import Path
 from typing import Any
 
@@ -40,6 +39,7 @@ from huggingface_hub import snapshot_download
 from PIL import Image
 from safetensors.torch import load_model
 from torchvision.transforms.functional import pil_to_tensor, resize
+from tqdm import tqdm
 
 
 def _bootstrap_local_package() -> None:
@@ -62,13 +62,16 @@ from kb_nano.tasks.baseline.L4.oasis import (  # noqa: E402
     OasisPipeline,
     OasisSamplingParams,
 )
+from kb_nano.bench.utils.workloads import (  # noqa: E402
+    OASIS_LATENCY_WORKLOADS,
+    OASIS_THROUGHPUT_WORKLOADS,
+    OasisWorkload,
+)
 
 
 OPEN_OASIS_REPO = "https://github.com/etched-ai/open-oasis.git"
 OASIS_MODEL = "Etched/oasis-500m"
 CACHE_FORMAT_VERSION = 3
-DATASET_NAME = "TESS-Computer/minecraft-vla-stage1"
-DATASET_SPLIT = "train"
 WARMUP_ITERS = 2
 THROUGHPUT_ITERS = 5
 CORRECTNESS_COSINE_THRESHOLDS = {
@@ -76,6 +79,10 @@ CORRECTNESS_COSINE_THRESHOLDS = {
     "latents": 0.99,
     "video": 0.99,
 }
+
+
+def _log(message: str) -> None:
+    print(f"[bench_oasis] {message}", flush=True)
 
 OASIS_ACTION_KEYS = [
     "inventory",
@@ -126,58 +133,6 @@ LUMINE_TOKEN_TO_ACTION = {
 }
 
 
-@dataclass(frozen=True)
-class OasisBenchScenario:
-    name: str
-    batch_clips: int
-    num_frames: int
-    ddim_steps: int
-    n_prompt_frames: int = 1
-    kind: str = "throughput"
-
-
-LATENCY_SCENARIOS = [
-    OasisBenchScenario(
-        name="latency-bs1-8f-4ddim",
-        batch_clips=1,
-        num_frames=8,
-        ddim_steps=4,
-        kind="latency",
-    ),
-]
-
-THROUGHPUT_WORKLOAD = [
-    OasisBenchScenario(
-        name="short-bs4-16f-4ddim",
-        batch_clips=4,
-        num_frames=16,
-        ddim_steps=4,
-        kind="throughput",
-    ),
-    OasisBenchScenario(
-        name="medium-bs8-24f-4ddim",
-        batch_clips=8,
-        num_frames=24,
-        ddim_steps=4,
-        kind="throughput",
-    ),
-    OasisBenchScenario(
-        name="long-bs8-32f-4ddim",
-        batch_clips=8,
-        num_frames=32,
-        ddim_steps=4,
-        kind="throughput",
-    ),
-    OasisBenchScenario(
-        name="denoise-bs4-16f-8ddim",
-        batch_clips=4,
-        num_frames=16,
-        ddim_steps=8,
-        kind="throughput",
-    ),
-]
-
-
 def _detect_gpu_name() -> str:
     try:
         out = subprocess.check_output(
@@ -204,7 +159,10 @@ def _sync(device: torch.device) -> None:
 
 
 def _download_model(model_name: str) -> str:
-    return snapshot_download(model_name, allow_patterns=["*.safetensors", "README.md", "LICENSE"])
+    _log(f"checking/downloading Hugging Face checkpoint: {model_name}")
+    model_dir = snapshot_download(model_name, allow_patterns=["*.safetensors", "README.md", "LICENSE"])
+    _log(f"checkpoint ready: {model_dir}")
+    return model_dir
 
 
 def _default_cache_dir() -> Path:
@@ -220,16 +178,20 @@ def _ensure_open_oasis_source(open_oasis_src: str | None, *, repo: str) -> Path:
         src = Path(open_oasis_src).expanduser().resolve()
         if not (src / "dit.py").exists() or not (src / "vae.py").exists() or not (src / "utils.py").exists():
             raise FileNotFoundError(f"{src} does not look like an open-oasis checkout")
+        _log(f"using open-oasis source: {src}")
         return src
 
     src = _default_open_oasis_dir()
     if (src / "dit.py").exists() and (src / "vae.py").exists() and (src / "utils.py").exists():
+        _log(f"using cached open-oasis source: {src}")
         return src
 
     src.parent.mkdir(parents=True, exist_ok=True)
     if src.exists():
         shutil.rmtree(src)
+    _log(f"cloning open-oasis into {src}")
     subprocess.run(["git", "clone", "--depth", "1", repo, str(src)], check=True)
+    _log("open-oasis clone ready")
     return src
 
 
@@ -261,23 +223,30 @@ def _build_open_oasis(
     *,
     device: torch.device,
 ) -> tuple[torch.nn.Module, torch.nn.Module, Any]:
+    _log("building open-oasis reference models")
     dit_mod, vae_mod, utils_mod = _import_open_oasis_modules(open_oasis_src)
     model_path, vae_path = _checkpoint_paths(model_dir)
 
     model = dit_mod.DiT_models["DiT-S/2"]()
     vae = vae_mod.VAE_models["vit-l-20-shallow-encoder"]()
+    _log("loading open-oasis DiT weights")
     load_model(model, model_path)
+    _log("loading open-oasis VAE weights")
     load_model(vae, vae_path)
     model = model.to(device=device).eval()
     vae = vae.to(device=device).eval()
+    _log("open-oasis reference ready")
     return model, vae, utils_mod.sigmoid_beta_schedule
 
 
 def _build_kb_nano(model_dir: str, *, device: torch.device, dtype: torch.dtype) -> OasisPipeline:
+    _log("building kb-nano Oasis pipeline")
     pipeline = OasisPipeline(OasisConfig())
+    _log("loading kb-nano Oasis weights")
     pipeline.load_weights(model_dir)
     pipeline.model.to(device=device, dtype=dtype)
     pipeline.vae.to(device=device, dtype=dtype)
+    _log("kb-nano Oasis pipeline ready")
     return pipeline.eval()
 
 
@@ -370,6 +339,11 @@ def _prepare_dataset_cache(
     clip_start_frame_idx: int | None = None
 
     dataset = load_dataset(dataset_name, split=dataset_split, streaming=True)
+    _log(
+        f"building dataset cache: {dataset_name}:{dataset_split}, "
+        f"clips={num_clips}, frames={num_frames}, prompt_frames={n_prompt_frames}"
+    )
+    pbar = tqdm(total=num_clips, desc="dataset clips", unit="clip", file=sys.stderr)
     for row in dataset:
         video_id = str(row["video_id"])
         frame_idx = int(row["frame_idx"])
@@ -430,12 +404,14 @@ def _prepare_dataset_cache(
                 "end_frame_idx": frame_idx,
             }
         )
+        pbar.update(1)
 
         frame_buffer.clear()
         action_buffer.clear()
         clip_start_frame_idx = None
         if len(prompts) >= num_clips:
             break
+    pbar.close()
 
     if len(prompts) < num_clips:
         raise RuntimeError(
@@ -455,6 +431,7 @@ def _prepare_dataset_cache(
         },
         cache_path,
     )
+    _log(f"saved dataset cache: {cache_path}")
 
 
 def _load_real_dataset_inputs(
@@ -484,10 +461,16 @@ def _load_real_dataset_inputs(
             num_frames=num_frames,
             n_prompt_frames=n_prompt_frames,
         )
+    else:
+        _log(f"using dataset cache: {cache_path}")
+    _log("loading dataset tensors")
     payload = torch.load(cache_path, map_location="cpu", weights_only=False)
+    prompt = payload["prompt"].float().to(device)
+    actions = payload["actions"].float().to(device)
+    _log(f"dataset tensors ready: prompt={tuple(prompt.shape)}, actions={tuple(actions.shape)}")
     return (
-        payload["prompt"].float().to(device),
-        payload["actions"].float().to(device),
+        prompt,
+        actions,
         {
             "mode": "dataset",
             "name": payload["dataset"],
@@ -499,7 +482,7 @@ def _load_real_dataset_inputs(
     )
 
 
-def _scenario_params(scenario: OasisBenchScenario, *, seed: int) -> OasisSamplingParams:
+def _scenario_params(scenario: OasisWorkload, *, seed: int) -> OasisSamplingParams:
     return OasisSamplingParams(
         num_frames=scenario.num_frames,
         ddim_steps=scenario.ddim_steps,
@@ -511,7 +494,7 @@ def _scenario_params(scenario: OasisBenchScenario, *, seed: int) -> OasisSamplin
 def _slice_inputs(
     prompt: torch.Tensor,
     actions: torch.Tensor,
-    scenario: OasisBenchScenario,
+    scenario: OasisWorkload,
 ) -> tuple[torch.Tensor, torch.Tensor]:
     batch = min(scenario.batch_clips, int(prompt.shape[0]))
     if batch < scenario.batch_clips:
@@ -523,7 +506,7 @@ def _run_kb_pipeline(
     pipeline: OasisPipeline,
     prompt: torch.Tensor,
     actions: torch.Tensor,
-    scenario: OasisBenchScenario,
+    scenario: OasisWorkload,
     *,
     dtype: torch.dtype,
     seed: int,
@@ -542,7 +525,7 @@ def _run_open_oasis_pipeline(
     beta_schedule,
     prompt: torch.Tensor,
     actions: torch.Tensor,
-    scenario: OasisBenchScenario,
+    scenario: OasisWorkload,
     *,
     dtype: torch.dtype,
     seed: int,
@@ -611,12 +594,20 @@ def _run_open_oasis_pipeline(
     }
 
 
-def _benchmark(fn, *, device: torch.device, warmup: int, iters: int, units_per_iter: int) -> dict[str, float]:
-    for _ in range(warmup):
+def _benchmark(
+    fn,
+    *,
+    device: torch.device,
+    warmup: int,
+    iters: int,
+    units_per_iter: int,
+    desc: str,
+) -> dict[str, float]:
+    for _ in tqdm(range(warmup), desc=f"{desc} warmup", unit="iter", file=sys.stderr):
         fn()
     _sync(device)
     times: list[float] = []
-    for _ in range(iters):
+    for _ in tqdm(range(iters), desc=f"{desc} timed", unit="iter", file=sys.stderr):
         _sync(device)
         start = time.perf_counter()
         fn()
@@ -671,7 +662,7 @@ def _correctness_status(metrics: dict[str, dict[str, float]]) -> dict[str, Any]:
     return checked
 
 
-def _max_workload_requirements(scenarios: list[OasisBenchScenario]) -> tuple[int, int, int]:
+def _max_workload_requirements(scenarios: list[OasisWorkload]) -> tuple[int, int, int]:
     max_clips = max(s.batch_clips for s in scenarios)
     max_frames = max(s.num_frames for s in scenarios)
     max_prompt_frames = max(s.n_prompt_frames for s in scenarios)
@@ -692,13 +683,19 @@ def main() -> None:
 
     device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
     dtype = torch.float16 if device.type == "cuda" else torch.float32
-    scenarios: list[OasisBenchScenario] = []
+    _log(f"starting benchmark on {device} with dtype={dtype}")
+    scenarios: list[OasisWorkload] = []
     if not args.skip_latency:
-        scenarios.extend(LATENCY_SCENARIOS)
+        scenarios.extend(OASIS_LATENCY_WORKLOADS)
     if not args.skip_throughput:
-        scenarios.extend(THROUGHPUT_WORKLOAD)
+        scenarios.extend(OASIS_THROUGHPUT_WORKLOADS)
     if not scenarios:
         raise ValueError("Nothing to run: both latency and throughput were skipped.")
+    _log("selected scenarios: " + ", ".join(s.name for s in scenarios))
+    dataset_name = scenarios[0].dataset_name
+    dataset_split = scenarios[0].dataset_split
+    if any(s.dataset_name != dataset_name or s.dataset_split != dataset_split for s in scenarios):
+        raise ValueError("Oasis benchmark expects all selected workloads to use the same dataset")
     max_clips, max_frames, max_prompt_frames = _max_workload_requirements(scenarios)
 
     model_dir = _download_model(args.model)
@@ -707,8 +704,8 @@ def main() -> None:
         open_oasis_src = _ensure_open_oasis_source(args.open_oasis_src, repo=OPEN_OASIS_REPO)
 
     prompt, actions, input_info = _load_real_dataset_inputs(
-        dataset_name=DATASET_NAME,
-        dataset_split=DATASET_SPLIT,
+        dataset_name=dataset_name,
+        dataset_split=dataset_split,
         cache_dir=_default_cache_dir(),
         num_clips=max_clips,
         num_frames=max_frames,
@@ -736,7 +733,11 @@ def main() -> None:
 
     if scenarios:
         throughput_results: list[dict[str, Any]] = []
-        for scenario in scenarios:
+        for scenario in tqdm(scenarios, desc="scenarios", unit="scenario", file=sys.stderr):
+            _log(
+                f"scenario {scenario.name}: clips={scenario.batch_clips}, "
+                f"frames={scenario.num_frames}, ddim_steps={scenario.ddim_steps}"
+            )
             scenario_prompt, scenario_actions = _slice_inputs(prompt, actions, scenario)
             units_per_iter = int(scenario_prompt.shape[0])
             timed_iters = args.latency_iters if scenario.kind == "latency" else THROUGHPUT_ITERS
@@ -748,10 +749,13 @@ def main() -> None:
                 and ref_vae is not None
                 and ref_beta_schedule is not None
             ):
+                _log(f"{scenario.name}: running correctness pass for kb-nano and open-oasis")
                 with torch.inference_mode():
+                    _log(f"{scenario.name}: correctness kb-nano rollout")
                     kb_out = _run_kb_pipeline(
                         kb, scenario_prompt, scenario_actions, scenario, dtype=dtype, seed=args.seed
                     )
+                    _log(f"{scenario.name}: correctness open-oasis rollout")
                     ref_out = _run_open_oasis_pipeline(
                         ref_model,
                         ref_vae,
@@ -769,7 +773,9 @@ def main() -> None:
                         "video": _tensor_metrics(kb_out["video"], ref_out["video"]),
                     }
                 )
+                _log(f"{scenario.name}: correctness overall_pass={correctness['overall_pass']}")
 
+            _log(f"{scenario.name}: benchmarking kb-nano")
             kb_metrics = _benchmark(
                 lambda s=scenario, p=scenario_prompt, a=scenario_actions: _run_kb_pipeline(
                     kb, p, a, s, dtype=dtype, seed=args.seed
@@ -778,6 +784,7 @@ def main() -> None:
                 warmup=WARMUP_ITERS,
                 iters=timed_iters,
                 units_per_iter=units_per_iter,
+                desc=f"kb-nano {scenario.name}",
             )
             item: dict[str, Any] = {
                 "scenario": scenario.__dict__,
@@ -786,6 +793,7 @@ def main() -> None:
             if correctness is not None:
                 item["correctness"] = correctness
             if ref_model is not None and ref_vae is not None and ref_beta_schedule is not None:
+                _log(f"{scenario.name}: benchmarking open-oasis")
                 ref_metrics = _benchmark(
                     lambda s=scenario, p=scenario_prompt, a=scenario_actions: _run_open_oasis_pipeline(
                         ref_model, ref_vae, ref_beta_schedule, p, a, s, dtype=dtype, seed=args.seed
@@ -794,6 +802,7 @@ def main() -> None:
                     warmup=WARMUP_ITERS,
                     iters=timed_iters,
                     units_per_iter=units_per_iter,
+                    desc=f"open-oasis {scenario.name}",
                 )
                 item["open_oasis"] = ref_metrics
                 item["speedup"] = kb_metrics["videos_per_second"] / ref_metrics["videos_per_second"]
