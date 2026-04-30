@@ -16,8 +16,8 @@ from ..L3.oasis_rollout import OasisRollout
 sigmoid_beta_schedule = OasisRollout.sigmoid_beta_schedule
 
 
-def DiT_S_2() -> OasisDiT:
-    return OasisDiT(patch_size=2, hidden_size=1024, depth=16, num_heads=16)
+def DiT_S_2(*, max_frames: int = 32) -> OasisDiT:
+    return OasisDiT(patch_size=2, hidden_size=1024, depth=16, num_heads=16, max_frames=max_frames)
 
 
 def ViT_L_20_Shallow_Encoder() -> OasisAutoencoderKL:
@@ -67,7 +67,11 @@ class OasisPipeline(nn.Module):
     def __init__(self, config: OasisConfig):
         super().__init__()
         self.config = config
-        self.model = DiT_S_2()
+        if config.dit_variant != "DiT-S/2":
+            raise ValueError(f"unsupported Oasis DiT variant: {config.dit_variant}")
+        if config.vae_variant != "vit-l-20-shallow-encoder":
+            raise ValueError(f"unsupported Oasis VAE variant: {config.vae_variant}")
+        self.model = DiT_S_2(max_frames=config.max_frames)
         self.vae = ViT_L_20_Shallow_Encoder()
         self.rollout_engine = OasisRollout(
             scaling_factor=config.scaling_factor,

@@ -12,14 +12,13 @@ from math import pi
 
 import torch
 import torch.nn as nn
-from einops import rearrange, repeat
 
 
 def oasis_rotate_half(x: torch.Tensor) -> torch.Tensor:
-    x = rearrange(x, "... (d r) -> ... d r", r=2)
+    x = x.reshape(*x.shape[:-1], -1, 2)
     x1, x2 = x.unbind(dim=-1)
     x = torch.stack((-x2, x1), dim=-1)
-    return rearrange(x, "... d r -> ... (d r)")
+    return x.flatten(-2)
 
 
 def oasis_apply_rotary_emb(freqs: torch.Tensor, t: torch.Tensor) -> torch.Tensor:
@@ -59,7 +58,7 @@ class OasisRotaryEmbedding(nn.Module):
 
     def _forward_freqs(self, positions: torch.Tensor, freqs: torch.Tensor) -> torch.Tensor:
         freqs = torch.einsum("..., f -> ... f", positions.to(freqs.dtype), freqs)
-        return repeat(freqs, "... n -> ... (n r)", r=2)
+        return freqs.repeat_interleave(2, dim=-1)
 
     def rotate_queries_or_keys(self, t: torch.Tensor, freqs: torch.Tensor) -> torch.Tensor:
         seq_len = t.shape[-2]
