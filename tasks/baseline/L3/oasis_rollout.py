@@ -37,7 +37,7 @@ class OasisRollout(nn.Module):
         start: float = -3,
         end: float = 3,
         tau: float = 1,
-        clamp_min: float = 1e-5,
+        clamp_min: float = 0.0,
     ) -> torch.Tensor:
         steps = timesteps + 1
         t = torch.linspace(0, timesteps, steps, dtype=torch.float64) / timesteps
@@ -125,7 +125,8 @@ class OasisRollout(nn.Module):
                 alpha_next[:, :-1] = torch.ones_like(alpha_next[:, :-1])
                 if noise_idx == 1:
                     alpha_next[:, -1:] = torch.ones_like(alpha_next[:, -1:])
-                x[:, -1:] = alpha_next.sqrt() * x_start + x_noise * (1 - alpha_next).sqrt()
+                x_pred = alpha_next.sqrt() * x_start + x_noise * (1 - alpha_next).sqrt()
+                x[:, -1:] = x_pred[:, -1:]
 
         video = self.decode_latents(vae, x)
         return video, x, prompt_latents

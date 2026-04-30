@@ -305,15 +305,15 @@ The diffusion benchmark measures:
 ### Benchmarking vs open-oasis (Autoregressive Diffusion)
 
 ```bash
-# Oasis 500M: throughput + alignment benchmark vs official open-oasis
+# Oasis 500M: throughput + latency + correctness benchmark vs official open-oasis
 python tests/bench_oasis.py --model Etched/oasis-500m
 
-# Larger rollout
-python tests/bench_oasis.py --model Etched/oasis-500m --num-frames 8 --ddim-steps 4
+# Use an existing open-oasis checkout instead of auto-cloning it
+python tests/bench_oasis.py --model Etched/oasis-500m --open-oasis-src /path/to/open-oasis
 
-# Skip throughput or alignment
+# Skip throughput or latency
 python tests/bench_oasis.py --model Etched/oasis-500m --skip-throughput
-python tests/bench_oasis.py --model Etched/oasis-500m --skip-alignment
+python tests/bench_oasis.py --model Etched/oasis-500m --skip-latency
 
 # Save results to a specific directory
 python tests/bench_oasis.py --model Etched/oasis-500m --output-dir tests/results/H200/oasis-500m
@@ -475,7 +475,7 @@ Each run is tagged with a `tier` (`agent`, `kernel`, `eval`, or `e2e`) indicatin
 - timm (pytorch-image-models — only needed for vision encoder comparison tests)
 - vLLM (only needed for running comparison tests)
 - matplotlib (only needed for benchmark plotting)
-- timm and av (only needed for the Oasis / open-oasis comparison benchmark)
+- timm, einops, torchvision, av, rotary-embedding-torch (only needed for the Oasis / open-oasis comparison benchmark)
 - ultralytics (YOLOv10 baseline benchmarking)
 
 ### Optional detection benchmark dependencies
@@ -796,25 +796,28 @@ Correctness is measured in decoded pixel space (both engines produce PIL video f
 
 ### Oasis 500M (Autoregressive Diffusion)
 
-Run `python tests/bench_oasis.py --model Etched/oasis-500m` to reproduce. Reference baseline: official `open-oasis`.
+Run `python tests/bench_oasis.py --model Etched/oasis-500m` to reproduce. Reference baseline: official `open-oasis`, which the benchmark auto-clones under `data/open_oasis_src/` unless `--open-oasis-src` is provided.
 
-Dataset: `TESS-Computer/minecraft-vla-stage1` (`train` split), using 8 non-overlapping real Minecraft clips from distinct source videos with 16 frames per clip at 360x640. The benchmark converts each dataset action string into Oasis' 25-d control vector and caches the resulting prompt/action tensors locally under `data/oasis_cache/`.
+Dataset: `TESS-Computer/minecraft-vla-stage1` (`train` split), using non-overlapping real Minecraft clips from distinct source videos at 360x640. The benchmark converts each dataset action string into Oasis' 25-d control vector and caches the resulting prompt/action tensors locally under `data/oasis_cache/`.
 
-**Hardware: NVIDIA H200**
+**Hardware: NVIDIA B200**
 
-Throughput:
+Throughput workload:
 
-| Scenario | Dataset | Clips | Frames | Reference (videos/s) | Ours (videos/s) | Ratio |
-|----------|---------|------:|-------:|---------------------:|----------------:|------:|
-| real-minecraft-16f | `TESS-Computer/minecraft-vla-stage1` | 8 | 16 | 1.65 | 2.10 | **1.28x** |
+| Scenario | Dataset | Clips | Frames | DDIM Steps | Correctness Checked |
+|----------|---------|------:|-------:|-----------:|:--------------------|
+| short-bs4-16f-4ddim | `TESS-Computer/minecraft-vla-stage1` | 4 | 16 | 4 | yes |
+| medium-bs8-24f-4ddim | `TESS-Computer/minecraft-vla-stage1` | 8 | 24 | 4 | yes |
+| long-bs8-32f-4ddim | `TESS-Computer/minecraft-vla-stage1` | 8 | 32 | 4 | yes |
+| denoise-bs4-16f-8ddim | `TESS-Computer/minecraft-vla-stage1` | 4 | 16 | 8 | yes |
 
-Alignment:
+Latency:
 
-| Scenario | Align Clips | Output | Avg CosSim | Avg Mean Abs Diff | Notes |
-|----------|------------:|--------|-----------:|------------------:|:------|
-| real-minecraft-16f | 4 | Prompt latents | 0.99979734 | 3.99e-03 | PASS |
-| real-minecraft-16f | 4 | Rollout latents | 0.97681195 | 8.50e-02 | PASS |
-| real-minecraft-16f | 4 | Decoded video | 0.99244010 | 1.40e-02 | PASS |
+| Scenario | Clips | Frames | Reference p50 (ms) | Ours p50 (ms) | Ratio |
+|----------|------:|-------:|-------------------:|--------------:|------:|
+| latency-bs1-8f-4ddim | 1 | 8 | 981.28 | 758.85 | **1.29x** |
+
+Correctness is measured for every throughput workload entry, using the same prompt frames and actions as the timed run. The benchmark reports cosine similarity, pass/fail status, and mean absolute difference for prompt latents, rollout latents, and decoded video in each throughput scenario.
 
 ### CosyVoice3 (TTS)
 
