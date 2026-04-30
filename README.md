@@ -1,6 +1,6 @@
 # kb-nano
 
-A standalone, high-performance inference engine supporting **LLMs** (Llama 3.1, Llama 4, Mixtral-8x7B, DeepSeek V3.2, GPT-OSS, Qwen2-VL, Qwen3-VL), **linear-attention LLMs** (GLA, RetNet, RWKV7), **diffusion models** (FLUX.1-dev, SDXL, HunyuanVideo-1.5), **detection models** (YOLOv10, RTDetrV2), **vision encoders** (SigLIP-2, DINOv3, SwinV2), **segmentation models** (SAM3.1), **protein structure prediction** (OpenFold3), audio models (Whisper), and **TTS models** (CosyVoice3) with tensor parallelism and FP8 quantization. No vLLM dependency at runtime — just PyTorch, Triton, and Flash Attention.
+A standalone, high-performance inference engine supporting **LLMs** (Llama 3.1, Llama 4, Mixtral-8x7B, DeepSeek V3.2, GPT-OSS, Qwen2-VL, Qwen3-VL), **linear-attention LLMs** (GLA, RetNet, RWKV7), **diffusion models** (FLUX.1-dev, SDXL, HunyuanVideo-1.5), **predictive video models** (V-JEPA 2), **detection models** (YOLOv10, RTDetrV2), **vision encoders** (SigLIP-2, DINOv3, SwinV2), **segmentation models** (SAM3.1), **protein structure prediction** (OpenFold3), audio models (Whisper), and **TTS models** (CosyVoice3) with tensor parallelism and FP8 quantization. No vLLM dependency at runtime — just PyTorch, Triton, and Flash Attention.
 
 ## Features
 
@@ -16,6 +16,7 @@ A standalone, high-performance inference engine supporting **LLMs** (Llama 3.1, 
 - **FLUX.1-dev** diffusion transformer (text-to-image) with Flash Attention
 - **SDXL** (Stable Diffusion XL) UNet-based text-to-image with dual CLIP text encoders
 - **HunyuanVideo-1.5** 3D video diffusion transformer (text-to-video) with dual-stream joint attention, M-RoPE, and Qwen2.5-VL text encoder
+- **V-JEPA 2** predictive video model with asymmetric spatio-temporal masking and predictor head
 - **YOLOv10** (`jameslahm/yolov10n`) NMS-free object detection with rank sorting
 - **RTDetrV2** (`PekingU/rtdetr_v2_r101vd`) real-time detection transformer with deformable attention
 - **Qwen2-VL / Qwen3-VL** vision-language models with image and video support
@@ -41,6 +42,7 @@ A standalone, high-performance inference engine supporting **LLMs** (Llama 3.1, 
 - **Detection benchmark** for YOLOv10 and RTDetrV2
 - **timm comparison benchmark** for SigLIP-2, DINOv3, and SwinV2 vision encoders (ImageNet-1K validation)
 - **facebook/sam3 comparison benchmark** for SAM3.1 segmentation
+- **transformers comparison benchmark** for V-JEPA 2 predictor / encoder alignment
 - **OpenFold/OpenFold3 comparison benchmark** for protein structure prediction
 
 ## Project Structure
@@ -80,6 +82,7 @@ A standalone, high-performance inference engine supporting **LLMs** (Llama 3.1, 
     ├── bench_vllm_omni.py     # Diffusion (FLUX / HunyuanVideo) and TTS (CosyVoice3) benchmark: kb-nano vs vllm-omni
     ├── bench_diffusers.py     # SDXL diffusion benchmark: kb-nano vs diffusers + torch.compile
     ├── bench_timm.py          # Vision encoder benchmark: kb-nano vs timm (SigLIP-2, DINOv3, SwinV2)
+    ├── bench_vjepa2.py        # V-JEPA 2 predictor benchmark: kb-nano vs transformers
     ├── test_sam.py            # SAM3 segmentation benchmark: kb-nano vs facebook/sam3 reference
     ├── bench_openfold3.py     # OpenFold3 protein structure benchmark: kb-nano vs OpenFold reference
     ├── utils/                  # Post-processing and visualization
@@ -253,6 +256,37 @@ python tests/test_sam.py --skip-reference
 python tests/test_sam.py --skip-latency
 ```
 
+### Benchmarking vs transformers (V-JEPA 2)
+
+Default input source is the real `nateraw/kinetics-mini` `validation` split. Install `av` first for video decoding:
+
+```bash
+python -m pip install av
+```
+
+```bash
+# V-JEPA 2 predictor: throughput + latency + alignment benchmark vs transformers
+python tests/bench_vjepa2.py --model facebook/vjepa2-vitl-fpc64-256
+
+# kb-nano only
+python tests/bench_vjepa2.py --model facebook/vjepa2-vitl-fpc64-256 --skip-reference
+
+# Encoder-only benchmark (skip predictor path)
+python tests/bench_vjepa2.py --model facebook/vjepa2-vitl-fpc64-256 --task encoder
+
+# Classification checkpoint benchmark
+python tests/bench_vjepa2.py --model facebook/vjepa2-vitl-fpc16-256-ssv2 --task classification
+
+# Old synthetic random-video path
+python tests/bench_vjepa2.py --model facebook/vjepa2-vitl-fpc64-256 --input-source synthetic
+
+# Skip latency phase
+python tests/bench_vjepa2.py --model facebook/vjepa2-vitl-fpc64-256 --skip-latency
+
+# Save results to a specific directory
+python tests/bench_vjepa2.py --model facebook/vjepa2-vitl-fpc64-256 --output-dir tests/results/H200/vjepa2-vitl-fpc64-256
+```
+
 ### Benchmarking detection models
 
 ```bash
@@ -294,7 +328,6 @@ The protein structure benchmark measures:
 - **Throughput**: tokens/sec across short (100-200 residues), medium (200-400), long (400-700), and extra-long (700+) protein chains
 - **Latency**: per-structure prediction latency with median stats
 - **Correctness**: percentage of queries meeting all correctness requirements (atom position cosine similarity >= 0.95, RMSD < 0.5A, pLDDT correlation >= 0.99, PAE cosine similarity >= 0.95)
-
 The diffusion benchmark measures:
 - **Throughput**: images/sec (FLUX) or videos/sec (HunyuanVideo) at various resolutions
 - **Latency**: per-image/video latency with P50 percentile stats
@@ -448,6 +481,7 @@ Each run is tagged with a `tier` (`agent`, `kernel`, `eval`, or `e2e`) indicatin
 - PyTorch 2.x with CUDA
 - Triton
 - Flash Attention (`flash-attn`)
+- PyAV (`av`) — required for real-video V-JEPA 2 benchmark decoding
 - SGLang kernel library (`sgl-kernel`) — fused RMSNorm, SiLU, RoPE, MoE ops
 - FlashInfer (`flashinfer-python`) — TRTLLM-gen attention kernels on Blackwell+
 - Hugging Face (`transformers`, `huggingface_hub`, `safetensors`)
@@ -773,6 +807,50 @@ Correctness (eager mode, decoded video frames, per-prompt cosine similarity):
 | 480p-medium |  8 | 0.923 | 0.862 | 12.92 dB | WARN |
 
 Correctness is measured in decoded pixel space (both engines produce PIL video frames which are compared as uint8 numpy arrays). The pixel-level cosine similarity of ~0.92 is expected for two independent bf16 implementations: numerical differences in the 30-step denoising loop are amplified by the VAE decoder. For reference, latent-space comparison between kb-nano and HF diffusers yields CosSim=0.986, confirming the transformer backbone is correctly implemented. The pixel-space divergence is dominated by VAE decode amplification and different text encoder implementations (kb-nano uses a custom Qwen2.5-VL paged-attention encoder vs vllm-omni's HuggingFace-based encoder).
+
+### V-JEPA 2 (Predictive Video)
+
+Run `python -m pip install av` once, then `tests/bench_vjepa2.py --model facebook/vjepa2-vitl-fpc64-256` to reproduce the default predictor benchmark. Reference engine: `transformers` 4.57.6. By default all three tasks use real videos from `nateraw/kinetics-mini` (`validation`), decoded via PyAV/torchvision and preprocessed with `VJEPA2VideoProcessor`. Predictor and encoder use the V-JEPA 2 pretraining geometry (64 frames, 256x256), bf16 precision, `context_ratio=0.75`, and `target_ratio=0.25`. Classification uses the real `facebook/vjepa2-vitl-fpc16-256-ssv2` checkpoint on the same real-video dataset for pipeline parity, not task-accuracy measurement. Use `--input-source synthetic` to revert to the old random-video path.
+
+The results below use near-maximal non-repeating real-data workloads from the 50-video `kinetics-mini` validation split: `40` videos for predictor/encoder and `48` videos for classification. Reproduce them with:
+
+```bash
+python tests/bench_vjepa2.py --model facebook/vjepa2-vitl-fpc64-256 --num-videos 40 --latency-iters 10
+python tests/bench_vjepa2.py --model facebook/vjepa2-vitl-fpc64-256 --task encoder --num-videos 40 --latency-iters 10
+python tests/bench_vjepa2.py --model facebook/vjepa2-vitl-fpc16-256-ssv2 --task classification --num-videos 48 --batch-size 4 --latency-batch-sizes 1,4 --latency-iters 10
+```
+
+**Hardware: NVIDIA H200**
+
+Throughput (videos/sec):
+
+| Model | Task | Videos | Batch | transformers | Ours | Ratio |
+|-------|------|-------:|------:|-------------:|-----:|------:|
+| facebook/vjepa2-vitl-fpc64-256 | predictor | 40 | 2 | 16.14 | 16.30 | **1.01x** |
+| facebook/vjepa2-vitl-fpc64-256 | encoder | 40 | 2 | 21.56 | 21.35 | 0.99x |
+| facebook/vjepa2-vitl-fpc16-256-ssv2 | classification | 48 | 4 | 108.72 | 111.65 | **1.03x** |
+
+Latency (median of 10 iterations):
+
+| Task | Batch | transformers | Ours | Ratio |
+|------|------:|-------------:|-----:|------:|
+| predictor | 1 | 0.0694s | 0.0705s | 0.98x |
+| predictor | 2 | 0.1222s | 0.1228s | 0.99x |
+| encoder | 1 | 0.0502s | 0.0510s | 0.98x |
+| encoder | 2 | 0.0927s | 0.0934s | 0.99x |
+| classification | 1 | 0.0304s | 0.0311s | 0.98x |
+| classification | 4 | 0.0352s | 0.0361s | 0.97x |
+
+Alignment:
+
+| Task | Output | Cosine | Mean Abs Diff |
+|------|--------|-------:|--------------:|
+| predictor | last_hidden_state | 1.000000 | 0.00e+00 |
+| predictor | masked_hidden_state | 1.000000 | 0.00e+00 |
+| predictor | predictor_hidden_state | 1.000000 | 0.00e+00 |
+| predictor | target_hidden_state | 1.000000 | 0.00e+00 |
+| encoder | last_hidden_state | 1.000000 | 0.00e+00 |
+| classification | logits | 1.000000 | 0.00e+00 |
 
 ### CosyVoice3 (TTS)
 

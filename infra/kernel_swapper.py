@@ -53,6 +53,7 @@ _L4_MODEL_KEYS: dict[str, str] = {
     "retnet": "retnet",
     "rwkv7": "rwkv7",
     "flux": "flux",
+    "vjepa2": "vjepa2",
     "sam3": "sam3",
     "cosyvoice3": "cosyvoice3",
     "hunyuan_video": "hunyuan_video",
