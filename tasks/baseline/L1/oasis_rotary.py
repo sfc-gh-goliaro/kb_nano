@@ -60,10 +60,20 @@ class OasisRotaryEmbedding(nn.Module):
         freqs = torch.einsum("..., f -> ... f", positions.to(freqs.dtype), freqs)
         return freqs.repeat_interleave(2, dim=-1)
 
+    def forward(
+        self,
+        t: torch.Tensor,
+        freqs: torch.Tensor,
+        seq_len: int | None = None,
+        offset: int = 0,
+    ) -> torch.Tensor:
+        del seq_len, offset
+        return self._forward_freqs(t, freqs)
+
     def rotate_queries_or_keys(self, t: torch.Tensor, freqs: torch.Tensor) -> torch.Tensor:
         seq_len = t.shape[-2]
         positions = torch.arange(seq_len, device=t.device, dtype=t.dtype)
-        seq_freqs = self._forward_freqs(positions, freqs)
+        seq_freqs = self.forward(positions, freqs, seq_len=seq_len)
         return oasis_apply_rotary_emb(seq_freqs, t)
 
     def get_axial_freqs(self, *dims: int) -> torch.Tensor:
@@ -75,7 +85,7 @@ class OasisRotaryEmbedding(nn.Module):
                 pos = torch.linspace(-1, 1, steps=dim, device=self.device)
             else:
                 pos = torch.arange(dim, device=self.device)
-            seq_freqs = self._forward_freqs(pos, self.freqs)
+            seq_freqs = self.forward(pos, self.freqs, seq_len=dim)
             axis = [None] * len(dims)
             axis[index] = colon
             all_freqs.append(seq_freqs[(Ellipsis, *axis, colon)])

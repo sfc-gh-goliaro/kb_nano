@@ -134,3 +134,35 @@ class OasisAutoencoderKL(nn.Module):
         z = self.dec_norm(z)
         z = self.predictor(z)
         return self.unpatchify(z)
+
+    def autoencode(
+        self,
+        input: torch.Tensor,
+        sample_posterior: bool = True,
+    ) -> tuple[torch.Tensor, DiagonalGaussianDistribution, torch.Tensor]:
+        posterior = self.encode(input)
+        if self.use_variational and sample_posterior:
+            z = posterior.sample()
+        else:
+            z = posterior.mode()
+        dec = self.decode(z)
+        return dec, posterior, z
+
+    def get_input(self, batch: dict[str, torch.Tensor], k: str) -> torch.Tensor:
+        x = batch[k]
+        if len(x.shape) == 3:
+            x = x[..., None]
+        return x.permute(0, 3, 1, 2).to(memory_format=torch.contiguous_format).float()
+
+    def forward(
+        self,
+        inputs: torch.Tensor,
+        labels: torch.Tensor,
+        split: str = "train",
+    ) -> tuple[torch.Tensor, DiagonalGaussianDistribution, torch.Tensor]:
+        del labels, split
+        rec, post, latent = self.autoencode(inputs)
+        return rec, post, latent
+
+    def get_last_layer(self) -> torch.Tensor:
+        return self.predictor.weight
