@@ -1,6 +1,6 @@
 # kb-nano
 
-A standalone, high-performance inference engine supporting **LLMs** (Llama 3.1, Llama 4, Mixtral-8x7B, DeepSeek V3.2, GPT-OSS, Qwen2-VL, Qwen3-VL), **linear-attention LLMs** (GLA, RetNet, RWKV7), **embedding / retrieval models** (BGE-M3, ColBERTv2), **diffusion models** (FLUX.1-dev, SDXL, HunyuanVideo-1.5), **detection models** (YOLOv10, RTDetrV2), **vision encoders** (SigLIP-2, DINOv3, SwinV2), **segmentation models** (SAM3.1), **3D point models** (PointTransformerV3), **protein structure prediction** (OpenFold3), audio models (Whisper), and **TTS models** (CosyVoice3) with tensor parallelism and FP8 quantization. No vLLM dependency at runtime — just PyTorch, Triton, and Flash Attention.
+A standalone, high-performance inference engine supporting **LLMs** (Llama 3.1, Llama 4, Mixtral-8x7B, DeepSeek V3.2, GPT-OSS, Qwen2-VL, Qwen3-VL), **linear-attention LLMs** (GLA, RetNet, RWKV7), **embedding / retrieval models** (BGE-M3, ColBERTv2), **diffusion models** (FLUX.1-dev, SDXL, HunyuanVideo-1.5), **world models** (Oasis 500M), **detection models** (YOLOv10, RTDetrV2), **vision encoders** (SigLIP-2, DINOv3, SwinV2), **segmentation models** (SAM3.1), **3D point models** (PointTransformerV3), **protein structure prediction** (OpenFold3), audio models (Whisper), and **TTS models** (CosyVoice3) with tensor parallelism and FP8 quantization. No vLLM dependency at runtime — just PyTorch, Triton, and Flash Attention.
 
 ## Features
 
@@ -18,6 +18,7 @@ A standalone, high-performance inference engine supporting **LLMs** (Llama 3.1, 
 - **FLUX.1-dev** diffusion transformer (text-to-image) with Flash Attention
 - **SDXL** (Stable Diffusion XL) UNet-based text-to-image with dual CLIP text encoders
 - **HunyuanVideo-1.5** 3D video diffusion transformer (text-to-video) with dual-stream joint attention, M-RoPE, and Qwen2.5-VL text encoder
+- **Oasis 500M** action-conditioned autoregressive diffusion world model
 - **YOLOv10** (`jameslahm/yolov10n`) NMS-free object detection with rank sorting
 - **RTDetrV2** (`PekingU/rtdetr_v2_r101vd`) real-time detection transformer with deformable attention
 - **Qwen2-VL / Qwen3-VL** vision-language models with image and video support
@@ -46,6 +47,7 @@ A standalone, high-performance inference engine supporting **LLMs** (Llama 3.1, 
 - **facebook/sam3 comparison benchmark** for SAM3.1 segmentation
 - **FlagEmbedding / ColBERT comparison benchmark** for embedding and retrieval models
 - **PointTransformerV3 detached comparison benchmark** for 3D point cloud encoding
+- **open-oasis comparison benchmark** for autoregressive diffusion world models
 - **OpenFold/OpenFold3 comparison benchmark** for protein structure prediction
 
 ## Project Structure
@@ -337,6 +339,23 @@ The diffusion benchmark measures:
 - **Latency**: per-image/video latency with P50 percentile stats
 - **Correctness**: per-batch latent cosine similarity (FLUX) or per-prompt decoded-frame PSNR and cosine similarity (HunyuanVideo)
 
+### Benchmarking vs open-oasis (Autoregressive Diffusion)
+
+```bash
+# Oasis 500M: throughput + latency + correctness benchmark vs official open-oasis
+python tests/bench_oasis.py --model Etched/oasis-500m
+
+# Use an existing open-oasis checkout instead of auto-cloning it
+python tests/bench_oasis.py --model Etched/oasis-500m --open-oasis-src /path/to/open-oasis
+
+# Skip throughput or latency
+python tests/bench_oasis.py --model Etched/oasis-500m --skip-throughput
+python tests/bench_oasis.py --model Etched/oasis-500m --skip-latency
+
+# Save results to a specific directory
+python tests/bench_oasis.py --model Etched/oasis-500m --output-dir tests/results/H200/oasis-500m
+```
+
 ## Benchmarking
 
 The benchmark suite lets you evaluate custom kernel implementations at 4 abstraction levels:
@@ -493,6 +512,7 @@ Each run is tagged with a `tier` (`agent`, `kernel`, `eval`, or `e2e`) indicatin
 - timm (pytorch-image-models — only needed for vision encoder comparison tests)
 - vLLM (only needed for running comparison tests)
 - matplotlib (only needed for benchmark plotting)
+- timm, einops, torchvision, av, rotary-embedding-torch (only needed for the Oasis / open-oasis comparison benchmark)
 - ultralytics (YOLOv10 baseline benchmarking)
 
 ### Optional detection benchmark dependencies
@@ -867,6 +887,31 @@ Correctness (eager mode, decoded video frames, per-prompt cosine similarity):
 | 480p-medium |  8 | 0.923 | 0.862 | 12.92 dB | WARN |
 
 Correctness is measured in decoded pixel space (both engines produce PIL video frames which are compared as uint8 numpy arrays). The pixel-level cosine similarity of ~0.92 is expected for two independent bf16 implementations: numerical differences in the 30-step denoising loop are amplified by the VAE decoder. For reference, latent-space comparison between kb-nano and HF diffusers yields CosSim=0.986, confirming the transformer backbone is correctly implemented. The pixel-space divergence is dominated by VAE decode amplification and different text encoder implementations (kb-nano uses a custom Qwen2.5-VL paged-attention encoder vs vllm-omni's HuggingFace-based encoder).
+
+### Oasis 500M (Autoregressive Diffusion)
+
+Run `python tests/bench_oasis.py --model Etched/oasis-500m` to reproduce. Reference baseline: official `open-oasis`, which the benchmark auto-clones under `data/open_oasis_src/` unless `--open-oasis-src` is provided.
+
+Dataset: `TESS-Computer/minecraft-vla-stage1` (`train` split), using non-overlapping real Minecraft clips from distinct source videos at 360x640. The benchmark converts each dataset action string into Oasis' 25-d control vector and caches the resulting prompt/action tensors locally under `data/oasis_cache/`.
+
+**Hardware: NVIDIA B200**
+
+Throughput workload:
+
+| Scenario | Dataset | Clips | Frames | DDIM Steps | Correctness Checked |
+|----------|---------|------:|-------:|-----------:|:--------------------|
+| short-bs4-16f-4ddim | `TESS-Computer/minecraft-vla-stage1` | 4 | 16 | 4 | yes |
+| medium-bs8-24f-4ddim | `TESS-Computer/minecraft-vla-stage1` | 8 | 24 | 4 | yes |
+| long-bs8-32f-4ddim | `TESS-Computer/minecraft-vla-stage1` | 8 | 32 | 4 | yes |
+| denoise-bs4-16f-8ddim | `TESS-Computer/minecraft-vla-stage1` | 4 | 16 | 8 | yes |
+
+Latency:
+
+| Scenario | Clips | Frames | Reference p50 (ms) | Ours p50 (ms) | Ratio |
+|----------|------:|-------:|-------------------:|--------------:|------:|
+| latency-bs1-8f-4ddim | 1 | 8 | 981.28 | 758.85 | **1.29x** |
+
+Correctness is measured for every throughput workload entry, using the same prompt frames and actions as the timed run. The benchmark reports cosine similarity, pass/fail status, and mean absolute difference for prompt latents, rollout latents, and decoded video in each throughput scenario.
 
 ### CosyVoice3 (TTS)
 

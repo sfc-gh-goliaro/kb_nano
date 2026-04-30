@@ -58,6 +58,7 @@ _L4_MODEL_KEYS: dict[str, str] = {
     "hunyuan_video": "hunyuan_video",
     "bge_m3": "bge_m3",
     "colbertv2": "colbertv2",
+    "oasis": "oasis",
     "yolov10": "yolov10",
     "rtdetrv2": "rtdetrv2",
     "openfold3": "openfold3",
