@@ -16,12 +16,12 @@ class ConvNeXtV2Layer(nn.Module):
     def __init__(self, dim: int, hidden_dim: int):
         super().__init__()
         self.dwconv = Conv2d(dim, dim, kernel_size=7, padding=3, groups=dim)
-        self.layernorm = LayerNorm(dim, eps=1e-6)
+        self.layernorm = LayerNorm(dim, eps=1e-6, promote_fp32=False)
         self.pwconv1 = Linear(dim, hidden_dim)
         self.act = GELU()
         self.grn = GRN(hidden_dim)
         self.pwconv2 = Linear(hidden_dim, dim)
-        self.drop_path = nn.Identity()
+        self.drop_path = None
 
     def forward(self, x: torch.Tensor) -> torch.Tensor:
         residual = x
@@ -33,4 +33,6 @@ class ConvNeXtV2Layer(nn.Module):
         x = self.grn(x)
         x = self.pwconv2(x)
         x = x.permute(0, 3, 1, 2)
-        return residual + self.drop_path(x)
+        if self.drop_path is not None:
+            x = self.drop_path(x)
+        return residual + x

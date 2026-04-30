@@ -19,11 +19,13 @@ class LayerNorm(nn.Module):
         elementwise_affine: bool = True,
         create_scale: bool = True,
         create_offset: bool = True,
+        promote_fp32: bool = True,
     ):
         super().__init__()
         self.normalized_shape = (normalized_shape,)
         self.eps = eps
         self.elementwise_affine = elementwise_affine
+        self.promote_fp32 = promote_fp32
 
         if elementwise_affine and create_scale:
             self.weight = nn.Parameter(torch.ones(normalized_shape))
@@ -36,6 +38,11 @@ class LayerNorm(nn.Module):
             self.register_parameter("bias", None)
 
     def forward(self, x: torch.Tensor) -> torch.Tensor:
+        if not self.promote_fp32:
+            return F.layer_norm(
+                x, self.normalized_shape, self.weight, self.bias, self.eps,
+            )
+
         # Promote to fp32 for the reduction to match vLLM's
         # ``vllm/model_executor/layers/layernorm.py:LayerNorm`` which keeps
         # ``weight`` / ``bias`` in fp32 and runs the reduction in fp32.

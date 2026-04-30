@@ -25,7 +25,7 @@ def infer_image_size(model_name: str) -> int:
     if is_efficientnetv2_model(model_name):
         import timm
 
-        ref = timm.create_model(_strip_timm_prefix(model_name), pretrained=True)
+        ref = timm.create_model(_strip_timm_prefix(model_name), pretrained=False)
         return int(ref.default_cfg["input_size"][1])
     raise ValueError(f"Unsupported image classification model: {model_name}")
 
@@ -41,7 +41,7 @@ def infer_image_mean_std(model_name: str) -> tuple[list[float], list[float]]:
     if is_efficientnetv2_model(model_name):
         import timm
 
-        ref = timm.create_model(_strip_timm_prefix(model_name), pretrained=True)
+        ref = timm.create_model(_strip_timm_prefix(model_name), pretrained=False)
         mean = [float(x) for x in ref.default_cfg["mean"]]
         std = [float(x) for x in ref.default_cfg["std"]]
         return mean, std

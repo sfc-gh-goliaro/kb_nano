@@ -5,7 +5,8 @@ from __future__ import annotations
 import torch
 import torch.nn as nn
 
-from ..L2.efficientnetv2_blocks import EdgeResidual, InvertedResidual
+from ..L2.efficientnetv2_edge_residual import EdgeResidual
+from ..L2.efficientnetv2_inverted_residual import InvertedResidual
 
 
 class EfficientNetV2Stage(nn.Module):

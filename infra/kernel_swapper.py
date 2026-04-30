@@ -44,7 +44,6 @@ _L4_MODEL_KEYS: dict[str, str] = {
     "gla": "gla",
     "gpt_oss": "gpt_oss",
     "llama": "llama31",
-    "llada": "llada",
     "llama4": "llama4",
     "mamba": "mamba",
     "mamba2": "mamba2",

@@ -112,6 +112,13 @@ def _preprocess_batch(pil_images, resolution, image_mean, image_std, dtype):
     return torch.stack(tensors).to(device="cuda", dtype=dtype)
 
 
+def _preprocess_batches(raw_images, resolution, image_mean, image_std, dtype, batch_size, num_images):
+    return [
+        _preprocess_batch(raw_images[start:start + batch_size], resolution, image_mean, image_std, dtype)
+        for start in range(0, num_images, batch_size)
+    ]
+
+
 def main():
     with open(sys.argv[1]) as f:
         cfg = json.load(f)
@@ -146,17 +153,15 @@ def main():
     else:
         model, baseline_name = load_reference_model(model_name, device=device, dtype=dtype)
 
-    warm_batch = _preprocess_batch(
-        raw_images[:1], image_size, image_mean, image_std, dtype,
+    throughput_batches = _preprocess_batches(
+        raw_images, image_size, image_mean, image_std, dtype, batch_size, num_images,
     )
+    warm_batch = throughput_batches[0][:1]
     with torch.inference_mode():
         logits = _extract_logits(model(warm_batch))
 
     for _ in range(cfg["warmup_iters"]):
-        for start in range(0, num_images, batch_size):
-            x = _preprocess_batch(
-                raw_images[start:start + batch_size], image_size, image_mean, image_std, dtype,
-            )
+        for x in throughput_batches:
             with torch.inference_mode():
                 _ = _extract_logits(model(x))
     torch.cuda.synchronize()
@@ -164,19 +169,14 @@ def main():
     total_elapsed = 0.0
     total_images = 0
     for _ in range(cfg["measure_iters"]):
-        for start in range(0, num_images, batch_size):
-            end = min(start + batch_size, num_images)
-            actual_bs = end - start
-            x = _preprocess_batch(
-                raw_images[start:end], image_size, image_mean, image_std, dtype,
-            )
+        for x in throughput_batches:
             torch.cuda.synchronize()
             t0 = time.perf_counter()
             with torch.inference_mode():
                 _ = _extract_logits(model(x))
             torch.cuda.synchronize()
             total_elapsed += time.perf_counter() - t0
-            total_images += actual_bs
+            total_images += x.shape[0]
 
     avg_elapsed = total_elapsed / max(cfg["measure_iters"], 1)
     avg_images = total_images / max(cfg["measure_iters"], 1)
@@ -193,10 +193,12 @@ def main():
     }
 
     latencies = {}
+    latency_batches = {
+        bs: _preprocess_batch(raw_images[:bs], image_size, image_mean, image_std, dtype)
+        for bs in cfg.get("latency_batch_sizes", [])
+    }
     for bs in cfg.get("latency_batch_sizes", []):
-        batch = _preprocess_batch(
-            raw_images[:bs], image_size, image_mean, image_std, dtype,
-        )
+        batch = latency_batches[bs]
         samples = []
         for _ in range(cfg["latency_iters"]):
             torch.cuda.synchronize()
@@ -211,9 +213,7 @@ def main():
         }
     result["latency"] = latencies
 
-    align_batch = _preprocess_batch(
-        raw_images[:cfg["alignment_images"]], image_size, image_mean, image_std, dtype,
-    )
+    align_batch = _preprocess_batch(raw_images[:cfg["alignment_images"]], image_size, image_mean, image_std, dtype)
     with torch.inference_mode():
         align_logits = _extract_logits(model(align_batch))
     result["alignment_logits"] = align_logits.float().cpu().tolist()

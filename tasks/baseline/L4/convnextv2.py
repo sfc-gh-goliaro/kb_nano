@@ -8,9 +8,11 @@ import torch
 import torch.nn as nn
 
 from ..L1.conv2d import Conv2d
+from ..L1.global_avg_pool2d import GlobalAvgPool2d
 from ..L1.layer_norm import LayerNorm
+from ..L1.layer_norm2d import LayerNorm2d
 from ..L1.linear import Linear
-from ..L3.convnextv2_stage import ConvNeXtV2LayerNorm2d, ConvNeXtV2Stage
+from ..L3.convnextv2_stage import ConvNeXtV2Stage
 
 
 @dataclass
@@ -22,7 +24,7 @@ class ConvNeXtV2Embeddings(nn.Module):
     def __init__(self, num_channels: int, hidden_size: int, patch_size: int):
         super().__init__()
         self.patch_embeddings = Conv2d(num_channels, hidden_size, kernel_size=patch_size, stride=patch_size)
-        self.layernorm = ConvNeXtV2LayerNorm2d(hidden_size, eps=1e-6)
+        self.layernorm = LayerNorm2d(hidden_size, eps=1e-6)
 
     def forward(self, pixel_values: torch.Tensor) -> torch.Tensor:
         x = self.patch_embeddings(pixel_values)
@@ -65,12 +67,13 @@ class ConvNeXtV2Model(nn.Module):
             hidden_sizes=list(config.hidden_sizes),
             depths=list(config.depths),
         )
-        self.layernorm = LayerNorm(config.hidden_sizes[-1], eps=config.layer_norm_eps)
+        self.pooler = GlobalAvgPool2d()
+        self.layernorm = LayerNorm(config.hidden_sizes[-1], eps=config.layer_norm_eps, promote_fp32=False)
 
     def forward(self, pixel_values: torch.Tensor) -> tuple[torch.Tensor, torch.Tensor]:
         x = self.embeddings(pixel_values)
         x = self.encoder(x)
-        pooled = x.mean(dim=(-2, -1))
+        pooled = self.pooler(x)
         pooled = self.layernorm(pooled)
         return x, pooled
 
