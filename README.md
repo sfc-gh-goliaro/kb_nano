@@ -1,6 +1,6 @@
 # kb-nano
 
-A standalone, high-performance inference engine supporting **LLMs** (Llama 3.1, Llama 4, Mixtral-8x7B, DeepSeek V3.2, GPT-OSS, Qwen2-VL, Qwen3-VL), **linear-attention LLMs** (GLA, RetNet, RWKV7), **diffusion models** (FLUX.1-dev, SDXL, HunyuanVideo-1.5), **detection models** (YOLOv10, RTDetrV2), **vision encoders** (SigLIP-2, DINOv3, SwinV2), **segmentation models** (SAM3.1), **protein structure prediction** (OpenFold3), audio models (Whisper), and **TTS models** (CosyVoice3) with tensor parallelism and FP8 quantization. No vLLM dependency at runtime — just PyTorch, Triton, and Flash Attention.
+A standalone, high-performance inference engine supporting **LLMs** (Llama 3.1, Llama 4, Mixtral-8x7B, DeepSeek V3.2, GPT-OSS, Qwen2-VL, Qwen3-VL), **linear-attention LLMs** (GLA, RetNet, RWKV7), **diffusion models** (FLUX.1-dev, SDXL, HunyuanVideo-1.5), **detection models** (YOLOv10, RTDetrV2), **vision encoders** (SigLIP-2, DINOv3, SwinV2), **segmentation models** (SAM3.1), **3D point models** (PointTransformerV3), **protein structure prediction** (OpenFold3), audio models (Whisper), and **TTS models** (CosyVoice3) with tensor parallelism and FP8 quantization. No vLLM dependency at runtime — just PyTorch, Triton, and Flash Attention.
 
 ## Features
 
@@ -23,6 +23,7 @@ A standalone, high-performance inference engine supporting **LLMs** (Llama 3.1, 
 - **DINOv3** (facebook/dinov3-vit7b16-pretrain-lvd1689m) Eva vision encoder with 2D RoPE, SwiGLU MLP, and register tokens
 - **SwinV2** (timm/swinv2_large_window12_192.ms_in22k) hierarchical vision transformer with shifted-window cosine attention and continuous position bias
 - **SAM3.1** (facebook/sam3.1) image/video segmentation with ViT backbone, fusion encoder, detection decoder, and segmentation head
+- **PointTransformerV3** (Pointcept/PointTransformerV3) 3D point cloud transformer with serialized pooling, sparse conv stems, and optional Flash Attention
 - **Whisper** (large-v3) encoder-decoder speech-to-text with batched inference and paged cross-attention KV cache
 - **CosyVoice3** (Fun-CosyVoice3-0.5B-2512) text-to-speech with flow matching DiT + HiFi-GAN vocoder
 - **OpenFold3** (OpenFold/OpenFold3) protein structure prediction with MSA module, PairFormer, diffusion sampling, and atom attention
@@ -41,6 +42,7 @@ A standalone, high-performance inference engine supporting **LLMs** (Llama 3.1, 
 - **Detection benchmark** for YOLOv10 and RTDetrV2
 - **timm comparison benchmark** for SigLIP-2, DINOv3, and SwinV2 vision encoders (ImageNet-1K validation)
 - **facebook/sam3 comparison benchmark** for SAM3.1 segmentation
+- **PointTransformerV3 detached comparison benchmark** for 3D point cloud encoding
 - **OpenFold/OpenFold3 comparison benchmark** for protein structure prediction
 
 ## Project Structure
@@ -251,6 +253,37 @@ python tests/test_sam.py --skip-reference
 
 # Skip latency phase
 python tests/test_sam.py --skip-latency
+```
+
+### Benchmarking vs official PointTransformerV3 (Point Cloud)
+
+```bash
+# Clone detached PointTransformerV3 reference once
+git clone https://github.com/Pointcept/PointTransformerV3.git third_party/PointTransformerV3
+
+# PointTransformerV3: throughput + final-feature alignment vs official detached implementation
+# First run auto-downloads jxie/scanobjectnn and the default ScanNet PTv3 checkpoint
+python tests/bench_pointcloud.py --use-fp16
+
+# Heavier ScanObjectNN workload used for README numbers
+python tests/bench_pointcloud.py \
+    --use-fp16 \
+    --split nobg_test \
+    --max-samples 128 \
+    --batch-size 8 \
+    --points-per-sample 2048 \
+    --grid-size 0.01 \
+    --warmup-iters 10 \
+    --measure-iters 50
+
+# Enable Flash Attention in both ours and reference
+python tests/bench_pointcloud.py --use-fp16 --enable-flash
+
+# kb-nano only (skip reference comparison)
+python tests/bench_pointcloud.py --use-fp16 --skip-reference
+
+# Save results to a specific directory
+python tests/bench_pointcloud.py --use-fp16 --output-dir tests/results/H200/PointTransformerV3
 ```
 
 ### Benchmarking detection models
@@ -464,6 +497,14 @@ Each run is tagged with a `tier` (`agent`, `kernel`, `eval`, or `e2e`) indicatin
 pip install ultralytics==8.4.35
 git clone https://github.com/THU-MIG/yolov10.git third_party/yolov10
 ```
+
+Optional benchmark baselines:
+
+```bash
+pip install addict datasets spconv-cu121==2.3.8
+```
+
+PointTransformerV3 benchmarking compares against the official detached implementation in `third_party/PointTransformerV3`. The current benchmark path uses a local `torch_scatter.segment_csr` shim backed by `torch.segment_reduce`, so `torch_scatter` is not required.
 
 ### GPU architecture and library compatibility
 
@@ -953,6 +994,24 @@ Correctness (100 images, per-element cosine similarity):
 
 The remaining numerical divergence is expected from SDPA vs Flash Attention numerics and bf16/fp32 precision differences accumulated through the deep pipeline (backbone + encoder + decoder + pixel decoder + mask predictor). All metrics pass their thresholds (boxes/logits: mean >= 0.95, min >= 0.90; masks: mean >= 0.90, min >= 0.85).
 
+### PointTransformerV3 (Point Cloud)
+
+Run `tests/bench_pointcloud.py` to reproduce. The benchmark uses the public `jxie/scanobjectnn` dataset from Hugging Face and auto-downloads it on first run into `data/scanobjectnn`. Inputs are deterministically voxel-deduplicated before building the sparse tensor so both the official detached implementation and kb-nano see the same valid voxel set. By default, the benchmark loads the official `Pointcept/PointTransformerV3` ScanNet checkpoint file `scannet-semseg-pt-v3m1-0-base/model/model_best.pth`, strips the `module.backbone.` prefix, and compares final backbone features. This is a real pretrained backbone throughput/alignment benchmark on ScanObjectNN inputs; it still does not report ScanObjectNN classification accuracy.
+
+**Hardware: NVIDIA H200**
+
+Throughput (points/sec):
+
+| Dataset Split | Requested Points/Sample | Avg Points After Voxelization | Batch | Official Detached | Ours | Ratio |
+|---------------|------------------------:|------------------------------:|------:|------------------:|-----:|------:|
+| ScanObjectNN `nobg_test` | 2048 | 1941.47 | 8 | 367,144 | 366,602 | 1.00x |
+
+Correctness (feature space, all alignment batches):
+
+| Dataset Split | Feature CosSim | Feature MAE | Feature Shape |
+|---------------|---------------:|------------:|:-------------:|
+| ScanObjectNN `nobg_test` | 0.979595 | 0.14804 | 15702x64 |
+
 ### YOLOv10 (Detection)
 
 Run `tests/bench_detection.py --model jameslahm/yolov10n` to reproduce. Throughput uses synthetic 640x640 image tensors; the reference baseline is the official `THU-MIG/yolov10` implementation loaded from `third_party/yolov10`.
@@ -1006,6 +1065,7 @@ Alignment:
 | Scores | Cosine | 1.000 |
 | Scores | MAE | 0.0 |
 | Labels | Match Rate | 1.000 |
+
 ### OpenFold3 (Protein Structure Prediction)
 
 Run `tests/bench_openfold3.py` to reproduce. Uses real pre-computed MSA data from [OpenProteinSet](https://registry.opendata.aws/openfold/) (74 protein chains across 4 length buckets). Model: OpenFold/OpenFold3 (368M params, `of3-p2-155k.pt` checkpoint). Both engines use identical code with 10 diffusion rollout steps and 1 recycle. Correctness is verified deterministically (identical seeds, `torch.use_deterministic_algorithms`).
