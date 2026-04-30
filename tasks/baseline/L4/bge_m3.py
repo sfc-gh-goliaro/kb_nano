@@ -5,15 +5,12 @@ from __future__ import annotations
 from dataclasses import dataclass
 
 import torch
-import torch.nn as nn
-import torch.nn.functional as F
 from transformers import AutoConfig
-from transformers.modeling_outputs import BaseModelOutput
 
-from ..L1.relu import ReLU
-from ..L1.linear import Linear
-from ..L2.xlm_roberta_embeddings import XLMRobertaEmbeddings
-from ..L3.xlm_roberta_layer import XLMRobertaLayer
+from ..L2.bge_m3_colbert_embedding import BGEM3ColBERTEmbedding
+from ..L2.bge_m3_dense_embedding import BGEM3DenseEmbedding
+from ..L2.bge_m3_sparse_embedding import BGEM3SparseEmbedding
+from ..L3.xlm_roberta_model import XLMRobertaModel
 
 
 @dataclass
@@ -57,77 +54,6 @@ class BGEM3Config:
         )
 
 
-class XLMRobertaEncoder(nn.Module):
-    def __init__(self, config: BGEM3Config):
-        super().__init__()
-        self.layer = nn.ModuleList([
-            XLMRobertaLayer(config) for _ in range(config.num_hidden_layers)
-        ])
-
-    def forward(
-        self,
-        hidden_states: torch.Tensor,
-        attention_mask: torch.Tensor | None = None,
-    ) -> torch.Tensor:
-        for layer_module in self.layer:
-            hidden_states = layer_module(hidden_states, attention_mask=attention_mask)
-        return hidden_states
-
-
-class XLMRobertaModel(nn.Module):
-    def __init__(self, config: BGEM3Config):
-        super().__init__()
-        self.config = config
-        self.embeddings = XLMRobertaEmbeddings(config)
-        self.encoder = XLMRobertaEncoder(config)
-
-    def _prepare_attention_mask(
-        self,
-        attention_mask: torch.Tensor | None,
-        device: torch.device,
-    ) -> torch.Tensor | None:
-        if attention_mask is None:
-            return None
-        return attention_mask[:, None, None, :].to(device=device, dtype=torch.bool)
-
-    def forward(
-        self,
-        input_ids: torch.Tensor | None = None,
-        attention_mask: torch.Tensor | None = None,
-        token_type_ids: torch.Tensor | None = None,
-        position_ids: torch.Tensor | None = None,
-        inputs_embeds: torch.Tensor | None = None,
-        return_dict: bool = True,
-    ) -> BaseModelOutput | tuple[torch.Tensor]:
-        if input_ids is not None and inputs_embeds is not None:
-            raise ValueError("Cannot specify both input_ids and inputs_embeds")
-        if input_ids is None and inputs_embeds is None:
-            raise ValueError("Must specify input_ids or inputs_embeds")
-
-        if input_ids is not None:
-            batch_size, seq_length = input_ids.shape
-            device = input_ids.device
-        else:
-            batch_size, seq_length = inputs_embeds.shape[:2]
-            device = inputs_embeds.device
-
-        if attention_mask is None:
-            attention_mask = torch.ones((batch_size, seq_length), dtype=torch.long, device=device)
-
-        embedding_output = self.embeddings(
-            input_ids=input_ids,
-            token_type_ids=token_type_ids,
-            position_ids=position_ids,
-            inputs_embeds=inputs_embeds,
-        )
-        extended_attention_mask = self._prepare_attention_mask(attention_mask, device)
-        hidden_states = self.encoder(embedding_output, attention_mask=extended_attention_mask)
-
-        if not return_dict:
-            return (hidden_states,)
-        return BaseModelOutput(last_hidden_state=hidden_states)
-
-
 class BGEM3ModelForInference(XLMRobertaModel):
     """FlagEmbedding-aligned BGE-M3 inference wrapper."""
 
@@ -140,78 +66,20 @@ class BGEM3ModelForInference(XLMRobertaModel):
         super().__init__(config)
         self.sentence_pooling_method = sentence_pooling_method
         self.normalize_embeddings = normalize_embeddings
-        self.sparse_linear = Linear(config.hidden_size, 1, bias=True)
-        self.colbert_linear = Linear(config.hidden_size, config.colbert_dim, bias=True)
-        self.relu = ReLU()
-
-    def _dense_embedding(
-        self,
-        last_hidden_state: torch.Tensor,
-        attention_mask: torch.Tensor,
-    ) -> torch.Tensor:
-        if self.sentence_pooling_method == "cls":
-            return last_hidden_state[:, 0]
-        if self.sentence_pooling_method == "mean":
-            summed = torch.sum(last_hidden_state * attention_mask.unsqueeze(-1).float(), dim=1)
-            denom = attention_mask.sum(dim=1, keepdim=True).float()
-            return summed / denom
-        if self.sentence_pooling_method == "last_token":
-            left_padding = attention_mask[:, -1].sum() == attention_mask.shape[0]
-            if left_padding:
-                return last_hidden_state[:, -1]
-            sequence_lengths = attention_mask.sum(dim=1) - 1
-            batch = last_hidden_state.shape[0]
-            return last_hidden_state[
-                torch.arange(batch, device=last_hidden_state.device),
-                sequence_lengths,
-            ]
-        raise NotImplementedError(
-            f"Unsupported pooling method: {self.sentence_pooling_method}",
+        self.dense_embedding = BGEM3DenseEmbedding(
+            sentence_pooling_method=sentence_pooling_method,
+            normalize_embeddings=normalize_embeddings,
         )
-
-    def _sparse_embedding(
-        self,
-        hidden_state: torch.Tensor,
-        input_ids: torch.Tensor,
-        return_embedding: bool = True,
-    ) -> torch.Tensor:
-        token_weights = self.relu(self.sparse_linear(hidden_state))
-        if not return_embedding:
-            return token_weights
-
-        sparse_embedding = torch.zeros(
-            input_ids.size(0),
-            self.config.vocab_size,
-            dtype=token_weights.dtype,
-            device=token_weights.device,
+        self.sparse_embedding = BGEM3SparseEmbedding(
+            config.hidden_size,
+            config.vocab_size,
+            config.pad_token_id,
         )
-        sparse_embedding = sparse_embedding.scatter_reduce(
-            dim=-1,
-            index=input_ids,
-            src=token_weights.squeeze(-1),
-            reduce="amax",
+        self.colbert_embedding = BGEM3ColBERTEmbedding(
+            config.hidden_size,
+            config.colbert_dim,
+            normalize_embeddings=normalize_embeddings,
         )
-
-        unused_tokens = [
-            token_id
-            for token_id in (
-                self.config.pad_token_id,
-                0,  # <s>
-                2,  # </s>
-                3,  # <unk>
-            )
-            if token_id is not None
-        ]
-        sparse_embedding[:, unused_tokens] *= 0.0
-        return sparse_embedding
-
-    def _colbert_embedding(
-        self,
-        last_hidden_state: torch.Tensor,
-        attention_mask: torch.Tensor,
-    ) -> torch.Tensor:
-        colbert_vecs = self.colbert_linear(last_hidden_state[:, 1:])
-        return colbert_vecs * attention_mask[:, 1:][:, :, None].float()
 
     def forward(
         self,
@@ -232,19 +100,13 @@ class BGEM3ModelForInference(XLMRobertaModel):
 
         result: dict[str, torch.Tensor] = {}
         if return_dense:
-            dense_vecs = self._dense_embedding(last_hidden_state, attention_mask)
-            if self.normalize_embeddings:
-                dense_vecs = F.normalize(dense_vecs, dim=-1)
-            result["dense_vecs"] = dense_vecs
+            result["dense_vecs"] = self.dense_embedding(last_hidden_state, attention_mask)
         if return_sparse:
-            result["sparse_vecs"] = self._sparse_embedding(
+            result["sparse_vecs"] = self.sparse_embedding(
                 last_hidden_state,
                 text_input["input_ids"],
                 return_embedding=return_sparse_embedding,
             )
         if return_colbert_vecs:
-            colbert_vecs = self._colbert_embedding(last_hidden_state, attention_mask)
-            if self.normalize_embeddings:
-                colbert_vecs = F.normalize(colbert_vecs, dim=-1)
-            result["colbert_vecs"] = colbert_vecs
+            result["colbert_vecs"] = self.colbert_embedding(last_hidden_state, attention_mask)
         return result

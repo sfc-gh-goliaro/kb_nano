@@ -6,7 +6,8 @@ import torch
 import torch.nn as nn
 
 from ..L2.encoder_attention import EncoderAttention
-from ..L2.encoder_mlp import EncoderIntermediate, EncoderOutput
+from ..L2.encoder_intermediate import EncoderIntermediate
+from ..L2.encoder_output import EncoderOutput
 
 
 class BertLayer(nn.Module):

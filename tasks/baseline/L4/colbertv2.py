@@ -6,13 +6,13 @@ from dataclasses import dataclass
 
 import torch
 import torch.nn as nn
-import torch.nn.functional as F
 from transformers import AutoConfig
-from transformers.modeling_outputs import BaseModelOutput
 
-from ..L1.linear import Linear
-from ..L2.bert_embeddings import BertEmbeddings
-from ..L3.bert_layer import BertLayer
+from ..L2.colbertv2_embedding import ColBERTv2Embedding
+from ..L2.colbertv2_maxsim import ColBERTv2MaxSim
+from ..L2.colbertv2_score_reduce import ColBERTv2ScoreReduce
+from ..L2.colbertv2_token_mask import ColBERTv2TokenMask
+from ..L3.bert_model import BertModel
 
 
 @dataclass
@@ -65,82 +65,15 @@ class ColBERTv2Config:
         )
 
 
-class BertEncoder(nn.Module):
-    def __init__(self, config: ColBERTv2Config):
-        super().__init__()
-        self.layer = nn.ModuleList([BertLayer(config) for _ in range(config.num_hidden_layers)])
-
-    def forward(
-        self,
-        hidden_states: torch.Tensor,
-        attention_mask: torch.Tensor | None = None,
-    ) -> torch.Tensor:
-        for layer_module in self.layer:
-            hidden_states = layer_module(hidden_states, attention_mask=attention_mask)
-        return hidden_states
-
-
-class BertModel(nn.Module):
-    def __init__(self, config: ColBERTv2Config):
-        super().__init__()
-        self.config = config
-        self.embeddings = BertEmbeddings(config)
-        self.encoder = BertEncoder(config)
-
-    def _prepare_attention_mask(
-        self,
-        attention_mask: torch.Tensor | None,
-        device: torch.device,
-    ) -> torch.Tensor | None:
-        if attention_mask is None:
-            return None
-        return attention_mask[:, None, None, :].to(device=device, dtype=torch.bool)
-
-    def forward(
-        self,
-        input_ids: torch.Tensor | None = None,
-        attention_mask: torch.Tensor | None = None,
-        token_type_ids: torch.Tensor | None = None,
-        position_ids: torch.Tensor | None = None,
-        inputs_embeds: torch.Tensor | None = None,
-        return_dict: bool = True,
-    ) -> BaseModelOutput | tuple[torch.Tensor]:
-        if input_ids is not None and inputs_embeds is not None:
-            raise ValueError("Cannot specify both input_ids and inputs_embeds")
-        if input_ids is None and inputs_embeds is None:
-            raise ValueError("Must specify input_ids or inputs_embeds")
-
-        if input_ids is not None:
-            batch_size, seq_length = input_ids.shape
-            device = input_ids.device
-        else:
-            batch_size, seq_length = inputs_embeds.shape[:2]
-            device = inputs_embeds.device
-
-        if attention_mask is None:
-            attention_mask = torch.ones((batch_size, seq_length), dtype=torch.long, device=device)
-
-        embedding_output = self.embeddings(
-            input_ids=input_ids,
-            token_type_ids=token_type_ids,
-            position_ids=position_ids,
-            inputs_embeds=inputs_embeds,
-        )
-        extended_attention_mask = self._prepare_attention_mask(attention_mask, device)
-        hidden_states = self.encoder(embedding_output, attention_mask=extended_attention_mask)
-
-        if not return_dict:
-            return (hidden_states,)
-        return BaseModelOutput(last_hidden_state=hidden_states)
-
-
 class ColBERTv2ModelForInference(nn.Module):
     def __init__(self, config: ColBERTv2Config):
         super().__init__()
         self.config = config
         self.bert = BertModel(config)
-        self.linear = Linear(config.hidden_size, config.dim, bias=False)
-        self.pad_token = config.pad_token_id
+        self.embedding = ColBERTv2Embedding(config.hidden_size, config.dim)
+        self.token_mask = ColBERTv2TokenMask(config.pad_token_id)
+        self.maxsim = ColBERTv2MaxSim()
+        self.score_reducer = ColBERTv2ScoreReduce()
         self.skiplist: set[int] = set()
 
     def set_skiplist(self, token_ids: set[int] | list[int] | tuple[int, ...]) -> None:
@@ -151,13 +84,7 @@ class ColBERTv2ModelForInference(nn.Module):
         input_ids: torch.Tensor,
         skiplist: set[int] | None = None,
     ) -> torch.Tensor:
-        blocked = {self.pad_token}
-        if skiplist:
-            blocked |= {int(token_id) for token_id in skiplist}
-        mask = torch.ones_like(input_ids, dtype=torch.bool)
-        for token_id in blocked:
-            mask &= input_ids.ne(token_id)
-        return mask
+        return self.token_mask(input_ids, skiplist=skiplist)
 
     def query(
         self,
@@ -169,9 +96,8 @@ class ColBERTv2ModelForInference(nn.Module):
             attention_mask=attention_mask,
             return_dict=True,
         ).last_hidden_state
-        query_vecs = self.linear(hidden_states)
-        query_mask = self.mask(input_ids, skiplist=set()).unsqueeze(-1).float()
-        return F.normalize(query_vecs * query_mask, p=2, dim=2)
+        query_mask = self.mask(input_ids, skiplist=set())
+        return self.embedding(hidden_states, query_mask)
 
     def doc(
         self,
@@ -184,9 +110,8 @@ class ColBERTv2ModelForInference(nn.Module):
             attention_mask=attention_mask,
             return_dict=True,
         ).last_hidden_state
-        doc_vecs = self.linear(hidden_states)
         doc_mask = self.mask(input_ids, skiplist=self.skiplist)
-        doc_vecs = F.normalize(doc_vecs * doc_mask.unsqueeze(-1).float(), p=2, dim=2)
+        doc_vecs = self.embedding(hidden_states, doc_mask)
         if return_mask:
             return doc_vecs, doc_mask
         return doc_vecs
@@ -197,17 +122,14 @@ class ColBERTv2ModelForInference(nn.Module):
         doc_vecs: torch.Tensor,
         doc_mask: torch.Tensor,
     ) -> torch.Tensor:
-        scores = doc_vecs @ query_vecs.to(dtype=doc_vecs.dtype).permute(0, 2, 1)
-        return self.score_reduce(scores, doc_mask)
+        return self.maxsim(query_vecs, doc_vecs, doc_mask)
 
     def score_reduce(
         self,
         scores_padded: torch.Tensor,
         doc_mask: torch.Tensor,
     ) -> torch.Tensor:
-        doc_padding = ~doc_mask.view(scores_padded.size(0), scores_padded.size(1)).bool()
-        scores_padded = scores_padded.masked_fill(doc_padding.unsqueeze(-1), -9999)
-        return scores_padded.max(1).values.sum(-1)
+        return self.score_reducer(scores_padded, doc_mask)
 
     def forward(
         self,

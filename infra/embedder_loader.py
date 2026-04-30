@@ -68,23 +68,23 @@ def load_bge_m3_weights(model: BGEM3ModelForInference, model_path: str) -> None:
     if not os.path.exists(sparse_path):
         raise FileNotFoundError(f"Missing sparse head weights: {sparse_path}")
     sparse_state = torch.load(sparse_path, map_location="cpu", weights_only=True)
-    model.sparse_linear.load_state_dict(sparse_state)
+    model.sparse_embedding.sparse_linear.load_state_dict(sparse_state)
 
     colbert_path = os.path.join(model_path, "colbert_linear.pt")
     if not os.path.exists(colbert_path):
         raise FileNotFoundError(f"Missing ColBERT head weights: {colbert_path}")
     colbert_state = torch.load(colbert_path, map_location="cpu", weights_only=True)
-    model.colbert_linear.load_state_dict(colbert_state)
+    model.colbert_embedding.colbert_linear.load_state_dict(colbert_state)
 
     missing = [
         key for key in missing
         if key not in {
             "embeddings.position_ids",
             "embeddings.token_type_ids",
-            "sparse_linear.weight",
-            "sparse_linear.bias",
-            "colbert_linear.weight",
-            "colbert_linear.bias",
+            "sparse_embedding.sparse_linear.weight",
+            "sparse_embedding.sparse_linear.bias",
+            "colbert_embedding.colbert_linear.weight",
+            "colbert_embedding.colbert_linear.bias",
         }
     ]
     if missing:
@@ -117,6 +117,8 @@ def load_bge_m3_model(
 
 def load_colbertv2_weights(model: ColBERTv2ModelForInference, model_path: str) -> None:
     state = _remap_encoder_embedding_keys(_load_backbone_state_dict(model_path))
+    if "linear.weight" in state:
+        state["embedding.linear.weight"] = state.pop("linear.weight")
     missing, unexpected = model.load_state_dict(state, strict=False)
 
     missing = [
