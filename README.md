@@ -1,12 +1,14 @@
 # kb-nano
 
-A standalone, high-performance inference engine supporting **LLMs** (Llama 3.1, Llama 4, Mixtral-8x7B, DeepSeek V3.2, GPT-OSS, Qwen2-VL, Qwen3-VL), **linear-attention LLMs** (GLA, RetNet, RWKV7), **diffusion models** (FLUX.1-dev, SDXL, HunyuanVideo-1.5), **detection models** (YOLOv10, RTDetrV2), **vision encoders** (SigLIP-2, DINOv3, SwinV2), **segmentation models** (SAM3.1), **protein structure prediction** (OpenFold3), audio models (Whisper), and **TTS models** (CosyVoice3) with tensor parallelism and FP8 quantization. No vLLM dependency at runtime — just PyTorch, Triton, and Flash Attention.
+A standalone, high-performance inference engine supporting **LLMs** (Llama 3.1, Llama 4, Mixtral-8x7B, DeepSeek V3.2, GPT-OSS, Qwen2-VL, Qwen3-VL), **linear-attention LLMs** (GLA, RetNet, RWKV7), **image classification models** (ConvNeXtV2, EfficientNetV2), **diffusion models** (FLUX.1-dev, SDXL, HunyuanVideo-1.5), **detection models** (YOLOv10, RTDetrV2), **vision encoders** (SigLIP-2, DINOv3, SwinV2), **segmentation models** (SAM3.1), **protein structure prediction** (OpenFold3), audio models (Whisper), and **TTS models** (CosyVoice3) with tensor parallelism and FP8 quantization. No vLLM dependency at runtime — just PyTorch, Triton, and Flash Attention.
 
 ## Features
 
 - **Llama 3.1** (8B, 70B) with frequency-scaled RoPE
 - **Llama 4** with fused MoE experts
 - **Mixtral-8x7B** with fused Triton MoE grouped-GEMM kernels
+- **ConvNeXtV2** image classification with GRN and large-kernel depthwise blocks
+- **EfficientNetV2** image classification with fused MBConv / EdgeResidual blocks
 - **DeepSeek V3.2** with MLA (Multi-head Latent Attention), 256-expert MoE via DeepGEMM FP8, DSA (DeepSeek Sparse Attention), and YARN RoPE — currently **0.78–0.90× of vLLM** throughput on 8×H200 (gap due to kernel-launch overhead, GEMM kernel selection, and AllReduce+RMSNorm fusion)
 - **GPT-OSS** (20B, 120B) MXFP4-quantized MoE with native Triton inference, YaRN RoPE, attention sinks, and sliding window
 - **Mamba / Mamba2** (`state-spaces/mamba-2.8b-hf`, `mistralai/Mamba-Codestral-7B-v0.1`) selective state-space models with vLLM-aligned `causal_conv1d` + `mamba_chunk_scan` / `selective_scan` kernels, slot-based recurrent state cache, chunked-prefill metadata, and TP sharding (incl. `n_groups % tp != 0` head-shard groups)
@@ -77,6 +79,7 @@ A standalone, high-performance inference engine supporting **LLMs** (Llama 3.1, 
 └── tests/                      # Test suite
     ├── test_bench.py           # Bench module tests (discovery, replacement, kernel and E2E integration)
     ├── bench_vllm.py           # Multi-scenario throughput + latency + alignment benchmark vs vLLM
+    ├── bench_image_cls.py     # Image classification benchmark: kb-nano vs transformers / timm
     ├── bench_vllm_omni.py     # Diffusion (FLUX / HunyuanVideo) and TTS (CosyVoice3) benchmark: kb-nano vs vllm-omni
     ├── bench_diffusers.py     # SDXL diffusion benchmark: kb-nano vs diffusers + torch.compile
     ├── bench_timm.py          # Vision encoder benchmark: kb-nano vs timm (SigLIP-2, DINOv3, SwinV2)
@@ -129,6 +132,68 @@ python tests/test_bench.py
 
 # Bench module unit tests only (no GPU required)
 python tests/test_bench.py --unit-only
+```
+
+### Benchmarking vs transformers / timm (Image Classification)
+
+Default dataset: real `food101` validation images. ConvNeXtV2 is compared with Hugging Face Transformers, and EfficientNetV2 is compared with timm (`pytorch-image-models`). The official workload below uses batch size 8, 3072 images per measured pass, and 3 measured passes. If you have gated access to `ILSVRC/imagenet-1k`, you can override with `--dataset ILSVRC/imagenet-1k --dataset-split validation`.
+
+```bash
+# ConvNeXtV2: throughput + latency + logits alignment vs transformers
+python tests/bench_image_cls.py \
+    --model facebook/convnextv2-base-22k-384 \
+    --use-fp16 \
+    --num-images 3072 \
+    --batch-size 8 \
+    --measure-iters 3 \
+    --alignment-images 32
+
+# EfficientNetV2: throughput + latency + logits alignment vs timm
+python tests/bench_image_cls.py \
+    --model timm/efficientnetv2_rw_m.agc_in1k \
+    --use-fp16 \
+    --num-images 3072 \
+    --batch-size 8 \
+    --measure-iters 3 \
+    --alignment-images 32
+
+# kb-nano only
+python tests/bench_image_cls.py \
+    --model facebook/convnextv2-base-22k-384 \
+    --use-fp16 \
+    --num-images 3072 \
+    --batch-size 8 \
+    --measure-iters 3 \
+    --alignment-images 32 \
+    --skip-reference
+
+# Use gated ImageNet-1K validation instead
+python tests/bench_image_cls.py \
+    --model facebook/convnextv2-base-22k-384 \
+    --use-fp16 \
+    --num-images 3072 \
+    --batch-size 8 \
+    --measure-iters 3 \
+    --alignment-images 32 \
+    --dataset ILSVRC/imagenet-1k --dataset-split validation
+
+# Save results to a specific directory
+python tests/bench_image_cls.py \
+    --model facebook/convnextv2-base-22k-384 \
+    --use-fp16 \
+    --num-images 3072 \
+    --batch-size 8 \
+    --measure-iters 3 \
+    --alignment-images 32 \
+    --output-dir tests/results/H200/convnextv2-base-22k-384-heavy
+python tests/bench_image_cls.py \
+    --model timm/efficientnetv2_rw_m.agc_in1k \
+    --use-fp16 \
+    --num-images 3072 \
+    --batch-size 8 \
+    --measure-iters 3 \
+    --alignment-images 32 \
+    --output-dir tests/results/H200/efficientnetv2_rw_m.agc_in1k-heavy
 ```
 
 ### Benchmarking vs flash-linear-attention (GLA / RetNet / RWKV7)
@@ -453,7 +518,7 @@ Each run is tagged with a `tier` (`agent`, `kernel`, `eval`, or `e2e`) indicatin
 - Hugging Face (`transformers`, `huggingface_hub`, `safetensors`)
 - aiohttp (for the LLM kernel agent)
 - MLflow (experiment tracking — gracefully skipped if not installed)
-- timm (pytorch-image-models — only needed for vision encoder comparison tests)
+- timm (pytorch-image-models — only needed for EfficientNetV2 and vision encoder comparison tests)
 - vLLM (only needed for running comparison tests)
 - matplotlib (only needed for benchmark plotting)
 - ultralytics (YOLOv10 baseline benchmarking)
@@ -585,6 +650,29 @@ Run `tests/bench_vllm.py` to reproduce. Three scenarios per model, 1000 sequence
 | Mixtral-8x7B | 4 | prefill-heavy | 1024/512  | 15,060 | 23,064 | **1.53x** |
 | Mixtral-8x7B | 4 | balanced      |  512/512  | 20,530 | 33,443 | **1.63x** |
 | Mixtral-8x7B | 4 | decode-heavy  |  512/1024 | 24,728 | 37,761 | **1.53x** |
+
+### ConvNeXtV2 / EfficientNetV2 (Image Classification)
+
+Run `tests/bench_image_cls.py` to reproduce. Real `food101` validation images are used by default (streamed from Hugging Face datasets), resized and center-cropped to the target resolution with model-specific normalization. ConvNeXtV2 uses Hugging Face Transformers as the reference library; EfficientNetV2 uses timm (`pytorch-image-models`). Both engines run in fp16 on H200. The reported workload uses `--num-images 3072 --batch-size 8 --measure-iters 3 --alignment-images 32`, for 9216 timed images per backend.
+
+| Model | Reference | Image Size | Ref (img/s) | Ours (img/s) | Ratio | Top1 Match |
+|-------|-----------|-----------:|------------:|-------------:|------:|-----------:|
+| facebook/convnextv2-base-22k-384 | transformers | 384 | 784.28 | 780.12 | **0.99x** | 1.00 |
+| timm/efficientnetv2_rw_m.agc_in1k | timm | 320 | 651.71 | 681.34 | **1.05x** | 1.00 |
+
+Latency ratio (`reference median / ours median`):
+
+| Model | Batch 1 | Batch 8 |
+|-------|--------:|--------:|
+| ConvNeXtV2 | 0.98x | **1.00x** |
+| EfficientNetV2 | **1.09x** | **1.06x** |
+
+Logit alignment:
+
+| Model | Cosine | MAE |
+|-------|-------:|----:|
+| ConvNeXtV2 | 1.000000 | 0.0 |
+| EfficientNetV2 | 1.000000 | 0.0 |
 
 ### Qwen2-VL / Qwen3-VL (VLM)
 
