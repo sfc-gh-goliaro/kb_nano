@@ -297,6 +297,12 @@ python tests/bench_recsys.py --model lightgcn
 # Run both recsys baselines in one invocation
 python tests/bench_recsys.py --model all
 
+# Full alignment + throughput run used for the H200 numbers below
+python tests/bench_recsys.py --model all --output-dir tests/results/H200/recsys
+
+# Force regeneration of the cached trained checkpoints
+python tests/bench_recsys.py --model all --retrain-checkpoints --output-dir tests/results/H200/recsys
+
 # Override dataset cache root
 python tests/bench_recsys.py --model all --dataset-root tests/data/recsys
 
@@ -310,6 +316,9 @@ python tests/bench_recsys.py --model lightgcn --output-dir tests/results/H200/li
 ```
 
 Default timing for the recsys benchmark is `100` warmup iterations and `11000` measured iterations.
+The benchmark uses real input datasets and official TorchRec / PyG model implementations as references.
+If a trained checkpoint is missing, the script trains one on the real dataset and caches it under `tests/data/recsys/checkpoints` by default.
+Both the reference implementation and kb-nano load the same trained checkpoint for alignment and throughput.
 
 ### Benchmarking detection models
 
@@ -785,11 +794,14 @@ Alignment:
 ### DLRMv2 (RecSys)
 
 Default real benchmark: `python tests/bench_recsys.py --model dlrmv2`
+H200 command used for the table below: `python tests/bench_recsys.py --model all --output-dir tests/results/H200/recsys`
 
 - Dataset: `scikit-learn/adult-census-income` train split
 - Reference baseline: `torchrec.models.dlrm.DLRM`
+- Checkpoint: trained on Adult train with binary cross-entropy, `64` steps, cached at `tests/data/recsys/checkpoints/dlrmv2_adult_seed42.pt`
 - Default workload: batch size `16384`
 - Default timing: `100` warmup iterations + `11000` measured iterations
+- H200 cached-checkpoint full run wall time: `37.81s` for DLRMv2 + LightGCN
 
 **Hardware: NVIDIA H200**
 
@@ -797,7 +809,7 @@ Throughput (real dataset default: Adult train, batch size 16384, bag size 1):
 
 | Model | TorchRec (samples/s) | Ours (samples/s) | Ratio |
 |-------|----------------------:|-----------------:|------:|
-| DLRMv2 | 38,148,735 | 40,077,663 | **1.05x** |
+| DLRMv2 | 38,244,364 | 40,422,675 | **1.06x** |
 
 Alignment (real dataset default):
 
@@ -811,11 +823,14 @@ Alignment (real dataset default):
 ### LightGCN (Graph Recommendation)
 
 Default real benchmark: `python tests/bench_recsys.py --model lightgcn`
+H200 command used for the table below: `python tests/bench_recsys.py --model all --output-dir tests/results/H200/recsys`
 
 - Dataset: MovieLens 1M ratings, treating `rating >= 4` as positive implicit feedback
 - Reference baseline: `torch_geometric.nn.models.LightGCN`
+- Checkpoint: trained on MovieLens 1M positives with BPR, `64` steps, cached at `tests/data/recsys/checkpoints/lightgcn_movielens-1m_min4p0_d64_l3_seed42.pt`
 - Default workload: full graph with `575281` edges, `131072` scored pairs per iteration
 - Default timing: `100` warmup iterations + `11000` measured iterations
+- H200 cached-checkpoint full run wall time: `37.81s` for DLRMv2 + LightGCN
 
 **Hardware: NVIDIA H200**
 
@@ -823,15 +838,15 @@ Throughput (real dataset default: MovieLens 1M, 575281 edges, 131072 query pairs
 
 | Model | torch_geometric (pairs/s) | Ours (pairs/s) | Ratio |
 |-------|---------------------------:|---------------:|------:|
-| LightGCN | 258,886,800 | 264,966,359 | **1.02x** |
+| LightGCN | 258,867,242 | 265,871,241 | **1.03x** |
 
 Alignment (real dataset default):
 
 | Output | Avg CosSim | Avg Mean Abs Diff | Notes |
 |--------|-----------:|------------------:|:------|
-| User embeddings | 1.00000000 | 6.14e-10 | PASS |
-| Item embeddings | 1.00000000 | 8.97e-10 | PASS |
-| Scores | 1.00000000 | 2.40e-08 | PASS |
+| User embeddings | 1.00000000 | 2.69e-09 | PASS |
+| Item embeddings | 1.00000000 | 3.93e-09 | PASS |
+| Scores | 1.00000000 | 1.23e-07 | PASS |
 
 ### DeepSeek V3.2 FP8 (MoE, MLA, DSA)
 

@@ -5,6 +5,10 @@ Real-data defaults:
 - `dlrmv2`: Hugging Face `scikit-learn/adult-census-income`
 - `lightgcn`: official GroupLens MovieLens 1M ratings
 
+Checkpoint defaults:
+- missing checkpoints are trained on the real dataset and cached locally
+- both kb-nano and the reference backend load the same trained checkpoint
+
 Current reference backends:
 - `lightgcn`: `torch_geometric.nn.models.LightGCN`
 - `dlrmv2`: `torchrec.models.dlrm.DLRM`
@@ -26,6 +30,7 @@ import sys
 import time
 import urllib.request
 import zipfile
+from dataclasses import asdict
 from pathlib import Path
 from typing import Any
 
@@ -36,6 +41,7 @@ import torch.nn.functional as F
 ADULT_DATASET_ID = "scikit-learn/adult-census-income"
 MOVIELENS_1M_URL = "https://files.grouplens.org/datasets/movielens/ml-1m.zip"
 DEFAULT_DATASET_ROOT = Path("tests") / "data" / "recsys"
+DEFAULT_CHECKPOINT_ROOT = DEFAULT_DATASET_ROOT / "checkpoints"
 
 ADULT_NUMERIC_COLUMNS = [
     "age",
@@ -55,6 +61,7 @@ ADULT_CATEGORICAL_COLUMNS = [
     "sex",
     "native.country",
 ]
+ADULT_LABEL_COLUMN = "income"
 
 
 def _bootstrap_local_package() -> None:
@@ -220,30 +227,84 @@ def _auto_device() -> torch.device:
     return torch.device("cuda" if torch.cuda.is_available() else "cpu")
 
 
-def _copy_dlrm_weights_from_torchrec(ref, ours: DLRMv2) -> None:
+def _copy_dlrm_weights_to_torchrec(ours: DLRMv2, ref) -> None:
     with torch.no_grad():
         for index, num_embeddings in enumerate(ours.config.num_embeddings_per_feature):
             start = int(ours.embedding_bag_collection.table_offsets[index].item())
             end = start + num_embeddings
-            ours.embedding_bag_collection.embedding_bag.emb.weight[start:end].copy_(
-                ref.sparse_arch.embedding_bag_collection.embedding_bags[f"t{index}"].weight,
+            ref.sparse_arch.embedding_bag_collection.embedding_bags[f"t{index}"].weight.copy_(
+                ours.embedding_bag_collection.embedding_bag.emb.weight[start:end],
             )
         for ref_layer, ours_layer in zip(
             ref.dense_arch.model._mlp,
             ours.bottom_mlp.layers,
             strict=True,
         ):
-            ours_layer.weight.copy_(ref_layer._linear.weight)
-            ours_layer.bias.copy_(ref_layer._linear.bias)
+            ref_layer._linear.weight.copy_(ours_layer.weight)
+            ref_layer._linear.bias.copy_(ours_layer.bias)
         for ref_layer, ours_layer in zip(
             ref.over_arch.model[0]._mlp,
             ours.top_mlp.layers[:-1],
             strict=True,
         ):
-            ours_layer.weight.copy_(ref_layer._linear.weight)
-            ours_layer.bias.copy_(ref_layer._linear.bias)
-        ours.top_mlp.layers[-1].weight.copy_(ref.over_arch.model[1].weight)
-        ours.top_mlp.layers[-1].bias.copy_(ref.over_arch.model[1].bias)
+            ref_layer._linear.weight.copy_(ours_layer.weight)
+            ref_layer._linear.bias.copy_(ours_layer.bias)
+        ref.over_arch.model[1].weight.copy_(ours.top_mlp.layers[-1].weight)
+        ref.over_arch.model[1].bias.copy_(ours.top_mlp.layers[-1].bias)
+
+
+def _checkpoint_state_dict(model: torch.nn.Module) -> dict[str, torch.Tensor]:
+    return {
+        name: tensor.detach().cpu()
+        for name, tensor in model.state_dict().items()
+    }
+
+
+def _config_dict(config) -> dict[str, Any]:
+    return asdict(config)
+
+
+def _load_compatible_checkpoint(
+    checkpoint_path: Path,
+    *,
+    model_name: str,
+    config,
+    device: torch.device,
+) -> dict[str, Any] | None:
+    if not checkpoint_path.exists():
+        return None
+    checkpoint = torch.load(checkpoint_path, map_location=device, weights_only=True)
+    if checkpoint.get("model") != model_name:
+        return None
+    if checkpoint.get("config") != _config_dict(config):
+        return None
+    if "state_dict" not in checkpoint:
+        return None
+    return checkpoint
+
+
+def _save_checkpoint(
+    checkpoint_path: Path,
+    *,
+    model_name: str,
+    config,
+    model: torch.nn.Module,
+    metadata: dict[str, Any],
+) -> dict[str, Any]:
+    checkpoint = {
+        "format_version": 1,
+        "model": model_name,
+        "config": _config_dict(config),
+        "state_dict": _checkpoint_state_dict(model),
+        "metadata": metadata,
+    }
+    checkpoint_path.parent.mkdir(parents=True, exist_ok=True)
+    torch.save(checkpoint, checkpoint_path)
+    return checkpoint
+
+
+def _batch_indices(total: int, *, start: int, count: int, device: torch.device) -> torch.Tensor:
+    return (torch.arange(count, device=device, dtype=torch.long) + start) % total
 
 
 def _load_adult_train_split(dataset_root: Path):
@@ -271,6 +332,10 @@ def _transform_adult_dense_value(value: Any) -> float:
     if value is None:
         return 0.0
     return math.log1p(max(float(value), 0.0))
+
+
+def _transform_adult_label(value: Any) -> float:
+    return 1.0 if ">50K" in str(value) else 0.0
 
 
 def _build_adult_categorical_mappings(train_split) -> dict[str, dict[str, int]]:
@@ -310,6 +375,25 @@ def _adult_rows_to_tensors(
     return dense_features, sparse_indices
 
 
+def _adult_rows_to_labeled_tensors(
+    rows: list[dict[str, Any]],
+    *,
+    mappings: dict[str, dict[str, int]],
+    device: torch.device,
+) -> tuple[torch.Tensor, list[torch.Tensor], torch.Tensor]:
+    dense_features, sparse_indices = _adult_rows_to_tensors(
+        rows,
+        mappings=mappings,
+        device=device,
+    )
+    labels = torch.tensor(
+        [_transform_adult_label(row[ADULT_LABEL_COLUMN]) for row in rows],
+        dtype=torch.float32,
+        device=device,
+    ).unsqueeze(1)
+    return dense_features, sparse_indices, labels
+
+
 def _take_dataset_rows(dataset, *, start: int, count: int) -> list[dict[str, Any]]:
     dataset_size = len(dataset)
     if dataset_size == 0:
@@ -318,6 +402,103 @@ def _take_dataset_rows(dataset, *, start: int, count: int) -> list[dict[str, Any
         dataset[(start + index) % dataset_size]
         for index in range(count)
     ]
+
+
+def _dlrm_checkpoint_path(args: argparse.Namespace) -> Path:
+    return args.checkpoint_root / f"dlrmv2_{args.dlrm_dataset}_seed{args.seed}.pt"
+
+
+def _ensure_dlrm_checkpoint(
+    args: argparse.Namespace,
+    *,
+    config: DLRMv2Config,
+    train_split,
+    mappings: dict[str, dict[str, int]],
+    device: torch.device,
+) -> tuple[Path, dict[str, Any]]:
+    checkpoint_path = _dlrm_checkpoint_path(args)
+    checkpoint = None if args.retrain_checkpoints else _load_compatible_checkpoint(
+        checkpoint_path,
+        model_name="dlrmv2",
+        config=config,
+        device=device,
+    )
+    if checkpoint is not None:
+        return checkpoint_path, checkpoint["metadata"]
+
+    shuffled = train_split.shuffle(seed=args.seed)
+    train_rows = _take_dataset_rows(shuffled, start=0, count=len(train_split))
+    dense_features, sparse_indices, labels = _adult_rows_to_labeled_tensors(
+        train_rows,
+        mappings=mappings,
+        device=device,
+    )
+
+    model = DLRMv2(config).to(device).train()
+    optimizer = torch.optim.AdamW(model.parameters(), lr=args.dlrm_train_lr)
+    final_loss = math.nan
+    total_rows = labels.shape[0]
+
+    for step in range(args.dlrm_train_steps):
+        indices = _batch_indices(
+            total_rows,
+            start=step * args.dlrm_train_batch_size,
+            count=args.dlrm_train_batch_size,
+            device=device,
+        )
+        batch_dense = dense_features.index_select(0, indices)
+        batch_sparse = [feature.index_select(0, indices) for feature in sparse_indices]
+        batch_labels = labels.index_select(0, indices)
+
+        optimizer.zero_grad(set_to_none=True)
+        logits = model(batch_dense, batch_sparse)
+        loss = F.binary_cross_entropy_with_logits(logits, batch_labels)
+        loss.backward()
+        optimizer.step()
+        final_loss = float(loss.detach().item())
+
+    _maybe_sync(device)
+    model.eval()
+    metadata = {
+        "dataset": ADULT_DATASET_ID,
+        "split": "train",
+        "rows": len(train_split),
+        "objective": "binary_cross_entropy",
+        "train_steps": args.dlrm_train_steps,
+        "train_batch_size": args.dlrm_train_batch_size,
+        "train_lr": args.dlrm_train_lr,
+        "final_loss": final_loss,
+    }
+    checkpoint = _save_checkpoint(
+        checkpoint_path,
+        model_name="dlrmv2",
+        config=config,
+        model=model,
+        metadata=metadata,
+    )
+    return checkpoint_path, checkpoint["metadata"]
+
+
+def _load_dlrm_models(
+    *,
+    config: DLRMv2Config,
+    checkpoint_path: Path,
+    device: torch.device,
+):
+    checkpoint = _load_compatible_checkpoint(
+        checkpoint_path,
+        model_name="dlrmv2",
+        config=config,
+        device=device,
+    )
+    if checkpoint is None:
+        raise RuntimeError(f"missing or incompatible DLRMv2 checkpoint: {checkpoint_path}")
+
+    ours = DLRMv2(config).to(device).eval()
+    ours.load_state_dict(checkpoint["state_dict"], strict=True)
+    ref = _build_torchrec_dlrm_reference(config, device)
+    _copy_dlrm_weights_to_torchrec(ours, ref)
+    return ref.eval(), ours.eval(), checkpoint
 
 
 def _prepare_dlrm_inputs(
@@ -340,6 +521,13 @@ def _prepare_dlrm_inputs(
         bottom_mlp_dims=[128, 64],
         top_mlp_dims=[128, 64, 1],
         embedding_bag_mode="sum",
+    )
+    checkpoint_path, checkpoint_metadata = _ensure_dlrm_checkpoint(
+        args,
+        config=config,
+        train_split=train_split,
+        mappings=mappings,
+        device=device,
     )
 
     alignment_rows = _take_dataset_rows(
@@ -365,6 +553,8 @@ def _prepare_dlrm_inputs(
             mappings=mappings,
             device=device,
         ),
+        "checkpoint_path": checkpoint_path,
+        "checkpoint_metadata": checkpoint_metadata,
         "metadata": {
             "dataset": ADULT_DATASET_ID,
             "split": "train",
@@ -373,6 +563,9 @@ def _prepare_dlrm_inputs(
             "bag_size": 1,
             "numeric_features": len(ADULT_NUMERIC_COLUMNS),
             "categorical_features": len(ADULT_CATEGORICAL_COLUMNS),
+            "checkpoint": str(checkpoint_path),
+            "checkpoint_objective": checkpoint_metadata["objective"],
+            "checkpoint_train_steps": checkpoint_metadata["train_steps"],
         },
     }
 
@@ -383,9 +576,11 @@ def _run_dlrm_alignment(
     prepared_inputs: dict[str, Any],
 ) -> dict[str, Any]:
     config: DLRMv2Config = prepared_inputs["config"]
-    ref = _build_torchrec_dlrm_reference(config, device)
-    ours = DLRMv2(config).to(device).eval()
-    _copy_dlrm_weights_from_torchrec(ref, ours)
+    ref, ours, checkpoint = _load_dlrm_models(
+        config=config,
+        checkpoint_path=prepared_inputs["checkpoint_path"],
+        device=device,
+    )
     dense_features, sparse_indices = prepared_inputs["alignment_batch"]
     kjt = _build_torchrec_kjt(sparse_indices)
 
@@ -401,6 +596,8 @@ def _run_dlrm_alignment(
 
     return {
         "reference": "torchrec.models.dlrm.DLRM",
+        "checkpoint": str(prepared_inputs["checkpoint_path"]),
+        "checkpoint_objective": checkpoint["metadata"]["objective"],
         "dense_embedding": _tensor_metrics(ours_dense, ref_dense),
         "sparse_embeddings": _tensor_metrics(ours_sparse, ref_sparse),
         "interaction": _tensor_metrics(ours_interacted, ref_interacted),
@@ -416,9 +613,11 @@ def _run_dlrm_throughput(
     measure_iters: int,
 ) -> dict[str, Any]:
     config: DLRMv2Config = prepared_inputs["config"]
-    ref = _build_torchrec_dlrm_reference(config, device)
-    ours = DLRMv2(config).to(device).eval()
-    _copy_dlrm_weights_from_torchrec(ref, ours)
+    ref, ours, checkpoint = _load_dlrm_models(
+        config=config,
+        checkpoint_path=prepared_inputs["checkpoint_path"],
+        device=device,
+    )
     dense_features, sparse_indices = prepared_inputs["throughput_batch"]
     kjt = _build_torchrec_kjt(sparse_indices)
     batch_size = dense_features.shape[0]
@@ -445,6 +644,8 @@ def _run_dlrm_throughput(
     ref_sps = ref_metrics["samples_per_second"]
     return {
         "reference": "torchrec.models.dlrm.DLRM",
+        "checkpoint": str(prepared_inputs["checkpoint_path"]),
+        "checkpoint_objective": checkpoint["metadata"]["objective"],
         "ours": ours_metrics,
         "reference_metrics": ref_metrics,
         "ratio_vs_reference": ours_sps / ref_sps if ref_sps > 0 else math.nan,
@@ -468,6 +669,120 @@ def _copy_lightgcn_weights(ours: LightGCN, ref) -> None:
         num_users = ours.config.num_users
         ref.embedding.weight[:num_users].copy_(ours.user_embedding.emb.weight)
         ref.embedding.weight[num_users:].copy_(ours.item_embedding.emb.weight)
+
+
+def _lightgcn_checkpoint_path(args: argparse.Namespace) -> Path:
+    min_rating = str(args.lightgcn_min_rating).replace(".", "p")
+    return (
+        args.checkpoint_root
+        / f"lightgcn_{args.lightgcn_dataset}_min{min_rating}_"
+          f"d{args.lightgcn_embedding_dim}_l{args.lightgcn_num_layers}_seed{args.seed}.pt"
+    )
+
+
+def _ensure_lightgcn_checkpoint(
+    args: argparse.Namespace,
+    *,
+    config: LightGCNConfig,
+    edge_users: torch.Tensor,
+    edge_items: torch.Tensor,
+    adjacency: torch.Tensor,
+    device: torch.device,
+) -> tuple[Path, dict[str, Any]]:
+    checkpoint_path = _lightgcn_checkpoint_path(args)
+    checkpoint = None if args.retrain_checkpoints else _load_compatible_checkpoint(
+        checkpoint_path,
+        model_name="lightgcn",
+        config=config,
+        device=device,
+    )
+    if checkpoint is not None:
+        return checkpoint_path, checkpoint["metadata"]
+
+    edge_users = edge_users.to(device)
+    edge_items = edge_items.to(device)
+    model = LightGCN(config).to(device).train()
+    optimizer = torch.optim.AdamW(model.parameters(), lr=args.lightgcn_train_lr)
+    final_loss = math.nan
+
+    for _ in range(args.lightgcn_train_steps):
+        indices = torch.randint(
+            edge_users.numel(),
+            (args.lightgcn_train_batch_size,),
+            device=device,
+            dtype=torch.long,
+        )
+        positive_users = edge_users.index_select(0, indices)
+        positive_items = edge_items.index_select(0, indices)
+        negative_items = torch.randint(
+            config.num_items,
+            (args.lightgcn_train_batch_size,),
+            device=device,
+            dtype=torch.long,
+        )
+
+        optimizer.zero_grad(set_to_none=True)
+        user_embeddings, item_embeddings = model.get_user_item_embeddings(adjacency)
+        positive_scores = (
+            user_embeddings[positive_users] * item_embeddings[positive_items]
+        ).sum(dim=-1)
+        negative_scores = (
+            user_embeddings[positive_users] * item_embeddings[negative_items]
+        ).sum(dim=-1)
+        loss = -F.logsigmoid(positive_scores - negative_scores).mean()
+        loss.backward()
+        optimizer.step()
+        final_loss = float(loss.detach().item())
+
+    _maybe_sync(device)
+    model.eval()
+    metadata = {
+        "dataset": "movielens-1m",
+        "source": MOVIELENS_1M_URL,
+        "edges": int(edge_users.numel()),
+        "objective": "bpr",
+        "train_steps": args.lightgcn_train_steps,
+        "train_batch_size": args.lightgcn_train_batch_size,
+        "train_lr": args.lightgcn_train_lr,
+        "final_loss": final_loss,
+    }
+    checkpoint = _save_checkpoint(
+        checkpoint_path,
+        model_name="lightgcn",
+        config=config,
+        model=model,
+        metadata=metadata,
+    )
+    return checkpoint_path, checkpoint["metadata"]
+
+
+def _load_lightgcn_models(
+    *,
+    config: LightGCNConfig,
+    checkpoint_path: Path,
+    device: torch.device,
+):
+    checkpoint = _load_compatible_checkpoint(
+        checkpoint_path,
+        model_name="lightgcn",
+        config=config,
+        device=device,
+    )
+    if checkpoint is None:
+        raise RuntimeError(f"missing or incompatible LightGCN checkpoint: {checkpoint_path}")
+
+    PyGLightGCN = _load_pyg_lightgcn()
+    ours = LightGCN(config).to(device).eval()
+    ours.load_state_dict(checkpoint["state_dict"], strict=True)
+    ref = PyGLightGCN(
+        num_nodes=config.num_users + config.num_items,
+        embedding_dim=config.embedding_dim,
+        num_layers=config.num_layers,
+        alpha=1.0 / (config.num_layers + 1),
+        normalize=False,
+    ).to(device).eval()
+    _copy_lightgcn_weights(ours, ref)
+    return ref.eval(), ours.eval(), checkpoint
 
 
 def _download_file(url: str, destination: Path) -> None:
@@ -592,6 +907,14 @@ def _prepare_lightgcn_inputs(
         config.num_items,
         device=device,
     )
+    checkpoint_path, checkpoint_metadata = _ensure_lightgcn_checkpoint(
+        args,
+        config=config,
+        edge_users=edge_users_device,
+        edge_items=edge_items_device,
+        adjacency=adjacency,
+        device=device,
+    )
 
     return {
         "config": config,
@@ -609,6 +932,8 @@ def _prepare_lightgcn_inputs(
             throughput_items.to(device),
             adjacency,
         ),
+        "checkpoint_path": checkpoint_path,
+        "checkpoint_metadata": checkpoint_metadata,
         "metadata": {
             "dataset": "movielens-1m",
             "source": MOVIELENS_1M_URL,
@@ -617,6 +942,9 @@ def _prepare_lightgcn_inputs(
             "edges": payload["num_edges"],
             "pairs": args.lightgcn_num_pairs,
             "min_rating": args.lightgcn_min_rating,
+            "checkpoint": str(checkpoint_path),
+            "checkpoint_objective": checkpoint_metadata["objective"],
+            "checkpoint_train_steps": checkpoint_metadata["train_steps"],
         },
     }
 
@@ -626,17 +954,12 @@ def _run_lightgcn_alignment(
     device: torch.device,
     prepared_inputs: dict[str, Any],
 ) -> dict[str, Any]:
-    PyGLightGCN = _load_pyg_lightgcn()
     config: LightGCNConfig = prepared_inputs["config"]
-    ours = LightGCN(config).to(device).eval()
-    ref = PyGLightGCN(
-        num_nodes=config.num_users + config.num_items,
-        embedding_dim=config.embedding_dim,
-        num_layers=config.num_layers,
-        alpha=1.0 / (config.num_layers + 1),
-        normalize=False,
-    ).to(device).eval()
-    _copy_lightgcn_weights(ours, ref)
+    ref, ours, checkpoint = _load_lightgcn_models(
+        config=config,
+        checkpoint_path=prepared_inputs["checkpoint_path"],
+        device=device,
+    )
 
     _edge_users, _edge_items, user_ids, item_ids, adjacency = prepared_inputs["alignment_batch"]
     edge_label_index = torch.stack([user_ids, item_ids + config.num_users], dim=0)
@@ -651,6 +974,8 @@ def _run_lightgcn_alignment(
 
     return {
         "reference": "torch_geometric.nn.models.LightGCN",
+        "checkpoint": str(prepared_inputs["checkpoint_path"]),
+        "checkpoint_objective": checkpoint["metadata"]["objective"],
         "user_embeddings": _tensor_metrics(ours_user, ref_user),
         "item_embeddings": _tensor_metrics(ours_item, ref_item),
         "scores": _tensor_metrics(ours_scores, ref_scores),
@@ -664,17 +989,12 @@ def _run_lightgcn_throughput(
     warmup_iters: int,
     measure_iters: int,
 ) -> dict[str, Any]:
-    PyGLightGCN = _load_pyg_lightgcn()
     config: LightGCNConfig = prepared_inputs["config"]
-    ours = LightGCN(config).to(device).eval()
-    ref = PyGLightGCN(
-        num_nodes=config.num_users + config.num_items,
-        embedding_dim=config.embedding_dim,
-        num_layers=config.num_layers,
-        alpha=1.0 / (config.num_layers + 1),
-        normalize=False,
-    ).to(device).eval()
-    _copy_lightgcn_weights(ours, ref)
+    ref, ours, checkpoint = _load_lightgcn_models(
+        config=config,
+        checkpoint_path=prepared_inputs["checkpoint_path"],
+        device=device,
+    )
 
     _edge_users, _edge_items, user_ids, item_ids, adjacency = prepared_inputs["throughput_batch"]
     edge_label_index = torch.stack([user_ids, item_ids + config.num_users], dim=0)
@@ -701,6 +1021,8 @@ def _run_lightgcn_throughput(
     ref_pps = ref_metrics["pairs_per_second"]
     return {
         "reference": "torch_geometric.nn.models.LightGCN",
+        "checkpoint": str(prepared_inputs["checkpoint_path"]),
+        "checkpoint_objective": checkpoint["metadata"]["objective"],
         "ours": ours_metrics,
         "reference_metrics": ref_metrics,
         "ratio_vs_reference": ours_pps / ref_pps if ref_pps > 0 else math.nan,
@@ -723,6 +1045,11 @@ def _summarize_model_result(name: str, result: dict[str, Any]) -> None:
         if "pairs" in metadata:
             parts.append(f"pairs={metadata['pairs']}")
         print(f"  data: {', '.join(parts)}")
+        if "checkpoint" in metadata:
+            print(
+                f"  checkpoint: {metadata['checkpoint']} "
+                f"({metadata['checkpoint_objective']}, steps={metadata['checkpoint_train_steps']})"
+            )
 
     alignment = result.get("alignment")
     if alignment:
@@ -805,6 +1132,17 @@ def _parse_args() -> argparse.Namespace:
         default=DEFAULT_DATASET_ROOT,
         help="Local cache root for real benchmark datasets.",
     )
+    parser.add_argument(
+        "--checkpoint-root",
+        type=Path,
+        default=DEFAULT_CHECKPOINT_ROOT,
+        help="Local cache root for trained recsys checkpoints.",
+    )
+    parser.add_argument(
+        "--retrain-checkpoints",
+        action="store_true",
+        help="Retrain and overwrite cached recsys checkpoints before benchmarking.",
+    )
     parser.add_argument("--device", default="auto", help="Device to use (default: auto)")
     parser.add_argument("--seed", type=int, default=42, help="Random seed")
     parser.add_argument("--warmup-iters", type=int, default=100, help="Warmup iterations")
@@ -831,6 +1169,9 @@ def _parse_args() -> argparse.Namespace:
         default=16384,
         help="Per-iteration batch size for the real Adult benchmark.",
     )
+    parser.add_argument("--dlrm-train-steps", type=int, default=64)
+    parser.add_argument("--dlrm-train-batch-size", type=int, default=2048)
+    parser.add_argument("--dlrm-train-lr", type=float, default=1e-3)
 
     parser.add_argument(
         "--lightgcn-dataset",
@@ -841,6 +1182,9 @@ def _parse_args() -> argparse.Namespace:
     parser.add_argument("--lightgcn-min-rating", type=float, default=4.0)
     parser.add_argument("--lightgcn-embedding-dim", type=int, default=64)
     parser.add_argument("--lightgcn-num-layers", type=int, default=3)
+    parser.add_argument("--lightgcn-train-steps", type=int, default=64)
+    parser.add_argument("--lightgcn-train-batch-size", type=int, default=8192)
+    parser.add_argument("--lightgcn-train-lr", type=float, default=1e-2)
     parser.add_argument(
         "--lightgcn-num-pairs",
         type=int,
@@ -862,6 +1206,7 @@ def main() -> None:
         "device": str(device),
         "gpu": _detect_gpu_name() if device.type == "cuda" else None,
         "dataset_root": str(args.dataset_root),
+        "checkpoint_root": str(args.checkpoint_root),
         "models": {},
     }
 

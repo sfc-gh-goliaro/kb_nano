@@ -59,12 +59,12 @@ class LightGCNPropagation(nn.Module):
         item_embeddings: torch.Tensor,
     ) -> tuple[torch.Tensor, torch.Tensor]:
         all_embeddings = torch.cat([user_embeddings, item_embeddings], dim=0)
-        layer_outputs = [all_embeddings]
+        embedding_sum = all_embeddings
 
         for _ in range(self.num_layers):
             all_embeddings = self.sparse_mm(adjacency, all_embeddings)
-            layer_outputs.append(all_embeddings)
+            embedding_sum = embedding_sum + all_embeddings
 
-        final_embeddings = torch.stack(layer_outputs, dim=0).mean(dim=0)
+        final_embeddings = embedding_sum / (self.num_layers + 1)
         num_users = user_embeddings.size(0)
         return final_embeddings[:num_users], final_embeddings[num_users:]
