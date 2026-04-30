@@ -21,9 +21,13 @@ from collections import defaultdict
 from pathlib import Path
 from typing import Any
 
+if __package__ in {None, ""}:
+    sys.path.insert(0, str(Path(__file__).resolve().parents[3]))
+
 import torch
 import yaml
 from safetensors.torch import save_file
+from tqdm.auto import tqdm
 
 from kb_nano import GOLDEN_DIR, INPUTS_DIR, KB_ROOT, TRACE_DIR
 from kb_nano.bench.kernels.scenario_registry import InputRegistry
@@ -43,6 +47,10 @@ DEFAULT_PROMPTS = [
     "Write a Python hello world program.",
     "Describe the water cycle.",
 ]
+
+
+def _progress(iterable, *, desc: str, total: int | None = None, unit: str = "it"):
+    return tqdm(iterable, desc=desc, total=total, unit=unit, dynamic_ncols=True)
 
 
 def _short_model_key(model_name: str) -> str:
@@ -80,16 +88,34 @@ def _torch_dtype(dtype: str) -> torch.dtype | None:
     }.get(_dtype_name(dtype))
 
 
-def _resolve_targets() -> dict[type, str]:
-    """Import discoverable benchmark target classes.
+def _model_family_matches(model_key: str, family: str) -> bool:
+    return (
+        model_key == family
+        or model_key.startswith(f"{family}-")
+        or family.startswith(f"{model_key}-")
+    )
 
-    Some target modules have optional dependencies.  If full discovery fails in
-    the local environment, tracing can still proceed by matching module class
-    names through ``--ops`` filters, but class-based matching is preferred.
+
+def _resolve_targets(model_key: str) -> dict[type, str]:
+    """Import benchmark target classes used by the current model family.
+
+    This uses the same model/operator map as ``python -m kb_nano.bench.kernels
+    --map``.  The fallback path is only for environments where full discovery
+    fails because of optional dependencies.
     """
     try:
         from kb_nano.infra.kernel_swapper import discover_targets
 
+        targets = [
+            t for t in discover_targets()
+            if any(_model_family_matches(model_key, family) for family in t.models)
+        ]
+        if targets:
+            return {t.target_cls: t.name for t in targets}
+        print(
+            f"WARNING: no mapped benchmark targets found for model_key={model_key!r}; "
+            "falling back to all discovered targets"
+        )
         return {t.target_cls: t.name for t in discover_targets()}
     except Exception as exc:
         print(f"WARNING: full target discovery failed: {exc}")
@@ -181,9 +207,11 @@ class InputTraceRecorder:
         self.golden_dir = golden_dir
         self.ops = ops
         self.capture_golden = capture_golden
-        self.target_classes = _resolve_targets()
+        self.target_classes = _resolve_targets(model_key)
         self.occurrences: dict[str, int] = defaultdict(int)
         self.seen_goldens: set[str] = set()
+        self.events_written = 0
+        self.goldens_captured = 0
         self.handles = []
         self._file = None
 
@@ -203,7 +231,12 @@ class InputTraceRecorder:
     def attach(self, model: torch.nn.Module) -> int:
         paths = _module_path_lookup(model)
         count = 0
-        for module in model.modules():
+        modules = list(model.modules())
+        for module in _progress(
+            modules,
+            desc=f"Scanning modules for {self.model_key}/{self.workload}",
+            unit="module",
+        ):
             op = self._op_name(module)
             if op is None:
                 continue
@@ -252,6 +285,7 @@ class InputTraceRecorder:
                 event.golden_path = self._capture_golden(op, event, named_inputs)
             assert self._file is not None
             self._file.write(event.to_json() + "\n")
+            self.events_written += 1
         return hook
 
     def _capture_golden(self, op: str, event: TraceEvent, inputs: dict[str, Any]) -> str | None:
@@ -295,6 +329,8 @@ class InputTraceRecorder:
         if scalars:
             with open(out_path.with_suffix(".json"), "w") as f:
                 json.dump(scalars, f, sort_keys=True, default=str)
+        self.goldens_captured += 1
+        print(f"Captured input tensors for {op}: {rel}")
         return str(rel)
 
 
@@ -320,6 +356,11 @@ def trace_llm_model(
 
     key = model_key or _short_model_key(model_name)
     trace_path = trace_dir / key / f"tp{tp}" / dtype / f"{workload}.jsonl"
+    print(
+        f"Tracing {key}/{workload}: model={model_name}, tp={tp}, dtype={dtype}, "
+        f"ops={','.join(sorted(ops)) if ops else 'mapped'}"
+    )
+    print(f"Raw trace output: {trace_path}")
     engine = LlamaEngine(
         model_name=model_name,
         dtype=_torch_dtype(dtype),
@@ -346,6 +387,7 @@ def trace_llm_model(
             attached = recorder.attach(model)
             print(f"Attached {attached} trace hooks for {model_name} ({workload})")
             if prompts is None or output_lens is None:
+                print(f"Loading standardized workload {workload}...")
                 prompts, output_lens = _load_standard_workload(
                     workload,
                     engine.tokenizer,
@@ -353,6 +395,12 @@ def trace_llm_model(
                     decode_cap=decode_cap,
                     seed=seed,
                 )
+            total_prompt_tokens = sum(len(prompt) for prompt in prompts)
+            total_output_tokens = sum(output_lens)
+            print(
+                f"Running generation for {len(prompts)} requests "
+                f"({total_prompt_tokens} prompt tokens, {total_output_tokens} max output tokens)..."
+            )
             sp_list = [
                 SamplingParams(
                     temperature=0.0,
@@ -362,6 +410,10 @@ def trace_llm_model(
                 for out_len in output_lens
             ]
             engine.generate(prompts, sp_list if len(sp_list) > 1 else sp_list[0])
+            print(
+                f"Finished {key}/{workload}: wrote {recorder.events_written} events, "
+                f"captured {recorder.goldens_captured} input blobs"
+            )
     finally:
         if hasattr(engine, "_cleanup"):
             engine._cleanup()
@@ -470,13 +522,20 @@ def trace_inputs_main() -> None:
     jobs = _iter_model_jobs(cfg)
     if not jobs:
         raise SystemExit("No model jobs found in workload scenario file")
+    print(f"Loaded {len(jobs)} trace job(s) from {args.config}")
+    for idx, job in enumerate(jobs, start=1):
+        print(
+            f"  [{idx}/{len(jobs)}] {job['model_key'] or _short_model_key(job['model'])}/"
+            f"{job['workload']} tp={job['tp']} dtype={job['dtype']} "
+            f"num_requests={job.get('num_requests')}"
+        )
 
     trace_dir = Path(args.trace_dir)
     golden_dir = Path(args.golden_dir)
     ops = set(args.ops) if args.ops else None
 
     if len(jobs) > 1 and os.environ.get("KB_NANO_TRACE_CHILD") != "1":
-        for job in jobs:
+        for job in _progress(jobs, desc="Trace jobs", unit="job"):
             child_cfg = {
                 "models": [{
                     "key": job["model_key"],
@@ -496,7 +555,7 @@ def trace_inputs_main() -> None:
                 yaml.safe_dump(child_cfg, f, sort_keys=False)
                 child_config = f.name
             cmd = [
-                sys.executable, "-m", "kb_nano", "trace-inputs",
+                sys.executable, str(Path(__file__).resolve()), "trace-inputs",
                 "--config", child_config,
                 "--trace-dir", str(trace_dir),
                 "--golden-dir", str(golden_dir),
@@ -510,6 +569,10 @@ def trace_inputs_main() -> None:
             env = dict(os.environ)
             env["KB_NANO_TRACE_CHILD"] = "1"
             try:
+                print(
+                    f"Starting child trace job: "
+                    f"{job['model_key'] or _short_model_key(job['model'])}/{job['workload']}"
+                )
                 subprocess.run(cmd, check=True, env=env)
             finally:
                 try:
@@ -518,7 +581,7 @@ def trace_inputs_main() -> None:
                     pass
         return
 
-    for job in jobs:
+    for job in _progress(jobs, desc="Trace jobs", unit="job"):
         out = trace_llm_model(
             model_name=job["model"],
             model_key=job["model_key"],
@@ -541,14 +604,22 @@ def trace_inputs_main() -> None:
 
 def _read_events(trace_dir: Path) -> list[dict[str, Any]]:
     events = []
-    for path in sorted(trace_dir.rglob("*.jsonl")):
+    trace_files = [
+        path for path in sorted(trace_dir.rglob("*.jsonl"))
+        if path.name not in {"flashinfer_workloads.jsonl", "representative_workloads.jsonl"}
+    ]
+    print(f"Reading raw trace events from {len(trace_files)} file(s) under {trace_dir}")
+    for path in _progress(trace_files, desc="Trace files", unit="file"):
         if path.name in {"flashinfer_workloads.jsonl", "representative_workloads.jsonl"}:
             continue
+        read_count = 0
+        kept_count = 0
         with open(path) as f:
             for line in f:
                 line = line.strip()
                 if not line:
                     continue
+                read_count += 1
                 event = json.loads(line)
                 if event.get("op") in DATA_DEPENDENT_OPS:
                     golden_path = event.get("golden_path")
@@ -556,6 +627,9 @@ def _read_events(trace_dir: Path) -> list[dict[str, Any]]:
                         continue
                 event["_trace_file"] = str(path)
                 events.append(event)
+                kept_count += 1
+        print(f"  {path}: kept {kept_count}/{read_count} events")
+    print(f"Loaded {len(events)} trace events")
     return events
 
 
@@ -874,7 +948,8 @@ def _select_representatives(
     max_tokens_per_family: int,
 ) -> list[dict[str, Any]]:
     by_signature: dict[str, dict[str, Any]] = {}
-    for event in events:
+    print(f"Deduplicating {len(events)} trace events by scenario signature...")
+    for event in _progress(events, desc="Deduplicate events", unit="event"):
         sig = _scenario_signature(event)
         if sig in by_signature:
             by_signature[sig]["_observed_count"] += 1
@@ -885,13 +960,20 @@ def _select_representatives(
         item["_scenario_signature"] = sig
         item["_observed_count"] = 1
         by_signature[sig] = item
+    print(f"Found {len(by_signature)} unique scenario signatures")
 
     grouped: dict[tuple[Any, ...], list[dict[str, Any]]] = defaultdict(list)
-    for event in by_signature.values():
+    for event in _progress(
+        by_signature.values(),
+        desc="Group scenarios",
+        total=len(by_signature),
+        unit="scenario",
+    ):
         grouped[_group_key(event)].append(event)
+    print(f"Condensing {len(grouped)} op/dtype/init group(s)")
 
     selected = []
-    for group_events in grouped.values():
+    for group_events in _progress(grouped.values(), desc="Select representatives", unit="group"):
         ordered = sorted(group_events, key=lambda e: (_primary_size(e), e.get("_scenario_signature", "")))
         families: dict[str, list[dict[str, Any]]] = defaultdict(list)
         for event in ordered:
@@ -905,6 +987,7 @@ def _select_representatives(
         for family_key, count in slots.items():
             picks.extend(_pick_from_family(families[family_key], count))
         selected.extend(sorted(picks, key=lambda e: (_primary_size(e), e.get("_scenario_signature", ""))))
+    print(f"Selected {len(selected)} representative scenario(s)")
     return selected
 
 
@@ -933,7 +1016,7 @@ def build_registry(
 
     manifest: dict[str, dict[str, list[dict[str, Any]]]] = {}
     workload_traces = []
-    for event in selected:
+    for event in _progress(selected, desc="Write scenario records", unit="scenario"):
         op = event["op"]
         inputs = _tensor_specs(event.get("inputs", {}))
         scenario: dict[str, Any] = {
@@ -1463,11 +1546,14 @@ def validate_registry(
     inputs_dir: Path,
     golden_required: bool = True,
     require_all_static_targets: bool = False,
+    materialize_inputs: bool = False,
 ) -> int:
     reg = InputRegistry(inputs_dir=inputs_dir)
     ops = set(reg.operators())
     errors: list[str] = []
     warnings: list[str] = []
+    total_scenarios = sum(len(reg.scenarios(op)) for op in ops)
+    print(f"Validating {len(ops)} operator(s), {total_scenarios} scenario(s)")
 
     if require_all_static_targets:
         missing = sorted(_static_target_names() - ops)
@@ -1477,14 +1563,22 @@ def validate_registry(
                 f"sample: {', '.join(missing[:20])}"
             )
 
-    for op in sorted(ops):
+    for op in _progress(sorted(ops), desc="Validate operators", unit="op"):
         scenarios = reg.scenarios(op)
         if not scenarios:
             errors.append(f"{op}: no scenarios")
             continue
-        for scenario in scenarios:
+        for scenario in _progress(
+            scenarios,
+            desc=f"Validate {op}",
+            unit="scenario",
+        ):
             if op in DATA_DEPENDENT_OPS and golden_required and not scenario.golden_path:
                 errors.append(f"{op}/{scenario.name}: data-dependent scenario has no golden path")
+            if scenario.golden_path and golden_required:
+                golden_file = GOLDEN_DIR / scenario.golden_path
+                if not golden_file.is_file():
+                    errors.append(f"{op}/{scenario.name}: golden data file not found: {golden_file}")
             try:
                 init_args = reg.get_init_args(op, scenario.name)
             except Exception as exc:
@@ -1492,6 +1586,11 @@ def validate_registry(
                 continue
             if not isinstance(init_args, dict):
                 errors.append(f"{op}/{scenario.name}: init_args is not a mapping")
+            if not materialize_inputs:
+                scenario_inputs = getattr(scenario, "inputs", None)
+                if not isinstance(scenario_inputs, dict):
+                    errors.append(f"{op}/{scenario.name}: inputs is not a mapping")
+                continue
             try:
                 inputs = reg.get_inputs(op, scenario.name, device="cpu")
             except FileNotFoundError as exc:
@@ -1519,9 +1618,46 @@ def validate_input_registry_main() -> None:
     parser.add_argument("--inputs-dir", type=str, default=str(INPUTS_DIR))
     parser.add_argument("--allow-missing-golden", action="store_true")
     parser.add_argument("--require-all-static-targets", action="store_true")
+    parser.add_argument(
+        "--materialize-inputs",
+        action="store_true",
+        help="Instantiate tensors on CPU instead of only validating metadata and captured-input paths",
+    )
     args = parser.parse_args()
     raise SystemExit(validate_registry(
         inputs_dir=Path(args.inputs_dir),
         golden_required=not args.allow_missing_golden,
         require_all_static_targets=args.require_all_static_targets,
+        materialize_inputs=args.materialize_inputs,
     ))
+
+
+def main() -> None:
+    commands = {
+        "generate-inputs": generate_inputs_main,
+        "capture-golden": capture_golden_main,
+        "trace-inputs": trace_inputs_main,
+        "build-input-registry": build_input_registry_main,
+        "validate-input-registry": validate_input_registry_main,
+    }
+    if len(sys.argv) < 2 or sys.argv[1] in {"-h", "--help", "help"}:
+        print("Usage: python bench/kernels/scenario_pipeline.py <command> [args...]")
+        print()
+        print("Commands:")
+        for command in commands:
+            print(f"  {command}")
+        raise SystemExit(0 if len(sys.argv) >= 2 else 1)
+
+    command = sys.argv[1]
+    handler = commands.get(command)
+    if handler is None:
+        print(f"Unknown command: {command}")
+        print("Run with --help to list commands.")
+        raise SystemExit(1)
+
+    sys.argv = [f"scenario_pipeline.py {command}"] + sys.argv[2:]
+    handler()
+
+
+if __name__ == "__main__":
+    main()
