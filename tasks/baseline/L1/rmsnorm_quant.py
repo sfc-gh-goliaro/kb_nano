@@ -10,6 +10,7 @@ so Inductor fusion passes can reference them.
 from __future__ import annotations
 
 import torch
+import torch.nn as nn
 
 from .csrc import _C
 
@@ -56,60 +57,76 @@ def _fused_add_rmsnorm_fp8_quant_meta(output_fp8, output_scales,
 
 
 # ---------------------------------------------------------------------------
-# Python-level convenience wrappers
+# Module wrappers
 # ---------------------------------------------------------------------------
 
-def rmsnorm_fp8_quant(
-    input: torch.Tensor,
-    weight: torch.Tensor,
-    eps: float = 1e-6,
-) -> tuple[torch.Tensor, torch.Tensor]:
+class RMSNormFP8Quant(nn.Module):
     """Fused RMSNorm + per-token-group FP8 quantization.
 
-    Returns:
-        (output_fp8, output_scales) where output_fp8 is [num_tokens, hidden_size]
-        in float8_e4m3fn and output_scales is [num_tokens, num_groups] in float32
-        with column-major layout.
+    Stateless wrapper around ``torch.ops.kb_nano_norm.rmsnorm_fp8_quant``.
+    The RMSNorm weight is owned by the parent module and passed through
+    ``forward``.
     """
-    hidden_size = input.size(-1)
-    num_tokens = input.numel() // hidden_size
-    num_groups = (hidden_size + _FP8_GROUP_SIZE - 1) // _FP8_GROUP_SIZE
 
-    output_fp8 = torch.empty(
-        num_tokens, hidden_size, dtype=torch.float8_e4m3fn, device=input.device,
-    )
-    output_scales = torch.empty(
-        num_groups, num_tokens, dtype=torch.float32, device=input.device,
-    ).transpose(0, 1)
+    def forward(
+        self,
+        input: torch.Tensor,
+        weight: torch.Tensor,
+        eps: float = 1e-6,
+    ) -> tuple[torch.Tensor, torch.Tensor]:
+        """Fused RMSNorm + per-token-group FP8 quantization.
 
-    torch.ops.kb_nano_norm.rmsnorm_fp8_quant(
-        output_fp8, output_scales, input, weight, eps,
-    )
-    return output_fp8, output_scales
+        Returns:
+            (output_fp8, output_scales) where output_fp8 is
+            [num_tokens, hidden_size] in float8_e4m3fn and output_scales is
+            [num_tokens, num_groups] in float32 with column-major layout.
+        """
+        hidden_size = input.size(-1)
+        num_tokens = input.numel() // hidden_size
+        num_groups = (hidden_size + _FP8_GROUP_SIZE - 1) // _FP8_GROUP_SIZE
+
+        output_fp8 = torch.empty(
+            num_tokens, hidden_size,
+            dtype=torch.float8_e4m3fn, device=input.device,
+        )
+        output_scales = torch.empty(
+            num_groups, num_tokens, dtype=torch.float32, device=input.device,
+        ).transpose(0, 1)
+
+        torch.ops.kb_nano_norm.rmsnorm_fp8_quant(
+            output_fp8, output_scales, input, weight, eps,
+        )
+        return output_fp8, output_scales
 
 
-def fused_add_rmsnorm_fp8_quant(
-    input: torch.Tensor,
-    residual: torch.Tensor,
-    weight: torch.Tensor,
-    eps: float = 1e-6,
-) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
+class FusedAddRMSNormFP8Quant(nn.Module):
     """Fused residual-add + RMSNorm + per-token-group FP8 quantization.
 
-    Modifies *input* and *residual* in-place.
+    Stateless wrapper around
+    ``torch.ops.kb_nano_norm.fused_add_rmsnorm_fp8_quant``.
     """
-    hidden_size = input.size(-1)
-    num_tokens = input.numel() // hidden_size
-    num_groups = (hidden_size + _FP8_GROUP_SIZE - 1) // _FP8_GROUP_SIZE
 
-    output_fp8 = torch.empty(
-        num_tokens, hidden_size, dtype=torch.float8_e4m3fn, device=input.device,
-    )
-    output_scales = torch.empty(
-        num_groups, num_tokens, dtype=torch.float32, device=input.device,
-    ).transpose(0, 1)
+    def forward(
+        self,
+        input: torch.Tensor,
+        residual: torch.Tensor,
+        weight: torch.Tensor,
+        eps: float = 1e-6,
+    ) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
+        """Modifies *input* and *residual* in-place."""
+        hidden_size = input.size(-1)
+        num_tokens = input.numel() // hidden_size
+        num_groups = (hidden_size + _FP8_GROUP_SIZE - 1) // _FP8_GROUP_SIZE
 
-    torch.ops.kb_nano_norm.fused_add_rmsnorm_fp8_quant(
-        output_fp8, output_scales, input, residual, weight, eps,
-    )
-    return output_fp8, output_scales, residual
+        output_fp8 = torch.empty(
+            num_tokens, hidden_size,
+            dtype=torch.float8_e4m3fn, device=input.device,
+        )
+        output_scales = torch.empty(
+            num_groups, num_tokens, dtype=torch.float32, device=input.device,
+        ).transpose(0, 1)
+
+        torch.ops.kb_nano_norm.fused_add_rmsnorm_fp8_quant(
+            output_fp8, output_scales, input, residual, weight, eps,
+        )
+        return output_fp8, output_scales, residual

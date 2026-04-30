@@ -1,4 +1,4 @@
-"""GPT-OSS MoE: MXFP4-native fused MoE using vLLM's Triton kernels.
+"""GPT-OSS MoE: MXFP4-native fused MoE composed from KB-Nano L1 ops.
 
 32 experts (top-4, softmax routing), router bias, expert gate/up/down biases,
 OAI SwiGLU activation fused inside the Triton matmul_ogs kernel.
@@ -16,28 +16,7 @@ import torch.nn as nn
 from ....infra.tp import _tp_rank, _tp_size
 from ..L1.allreduce import AllReduce
 from ..L1.linear import Linear
-
-# vLLM Triton MXFP4 MoE imports (loaded lazily to avoid import-time issues)
-_TRITON_MOE_READY = False
-_triton_kernel_moe_forward = None
-_mxfp4_w4a16_moe_quant_config = None
-
-
-def _ensure_triton_moe():
-    global _TRITON_MOE_READY, _triton_kernel_moe_forward, _mxfp4_w4a16_moe_quant_config
-    if _TRITON_MOE_READY:
-        return
-    from vllm.utils.import_utils import import_triton_kernels
-    import_triton_kernels()
-    from vllm.model_executor.layers.fused_moe.gpt_oss_triton_kernels_moe import (
-        triton_kernel_moe_forward,
-    )
-    from vllm.model_executor.layers.fused_moe.config import (
-        mxfp4_w4a16_moe_quant_config,
-    )
-    _triton_kernel_moe_forward = triton_kernel_moe_forward
-    _mxfp4_w4a16_moe_quant_config = mxfp4_w4a16_moe_quant_config
-    _TRITON_MOE_READY = True
+from ..L1.mxfp4_moe import Mxfp4MoE
 
 
 def _round_up(x: int, align: int) -> int:
@@ -45,10 +24,10 @@ def _round_up(x: int, align: int) -> int:
 
 
 class GptOssMoE(nn.Module):
-    """MXFP4-native MoE using vLLM's Triton fused kernel.
+    """MXFP4-native MoE composed from KB-Nano L1 ops.
 
-    Weights stay in packed uint8 MXFP4 format. Inference uses
-    triton_kernels.matmul_ogs with FP4 precision configs.
+    Weights stay in packed uint8 MXFP4 format. Routing, swizzling and the
+    fused matmul_ogs forward are all delegated to ``L1.mxfp4_moe``.
     """
 
     MXFP4_BLOCK = 32
@@ -107,6 +86,7 @@ class GptOssMoE(nn.Module):
         self.w2_bias.weight_loader = self._w2_bias_loader
 
         self.allreduce = AllReduce()
+        self.mxfp4_moe = Mxfp4MoE()
 
         # Populated after process_weights_after_loading
         self._quant_config = None
@@ -184,42 +164,28 @@ class GptOssMoE(nn.Module):
         if self._processed:
             return
 
-        _ensure_triton_moe()
-        from vllm.model_executor.layers.quantization.utils.mxfp4_utils import (
-            _swizzle_mxfp4,
-        )
-        from triton_kernels.matmul_ogs import FlexCtx, PrecisionConfig
-
         # Biases must be float32 for the Triton kernel
         self.w13_bias.data = self.w13_bias.data.float()
         self.w2_bias.data = self.w2_bias.data.float()
 
-        num_warps = 8
-
-        w13_weight, w13_flex, w13_scale = _swizzle_mxfp4(
-            self.w13_weight.data, self.w13_weight_scale.data, num_warps
+        w13_weight, w13_precision = Mxfp4MoE.prepare_weight(
+            self.w13_weight.data, self.w13_weight_scale.data
         )
-        w2_weight, w2_flex, w2_scale = _swizzle_mxfp4(
-            self.w2_weight.data, self.w2_weight_scale.data, num_warps
+        w2_weight, w2_precision = Mxfp4MoE.prepare_weight(
+            self.w2_weight.data, self.w2_weight_scale.data
         )
 
-        w13_precision = PrecisionConfig(
-            weight_scale=w13_scale, flex_ctx=FlexCtx(rhs_data=w13_flex)
-        )
-        w2_precision = PrecisionConfig(
-            weight_scale=w2_scale, flex_ctx=FlexCtx(rhs_data=w2_flex)
-        )
-
-        # _swizzle_mxfp4 returns triton_kernels.Tensor objects, not torch.Tensor;
-        # store as plain attributes (the original nn.Parameters are no longer used)
+        # prepare_weight returns triton_kernels.Tensor objects, not
+        # torch.Tensor; store as plain attributes (the original nn.Parameters
+        # are no longer used)
         del self.w13_weight, self.w2_weight
         del self.w13_weight_scale, self.w2_weight_scale
         self._w13_swizzled = w13_weight
         self._w2_swizzled = w2_weight
 
-        self._quant_config = _mxfp4_w4a16_moe_quant_config(
-            w1_scale=w13_precision,
-            w2_scale=w2_precision,
+        self._quant_config = Mxfp4MoE.make_quant_config(
+            w1_precision=w13_precision,
+            w2_precision=w2_precision,
             w1_bias=self.w13_bias.data,
             w2_bias=self.w2_bias.data,
         )
@@ -234,16 +200,13 @@ class GptOssMoE(nn.Module):
 
         router_logits = self.router(hidden_states)
 
-        _ensure_triton_moe()
-        output = _triton_kernel_moe_forward(
+        output = self.mxfp4_moe(
             hidden_states=hidden_states,
             w1=self._w13_swizzled,
             w2=self._w2_swizzled,
             gating_output=router_logits,
             topk=self.top_k,
             renormalize=True,
-            global_num_experts=self.num_experts,
-            expert_map=None,
             quant_config=self._quant_config,
             apply_router_weight_on_input=False,
         )
