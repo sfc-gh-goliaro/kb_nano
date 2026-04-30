@@ -13,7 +13,7 @@ import math
 import torch
 import torch.nn as nn
 
-from ..L1.fp8_linear import _per_token_group_quant_fp8
+from ..L1.fp8_linear import PerTokenGroupQuantFp8
 from ..L1.moe_align import MoeAlign
 from ..L1.moe_grouped_gemm import (
     MoeGroupedGemm,
@@ -23,7 +23,7 @@ from ..L1.moe_grouped_gemm import (
 )
 from ..L1.moe_sum import MoeSum
 from ..L1.silu_and_mul import SiluAndMul
-from ..L1.silu_mul_quant_fp8 import silu_mul_per_token_group_quant_fp8_colmajor
+from ..L1.silu_mul_quant_fp8 import SiluMulQuantFp8
 
 SPARSITY_FACTOR = 4
 _FP8_GROUP_SIZE = 128
@@ -168,6 +168,8 @@ class FusedExperts(nn.Module):
         self.moe_grouped_gemm = MoeGroupedGemm()
         self.act_fn = SiluAndMul()
         self.moe_sum = MoeSum()
+        self.per_token_group_quant_fp8 = PerTokenGroupQuantFp8()
+        self.silu_mul_quant_fp8 = SiluMulQuantFp8()
         self._sb = _SHARED_BUF
 
     def _get_cache13(self, total_elems, device, dtype):
@@ -253,7 +255,7 @@ class FusedExperts(nn.Module):
         M_sum = _compute_aligned_M(M, top_k, num_experts, alignment)
 
         a_fp8, a_scale = self._get_fp8_bufs(1, M, K, hidden_states.device)
-        _per_token_group_quant_fp8(hidden_states, a_fp8, a_scale)
+        self.per_token_group_quant_fp8(hidden_states, a_fp8, a_scale)
 
         a1_perm, a1_scale_perm, expert_ids, inv_perm = _deepgemm_permute(
             a_fp8, a_scale, topk_ids, num_experts, alignment,
@@ -267,7 +269,7 @@ class FusedExperts(nn.Module):
         quant_out = self._get_dg_workspace(
             2, (M_sum, N), hidden_states.device, torch.float8_e4m3fn,
         )
-        a2_fp8, a2_scale = silu_mul_per_token_group_quant_fp8_colmajor(
+        a2_fp8, a2_scale = self.silu_mul_quant_fp8(
             mm1_out, output=quant_out,
         )
 
@@ -306,7 +308,7 @@ class FusedExperts(nn.Module):
 
         if use_fp8_w8a8:
             a_fp8, a_scale = self._get_fp8_bufs(1, M, K, hidden_states.device)
-            _per_token_group_quant_fp8(hidden_states, a_fp8, a_scale)
+            self.per_token_group_quant_fp8(hidden_states, a_fp8, a_scale)
             gemm1_input = a_fp8
             gemm1_a_scale = a_scale
         else:
@@ -326,7 +328,7 @@ class FusedExperts(nn.Module):
 
         if use_fp8_w8a8:
             a2_fp8, a2_scale = self._get_fp8_bufs(2, M * top_k, N, hidden_states.device)
-            _per_token_group_quant_fp8(intermediate2, a2_fp8, a2_scale)
+            self.per_token_group_quant_fp8(intermediate2, a2_fp8, a2_scale)
             gemm2_input = a2_fp8
             gemm2_a_scale = a2_scale
         else:
