@@ -3,7 +3,7 @@
 These workloads are constants that ensure reproducible, comparable results
 across runs and users. They are not configurable by design.
 
-LLM workloads (text-only, random token IDs):
+LLM workloads (text-only, real WildChat-derived requests):
   Throughput: 3 scenarios (prefill-heavy, balanced, decode-heavy), 1000 reqs each.
   Latency: 2 scenarios (single-request, fixed-batch-32).
 
@@ -16,13 +16,14 @@ from __future__ import annotations
 
 from dataclasses import dataclass
 
+from kb_nano.bench.utils.real_prompts import DEFAULT_WORKLOAD_DATASETS
+
 
 @dataclass(frozen=True)
 class ThroughputWorkload:
     name: str
-    input_len: int
-    output_len: int
     num_requests: int = 1000
+    dataset_name: str = ""
 
 
 @dataclass(frozen=True)
@@ -36,9 +37,18 @@ class LatencyWorkload:
 
 
 THROUGHPUT_WORKLOADS: list[ThroughputWorkload] = [
-    ThroughputWorkload(name="prefill-heavy", input_len=1024, output_len=512),
-    ThroughputWorkload(name="balanced",      input_len=512,  output_len=512),
-    ThroughputWorkload(name="decode-heavy",  input_len=512,  output_len=1024),
+    ThroughputWorkload(
+        name="prefill-heavy",
+        dataset_name=DEFAULT_WORKLOAD_DATASETS["prefill-heavy"],
+    ),
+    ThroughputWorkload(
+        name="balanced",
+        dataset_name=DEFAULT_WORKLOAD_DATASETS["balanced"],
+    ),
+    ThroughputWorkload(
+        name="decode-heavy",
+        dataset_name=DEFAULT_WORKLOAD_DATASETS["decode-heavy"],
+    ),
 ]
 
 LATENCY_WORKLOADS: list[LatencyWorkload] = [
@@ -338,10 +348,12 @@ ALL_DETECTION_WORKLOADS = {
 
 
 def get_max_seq_len() -> int:
-    """Return the maximum sequence length across all standardized LLM workloads."""
+    """Return the maximum static sequence length for standardized LLM workloads.
+
+    Throughput decode lengths are data-dependent for real-prompt workloads, so
+    eval computes their max sequence length after loading the dataset.
+    """
     max_len = 0
-    for w in THROUGHPUT_WORKLOADS:
-        max_len = max(max_len, w.input_len + w.output_len)
     for w in LATENCY_WORKLOADS:
         max_len = max(max_len, w.input_len + w.output_len)
     return max_len

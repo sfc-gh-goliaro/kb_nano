@@ -11,14 +11,14 @@ parallel, TP=8 jobs run 1 at a time.
 
 from __future__ import annotations
 
-import random
 from dataclasses import dataclass, field
-from random import randint
 
+from transformers import AutoTokenizer
+
+from kb_nano.bench.utils.real_prompts import load_real_prompt_workload
 from kb_nano.bench.utils.workloads import (
     LATENCY_WORKLOADS,
     THROUGHPUT_WORKLOADS,
-    get_max_seq_len,
 )
 
 from .config import EvalConfig, MODEL_KEY_TO_DEFAULT_HF
@@ -89,46 +89,79 @@ class EvalPlanner:
 
     def _generate_workload_data(
         self,
+        model: str,
         seed: int,
         num_prompts: int,
     ) -> tuple[list[dict], list[dict]]:
-        """Pre-generate all scenario data (matching bench_vllm.py methodology)."""
+        """Load and tokenize scenario data for the target model."""
+        tokenizer = AutoTokenizer.from_pretrained(model, trust_remote_code=True)
+
         throughput_data = []
         for i, w in enumerate(THROUGHPUT_WORKLOADS):
-            rng_seed = seed + i
-            random.seed(rng_seed)
-            prompt_token_ids = [
-                [randint(0, 10000) for _ in range(w.input_len)]
-                for _ in range(num_prompts)
-            ]
-            output_lens = [w.output_len] * num_prompts
+            samples = load_real_prompt_workload(
+                w.name,
+                tokenizer,
+                num_requests=num_prompts,
+                decode_cap=None,
+                dataset_name=w.dataset_name,
+                seed=seed + i,
+            )
+            prompt_token_ids = [s.prompt_token_ids for s in samples]
+            output_lens = [s.output_len for s in samples]
             throughput_data.append({
                 "name": w.name,
-                "input_len": w.input_len,
-                "output_len": w.output_len,
                 "prompt_token_ids": prompt_token_ids,
                 "output_lens": output_lens,
             })
 
         latency_data = []
         for j, w in enumerate(LATENCY_WORKLOADS):
-            rng_seed = seed + 100 + j
-            random.seed(rng_seed)
-            prompt_token_ids = [
-                [randint(0, 10000) for _ in range(w.input_len)]
-                for _ in range(w.batch_size)
-            ]
+            samples = load_real_prompt_workload(
+                "balanced",
+                tokenizer,
+                num_requests=w.batch_size,
+                decode_cap=None,
+                seed=seed + 100 + j,
+            )
+            prompt_token_ids = [s.prompt_token_ids for s in samples]
+            output_lens = [s.output_len for s in samples]
             latency_data.append({
                 "name": w.name,
                 "input_len": w.input_len,
                 "output_len": w.output_len,
                 "batch_size": w.batch_size,
                 "prompt_token_ids": prompt_token_ids,
+                "output_lens": output_lens,
                 "num_warmup": w.num_warmup,
                 "num_iters": w.num_iters,
             })
 
         return throughput_data, latency_data
+
+    @staticmethod
+    def _max_loaded_seq_len(
+        throughput_data: list[dict],
+        latency_data: list[dict],
+    ) -> int:
+        max_len = 0
+        for scenario in throughput_data + latency_data:
+            output_lens = scenario.get("output_lens")
+            if output_lens is None:
+                output_lens = [
+                    scenario["output_len"]
+                    for _ in scenario["prompt_token_ids"]
+                ]
+            max_len = max(
+                max_len,
+                max(
+                    len(prompt) + output_len
+                    for prompt, output_len in zip(
+                        scenario["prompt_token_ids"],
+                        output_lens,
+                    )
+                ),
+            )
+        return max_len
 
     def plan(self) -> EvalPlan:
         """Generate the eval plan: ordered list of (model, tp) job pairs."""
@@ -142,14 +175,17 @@ class EvalPlanner:
                 if self.config.get_model_category(m) in self.config.categories
             ]
 
-        max_seq_len = get_max_seq_len()
-        throughput_data, latency_data = self._generate_workload_data(
-            self.config.seed, self.config.num_prompts,
-        )
-
+        max_seq_len = 0
         jobs: list[EvalJob] = []
         for model in models:
             category = self.config.get_model_category(model)
+            throughput_data, latency_data = self._generate_workload_data(
+                model, self.config.seed, self.config.num_prompts,
+            )
+            max_seq_len = max(
+                max_seq_len,
+                self._max_loaded_seq_len(throughput_data, latency_data),
+            )
             for tp in sorted(self.config.tp_degrees):
                 jobs.append(EvalJob(
                     model=model,

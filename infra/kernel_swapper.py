@@ -41,15 +41,20 @@ _KB_ROOT = KB_ROOT
 _CANDIDATE_DIR = CANDIDATE_DIR
 
 _L4_MODEL_KEYS: dict[str, str] = {
+    "gla": "gla",
     "gpt_oss": "gpt_oss",
     "llama": "llama31",
     "llada": "llada",
     "llama4": "llama4",
+    "mamba": "mamba",
+    "mamba2": "mamba2",
     "mixtral": "mixtral",
     "convnextv2": "convnextv2",
     "efficientnetv2": "efficientnetv2",
     "qwen2_vl": "qwen2_vl",
     "qwen3_vl": "qwen3_vl",
+    "retnet": "retnet",
+    "rwkv7": "rwkv7",
     "flux": "flux",
     "sam3": "sam3",
     "cosyvoice3": "cosyvoice3",

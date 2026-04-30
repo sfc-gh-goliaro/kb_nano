@@ -74,6 +74,24 @@ def set_attn_backend_config(config: AttnBackendConfig) -> None:
 
 
 @dataclass
+class ChunkedContextMetadata:
+    """Metadata for chunked prefill context processing (MLA).
+
+    When a prefill request has prior computed tokens in the KV cache,
+    those tokens must be gathered and attended to in chunks to bound
+    workspace memory.  Matches vllm's MLACommonPrefillMetadata.ChunkedContextMetadata.
+    """
+    cu_seq_lens: torch.Tensor
+    starts: torch.Tensor
+    seq_tot: list[int]
+    max_seq_lens: list[int]
+    seq_lens: torch.Tensor
+    workspace: torch.Tensor
+    token_to_seq: torch.Tensor
+    chunk_total_token: list[int]
+
+
+@dataclass
 class Context:
     is_prefill: bool = False
     cu_seqlens_q: torch.Tensor | None = None
@@ -107,6 +125,12 @@ class Context:
     # Flat indices into concatenated input for extracting one logit per seq
     logit_indices: torch.Tensor | None = None
 
+    # MLA chunked prefill context (for requests with prior computed tokens)
+    chunked_context: ChunkedContextMetadata | None = None
+
+    # Per-token request ID mapping (for sparse indexer index conversion)
+    req_id_per_token: torch.Tensor | None = None
+
     # Cross-attention metadata (encoder-decoder models like Whisper)
     # Slot mapping for writing encoder K/V to paged cache
     cross_slot_mapping: torch.Tensor | None = None
@@ -127,6 +151,14 @@ class Context:
     cudagraph_runtime_mode: CUDAGraphMode = CUDAGraphMode.NONE
     # Batch size key used by CUDAGraphWrapper for per-shape graph caching.
     batch_size_for_graph: int = 0
+
+    # --- Mamba / SSM fields (mirror vLLM ForwardContext.attn_metadata
+    # for Mamba layers).  ``mamba_state`` owns the global conv/ssm state
+    # tensors; ``mamba_metadata`` is a per-batch dataclass (Mamba2Metadata
+    # or MambaMetadata) carrying state slot indices and prefill/decode
+    # metadata read by every Mamba mixer in its forward pass.
+    mamba_state: object = None
+    mamba_metadata: object = None
 
 
 # Global module registry populated once at model init; copied into each
@@ -149,13 +181,18 @@ def auto_register_no_compile_layers(model: "nn.Module") -> None:
     fully-qualified prefix so custom ops can find them at runtime.
 
     Recognized types (by class name to avoid circular imports):
-      - ``Qwen3MoE``, ``MixtralMoE``  (MoE blocks)
-      - ``Attention``                  (paged-KV attention impl)
+      - ``Qwen3MoE``, ``MixtralMoE``, ``GptOssMoE``, ``DeepSeekMoE`` (MoE blocks)
+      - ``Attention``, ``MLAAttention``, ``SparseAttnIndexer``       (attention impls)
+      - ``Mamba2Mixer``                                              (Mamba2 compile boundary)
 
     Also sets ``_layer_name`` on each module so it knows its own key.
     ``_use_custom_op`` remains ``False`` until compilation is enabled.
     """
-    _TARGET_NAMES = {"Qwen3MoE", "MixtralMoE", "GptOssMoE", "Attention"}
+    _TARGET_NAMES = {
+        "Qwen3MoE", "MixtralMoE", "GptOssMoE", "DeepSeekMoE",
+        "Attention", "MLAAttention", "SparseAttnIndexer",
+        "Mamba2Mixer",
+    }
     layers: dict[str, "nn.Module"] = {}
     for name, mod in model.named_modules():
         if type(mod).__name__ in _TARGET_NAMES:
@@ -187,12 +224,28 @@ def get_context() -> Context:
 def set_context(is_prefill, cu_seqlens_q=None, cu_seqlens_k=None,
                 max_seqlen_q=0, max_seqlen_k=0, slot_mapping=None,
                 context_lens=None, block_tables=None,
-                max_context_len=0):
+                max_context_len=0, chunked_context=None,
+                req_id_per_token=None):
     global _CONTEXT
+    # For pure-decode batches (``is_prefill=False`` with no mixed fields),
+    # mirror the generic ``context_lens`` / ``block_tables`` / ``max_context_len``
+    # into the decode-specific fields so that DSA indexer and other
+    # decode-specialised paths (which consult ``decode_context_lens`` /
+    # ``decode_block_tables`` — matching vLLM's FlashInfer metadata) can
+    # find them.  Without this, ``SparseAttnIndexer._decode_topk`` would
+    # early-return all -1 indices and attention would degenerate.
+    dc_cl = context_lens if not is_prefill else None
+    dc_bt = block_tables if not is_prefill else None
+    dc_max = max_context_len if not is_prefill else 0
     _CONTEXT = Context(is_prefill, cu_seqlens_q, cu_seqlens_k,
                        max_seqlen_q, max_seqlen_k, slot_mapping,
                        context_lens, block_tables, max_context_len,
-                       no_compile_layers=_STATIC_NO_COMPILE_LAYERS)
+                       chunked_context=chunked_context,
+                       req_id_per_token=req_id_per_token,
+                       no_compile_layers=_STATIC_NO_COMPILE_LAYERS,
+                       decode_context_lens=dc_cl,
+                       decode_block_tables=dc_bt,
+                       decode_max_context_len=dc_max)
 
 
 def set_mixed_context(
@@ -203,6 +256,8 @@ def set_mixed_context(
     prefill_block_tables,
     decode_context_lens, decode_block_tables, decode_max_context_len,
     logit_indices,
+    chunked_context=None,
+    req_id_per_token=None,
 ):
     global _CONTEXT
     _CONTEXT = Context(
@@ -220,6 +275,28 @@ def set_mixed_context(
         decode_block_tables=decode_block_tables,
         decode_max_context_len=decode_max_context_len,
         logit_indices=logit_indices,
+        chunked_context=chunked_context,
+        req_id_per_token=req_id_per_token,
+        no_compile_layers=_STATIC_NO_COMPILE_LAYERS,
+    )
+
+
+def set_mamba_context(
+    is_prefill: bool,
+    mamba_state,
+    mamba_metadata,
+):
+    """Install per-batch Mamba state + metadata in the global Context.
+
+    Used by ``ModelRunner.run_mamba`` -- mirrors how the attention path
+    uses ``set_context`` / ``set_mixed_context``.  Mamba mixers read
+    ``ctx.mamba_state`` and ``ctx.mamba_metadata`` in their forward.
+    """
+    global _CONTEXT
+    _CONTEXT = Context(
+        is_prefill=is_prefill,
+        mamba_state=mamba_state,
+        mamba_metadata=mamba_metadata,
         no_compile_layers=_STATIC_NO_COMPILE_LAYERS,
     )
 
