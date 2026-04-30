@@ -18,12 +18,25 @@ import torch
 
 DATA_DEPENDENT_OPS = {
     "fused_experts",
-    "grouped_topk",
     "moe_align",
     "moe_grouped_gemm",
-    "sigmoid_topk",
     "store_kvcache",
-    "topk_softmax",
+}
+
+DATA_DEPENDENT_INPUTS = {
+    # KV-cache stores branch/index by slot only; key/value/cache tensors can be
+    # regenerated from shape metadata.
+    "store_kvcache": {"slot_mapping"},
+    # MoE alignment/routing kernels need real routing indices. Value tensors and
+    # routed weights are not control-flow inputs for the benchmark harness.
+    "moe_align": {"topk_ids"},
+    "fused_experts": {"topk_ids"},
+    # Grouped GEMM consumes the already-built routing layout.
+    "moe_grouped_gemm": {
+        "sorted_token_ids",
+        "expert_ids",
+        "num_tokens_post_padded",
+    },
 }
 
 

@@ -32,6 +32,7 @@ from tqdm.auto import tqdm
 from kb_nano import GOLDEN_DIR, INPUTS_DIR, KB_ROOT, TRACE_DIR
 from kb_nano.bench.kernels.scenario_registry import InputRegistry
 from kb_nano.bench.kernels.scenario_schema import (
+    DATA_DEPENDENT_INPUTS,
     DATA_DEPENDENT_OPS,
     TraceEvent,
     flatten_named_values,
@@ -168,6 +169,10 @@ def _summarize_outputs(output: Any) -> Any:
     return summarize_value(output)
 
 
+def _capture_name_matches(name: str, selected: set[str]) -> bool:
+    return name in selected or any(name.startswith(f"{prefix}.") for prefix in selected)
+
+
 def _module_path_lookup(root: torch.nn.Module) -> dict[int, str]:
     return {id(module): name for name, module in root.named_modules()}
 
@@ -296,6 +301,13 @@ class InputTraceRecorder:
         self.seen_goldens.add(first_key)
 
         flat = flatten_named_values(inputs)
+        selected_inputs = DATA_DEPENDENT_INPUTS.get(op, set())
+        if selected_inputs:
+            flat = {
+                name: value
+                for name, value in flat.items()
+                if _capture_name_matches(name, selected_inputs)
+            }
         tensors = {
             name: value.detach().cpu().contiguous()
             for name, value in flat.items()
@@ -324,6 +336,7 @@ class InputTraceRecorder:
             "tp": str(self.tp),
             "dtype": self.dtype,
             "module_path": event.module_path,
+            "captured_inputs": ",".join(sorted(selected_inputs)),
         }
         save_file(tensors, out_path, metadata=metadata)
         if scalars:
@@ -1026,6 +1039,7 @@ def build_registry(
         }
         if op in DATA_DEPENDENT_OPS and event.get("golden_path"):
             scenario["golden"] = event["golden_path"]
+            scenario["golden_inputs"] = sorted(DATA_DEPENDENT_INPUTS.get(op, set()))
         manifest.setdefault(op, {"scenarios": []})["scenarios"].append(scenario)
         workload_traces.append(_flashinfer_workload(event, inputs))
 

@@ -3,7 +3,7 @@
 Test suite for the benchmarking infrastructure.
 
 Sections 1-6: Unit tests (no GPU required).
-Sections 7-9: Integration tests (GPU required).
+Sections 7-9: Integration tests (GPU required and run by default).
 
 Usage:
     python tests/test_bench.py                 # all tests
@@ -80,7 +80,7 @@ def test_section_1():
     print("  SECTION 1: Input Registry")
     print(f"{'=' * 60}")
 
-    from kb_nano.bench.utils.input_registry import InputRegistry, Scenario
+    from kb_nano.bench.kernels.scenario_registry import InputRegistry
 
     # 1a. YAML parsing
     with _Timeout(30):
@@ -108,6 +108,7 @@ moe_align:
       inputs:
         topk_ids: {shape: [1, 2], dtype: int32}
       golden: "mixtral/moe_align/decode-bs1-tp1.pt"
+      golden_inputs: [topk_ids]
 """
         with tempfile.TemporaryDirectory() as tmpdir:
             inputs_dir = Path(tmpdir) / "inputs"
@@ -138,6 +139,10 @@ moe_align:
             check(
                 moe_scenarios[0].golden_path == "mixtral/moe_align/decode-bs1-tp1.pt",
                 "1a. golden path parsed correctly",
+            )
+            check(
+                moe_scenarios[0].golden_inputs == ["topk_ids"],
+                "1a. golden input allowlist parsed correctly",
             )
 
     # 1b. Shape-only tensor generation
@@ -189,6 +194,146 @@ moe_align:
                 torch.equal(golden_inputs["topk_ids"], torch.tensor([[3, 7]], dtype=torch.int32)),
                 "1c. golden data loads exact tensors",
             )
+
+    # 1h. Partial golden data overlays shape-generated inputs
+    with _Timeout(30):
+        partial_yaml = """
+store_kvcache:
+  scenarios:
+    - name: "toy/store/tp1"
+      init_args: {}
+      inputs:
+        key: {shape: [2, 1, 4], dtype: bfloat16}
+        value: {shape: [2, 1, 4], dtype: bfloat16}
+        k_cache: {shape: [4, 8, 1, 4], dtype: bfloat16}
+        v_cache: {shape: [4, 8, 1, 4], dtype: bfloat16}
+        slot_mapping: {shape: [2], dtype: int64}
+      golden: "toy/store/slots.pt"
+      golden_inputs: [slot_mapping]
+"""
+        with tempfile.TemporaryDirectory() as tmpdir:
+            inputs_dir = Path(tmpdir) / "inputs"
+            golden_dir = Path(tmpdir) / "golden"
+            inputs_dir.mkdir()
+            (golden_dir / "toy" / "store").mkdir(parents=True)
+            (inputs_dir / "test.yaml").write_text(partial_yaml)
+            torch.save(
+                {"slot_mapping": torch.tensor([3, 9], dtype=torch.int64)},
+                golden_dir / "toy" / "store" / "slots.pt",
+            )
+            reg = InputRegistry(inputs_dir=inputs_dir, golden_dir=golden_dir)
+            materialized = reg.get_inputs("store_kvcache", "toy/store/tp1", device="cpu")
+            check(
+                set(materialized) == {"key", "value", "k_cache", "v_cache", "slot_mapping"},
+                "1h. partial golden overlays generated shape inputs",
+            )
+            check(
+                torch.equal(materialized["slot_mapping"], torch.tensor([3, 9])),
+                "1h. captured control input overrides synthetic input",
+            )
+            check(
+                materialized["key"].shape == (2, 1, 4)
+                and materialized["k_cache"].shape == (4, 8, 1, 4),
+                "1h. non-golden tensors are still generated from shape specs",
+            )
+
+    # 1i. Data-dependent synthetic index inputs are range-constrained
+    with _Timeout(30):
+        constrained_yaml = """
+store_kvcache:
+  scenarios:
+    - name: "toy/store/tp1"
+      init_args: {}
+      inputs:
+        key: {shape: [16, 2, 8], dtype: bfloat16}
+        value: {shape: [16, 2, 8], dtype: bfloat16}
+        k_cache: {shape: [4, 8, 2, 8], dtype: bfloat16}
+        v_cache: {shape: [4, 8, 2, 8], dtype: bfloat16}
+        slot_mapping: {shape: [16], dtype: int64}
+moe_align:
+  scenarios:
+    - name: "toy/align/tp1"
+      init_args: {}
+      inputs:
+        topk_ids: {shape: [32, 2], dtype: int32}
+        block_size: 128
+        num_experts: 8
+moe_grouped_gemm:
+  scenarios:
+    - name: "toy/gemm/tp1"
+      init_args: {}
+      inputs:
+        A: {shape: [32, 128], dtype: bfloat16}
+        B: {shape: [8, 256, 128], dtype: bfloat16}
+        C: {shape: [64, 256], dtype: bfloat16}
+        topk_weights: {shape: [32, 2], dtype: float32}
+        sorted_token_ids: {shape: [256], dtype: int32}
+        expert_ids: {shape: [2], dtype: int32}
+        num_tokens_post_padded: {shape: [1], dtype: int32}
+        mul_routed_weight: true
+        top_k: 2
+"""
+        with tempfile.TemporaryDirectory() as tmpdir:
+            inputs_dir = Path(tmpdir) / "inputs"
+            inputs_dir.mkdir()
+            (inputs_dir / "test.yaml").write_text(constrained_yaml)
+            reg = InputRegistry(inputs_dir=inputs_dir)
+            store_inputs = reg.get_inputs("store_kvcache", "toy/store/tp1", device="cpu")
+            check(
+                int(store_inputs["slot_mapping"].min()) >= 0
+                and int(store_inputs["slot_mapping"].max()) < 32,
+                "1i. synthetic slot_mapping is inside cache slot range",
+            )
+            align_inputs = reg.get_inputs("moe_align", "toy/align/tp1", device="cpu")
+            check(
+                int(align_inputs["topk_ids"].min()) >= 0
+                and int(align_inputs["topk_ids"].max()) < 8,
+                "1i. synthetic topk_ids are inside expert range",
+            )
+            gemm_inputs = reg.get_inputs("moe_grouped_gemm", "toy/gemm/tp1", device="cpu")
+            check(
+                int(gemm_inputs["expert_ids"].min()) >= 0
+                and int(gemm_inputs["expert_ids"].max()) < 8,
+                "1i. synthetic expert_ids are inside expert range",
+            )
+            check(
+                int(gemm_inputs["sorted_token_ids"].min()) >= 0
+                and int(gemm_inputs["sorted_token_ids"].max()) < 64,
+                "1i. synthetic sorted_token_ids are inside routed-token range",
+            )
+            check(
+                int(gemm_inputs["num_tokens_post_padded"][0]) == 256,
+                "1i. synthetic num_tokens_post_padded matches aligned rows",
+            )
+
+    # 1j. Data-dependent capture policy is input-specific
+    with _Timeout(30):
+        from kb_nano.bench.kernels.scenario_schema import (
+            DATA_DEPENDENT_INPUTS,
+            DATA_DEPENDENT_OPS,
+        )
+
+        check(
+            DATA_DEPENDENT_INPUTS["store_kvcache"] == {"slot_mapping"},
+            "1j. store_kvcache captures only slot_mapping",
+        )
+        check(
+            DATA_DEPENDENT_INPUTS["moe_align"] == {"topk_ids"}
+            and DATA_DEPENDENT_INPUTS["fused_experts"] == {"topk_ids"},
+            "1j. MoE alignment/expert ops capture only routing ids",
+        )
+        check(
+            DATA_DEPENDENT_INPUTS["moe_grouped_gemm"] == {
+                "sorted_token_ids",
+                "expert_ids",
+                "num_tokens_post_padded",
+            },
+            "1j. grouped GEMM captures only aligned routing metadata",
+        )
+        check(
+            not {"grouped_topk", "sigmoid_topk", "topk_softmax"} & DATA_DEPENDENT_OPS,
+            "1j. top-k producer ops do not require golden input capture",
+        )
 
     # 1d. Filtering
     with _Timeout(30):
@@ -311,7 +456,12 @@ def test_section_2():
     print("  SECTION 2: KernelRunner")
     print(f"{'=' * 60}")
 
-    from kb_nano.bench.kernels.runner import _compare_outputs, _time_forward
+    from kb_nano.bench.kernels.runner import (
+        _compare_outputs,
+        _merge_correctness,
+        _run_forward_once,
+        _time_forward,
+    )
     from kb_nano.bench.kernels.result import OperatorResult, ScenarioResult
 
     # 2a. Identical modules
@@ -408,10 +558,19 @@ def test_section_2():
         mod = _instantiate_module(ConfigModule, {"hidden_size": 32, "eps": 1e-5}, device="cpu")
         check(mod.hidden_size == 32, "2e. hidden_size=32 propagated")
         check(mod.eps == 1e-5, "2e. eps=1e-5 propagated")
+        mod = _instantiate_module(
+            ConfigModule,
+            {"hidden_size": 48, "eps": 1e-4, "training": False},
+            device="cpu",
+        )
+        check(
+            mod.hidden_size == 48 and mod.eps == 1e-4,
+            "2e. unsupported init metadata is ignored",
+        )
 
     # 2f. Scenario filtering
     with _Timeout(30):
-        from kb_nano.bench.utils.input_registry import InputRegistry
+        from kb_nano.bench.kernels.scenario_registry import InputRegistry
 
         filter_yaml = """
 rms_norm:
@@ -433,6 +592,69 @@ rms_norm:
             check(len(all_s) == 10, "2f. total 10 scenarios")
             filtered = reg.scenarios("rms_norm", models=["llama"])
             check(len(filtered) == 3, "2f. model=llama -> 3 scenarios")
+
+    # 2g. Mutated input tensors are part of correctness
+    with _Timeout(30):
+        baseline_inputs = {
+            "cache": torch.zeros(2, 2, dtype=torch.float32),
+            "x": torch.ones(1, dtype=torch.float32),
+        }
+        candidate_inputs = {
+            "cache": torch.zeros(2, 2, dtype=torch.float32),
+            "x": torch.ones(1, dtype=torch.float32),
+        }
+        baseline_inputs["cache"][0, 0] = 1.0
+        candidate_inputs["cache"][0, 0] = 2.0
+        correct, error_ratio, diff = _merge_correctness(
+            _compare_outputs(None, None),
+            _compare_outputs(baseline_inputs, candidate_inputs),
+        )
+        check(
+            not correct and error_ratio > 1.0 and diff > 0.0,
+            "2g. mutated input mismatch fails correctness",
+        )
+        candidate_inputs["cache"][0, 0] = 1.0
+        correct, error_ratio, diff = _merge_correctness(
+            _compare_outputs(None, None),
+            _compare_outputs(baseline_inputs, candidate_inputs),
+        )
+        check(
+            correct and error_ratio == 0.0 and diff == 0.0,
+            "2g. matching mutated inputs pass correctness",
+        )
+
+    # 2h. Correctness is checked on one forward, independent of timing repeats
+    with _Timeout(30):
+        class AddInPlace(nn.Module):
+            def forward(self, x, residual):
+                residual.add_(x)
+                return x, residual
+
+        baseline = AddInPlace()
+        candidate = AddInPlace()
+        inputs = {
+            "x": torch.ones(2, 2, dtype=torch.float32),
+            "residual": torch.zeros(2, 2, dtype=torch.float32),
+        }
+        baseline_inputs = {k: v.clone() for k, v in inputs.items()}
+        candidate_inputs = {k: v.clone() for k, v in inputs.items()}
+        baseline_out = _run_forward_once(baseline, baseline_inputs)
+        candidate_out = _run_forward_once(candidate, candidate_inputs)
+        correct, error_ratio, diff = _merge_correctness(
+            _compare_outputs(baseline_out, candidate_out),
+            _compare_outputs(baseline_inputs, candidate_inputs),
+        )
+        check(
+            correct and error_ratio == 0.0 and diff == 0.0,
+            "2h. one-forward in-place correctness passes for identical modules",
+        )
+
+        timing_inputs = {k: v.clone() for k, v in inputs.items()}
+        _time_forward(baseline, timing_inputs, num_warmup=1, num_runs=2)
+        check(
+            torch.equal(timing_inputs["residual"], torch.full((2, 2), 3.0)),
+            "2h. timing loop may mutate inputs repeatedly",
+        )
 
 
 # ===========================================================================
@@ -824,7 +1046,8 @@ def _can_discover_targets() -> bool:
         from kb_nano.infra.kernel_swapper import discover_targets
         discover_targets()
         return True
-    except (ImportError, ModuleNotFoundError):
+    except Exception as exc:
+        print(f"    SKIP  target discovery unavailable: {exc}")
         return False
 
 
