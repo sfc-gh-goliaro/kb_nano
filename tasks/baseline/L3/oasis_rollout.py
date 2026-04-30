@@ -27,7 +27,7 @@ class OasisRollout(nn.Module):
 
     @staticmethod
     def _autocast(device: torch.device, dtype: torch.dtype):
-        if device.type == "cuda":
+        if device.type == "cuda" and dtype in (torch.float16, torch.bfloat16):
             return torch.autocast("cuda", dtype=dtype)
         return nullcontext()
 

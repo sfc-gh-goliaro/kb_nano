@@ -22,7 +22,7 @@ class OasisVAEAttentionBlock(nn.Module):
         qkv_bias: bool = False,
     ):
         super().__init__()
-        self.norm1 = LayerNorm(dim)
+        self.norm1 = LayerNorm(dim, eps=1e-6)
         self.attn = OasisVAEAttention(
             dim,
             num_heads,
@@ -30,7 +30,7 @@ class OasisVAEAttentionBlock(nn.Module):
             frame_width,
             qkv_bias=qkv_bias,
         )
-        self.norm2 = LayerNorm(dim)
+        self.norm2 = LayerNorm(dim, eps=1e-6)
         self.mlp = OasisMLP(dim, hidden_features=int(dim * mlp_ratio), approximate_tanh=False)
 
     def forward(self, x: torch.Tensor) -> torch.Tensor:

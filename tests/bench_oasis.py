@@ -148,7 +148,7 @@ def _detect_gpu_name() -> str:
 
 
 def _autocast(device: torch.device, dtype: torch.dtype):
-    if device.type == "cuda":
+    if device.type == "cuda" and dtype in (torch.float16, torch.bfloat16):
         return torch.autocast("cuda", dtype=dtype)
     return nullcontext()
 
@@ -244,8 +244,9 @@ def _build_kb_nano(model_dir: str, *, device: torch.device, dtype: torch.dtype) 
     pipeline = OasisPipeline(OasisConfig())
     _log("loading kb-nano Oasis weights")
     pipeline.load_weights(model_dir)
-    pipeline.model.to(device=device, dtype=dtype)
-    pipeline.vae.to(device=device, dtype=dtype)
+    del dtype
+    pipeline.model.to(device=device)
+    pipeline.vae.to(device=device)
     _log("kb-nano Oasis pipeline ready")
     return pipeline.eval()
 
@@ -669,6 +670,90 @@ def _max_workload_requirements(scenarios: list[OasisWorkload]) -> tuple[int, int
     return max_clips, max_frames, max_prompt_frames
 
 
+def _format_float(value: float | None, *, precision: int = 2, suffix: str = "") -> str:
+    if value is None:
+        return "N/A"
+    return f"{value:.{precision}f}{suffix}"
+
+
+def _correctness_summary(correctness: dict[str, Any] | None) -> tuple[str, str]:
+    if correctness is None:
+        return "N/A", "N/A"
+    status = "PASS" if correctness.get("overall_pass") else "FAIL"
+    cosines = [
+        values["cosine"]
+        for key, values in correctness.items()
+        if key != "overall_pass" and isinstance(values, dict) and "cosine" in values
+    ]
+    min_cosine = min(cosines) if cosines else None
+    return status, _format_float(min_cosine, precision=6)
+
+
+def _print_results_summary(results: dict[str, Any]) -> None:
+    performance = results.get("performance", [])
+    throughput = [item for item in performance if item["scenario"]["kind"] == "throughput"]
+    latency = [item for item in performance if item["scenario"]["kind"] == "latency"]
+
+    print(f"\n\n{'=' * 110}")
+    print("  OASIS 500M BENCHMARK SUMMARY")
+    print(f"{'=' * 110}")
+    print(f"  Model      : {results['model']}")
+    print(f"  Reference  : {results['reference']}")
+    print(f"  GPU        : {results['gpu']}")
+    print(f"  DType      : {results['dtype']}")
+    print(f"  Correctness: {results['correctness_dtype']}")
+    print(f"  Dataset    : {results['input']['name']} ({results['input']['split']})")
+    print(f"  Scenarios  : {', '.join(s['name'] for s in results['scenarios'])}")
+    print(f"{'=' * 110}")
+
+    if throughput:
+        print(f"\n{'=' * 110}")
+        print("  THROUGHPUT SUMMARY")
+        print(f"{'=' * 110}")
+        print(
+            f"  {'SCENARIO':<24} {'CLIPS':>5} {'FRAMES':>6} {'DDIM':>5}"
+            f" {'KB-NANO vid/s':>15} {'open-oasis vid/s':>17} {'SPEEDUP':>8}"
+            f" {'CORRECT':>9} {'MIN COS':>10}"
+        )
+        print(f"  {'-' * 104}")
+        for item in throughput:
+            scenario = item["scenario"]
+            kb_vps = item["kb_nano"]["videos_per_second"]
+            ref_vps = item.get("open_oasis", {}).get("videos_per_second")
+            speedup = item.get("speedup")
+            correctness_status, min_cosine = _correctness_summary(item.get("correctness"))
+            print(
+                f"  {scenario['name']:<24} {scenario['batch_clips']:>5}"
+                f" {scenario['num_frames']:>6} {scenario['ddim_steps']:>5}"
+                f" {kb_vps:>15.2f} {_format_float(ref_vps, precision=2):>17}"
+                f" {_format_float(speedup, precision=2, suffix='x'):>8}"
+                f" {correctness_status:>9} {min_cosine:>10}"
+            )
+        print(f"{'=' * 110}")
+
+    if latency:
+        print(f"\n{'=' * 105}")
+        print("  LATENCY SUMMARY")
+        print(f"{'=' * 105}")
+        print(
+            f"  {'SCENARIO':<24} {'CLIPS':>5} {'FRAMES':>6} {'DDIM':>5}"
+            f" {'KB-NANO p50':>15} {'open-oasis p50':>17} {'SPEEDUP':>8}"
+        )
+        print(f"  {'-' * 91}")
+        for item in latency:
+            scenario = item["scenario"]
+            kb_p50 = item["kb_nano"]["latency_ms_p50"]
+            ref_p50 = item.get("open_oasis", {}).get("latency_ms_p50")
+            speedup = item.get("latency_ratio_p50")
+            print(
+                f"  {scenario['name']:<24} {scenario['batch_clips']:>5}"
+                f" {scenario['num_frames']:>6} {scenario['ddim_steps']:>5}"
+                f" {kb_p50:>13.2f}ms {_format_float(ref_p50, precision=2, suffix='ms'):>17}"
+                f" {_format_float(speedup, precision=2, suffix='x'):>8}"
+            )
+        print(f"{'=' * 105}")
+
+
 def main() -> None:
     parser = argparse.ArgumentParser(description="Oasis 500M benchmark: kb-nano vs open-oasis")
     parser.add_argument("--model", default=OASIS_MODEL)
@@ -727,6 +812,7 @@ def main() -> None:
         "device": str(device),
         "gpu": torch.cuda.get_device_name(device) if device.type == "cuda" else "cpu",
         "dtype": str(dtype),
+        "correctness_dtype": str(torch.float32),
         "input": input_info,
         "scenarios": [s.__dict__ for s in scenarios],
     }
@@ -749,11 +835,20 @@ def main() -> None:
                 and ref_vae is not None
                 and ref_beta_schedule is not None
             ):
-                _log(f"{scenario.name}: running correctness pass for kb-nano and open-oasis")
+                correctness_dtype = torch.float32
+                _log(
+                    f"{scenario.name}: running correctness pass for kb-nano and open-oasis "
+                    f"with dtype={correctness_dtype}"
+                )
                 with torch.inference_mode():
                     _log(f"{scenario.name}: correctness kb-nano rollout")
                     kb_out = _run_kb_pipeline(
-                        kb, scenario_prompt, scenario_actions, scenario, dtype=dtype, seed=args.seed
+                        kb,
+                        scenario_prompt,
+                        scenario_actions,
+                        scenario,
+                        dtype=correctness_dtype,
+                        seed=args.seed,
                     )
                     _log(f"{scenario.name}: correctness open-oasis rollout")
                     ref_out = _run_open_oasis_pipeline(
@@ -763,7 +858,7 @@ def main() -> None:
                         scenario_prompt,
                         scenario_actions,
                         scenario,
-                        dtype=dtype,
+                        dtype=correctness_dtype,
                         seed=args.seed,
                     )
                 correctness = _correctness_status(
@@ -817,6 +912,7 @@ def main() -> None:
     output_dir.mkdir(parents=True, exist_ok=True)
     output_path = output_dir / "results.json"
     output_path.write_text(json.dumps(results, indent=2))
+    _print_results_summary(results)
     print(json.dumps(results, indent=2))
     print(f"\nResults saved to: {output_path}")
 
