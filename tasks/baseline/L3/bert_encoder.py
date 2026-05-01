@@ -32,3 +32,13 @@ class BertEncoder(nn.Module):
                 attention_mask=attention_mask,
             )
         return hidden_states
+
+    def forward_varlen(
+        self,
+        hidden_states: torch.Tensor,
+        cu_seqlens: torch.Tensor,
+        max_seqlen: int,
+    ) -> torch.Tensor:
+        for layer_module in self.layer:
+            hidden_states = layer_module.forward_varlen(hidden_states, cu_seqlens, max_seqlen)
+        return hidden_states

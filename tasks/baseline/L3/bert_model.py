@@ -65,3 +65,20 @@ class BertModel(nn.Module):
             embedding_output,
             attention_mask=extended_attention_mask,
         )
+
+    def forward_varlen(
+        self,
+        input_ids: torch.Tensor,
+        positions: torch.Tensor,
+        cu_seqlens: torch.Tensor,
+        max_seqlen: int,
+        intermediate_tensors=None,
+        inputs_embeds: torch.Tensor | None = None,
+    ) -> torch.Tensor:
+        del intermediate_tensors
+        embedding_output = self.embeddings(
+            input_ids=input_ids,
+            position_ids=positions,
+            inputs_embeds=inputs_embeds,
+        )
+        return self.encoder.forward_varlen(embedding_output, cu_seqlens, max_seqlen)

@@ -105,6 +105,24 @@ class ColBERTModel(nn.Module):
             inputs_embeds=inputs_embeds,
         )
 
+    def forward_varlen(
+        self,
+        input_ids: torch.Tensor,
+        positions: torch.Tensor,
+        cu_seqlens: torch.Tensor,
+        max_seqlen: int,
+        intermediate_tensors=None,
+        inputs_embeds: torch.Tensor | None = None,
+    ) -> torch.Tensor:
+        return self.model.forward_varlen(
+            input_ids=input_ids,
+            positions=positions,
+            cu_seqlens=cu_seqlens,
+            max_seqlen=max_seqlen,
+            inputs_embeds=inputs_embeds,
+            intermediate_tensors=intermediate_tensors,
+        )
+
     def token_embed(
         self,
         hidden_states: torch.Tensor,

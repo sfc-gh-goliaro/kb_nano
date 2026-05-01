@@ -35,3 +35,13 @@ class XLMRobertaLayer(nn.Module):
         )
         intermediate_output = self.intermediate(attention_output)
         return self.output(intermediate_output, attention_output)
+
+    def forward_varlen(
+        self,
+        hidden_states: torch.Tensor,
+        cu_seqlens: torch.Tensor,
+        max_seqlen: int,
+    ) -> torch.Tensor:
+        attention_output = self.attention.forward_varlen(hidden_states, cu_seqlens, max_seqlen)
+        intermediate_output = self.intermediate(attention_output)
+        return self.output(intermediate_output, attention_output)

@@ -15,15 +15,14 @@ def encode_token_type_ids(input_ids: torch.Tensor, token_type_ids: torch.Tensor)
     input_ids[: token_type_ids.shape[0]].bitwise_or_(token_type_ids << TOKEN_TYPE_SHIFT)
 
 
-def decode_token_type_ids(input_ids: torch.Tensor) -> torch.Tensor:
+def decode_token_type_ids(input_ids: torch.Tensor) -> tuple[torch.Tensor, torch.Tensor]:
     ids_mask = (
         torch.ones_like(input_ids, dtype=torch.int32, device=input_ids.device)
         << TOKEN_TYPE_SHIFT
     )
     tokens_mask = ids_mask.bitwise_not()
     token_type_ids = input_ids.bitwise_and(ids_mask) >> TOKEN_TYPE_SHIFT
-    input_ids.bitwise_and_(tokens_mask)
-    return token_type_ids
+    return input_ids.bitwise_and(tokens_mask), token_type_ids
 
 
 def create_roberta_position_ids_from_input_ids(
@@ -92,7 +91,7 @@ class EncoderEmbeddingsBase(nn.Module):
         position_ids: torch.Tensor,
         inputs_embeds: torch.Tensor | None = None,
     ) -> torch.Tensor:
-        token_type_ids = decode_token_type_ids(input_ids)
+        input_ids, token_type_ids = decode_token_type_ids(input_ids)
         if inputs_embeds is None:
             inputs_embeds = self.word_embeddings(input_ids)
 

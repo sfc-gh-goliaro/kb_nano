@@ -540,7 +540,6 @@ class EmbeddingThroughputWorkload:
     text_column: str
     jsonl_name: str
     num_requests: int = 1000
-    batch_size: int = 32
 
 
 @dataclass(frozen=True)

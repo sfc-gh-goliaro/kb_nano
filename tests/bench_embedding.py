@@ -38,6 +38,15 @@ _HELD_PORT_LOCKS: list[object] = []
 CORRECTNESS_COSINE_THRESHOLD = 0.99
 
 
+def _vllm_default_scheduler_limits(gpu: str) -> tuple[int, int]:
+    high_mem_names = ("B200", "B100", "H200", "H100", "MI300")
+    if any(name in gpu for name in high_mem_names) and "A100" not in gpu:
+        return 16384, 1024
+    if gpu == "unknown":
+        return 4096, 256
+    return 8192, 256
+
+
 def _jsonl_path(workload: EmbeddingThroughputWorkload) -> Path:
     return _PACKAGE_DIR / "data" / "embedding_workloads" / workload.jsonl_name
 
@@ -110,13 +119,13 @@ def _load_jsonl(path: Path) -> list[dict[str, str]]:
     return records
 
 
-def _token_counts(tokenizer, texts: list[str], max_length: int) -> list[int]:
-    counts = []
+def _tokenize_texts(tokenizer, texts: list[str], max_length: int) -> list[list[int]]:
+    token_ids = []
     batch_starts = range(0, len(texts), 64)
     for start in tqdm(
         batch_starts,
         total=(len(texts) + 63) // 64,
-        desc="count input tokens",
+        desc="tokenize workload",
         unit="batch",
         file=sys.stdout,
     ):
@@ -128,8 +137,8 @@ def _token_counts(tokenizer, texts: list[str], max_length: int) -> list[int]:
             max_length=max_length,
             verbose=False,
         )
-        counts.extend(len(ids) for ids in encoded["input_ids"])
-    return counts
+        token_ids.extend(list(ids) for ids in encoded["input_ids"])
+    return token_ids
 
 
 def _tokenizer_max_length(tokenizer) -> int:
@@ -164,14 +173,19 @@ def _build_records(
         )
     max_length = _vllm_model_max_length(tokenizer)
     print(
-        f"  Counting input tokens for {workload.name} "
+        f"  Tokenizing workload for {workload.name} "
         f"({len(records)} requests, max_length={max_length})",
         flush=True,
     )
-    counts = _token_counts(tokenizer, [r["text"] for r in records], max_length)
+    prompt_token_ids = _tokenize_texts(tokenizer, [r["text"] for r in records], max_length)
     return path, [
-        {"id": record["id"], "text": record["text"], "input_tokens": int(count)}
-        for record, count in zip(records, counts, strict=True)
+        {
+            "id": record["id"],
+            "text": record["text"],
+            "prompt_token_ids": list(token_ids),
+            "input_tokens": len(token_ids),
+        }
+        for record, token_ids in zip(records, prompt_token_ids, strict=True)
     ]
 
 
@@ -325,23 +339,20 @@ def _load_kb_engine(cfg, device, dtype):
         seed=cfg["seed"],
         dtype=dtype,
         device=device,
-        batch_size=cfg["batch_size"],
+        max_num_batched_tokens=cfg["max_num_batched_tokens"],
+        max_num_seqs=cfg["max_num_seqs"],
     )
 
 
-def _encode(engine, texts, cfg):
-    print(f"  kb-nano encode: {len(texts)} requests", flush=True)
+def _encode(engine, prompts, cfg):
+    print(f"  kb-nano encode: {len(prompts)} requests", flush=True)
     outputs = engine.encode(
-        texts,
+        prompts,
         pooling_task="token_embed",
         use_tqdm=True,
-        tokenization_kwargs={
-            "truncation": True,
-            "max_length": cfg["max_length"],
-        },
     )
     return [
-        item.outputs.data.detach().float().cpu().numpy()
+        item.outputs.data.detach().cpu().numpy()
         for item in outputs
     ]
 
@@ -352,22 +363,28 @@ def main():
     torch.manual_seed(cfg["seed"])
     engine = _load_kb_engine(cfg, device, dtype)
 
-    warm_texts = [r["text"] for r in cfg["records"][:min(4, len(cfg["records"]))]]
-    print(f"  kb-nano warmup: {len(warm_texts)} requests", flush=True)
-    _encode(engine, warm_texts, cfg)
+    warm_prompts = [
+        {"prompt_token_ids": r["prompt_token_ids"]}
+        for r in cfg["records"][:min(4, len(cfg["records"]))]
+    ]
+    print(f"  kb-nano warmup: {len(warm_prompts)} requests", flush=True)
+    _encode(engine, warm_prompts, cfg)
 
-    texts = [r["text"] for r in cfg["records"]]
-    print(f"  kb-nano timed throughput encode starting: {len(texts)} requests", flush=True)
+    prompts = [{"prompt_token_ids": r["prompt_token_ids"]} for r in cfg["records"]]
+    print(f"  kb-nano timed throughput encode starting: {len(prompts)} requests", flush=True)
     _cuda_sync()
     start = time.perf_counter()
-    outputs = _encode(engine, texts, cfg)
+    outputs = _encode(engine, prompts, cfg)
     _cuda_sync()
     elapsed = time.perf_counter() - start
     output_summaries, output_artifact = _save_outputs(cfg["output_npz"], outputs)
 
     latency = []
     for spec in cfg.get("latency_scenarios", []):
-        lat_texts = [r["text"] for r in cfg["records"][:spec["batch_size"]]]
+        lat_prompts = [
+            {"prompt_token_ids": r["prompt_token_ids"]}
+            for r in cfg["records"][:spec["batch_size"]]
+        ]
         print(
             f"  kb-nano latency {spec['name']}: "
             f"{spec['num_warmup']} warmup, {spec['num_iters']} timed iterations",
@@ -379,7 +396,7 @@ def main():
             unit="iter",
             file=sys.stdout,
         ):
-            _encode(engine, lat_texts, cfg)
+            _encode(engine, lat_prompts, cfg)
         latencies = []
         for _ in tqdm(
             range(spec["num_iters"]),
@@ -389,7 +406,7 @@ def main():
         ):
             _cuda_sync()
             start = time.perf_counter()
-            _encode(engine, lat_texts, cfg)
+            _encode(engine, lat_prompts, cfg)
             _cuda_sync()
             latencies.append(time.perf_counter() - start)
         item = {
@@ -403,7 +420,7 @@ def main():
 
     result = {
         "elapsed": elapsed,
-        "num_requests": len(texts),
+        "num_requests": len(prompts),
         "total_input_tokens": int(sum(r["input_tokens"] for r in cfg["records"])),
         "outputs": output_summaries,
         "output_npz": output_artifact,
@@ -419,28 +436,24 @@ if __name__ == "__main__":
 
 
 VLLM_WORKER = WORKER_SHARED + r'''
-def _encode(llm, texts, cfg):
+def _encode(llm, prompts, cfg):
     from vllm.pooling_params import PoolingParams
 
-    print(f"  vLLM encode: {len(texts)} requests", flush=True)
+    print(f"  vLLM encode: {len(prompts)} requests", flush=True)
     params = PoolingParams(task="token_embed")
     outputs = llm.encode(
-        texts,
+        prompts,
         pooling_params=params,
         pooling_task="token_embed",
         use_tqdm=True,
-        tokenization_kwargs={
-            "truncation": True,
-            "max_length": cfg["max_length"],
-        },
     )
     arrays = []
     for output in outputs:
         data = output.outputs.data
         if isinstance(data, torch.Tensor):
-            arr = data.detach().float().cpu().numpy()
+            arr = data.detach().cpu().numpy()
         else:
-            arr = np.asarray(data, dtype=np.float32)
+            arr = np.asarray(data)
         arrays.append(arr)
     return arrays
 
@@ -466,24 +479,32 @@ def main():
         trust_remote_code=True,
         hf_overrides=hf_overrides,
         max_model_len=cfg["max_length"],
+        max_num_batched_tokens=cfg["max_num_batched_tokens"],
+        max_num_seqs=cfg["max_num_seqs"],
     )
 
-    warm_texts = [r["text"] for r in cfg["records"][:min(4, len(cfg["records"]))]]
-    print(f"  vLLM warmup: {len(warm_texts)} requests", flush=True)
-    _encode(llm, warm_texts, cfg)
+    warm_prompts = [
+        {"prompt_token_ids": r["prompt_token_ids"]}
+        for r in cfg["records"][:min(4, len(cfg["records"]))]
+    ]
+    print(f"  vLLM warmup: {len(warm_prompts)} requests", flush=True)
+    _encode(llm, warm_prompts, cfg)
 
-    texts = [r["text"] for r in cfg["records"]]
-    print(f"  vLLM timed throughput encode starting: {len(texts)} requests", flush=True)
+    prompts = [{"prompt_token_ids": r["prompt_token_ids"]} for r in cfg["records"]]
+    print(f"  vLLM timed throughput encode starting: {len(prompts)} requests", flush=True)
     _cuda_sync()
     start = time.perf_counter()
-    outputs = _encode(llm, texts, cfg)
+    outputs = _encode(llm, prompts, cfg)
     _cuda_sync()
     elapsed = time.perf_counter() - start
     output_summaries, output_artifact = _save_outputs(cfg["output_npz"], outputs)
 
     latency = []
     for spec in cfg.get("latency_scenarios", []):
-        lat_texts = [r["text"] for r in cfg["records"][:spec["batch_size"]]]
+        lat_prompts = [
+            {"prompt_token_ids": r["prompt_token_ids"]}
+            for r in cfg["records"][:spec["batch_size"]]
+        ]
         print(
             f"  vLLM latency {spec['name']}: "
             f"{spec['num_warmup']} warmup, {spec['num_iters']} timed iterations",
@@ -495,7 +516,7 @@ def main():
             unit="iter",
             file=sys.stdout,
         ):
-            _encode(llm, lat_texts, cfg)
+            _encode(llm, lat_prompts, cfg)
         latencies = []
         for _ in tqdm(
             range(spec["num_iters"]),
@@ -505,7 +526,7 @@ def main():
         ):
             _cuda_sync()
             start = time.perf_counter()
-            _encode(llm, lat_texts, cfg)
+            _encode(llm, lat_prompts, cfg)
             _cuda_sync()
             latencies.append(time.perf_counter() - start)
         item = {
@@ -519,7 +540,7 @@ def main():
 
     result = {
         "elapsed": elapsed,
-        "num_requests": len(texts),
+        "num_requests": len(prompts),
         "total_input_tokens": int(sum(r["input_tokens"] for r in cfg["records"])),
         "outputs": output_summaries,
         "output_npz": output_artifact,
@@ -627,7 +648,9 @@ def _run_one_workload(
     total_input_tokens = int(sum(r["input_tokens"] for r in records))
     print(
         f"  Workload ready: {len(records)} requests, "
-        f"{total_input_tokens:,} input tokens, batch_size={workload.batch_size}",
+        f"{total_input_tokens:,} input tokens, "
+        f"max_num_batched_tokens={args.max_num_batched_tokens}, "
+        f"max_num_seqs={args.max_num_seqs}",
         flush=True,
     )
     latency_scenarios = [
@@ -648,7 +671,8 @@ def _run_one_workload(
         "model_name": workload.model_name,
         "records": records,
         "max_length": max_length,
-        "batch_size": workload.batch_size,
+        "max_num_batched_tokens": args.max_num_batched_tokens,
+        "max_num_seqs": args.max_num_seqs,
         "seed": args.seed,
         "dtype": args.dtype,
         "device": "cuda:0" if gpu != "unknown" else "cpu",
@@ -814,6 +838,7 @@ def main() -> None:
     args = parser.parse_args()
 
     gpu = _detect_gpu_name()
+    args.max_num_batched_tokens, args.max_num_seqs = _vllm_default_scheduler_limits(gpu)
     if args.output_dir is None:
         run_id = _make_run_id(args.run_id)
         args.output_dir = str(
@@ -852,6 +877,7 @@ def main() -> None:
     print(f"  TP             : {args.tp}")
     print(f"  DType          : {args.dtype}")
     print(f"  Seed           : {args.seed}")
+    print(f"  Scheduler      : max_num_batched_tokens={args.max_num_batched_tokens}, max_num_seqs={args.max_num_seqs}")
     print(f"  Output dir     : {args.output_dir}")
     if vllm_port is not None:
         print(f"  vLLM port      : {vllm_port}")

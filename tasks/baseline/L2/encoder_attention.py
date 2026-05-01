@@ -6,6 +6,7 @@ import torch
 import torch.nn as nn
 
 from ..L1.dense_attention import DenseAttention
+from ..L1.flash_attn_varlen import FlashAttnVarlen
 from ..L1.layer_norm import LayerNorm
 from ..L1.linear import Linear
 
@@ -26,6 +27,7 @@ class EncoderSelfAttention(nn.Module):
         self.key = Linear(config.hidden_size, self.all_head_size, bias=True)
         self.value = Linear(config.hidden_size, self.all_head_size, bias=True)
         self.attn = DenseAttention(backend="sdpa")
+        self.varlen_attn = FlashAttnVarlen()
 
     def forward(
         self,
@@ -59,6 +61,42 @@ class EncoderSelfAttention(nn.Module):
         )
         context = self.attn(query, key, value, causal=False, attn_mask=attention_mask)
         return context.contiguous().view(batch_size, seq_len, self.all_head_size)
+
+    def forward_varlen(
+        self,
+        hidden_states: torch.Tensor,
+        cu_seqlens: torch.Tensor,
+        max_seqlen: int,
+    ) -> torch.Tensor:
+        query = self.query(hidden_states).view(
+            hidden_states.size(0),
+            self.num_attention_heads,
+            self.attention_head_size,
+        )
+        key = self.key(hidden_states).view(
+            hidden_states.size(0),
+            self.num_attention_heads,
+            self.attention_head_size,
+        )
+        value = self.value(hidden_states).view(
+            hidden_states.size(0),
+            self.num_attention_heads,
+            self.attention_head_size,
+        )
+        context = self.varlen_attn(
+            query,
+            key,
+            value,
+            cu_seqlens_q=cu_seqlens,
+            cu_seqlens_k=cu_seqlens,
+            max_seqlen_q=max_seqlen,
+            max_seqlen_k=max_seqlen,
+            softmax_scale=self.attention_head_size ** -0.5,
+            causal=False,
+        )
+        if isinstance(context, tuple):
+            context = context[0]
+        return context.contiguous().view(hidden_states.size(0), self.all_head_size)
 
 
 class EncoderSelfOutput(nn.Module):
@@ -100,4 +138,13 @@ class EncoderAttention(nn.Module):
             hidden_states,
             attention_mask=attention_mask,
         )
+        return self.output(attention_output, hidden_states)
+
+    def forward_varlen(
+        self,
+        hidden_states: torch.Tensor,
+        cu_seqlens: torch.Tensor,
+        max_seqlen: int,
+    ) -> torch.Tensor:
+        attention_output = self.self.forward_varlen(hidden_states, cu_seqlens, max_seqlen)
         return self.output(attention_output, hidden_states)
