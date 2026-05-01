@@ -127,6 +127,7 @@ class BgeM3EmbeddingModel(nn.Module):
         hidden_states: torch.Tensor,
         attention_mask: torch.Tensor | None = None,
     ) -> torch.Tensor:
+        hidden_states = hidden_states.to(self.colbert_linear.weight.dtype)
         vecs = self.colbert_linear(hidden_states[:, 1:])
         if attention_mask is not None:
             vecs = vecs * attention_mask[:, 1:].unsqueeze(-1).to(dtype=vecs.dtype)
@@ -137,6 +138,7 @@ class BgeM3EmbeddingModel(nn.Module):
         hidden_states: torch.Tensor,
         attention_mask: torch.Tensor | None = None,
     ) -> torch.Tensor:
+        hidden_states = hidden_states.to(self.sparse_linear.weight.dtype)
         weights = self.relu(self.sparse_linear(hidden_states))
         if attention_mask is not None:
             weights = weights * attention_mask.unsqueeze(-1).to(dtype=weights.dtype)

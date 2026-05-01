@@ -80,8 +80,17 @@ def _ensure_jsonl_workload(
 ) -> Path:
     path = _jsonl_path(workload)
     if path.exists() and not force:
-        print(f"  Using existing JSONL workload: {path}", flush=True)
-        return path
+        with path.open(encoding="utf-8") as f:
+            num_cached = sum(1 for line in f if line.strip())
+        if num_cached < workload.num_requests:
+            print(
+                f"  Cached JSONL workload {path} has {num_cached} records; "
+                f"rebuilding for {workload.num_requests}",
+                flush=True,
+            )
+        else:
+            print(f"  Using existing JSONL workload: {path}", flush=True)
+            return path
     path.parent.mkdir(parents=True, exist_ok=True)
     print(
         f"  Preparing JSONL workload {workload.name}: downloading/streaming "

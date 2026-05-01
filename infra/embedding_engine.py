@@ -194,12 +194,16 @@ class EmbeddingEngine:
                     cu_seqlens=cu_seqlens,
                     max_seqlen=max(lengths) if lengths else 0,
                 )
+                head_dtype = self.model.colbert_linear.weight.dtype
+                hidden_states = hidden_states.to(head_dtype)
                 if self.model_key == "bge_m3":
                     projected = self.model.norm(self.model.colbert_linear(hidden_states))
                     slice_offset = 1
                 else:
                     projected = self.model.norm(self.model.colbert_linear(hidden_states))
                     slice_offset = 0
+
+                projected = projected.float()
 
                 if copy_stream is not None:
                     copy_stream.wait_stream(torch.cuda.current_stream(self.device))
@@ -229,7 +233,7 @@ class EmbeddingEngine:
                     end = int(cu_seqlens[local_idx + 1].item())
                     results[request_idx] = PoolingRequestOutput(
                         request_id=str(request_idx),
-                        outputs=PoolingOutput(data=projected[start:end].detach()),
+                        outputs=PoolingOutput(data=projected[start:end].detach().float()),
                         prompt_token_ids=list(token_ids),
                         num_cached_tokens=0,
                         finished=True,

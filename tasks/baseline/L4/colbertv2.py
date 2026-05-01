@@ -128,6 +128,7 @@ class ColBERTModel(nn.Module):
         hidden_states: torch.Tensor,
         token_mask: torch.Tensor | None = None,
     ) -> torch.Tensor:
+        hidden_states = hidden_states.to(self.colbert_linear.weight.dtype)
         vecs = self.colbert_linear(hidden_states)
         if token_mask is not None:
             vecs = vecs * token_mask.unsqueeze(-1).to(dtype=vecs.dtype)

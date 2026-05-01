@@ -574,6 +574,7 @@ EMBEDDING_THROUGHPUT_WORKLOADS: list[EmbeddingThroughputWorkload] = [
         id_column="passage_id",
         text_column="passage",
         jsonl_name="colbertv2_msmarco_passages.jsonl",
+        num_requests=60_000,
     ),
 ]
 

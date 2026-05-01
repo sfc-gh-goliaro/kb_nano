@@ -124,6 +124,8 @@ def load_bge_m3_model(
     model = BgeM3EmbeddingModel(config)
     load_bge_m3_weights(model, model_path)
     model = model.to(device=device, dtype=dtype)
+    model.sparse_linear.to(device=device, dtype=torch.float32)
+    model.colbert_linear.to(device=device, dtype=torch.float32)
     model.eval()
     return model, config
 
@@ -173,5 +175,6 @@ def load_colbertv2_model(
     model = ColBERTModel(config)
     load_colbertv2_weights(model, model_path)
     model = model.to(device=device, dtype=dtype)
+    model.colbert_linear.to(device=device, dtype=torch.float32)
     model.eval()
     return model, config
