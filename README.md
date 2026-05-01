@@ -45,7 +45,7 @@ A standalone, high-performance inference engine supporting **LLMs** (Llama 3.1, 
 - **Detection benchmark** for YOLOv10 and RTDetrV2
 - **timm comparison benchmark** for SigLIP-2, DINOv3, and SwinV2 vision encoders (ImageNet-1K validation)
 - **facebook/sam3 comparison benchmark** for SAM3.1 segmentation
-- **FlagEmbedding / ColBERT comparison benchmark** for embedding and retrieval models
+- **vLLM pooling/token_embed comparison benchmark** for embedding and retrieval models
 - **PointTransformerV3 detached comparison benchmark** for 3D point cloud encoding
 - **open-oasis comparison benchmark** for autoregressive diffusion world models
 - **OpenFold/OpenFold3 comparison benchmark** for protein structure prediction
@@ -302,36 +302,32 @@ The protein structure benchmark measures:
 - **Latency**: per-structure prediction latency with median stats
 - **Correctness**: percentage of queries meeting all correctness requirements (atom position cosine similarity >= 0.95, RMSD < 0.5A, pLDDT correlation >= 0.99, PAE cosine similarity >= 0.95)
 
-### Benchmarking vs Embedding Baselines
+### Benchmarking vs vLLM (Embedding / Retrieval)
 
-Install the reference packages in the `kb` environment:
+Install the benchmark dependencies in the `kb` environment:
 
 ```bash
 python -m pip install datasets==4.8.4 peft==0.18.1 GitPython==3.1.46 ujson==5.12.0 scipy==1.17.1
-python -m pip install --no-deps FlagEmbedding==1.3.5 colbert-ai==0.2.22
 ```
 
-After that, the following commands can be run directly from the repo root. By default, the embedding benchmark uses sampled real `mteb/scifact` query/document text and qrels positive pairs, runs fp16 on CUDA, measures dataset-backed throughput on 128 sampled texts per scenario, runs latency at batch sizes 1 and 4, and checks embedding alignment on 32 sampled texts/pairs. It does not run full-corpus retrieval metrics such as NDCG@10 or MRR@10. You can switch datasets with `--dataset <hf-retrieval-dataset>` as long as the dataset exposes `queries`, `corpus`, and qrels-style `default/test` splits. `--lengths` adds optional fixed-length stress scenarios:
+After that, run the benchmark directly from the repo root. The embedding benchmark compares kb-nano against vLLM's pooling runner in `token_embed` mode, using pre-tokenized identical requests for both engines. It reports end-to-end input tokens/sec, latency, and per-request output cosine correctness as part of the throughput run.
 
 ```bash
-# BGE-M3: dense + sparse + ColBERT-vector throughput/latency/alignment vs FlagEmbedding
-python tests/bench_embedding.py --model BAAI/bge-m3 --return-colbert-vecs
+# BGE-M3 + ColBERTv2 token-level embedding throughput/latency/correctness vs vLLM
+python tests/bench_embedding.py
 
-# ColBERTv2: query/doc throughput + latency + alignment benchmark vs official ColBERT
-python tests/bench_embedding.py --model colbert-ir/colbertv2.0
+# Single model
+python tests/bench_embedding.py --model bge-m3
+python tests/bench_embedding.py --model colbertv2.0
 
-# Use a different retrieval dataset
-python tests/bench_embedding.py --model BAAI/bge-m3 --dataset <hf-retrieval-dataset>
-
-# kb-nano only (skip reference comparison)
-python tests/bench_embedding.py --model BAAI/bge-m3 --skip-reference
+# kb-nano only
+python tests/bench_embedding.py --model bge-m3 --skip-vllm
 
 # Skip latency phase
-python tests/bench_embedding.py --model BAAI/bge-m3 --skip-latency
+python tests/bench_embedding.py --skip-latency
 
 # Save results to a specific directory
-python tests/bench_embedding.py --model BAAI/bge-m3 --return-colbert-vecs --output-dir tests/results/H200/bge-m3_embedding
-python tests/bench_embedding.py --model colbert-ir/colbertv2.0 --output-dir tests/results/H200/colbertv2.0_embedding
+python tests/bench_embedding.py --output-dir tests/results/B200/embedding/manual
 ```
 
 The diffusion benchmark measures:
@@ -708,62 +704,29 @@ Latency (batch size 1, 128 output tokens, 5 iterations):
 
 FP8 activation quantization uses a custom Triton kernel for single-launch per-token-group UE8M0 quantization. Pre-allocated shared prefill buffers eliminate dynamic allocation during FP8 prefill, and DeepGEMM is JIT-warmed for both decode and prefill batch sizes. The remaining throughput gap vs vLLM is primarily from vLLM's `torch.compile` + Inductor fusion passes (RMSNorm+quant, SiLU+quant).
 
-### BGE-M3 (Embedding)
+### BGE-M3 / ColBERTv2 (Embedding)
 
-Run `python tests/bench_embedding.py --model BAAI/bge-m3 --return-colbert-vecs` to reproduce. Reference baseline: FlagEmbedding / BGEM3FlagModel.
+Run `python tests/bench_embedding.py` to reproduce. Reference baseline: vLLM pooling runner in `token_embed` mode. Both engines receive the same pre-tokenized requests, use fp16 model weights with fp32 pooling heads, and materialize token-level embedding outputs before correctness comparison. The benchmark measures end-to-end input tokens/sec, not retrieval ranking quality.
 
-**Hardware: NVIDIA H200**
+**Hardware: NVIDIA B200**
 
-Throughput (sampled real docs from `mteb/scifact`, fp16; dense + sparse + ColBERT-vector outputs):
+Throughput (real dataset workloads, fp16, token-level embeddings):
 
-| Scenario | BS | Samples | FlagEmbedding (docs/s) | Ours (docs/s) | Ratio |
-|----------|---:|--------:|-----------------------:|--------------:|------:|
-| mteb/scifact-doc | 4 | 128 | 176.61 | 192.12 | **1.09x** |
-
-Latency (median of 5 runs, fp16):
-
-| BS | Samples | Len | FlagEmbedding median | Ours median | Ratio |
-|---:|--------:|----:|---------------------:|------------:|------:|
-| 1 | 1 | 128 | 0.0187s | 0.0079s | **2.35x** |
-| 4 | 4 | 128 | 0.0217s | 0.0092s | **2.37x** |
-
-Alignment:
-
-| Output | Metric | Avg Mean Abs Diff | Notes |
-|--------|:-------|------------------:|:------|
-| Dense | cosine=0.99999821 | 4.40e-05 | PASS |
-| Sparse | key jaccard=0.999572 | 1.41e-04 | PASS |
-| ColBERT vectors | cosine=0.99991202 | 1.06e-04 | PASS |
-
-### ColBERTv2 (Retrieval)
-
-Run `python tests/bench_embedding.py --model colbert-ir/colbertv2.0` to reproduce. Reference baseline: official ColBERT / HF_ColBERT. This benchmark uses sampled real query/doc text and qrels positive pairs for throughput/alignment; it is not a full-corpus ranking eval.
-
-**Hardware: NVIDIA H200**
-
-Throughput (sampled real query/doc texts from `mteb/scifact`, fp16):
-
-| Scenario | BS | Samples | Reference (docs/s) | Ours (docs/s) | Ratio |
-|----------|---:|--------:|-------------------:|--------------:|------:|
-| mteb/scifact-query | 4 | 128 | 876.71 | 900.26 | **1.03x** |
-| mteb/scifact-doc | 4 | 128 | 321.20 | 341.21 | **1.06x** |
+| Scenario | Requests | Input Tokens | vLLM tok/s | Ours tok/s | Ratio | Correct | Min Cos |
+|----------|---------:|-------------:|-----------:|-----------:|------:|:--------|--------:|
+| BGE-M3 MLDR documents | 1,000 | 4,569,071 | 376,516 | 398,706 | **1.06x** | PASS | 0.999012 |
+| ColBERTv2 MS MARCO passages | 60,000 | 4,627,378 | 346,735 | 1,068,509 | **3.08x** | PASS | 0.999992 |
 
 Latency (median of 5 runs, fp16):
 
-| Mode | BS | Samples | Len | Reference median | Ours median | Ratio |
-|------|---:|--------:|----:|-----------------:|------------:|------:|
-| Query | 1 | 1 | 32 | 0.0037s | 0.0038s | 0.98x |
-| Query | 4 | 4 | 32 | 0.0045s | 0.0042s | **1.06x** |
-| Doc | 1 | 1 | 128 | 0.0044s | 0.0047s | 0.94x |
-| Doc | 4 | 4 | 128 | 0.0056s | 0.0057s | 0.99x |
+| Model | Scenario | BS | Input Tokens | vLLM median | Ours median | vLLM ms/tok | Ours ms/tok | Ratio |
+|-------|----------|---:|-------------:|------------:|------------:|------------:|------------:|------:|
+| BGE-M3 | single-request | 1 | 6,638 | 0.0197s | 0.0183s | 0.00 | 0.00 | **1.08x** |
+| BGE-M3 | fixed-batch-32 | 32 | 152,801 | 0.3411s | 0.3520s | 0.00 | 0.00 | 0.97x |
+| ColBERTv2 | single-request | 1 | 56 | 0.0042s | 0.0011s | 0.08 | 0.02 | **3.99x** |
+| ColBERTv2 | fixed-batch-32 | 32 | 2,401 | 0.0193s | 0.0022s | 0.01 | 0.00 | **8.63x** |
 
-Alignment:
-
-| Output | Metric | Avg Mean Abs Diff | Notes |
-|--------|:-------|------------------:|:------|
-| Query | cosine=1.00000000 | 0.00e+00 | PASS |
-| Doc | cosine=0.99999946 | 7.05e-05 | PASS |
-| MaxSim score | score diff | 6.62e-04 | PASS |
+BGE-M3 is near vLLM parity on large-document encoder work. The ColBERTv2 workload has many short passages, so the larger speedup primarily reflects lower end-to-end request/pooling/output overhead in kb-nano's packed token-embedding path rather than a claim that every ColBERT kernel is 3x faster than vLLM.
 
 ### DeepSeek V3.2 FP8 (MoE, MLA, DSA)
 
