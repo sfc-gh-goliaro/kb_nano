@@ -7,7 +7,7 @@ from dataclasses import dataclass
 import torch
 import torch.nn as nn
 
-from ..L2.xlm_roberta_embeddings import XLMRobertaEmbeddings
+from ..L2.encoder_embeddings import XLMRobertaEmbeddings
 from .xlm_roberta_encoder import XLMRobertaEncoder
 
 

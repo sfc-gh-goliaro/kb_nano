@@ -7,7 +7,7 @@ from dataclasses import dataclass
 import torch
 import torch.nn as nn
 
-from ..L2.bert_embeddings import BertEmbeddings
+from ..L2.encoder_embeddings import BertEmbeddings
 from .bert_encoder import BertEncoder
 
 
