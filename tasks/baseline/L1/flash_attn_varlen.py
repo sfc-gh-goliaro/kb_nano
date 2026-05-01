@@ -86,13 +86,14 @@ class FlashAttnVarlen(nn.Module):
                 kwargs["fa_version"] = _fa_version
             return _fa3_varlen_func(q, k, v, **kwargs)
         fn = _fa2_varlen_func if _fa2_varlen_func is not None else _flashmla_varlen_func
-        return fn(
-            q, k, v,
+        kwargs = dict(
             cu_seqlens_q=cu_seqlens_q,
             cu_seqlens_k=cu_seqlens_k,
             max_seqlen_q=max_seqlen_q,
             max_seqlen_k=max_seqlen_k,
             softmax_scale=softmax_scale,
             causal=causal,
-            return_softmax_lse=return_softmax_lse,
         )
+        if return_softmax_lse:
+            kwargs["return_softmax_lse"] = return_softmax_lse
+        return fn(q, k, v, **kwargs)
