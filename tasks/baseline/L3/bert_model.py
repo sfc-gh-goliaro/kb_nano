@@ -2,18 +2,11 @@
 
 from __future__ import annotations
 
-from dataclasses import dataclass
-
 import torch
 import torch.nn as nn
 
 from ..L2.encoder_embeddings import BertEmbeddings
 from .bert_encoder import BertEncoder
-
-
-@dataclass
-class EncoderModelOutput:
-    last_hidden_state: torch.Tensor
 
 
 class BertModel(nn.Module):
@@ -34,37 +27,41 @@ class BertModel(nn.Module):
 
     def forward(
         self,
-        input_ids: torch.Tensor | None = None,
-        attention_mask: torch.Tensor | None = None,
-        token_type_ids: torch.Tensor | None = None,
-        position_ids: torch.Tensor | None = None,
+        input_ids: torch.Tensor,
+        positions: torch.Tensor,
+        intermediate_tensors=None,
         inputs_embeds: torch.Tensor | None = None,
-        return_dict: bool = True,
-    ) -> EncoderModelOutput | tuple[torch.Tensor]:
-        if input_ids is not None and inputs_embeds is not None:
-            raise ValueError("Cannot specify both input_ids and inputs_embeds")
-        if input_ids is None and inputs_embeds is None:
-            raise ValueError("Must specify input_ids or inputs_embeds")
-
-        if input_ids is not None:
-            batch_size, seq_length = input_ids.shape
-            device = input_ids.device
-        else:
-            batch_size, seq_length = inputs_embeds.shape[:2]
-            device = inputs_embeds.device
-
-        if attention_mask is None:
-            attention_mask = torch.ones((batch_size, seq_length), dtype=torch.long, device=device)
-
+    ) -> torch.Tensor:
+        del intermediate_tensors
         embedding_output = self.embeddings(
             input_ids=input_ids,
-            token_type_ids=token_type_ids,
-            position_ids=position_ids,
+            position_ids=positions,
             inputs_embeds=inputs_embeds,
         )
-        extended_attention_mask = self._prepare_attention_mask(attention_mask, device)
-        hidden_states = self.encoder(embedding_output, attention_mask=extended_attention_mask)
+        return self.encoder(embedding_output)
 
-        if not return_dict:
-            return (hidden_states,)
-        return EncoderModelOutput(last_hidden_state=hidden_states)
+    def forward_with_attention_mask(
+        self,
+        input_ids: torch.Tensor,
+        attention_mask: torch.Tensor | None = None,
+        token_type_ids: torch.Tensor | None = None,
+        positions: torch.Tensor | None = None,
+        inputs_embeds: torch.Tensor | None = None,
+    ) -> torch.Tensor:
+        if positions is None:
+            seq_length = input_ids.size(1)
+            positions = torch.arange(seq_length, device=input_ids.device).unsqueeze(0)
+            positions = positions.expand(input_ids.size(0), seq_length)
+        if attention_mask is None:
+            attention_mask = torch.ones_like(input_ids, dtype=torch.long)
+        embedding_output = self.embeddings.forward_with_token_type_ids(
+            input_ids=input_ids,
+            position_ids=positions,
+            token_type_ids=token_type_ids,
+            inputs_embeds=inputs_embeds,
+        )
+        extended_attention_mask = self._prepare_attention_mask(attention_mask, input_ids.device)
+        return self.encoder.forward_with_attention_mask(
+            embedding_output,
+            attention_mask=extended_attention_mask,
+        )

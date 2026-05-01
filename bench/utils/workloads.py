@@ -520,3 +520,70 @@ ALL_VISION_ENCODER_WORKLOADS = {
     "throughput": VISION_ENCODER_THROUGHPUT_WORKLOADS,
     "latency": VISION_ENCODER_LATENCY_WORKLOADS,
 }
+
+
+# ---------------------------------------------------------------------------
+# Text embedding workloads (token-level retrieval embeddings)
+# ---------------------------------------------------------------------------
+
+@dataclass(frozen=True)
+class EmbeddingThroughputWorkload:
+    """Throughput workload for token-level text embedding models."""
+
+    name: str
+    model_key: str
+    model_name: str
+    dataset_name: str
+    dataset_config: str
+    dataset_split: str
+    id_column: str | None
+    text_column: str
+    jsonl_name: str
+    num_requests: int = 1000
+    batch_size: int = 32
+
+
+@dataclass(frozen=True)
+class EmbeddingLatencyWorkload:
+    """Latency workload for token-level text embedding models."""
+
+    name: str
+    batch_size: int
+    num_warmup: int = 3
+    num_iters: int = 5
+
+
+EMBEDDING_THROUGHPUT_WORKLOADS: list[EmbeddingThroughputWorkload] = [
+    EmbeddingThroughputWorkload(
+        name="bge-m3-mldr-docs",
+        model_key="bge_m3",
+        model_name="BAAI/bge-m3",
+        dataset_name="sentence-transformers/mldr",
+        dataset_config="en-triplet",
+        dataset_split="train",
+        id_column=None,
+        text_column="positive",
+        jsonl_name="bge_m3_mldr_documents.jsonl",
+    ),
+    EmbeddingThroughputWorkload(
+        name="colbertv2-msmarco-passages",
+        model_key="colbertv2",
+        model_name="colbert-ir/colbertv2.0",
+        dataset_name="sentence-transformers/msmarco",
+        dataset_config="corpus",
+        dataset_split="train",
+        id_column="passage_id",
+        text_column="passage",
+        jsonl_name="colbertv2_msmarco_passages.jsonl",
+    ),
+]
+
+EMBEDDING_LATENCY_WORKLOADS: list[EmbeddingLatencyWorkload] = [
+    EmbeddingLatencyWorkload(name="single-request", batch_size=1),
+    EmbeddingLatencyWorkload(name="fixed-batch-32", batch_size=32),
+]
+
+ALL_EMBEDDING_WORKLOADS = {
+    "throughput": EMBEDDING_THROUGHPUT_WORKLOADS,
+    "latency": EMBEDDING_LATENCY_WORKLOADS,
+}

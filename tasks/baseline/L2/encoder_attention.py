@@ -30,6 +30,12 @@ class EncoderSelfAttention(nn.Module):
     def forward(
         self,
         hidden_states: torch.Tensor,
+    ) -> torch.Tensor:
+        return self.forward_with_attention_mask(hidden_states)
+
+    def forward_with_attention_mask(
+        self,
+        hidden_states: torch.Tensor,
         attention_mask: torch.Tensor | None = None,
     ) -> torch.Tensor:
         batch_size, seq_len, _ = hidden_states.shape
@@ -81,7 +87,17 @@ class EncoderAttention(nn.Module):
     def forward(
         self,
         hidden_states: torch.Tensor,
+    ) -> torch.Tensor:
+        attention_output = self.self(hidden_states)
+        return self.output(attention_output, hidden_states)
+
+    def forward_with_attention_mask(
+        self,
+        hidden_states: torch.Tensor,
         attention_mask: torch.Tensor | None = None,
     ) -> torch.Tensor:
-        attention_output = self.self(hidden_states, attention_mask=attention_mask)
+        attention_output = self.self.forward_with_attention_mask(
+            hidden_states,
+            attention_mask=attention_mask,
+        )
         return self.output(attention_output, hidden_states)

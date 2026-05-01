@@ -8,6 +8,23 @@ import torch.nn as nn
 from ..L1.embedding import Embedding
 from ..L1.layer_norm import LayerNorm
 
+TOKEN_TYPE_SHIFT = 30
+
+
+def encode_token_type_ids(input_ids: torch.Tensor, token_type_ids: torch.Tensor) -> None:
+    input_ids[: token_type_ids.shape[0]].bitwise_or_(token_type_ids << TOKEN_TYPE_SHIFT)
+
+
+def decode_token_type_ids(input_ids: torch.Tensor) -> torch.Tensor:
+    ids_mask = (
+        torch.ones_like(input_ids, dtype=torch.int32, device=input_ids.device)
+        << TOKEN_TYPE_SHIFT
+    )
+    tokens_mask = ids_mask.bitwise_not()
+    token_type_ids = input_ids.bitwise_and(ids_mask) >> TOKEN_TYPE_SHIFT
+    input_ids.bitwise_and_(tokens_mask)
+    return token_type_ids
+
 
 def create_roberta_position_ids_from_input_ids(
     input_ids: torch.Tensor,
@@ -71,42 +88,36 @@ class EncoderEmbeddingsBase(nn.Module):
 
     def forward(
         self,
-        input_ids: torch.Tensor | None = None,
-        token_type_ids: torch.Tensor | None = None,
-        position_ids: torch.Tensor | None = None,
+        input_ids: torch.Tensor,
+        position_ids: torch.Tensor,
         inputs_embeds: torch.Tensor | None = None,
-        past_key_values_length: int = 0,
     ) -> torch.Tensor:
-        if input_ids is not None:
-            input_shape = input_ids.size()
-            device = input_ids.device
-        else:
-            if inputs_embeds is None:
-                raise ValueError("inputs_embeds must be provided when input_ids is None")
-            input_shape = inputs_embeds.size()[:-1]
-            device = inputs_embeds.device
-
-        seq_len = input_shape[1]
-        if position_ids is None:
-            position_ids = self._resolve_position_ids(
-                input_ids=input_ids,
-                inputs_embeds=inputs_embeds,
-                past_key_values_length=past_key_values_length,
-            )
-
-        if token_type_ids is None:
-            buffered = self.token_type_ids[:, :seq_len]
-            token_type_ids = buffered.expand(input_shape[0], seq_len)
-
+        token_type_ids = decode_token_type_ids(input_ids)
         if inputs_embeds is None:
             inputs_embeds = self.word_embeddings(input_ids)
 
         embeddings = (
             inputs_embeds
-            + self.token_type_embeddings(token_type_ids.to(device=device))
+            + self.token_type_embeddings(token_type_ids.to(device=input_ids.device))
         )
         if self.position_embedding_type == "absolute":
-            embeddings = embeddings + self.position_embeddings(position_ids.to(device=device))
+            embeddings = embeddings + self.position_embeddings(position_ids.to(device=input_ids.device))
+        return self.LayerNorm(embeddings)
+
+    def forward_with_token_type_ids(
+        self,
+        input_ids: torch.Tensor,
+        position_ids: torch.Tensor,
+        token_type_ids: torch.Tensor | None = None,
+        inputs_embeds: torch.Tensor | None = None,
+    ) -> torch.Tensor:
+        if token_type_ids is None:
+            token_type_ids = self.token_type_ids[:, : input_ids.size(1)].expand(input_ids.size())
+        if inputs_embeds is None:
+            inputs_embeds = self.word_embeddings(input_ids)
+        embeddings = inputs_embeds + self.token_type_embeddings(token_type_ids.to(input_ids.device))
+        if self.position_embedding_type == "absolute":
+            embeddings = embeddings + self.position_embeddings(position_ids.to(input_ids.device))
         return self.LayerNorm(embeddings)
 
 

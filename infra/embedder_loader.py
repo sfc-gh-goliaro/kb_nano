@@ -11,13 +11,13 @@ from huggingface_hub import snapshot_download
 from safetensors import safe_open
 
 try:
-    from ..tasks.baseline.L4.bge_m3 import BGEM3Config, BGEM3ModelForInference
-    from ..tasks.baseline.L4.colbertv2 import ColBERTv2Config, ColBERTv2ModelForInference
+    from ..tasks.baseline.L4.bge_m3 import BGEM3Config, BgeM3EmbeddingModel
+    from ..tasks.baseline.L4.colbertv2 import ColBERTModel, ColBERTv2Config
 except ImportError as exc:
     if "attempted relative import beyond top-level package" not in str(exc):
         raise
-    from tasks.baseline.L4.bge_m3 import BGEM3Config, BGEM3ModelForInference
-    from tasks.baseline.L4.colbertv2 import ColBERTv2Config, ColBERTv2ModelForInference
+    from tasks.baseline.L4.bge_m3 import BGEM3Config, BgeM3EmbeddingModel
+    from tasks.baseline.L4.colbertv2 import ColBERTModel, ColBERTv2Config
 
 
 _EMBEDDING_WEIGHT_RE = re.compile(
@@ -60,31 +60,44 @@ def _remap_encoder_embedding_keys(state: dict[str, torch.Tensor]) -> dict[str, t
     return remapped
 
 
-def load_bge_m3_weights(model: BGEM3ModelForInference, model_path: str) -> None:
-    backbone_state = _remap_encoder_embedding_keys(_load_backbone_state_dict(model_path))
+def _prefix_model_keys(state: dict[str, torch.Tensor]) -> dict[str, torch.Tensor]:
+    remapped: dict[str, torch.Tensor] = {}
+    for key, value in state.items():
+        for prefix in ("bert.", "roberta."):
+            if key.startswith(prefix):
+                key = key[len(prefix):]
+                break
+        remapped[key if key.startswith("model.") else f"model.{key}"] = value
+    return remapped
+
+
+def load_bge_m3_weights(model: BgeM3EmbeddingModel, model_path: str) -> None:
+    backbone_state = _prefix_model_keys(
+        _remap_encoder_embedding_keys(_load_backbone_state_dict(model_path)),
+    )
     missing, unexpected = model.load_state_dict(backbone_state, strict=False)
 
     sparse_path = os.path.join(model_path, "sparse_linear.pt")
     if not os.path.exists(sparse_path):
         raise FileNotFoundError(f"Missing sparse head weights: {sparse_path}")
     sparse_state = torch.load(sparse_path, map_location="cpu", weights_only=True)
-    model.sparse_embedding.sparse_linear.load_state_dict(sparse_state)
+    model.sparse_linear.load_state_dict(sparse_state)
 
     colbert_path = os.path.join(model_path, "colbert_linear.pt")
     if not os.path.exists(colbert_path):
         raise FileNotFoundError(f"Missing ColBERT head weights: {colbert_path}")
     colbert_state = torch.load(colbert_path, map_location="cpu", weights_only=True)
-    model.colbert_embedding.colbert_linear.load_state_dict(colbert_state)
+    model.colbert_linear.load_state_dict(colbert_state)
 
     missing = [
         key for key in missing
         if key not in {
-            "embeddings.position_ids",
-            "embeddings.token_type_ids",
-            "sparse_embedding.sparse_linear.weight",
-            "sparse_embedding.sparse_linear.bias",
-            "colbert_embedding.colbert_linear.weight",
-            "colbert_embedding.colbert_linear.bias",
+            "model.embeddings.position_ids",
+            "model.embeddings.token_type_ids",
+            "sparse_linear.weight",
+            "sparse_linear.bias",
+            "colbert_linear.weight",
+            "colbert_linear.bias",
         }
     ]
     if missing:
@@ -92,8 +105,8 @@ def load_bge_m3_weights(model: BGEM3ModelForInference, model_path: str) -> None:
     unexpected = [
         key for key in unexpected
         if key not in {
-            "pooler.dense.weight",
-            "pooler.dense.bias",
+            "model.pooler.dense.weight",
+            "model.pooler.dense.bias",
         }
     ]
     if unexpected:
@@ -104,27 +117,34 @@ def load_bge_m3_model(
     model_name: str,
     device: torch.device = torch.device("cuda"),
     dtype: torch.dtype = torch.bfloat16,
-) -> tuple[BGEM3ModelForInference, BGEM3Config]:
+) -> tuple[BgeM3EmbeddingModel, BGEM3Config]:
     model_path = download_embedder_model(model_name)
     config = BGEM3Config.from_pretrained(model_name)
     config.dtype = dtype
-    model = BGEM3ModelForInference(config)
+    model = BgeM3EmbeddingModel(config)
     load_bge_m3_weights(model, model_path)
     model = model.to(device=device, dtype=dtype)
     model.eval()
     return model, config
 
 
-def load_colbertv2_weights(model: ColBERTv2ModelForInference, model_path: str) -> None:
-    state = _remap_encoder_embedding_keys(_load_backbone_state_dict(model_path))
+def load_colbertv2_weights(model: ColBERTModel, model_path: str) -> None:
+    state = _prefix_model_keys(
+        _remap_encoder_embedding_keys(_load_backbone_state_dict(model_path)),
+    )
     if "linear.weight" in state:
-        state["embedding.linear.weight"] = state.pop("linear.weight")
+        state["colbert_linear.weight"] = state.pop("linear.weight")
+    if "model.linear.weight" in state:
+        state["colbert_linear.weight"] = state.pop("model.linear.weight")
+    if "model.colbert_linear.weight" in state:
+        state["colbert_linear.weight"] = state.pop("model.colbert_linear.weight")
     missing, unexpected = model.load_state_dict(state, strict=False)
 
     missing = [
         key for key in missing
         if key not in {
-            "bert.embeddings.position_ids",
+            "model.embeddings.position_ids",
+            "colbert_linear.weight",
         }
     ]
     if missing:
@@ -133,9 +153,9 @@ def load_colbertv2_weights(model: ColBERTv2ModelForInference, model_path: str) -
     unexpected = [
         key for key in unexpected
         if key not in {
-            "bert.embeddings.position_ids",
-            "bert.pooler.dense.weight",
-            "bert.pooler.dense.bias",
+            "model.embeddings.position_ids",
+            "model.pooler.dense.weight",
+            "model.pooler.dense.bias",
         }
     ]
     if unexpected:
@@ -146,11 +166,11 @@ def load_colbertv2_model(
     model_name: str,
     device: torch.device = torch.device("cuda"),
     dtype: torch.dtype = torch.bfloat16,
-) -> tuple[ColBERTv2ModelForInference, ColBERTv2Config]:
+) -> tuple[ColBERTModel, ColBERTv2Config]:
     model_path = download_embedder_model(model_name)
     config = ColBERTv2Config.from_pretrained(model_name)
     config.dtype = dtype
-    model = ColBERTv2ModelForInference(config)
+    model = ColBERTModel(config)
     load_colbertv2_weights(model, model_path)
     model = model.to(device=device, dtype=dtype)
     model.eval()

@@ -1,4 +1,4 @@
-"""ColBERTv2 encoder model and MaxSim scoring."""
+"""ColBERT vLLM-compatible embedding model wiring."""
 
 from __future__ import annotations
 
@@ -8,12 +8,9 @@ import torch
 import torch.nn as nn
 from transformers import AutoConfig
 
-from ..L2.colbertv2_ops import (
-    ColBERTv2Embedding,
-    ColBERTv2MaxSim,
-    ColBERTv2ScoreReduce,
-    ColBERTv2TokenMask,
-)
+from ..L1.l2_norm import L2Norm
+from ..L1.linear import Linear
+from ..L2.colbertv2_ops import ColBERTv2MaxSim, ColBERTv2ScoreReduce, ColBERTv2TokenMask
 from ..L3.bert_model import BertModel
 
 
@@ -35,16 +32,6 @@ class ColBERTv2Config:
     position_embedding_type: str = "absolute"
     dtype: torch.dtype = torch.bfloat16
     dim: int = 128
-    query_maxlen: int = 32
-    doc_maxlen: int = 220
-    query_marker_token_id: int = 1
-    doc_marker_token_id: int = 2
-    mask_token_id: int = 103
-    cls_token_id: int = 101
-    sep_token_id: int = 102
-    mask_punctuation: bool = True
-    interaction: str = "colbert"
-    similarity: str = "cosine"
 
     @classmethod
     def from_pretrained(cls, model_name: str) -> "ColBERTv2Config":
@@ -64,22 +51,69 @@ class ColBERTv2Config:
             attention_probs_dropout_prob=hf.attention_probs_dropout_prob,
             pad_token_id=hf.pad_token_id,
             position_embedding_type=getattr(hf, "position_embedding_type", "absolute"),
+            dim=(
+                getattr(hf, "colbert_dim", None)
+                or getattr(hf, "dim", None)
+                or getattr(hf, "projection_dim", 128)
+            ),
         )
 
 
-class ColBERTv2ModelForInference(nn.Module):
+class ColBERTModel(nn.Module):
+    is_pooling_model = True
+
     def __init__(self, config: ColBERTv2Config):
         super().__init__()
         self.config = config
-        self.bert = BertModel(config)
-        self.embedding = ColBERTv2Embedding(config.hidden_size, config.dim)
+        self.model = BertModel(config)
+        self.colbert_linear = Linear(config.hidden_size, config.dim, bias=False)
+        self.norm = L2Norm(dim=-1)
         self.token_mask = ColBERTv2TokenMask(config.pad_token_id)
         self.maxsim = ColBERTv2MaxSim()
         self.score_reducer = ColBERTv2ScoreReduce()
-        self.skiplist: set[int] = set()
 
-    def set_skiplist(self, token_ids: set[int] | list[int] | tuple[int, ...]) -> None:
-        self.skiplist = {int(token_id) for token_id in token_ids}
+    def embed_input_ids(self, input_ids: torch.Tensor) -> torch.Tensor:
+        return self.model.embeddings.word_embeddings(input_ids)
+
+    def forward(
+        self,
+        input_ids: torch.Tensor,
+        positions: torch.Tensor,
+        intermediate_tensors=None,
+        inputs_embeds: torch.Tensor | None = None,
+    ) -> torch.Tensor:
+        return self.model(
+            input_ids=input_ids,
+            positions=positions,
+            inputs_embeds=inputs_embeds,
+            intermediate_tensors=intermediate_tensors,
+        )
+
+    def forward_with_attention_mask(
+        self,
+        input_ids: torch.Tensor,
+        attention_mask: torch.Tensor | None = None,
+        token_type_ids: torch.Tensor | None = None,
+        positions: torch.Tensor | None = None,
+        inputs_embeds: torch.Tensor | None = None,
+    ) -> torch.Tensor:
+        return self.model.forward_with_attention_mask(
+            input_ids=input_ids,
+            attention_mask=attention_mask,
+            token_type_ids=token_type_ids,
+            positions=positions,
+            inputs_embeds=inputs_embeds,
+        )
+
+    def token_embed(
+        self,
+        hidden_states: torch.Tensor,
+        token_mask: torch.Tensor | None = None,
+    ) -> torch.Tensor:
+        vecs = self.colbert_linear(hidden_states)
+        if token_mask is not None:
+            vecs = vecs * token_mask.unsqueeze(-1).to(dtype=vecs.dtype)
+        return self.norm(vecs)
 
     def mask(
         self,
@@ -88,36 +122,6 @@ class ColBERTv2ModelForInference(nn.Module):
     ) -> torch.Tensor:
         return self.token_mask(input_ids, skiplist=skiplist)
 
-    def query(
-        self,
-        input_ids: torch.Tensor,
-        attention_mask: torch.Tensor,
-    ) -> torch.Tensor:
-        hidden_states = self.bert(
-            input_ids=input_ids,
-            attention_mask=attention_mask,
-            return_dict=True,
-        ).last_hidden_state
-        query_mask = self.mask(input_ids, skiplist=set())
-        return self.embedding(hidden_states, query_mask)
-
-    def doc(
-        self,
-        input_ids: torch.Tensor,
-        attention_mask: torch.Tensor,
-        return_mask: bool = False,
-    ) -> torch.Tensor | tuple[torch.Tensor, torch.Tensor]:
-        hidden_states = self.bert(
-            input_ids=input_ids,
-            attention_mask=attention_mask,
-            return_dict=True,
-        ).last_hidden_state
-        doc_mask = self.mask(input_ids, skiplist=self.skiplist)
-        doc_vecs = self.embedding(hidden_states, doc_mask)
-        if return_mask:
-            return doc_vecs, doc_mask
-        return doc_vecs
-
     def score(
         self,
         query_vecs: torch.Tensor,
@@ -125,21 +129,3 @@ class ColBERTv2ModelForInference(nn.Module):
         doc_mask: torch.Tensor,
     ) -> torch.Tensor:
         return self.maxsim(query_vecs, doc_vecs, doc_mask)
-
-    def score_reduce(
-        self,
-        scores_padded: torch.Tensor,
-        doc_mask: torch.Tensor,
-    ) -> torch.Tensor:
-        return self.score_reducer(scores_padded, doc_mask)
-
-    def forward(
-        self,
-        query_input: tuple[torch.Tensor, torch.Tensor] | None = None,
-        doc_input: tuple[torch.Tensor, torch.Tensor] | None = None,
-    ) -> torch.Tensor:
-        if query_input is None or doc_input is None:
-            raise ValueError("query_input and doc_input must both be provided")
-        query_vecs = self.query(*query_input)
-        doc_vecs, doc_mask = self.doc(*doc_input, return_mask=True)
-        return self.score(query_vecs, doc_vecs, doc_mask)
