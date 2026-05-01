@@ -8,10 +8,12 @@ import torch
 import torch.nn as nn
 from transformers import AutoConfig
 
-from ..L2.colbertv2_embedding import ColBERTv2Embedding
-from ..L2.colbertv2_maxsim import ColBERTv2MaxSim
-from ..L2.colbertv2_score_reduce import ColBERTv2ScoreReduce
-from ..L2.colbertv2_token_mask import ColBERTv2TokenMask
+from ..L2.colbertv2_ops import (
+    ColBERTv2Embedding,
+    ColBERTv2MaxSim,
+    ColBERTv2ScoreReduce,
+    ColBERTv2TokenMask,
+)
 from ..L3.bert_model import BertModel
 
 

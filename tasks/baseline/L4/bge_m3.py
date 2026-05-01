@@ -7,9 +7,11 @@ from dataclasses import dataclass
 import torch
 from transformers import AutoConfig
 
-from ..L2.bge_m3_colbert_embedding import BGEM3ColBERTEmbedding
-from ..L2.bge_m3_dense_embedding import BGEM3DenseEmbedding
-from ..L2.bge_m3_sparse_embedding import BGEM3SparseEmbedding
+from ..L2.bge_m3_embeddings import (
+    BGEM3ColBERTEmbedding,
+    BGEM3DenseEmbedding,
+    BGEM3SparseEmbedding,
+)
 from ..L3.xlm_roberta_model import XLMRobertaModel
 
 
