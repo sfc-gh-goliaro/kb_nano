@@ -7,6 +7,7 @@ import argparse
 import json
 import os
 import sys
+import tempfile
 from pathlib import Path
 
 import numpy as np
@@ -569,6 +570,21 @@ def _load_output_artifact(path: str) -> dict:
     return np.load(path, mmap_mode="r")
 
 
+def _delete_output_artifact(path: str) -> None:
+    paths = [path]
+    if path.endswith(".json") and os.path.exists(path):
+        with open(path) as f:
+            metadata = json.load(f)
+        values_path = metadata.get("values_path")
+        if isinstance(values_path, str):
+            paths.insert(0, values_path)
+    for item in paths:
+        try:
+            os.remove(item)
+        except FileNotFoundError:
+            pass
+
+
 def _compare_outputs(kb_npz: str, vllm_npz: str, num_requests: int) -> dict:
     print(f"  Correctness: comparing {num_requests} request outputs", flush=True)
     kb_data = _load_output_artifact(kb_npz)
@@ -664,7 +680,7 @@ def _run_one_workload(
         if item.batch_size <= len(records)
     ]
 
-    scenario_dir = Path(args.output_dir) / workload.name
+    scenario_dir = Path(args.artifact_dir) / workload.name
     scenario_dir.mkdir(parents=True, exist_ok=True)
     common_cfg = {
         "model_key": workload.model_key,
@@ -728,21 +744,30 @@ def _run_one_workload(
         "total_input_tokens": total_input_tokens,
         "kb_nano_elapsed": kb_raw["elapsed"],
         "kb_nano_input_tok_per_s": kb_tps,
-        "kb_nano_output_npz": kb_raw["output_npz"],
+        "kb_nano_output_artifact": kb_raw["output_npz"],
     }
+    artifacts_deleted = False
     if vllm_raw is not None:
         vllm_tps = vllm_raw["total_input_tokens"] / vllm_raw["elapsed"]
+        correctness = _compare_outputs(
+            kb_raw["output_npz"],
+            vllm_raw["output_npz"],
+            len(records),
+        )
+        _delete_output_artifact(kb_raw["output_npz"])
+        _delete_output_artifact(vllm_raw["output_npz"])
+        artifacts_deleted = True
         result.update({
             "vllm_elapsed": vllm_raw["elapsed"],
             "vllm_input_tok_per_s": vllm_tps,
-            "vllm_output_npz": vllm_raw["output_npz"],
+            "vllm_output_artifact": vllm_raw["output_npz"],
             "speedup": _safe_div(kb_tps, vllm_tps),
-            "correctness": _compare_outputs(
-                kb_raw["output_npz"],
-                vllm_raw["output_npz"],
-                len(records),
-            ),
+            "correctness": correctness,
         })
+    elif args.skip_vllm:
+        _delete_output_artifact(kb_raw["output_npz"])
+        artifacts_deleted = True
+    result["output_artifacts_deleted"] = artifacts_deleted
 
     latency_results = []
     kb_latency = kb_raw.get("latency", [])
@@ -846,6 +871,11 @@ def main() -> None:
         )
     elif args.run_id is not None:
         print("  NOTE: --run-id is ignored because --output-dir was provided.")
+    args.artifact_dir = str(
+        Path(tempfile.gettempdir())
+        / "kb_nano_embedding_outputs"
+        / Path(args.output_dir).name
+    )
 
     vllm_port = None
     flashinfer_namespace = None
@@ -879,6 +909,7 @@ def main() -> None:
     print(f"  Seed           : {args.seed}")
     print(f"  Scheduler      : max_num_batched_tokens={args.max_num_batched_tokens}, max_num_seqs={args.max_num_seqs}")
     print(f"  Output dir     : {args.output_dir}")
+    print(f"  Artifact dir   : {args.artifact_dir}")
     if vllm_port is not None:
         print(f"  vLLM port      : {vllm_port}")
         if flashinfer_namespace is not None:
