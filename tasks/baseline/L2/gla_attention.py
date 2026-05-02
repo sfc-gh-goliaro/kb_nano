@@ -186,6 +186,13 @@ class GatedLinearAttention(nn.Module):
         **kwargs,
     ) -> tuple[torch.Tensor, None, object | None]:
         B, T, _ = hidden_states.shape
+        cu_seqlens = kwargs.get("cu_seqlens")
+        max_seqlen = None
+        if cu_seqlens is not None:
+            if B != 1:
+                raise ValueError("cu_seqlens prefill expects packed hidden_states with batch size 1")
+            lengths = cu_seqlens[1:] - cu_seqlens[:-1]
+            max_seqlen = int(lengths.max().item()) if lengths.numel() else 0
 
         q = self.q_proj(hidden_states)
         k = self.k_proj(hidden_states)
@@ -238,33 +245,38 @@ class GatedLinearAttention(nn.Module):
         #   T  < 64 + fast kernels -> fused_recurrent (decode)
         #   no fast kernels         -> naive PyTorch (CPU / debug / reference)
         if self.use_fast_kernels and q.is_cuda:
+            dispatch_len = max_seqlen if max_seqlen is not None else T
             if self.decay_mode == "learned_low_rank":
                 # gk in [B, T, H, K] log-space, NOT transposed
                 gk_btHK = self._compute_gk_bthk(hidden_states, B, T)
-                if T >= _CHUNK_THRESHOLD:
+                if dispatch_len >= _CHUNK_THRESHOLD:
                     o, final_state = self.chunk(
                         q=q, k=k, v=v, g=gk_btHK,
                         initial_state=initial_state,
                         output_final_state=use_cache,
+                        cu_seqlens=cu_seqlens,
                     )
                 else:
                     o, final_state = self.fused_recurrence(
                         q=q, k=k, v=v, gk=gk_btHK,
                         initial_state=initial_state,
                         output_final_state=use_cache,
+                        cu_seqlens=cu_seqlens,
                     )
             else:  # RetNet — kernel bakes in the per-head decay
-                if T >= _CHUNK_THRESHOLD:
+                if dispatch_len >= _CHUNK_THRESHOLD:
                     o, final_state = self.chunk(
                         q=q, k=k, v=v,
                         initial_state=initial_state,
                         output_final_state=use_cache,
+                        cu_seqlens=cu_seqlens,
                     )
                 else:
                     o, final_state = self.fused_recurrence(
                         q=q, k=k, v=v,
                         initial_state=initial_state,
                         output_final_state=use_cache,
+                        cu_seqlens=cu_seqlens,
                     )
             # Fast-path output is already [B, T, H, V] — no transpose needed.
         else:
