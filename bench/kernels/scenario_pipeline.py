@@ -14,9 +14,11 @@ import gc
 import inspect
 import json
 import os
+import shutil
 import subprocess
 import sys
 import tempfile
+import time
 from collections import defaultdict
 from pathlib import Path
 from typing import Any
@@ -87,6 +89,35 @@ def _torch_dtype(dtype: str) -> torch.dtype | None:
         "float16": torch.float16,
         "bfloat16": torch.bfloat16,
     }.get(_dtype_name(dtype))
+
+
+def _trace_path_for_job(trace_dir: Path, job: dict[str, Any]) -> Path:
+    key = job["model_key"] or _short_model_key(job["model"])
+    return trace_dir / key / f"tp{job['tp']}" / job["dtype"] / f"{job['workload']}.jsonl"
+
+
+def _trace_exists(trace_dir: Path, job: dict[str, Any]) -> bool:
+    path = _trace_path_for_job(trace_dir, job)
+    return path.is_file() and path.stat().st_size > 0
+
+
+def _model_family(model_name: str, model_key: str | None = None) -> str:
+    text = f"{model_key or ''} {model_name}".lower()
+    if any(token in text for token in ("gla", "retnet", "rwkv7")):
+        return "fla"
+    if "flux" in text or "hunyuan-video" in text or "hunyuan_video" in text:
+        return "diffusion"
+    if "oasis" in text:
+        return "oasis"
+    if "bge-m3" in text or "bge_m3" in text or "colbert" in text:
+        return "embedding"
+    if "openfold" in text:
+        return "structure"
+    if "yolo" in text or "rtdetr" in text:
+        return "detection"
+    if "qwen" in text and "vl" in text:
+        return "vlm"
+    return "llm"
 
 
 def _model_family_matches(model_key: str, family: str) -> bool:
@@ -169,6 +200,174 @@ def _summarize_outputs(output: Any) -> Any:
     return summarize_value(output)
 
 
+def _summarize_shape_value(value: Any, *, scalar_limit: int = 16, depth: int = 0) -> Any:
+    """Fast metadata summary used by no-golden tracing.
+
+    It intentionally skips output metadata and avoids expensive repr/object
+    traversal. Shape registries only need input tensor/scalar structure.
+    """
+    if isinstance(value, torch.Tensor):
+        return {
+            "kind": "tensor",
+            "shape": list(value.shape),
+            "dtype": str(value.dtype).replace("torch.", ""),
+            "ndim": value.ndim,
+            "numel": value.numel(),
+            "stride": list(value.stride()),
+            "layout": str(value.layout).replace("torch.", ""),
+            "requires_grad": bool(value.requires_grad),
+        }
+    if isinstance(value, (str, int, float, bool)) or value is None:
+        return {"kind": "scalar", "value": value}
+    if isinstance(value, (list, tuple)):
+        if len(value) <= scalar_limit and all(
+            isinstance(v, (str, int, float, bool)) or v is None for v in value
+        ):
+            return {"kind": "sequence", "value": list(value)}
+        if depth >= 2:
+            return {"kind": "sequence", "length": len(value), "truncated": True}
+        return {
+            "kind": "sequence",
+            "length": len(value),
+            "items": [
+                _summarize_shape_value(v, scalar_limit=scalar_limit, depth=depth + 1)
+                for v in value[:scalar_limit]
+            ],
+            "truncated": len(value) > scalar_limit,
+        }
+    if isinstance(value, dict):
+        if depth >= 2:
+            return {"kind": "mapping", "length": len(value), "truncated": True}
+        return {
+            "kind": "mapping",
+            "items": {
+                str(k): _summarize_shape_value(v, scalar_limit=scalar_limit, depth=depth + 1)
+                for k, v in sorted(value.items())
+            },
+        }
+    return {"kind": "object", "type": type(value).__name__}
+
+
+def _make_fast_input_binder(module: torch.nn.Module):
+    try:
+        sig = inspect.signature(module.forward)
+        params = [
+            (name, param.kind)
+            for name, param in sig.parameters.items()
+            if param.kind
+            in {
+                inspect.Parameter.POSITIONAL_ONLY,
+                inspect.Parameter.POSITIONAL_OR_KEYWORD,
+                inspect.Parameter.KEYWORD_ONLY,
+            }
+        ]
+        positional_names = [
+            name for name, kind in params
+            if kind
+            in {
+                inspect.Parameter.POSITIONAL_ONLY,
+                inspect.Parameter.POSITIONAL_OR_KEYWORD,
+            }
+        ]
+    except Exception:
+        positional_names = []
+
+    def bind(args: tuple[Any, ...], kwargs: dict[str, Any]) -> dict[str, Any]:
+        result = {
+            positional_names[idx] if idx < len(positional_names) else f"arg{idx}": value
+            for idx, value in enumerate(args)
+        }
+        result.update(kwargs or {})
+        return result
+
+    return bind
+
+
+def _is_integer_tensor(value: Any) -> bool:
+    return isinstance(value, torch.Tensor) and not torch.is_floating_point(value) and not torch.is_complex(value)
+
+
+def _merge_range(dst: dict[str, Any], src: dict[str, Any]) -> None:
+    if "observed_min" in src:
+        dst["observed_min"] = min(dst.get("observed_min", src["observed_min"]), src["observed_min"])
+    if "observed_max" in src:
+        dst["observed_max"] = max(dst.get("observed_max", src["observed_max"]), src["observed_max"])
+    dst["observed_count"] = int(dst.get("observed_count", 0)) + int(src.get("observed_count", 1))
+    for key in ("semantic", "allowed_min", "allowed_max_exclusive", "allowed_max_inclusive"):
+        if key in src and key not in dst:
+            dst[key] = src[key]
+
+
+def _find_int_init_arg(init_args: dict[str, Any], names: tuple[str, ...]) -> int | None:
+    for key, value in init_args.items():
+        if key in names and isinstance(value, int):
+            return value
+        if isinstance(value, dict):
+            nested = _find_int_init_arg(value, names)
+            if nested is not None:
+                return nested
+    return None
+
+
+def _index_semantics(op: str, name: str, init_args: dict[str, Any]) -> dict[str, Any]:
+    lowered = name.lower()
+    result: dict[str, Any] = {}
+    if op == "store_kvcache" or "slot" in lowered:
+        result.update({"semantic": "kv_cache_slot", "allowed_min": 0})
+    elif "expert" in lowered or "topk" in lowered:
+        result.update({"semantic": "expert_index", "allowed_min": 0})
+        num_experts = _find_int_init_arg(
+            init_args,
+            ("num_experts", "num_local_experts", "n_routed_experts", "num_experts_per_tok"),
+        )
+        if num_experts is not None:
+            result["allowed_max_exclusive"] = num_experts
+    elif "token" in lowered or "indices" in lowered or "ids" in lowered:
+        result.update({"semantic": "index", "allowed_min": 0})
+    return result
+
+
+def _collect_index_constraints(
+    op: str,
+    named_inputs: dict[str, Any],
+    init_args: dict[str, Any],
+) -> dict[str, dict[str, Any]]:
+    selected = DATA_DEPENDENT_INPUTS.get(op, set())
+    if not selected:
+        return {}
+    constraints: dict[str, dict[str, Any]] = {}
+    flat = flatten_named_values(named_inputs)
+    for name, value in flat.items():
+        if not _capture_name_matches(name, selected) or not _is_integer_tensor(value):
+            continue
+        if value.numel() == 0:
+            continue
+        # This sync is intentional and limited to control/index tensors for
+        # data-dependent ops. It is much cheaper than saving full tensors.
+        observed_min = int(value.detach().amin().item())
+        observed_max = int(value.detach().amax().item())
+        constraints[name] = {
+            "dtype": str(value.dtype).replace("torch.", ""),
+            "shape": list(value.shape),
+            "observed_min": observed_min,
+            "observed_max": observed_max,
+            "observed_count": 1,
+            **_index_semantics(op, name, init_args),
+        }
+    return constraints
+
+
+def _merge_index_constraints(
+    dst: dict[str, dict[str, Any]],
+    src: dict[str, dict[str, Any]],
+) -> None:
+    for name, value in src.items():
+        if name in dst:
+            _merge_range(dst[name], value)
+        else:
+            dst[name] = dict(value)
+
+
 def _capture_name_matches(name: str, selected: set[str]) -> bool:
     return name in selected or any(name.startswith(f"{prefix}.") for prefix in selected)
 
@@ -212,9 +411,11 @@ class InputTraceRecorder:
         self.golden_dir = golden_dir
         self.ops = ops
         self.capture_golden = capture_golden
+        self.shape_only = not capture_golden
         self.target_classes = _resolve_targets(model_key)
         self.occurrences: dict[str, int] = defaultdict(int)
         self.seen_goldens: set[str] = set()
+        self.shape_events: dict[str, dict[str, Any]] = {}
         self.events_written = 0
         self.goldens_captured = 0
         self.handles = []
@@ -230,6 +431,10 @@ class InputTraceRecorder:
             handle.remove()
         self.handles.clear()
         if self._file is not None:
+            if self.shape_only:
+                for event in self.shape_events.values():
+                    self._file.write(json.dumps(event, sort_keys=True) + "\n")
+                self.events_written = len(self.shape_events)
             self._file.close()
             self._file = None
 
@@ -249,7 +454,7 @@ class InputTraceRecorder:
                 continue
             module_path = paths.get(id(module), "")
             handle = module.register_forward_hook(
-                self._make_hook(op, module_path),
+                self._make_hook(op, module_path, module),
                 with_kwargs=True,
             )
             self.handles.append(handle)
@@ -262,10 +467,52 @@ class InputTraceRecorder:
                 return op_name
         return None
 
-    def _make_hook(self, op: str, module_path: str):
+    def _make_hook(self, op: str, module_path: str, module_for_signature: torch.nn.Module):
+        fast_bind = _make_fast_input_binder(module_for_signature)
+
         def hook(module, args, kwargs, output):
             self.occurrences[op] += 1
             occurrence = self.occurrences[op]
+            if self.shape_only:
+                named_inputs = fast_bind(args, kwargs or {})
+                inputs_meta = {
+                    name: _summarize_shape_value(value)
+                    for name, value in named_inputs.items()
+                }
+                event = TraceEvent(
+                    op=op,
+                    model_key=self.model_key,
+                    model=self.model,
+                    tp=self.tp,
+                    dtype=self.dtype,
+                    workload=self.workload,
+                    module_path=module_path,
+                    module_class=module.__class__.__name__,
+                    occurrence=occurrence,
+                    first_occurrence=occurrence == 1,
+                    inputs=inputs_meta,
+                    init_args=_extract_init_args(module),
+                    outputs=None,
+                )
+                signature = event.canonical_key()
+                constraints = _collect_index_constraints(op, named_inputs, event.init_args)
+                existing = self.shape_events.get(signature)
+                if existing is not None:
+                    existing["_observed_count"] += 1
+                    _merge_index_constraints(
+                        existing.setdefault("index_constraints", {}),
+                        constraints,
+                    )
+                    return
+                payload = event.__dict__.copy()
+                payload["signature"] = signature
+                payload["_observed_count"] = 1
+                if constraints:
+                    payload["index_constraints"] = constraints
+                self.shape_events[signature] = payload
+                self.events_written = len(self.shape_events)
+                return
+
             named_inputs = _bind_forward_inputs(module, args, kwargs or {})
             inputs_meta = {
                 name: summarize_value(value)
@@ -441,6 +688,486 @@ def trace_llm_model(
     return trace_path
 
 
+def trace_fla_model(
+    *,
+    model_name: str,
+    model_key: str | None,
+    tp: int,
+    dtype: str,
+    workload: str,
+    prompts: list[str | list[int]] | None,
+    output_lens: list[int] | None,
+    trace_dir: Path,
+    golden_dir: Path,
+    ops: set[str] | None = None,
+    seed: int = 42,
+    capture_golden: bool = True,
+    num_requests: int | None = None,
+    decode_cap: int | None = None,
+) -> Path:
+    if tp != 1:
+        raise ValueError(f"FLAEngine only supports tp=1, got tp={tp}")
+    from kb_nano.infra.fla_engine import FLAEngine, SamplingParams
+
+    key = model_key or _short_model_key(model_name)
+    trace_path = trace_dir / key / f"tp{tp}" / dtype / f"{workload}.jsonl"
+    print(
+        f"Tracing {key}/{workload} with FLAEngine: model={model_name}, dtype={dtype}, "
+        f"ops={','.join(sorted(ops)) if ops else 'mapped'}"
+    )
+    print(f"Raw trace output: {trace_path}")
+    engine = FLAEngine(
+        model_name=model_name,
+        dtype=_torch_dtype(dtype) or torch.bfloat16,
+        seed=seed,
+    )
+    try:
+        recorder = InputTraceRecorder(
+            model=model_name,
+            model_key=key,
+            tp=tp,
+            dtype=_dtype_name(dtype),
+            workload=workload,
+            trace_path=trace_path,
+            golden_dir=golden_dir,
+            ops=ops,
+            capture_golden=capture_golden,
+        )
+        with recorder:
+            attached = recorder.attach(engine.model)
+            print(f"Attached {attached} trace hooks for {model_name} ({workload})")
+            if prompts is None or output_lens is None:
+                print(f"Loading standardized workload {workload}...")
+                prompts, output_lens = _load_standard_workload(
+                    workload,
+                    engine.tokenizer,
+                    num_requests=num_requests,
+                    decode_cap=decode_cap,
+                    seed=seed,
+                )
+            sp_list = [
+                SamplingParams(temperature=0.0, max_tokens=out_len, ignore_eos=True)
+                for out_len in output_lens
+            ]
+            engine.generate(prompts, sp_list if len(sp_list) > 1 else sp_list[0])
+            print(
+                f"Finished {key}/{workload}: wrote {recorder.events_written} events, "
+                f"captured {recorder.goldens_captured} input blobs"
+            )
+    finally:
+        del engine
+        gc.collect()
+        if torch.cuda.is_available():
+            torch.cuda.empty_cache()
+    return trace_path
+
+
+def trace_diffusion_model(
+    *,
+    model_name: str,
+    model_key: str | None,
+    tp: int,
+    dtype: str,
+    workload: str,
+    trace_dir: Path,
+    golden_dir: Path,
+    ops: set[str] | None = None,
+    seed: int = 42,
+    capture_golden: bool = True,
+    num_requests: int | None = None,
+    **_: Any,
+) -> Path:
+    if tp != 1:
+        raise ValueError(f"DiffusionEngine only supports tp=1, got tp={tp}")
+    from kb_nano.bench.utils.workloads import DIFFUSION_THROUGHPUT_WORKLOADS, FLUX_CONFIG
+    from kb_nano.infra.diffusion_engine import DiffusionEngine
+    from kb_nano.tasks.baseline.L4.flux import DiffusionSamplingParams
+
+    by_name = {w.name: w for w in DIFFUSION_THROUGHPUT_WORKLOADS}
+    if workload not in by_name:
+        raise ValueError(f"Unsupported diffusion workload {workload!r}")
+    spec = by_name[workload]
+    n = num_requests if num_requests is not None else spec.num_requests
+    key = model_key or _short_model_key(model_name)
+    trace_path = trace_dir / key / f"tp{tp}" / dtype / f"{workload}.jsonl"
+    print(f"Tracing {key}/{workload} with DiffusionEngine: model={model_name}, dtype={dtype}")
+    engine = DiffusionEngine(model_name=model_name, dtype=_torch_dtype(dtype) or torch.bfloat16, seed=seed, enforce_eager=True)
+    try:
+        pipeline = engine._get_pipeline()
+        model = pipeline.transformer
+        recorder = InputTraceRecorder(
+            model=model_name, model_key=key, tp=tp, dtype=_dtype_name(dtype),
+            workload=workload, trace_path=trace_path, golden_dir=golden_dir,
+            ops=ops, capture_golden=capture_golden,
+        )
+        with recorder:
+            attached = recorder.attach(model)
+            print(f"Attached {attached} trace hooks for {model_name} ({workload})")
+            params = DiffusionSamplingParams(
+                height=spec.height,
+                width=spec.width,
+                num_inference_steps=FLUX_CONFIG.num_inference_steps,
+                guidance_scale=FLUX_CONFIG.guidance_scale,
+                output_type="latent",
+                seed=seed,
+            )
+            prompts = [f"trace prompt {i}" for i in range(spec.batch_size)]
+            for _idx in range(n):
+                engine.generate(prompts, params)
+            print(
+                f"Finished {key}/{workload}: wrote {recorder.events_written} events, "
+                f"captured {recorder.goldens_captured} input blobs"
+            )
+    finally:
+        if hasattr(engine, "_cleanup"):
+            engine._cleanup()
+        del engine
+        gc.collect()
+        if torch.cuda.is_available():
+            torch.cuda.empty_cache()
+    return trace_path
+
+
+def trace_embedding_model(
+    *,
+    model_name: str,
+    model_key: str | None,
+    tp: int,
+    dtype: str,
+    workload: str,
+    trace_dir: Path,
+    golden_dir: Path,
+    ops: set[str] | None = None,
+    seed: int = 42,
+    capture_golden: bool = True,
+    num_requests: int | None = None,
+    **_: Any,
+) -> Path:
+    if tp != 1:
+        raise ValueError(f"EmbeddingEngine only supports tp=1, got tp={tp}")
+    from kb_nano.bench.utils.workloads import EMBEDDING_THROUGHPUT_WORKLOADS
+    from kb_nano.infra.embedding_engine import EmbeddingEngine
+
+    by_name = {w.name: w for w in EMBEDDING_THROUGHPUT_WORKLOADS}
+    if workload not in by_name:
+        raise ValueError(f"Unsupported embedding workload {workload!r}")
+    spec = by_name[workload]
+    n = num_requests if num_requests is not None else spec.num_requests
+    key = model_key or _short_model_key(model_name)
+    trace_path = trace_dir / key / f"tp{tp}" / dtype / f"{workload}.jsonl"
+    print(f"Tracing {key}/{workload} with EmbeddingEngine: model={model_name}, dtype={dtype}")
+    engine = EmbeddingEngine(model_name=model_name, dtype=_torch_dtype(dtype) or torch.bfloat16, seed=seed)
+    try:
+        recorder = InputTraceRecorder(
+            model=model_name, model_key=key, tp=tp, dtype=_dtype_name(dtype),
+            workload=workload, trace_path=trace_path, golden_dir=golden_dir,
+            ops=ops, capture_golden=capture_golden,
+        )
+        with recorder:
+            attached = recorder.attach(engine.model)
+            print(f"Attached {attached} trace hooks for {model_name} ({workload})")
+            prompts = [f"retrieval document passage {i} for workload tracing" for i in range(n)]
+            engine.encode(prompts, pooling_task="token_embed", use_tqdm=True)
+            print(
+                f"Finished {key}/{workload}: wrote {recorder.events_written} events, "
+                f"captured {recorder.goldens_captured} input blobs"
+            )
+    finally:
+        del engine
+        gc.collect()
+        if torch.cuda.is_available():
+            torch.cuda.empty_cache()
+    return trace_path
+
+
+def trace_oasis_model(
+    *,
+    model_name: str,
+    model_key: str | None,
+    tp: int,
+    dtype: str,
+    workload: str,
+    trace_dir: Path,
+    golden_dir: Path,
+    ops: set[str] | None = None,
+    seed: int = 42,
+    capture_golden: bool = True,
+    num_requests: int | None = None,
+    **_: Any,
+) -> Path:
+    if tp != 1:
+        raise ValueError(f"OasisEngine only supports tp=1, got tp={tp}")
+    from kb_nano.bench.utils.workloads import OASIS_THROUGHPUT_WORKLOADS
+    from kb_nano.infra.oasis_engine import OasisEngine
+    from kb_nano.tasks.baseline.L4.oasis import OasisSamplingParams
+
+    by_name = {w.name: w for w in OASIS_THROUGHPUT_WORKLOADS}
+    if workload not in by_name:
+        raise ValueError(f"Unsupported Oasis workload {workload!r}")
+    spec = by_name[workload]
+    n = num_requests if num_requests is not None else 1
+    key = model_key or _short_model_key(model_name)
+    trace_path = trace_dir / key / f"tp{tp}" / dtype / f"{workload}.jsonl"
+    print(f"Tracing {key}/{workload} with OasisEngine: model={model_name}, dtype={dtype}")
+    engine = OasisEngine(model_name=model_name, dtype=_torch_dtype(dtype) or torch.float16, seed=seed)
+    try:
+        pipeline = engine._get_pipeline()
+        recorder = InputTraceRecorder(
+            model=model_name, model_key=key, tp=tp, dtype=_dtype_name(dtype),
+            workload=workload, trace_path=trace_path, golden_dir=golden_dir,
+            ops=ops, capture_golden=capture_golden,
+        )
+        with recorder:
+            attached = recorder.attach(pipeline)
+            print(f"Attached {attached} trace hooks for {model_name} ({workload})")
+            generator = torch.Generator(device=engine.device).manual_seed(seed)
+            prompt = torch.rand(
+                spec.batch_clips, spec.n_prompt_frames, 3, 360, 640,
+                device=engine.device, dtype=torch.float32, generator=generator,
+            )
+            actions = torch.zeros(spec.batch_clips, spec.num_frames, 25, device=engine.device)
+            params = OasisSamplingParams(num_frames=spec.num_frames, ddim_steps=spec.ddim_steps, seed=seed)
+            for _idx in range(n):
+                engine.generate(prompt, actions, params)
+            print(
+                f"Finished {key}/{workload}: wrote {recorder.events_written} events, "
+                f"captured {recorder.goldens_captured} input blobs"
+            )
+    finally:
+        del engine
+        gc.collect()
+        if torch.cuda.is_available():
+            torch.cuda.empty_cache()
+    return trace_path
+
+
+def trace_detection_model(
+    *,
+    model_name: str,
+    model_key: str | None,
+    tp: int,
+    dtype: str,
+    workload: str,
+    trace_dir: Path,
+    golden_dir: Path,
+    ops: set[str] | None = None,
+    seed: int = 42,
+    capture_golden: bool = True,
+    num_requests: int | None = None,
+    **_: Any,
+) -> Path:
+    if tp != 1:
+        raise ValueError(f"Detection tracing only supports tp=1, got tp={tp}")
+    from kb_nano.bench.utils.workloads import DETECTION_THROUGHPUT_WORKLOADS
+    from kb_nano.infra.detection_loader import load_ours_detector
+
+    by_name = {w.name: w for w in DETECTION_THROUGHPUT_WORKLOADS}
+    if workload not in by_name:
+        raise ValueError(f"Unsupported detection workload {workload!r}")
+    spec = by_name[workload]
+    n = num_requests if num_requests is not None else spec.num_images
+    key = model_key or _short_model_key(model_name)
+    trace_path = trace_dir / key / f"tp{tp}" / dtype / f"{workload}.jsonl"
+    print(f"Tracing {key}/{workload} with detection model: model={model_name}, dtype={dtype}")
+    device = "cuda" if torch.cuda.is_available() else "cpu"
+    model = load_ours_detector(model_name, device=device, dtype=_torch_dtype(dtype) or torch.bfloat16)
+    try:
+        recorder = InputTraceRecorder(
+            model=model_name, model_key=key, tp=tp, dtype=_dtype_name(dtype),
+            workload=workload, trace_path=trace_path, golden_dir=golden_dir,
+            ops=ops, capture_golden=capture_golden,
+        )
+        with recorder:
+            attached = recorder.attach(model)
+            print(f"Attached {attached} trace hooks for {model_name} ({workload})")
+            batch = torch.rand(spec.batch_size, 3, spec.image_size, spec.image_size, device=device, dtype=_torch_dtype(dtype) or torch.float16)
+            for _idx in range(max(1, (n + spec.batch_size - 1) // spec.batch_size)):
+                with torch.no_grad():
+                    model(batch)
+            print(
+                f"Finished {key}/{workload}: wrote {recorder.events_written} events, "
+                f"captured {recorder.goldens_captured} input blobs"
+            )
+    finally:
+        del model
+        gc.collect()
+        if torch.cuda.is_available():
+            torch.cuda.empty_cache()
+    return trace_path
+
+
+def trace_vlm_model(
+    *,
+    model_name: str,
+    model_key: str | None,
+    tp: int,
+    dtype: str,
+    workload: str,
+    prompts: list[str | list[int]] | None,
+    output_lens: list[int] | None,
+    trace_dir: Path,
+    golden_dir: Path,
+    ops: set[str] | None = None,
+    seed: int = 42,
+    capture_golden: bool = True,
+    num_requests: int | None = None,
+    decode_cap: int | None = None,
+) -> Path:
+    from kb_nano.bench.utils.workloads import VLM_THROUGHPUT_WORKLOADS
+    from kb_nano.infra.engine import LlamaEngine, SamplingParams
+
+    by_name = {w.name: w for w in VLM_THROUGHPUT_WORKLOADS}
+    if workload not in by_name:
+        raise ValueError(f"Unsupported VLM workload {workload!r}")
+    spec = by_name[workload]
+    key = model_key or _short_model_key(model_name)
+    trace_path = trace_dir / key / f"tp{tp}" / dtype / f"{workload}.jsonl"
+    print(f"Tracing {key}/{workload} with LlamaEngine VLM path: model={model_name}, dtype={dtype}")
+    engine = LlamaEngine(
+        model_name=model_name,
+        dtype=_torch_dtype(dtype),
+        seed=seed,
+        enforce_eager=True,
+        tensor_parallel_size=tp,
+    )
+    try:
+        recorder = InputTraceRecorder(
+            model=model_name, model_key=key, tp=tp, dtype=_dtype_name(dtype),
+            workload=workload, trace_path=trace_path, golden_dir=golden_dir,
+            ops=ops, capture_golden=capture_golden,
+        )
+        with recorder:
+            model = getattr(engine, "model", None)
+            if model is None:
+                model = engine.model_runner.model
+            attached = recorder.attach(model)
+            print(f"Attached {attached} trace hooks for {model_name} ({workload})")
+            if spec.modality == "text":
+                if prompts is None or output_lens is None:
+                    prompts, output_lens = _load_standard_workload(
+                        workload,
+                        engine.tokenizer,
+                        num_requests=num_requests,
+                        decode_cap=decode_cap,
+                        seed=seed,
+                    )
+                sp_list = [
+                    SamplingParams(temperature=0.0, max_tokens=out_len, ignore_eos=True)
+                    for out_len in output_lens
+                ]
+                engine.generate(prompts, sp_list if len(sp_list) > 1 else sp_list[0])
+            else:
+                from PIL import Image
+                from transformers import AutoProcessor
+                from kb_nano.tests import bench_vllm as bench_vllm_mod
+
+                ns: dict[str, Any] = {}
+                exec(bench_vllm_mod._MM_PRELOAD_FN, ns)
+                n = num_requests if num_requests is not None else spec.num_requests
+                processor = AutoProcessor.from_pretrained(model_name, trust_remote_code=True)
+                mm_data = ns["_preload_mm_data"](
+                    spec.dataset_name,
+                    spec.dataset_split,
+                    n,
+                    seed,
+                )
+                max_input_tokens = getattr(engine, "max_model_len", 32768) - spec.output_len
+                mm_data = ns["_filter_and_prepare"](mm_data, processor, max_input_tokens)
+                prompts_mm = [item["prompt"] for item in mm_data]
+                batch_images = [item["images"] if item["images"] is not None else None for item in mm_data]
+                batch_videos = []
+                for item in mm_data:
+                    if item["video_frames"] is None:
+                        batch_videos.append(None)
+                    else:
+                        frames_pil = [
+                            Image.fromarray(item["video_frames"][j]).convert("RGB")
+                            for j in range(item["video_frames"].shape[0])
+                        ]
+                        batch_videos.append([frames_pil])
+                out_len = min(spec.output_len, decode_cap) if decode_cap else spec.output_len
+                sp_list = [
+                    SamplingParams(temperature=0.0, max_tokens=out_len, ignore_eos=True)
+                    for _ in prompts_mm
+                ]
+                engine.generate(
+                    prompts_mm,
+                    sp_list if len(sp_list) > 1 else sp_list[0],
+                    images=batch_images,
+                    videos=batch_videos,
+                    use_tqdm=True,
+                )
+            print(
+                f"Finished {key}/{workload}: wrote {recorder.events_written} events, "
+                f"captured {recorder.goldens_captured} input blobs"
+            )
+    finally:
+        if hasattr(engine, "_cleanup"):
+            engine._cleanup()
+            try:
+                atexit.unregister(engine._cleanup)
+            except Exception:
+                pass
+        del engine
+        gc.collect()
+        if torch.cuda.is_available():
+            torch.cuda.empty_cache()
+    return trace_path
+
+
+def trace_model_job(
+    *,
+    model_name: str,
+    model_key: str | None,
+    tp: int,
+    dtype: str,
+    workload: str,
+    prompts: list[str | list[int]] | None,
+    output_lens: list[int] | None,
+    trace_dir: Path,
+    golden_dir: Path,
+    ops: set[str] | None = None,
+    seed: int = 42,
+    capture_golden: bool = True,
+    num_requests: int | None = None,
+    decode_cap: int | None = None,
+) -> Path:
+    family = _model_family(model_name, model_key)
+    common = dict(
+        model_name=model_name,
+        model_key=model_key,
+        tp=tp,
+        dtype=dtype,
+        workload=workload,
+        trace_dir=trace_dir,
+        golden_dir=golden_dir,
+        ops=ops,
+        seed=seed,
+        capture_golden=capture_golden,
+        num_requests=num_requests,
+        decode_cap=decode_cap,
+    )
+    if family == "fla":
+        return trace_fla_model(prompts=prompts, output_lens=output_lens, **common)
+    if family == "diffusion":
+        return trace_diffusion_model(**common)
+    if family == "embedding":
+        return trace_embedding_model(**common)
+    if family == "oasis":
+        return trace_oasis_model(**common)
+    if family == "detection":
+        return trace_detection_model(**common)
+    if family == "vlm":
+        return trace_vlm_model(prompts=prompts, output_lens=output_lens, **common)
+    if family == "structure":
+        raise NotImplementedError(
+            "OpenFold3 tracing needs a featurized OpenFold batch; route exists, "
+            "but scenario_pipeline does not yet have the OpenFold3 dataset "
+            "featurizer wired in-process."
+        )
+    return trace_llm_model(prompts=prompts, output_lens=output_lens, enforce_eager=True, **common)
+
+
 def _load_standard_workload(
     workload: str,
     tokenizer: Any,
@@ -450,17 +1177,35 @@ def _load_standard_workload(
     seed: int,
 ) -> tuple[list[list[int]], list[int]]:
     from kb_nano.bench.utils.real_prompts import load_real_prompt_workload
-    from kb_nano.bench.utils.workloads import THROUGHPUT_WORKLOADS
+    from kb_nano.bench.utils.workloads import THROUGHPUT_WORKLOADS, VLM_THROUGHPUT_WORKLOADS
 
     by_name = {w.name: w for w in THROUGHPUT_WORKLOADS}
     if workload not in by_name:
+        vlm_by_name = {w.name: w for w in VLM_THROUGHPUT_WORKLOADS}
+        if workload in vlm_by_name and vlm_by_name[workload].modality == "text":
+            spec = vlm_by_name[workload]
+            n = num_requests if num_requests is not None else spec.num_requests
+            output_len = min(spec.output_len, decode_cap) if decode_cap else spec.output_len
+            vocab_size = int(getattr(tokenizer, "vocab_size", 32000) or 32000)
+            generator = torch.Generator().manual_seed(seed)
+            prompts = [
+                torch.randint(
+                    low=0,
+                    high=max(vocab_size, 1),
+                    size=(int(spec.input_len or 512),),
+                    generator=generator,
+                    dtype=torch.long,
+                ).tolist()
+                for _ in range(n)
+            ]
+            return prompts, [output_len for _ in range(n)]
         available = ", ".join(sorted(by_name))
         raise ValueError(
             f"Workload {workload!r} does not provide prompts/output_lens and "
             f"is not a standardized throughput workload. Available: {available}"
         )
     spec = by_name[workload]
-    n = num_requests if num_requests is not None else min(spec.num_requests, 4)
+    n = num_requests if num_requests is not None else spec.num_requests
     samples = load_real_prompt_workload(
         spec.name,
         tokenizer,
@@ -521,14 +1266,178 @@ def _iter_model_jobs(config: dict[str, Any]) -> list[dict[str, Any]]:
     return jobs
 
 
+def _clean_trace_outputs(trace_dir: Path, output_dir: Path) -> None:
+    if trace_dir.exists():
+        print(f"Removing trace directory: {trace_dir}")
+        shutil.rmtree(trace_dir)
+    shape_registry = output_dir / "shape_registry.yaml"
+    if shape_registry.exists():
+        print(f"Removing shape registry: {shape_registry}")
+        shape_registry.unlink()
+    representative = trace_dir / "representative_workloads.jsonl"
+    if representative.exists():
+        print(f"Removing representative workloads: {representative}")
+        representative.unlink()
+
+
+def _visible_gpu_ids() -> list[str]:
+    visible = os.environ.get("CUDA_VISIBLE_DEVICES")
+    if visible:
+        return [item.strip() for item in visible.split(",") if item.strip()]
+    if not torch.cuda.is_available():
+        return []
+    return [str(i) for i in range(torch.cuda.device_count())]
+
+
+def _child_config_for_job(job: dict[str, Any]) -> dict[str, Any]:
+    return {
+        "models": [{
+            "key": job["model_key"],
+            "hf_name": job["model"],
+            "tp": job["tp"],
+            "dtype": job["dtype"],
+            "workloads": [{
+                "name": job["workload"],
+                "prompts": job["prompts"],
+                "output_lens": job["output_lens"],
+                "num_requests": job.get("num_requests"),
+                "decode_cap": job.get("decode_cap"),
+            }],
+        }]
+    }
+
+
+def _run_trace_jobs_parallel(
+    *,
+    jobs: list[dict[str, Any]],
+    trace_dir: Path,
+    golden_dir: Path,
+    seed: int,
+    no_golden: bool,
+    ops: list[str] | None,
+    gpu_ids: list[str],
+) -> None:
+    pending = list(jobs)
+    running: list[dict[str, Any]] = []
+    free_gpus = list(gpu_ids)
+    failures: list[tuple[dict[str, Any], int]] = []
+    next_port = int(os.environ.get("KB_NANO_TRACE_BASE_PORT", "29501"))
+
+    def launch(job: dict[str, Any], assigned_gpus: list[str] | None) -> None:
+        nonlocal next_port
+        with tempfile.NamedTemporaryFile("w", suffix=".yaml", delete=False) as f:
+            yaml.safe_dump(_child_config_for_job(job), f, sort_keys=False)
+            child_config = f.name
+        cmd = [
+            sys.executable, str(Path(__file__).resolve()), "trace-inputs",
+            "--config", child_config,
+            "--trace-dir", str(trace_dir),
+            "--golden-dir", str(golden_dir),
+            "--seed", str(seed),
+        ]
+        if no_golden:
+            cmd.append("--no-golden")
+        if ops:
+            cmd.append("--ops")
+            cmd.extend(ops)
+        env = dict(os.environ)
+        env["KB_NANO_TRACE_CHILD"] = "1"
+        # LlamaEngine reads this at import time. Give each concurrent child a
+        # separate rendezvous port so independent process groups do not collide.
+        env["KB_NANO_NCCL_PORT"] = str(next_port)
+        next_port += 1
+        if assigned_gpus is not None:
+            env["CUDA_VISIBLE_DEVICES"] = ",".join(assigned_gpus)
+        label = f"{job['model_key'] or _short_model_key(job['model'])}/{job['workload']}"
+        gpu_label = ",".join(assigned_gpus) if assigned_gpus is not None else "cpu/default"
+        print(f"Starting child trace job: {label} on GPU(s) {gpu_label}")
+        proc = subprocess.Popen(cmd, env=env)
+        running.append({
+            "job": job,
+            "proc": proc,
+            "config": child_config,
+            "gpus": assigned_gpus or [],
+            "label": label,
+        })
+
+    while pending or running:
+        made_progress = False
+        for job in list(pending):
+            required = max(1, int(job["tp"]))
+            if gpu_ids and required > len(gpu_ids):
+                raise SystemExit(
+                    f"Trace job {job['model_key'] or _short_model_key(job['model'])}/"
+                    f"{job['workload']} requires tp={required}, but only "
+                    f"{len(gpu_ids)} visible GPU(s) are available"
+                )
+            if gpu_ids and len(free_gpus) < required:
+                continue
+            if not gpu_ids and running:
+                continue
+            assigned = None
+            if gpu_ids:
+                assigned = free_gpus[:required]
+                del free_gpus[:required]
+            pending.remove(job)
+            launch(job, assigned)
+            made_progress = True
+
+        still_running: list[dict[str, Any]] = []
+        for item in running:
+            code = item["proc"].poll()
+            if code is None:
+                still_running.append(item)
+                continue
+            try:
+                os.unlink(item["config"])
+            except OSError:
+                pass
+            free_gpus.extend(item["gpus"])
+            if code != 0:
+                failures.append((item["job"], code))
+                print(f"Trace job failed: {item['label']} exited with {code}")
+            else:
+                print(f"Trace job completed: {item['label']}")
+            made_progress = True
+        running = still_running
+
+        if failures:
+            for item in running:
+                item["proc"].terminate()
+            for item in running:
+                try:
+                    item["proc"].wait(timeout=30)
+                except subprocess.TimeoutExpired:
+                    item["proc"].kill()
+            labels = ", ".join(
+                f"{job['model_key'] or _short_model_key(job['model'])}/{job['workload']}={code}"
+                for job, code in failures
+            )
+            raise SystemExit(f"One or more trace jobs failed: {labels}")
+
+        if not made_progress:
+            time.sleep(5)
+
+
 def trace_inputs_main() -> None:
     parser = argparse.ArgumentParser(description="Trace operator input metadata from real workloads")
     parser.add_argument("--config", type=str, required=True, help="YAML/JSON workload scenario file")
     parser.add_argument("--trace-dir", type=str, default=str(TRACE_DIR))
     parser.add_argument("--golden-dir", type=str, default=str(GOLDEN_DIR))
+    parser.add_argument(
+        "--output-dir",
+        type=str,
+        default=None,
+        help="Directory containing shape_registry.yaml; defaults to trace-dir parent",
+    )
     parser.add_argument("--ops", nargs="*", default=None, help="Optional operator-name allowlist")
     parser.add_argument("--seed", type=int, default=42)
     parser.add_argument("--no-golden", action="store_true", help="Do not capture first-seen data-dependent tensors")
+    parser.add_argument(
+        "--clean",
+        action="store_true",
+        help="Remove previous traces, representative workloads, and shape_registry.yaml before tracing",
+    )
     args = parser.parse_args()
 
     cfg = _load_config(Path(args.config))
@@ -545,57 +1454,45 @@ def trace_inputs_main() -> None:
 
     trace_dir = Path(args.trace_dir)
     golden_dir = Path(args.golden_dir)
+    output_dir = Path(args.output_dir) if args.output_dir else trace_dir.parent
     ops = set(args.ops) if args.ops else None
 
-    if len(jobs) > 1 and os.environ.get("KB_NANO_TRACE_CHILD") != "1":
-        for job in _progress(jobs, desc="Trace jobs", unit="job"):
-            child_cfg = {
-                "models": [{
-                    "key": job["model_key"],
-                    "hf_name": job["model"],
-                    "tp": job["tp"],
-                    "dtype": job["dtype"],
-                    "workloads": [{
-                        "name": job["workload"],
-                        "prompts": job["prompts"],
-                        "output_lens": job["output_lens"],
-                        "num_requests": job.get("num_requests"),
-                        "decode_cap": job.get("decode_cap"),
-                    }],
-                }]
-            }
-            with tempfile.NamedTemporaryFile("w", suffix=".yaml", delete=False) as f:
-                yaml.safe_dump(child_cfg, f, sort_keys=False)
-                child_config = f.name
-            cmd = [
-                sys.executable, str(Path(__file__).resolve()), "trace-inputs",
-                "--config", child_config,
-                "--trace-dir", str(trace_dir),
-                "--golden-dir", str(golden_dir),
-                "--seed", str(args.seed),
-            ]
-            if args.no_golden:
-                cmd.append("--no-golden")
-            if args.ops:
-                cmd.append("--ops")
-                cmd.extend(args.ops)
-            env = dict(os.environ)
-            env["KB_NANO_TRACE_CHILD"] = "1"
-            try:
-                print(
-                    f"Starting child trace job: "
-                    f"{job['model_key'] or _short_model_key(job['model'])}/{job['workload']}"
-                )
-                subprocess.run(cmd, check=True, env=env)
-            finally:
-                try:
-                    os.unlink(child_config)
-                except OSError:
-                    pass
+    if args.no_golden and "VLLM_DEEP_GEMM_WARMUP" not in os.environ:
+        os.environ["VLLM_DEEP_GEMM_WARMUP"] = "skip"
+        print("No-golden tracing: skipping DeepGEMM JIT warmup")
+
+    if args.clean and os.environ.get("KB_NANO_TRACE_CHILD") != "1":
+        _clean_trace_outputs(trace_dir, output_dir)
+
+    runnable_jobs = []
+    for job in jobs:
+        if _trace_exists(trace_dir, job):
+            print(f"Skipping existing trace: {_trace_path_for_job(trace_dir, job)}")
+            continue
+        runnable_jobs.append(job)
+    if not runnable_jobs:
+        print("All requested trace jobs already exist; nothing to trace.")
         return
 
-    for job in _progress(jobs, desc="Trace jobs", unit="job"):
-        out = trace_llm_model(
+    if len(runnable_jobs) > 1 and os.environ.get("KB_NANO_TRACE_CHILD") != "1":
+        gpu_ids = _visible_gpu_ids()
+        if gpu_ids:
+            print(f"Scheduling {len(runnable_jobs)} trace job(s) across visible GPU(s): {','.join(gpu_ids)}")
+        else:
+            print("No CUDA GPUs visible; running trace jobs serially")
+        _run_trace_jobs_parallel(
+            jobs=runnable_jobs,
+            trace_dir=trace_dir,
+            golden_dir=golden_dir,
+            seed=args.seed,
+            no_golden=args.no_golden,
+            ops=args.ops,
+            gpu_ids=gpu_ids,
+        )
+        return
+
+    for job in _progress(runnable_jobs, desc="Trace jobs", unit="job"):
+        out = trace_model_job(
             model_name=job["model"],
             model_key=job["model_key"],
             tp=job["tp"],
@@ -634,10 +1531,6 @@ def _read_events(trace_dir: Path) -> list[dict[str, Any]]:
                     continue
                 read_count += 1
                 event = json.loads(line)
-                if event.get("op") in DATA_DEPENDENT_OPS:
-                    golden_path = event.get("golden_path")
-                    if not golden_path or not (GOLDEN_DIR / golden_path).exists():
-                        continue
                 event["_trace_file"] = str(path)
                 events.append(event)
                 kept_count += 1
@@ -661,6 +1554,13 @@ def _tensor_specs(inputs: dict[str, Any]) -> dict[str, Any]:
             result[name] = meta.get("value")
         elif kind == "sequence" and "value" in meta:
             result[name] = meta["value"]
+    return result
+
+
+def _input_metadata(event: dict[str, Any]) -> dict[str, Any]:
+    result: dict[str, Any] = {}
+    if event.get("index_constraints"):
+        result["index_constraints"] = event["index_constraints"]
     return result
 
 
@@ -736,6 +1636,7 @@ def _flashinfer_workload(event: dict[str, Any], scenario_inputs: dict[str, Any])
     axes: dict[str, int] = {}
     workload_inputs: dict[str, Any] = {}
     golden_path = event.get("golden_path")
+    index_constraints = event.get("index_constraints") or {}
 
     for input_name, meta in event.get("inputs", {}).items():
         if not isinstance(meta, dict):
@@ -748,6 +1649,22 @@ def _flashinfer_workload(event: dict[str, Any], scenario_inputs: dict[str, Any])
                     "type": "safetensors",
                     "path": golden_path,
                     "tensor_key": input_name,
+                }
+            elif input_name in index_constraints:
+                constraint = index_constraints[input_name]
+                min_value = int(constraint.get("allowed_min", constraint.get("observed_min", 0)))
+                if "allowed_max_exclusive" in constraint:
+                    max_value = int(constraint["allowed_max_exclusive"]) - 1
+                elif "allowed_max_inclusive" in constraint:
+                    max_value = int(constraint["allowed_max_inclusive"])
+                else:
+                    max_value = int(constraint.get("observed_max", min_value))
+                workload_inputs[input_name] = {
+                    "type": "random_int",
+                    "min": min_value,
+                    "max": max(max_value, min_value),
+                    "dtype": meta.get("dtype"),
+                    "semantic": constraint.get("semantic", "index"),
                 }
             else:
                 workload_inputs[input_name] = {"type": "random"}
@@ -787,6 +1704,7 @@ def _flashinfer_workload(event: dict[str, Any], scenario_inputs: dict[str, Any])
             "observed_count": event.get("_observed_count", 1),
             "source_trace": event.get("_trace_file"),
             "signature": event.get("signature"),
+            "index_constraints": index_constraints,
         },
     }
 
@@ -964,14 +1882,15 @@ def _select_representatives(
     print(f"Deduplicating {len(events)} trace events by scenario signature...")
     for event in _progress(events, desc="Deduplicate events", unit="event"):
         sig = _scenario_signature(event)
+        observed_count = int(event.get("_observed_count", 1))
         if sig in by_signature:
-            by_signature[sig]["_observed_count"] += 1
+            by_signature[sig]["_observed_count"] += observed_count
             if not by_signature[sig].get("golden_path") and event.get("golden_path"):
                 by_signature[sig]["golden_path"] = event["golden_path"]
             continue
         item = dict(event)
         item["_scenario_signature"] = sig
-        item["_observed_count"] = 1
+        item["_observed_count"] = observed_count
         by_signature[sig] = item
     print(f"Found {len(by_signature)} unique scenario signatures")
 
@@ -1037,6 +1956,9 @@ def build_registry(
             "init_args": event.get("init_args", {}),
             "inputs": inputs,
         }
+        metadata = _input_metadata(event)
+        if metadata:
+            scenario["input_metadata"] = metadata
         if op in DATA_DEPENDENT_OPS and event.get("golden_path"):
             scenario["golden"] = event["golden_path"]
             scenario["golden_inputs"] = sorted(DATA_DEPENDENT_INPUTS.get(op, set()))

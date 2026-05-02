@@ -32,13 +32,12 @@ from __future__ import annotations
 import argparse
 import json
 import os
-import random
 import subprocess
 import sys
 from pathlib import Path
-from random import randint
 
 import numpy as np
+from transformers import AutoTokenizer
 
 
 def _detect_gpu_name() -> str:
@@ -62,20 +61,27 @@ _PROJECT_ROOT = _PACKAGE_DIR.parent
 sys.path.insert(0, str(_PROJECT_ROOT))
 
 from kb_nano.bench.utils.worker import run_worker
+from kb_nano.bench.utils.real_prompts import load_real_prompt_workload
+from kb_nano.bench.utils.workloads import LATENCY_WORKLOADS, THROUGHPUT_WORKLOADS
 from kb_nano.tests.bench_vllm import compute_alignment
 
 
-# Same scenario shapes as bench_vllm.py so the workloads are directly
-# comparable to the dense LLM bench.
 SCENARIOS = [
-    {"name": "prefill-heavy", "input_len": 1024, "output_len": 512},
-    {"name": "balanced",      "input_len": 512,  "output_len": 512},
-    {"name": "decode-heavy",  "input_len": 512,  "output_len": 1024},
+    {
+        "name": w.name,
+        "dataset": w.dataset_name,
+    }
+    for w in THROUGHPUT_WORKLOADS
 ]
 
 LATENCY_SCENARIOS = [
-    {"name": "single-request", "input_len": 128, "output_len": 128, "batch_size": 1},
-    {"name": "fixed-batch-32", "input_len": 128, "output_len": 128, "batch_size": 32},
+    {
+        "name": w.name,
+        "input_len": w.input_len,
+        "output_len": w.output_len,
+        "batch_size": w.batch_size,
+    }
+    for w in LATENCY_WORKLOADS
 ]
 
 
@@ -114,7 +120,7 @@ def _load_fla_model(model_name, device, dtype):
 
 
 def _batched_generate(model, tokenizer, prompts, max_tokens, eos, device,
-                      ignore_eos=True):
+                      ignore_eos=True, output_lens=None):
     """Pad-batch prompts and run a single .generate() call.
 
     Returns list[list[int]] of generated token ids (excluding the prompt).
@@ -155,7 +161,292 @@ def _batched_generate(model, tokenizer, prompts, max_tokens, eos, device,
         out = model.generate(input_ids=input_ids, attention_mask=attn, **gen_kwargs)
     # Strip the prompt prefix from each row
     gen = out[:, max_len:]
-    return [row.tolist() for row in gen]
+    rows = [row.tolist() for row in gen]
+    if output_lens is not None:
+        rows = [row[:ol] for row, ol in zip(rows, output_lens)]
+    return rows
+
+
+def _slice_cache(cache, row):
+    """Take one batch row from an FLA Cache."""
+    new_cache = cache.__class__(seen_tokens=cache.get_seq_length())
+    for layer_idx, layer in enumerate(cache.layers):
+        while len(new_cache.layers) <= layer_idx:
+            new_cache.layers.append(new_cache.layer_class_to_replicate())
+        state = getattr(layer, "state", None)
+        if state is None:
+            new_cache.layers[layer_idx].state = None
+            continue
+        sliced = {}
+        for key, value in state.items():
+            if value is None:
+                sliced[key] = None
+            elif hasattr(value, "narrow"):
+                sliced[key] = value.narrow(0, row, 1).contiguous()
+            elif isinstance(value, (tuple, list)):
+                sliced[key] = tuple(
+                    v.narrow(0, row, 1).contiguous() if hasattr(v, "narrow") else v
+                    for v in value
+                )
+            else:
+                sliced[key] = value
+        new_cache.layers[layer_idx].state = sliced
+        new_cache.layers[layer_idx]._seen_tokens = layer.get_seq_length()
+    return new_cache
+
+
+def _slice_cache_rows(cache, rows):
+    """Take multiple batch rows from an FLA Cache."""
+    import torch
+
+    device = None
+    for layer in cache.layers:
+        state = getattr(layer, "state", None)
+        if not state:
+            continue
+        for value in state.values():
+            if hasattr(value, "device"):
+                device = value.device
+                break
+            if isinstance(value, (tuple, list)):
+                for v in value:
+                    if hasattr(v, "device"):
+                        device = v.device
+                        break
+            if device is not None:
+                break
+        if device is not None:
+            break
+    row_ids = torch.tensor(rows, dtype=torch.long, device=device)
+    new_cache = cache.__class__(seen_tokens=cache.get_seq_length())
+    for layer_idx, layer in enumerate(cache.layers):
+        while len(new_cache.layers) <= layer_idx:
+            new_cache.layers.append(new_cache.layer_class_to_replicate())
+        state = getattr(layer, "state", None)
+        if state is None:
+            new_cache.layers[layer_idx].state = None
+            continue
+        sliced = {}
+        for key, value in state.items():
+            if value is None:
+                sliced[key] = None
+            elif hasattr(value, "index_select"):
+                sliced[key] = value.index_select(0, row_ids).contiguous()
+            elif isinstance(value, (tuple, list)):
+                sliced[key] = tuple(
+                    v.index_select(0, row_ids).contiguous()
+                    if hasattr(v, "index_select") else v
+                    for v in value
+                )
+            else:
+                sliced[key] = value
+        new_cache.layers[layer_idx].state = sliced
+        new_cache.layers[layer_idx]._seen_tokens = layer.get_seq_length()
+    return new_cache
+
+
+def _concat_cache_batches(cache_batches):
+    """Concatenate already-batched FLA Caches along batch dimension."""
+    import torch
+
+    cache_batches = [c for c in cache_batches if c is not None]
+    if len(cache_batches) == 1:
+        return cache_batches[0]
+
+    first = cache_batches[0]
+    new_cache = first.__class__(seen_tokens=first.get_seq_length())
+    for layer_idx in range(len(first.layers)):
+        while len(new_cache.layers) <= layer_idx:
+            new_cache.layers.append(new_cache.layer_class_to_replicate())
+        first_state = getattr(first.layers[layer_idx], "state", None)
+        if first_state is None:
+            new_cache.layers[layer_idx].state = None
+            continue
+        merged = {}
+        for key, value in first_state.items():
+            if value is None:
+                merged[key] = None
+            elif hasattr(value, "narrow"):
+                merged[key] = torch.cat([
+                    c.layers[layer_idx].state[key] for c in cache_batches
+                ], dim=0)
+            elif isinstance(value, (tuple, list)):
+                merged[key] = tuple(
+                    torch.cat([
+                        c.layers[layer_idx].state[key][i]
+                        for c in cache_batches
+                    ], dim=0)
+                    for i in range(len(value))
+                )
+            else:
+                merged[key] = value
+        new_cache.layers[layer_idx].state = merged
+        new_cache.layers[layer_idx]._seen_tokens = first.layers[layer_idx].get_seq_length()
+    return new_cache
+
+
+def _gather_cache(caches):
+    """Concatenate per-request FLA Caches into a batched Cache."""
+    import torch
+
+    first = caches[0]
+    new_cache = first.__class__(seen_tokens=first.get_seq_length())
+    for layer_idx in range(len(first.layers)):
+        while len(new_cache.layers) <= layer_idx:
+            new_cache.layers.append(new_cache.layer_class_to_replicate())
+        first_state = getattr(first.layers[layer_idx], "state", None)
+        if first_state is None:
+            new_cache.layers[layer_idx].state = None
+            continue
+        gathered = {}
+        for key, value in first_state.items():
+            if value is None:
+                gathered[key] = None
+            elif hasattr(value, "narrow"):
+                gathered[key] = torch.cat([
+                    c.layers[layer_idx].state[key] for c in caches
+                ], dim=0)
+            elif isinstance(value, (tuple, list)):
+                gathered[key] = tuple(
+                    torch.cat([
+                        c.layers[layer_idx].state[key][i] for c in caches
+                    ], dim=0)
+                    for i in range(len(value))
+                )
+            else:
+                gathered[key] = value
+        new_cache.layers[layer_idx].state = gathered
+        new_cache.layers[layer_idx]._seen_tokens = first.layers[layer_idx].get_seq_length()
+    return new_cache
+
+
+def _continuous_generate(model, tokenizer, prompts, output_lens, eos, device,
+                         bs_cap, max_prefill_tokens=196608,
+                         ignore_eos=True):
+    """Reference generation with prompt-length prefill bucketing and
+    continuous decode. Output lengths are used only as stopping limits,
+    never to form batches.
+    """
+    import torch
+
+    pad_id = tokenizer.pad_token_id if tokenizer.pad_token_id is not None else (
+        eos if eos is not None else 0
+    )
+    if tokenizer.pad_token_id is None:
+        tokenizer.pad_token_id = pad_id
+
+    n = len(prompts)
+    generated = [[] for _ in range(n)]
+
+    # Prefill order uses only prompt length, which is known after tokenization.
+    order = sorted(range(n), key=lambda i: len(prompts[i]))
+    wait_pos = 0
+    active = []
+    active_cache = None
+
+    def _prefill_one_batch(slot_budget):
+        nonlocal wait_pos
+        if wait_pos >= n or slot_budget <= 0:
+            return [], None
+        group = []
+        max_len = 0
+        idx = wait_pos
+        while idx < n and len(group) < slot_budget:
+            request_idx = order[idx]
+            next_max = max(max_len, len(prompts[request_idx]))
+            if group and next_max * (len(group) + 1) > max_prefill_tokens:
+                break
+            group.append(request_idx)
+            max_len = next_max
+            idx += 1
+        max_len = max(len(prompts[i]) for i in group)
+        input_ids = torch.full(
+            (len(group), max_len), pad_id, dtype=torch.long, device=device,
+        )
+        attn = torch.zeros(
+            (len(group), max_len), dtype=torch.long, device=device,
+        )
+        for row, request_idx in enumerate(group):
+            prompt = prompts[request_idx]
+            input_ids[row, max_len - len(prompt):] = torch.tensor(
+                prompt, dtype=torch.long, device=device,
+            )
+            attn[row, max_len - len(prompt):] = 1
+        out = model(
+            input_ids=input_ids,
+            attention_mask=attn,
+            use_cache=True,
+            return_dict=True,
+            logits_to_keep=1,
+        )
+        first_tokens = out.logits[:, -1, :].argmax(dim=-1).tolist()
+        keep = []
+        keep_rows = []
+        for row, request_idx in enumerate(group):
+            tok = first_tokens[row]
+            generated[request_idx].append(tok)
+            if len(generated[request_idx]) >= output_lens[request_idx]:
+                continue
+            if not ignore_eos and eos is not None and tok == eos:
+                continue
+            keep.append(request_idx)
+            keep_rows.append(row)
+        wait_pos = idx
+        if not keep:
+            return [], None
+        if len(keep) == len(group):
+            return keep, out.past_key_values
+        return keep, _slice_cache_rows(out.past_key_values, keep_rows)
+
+    def _admit():
+        nonlocal active, active_cache
+        while wait_pos < n and len(active) < bs_cap:
+            new_active, new_cache = _prefill_one_batch(bs_cap - len(active))
+            if not new_active:
+                continue
+            if active_cache is None:
+                active = new_active
+                active_cache = new_cache
+            else:
+                active_cache = _concat_cache_batches([active_cache, new_cache])
+                active.extend(new_active)
+
+    with torch.inference_mode():
+        _admit()
+        while active:
+            input_ids = torch.tensor(
+                [[generated[i][-1]] for i in active],
+                dtype=torch.long, device=device,
+            )
+            out = model(
+                input_ids=input_ids,
+                past_key_values=active_cache,
+                use_cache=True,
+                return_dict=True,
+                logits_to_keep=1,
+            )
+            toks = out.logits[:, -1, :].argmax(dim=-1).tolist()
+            survivors = []
+            survivor_rows = []
+            for row, request_idx in enumerate(active):
+                tok = toks[row]
+                generated[request_idx].append(tok)
+                if len(generated[request_idx]) >= output_lens[request_idx]:
+                    continue
+                if not ignore_eos and eos is not None and tok == eos:
+                    continue
+                survivors.append(request_idx)
+                survivor_rows.append(row)
+            if len(survivors) == len(active):
+                active_cache = out.past_key_values
+            elif survivors:
+                active_cache = _slice_cache_rows(out.past_key_values, survivor_rows)
+            else:
+                active_cache = None
+            active = survivors
+            _admit()
+
+    return generated
 
 
 def main():
@@ -168,6 +459,7 @@ def main():
     device = "cuda"
     dtype = torch.bfloat16
     model_name = cfg["model"]
+    max_model_len = cfg.get("max_model_len")
 
     print(f"  [FLA reference] loading {model_name}...", flush=True)
     model = _load_fla_model(model_name, device, dtype)
@@ -186,25 +478,35 @@ def main():
         prompts = sc["prompt_token_ids"]
         out_lens = sc["output_lens"]
         max_out = max(out_lens) if out_lens else cfg.get("default_output_len", 128)
+        print(
+            f"  [FLA reference] throughput {sc['name']}: "
+            f"{len(prompts)} requests, avg_out={sum(out_lens) / max(len(out_lens), 1):.1f}",
+            flush=True,
+        )
 
         # Process in micro-batches of `max_num_seqs` so peak memory is the
         # same as kb-nano's continuous-batching ceiling. HF's .generate
         # has no continuous-batching, so this is the apples-to-apples way
         # to keep both engines at the same concurrency.
-        bs_cap = cfg.get("max_num_seqs", 256)
+        bs_cap = cfg.get("ref_max_num_seqs", cfg.get("max_num_seqs", 512))
         torch.cuda.synchronize()
         t0 = time.perf_counter()
-        gen_tokens = []
-        for off in range(0, len(prompts), bs_cap):
-            sub = prompts[off:off + bs_cap]
-            gen_tokens.extend(_batched_generate(
-                model, tokenizer, sub, max_out, eos, device, ignore_eos=True,
-            ))
+        gen_tokens = _continuous_generate(
+            model, tokenizer, prompts, out_lens, eos, device, bs_cap,
+            max_prefill_tokens=cfg.get("max_prefill_tokens", 196608),
+            ignore_eos=True,
+        )
         torch.cuda.synchronize()
         elapsed = time.perf_counter() - t0
 
         total_in = sum(len(p) for p in prompts)
         total_out = sum(len(g) for g in gen_tokens)
+        tps = total_out / elapsed if elapsed else 0.0
+        print(
+            f"  [FLA reference] throughput {sc['name']} done: "
+            f"{elapsed:.2f}s, {tps:,.0f} tok/s",
+            flush=True,
+        )
         all_results.append({
             "name": sc["name"],
             "elapsed": elapsed,
@@ -220,21 +522,48 @@ def main():
     latency_results = []
     for ls in cfg.get("latency_scenarios", []):
         prompts = ls["prompt_token_ids"]
-        out_len = ls["output_len"]
+        out_lens = ls.get("output_lens")
+        out_len = max(out_lens) if out_lens else ls["output_len"]
+        print(
+            f"  [FLA reference] latency {ls['name']}: "
+            f"bs={len(prompts)}, max_out={out_len}",
+            flush=True,
+        )
         num_warmup = ls.get("num_warmup", 3)
         num_iters = ls.get("num_iters", 5)
         for _ in range(num_warmup):
-            _batched_generate(model, tokenizer, prompts, out_len, eos, device,
-                              ignore_eos=True)
+            if out_lens is None:
+                _batched_generate(model, tokenizer, prompts, out_len, eos, device,
+                                  ignore_eos=True)
+            else:
+                _continuous_generate(
+                    model, tokenizer, prompts, out_lens, eos, device,
+                    len(prompts),
+                    max_prefill_tokens=cfg.get("max_prefill_tokens", 196608),
+                    ignore_eos=True,
+                )
         torch.cuda.synchronize()
         latencies = []
         for _ in range(num_iters):
             torch.cuda.synchronize()
             t0 = time.perf_counter()
-            _batched_generate(model, tokenizer, prompts, out_len, eos, device,
-                              ignore_eos=True)
+            if out_lens is None:
+                _batched_generate(model, tokenizer, prompts, out_len, eos, device,
+                                  ignore_eos=True)
+            else:
+                _continuous_generate(
+                    model, tokenizer, prompts, out_lens, eos, device,
+                    len(prompts),
+                    max_prefill_tokens=cfg.get("max_prefill_tokens", 196608),
+                    ignore_eos=True,
+                )
             torch.cuda.synchronize()
             latencies.append(time.perf_counter() - t0)
+        print(
+            f"  [FLA reference] latency {ls['name']} done: "
+            f"median={sorted(latencies)[len(latencies)//2]:.4f}s",
+            flush=True,
+        )
         latency_results.append({
             "name": ls["name"],
             "batch_size": ls["batch_size"],
@@ -277,8 +606,9 @@ def main():
     engine = FLAEngine(
         model_name=cfg["model"],
         seed=cfg["seed"],
-        max_num_seqs=cfg.get("max_num_seqs", 256),
+        max_num_seqs=cfg.get("max_num_seqs", 512),
         chunked_prefill_size=cfg.get("chunked_prefill_size", 256),
+        max_prefill_tokens=cfg.get("max_prefill_tokens", 196608),
     )
 
     # Warmup
@@ -326,8 +656,15 @@ def main():
     latency_results = []
     for ls in cfg.get("latency_scenarios", []):
         prompts = ls["prompt_token_ids"]
-        sp = SamplingParams(temperature=0.0, ignore_eos=True,
-                            max_tokens=ls["output_len"])
+        output_lens = ls.get("output_lens")
+        if output_lens is None:
+            sp = SamplingParams(temperature=0.0, ignore_eos=True,
+                                max_tokens=ls["output_len"])
+        else:
+            sp = [
+                SamplingParams(temperature=0.0, ignore_eos=True, max_tokens=ol)
+                for ol in output_lens
+            ]
         num_warmup = ls.get("num_warmup", 3)
         num_iters = ls.get("num_iters", 5)
         for _ in range(num_warmup):
@@ -368,6 +705,39 @@ SUPPORTED_MODELS = {
 }
 
 
+def _model_max_position_embeddings(model_name: str) -> int | None:
+    try:
+        from huggingface_hub import hf_hub_download
+
+        config_path = hf_hub_download(model_name, "config.json")
+        with open(config_path) as f:
+            config = json.load(f)
+    except Exception:
+        return None
+    value = config.get("max_position_embeddings")
+    try:
+        return int(value) if value is not None else None
+    except (TypeError, ValueError):
+        return None
+
+
+def _fit_prompt_to_context(
+    prompt_token_ids: list[int],
+    output_len: int,
+    max_model_len: int | None,
+) -> tuple[list[int], int]:
+    if max_model_len is None:
+        return prompt_token_ids, output_len
+    if max_model_len < 2:
+        raise SystemExit(f"Model max context is too small: {max_model_len}")
+
+    output_len = min(output_len, max_model_len - 1)
+    prompt_budget = max_model_len - output_len
+    if len(prompt_token_ids) > prompt_budget:
+        prompt_token_ids = prompt_token_ids[-prompt_budget:]
+    return prompt_token_ids, output_len
+
+
 def main():
     parser = argparse.ArgumentParser(
         description="Throughput & alignment benchmark: kb-nano FLAEngine vs FLA reference",
@@ -376,12 +746,17 @@ def main():
     parser.add_argument("--num-seqs", type=int, default=1000)
     parser.add_argument("--seed", type=int, default=42)
     parser.add_argument("--temperature", type=float, default=0.0)
-    parser.add_argument("--max-num-seqs", type=int, default=256,
+    parser.add_argument("--max-num-seqs", type=int, default=512,
                         help="Max concurrent sequences in FLAEngine "
                              "(default tuned for the bench_vllm.py workload)")
+    parser.add_argument("--ref-max-num-seqs", type=int, default=512,
+                        help="Max active sequences for the FLA reference "
+                             "continuous batching scheduler.")
     parser.add_argument("--chunked-prefill-size", type=int, default=1024,
                         help="Per-chunk prefill size (rounded up to a multiple "
                              "of 64). Default tuned for the bench_vllm.py workload.")
+    parser.add_argument("--max-prefill-tokens", type=int, default=196608,
+                        help="Max tokens per batched prefill forward.")
     parser.add_argument("--skip-fla", action="store_true",
                         help="Skip the FLA reference (kb-nano only)")
     parser.add_argument("--skip-throughput", action="store_true")
@@ -413,44 +788,61 @@ def main():
         if not throughput_scenarios:
             raise SystemExit(f"--scenario={args.scenario!r} did not match any scenario")
 
-    # Pre-generate all prompts so both engines see identical inputs.
+    # Pre-tokenize all prompts so both engines see identical chat-templated
+    # WildChat inputs and response-derived decode budgets.
     scenario_data = []
+    tokenizer = AutoTokenizer.from_pretrained(args.model, trust_remote_code=True)
+    max_model_len = _model_max_position_embeddings(args.model)
     if not args.skip_throughput:
         for i, sc in enumerate(throughput_scenarios):
-            rng = args.seed + i
-            random.seed(rng)
-            np.random.seed(rng)
-            input_len = sc["input_len"]
-            output_len = sc["output_len"]
-            prompt_token_ids = [
-                [randint(0, 10000) for _ in range(input_len)]
-                for _ in range(args.num_seqs)
+            samples = load_real_prompt_workload(
+                sc["name"],
+                tokenizer,
+                num_requests=args.num_seqs,
+                decode_cap=None,
+                dataset_name=sc["dataset"],
+                seed=args.seed + i,
+            )
+            fitted = [
+                _fit_prompt_to_context(
+                    s.prompt_token_ids, s.output_len, max_model_len,
+                )
+                for s in samples
             ]
+            prompt_token_ids = [p for p, _ in fitted]
+            output_lens = [ol for _, ol in fitted]
             scenario_data.append({
                 "name": sc["name"],
-                "input_len": input_len,
-                "output_len": output_len,
                 "prompt_token_ids": prompt_token_ids,
-                "output_lens": [output_len] * args.num_seqs,
+                "output_lens": output_lens,
             })
 
     latency_data = []
     if not args.skip_latency:
         for j, ls in enumerate(latency_scenarios):
-            rng = args.seed + 100 + j
-            random.seed(rng)
-            np.random.seed(rng)
             bs = ls["batch_size"]
-            prompt_token_ids = [
-                [randint(0, 10000) for _ in range(ls["input_len"])]
-                for _ in range(bs)
+            samples = load_real_prompt_workload(
+                "balanced",
+                tokenizer,
+                num_requests=bs,
+                decode_cap=None,
+                seed=args.seed + 100 + j,
+            )
+            fitted = [
+                _fit_prompt_to_context(
+                    s.prompt_token_ids, s.output_len, max_model_len,
+                )
+                for s in samples
             ]
+            prompt_token_ids = [p for p, _ in fitted]
+            output_lens = [ol for _, ol in fitted]
             latency_data.append({
                 "name": ls["name"],
                 "input_len": ls["input_len"],
                 "output_len": ls["output_len"],
                 "batch_size": bs,
                 "prompt_token_ids": prompt_token_ids,
+                "output_lens": output_lens,
                 "num_warmup": 2,
                 "num_iters": args.latency_iters,
             })
@@ -461,7 +853,11 @@ def main():
     print(f"  Model            : {args.model}")
     print(f"  Seqs/scenario    : {args.num_seqs}")
     print(f"  max_num_seqs     : {args.max_num_seqs}")
+    print(f"  ref max seqs     : {args.ref_max_num_seqs}")
     print(f"  chunk size       : {args.chunked_prefill_size}")
+    print(f"  prefill tokens   : {args.max_prefill_tokens}")
+    if max_model_len is not None:
+        print(f"  Max model len    : {max_model_len}")
     print(f"  Temperature      : {args.temperature}")
     print(f"  GPU              : {gpu}")
     print(f"  Seed             : {args.seed}")
@@ -479,6 +875,8 @@ def main():
         "model": args.model,
         "seed": args.seed,
         "temperature": args.temperature,
+        "max_model_len": max_model_len,
+        "max_prefill_tokens": args.max_prefill_tokens,
         "scenarios": scenario_data,
         "latency_scenarios": latency_data,
     }
@@ -487,6 +885,7 @@ def main():
     if not args.skip_fla:
         fla_cfg = dict(base_cfg)
         fla_cfg["max_num_seqs"] = args.max_num_seqs
+        fla_cfg["ref_max_num_seqs"] = args.ref_max_num_seqs
         fla_raw = run_worker(
             FLA_REF_WORKER, fla_cfg,
             f"FLA reference [{short_name}] all scenarios",
@@ -522,13 +921,17 @@ def main():
             kb_tps = kb_d["total_output_tokens"] / kb_d["elapsed"]
             r = {
                 "scenario": sc["name"],
-                "input_len": sc["input_len"],
-                "output_len": sc["output_len"],
                 "num_seqs": args.num_seqs,
                 "kb_nano_elapsed": kb_d["elapsed"],
                 "kb_nano_output_tokens": kb_d["total_output_tokens"],
                 "kb_nano_tok_per_s": kb_tps,
             }
+            if "input_len" in sc:
+                r["input_len"] = sc["input_len"]
+            if "output_len" in sc:
+                r["output_len"] = sc["output_len"]
+            elif args.num_seqs:
+                r["avg_output_len"] = kb_d["total_output_tokens"] / args.num_seqs
             if fla_thr is not None:
                 f_d = fla_thr[i]
                 f_tps = f_d["total_output_tokens"] / f_d["elapsed"]
@@ -567,8 +970,14 @@ def main():
             avg = align.get("avg_matching_tokens_per_request", 0)
             tot = align.get("avg_output_len", 0)
             match_str = f"{avg:.1f}/{tot:.0f}" if tot > 0 else "N/A"
+            in_str = f"{r['input_len']:>5}" if "input_len" in r else f"{'var':>5}"
+            out_str = (
+                f"{r['output_len']:>5}"
+                if "output_len" in r
+                else f"{r.get('avg_output_len', 0):>5.0f}"
+            )
             print(
-                f"  {r['scenario']:<16} {r['input_len']:>5} {r['output_len']:>5} "
+                f"  {r['scenario']:<16} {in_str} {out_str} "
                 f"{kb_str:>15} {f_str:>12} {spd_str:>9} {match_str:>18}"
             )
         print("=" * 100)
@@ -642,7 +1051,9 @@ def main():
                 "temperature": args.temperature,
                 "num_seqs": args.num_seqs,
                 "max_num_seqs": args.max_num_seqs,
+                "ref_max_num_seqs": args.ref_max_num_seqs,
                 "chunked_prefill_size": args.chunked_prefill_size,
+                "max_prefill_tokens": args.max_prefill_tokens,
                 "scenarios": all_results,
                 "latency_scenarios": latency_combined,
             }, f, indent=2)

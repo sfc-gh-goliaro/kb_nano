@@ -419,11 +419,11 @@ class Fp8Linear(nn.Module):
         if not torch.compiler.is_compiling():
             if self._a_buf is not None and M <= self._a_buf.shape[0]:
                 q_input = self._a_buf[:M]
-                input_scale = self._s_buf[:M]
+                input_scale = _alloc_colmajor_scale(M, num_groups, input_2d.device)
                 output = self._o_buf[:M]
             elif self._pf is not None and M <= self._pf.a.shape[0]:
                 q_input = self._pf.a[:M]
-                input_scale = self._pf.s[:M]
+                input_scale = _alloc_colmajor_scale(M, num_groups, input_2d.device)
                 output = self._pf.o[:M]
             else:
                 q_input = torch.empty(M, K, dtype=torch.float8_e4m3fn, device=input_2d.device)
