@@ -42,6 +42,7 @@ from ..L3.bitnet_decoder import BitNetDecoderLayer
 
 @dataclass
 class BitNetConfig:
+    model_type: str = "bitnet"
     hidden_size: int = 2560
     intermediate_size: int = 6912
     num_hidden_layers: int = 30
@@ -90,6 +91,7 @@ class BitNetModel(nn.Module):
         self.embed_tokens = VocabParallelEmbedding(config.vocab_size, config.hidden_size)
         self.rotary_emb = RotaryEmbedding(
             config.head_dim, config.max_position_embeddings, config.rope_theta,
+            is_neox_style=False,
         )
         self.layers = nn.ModuleList([
             BitNetDecoderLayer(config, rotary_emb=self.rotary_emb)

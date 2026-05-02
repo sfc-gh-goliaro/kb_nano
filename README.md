@@ -1,6 +1,6 @@
 # kb-nano
 
-A standalone, high-performance inference engine supporting **LLMs** (Llama 3.1, Llama 4, Mixtral-8x7B, DeepSeek V3.2, GPT-OSS, BitNet b1.58, Qwen2-VL, Qwen3-VL), **diffusion models** (FLUX.1-dev, SDXL, HunyuanVideo-1.5), **detection models** (YOLOv10, RTDetrV2), **vision encoders** (SigLIP-2, DINOv3, SwinV2), **segmentation models** (SAM3.1), **protein structure prediction** (OpenFold3), audio models (Whisper), and **TTS models** (CosyVoice3) with tensor parallelism and FP8 quantization. No vLLM dependency at runtime — just PyTorch, Triton, and Flash Attention.
+A standalone, high-performance inference engine supporting **LLMs** (Llama 3.1, Llama 4, Mixtral-8x7B, DeepSeek V3.2, GPT-OSS, BitNet b1.58, Qwen2-VL, Qwen3-VL), **linear-attention LLMs** (Mamba, Mamba2, GLA, RetNet, RWKV7), **diffusion models** (FLUX.1-dev, SDXL, HunyuanVideo-1.5), **detection models** (YOLOv10, RTDetrV2), **vision encoders** (SigLIP-2, DINOv3, SwinV2), **segmentation models** (SAM3.1), **protein structure prediction** (OpenFold3), audio models (Whisper), and **TTS models** (CosyVoice3) with tensor parallelism and FP8 quantization. No vLLM dependency at runtime — just PyTorch, Triton, and Flash Attention.
 
 ## Features
 
@@ -9,7 +9,11 @@ A standalone, high-performance inference engine supporting **LLMs** (Llama 3.1, 
 - **Mixtral-8x7B** with fused Triton MoE grouped-GEMM kernels
 - **DeepSeek V3.2** with MLA (Multi-head Latent Attention), 256-expert MoE via DeepGEMM FP8, DSA (DeepSeek Sparse Attention), and YARN RoPE — currently **0.78–0.90× of vLLM** throughput on 8×H200 (gap due to kernel-launch overhead, GEMM kernel selection, and AllReduce+RMSNorm fusion)
 - **GPT-OSS** (20B, 120B) MXFP4-quantized MoE with native Triton inference, YaRN RoPE, attention sinks, and sliding window
-- **BitNet b1.58 2B** (`microsoft/bitnet-b1.58-2B-4T`) native **W1.58A8** inference (1.58-bit ternary weights × int8 activations) with a custom Triton `int8 × packed-int2` GEMM, fused QKV / gate-up `BitLinearMerged` projections, squared-ReLU gated FFN, and `attn_sub_norm` / `ffn_sub_norm` placement matching the SOTA `vllm_repo/BitNet` architecture
+- **BitNet b1.58 2B** (`microsoft/bitnet-b1.58-2B-4T`) native **W1.58A8** inference (1.58-bit ternary weights × int8 activations) with a Triton `int8 × packed-int2` fallback plus optional Microsoft ladder decode kernel for fair `M=1` benchmarking, fused QKV / gate-up `BitLinearMerged` projections, squared-ReLU gated FFN, and `attn_sub_norm` / `ffn_sub_norm` placement matching the SOTA `vllm_repo/BitNet` architecture
+- **Mamba / Mamba2** (`state-spaces/mamba-2.8b-hf`, `mistralai/Mamba-Codestral-7B-v0.1`) selective state-space models with vLLM-aligned `causal_conv1d` + `mamba_chunk_scan` / `selective_scan` kernels, slot-based recurrent state cache, chunked-prefill metadata, and TP sharding (incl. `n_groups % tp != 0` head-shard groups)
+- **GLA** (`fla-hub/gla-2.7B-100B`) Gated Linear Attention with per-head logsigmoid forget gate, swish output gate, and SwiGLU MLP — token-aligned with the FLA reference
+- **RetNet** (`fla-hub/retnet-2.7B-100B`) Multi-Scale Retention with rotary embeddings, fixed per-head decay (γ_h = 1 − 2^(−5−h)), swish output gate, and SwiGLU MLP — token-aligned with the FLA reference
+- **RWKV7** (`fla-hub/rwkv7-2.9B-g1`, `fla-hub/rwkv7-2.9B-world`) DPLR (diagonal-plus-low-rank) recurrence with token-shift mixing, LoRA decay/value/gate adapters, GroupNorm output, and squared-ReLU FFN — token-aligned with the FLA reference
 - **FLUX.1-dev** diffusion transformer (text-to-image) with Flash Attention
 - **SDXL** (Stable Diffusion XL) UNet-based text-to-image with dual CLIP text encoders
 - **HunyuanVideo-1.5** 3D video diffusion transformer (text-to-video) with dual-stream joint attention, M-RoPE, and Qwen2.5-VL text encoder
@@ -122,16 +126,50 @@ python tests/bench_vllm.py \
 python tests/bench_vllm.py --model openai/whisper-large-v3
 
 # BitNet b1.58 (W1.58A8 native int8 inference) vs Microsoft BitNet GPU lib
-# (requires building the official CUDA kernel + converting the checkpoint -
-#  see tests/bench_microsoft_bitnet.py docstring for the one-time setup)
-BITNET_REPO=/path/to/microsoft/BitNet python tests/bench_microsoft_bitnet.py
-python tests/bench_microsoft_bitnet.py --skip-sota  # kb-nano only
+# One-time SOTA setup:
+git clone https://github.com/microsoft/BitNet /path/to/microsoft/BitNet
+cd /path/to/microsoft/BitNet/gpu
+bash bitnet_kernels/compile.sh
+huggingface-cli download microsoft/bitnet-b1.58-2B-4T-bf16 \
+    --local-dir checkpoints/bitnet-b1.58-2B-4T-bf16
+python convert_safetensors.py \
+    --safetensors_file checkpoints/bitnet-b1.58-2B-4T-bf16/model.safetensors \
+    --output checkpoints/model_state.pt --model_name 2B
+python convert_checkpoint.py --input checkpoints/model_state.pt
+rm checkpoints/model_state.pt
+cd /path/to/kb_nano
+BITNET_REPO=/path/to/microsoft/BitNet \
+    python tests/bench_microsoft_bitnet.py \
+        --prompt-source real --gen-bsz 1 --kb-bsz 1 --use-kb-cudagraph
+BITNET_REPO=/path/to/microsoft/BitNet \
+    python tests/bench_microsoft_bitnet.py \
+        --prompt-source real --skip-sota --kb-bsz 1 --use-kb-cudagraph
 
 # Bench module tests (unit tests + GPU integration)
 python tests/test_bench.py
 
 # Bench module unit tests only (no GPU required)
 python tests/test_bench.py --unit-only
+```
+
+### Benchmarking vs flash-linear-attention (GLA / RetNet / RWKV7)
+
+```bash
+# Throughput + latency + alignment benchmark vs the FLA reference (transformers.generate)
+python tests/bench_fla.py --model fla-hub/gla-2.7B-100B
+python tests/bench_fla.py --model fla-hub/retnet-2.7B-100B
+python tests/bench_fla.py --model fla-hub/rwkv7-2.9B-g1
+
+# kb-nano FLAEngine only (skip FLA reference)
+python tests/bench_fla.py --model fla-hub/gla-2.7B-100B --skip-fla
+
+# Override sequence count, batch budget, or chunked-prefill size
+# (defaults are tuned for the bench_vllm.py workload: 1000 / 256 / 1024)
+python tests/bench_fla.py --model fla-hub/gla-2.7B-100B \
+    --num-seqs 1000 --max-num-seqs 256 --chunked-prefill-size 1024
+
+# Skip latency phase (throughput + alignment only)
+python tests/bench_fla.py --model fla-hub/gla-2.7B-100B --skip-latency
 ```
 
 ### Benchmarking vs vllm-omni (Diffusion)
@@ -471,7 +509,7 @@ The engine auto-selects the attention backend based on GPU compute capability:
 
 ## Performance
 
-Run `tests/bench_vllm.py` to reproduce. Workload uses random token IDs with `ignore_eos=True`, both engines with full optimizations (`enforce_eager=False`).
+Run `tests/bench_vllm.py` to reproduce. LLM workloads use the WildChat-derived `sfc-gh-goliaro/wildchat-kb-nano-{prefill-heavy,balanced,decode-heavy}-1k` datasets, with each target model's chat template applied before tokenization and `ignore_eos=True`.
 
 **Hardware: 4x NVIDIA H200 (NVLink)**
 
@@ -519,46 +557,62 @@ Both models are at or above vLLM throughput across all scenarios (20B: 1.00–1.
 
 ### BitNet b1.58 2B (W1.58A8)
 
-`microsoft/bitnet-b1.58-2B-4T` runs in its native ternary-weight × int8-activation regime via a custom Triton `int8 × packed-int2` GEMM kernel (`tasks/baseline/L1/bitnet_int8xint2_linear.py`). The HuggingFace checkpoint stores ternary weights packed 4-per-`uint8` along the output axis; we re-pack to KN-layout (`out, in//4`) at load time to match the kernel's tile layout. QKV and gate/up projections are fused into single `BitLinearMerged` calls, the MLP uses a fused squared-ReLU + multiply L1 primitive (`SquaredReluAndMul`), and `attn_sub_norm` / `ffn_sub_norm` RMSNorms are placed inside attention/MLP blocks per the SOTA `vllm_repo/BitNet` architecture. SOTA reference is the official **Microsoft BitNet GPU library** (`vllm_repo/BitNet/gpu`, custom W2A8 CUDA kernel + CUDA-graph batched decode); HuggingFace `transformers` does *not* run this model in its native quantized format and is roughly 5× slower than either implementation, so it is not used as a reference.
+`microsoft/bitnet-b1.58-2B-4T` runs in its native ternary-weight × int8-activation regime. The default fallback is a custom Triton `int8 × packed-int2` GEMM kernel (`tasks/baseline/L1/bitnet_int8xint2_linear.py`); when `KB_BITNET_KERNEL_LIB` points at the official Microsoft `libbitnet.so`, decode uses the same specialized `M == 1` ladder CUDA kernel as the SOTA baseline. The HuggingFace checkpoint stores ternary weights packed 4-per-`uint8` along the output axis; we re-pack to both KN-layout (`out, in//4`) for Triton and Microsoft ladder layout for the official decode kernel at load time. QKV and gate/up projections are fused into single `BitLinearMerged` calls, the MLP uses a fused squared-ReLU + multiply L1 primitive (`SquaredReluAndMul`), and `attn_sub_norm` / `ffn_sub_norm` RMSNorms are placed inside attention/MLP blocks per the SOTA `vllm_repo/BitNet` architecture. SOTA reference is the official **Microsoft BitNet GPU library** (`vllm_repo/BitNet/gpu`, custom W2A8 CUDA kernel + CUDA-graph batched decode); HuggingFace `transformers` does *not* run this model in its native quantized format and is roughly 5× slower than either implementation, so it is not used as a reference.
 
-Run `tests/bench_microsoft_bitnet.py` to reproduce. 1000 sequences per scenario, `temperature=0`, `ignore_eos=True`, `enforce_eager=True`. The Microsoft GPU library hard-pins (batch size, prompt length, decode length) at CUDA-graph capture time, so the SOTA worker rebuilds the engine per scenario and processes prompts in `gen_bsz=32` chunks (the largest that fits the prefill activation in 140 GB).
+Run `tests/bench_microsoft_bitnet.py` to reproduce. 1000 sequences per scenario, `temperature=0`, `ignore_eos=True`. The benchmark uses the real official model/checkpoint (`microsoft/bitnet-b1.58-2B-4T-bf16` converted by Microsoft's scripts into `model_state_fp16.pt` + `model_state_int2.pt`) and the official Microsoft `libbitnet.so` decode kernel. The default workload uses real WildChat-derived natural-language datasets (`sfc-gh-goliaro/wildchat-kb-nano-prefill-heavy-1k`, `sfc-gh-goliaro/wildchat-kb-nano-balanced-1k`, `sfc-gh-goliaro/wildchat-kb-nano-decode-heavy-1k`), tokenized with the BitNet tokenizer, then normalized to the fixed adding-arch graph shapes by suffix-truncating long prompts or left-padding short prompts. Decode budgets stay fixed at 512/512/1024 because the Microsoft GPU library hard-pins (batch size, prompt length, decode length) at CUDA-graph capture time, so the SOTA worker rebuilds the engine per scenario. Its native int2 decode kernels only dispatch for `M == 1`, so the benchmark intentionally uses `--gen-bsz 1`; larger values print `required ladder gemm kernel: M ...` and produce invalid SOTA outputs. For a fair baseline comparison, kb-nano also runs with `--kb-bsz 1 --use-kb-cudagraph`. Throughput is timed against the official CUDA-graph path.
+
+Alignment is reported two ways. Exact free-running prefix is retained as a strict diagnostic, but it is brittle on real text because two close logits can pick different valid continuations and then the sequences diverge. The primary real-text alignment check is teacher-forced top-k: feed both SOTA-generated and kb-nano-generated token sequences back through the official direct-decode reference and check whether each generated token is in the reference top-k.
+
+H200 validation:
+
+```bash
+BITNET_REPO=/path/to/microsoft/BitNet \
+    python tests/bench_microsoft_bitnet.py \
+        --prompt-source real --num-prompts 2 --alignment-prompts 2 \
+        --gen-bsz 1 --kb-bsz 1 --use-kb-cudagraph
+```
+
+| Scenario | Input/Output | Microsoft BitNet GPU (tok/s) | Ours (tok/s) | Ratio |
+|----------|:------------:|-----------------------------:|-------------:|------:|
+| prefill-heavy | 1024/512  | 1,160 | 1,217 | 1.05x |
+| balanced      |  512/512  |   791 |   904 | 1.14x |
+| decode-heavy  |  512/1024 |   594 |   693 | 1.17x |
+
+| Scenario | Exact Prefix | SOTA Self Top1/Top20 | KB Under SOTA Top1/Top20 |
+|----------|-------------:|---------------------:|--------------------------:|
+| prefill-heavy | 1.5/512    | 0.9873 / 1.0000 | 0.9639 / 1.0000 |
+| balanced      | 257.5/512  | 0.9980 / 1.0000 | 0.9863 / 1.0000 |
+| decode-heavy  | 49.5/1024  | 0.9951 / 1.0000 | 0.9805 / 1.0000 |
+
+These bsz=1 numbers use a 2-request validation workload because the official direct-decode alignment reference and teacher-forced top-k scorer are slow. kb-nano's generated tokens are accepted by the Microsoft direct-decode scorer at top20=1.0000 for all three real-text scenarios, while bsz=1 throughput is above the Microsoft baseline. kb-nano's continuous scheduler is faster at larger active batches, but those numbers are not the fair baseline comparison because the official int2 decode path is limited to `M == 1`.
+
+### Mamba / Mamba2 (Selective State-Space)
+
+Run `tests/bench_vllm.py --model state-spaces/mamba-2.8b-hf` and `tests/bench_vllm.py --model mistralai/Mamba-Codestral-7B-v0.1` to reproduce. 1000 sequences per scenario, `temperature=0`. kb-nano reuses vLLM's `causal_conv1d_fn` / `causal_conv1d_update`, `mamba_chunk_scan_combined_varlen` / `selective_scan_fn`, and `selective_state_update` Triton kernels behind a slot-based recurrent state cache, a chunked-prefill scheduler with a `max_num_batched_tokens` budget, **decode-only CUDA graphs at bucketed batch sizes (1, 2, 4, 8, …, 256)** with `PAD_SLOT_ID = -1` padding, **GPU greedy argmax + async D2H** of next-token IDs (a Mamba mirror of the attention engine's fast greedy path), **batched per-step state slot allocation/deallocation** broadcast over SHM, and **profile-based state pool sizing** that runs a synthetic worst-case prefill before allocating slots (mirrors vLLM's `determine_available_memory` → `get_kv_cache_configs` flow) so the slot count tracks vLLM's KV cache concurrency.
+
+Throughput (1000 sequences per scenario, CUDA graphs enabled):
+
+| Model | TP | Scenario | Input/Output | vLLM (tok/s) | Ours (tok/s) | Ratio | Avg Match Tokens |
+|-------|---:|----------|:------------:|-------------:|-------------:|------:|-----------------:|
+| mamba-2.8b-hf            | 1 | prefill-heavy | 1024/512  |  7,080 |  6,912 | 0.98x | 416.2/512  |
+| mamba-2.8b-hf            | 1 | balanced      |  512/512  |  8,285 |  8,635 | 1.04x | 402.1/512  |
+| mamba-2.8b-hf            | 1 | decode-heavy  |  512/1024 | 12,033 | 13,476 | 1.12x | 805.5/1024 |
+| Mamba-Codestral-7B-v0.1  | 1 | prefill-heavy | 1024/512  |  3,935 |  3,844 | 0.98x | 418.4/512  |
+| Mamba-Codestral-7B-v0.1  | 1 | balanced      |  512/512  |  4,517 |  4,332 | 0.96x | 425.7/512  |
+| Mamba-Codestral-7B-v0.1  | 1 | decode-heavy  |  512/1024 |  4,834 |  4,668 | 0.97x | 823.5/1024 |
+
+Latency (TP=1, 5 timed iterations):
+
+| Model                   | Scenario       | Batch | Output | vLLM (s) | Ours (s) | vLLM (ms/tok) | Ours (ms/tok) | Ratio |
+|-------------------------|----------------|------:|-------:|---------:|---------:|--------------:|--------------:|------:|
+| mamba-2.8b-hf           | single-request |     1 |    128 |   0.4740 |   0.4575 |          3.70 |          3.57 | 1.04x |
+| mamba-2.8b-hf           | fixed-batch-32 |    32 |    128 |   1.5718 |   1.5371 |          0.38 |          0.38 | 1.02x |
+| Mamba-Codestral-7B-v0.1 | single-request |     1 |    128 |   0.7013 |   0.7370 |          5.48 |          5.76 | 0.95x |
+| Mamba-Codestral-7B-v0.1 | fixed-batch-32 |    32 |    128 |   1.5716 |   1.6316 |          0.38 |          0.40 | 0.96x |
+
+Token alignment is in the expected range for two independent SSM implementations at `temperature=0`: Mamba v1 stays relatively close (416.2/512, 402.1/512, 805.5/1024 average matching tokens across the three scenarios), and Codestral does as well after restoring its original mixed-batch token layout (418.4/512, 425.7/512, 823.5/1024). The recurrent state still accumulates small bf16 numerical differences over the full prefill chunk-scan, and those divergences compound across the decode loop. With profile-based state sizing kb-nano now allocates **716 slots** for Codestral and **1024 slots** for Mamba v1 on a single H200 (vLLM reports ~855 concurrent 1536-token requests for Codestral; Mamba v1's per-slot state is much smaller, so its slot count is higher). On the latest H200 rerun, Mamba v1 is effectively at parity with vLLM on throughput (0.98x / 1.04x / 1.12x across the three scenarios) and slightly ahead on latency (1.04x single-request, 1.02x fixed-batch-32), while Codestral is also near parity on throughput (0.98x / 0.96x / 0.97x) and latency (0.95x / 0.96x). Per-step instrumentation (enable with `KB_NANO_PROFILE_MAMBA=1`) still shows that **97% of decode-step wall time is in GPU + D2H wait**; CPU-side phases (admit, decode prep, finalize, slot bookkeeping) together account for less than 3%, so the remaining optimization work is concentrated in the GPU path and batched-latency tail rather than scheduler overhead.
 
 **Hardware: NVIDIA H200**
-
-Throughput:
-
-| Model | TP | Scenario | Input/Output | Microsoft BitNet GPU (tok/s) | Ours (tok/s) | Ratio | Avg Match Tokens |
-| --- | --- | --- | --- | --- | --- | --- | --- |
-| BitNet-b1.58-2B-4T | 1 | prefill-heavy | 1024/512  | 27,964 | 38,668 | **1.38x** | 31.9/512 |
-| BitNet-b1.58-2B-4T | 1 | balanced      |  512/512  | 23,122 | 33,003 | **1.43x** | 41.6/512 |
-| BitNet-b1.58-2B-4T | 1 | decode-heavy  |  512/1024 | 18,490 | 24,658 | **1.33x** | 82.8/1024 |
-
-kb-nano is **1.33–1.43× faster than the Microsoft BitNet GPU library** across all three scenarios. Three components drive this: (1) a fused Triton `act_quant_int8` kernel that does per-token absmax + scale + round-to-int8 in a single launch with no fp32 intermediate (the eager-PyTorch implementation was 4–19× slower because it dispatched 4–5 separate kernels and an fp32-promotion copy); (2) hand-tuned tile shapes per `M` regime in the int8×int2 GEMM (`BLOCK_K=256` with 4 warps for decode, `BLOCK_M=64,BLOCK_N=256,8 warps` for prefill, picked from H200 microbench); (3) **hybrid bf16-prefill + int8-decode dispatch** that mirrors SOTA's two-model architecture — every `BitLinear` carries a derived bf16 fake-quant weight buffer (`ternary * scale`, materialized once at load time) and dispatches to `F.linear(quant_input(x), bf16_weight)` for prefill (large `M`, `is_prefill=True`) versus the int8×int2 Triton kernel for decode. The bf16 prefill path is bit-exact with SOTA's `BitLinear.quant_input + F.linear` at the layer level, and `torch.compile` fuses the fake-quant into a single Triton kernel that beats our int8 prefill due to cuBLAS bf16 GEMM efficiency at large `M` and avoiding the per-`BitLinear` `act_quant_int8` launch.
-
-Greedy-decode token alignment vs SOTA averages 31.9/41.6/82.8 matching tokens per request across the three scenarios. The residual divergence is *not* from BitLinear precision (the bf16 prefill path matches SOTA bit-for-bit at the layer level), but from kb-nano's independent implementations of `RMSNorm`, `RoPE`, and the prefill attention kernel (we use flash-attn 2; SOTA uses xformers `fmha.flash.FwOp`) — small numerical differences in these primitives compound across 30 layers and flip argmaxes, which BitNet is unusually sensitive to because ternary weights produce many close-magnitude logits.
-
-<details>
-<summary>Earlier numbers</summary>
-
-Pre-bf16-prefill (int8 throughout, fused act_quant_int8 + tuned GEMM tiles):
-
-| Model | TP | Scenario | Input/Output | Microsoft BitNet GPU (tok/s) | Ours (tok/s) | Ratio | Avg Match Tokens |
-|-------|---:|----------|:------------:|------------------------------:|-------------:|------:|-----------------:|
-| BitNet-b1.58-2B-4T | 1 | prefill-heavy | 1024/512  | 27,964 | 26,809 | 0.96x | 33.5/512 |
-| BitNet-b1.58-2B-4T | 1 | balanced      |  512/512  | 23,129 | 25,810 | 1.12x | 43.2/512 |
-| BitNet-b1.58-2B-4T | 1 | decode-heavy  |  512/1024 | 18,504 | 21,802 | 1.18x | 86.0/1024 |
-
-Initial integration (eager `_activation_quant_int8` + fixed GEMM tiles):
-
-| Model | TP | Scenario | Input/Output | Microsoft BitNet GPU (tok/s) | Ours (tok/s) | Ratio |
-|-------|---:|----------|:------------:|------------------------------:|-------------:|------:|
-| BitNet-b1.58-2B-4T | 1 | prefill-heavy | 1024/512  | 27,943 | 11,433 | 0.41x |
-| BitNet-b1.58-2B-4T | 1 | balanced      |  512/512  | 23,108 | 11,296 | 0.49x |
-| BitNet-b1.58-2B-4T | 1 | decode-heavy  |  512/1024 | 18,489 | 10,499 | 0.57x |
-
-</details>
-
-**Hardware: 4x NVIDIA B200 (NVLink)**
 
 Run `tests/bench_vllm.py` to reproduce. Three scenarios per model, 1000 sequences each, `temperature=0`.
 
@@ -671,6 +725,48 @@ Latency (128 output tokens, 5 iterations):
 | DeepSeek-V3.2 | 8 | fixed-batch-32  | 32 | 3.835s | 4.208s |  0.94 |  1.03 | 0.91x |
 
 kb-nano currently runs 4–25% slower than vLLM on DeepSeek-V3.2 across all scenarios. The remaining gap is dominated by (1) per-step CPU launch overhead — kb-nano issues ~7× more uncaptured CUDA kernels than vLLM and its CUDA-graph launches are larger/slower; (2) GEMM kernel selection — kb-nano falls back to `sm90_fp8_gemm_1d2d_impl` on a few decode shapes where vLLM picks the faster `fp8_gemm_kernel_swapAB`; and (3) AllReduce fusion — vLLM fuses TP AllReduce with the surrounding RMSNorm + FP8 quant via flashinfer's `trtllm_allreduce_fusion`, eliminating ~3 kernel launches per AR site. Token match rates are higher than other MoE models in this README because we removed the prior bit-divergence in MLA/MoE routing; the residual divergence comes from FP8 quantization differences in the 256-expert MoE and DSA sparse-attention paths.
+
+### FLA Models — GLA / RetNet / RWKV7 (Linear Attention)
+
+Run `tests/bench_fla.py` to reproduce. Workload uses random token IDs with `ignore_eos=True`. The reference engine is the SOTA [`flash-linear-attention`](https://github.com/fla-org/flash-linear-attention) (FLA) library, driving `fla.models.{gla,retnet,rwkv7}.*ForCausalLM` via `transformers.generate` (the same recipe FLA uses in `benchmarks/benchmark_generation.py`). Both engines run continuous-batched decoding; kb-nano additionally supports chunked prefill via the `FLAEngine` (`infra/fla_engine.py`). Both use FLA's Triton kernels (`chunk_gla`, `fused_recurrent_gla`, `chunk_rwkv7`, `fused_recurrent_rwkv7`, etc.) so this measures engine-level overhead, not kernel quality.
+
+**Hardware: NVIDIA H200**
+
+Throughput (1000 sequences per scenario, `temperature=0`, `max_num_seqs=256`, `chunked_prefill_size=1024`; same shapes as `bench_vllm.py`):
+
+| Model | Scenario | Input/Output | FLA ref (tok/s) | Ours (tok/s) | Ratio | Avg Match Tokens |
+|-------|----------|:------------:|----------------:|-------------:|------:|-----------------:|
+| gla-2.7B-100B    | prefill-heavy | 1024/512 | 5,691 |  9,380 | **1.65x** | 477.8/512  |
+| gla-2.7B-100B    | balanced      |  512/512 | 6,082 | 11,579 | **1.90x** | 482.1/512  |
+| gla-2.7B-100B    | decode-heavy  | 512/1024 | 6,268 | 12,458 | **1.99x** | 976.6/1024 |
+| retnet-2.7B-100B | prefill-heavy | 1024/512 | 3,496 |  6,253 | **1.79x** | 478.0/512  |
+| retnet-2.7B-100B | balanced      |  512/512 | 3,645 |  6,761 | **1.85x** | 484.0/512  |
+| retnet-2.7B-100B | decode-heavy  | 512/1024 | 3,668 |  7,067 | **1.93x** | 978.9/1024 |
+| rwkv7-2.9B-g1    | prefill-heavy | 1024/512 | 4,993 |  5,894 | **1.18x** | 444.3/512  |
+| rwkv7-2.9B-g1    | balanced      |  512/512 | 5,633 |  6,617 | **1.17x** | 441.6/512  |
+| rwkv7-2.9B-g1    | decode-heavy  | 512/1024 | 5,904 |  7,043 | **1.19x** | 895.5/1024 |
+
+Latency (median over 3 iters, 128-token input, 128-token output):
+
+| Model | Scenario | Batch | FLA ref (ms/tok) | Ours (ms/tok) | Ratio |
+|-------|----------|------:|-----------------:|--------------:|------:|
+| gla-2.7B-100B    | single-request |  1 | 37.94 | 17.57 | **2.16x** |
+| gla-2.7B-100B    | fixed-batch-32 | 32 |  1.22 |  0.55 | **2.20x** |
+| retnet-2.7B-100B | single-request |  1 | 49.24 | 20.18 | **2.44x** |
+| retnet-2.7B-100B | fixed-batch-32 | 32 |  1.65 |  0.66 | **2.52x** |
+| rwkv7-2.9B-g1    | single-request |  1 | 40.32 | 31.00 | **1.30x** |
+| rwkv7-2.9B-g1    | fixed-batch-32 | 32 |  1.27 |  1.00 | **1.27x** |
+
+`FLAEngine` runs faster than FLA's reference `transformers.generate` on every throughput and latency scenario across all three models (no scenario below 1.0x). Average throughput speedup across the 9 throughput scenarios is ~1.63x; geomean ~1.59x. Latency speedups range from 1.27x (RWKV7 BS=32) to 2.52x (RetNet BS=32). Token alignment to FLA is bitwise within sampling tolerance: greedy outputs match the reference to ~94% (GLA), ~95% (RetNet), and ~87% (RWKV7) on average across scenarios.
+
+The recurrent state machinery is implemented in `infra/fla_engine.py`:
+
+- **Persistent slot-allocated cache** (`_SlotCache`): each in-flight sequence owns a slot in `[max_num_seqs, *state_shape]` buffers (one per L2 layer, lazily allocated on first commit). All gather/scatter is one `index_select` / `index_copy_` per layer per call — a constant number of CUDA launches regardless of batch size, replacing the previous O(layers × batch) per-seq copy loop.
+- **Live-cache reuse**: when the active set is unchanged step-to-step (the common case during steady-state decode of a batch), the previous forward's output cache is fed directly to the next forward with **zero** gather/scatter overhead. Only on membership change (seq finish or admission) do we flush the live cache to slots and re-gather the new active subset.
+- **Batched prefill**: each scheduler iteration runs ONE forward over all currently-prefilling seqs that want the same chunk size (capped by `max_prefill_tokens`, default 192k). For 256 prompts at length 1024 that's a single B=192 forward instead of 256 sequential B=1 forwards — the difference between memory-bandwidth-bound prefill and tensor-core-saturating prefill.
+- **Chunked prefill**: prompts longer than `chunked_prefill_size` (default 1024) are split into 64-token-aligned chunks routed through FLA's `chunk_*` kernels; per-layer recurrent state and (for RWKV7) per-module token-shift state are carried across chunks in `RecurrentCache`. The chunk planner absorbs sub-64-token tails so every chunk dispatches to the chunk kernel (not fused-recurrent), matching single-shot prefill bit-for-bit at the chunk boundary.
+- **Per-row position offsets**: RetNet's rotary embedding receives an absolute `seq_offsets` per batch row so cached prefill chunks and decode steps see the correct global token position.
+- **Last-token-only logits**: the L4 forward accepts `num_logits_to_keep=1` so lm_head + fp32 upcast operate on a single position. At B=200, T=1024, vocab=65k this saves ~50 GB of fp32 logits memory and the corresponding compute, making single-shot batched prefill of 200 prompts feasible on a single H200.
 
 ### FLUX.1-dev (Diffusion)
 

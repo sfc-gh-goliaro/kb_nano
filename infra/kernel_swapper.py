@@ -42,12 +42,17 @@ _CANDIDATE_DIR = CANDIDATE_DIR
 
 _L4_MODEL_KEYS: dict[str, str] = {
     "bitnet": "bitnet",
+    "gla": "gla",
     "gpt_oss": "gpt_oss",
     "llama": "llama31",
     "llama4": "llama4",
+    "mamba": "mamba",
+    "mamba2": "mamba2",
     "mixtral": "mixtral",
     "qwen2_vl": "qwen2_vl",
     "qwen3_vl": "qwen3_vl",
+    "retnet": "retnet",
+    "rwkv7": "rwkv7",
     "flux": "flux",
     "sam3": "sam3",
     "cosyvoice3": "cosyvoice3",

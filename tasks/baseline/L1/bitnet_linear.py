@@ -21,8 +21,10 @@ The on-disk HuggingFace checkpoint stores ``weight`` as ``(out//4, in)``
 uint8 packed along OUT (a 2-bit interleave per byte) and ``weight_scale``
 as a single bf16 scalar.  The ``weight_loader`` callbacks below unpack the
 HF format and re-pack into the simpler KN-major layout once at load time;
-all forward-pass arithmetic happens in native int8 / int2 with bf16 scale
-folding -- no bf16 master weights, no ``F.linear`` fallback.
+decode arithmetic happens in native int8 / int2 with bf16 scale folding.
+For prefill, each module also materializes the SOTA-equivalent bf16 fake-
+quant weight so large-M calls can use cuBLAS ``F.linear`` like Microsoft's
+official split prefill/decode implementation.
 """
 
 from __future__ import annotations
@@ -35,8 +37,11 @@ import torch.nn.functional as F
 
 from .bitnet_int8xint2_linear import (
     VALUES_PER_BYTE,
+    bitnet_int8xint2_linear_official,
     bitnet_int8xint2_linear,
+    bitnet_official_kernel_available,
     hf_packed_to_kn_packed,
+    pack_ternary_sota_ladder,
     unpack_kn_to_ternary,
 )
 
@@ -95,6 +100,13 @@ def _broadcast_scale_(slice_: torch.Tensor, loaded: torch.Tensor) -> None:
     (uniform for non-merged ``BitLinear``; per-shard for the merged form).
     """
     slice_.fill_(float(loaded.detach().to(torch.float32).flatten()[0]))
+
+
+def _set_buffer(module: nn.Module, name: str, value: torch.Tensor) -> None:
+    if name in module._buffers:
+        module._buffers[name] = value
+    else:
+        module.register_buffer(name, value, persistent=False)
 
 
 class BitLinear(nn.Module):
@@ -175,6 +187,25 @@ class BitLinear(nn.Module):
         ternary = unpack_kn_to_ternary(self.weight.data)
         bf16 = ternary.to(out_dtype) * self.weight_scale.data.unsqueeze(1)
         self.register_buffer("bf16_weight", bf16.contiguous(), persistent=False)
+        self.set_official_decode_buffers(ternary=ternary)
+
+    def set_official_decode_buffers(
+        self,
+        ternary: torch.Tensor | None = None,
+        scale_values: Sequence[torch.Tensor] | None = None,
+    ) -> None:
+        if not bitnet_official_kernel_available():
+            return
+        if ternary is None:
+            ternary = unpack_kn_to_ternary(self.weight.data)
+        if scale_values is None:
+            scale_values = [self.weight_scale.data.flatten()[0]]
+        scale = torch.zeros(4, dtype=self.weight_scale.dtype,
+                            device=self.weight_scale.device)
+        scale[0] = scale_values[0]
+        _set_buffer(self, "official_weight",
+                    pack_ternary_sota_ladder(ternary).contiguous())
+        _set_buffer(self, "official_weight_scale", scale.contiguous())
 
     # -- forward -----------------------------------------------------------
     def forward(self, x: torch.Tensor) -> torch.Tensor:
@@ -183,6 +214,12 @@ class BitLinear(nn.Module):
             M *= d
         if _bitnet_use_bf16_path(M) and getattr(self, "bf16_weight", None) is not None:
             return F.linear(_fake_quant_act_bf16(x), self.bf16_weight, self.bias)
+        official_weight = getattr(self, "official_weight", None)
+        official_scale = getattr(self, "official_weight_scale", None)
+        if M == 1 and self.bias is None and official_weight is not None:
+            return bitnet_int8xint2_linear_official(
+                x, official_weight, official_scale,
+            )
         return bitnet_int8xint2_linear(x, self.weight, self.weight_scale, self.bias)
 
 
@@ -309,6 +346,35 @@ class BitLinearMerged(nn.Module):
         ternary = unpack_kn_to_ternary(self.weight.data)
         bf16 = ternary.to(out_dtype) * self.weight_scale.data.unsqueeze(1)
         self.register_buffer("bf16_weight", bf16.contiguous(), persistent=False)
+        scale_values = [
+            self.weight_scale.data[self.shard_offsets[i]]
+            for i in range(len(self.out_sizes))
+        ]
+        self.set_official_decode_buffers(
+            ternary=ternary, scale_values=scale_values,
+        )
+
+    def set_official_decode_buffers(
+        self,
+        ternary: torch.Tensor | None = None,
+        scale_values: Sequence[torch.Tensor] | None = None,
+    ) -> None:
+        if not bitnet_official_kernel_available():
+            return
+        if ternary is None:
+            ternary = unpack_kn_to_ternary(self.weight.data)
+        if scale_values is None:
+            scale_values = [
+                self.weight_scale.data[self.shard_offsets[i]]
+                for i in range(len(self.out_sizes))
+            ]
+        scale = torch.zeros(4, dtype=self.weight_scale.dtype,
+                            device=self.weight_scale.device)
+        for i, value in enumerate(scale_values[:4]):
+            scale[i] = value
+        _set_buffer(self, "official_weight",
+                    pack_ternary_sota_ladder(ternary).contiguous())
+        _set_buffer(self, "official_weight_scale", scale.contiguous())
 
     # -- forward -----------------------------------------------------------
     def forward(self, x: torch.Tensor) -> torch.Tensor:
@@ -317,4 +383,10 @@ class BitLinearMerged(nn.Module):
             M *= d
         if _bitnet_use_bf16_path(M) and getattr(self, "bf16_weight", None) is not None:
             return F.linear(_fake_quant_act_bf16(x), self.bf16_weight, self.bias)
+        official_weight = getattr(self, "official_weight", None)
+        official_scale = getattr(self, "official_weight_scale", None)
+        if M == 1 and self.bias is None and official_weight is not None:
+            return bitnet_int8xint2_linear_official(
+                x, official_weight, official_scale,
+            )
         return bitnet_int8xint2_linear(x, self.weight, self.weight_scale, self.bias)

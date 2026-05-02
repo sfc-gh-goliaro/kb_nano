@@ -31,6 +31,10 @@ the per-shard scaling is encoded by the ``(N,)`` ``weight_scale`` array.
 
 from __future__ import annotations
 
+import ctypes
+import os
+
+import numpy as np
 import torch
 import torch.nn as nn
 import triton
@@ -142,7 +146,11 @@ def _bitnet_int8xint2_gemm_kernel(
     a_scale = tl.load(A_scale_ptr + offs_m, mask=m_mask, other=1.0).to(tl.float32)
     ws = tl.load(Ws_ptr + offs_n, mask=n_mask, other=0.0).to(tl.float32)
 
-    out_f = acc.to(tl.float32) * ws[None, :] / a_scale[:, None]
+    # Match Microsoft BitNet's CUDA kernel order exactly:
+    # ``(float)acc / (float)act_scale * (float)weight_scale``.
+    # Reordering this as ``acc * weight_scale / act_scale`` changes fp32
+    # rounding enough to flip close greedy logits on BitNet.
+    out_f = (acc.to(tl.float32) / a_scale[:, None]) * ws[None, :]
 
     if HAS_BIAS:
         bias = tl.load(Bias_ptr + offs_n, mask=n_mask, other=0.0).to(tl.float32)
@@ -243,6 +251,138 @@ def _activation_quant_int8(x: torch.Tensor) -> tuple[torch.Tensor, torch.Tensor]
     s_out = torch.empty(M, dtype=torch.bfloat16, device=x.device)
     torch.ops.kb_nano_bitnet_q.act_quant_int8(x, q_out, s_out)
     return q_out, s_out
+
+
+# ---------------------------------------------------------------------------
+# Optional Microsoft ladder decode kernel (M == 1).
+# ---------------------------------------------------------------------------
+
+_OFFICIAL_LIB = None
+_OFFICIAL_LIB_PATH = None
+_OFFICIAL_LIB_FAILED = False
+
+
+def _get_official_bitnet_lib():
+    global _OFFICIAL_LIB, _OFFICIAL_LIB_PATH, _OFFICIAL_LIB_FAILED
+    path = os.environ.get("KB_BITNET_KERNEL_LIB")
+    if not path:
+        return None
+    if _OFFICIAL_LIB is not None and _OFFICIAL_LIB_PATH == path:
+        return _OFFICIAL_LIB
+    if _OFFICIAL_LIB_FAILED:
+        return None
+    if not os.path.isfile(path):
+        _OFFICIAL_LIB_FAILED = True
+        return None
+    try:
+        lib = ctypes.CDLL(path)
+        fn = lib.bitlinear_int8xint2
+        fn.argtypes = [
+            ctypes.c_void_p, ctypes.c_void_p, ctypes.c_void_p,
+            ctypes.c_void_p, ctypes.c_void_p,
+            ctypes.c_int, ctypes.c_int, ctypes.c_int, ctypes.c_void_p,
+        ]
+        fn.restype = None
+    except Exception:
+        _OFFICIAL_LIB_FAILED = True
+        return None
+    _OFFICIAL_LIB = lib
+    _OFFICIAL_LIB_PATH = path
+    return lib
+
+
+def bitnet_official_kernel_available() -> bool:
+    return _get_official_bitnet_lib() is not None
+
+
+def _official_shape_supported(m: int, n: int, k: int) -> bool:
+    return m == 1 and (n, k) in {
+        (3840, 2560),
+        (2560, 2560),
+        (13824, 2560),
+        (2560, 6912),
+        (4800, 3200),
+        (3200, 3200),
+        (20480, 3200),
+        (3200, 10240),
+        (5120, 27648),
+        (55296, 5120),
+    }
+
+
+_bn_official_lib = torch.library.Library("kb_nano_bitnet_official", "DEF")
+_bn_official_lib.define(
+    "int8xint2_gemm(Tensor input_int8, Tensor act_scale, Tensor weight, "
+    "Tensor weight_scale, Tensor! output) -> ()"
+)
+
+
+def _official_gemm_impl(
+    input_int8: torch.Tensor,
+    act_scale: torch.Tensor,
+    weight: torch.Tensor,
+    weight_scale: torch.Tensor,
+    output: torch.Tensor,
+) -> None:
+    m, k = input_int8.shape
+    n, k_packed = weight.shape
+    assert k == k_packed * 4
+    if not _official_shape_supported(m, n, k):
+        raise RuntimeError(
+            f"Microsoft BitNet ladder kernel does not support "
+            f"M={m}, N={n}, K={k}"
+        )
+    lib = _get_official_bitnet_lib()
+    if lib is None:
+        raise RuntimeError(
+            "KB_BITNET_KERNEL_LIB must point to Microsoft BitNet "
+            "gpu/bitnet_kernels/libbitnet.so"
+        )
+    stream = torch.cuda.current_stream()
+    lib.bitlinear_int8xint2(
+        ctypes.c_void_p(input_int8.data_ptr()),
+        ctypes.c_void_p(weight.data_ptr()),
+        ctypes.c_void_p(output.data_ptr()),
+        ctypes.c_void_p(act_scale.data_ptr()),
+        ctypes.c_void_p(weight_scale.data_ptr()),
+        ctypes.c_int(m),
+        ctypes.c_int(n),
+        ctypes.c_int(k),
+        ctypes.c_void_p(stream.cuda_stream),
+    )
+
+
+_bn_official_lib.impl("int8xint2_gemm", _official_gemm_impl, "CUDA")
+
+
+@torch.library.impl(_bn_official_lib, "int8xint2_gemm", "Meta")
+def _official_gemm_meta(input_int8, act_scale, weight, weight_scale, output):
+    pass
+
+
+def bitnet_int8xint2_linear_official(
+    x: torch.Tensor,
+    weight: torch.Tensor,
+    weight_scale: torch.Tensor,
+) -> torch.Tensor:
+    """Microsoft ladder W1.58A8 decode path for M == 1."""
+    assert weight.dtype == torch.int8
+    n, k_packed = weight.shape
+    k = k_packed * 4
+    in_shape = x.shape
+    assert in_shape[-1] == k
+    x_2d = x.reshape(-1, k).contiguous()
+    if not _official_shape_supported(x_2d.shape[0], n, k):
+        raise RuntimeError(
+            f"Unsupported Microsoft BitNet kernel shape: "
+            f"M={x_2d.shape[0]}, N={n}, K={k}"
+        )
+    q_int8, act_scale = _activation_quant_int8(x_2d)
+    out = torch.empty(x_2d.shape[0], n, dtype=torch.bfloat16, device=x.device)
+    torch.ops.kb_nano_bitnet_official.int8xint2_gemm(
+        q_int8, act_scale, weight, weight_scale, out,
+    )
+    return out.reshape(*in_shape[:-1], n)
 
 
 # ---------------------------------------------------------------------------
@@ -409,6 +549,58 @@ def repack_ternary_kn(unpacked: torch.Tensor) -> torch.Tensor:
 def hf_packed_to_kn_packed(packed_hf: torch.Tensor) -> torch.Tensor:
     """Convenience: HF ``(out/4, in)`` -> KN-packed ``(out, in/4)`` uint8."""
     return repack_ternary_kn(unpack_hf_ternary(packed_hf))
+
+
+_SOTA_PACK_MAPPING = None
+
+
+def _sota_pack_mapping() -> np.ndarray:
+    global _SOTA_PACK_MAPPING
+    if _SOTA_PACK_MAPPING is not None:
+        return _SOTA_PACK_MAPPING
+    mapping = np.zeros((16, 32, 2), dtype=np.int64)
+    for i in range(16):
+        for j in range(32):
+            thread_id = i * 2 + j // 16
+            row = (thread_id // 16) * 8 + (thread_id % 8)
+            col = (j % 16) + 16 * ((thread_id % 16) // 8)
+            mapping[i, j] = (row, col)
+    _SOTA_PACK_MAPPING = mapping
+    return mapping
+
+
+def pack_ternary_sota_ladder(unpacked: torch.Tensor) -> torch.Tensor:
+    """Pack ternary ``(N, K)`` weights for Microsoft's M=1 ladder kernel."""
+    assert unpacked.dim() == 2
+    n, k = unpacked.shape
+    assert n % 16 == 0 and k % 32 == 0
+    device = unpacked.device
+    weight = (unpacked.detach().cpu().numpy().astype(np.int8) + 2).astype(np.int8)
+    mapping = _sota_pack_mapping()
+
+    n_blocks = np.arange(n // 16)[:, None, None, None]
+    k_blocks = np.arange(k // 32)[None, :, None, None]
+    src_n = n_blocks * 16 + mapping[None, None, :, :, 0]
+    src_k = k_blocks * 32 + mapping[None, None, :, :, 1]
+    permuted = weight[src_n, src_k]
+
+    compressed = np.zeros((n // 16, k // 32, 16, 8), dtype=np.int8)
+    for j in range(8):
+        for lane in range(4):
+            compressed[..., j] |= (
+                permuted[..., j * 4 + lane] << (lane * 2)
+            ).astype(np.int8)
+
+    qweight = compressed.view(np.int32)
+    interleaved = np.zeros_like(qweight)
+    for i in range(4):
+        for j in range(4):
+            offset = i * 4 + j
+            shift = (offset % 4) * 8 + (offset // 4) * 2
+            interleaved |= ((qweight >> (2 * offset)) & 3) << shift
+
+    packed = interleaved.view(np.int8).reshape(n, k // 4).copy()
+    return torch.from_numpy(packed).to(device=device, non_blocking=True)
 
 
 def unpack_kn_to_ternary(packed_kn: torch.Tensor) -> torch.Tensor:

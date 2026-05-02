@@ -143,7 +143,7 @@ def _print_operator_history(op_name: str, limit: int) -> None:
     print(f"{'=' * 70}")
     print(
         f"  {'TIMESTAMP':<18} {'RUN NAME':<28} "
-        f"{'SPEEDUP':>8} {'PASS':>6} {'MEAN_DIFF':>10} {'RUN ID':>10}"
+        f"{'SPEEDUP':>8} {'PASS':>6} {'ERR_RATIO':>10} {'RUN ID':>10}"
     )
     print(f"  {'\u2500' * 66}")
 
@@ -155,7 +155,7 @@ def _print_operator_history(op_name: str, limit: int) -> None:
         speedup = r.get(speedup_key)
         passed = r.get(f"metrics.{op_name}_passed")
         failed = r.get(f"metrics.{op_name}_failed")
-        diff = r.get(f"metrics.{op_name}_avg_mean_abs_diff")
+        error_ratio = r.get(f"metrics.{op_name}_avg_max_error_ratio")
         gen = r.get(gen_key)
 
         speedup_s = f"{speedup:.2f}x" if speedup is not None and speedup == speedup else "--"
@@ -168,11 +168,14 @@ def _print_operator_history(op_name: str, limit: int) -> None:
             pass_s = "gen=OK" if gen else "gen=FAIL"
         else:
             pass_s = "--"
-        diff_s = f"{diff:.1e}" if diff is not None and diff == diff else "--"
+        ratio_s = (
+            f"{error_ratio:.2e}"
+            if error_ratio is not None and error_ratio == error_ratio else "--"
+        )
 
         print(
             f"  {ts:<18} {name:<28} "
-            f"{speedup_s:>8} {pass_s:>6} {diff_s:>10} {run_id:>10}"
+            f"{speedup_s:>8} {pass_s:>6} {ratio_s:>10} {run_id:>10}"
         )
 
     print(f"{'=' * 70}")

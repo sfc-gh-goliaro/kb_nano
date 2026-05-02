@@ -30,6 +30,7 @@ dependencies = [
     "timm",
     "fastsafetensors",
     "ultralytics",
+    "flash-linear-attention>=0.4.2",
 ]
 
 [project.scripts]

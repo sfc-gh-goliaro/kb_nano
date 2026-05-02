@@ -152,6 +152,14 @@ class Context:
     # Batch size key used by CUDAGraphWrapper for per-shape graph caching.
     batch_size_for_graph: int = 0
 
+    # --- Mamba / SSM fields (mirror vLLM ForwardContext.attn_metadata
+    # for Mamba layers).  ``mamba_state`` owns the global conv/ssm state
+    # tensors; ``mamba_metadata`` is a per-batch dataclass (Mamba2Metadata
+    # or MambaMetadata) carrying state slot indices and prefill/decode
+    # metadata read by every Mamba mixer in its forward pass.
+    mamba_state: object = None
+    mamba_metadata: object = None
+
 
 # Global module registry populated once at model init; copied into each
 # Context so compiled custom ops can resolve their target modules.
@@ -173,8 +181,9 @@ def auto_register_no_compile_layers(model: "nn.Module") -> None:
     fully-qualified prefix so custom ops can find them at runtime.
 
     Recognized types (by class name to avoid circular imports):
-      - ``Qwen3MoE``, ``MixtralMoE``, ``DeepSeekMoE``  (MoE blocks)
-      - ``Attention``                                    (paged-KV attention impl)
+      - ``Qwen3MoE``, ``MixtralMoE``, ``GptOssMoE``, ``DeepSeekMoE`` (MoE blocks)
+      - ``Attention``, ``MLAAttention``, ``SparseAttnIndexer``       (attention impls)
+      - ``Mamba2Mixer``                                              (Mamba2 compile boundary)
 
     Also sets ``_layer_name`` on each module so it knows its own key.
     ``_use_custom_op`` remains ``False`` until compilation is enabled.
@@ -182,6 +191,7 @@ def auto_register_no_compile_layers(model: "nn.Module") -> None:
     _TARGET_NAMES = {
         "Qwen3MoE", "MixtralMoE", "GptOssMoE", "DeepSeekMoE",
         "Attention", "MLAAttention", "SparseAttnIndexer",
+        "Mamba2Mixer",
     }
     layers: dict[str, "nn.Module"] = {}
     for name, mod in model.named_modules():
@@ -267,6 +277,26 @@ def set_mixed_context(
         logit_indices=logit_indices,
         chunked_context=chunked_context,
         req_id_per_token=req_id_per_token,
+        no_compile_layers=_STATIC_NO_COMPILE_LAYERS,
+    )
+
+
+def set_mamba_context(
+    is_prefill: bool,
+    mamba_state,
+    mamba_metadata,
+):
+    """Install per-batch Mamba state + metadata in the global Context.
+
+    Used by ``ModelRunner.run_mamba`` -- mirrors how the attention path
+    uses ``set_context`` / ``set_mixed_context``.  Mamba mixers read
+    ``ctx.mamba_state`` and ``ctx.mamba_metadata`` in their forward.
+    """
+    global _CONTEXT
+    _CONTEXT = Context(
+        is_prefill=is_prefill,
+        mamba_state=mamba_state,
+        mamba_metadata=mamba_metadata,
         no_compile_layers=_STATIC_NO_COMPILE_LAYERS,
     )
 
