@@ -224,19 +224,28 @@ def _quantize_fp8_per_block(
 class Scenario:
     """A single test scenario for an operator."""
 
-    __slots__ = ("name", "init_args", "inputs", "golden_path", "golden_inputs")
+    __slots__ = (
+        "name",
+        "init_args",
+        "inputs",
+        "input_metadata",
+        "golden_path",
+        "golden_inputs",
+    )
 
     def __init__(
         self,
         name: str,
         init_args: dict[str, Any],
         inputs: dict[str, Any],
+        input_metadata: dict[str, Any] | None = None,
         golden_path: str | None = None,
         golden_inputs: list[str] | None = None,
     ):
         self.name = name
         self.init_args = init_args
         self.inputs = inputs
+        self.input_metadata = input_metadata or {}
         self.golden_path = golden_path
         self.golden_inputs = golden_inputs or []
 
@@ -273,6 +282,7 @@ class InputRegistry:
                         name=s["name"],
                         init_args=s.get("init_args", {}),
                         inputs=s.get("inputs", {}),
+                        input_metadata=s.get("input_metadata", {}),
                         golden_path=s.get("golden"),
                         golden_inputs=s.get("golden_inputs", []),
                     ))

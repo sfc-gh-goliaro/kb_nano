@@ -172,9 +172,14 @@ _PROJECT_ROOT = _PACKAGE_DIR.parent
 sys.path.insert(0, str(_PROJECT_ROOT))
 
 from kb_nano.bench.utils.worker import run_worker
-from kb_nano.bench.utils.real_prompts import (
-    DEFAULT_WORKLOAD_DATASETS,
-    load_real_prompt_workload,
+from kb_nano.bench.utils.real_prompts import load_real_prompt_workload
+from kb_nano.bench.utils.workloads import (
+    ASR_LATENCY_WORKLOADS,
+    ASR_THROUGHPUT_WORKLOADS,
+    LATENCY_WORKLOADS,
+    THROUGHPUT_WORKLOADS,
+    VLM_LATENCY_WORKLOADS,
+    VLM_THROUGHPUT_WORKLOADS,
 )
 
 _HELD_PORT_LOCKS: list[object] = []
@@ -182,53 +187,66 @@ _HELD_PORT_LOCKS: list[object] = []
 
 SCENARIOS = [
     {
-        "name": "prefill-heavy",
-        "dataset": DEFAULT_WORKLOAD_DATASETS["prefill-heavy"],
-    },
-    {
-        "name": "balanced",
-        "dataset": DEFAULT_WORKLOAD_DATASETS["balanced"],
-    },
-    {
-        "name": "decode-heavy",
-        "dataset": DEFAULT_WORKLOAD_DATASETS["decode-heavy"],
-    },
+        "name": w.name,
+        "dataset": w.dataset_name,
+    }
+    for w in THROUGHPUT_WORKLOADS
 ]
 
 LATENCY_SCENARIOS = [
-    {"name": "single-request",  "input_len": 128, "output_len": 128, "batch_size": 1},
-    {"name": "fixed-batch-32",  "input_len": 128, "output_len": 128, "batch_size": 32},
+    {
+        "name": w.name,
+        "input_len": w.input_len,
+        "output_len": w.output_len,
+        "batch_size": w.batch_size,
+    }
+    for w in LATENCY_WORKLOADS
 ]
 
 VLM_SCENARIOS = [
     {
-        "name": "text-only", "modality": "text",
-        "dataset": DEFAULT_WORKLOAD_DATASETS["decode-heavy"],
-    },
-    {"name": "image",      "modality": "image", "output_len": 512,
-     "dataset": "lmarena-ai/VisionArena-Chat", "dataset_split": "train"},
-    {"name": "video",      "modality": "video", "output_len": 512,
-     "dataset": "yale-nlp/MMVU", "dataset_split": "validation"},
+        "name": w.name,
+        "modality": w.modality,
+        "input_len": w.input_len,
+        "output_len": w.output_len,
+        "dataset": w.dataset_name,
+        "dataset_split": w.dataset_split,
+    }
+    for w in VLM_THROUGHPUT_WORKLOADS
 ]
 
 WHISPER_SCENARIOS = [
-    {"name": "librispeech", "output_len": 448,
-     "dataset": "openslr/librispeech_asr", "dataset_split": "test.clean",
-     "use_full_dataset": True},
+    {
+        "name": w.name,
+        "output_len": w.output_len,
+        "dataset": w.dataset_name,
+        "dataset_split": w.dataset_split,
+        "use_full_dataset": w.use_full_dataset,
+    }
+    for w in ASR_THROUGHPUT_WORKLOADS
 ]
 
 WHISPER_LATENCY_SCENARIOS = [
-    {"name": "single-utterance", "output_len": 448, "batch_size": 1,
-     "dataset": "openslr/librispeech_asr", "dataset_split": "test.clean"},
-    {"name": "fixed-batch-32", "output_len": 448, "batch_size": 32,
-     "dataset": "openslr/librispeech_asr", "dataset_split": "test.clean"},
+    {
+        "name": w.name,
+        "output_len": w.output_len,
+        "batch_size": w.batch_size,
+        "dataset": w.dataset_name,
+        "dataset_split": w.dataset_split,
+    }
+    for w in ASR_LATENCY_WORKLOADS
 ]
 
 VLM_LATENCY_SCENARIOS = [
-    {"name": "single-image", "modality": "image", "output_len": 128, "batch_size": 1,
-     "dataset": "lmarena-ai/VisionArena-Chat", "dataset_split": "train"},
-    {"name": "single-video", "modality": "video", "output_len": 128, "batch_size": 1,
-     "dataset": "yale-nlp/MMVU", "dataset_split": "validation"},
+    {
+        "name": w.name,
+        "modality": w.modality,
+        "output_len": w.output_len,
+        "batch_size": w.batch_size,
+        "dataset": w.dataset_name,
+        "dataset_split": w.dataset_split,
+    }
+    for w in VLM_LATENCY_WORKLOADS
 ]
 
 
