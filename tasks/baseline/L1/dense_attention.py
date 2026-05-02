@@ -22,7 +22,8 @@ Backend selection is controlled via the ``backend`` parameter:
     (FA3 > FA2); raises if none is installed.
 
 Used by diffusion models (FLUX, SDXL) and any architecture that needs
-stateless multi-head attention without KV cache.
+stateless multi-head attention without KV cache, including encoder-style
+bidirectional attention.
 """
 
 from __future__ import annotations
@@ -85,8 +86,16 @@ class DenseAttention(nn.Module):
         if 80 <= cc < 100:
             self.fa_func = _resolve_flash_attn_func()
 
-    def forward(self, query, key, value, softmax_scale=None, causal=False):
-        if self.fa_func is not None and query.dtype != torch.float32:
+    def forward(
+        self,
+        query,
+        key,
+        value,
+        softmax_scale=None,
+        causal=False,
+        attn_mask=None,
+    ):
+        if self.fa_func is not None and query.dtype != torch.float32 and attn_mask is None:
             out = self.fa_func(
                 query, key, value,
                 softmax_scale=softmax_scale,
@@ -101,6 +110,7 @@ class DenseAttention(nn.Module):
         v = value.permute(0, 2, 1, 3)
         out = F.scaled_dot_product_attention(
             q, k, v,
+            attn_mask=attn_mask,
             dropout_p=0.0,
             is_causal=causal,
             scale=softmax_scale,

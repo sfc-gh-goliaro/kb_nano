@@ -1,0 +1,3810 @@
+embedding:
+  scenarios:
+  - name: tokens-1/844725a5
+    init_args:
+      training: false
+    inputs:
+      input_ids:
+        shape:
+        - 1
+        dtype: int64
+  - name: tokens-4/ad63cf8c
+    init_args:
+      training: false
+    inputs:
+      input_ids:
+        shape:
+        - 4
+        dtype: int64
+  - name: tokens-8/7eec3de4
+    init_args:
+      training: false
+    inputs:
+      input_ids:
+        shape:
+        - 8
+        dtype: int64
+  - name: tokens-64/0766725e
+    init_args:
+      training: false
+    inputs:
+      input_ids:
+        shape:
+        - 64
+        dtype: int64
+  - name: tokens-16384/4ef6a917
+    init_args:
+      training: false
+    inputs:
+      input_ids:
+        shape:
+        - 16384
+        dtype: int64
+rms_norm:
+  scenarios:
+  - name: tokens-1/8d461ffb
+    init_args:
+      elementwise_affine: true
+      eps: 1.0e-05
+      hidden_size: 4096
+      training: false
+    inputs:
+      x:
+        shape:
+        - 1
+        - 4096
+        dtype: bfloat16
+  - name: tokens-4/0297ed69
+    init_args:
+      elementwise_affine: true
+      eps: 1.0e-05
+      hidden_size: 4096
+      training: false
+    inputs:
+      x:
+        shape:
+        - 4
+        - 4096
+        dtype: bfloat16
+  - name: tokens-8/73fe89b9
+    init_args:
+      elementwise_affine: true
+      eps: 1.0e-05
+      hidden_size: 4096
+      training: false
+    inputs:
+      x:
+        shape:
+        - 8
+        - 4096
+        dtype: bfloat16
+  - name: tokens-64/32275774
+    init_args:
+      elementwise_affine: true
+      eps: 1.0e-05
+      hidden_size: 4096
+      training: false
+    inputs:
+      x:
+        shape:
+        - 64
+        - 4096
+        dtype: bfloat16
+  - name: tokens-16384/2d89df12
+    init_args:
+      elementwise_affine: true
+      eps: 1.0e-05
+      hidden_size: 4096
+      training: false
+    inputs:
+      x:
+        shape:
+        - 16384
+        - 4096
+        dtype: bfloat16
+  - name: tokens-1/61d18358
+    init_args:
+      elementwise_affine: true
+      eps: 1.0e-05
+      hidden_size: 4096
+      training: false
+    inputs:
+      residual:
+        shape:
+        - 1
+        - 4096
+        dtype: bfloat16
+      x:
+        shape:
+        - 1
+        - 4096
+        dtype: bfloat16
+  - name: tokens-4/bdd57b13
+    init_args:
+      elementwise_affine: true
+      eps: 1.0e-05
+      hidden_size: 4096
+      training: false
+    inputs:
+      residual:
+        shape:
+        - 4
+        - 4096
+        dtype: bfloat16
+      x:
+        shape:
+        - 4
+        - 4096
+        dtype: bfloat16
+  - name: tokens-8/14df6125
+    init_args:
+      elementwise_affine: true
+      eps: 1.0e-05
+      hidden_size: 4096
+      training: false
+    inputs:
+      residual:
+        shape:
+        - 8
+        - 4096
+        dtype: bfloat16
+      x:
+        shape:
+        - 8
+        - 4096
+        dtype: bfloat16
+  - name: tokens-64/8dc356d8
+    init_args:
+      elementwise_affine: true
+      eps: 1.0e-05
+      hidden_size: 4096
+      training: false
+    inputs:
+      residual:
+        shape:
+        - 64
+        - 4096
+        dtype: bfloat16
+      x:
+        shape:
+        - 64
+        - 4096
+        dtype: bfloat16
+  - name: tokens-16384/610b6608
+    init_args:
+      elementwise_affine: true
+      eps: 1.0e-05
+      hidden_size: 4096
+      training: false
+    inputs:
+      residual:
+        shape:
+        - 16384
+        - 4096
+        dtype: bfloat16
+      x:
+        shape:
+        - 16384
+        - 4096
+        dtype: bfloat16
+rotary_emb:
+  scenarios:
+  - name: tokens-1/2ae00b25
+    init_args:
+      head_dim: 128
+      training: false
+    inputs:
+      key:
+        shape:
+        - 1
+        - 512
+        dtype: bfloat16
+      positions:
+        shape:
+        - 1
+        dtype: int64
+      query:
+        shape:
+        - 1
+        - 2048
+        dtype: bfloat16
+  - name: tokens-1/3516df83
+    init_args:
+      head_dim: 128
+      training: false
+    inputs:
+      key:
+        shape:
+        - 1
+        - 1024
+        dtype: bfloat16
+      positions:
+        shape:
+        - 1
+        dtype: int64
+      query:
+        shape:
+        - 1
+        - 4096
+        dtype: bfloat16
+  - name: tokens-4/21fd8902
+    init_args:
+      head_dim: 128
+      training: false
+    inputs:
+      key:
+        shape:
+        - 4
+        - 1024
+        dtype: bfloat16
+      positions:
+        shape:
+        - 4
+        dtype: int64
+      query:
+        shape:
+        - 4
+        - 4096
+        dtype: bfloat16
+  - name: tokens-4/ddf4780a
+    init_args:
+      head_dim: 128
+      training: false
+    inputs:
+      key:
+        shape:
+        - 4
+        - 512
+        dtype: bfloat16
+      positions:
+        shape:
+        - 4
+        dtype: int64
+      query:
+        shape:
+        - 4
+        - 2048
+        dtype: bfloat16
+  - name: tokens-8/441e45c7
+    init_args:
+      head_dim: 128
+      training: false
+    inputs:
+      key:
+        shape:
+        - 8
+        - 512
+        dtype: bfloat16
+      positions:
+        shape:
+        - 8
+        dtype: int64
+      query:
+        shape:
+        - 8
+        - 2048
+        dtype: bfloat16
+  - name: tokens-16/bd73e209
+    init_args:
+      head_dim: 128
+      training: false
+    inputs:
+      key:
+        shape:
+        - 16
+        - 1024
+        dtype: bfloat16
+      positions:
+        shape:
+        - 16
+        dtype: int64
+      query:
+        shape:
+        - 16
+        - 4096
+        dtype: bfloat16
+  - name: tokens-64/026e646f
+    init_args:
+      head_dim: 128
+      training: false
+    inputs:
+      key:
+        shape:
+        - 64
+        - 1024
+        dtype: bfloat16
+      positions:
+        shape:
+        - 64
+        dtype: int64
+      query:
+        shape:
+        - 64
+        - 4096
+        dtype: bfloat16
+  - name: tokens-64/8b87f526
+    init_args:
+      head_dim: 128
+      training: false
+    inputs:
+      key:
+        shape:
+        - 64
+        - 512
+        dtype: bfloat16
+      positions:
+        shape:
+        - 64
+        dtype: int64
+      query:
+        shape:
+        - 64
+        - 2048
+        dtype: bfloat16
+  - name: tokens-16384/b359bac8
+    init_args:
+      head_dim: 128
+      training: false
+    inputs:
+      key:
+        shape:
+        - 16384
+        - 1024
+        dtype: bfloat16
+      positions:
+        shape:
+        - 16384
+        dtype: int64
+      query:
+        shape:
+        - 16384
+        - 4096
+        dtype: bfloat16
+  - name: tokens-16384/fa3fcef8
+    init_args:
+      head_dim: 128
+      training: false
+    inputs:
+      key:
+        shape:
+        - 16384
+        - 512
+        dtype: bfloat16
+      positions:
+        shape:
+        - 16384
+        dtype: int64
+      query:
+        shape:
+        - 16384
+        - 2048
+        dtype: bfloat16
+flashinfer_prefill:
+  scenarios:
+  - name: tokens-70615/145505c2
+    init_args:
+      head_dim: 128
+      num_kv_heads: 8
+      num_qo_heads: 32
+      sm_scale: 0.08838834764831845
+      training: false
+    inputs:
+      block_table:
+        shape:
+        - 33
+        - 36
+        dtype: int32
+      causal: true
+      cu_seqlens_k:
+        shape:
+        - 34
+        dtype: int32
+      cu_seqlens_q:
+        shape:
+        - 34
+        dtype: int32
+      k:
+        shape:
+        - 70615
+        - 8
+        - 16
+        - 128
+        dtype: bfloat16
+      max_seqlen_k: 573
+      max_seqlen_q: 573
+      q:
+        shape:
+        - 16319
+        - 32
+        - 128
+        dtype: bfloat16
+      softmax_scale: 0.08838834764831845
+      v:
+        shape:
+        - 70615
+        - 8
+        - 16
+        - 128
+        dtype: bfloat16
+  - name: tokens-70615/1a77b0b0
+    init_args:
+      head_dim: 128
+      num_kv_heads: 8
+      num_qo_heads: 32
+      sm_scale: 0.08838834764831845
+      training: false
+    inputs:
+      block_table:
+        shape:
+        - 18
+        - 73
+        dtype: int32
+      causal: true
+      cu_seqlens_k:
+        shape:
+        - 19
+        dtype: int32
+      cu_seqlens_q:
+        shape:
+        - 19
+        dtype: int32
+      k:
+        shape:
+        - 70615
+        - 8
+        - 16
+        - 128
+        dtype: bfloat16
+      max_seqlen_k: 1158
+      max_seqlen_q: 1158
+      q:
+        shape:
+        - 16319
+        - 32
+        - 128
+        dtype: bfloat16
+      softmax_scale: 0.08838834764831845
+      v:
+        shape:
+        - 70615
+        - 8
+        - 16
+        - 128
+        dtype: bfloat16
+  - name: tokens-70615/3761bf7d
+    init_args:
+      head_dim: 128
+      num_kv_heads: 8
+      num_qo_heads: 32
+      sm_scale: 0.08838834764831845
+      training: false
+    inputs:
+      block_table:
+        shape:
+        - 17
+        - 74
+        dtype: int32
+      causal: true
+      cu_seqlens_k:
+        shape:
+        - 18
+        dtype: int32
+      cu_seqlens_q:
+        shape:
+        - 18
+        dtype: int32
+      k:
+        shape:
+        - 70615
+        - 8
+        - 16
+        - 128
+        dtype: bfloat16
+      max_seqlen_k: 1172
+      max_seqlen_q: 1172
+      q:
+        shape:
+        - 16368
+        - 32
+        - 128
+        dtype: bfloat16
+      softmax_scale: 0.08838834764831845
+      v:
+        shape:
+        - 70615
+        - 8
+        - 16
+        - 128
+        dtype: bfloat16
+  - name: tokens-70615/a0c16409
+    init_args:
+      head_dim: 128
+      num_kv_heads: 8
+      num_qo_heads: 32
+      sm_scale: 0.08838834764831845
+      training: false
+    inputs:
+      block_table:
+        shape:
+        - 17
+        - 74
+        dtype: int32
+      causal: true
+      cu_seqlens_k:
+        shape:
+        - 18
+        dtype: int32
+      cu_seqlens_q:
+        shape:
+        - 18
+        dtype: int32
+      k:
+        shape:
+        - 70615
+        - 8
+        - 16
+        - 128
+        dtype: bfloat16
+      max_seqlen_k: 1173
+      max_seqlen_q: 1173
+      q:
+        shape:
+        - 16384
+        - 32
+        - 128
+        dtype: bfloat16
+      softmax_scale: 0.08838834764831845
+      v:
+        shape:
+        - 70615
+        - 8
+        - 16
+        - 128
+        dtype: bfloat16
+  - name: tokens-70615/fa4123d8
+    init_args:
+      head_dim: 128
+      num_kv_heads: 8
+      num_qo_heads: 32
+      sm_scale: 0.08838834764831845
+      training: false
+    inputs:
+      block_table:
+        shape:
+        - 34
+        - 37
+        dtype: int32
+      causal: true
+      cu_seqlens_k:
+        shape:
+        - 35
+        dtype: int32
+      cu_seqlens_q:
+        shape:
+        - 35
+        dtype: int32
+      k:
+        shape:
+        - 70615
+        - 8
+        - 16
+        - 128
+        dtype: bfloat16
+      max_seqlen_k: 587
+      max_seqlen_q: 587
+      q:
+        shape:
+        - 16352
+        - 32
+        - 128
+        dtype: bfloat16
+      softmax_scale: 0.08838834764831845
+      v:
+        shape:
+        - 70615
+        - 8
+        - 16
+        - 128
+        dtype: bfloat16
+  - name: tokens-109779/72c6017d
+    init_args:
+      head_dim: 128
+      num_kv_heads: 4
+      num_qo_heads: 16
+      sm_scale: 0.08838834764831845
+      training: false
+    inputs:
+      block_table:
+        shape:
+        - 15
+        - 94
+        dtype: int32
+      causal: true
+      cu_seqlens_k:
+        shape:
+        - 16
+        dtype: int32
+      cu_seqlens_q:
+        shape:
+        - 16
+        dtype: int32
+      k:
+        shape:
+        - 109779
+        - 4
+        - 16
+        - 128
+        dtype: bfloat16
+      max_seqlen_k: 1500
+      max_seqlen_q: 1500
+      q:
+        shape:
+        - 16345
+        - 16
+        - 128
+        dtype: bfloat16
+      softmax_scale: 0.08838834764831845
+      v:
+        shape:
+        - 109779
+        - 4
+        - 16
+        - 128
+        dtype: bfloat16
+  - name: tokens-109779/76563a95
+    init_args:
+      head_dim: 128
+      num_kv_heads: 4
+      num_qo_heads: 16
+      sm_scale: 0.08838834764831845
+      training: false
+    inputs:
+      block_table:
+        shape:
+        - 15
+        - 79
+        dtype: int32
+      causal: true
+      cu_seqlens_k:
+        shape:
+        - 16
+        dtype: int32
+      cu_seqlens_q:
+        shape:
+        - 16
+        dtype: int32
+      k:
+        shape:
+        - 109779
+        - 4
+        - 16
+        - 128
+        dtype: bfloat16
+      max_seqlen_k: 1250
+      max_seqlen_q: 1250
+      q:
+        shape:
+        - 16304
+        - 16
+        - 128
+        dtype: bfloat16
+      softmax_scale: 0.08838834764831845
+      v:
+        shape:
+        - 109779
+        - 4
+        - 16
+        - 128
+        dtype: bfloat16
+  - name: tokens-109779/904aa4d1
+    init_args:
+      head_dim: 128
+      num_kv_heads: 4
+      num_qo_heads: 16
+      sm_scale: 0.08838834764831845
+      training: false
+    inputs:
+      block_table:
+        shape:
+        - 14
+        - 94
+        dtype: int32
+      causal: true
+      cu_seqlens_k:
+        shape:
+        - 15
+        dtype: int32
+      cu_seqlens_q:
+        shape:
+        - 15
+        dtype: int32
+      k:
+        shape:
+        - 109779
+        - 4
+        - 16
+        - 128
+        dtype: bfloat16
+      max_seqlen_k: 1489
+      max_seqlen_q: 1489
+      q:
+        shape:
+        - 16384
+        - 16
+        - 128
+        dtype: bfloat16
+      softmax_scale: 0.08838834764831845
+      v:
+        shape:
+        - 109779
+        - 4
+        - 16
+        - 128
+        dtype: bfloat16
+  - name: tokens-109779/94d2e881
+    init_args:
+      head_dim: 128
+      num_kv_heads: 4
+      num_qo_heads: 16
+      sm_scale: 0.08838834764831845
+      training: false
+    inputs:
+      block_table:
+        shape:
+        - 18
+        - 57
+        dtype: int32
+      causal: true
+      cu_seqlens_k:
+        shape:
+        - 19
+        dtype: int32
+      cu_seqlens_q:
+        shape:
+        - 19
+        dtype: int32
+      k:
+        shape:
+        - 109779
+        - 4
+        - 16
+        - 128
+        dtype: bfloat16
+      max_seqlen_k: 900
+      max_seqlen_q: 900
+      q:
+        shape:
+        - 10713
+        - 16
+        - 128
+        dtype: bfloat16
+      softmax_scale: 0.08838834764831845
+      v:
+        shape:
+        - 109779
+        - 4
+        - 16
+        - 128
+        dtype: bfloat16
+  - name: tokens-109779/d67a44fe
+    init_args:
+      head_dim: 128
+      num_kv_heads: 4
+      num_qo_heads: 16
+      sm_scale: 0.08838834764831845
+      training: false
+    inputs:
+      block_table:
+        shape:
+        - 15
+        - 91
+        dtype: int32
+      causal: true
+      cu_seqlens_k:
+        shape:
+        - 16
+        dtype: int32
+      cu_seqlens_q:
+        shape:
+        - 16
+        dtype: int32
+      k:
+        shape:
+        - 109779
+        - 4
+        - 16
+        - 128
+        dtype: bfloat16
+      max_seqlen_k: 1452
+      max_seqlen_q: 1452
+      q:
+        shape:
+        - 16359
+        - 16
+        - 128
+        dtype: bfloat16
+      softmax_scale: 0.08838834764831845
+      v:
+        shape:
+        - 109779
+        - 4
+        - 16
+        - 128
+        dtype: bfloat16
+attention_impl:
+  scenarios:
+  - name: tokens-1/7cb4899d
+    init_args:
+      attention_chunk_size: null
+      head_size: 128
+      num_heads: 32
+      num_kv_heads: 8
+      scale: 0.08838834764831845
+      sinks: null
+      sliding_window: null
+      training: false
+    inputs:
+      key:
+        shape:
+        - 1
+        - 1024
+        dtype: bfloat16
+      query:
+        shape:
+        - 1
+        - 4096
+        dtype: bfloat16
+      value:
+        shape:
+        - 1
+        - 1024
+        dtype: bfloat16
+  - name: tokens-4/845a49de
+    init_args:
+      attention_chunk_size: null
+      head_size: 128
+      num_heads: 32
+      num_kv_heads: 8
+      scale: 0.08838834764831845
+      sinks: null
+      sliding_window: null
+      training: false
+    inputs:
+      key:
+        shape:
+        - 4
+        - 1024
+        dtype: bfloat16
+      query:
+        shape:
+        - 4
+        - 4096
+        dtype: bfloat16
+      value:
+        shape:
+        - 4
+        - 1024
+        dtype: bfloat16
+  - name: tokens-16/3e2e59c9
+    init_args:
+      attention_chunk_size: null
+      head_size: 128
+      num_heads: 32
+      num_kv_heads: 8
+      scale: 0.08838834764831845
+      sinks: null
+      sliding_window: null
+      training: false
+    inputs:
+      key:
+        shape:
+        - 16
+        - 1024
+        dtype: bfloat16
+      query:
+        shape:
+        - 16
+        - 4096
+        dtype: bfloat16
+      value:
+        shape:
+        - 16
+        - 1024
+        dtype: bfloat16
+  - name: tokens-64/62937849
+    init_args:
+      attention_chunk_size: null
+      head_size: 128
+      num_heads: 32
+      num_kv_heads: 8
+      scale: 0.08838834764831845
+      sinks: null
+      sliding_window: null
+      training: false
+    inputs:
+      key:
+        shape:
+        - 64
+        - 1024
+        dtype: bfloat16
+      query:
+        shape:
+        - 64
+        - 4096
+        dtype: bfloat16
+      value:
+        shape:
+        - 64
+        - 1024
+        dtype: bfloat16
+  - name: tokens-16384/939564d0
+    init_args:
+      attention_chunk_size: null
+      head_size: 128
+      num_heads: 32
+      num_kv_heads: 8
+      scale: 0.08838834764831845
+      sinks: null
+      sliding_window: null
+      training: false
+    inputs:
+      key:
+        shape:
+        - 16384
+        - 1024
+        dtype: bfloat16
+      query:
+        shape:
+        - 16384
+        - 4096
+        dtype: bfloat16
+      value:
+        shape:
+        - 16384
+        - 1024
+        dtype: bfloat16
+  - name: tokens-1/760f7c7e
+    init_args:
+      attention_chunk_size: null
+      head_size: 128
+      num_heads: 16
+      num_kv_heads: 4
+      scale: 0.08838834764831845
+      sinks: null
+      sliding_window: null
+      training: false
+    inputs:
+      key:
+        shape:
+        - 1
+        - 512
+        dtype: bfloat16
+      query:
+        shape:
+        - 1
+        - 2048
+        dtype: bfloat16
+      value:
+        shape:
+        - 1
+        - 512
+        dtype: bfloat16
+  - name: tokens-4/8a4aa31f
+    init_args:
+      attention_chunk_size: null
+      head_size: 128
+      num_heads: 16
+      num_kv_heads: 4
+      scale: 0.08838834764831845
+      sinks: null
+      sliding_window: null
+      training: false
+    inputs:
+      key:
+        shape:
+        - 4
+        - 512
+        dtype: bfloat16
+      query:
+        shape:
+        - 4
+        - 2048
+        dtype: bfloat16
+      value:
+        shape:
+        - 4
+        - 512
+        dtype: bfloat16
+  - name: tokens-8/9ee86915
+    init_args:
+      attention_chunk_size: null
+      head_size: 128
+      num_heads: 16
+      num_kv_heads: 4
+      scale: 0.08838834764831845
+      sinks: null
+      sliding_window: null
+      training: false
+    inputs:
+      key:
+        shape:
+        - 8
+        - 512
+        dtype: bfloat16
+      query:
+        shape:
+        - 8
+        - 2048
+        dtype: bfloat16
+      value:
+        shape:
+        - 8
+        - 512
+        dtype: bfloat16
+  - name: tokens-64/2f939689
+    init_args:
+      attention_chunk_size: null
+      head_size: 128
+      num_heads: 16
+      num_kv_heads: 4
+      scale: 0.08838834764831845
+      sinks: null
+      sliding_window: null
+      training: false
+    inputs:
+      key:
+        shape:
+        - 64
+        - 512
+        dtype: bfloat16
+      query:
+        shape:
+        - 64
+        - 2048
+        dtype: bfloat16
+      value:
+        shape:
+        - 64
+        - 512
+        dtype: bfloat16
+  - name: tokens-16384/c306eaf5
+    init_args:
+      attention_chunk_size: null
+      head_size: 128
+      num_heads: 16
+      num_kv_heads: 4
+      scale: 0.08838834764831845
+      sinks: null
+      sliding_window: null
+      training: false
+    inputs:
+      key:
+        shape:
+        - 16384
+        - 512
+        dtype: bfloat16
+      query:
+        shape:
+        - 16384
+        - 2048
+        dtype: bfloat16
+      value:
+        shape:
+        - 16384
+        - 512
+        dtype: bfloat16
+parallel_linear:
+  scenarios:
+  - name: tokens-1/4a03b0f2
+    init_args:
+      bias: null
+      input_size_per_partition: 4096
+      reduce_results: true
+      tp_rank: 0
+      tp_size: 1
+      training: false
+      use_fp8: false
+    inputs:
+      x:
+        shape:
+        - 1
+        - 4096
+        dtype: bfloat16
+  - name: tokens-4/211f1097
+    init_args:
+      bias: null
+      input_size_per_partition: 4096
+      reduce_results: true
+      tp_rank: 0
+      tp_size: 1
+      training: false
+      use_fp8: false
+    inputs:
+      x:
+        shape:
+        - 4
+        - 4096
+        dtype: bfloat16
+  - name: tokens-16/f439e275
+    init_args:
+      bias: null
+      input_size_per_partition: 4096
+      reduce_results: true
+      tp_rank: 0
+      tp_size: 1
+      training: false
+      use_fp8: false
+    inputs:
+      x:
+        shape:
+        - 16
+        - 4096
+        dtype: bfloat16
+  - name: tokens-64/e863cd05
+    init_args:
+      bias: null
+      input_size_per_partition: 4096
+      reduce_results: true
+      tp_rank: 0
+      tp_size: 1
+      training: false
+      use_fp8: false
+    inputs:
+      x:
+        shape:
+        - 64
+        - 4096
+        dtype: bfloat16
+  - name: tokens-16384/dc2a75f4
+    init_args:
+      bias: null
+      input_size_per_partition: 4096
+      reduce_results: true
+      tp_rank: 0
+      tp_size: 1
+      training: false
+      use_fp8: false
+    inputs:
+      x:
+        shape:
+        - 16384
+        - 4096
+        dtype: bfloat16
+  - name: tokens-1/d7145000
+    init_args:
+      bias: null
+      input_size_per_partition: 14336
+      reduce_results: true
+      tp_rank: 0
+      tp_size: 1
+      training: false
+      use_fp8: false
+    inputs:
+      x:
+        shape:
+        - 1
+        - 14336
+        dtype: bfloat16
+  - name: tokens-4/fc7125c5
+    init_args:
+      bias: null
+      input_size_per_partition: 14336
+      reduce_results: true
+      tp_rank: 0
+      tp_size: 1
+      training: false
+      use_fp8: false
+    inputs:
+      x:
+        shape:
+        - 4
+        - 14336
+        dtype: bfloat16
+  - name: tokens-16/3123c54d
+    init_args:
+      bias: null
+      input_size_per_partition: 14336
+      reduce_results: true
+      tp_rank: 0
+      tp_size: 1
+      training: false
+      use_fp8: false
+    inputs:
+      x:
+        shape:
+        - 16
+        - 14336
+        dtype: bfloat16
+  - name: tokens-64/db5322f9
+    init_args:
+      bias: null
+      input_size_per_partition: 14336
+      reduce_results: true
+      tp_rank: 0
+      tp_size: 1
+      training: false
+      use_fp8: false
+    inputs:
+      x:
+        shape:
+        - 64
+        - 14336
+        dtype: bfloat16
+  - name: tokens-16384/98b08659
+    init_args:
+      bias: null
+      input_size_per_partition: 14336
+      reduce_results: true
+      tp_rank: 0
+      tp_size: 1
+      training: false
+      use_fp8: false
+    inputs:
+      x:
+        shape:
+        - 16384
+        - 14336
+        dtype: bfloat16
+  - name: tokens-1/8bc6da40
+    init_args:
+      bias: null
+      input_size_per_partition: 2048
+      reduce_results: true
+      tp_rank: 0
+      tp_size: 2
+      training: false
+      use_fp8: false
+    inputs:
+      x:
+        shape:
+        - 1
+        - 2048
+        dtype: bfloat16
+  - name: tokens-4/41a98ef7
+    init_args:
+      bias: null
+      input_size_per_partition: 2048
+      reduce_results: true
+      tp_rank: 0
+      tp_size: 2
+      training: false
+      use_fp8: false
+    inputs:
+      x:
+        shape:
+        - 4
+        - 2048
+        dtype: bfloat16
+  - name: tokens-8/a502a643
+    init_args:
+      bias: null
+      input_size_per_partition: 2048
+      reduce_results: true
+      tp_rank: 0
+      tp_size: 2
+      training: false
+      use_fp8: false
+    inputs:
+      x:
+        shape:
+        - 8
+        - 2048
+        dtype: bfloat16
+  - name: tokens-64/4ae10708
+    init_args:
+      bias: null
+      input_size_per_partition: 2048
+      reduce_results: true
+      tp_rank: 0
+      tp_size: 2
+      training: false
+      use_fp8: false
+    inputs:
+      x:
+        shape:
+        - 64
+        - 2048
+        dtype: bfloat16
+  - name: tokens-16384/e06892c1
+    init_args:
+      bias: null
+      input_size_per_partition: 2048
+      reduce_results: true
+      tp_rank: 0
+      tp_size: 2
+      training: false
+      use_fp8: false
+    inputs:
+      x:
+        shape:
+        - 16384
+        - 2048
+        dtype: bfloat16
+attention:
+  scenarios:
+  - name: tokens-1/5d4c9162
+    init_args:
+      attn_scale: 0.1
+      attn_temperature_tuning: false
+      floor_scale: 8192.0
+      head_dim: 128
+      k_norm: null
+      k_wl_norm: null
+      nope: false
+      num_heads: 32
+      num_kv_heads: 8
+      q_norm: null
+      q_wl_norm: null
+      sinks: null
+      training: false
+    inputs:
+      hidden_states:
+        shape:
+        - 1
+        - 4096
+        dtype: bfloat16
+      positions:
+        shape:
+        - 1
+        dtype: int64
+  - name: tokens-4/87882ce0
+    init_args:
+      attn_scale: 0.1
+      attn_temperature_tuning: false
+      floor_scale: 8192.0
+      head_dim: 128
+      k_norm: null
+      k_wl_norm: null
+      nope: false
+      num_heads: 32
+      num_kv_heads: 8
+      q_norm: null
+      q_wl_norm: null
+      sinks: null
+      training: false
+    inputs:
+      hidden_states:
+        shape:
+        - 4
+        - 4096
+        dtype: bfloat16
+      positions:
+        shape:
+        - 4
+        dtype: int64
+  - name: tokens-16/a8a7841c
+    init_args:
+      attn_scale: 0.1
+      attn_temperature_tuning: false
+      floor_scale: 8192.0
+      head_dim: 128
+      k_norm: null
+      k_wl_norm: null
+      nope: false
+      num_heads: 32
+      num_kv_heads: 8
+      q_norm: null
+      q_wl_norm: null
+      sinks: null
+      training: false
+    inputs:
+      hidden_states:
+        shape:
+        - 16
+        - 4096
+        dtype: bfloat16
+      positions:
+        shape:
+        - 16
+        dtype: int64
+  - name: tokens-64/5f005064
+    init_args:
+      attn_scale: 0.1
+      attn_temperature_tuning: false
+      floor_scale: 8192.0
+      head_dim: 128
+      k_norm: null
+      k_wl_norm: null
+      nope: false
+      num_heads: 32
+      num_kv_heads: 8
+      q_norm: null
+      q_wl_norm: null
+      sinks: null
+      training: false
+    inputs:
+      hidden_states:
+        shape:
+        - 64
+        - 4096
+        dtype: bfloat16
+      positions:
+        shape:
+        - 64
+        dtype: int64
+  - name: tokens-16384/b3c3f85e
+    init_args:
+      attn_scale: 0.1
+      attn_temperature_tuning: false
+      floor_scale: 8192.0
+      head_dim: 128
+      k_norm: null
+      k_wl_norm: null
+      nope: false
+      num_heads: 32
+      num_kv_heads: 8
+      q_norm: null
+      q_wl_norm: null
+      sinks: null
+      training: false
+    inputs:
+      hidden_states:
+        shape:
+        - 16384
+        - 4096
+        dtype: bfloat16
+      positions:
+        shape:
+        - 16384
+        dtype: int64
+  - name: tokens-1/02b93255
+    init_args:
+      attn_scale: 0.1
+      attn_temperature_tuning: false
+      floor_scale: 8192.0
+      head_dim: 128
+      k_norm: null
+      k_wl_norm: null
+      nope: false
+      num_heads: 16
+      num_kv_heads: 4
+      q_norm: null
+      q_wl_norm: null
+      sinks: null
+      training: false
+    inputs:
+      hidden_states:
+        shape:
+        - 1
+        - 4096
+        dtype: bfloat16
+      positions:
+        shape:
+        - 1
+        dtype: int64
+  - name: tokens-4/64a034cf
+    init_args:
+      attn_scale: 0.1
+      attn_temperature_tuning: false
+      floor_scale: 8192.0
+      head_dim: 128
+      k_norm: null
+      k_wl_norm: null
+      nope: false
+      num_heads: 16
+      num_kv_heads: 4
+      q_norm: null
+      q_wl_norm: null
+      sinks: null
+      training: false
+    inputs:
+      hidden_states:
+        shape:
+        - 4
+        - 4096
+        dtype: bfloat16
+      positions:
+        shape:
+        - 4
+        dtype: int64
+  - name: tokens-8/cf27b92c
+    init_args:
+      attn_scale: 0.1
+      attn_temperature_tuning: false
+      floor_scale: 8192.0
+      head_dim: 128
+      k_norm: null
+      k_wl_norm: null
+      nope: false
+      num_heads: 16
+      num_kv_heads: 4
+      q_norm: null
+      q_wl_norm: null
+      sinks: null
+      training: false
+    inputs:
+      hidden_states:
+        shape:
+        - 8
+        - 4096
+        dtype: bfloat16
+      positions:
+        shape:
+        - 8
+        dtype: int64
+  - name: tokens-64/40084ffe
+    init_args:
+      attn_scale: 0.1
+      attn_temperature_tuning: false
+      floor_scale: 8192.0
+      head_dim: 128
+      k_norm: null
+      k_wl_norm: null
+      nope: false
+      num_heads: 16
+      num_kv_heads: 4
+      q_norm: null
+      q_wl_norm: null
+      sinks: null
+      training: false
+    inputs:
+      hidden_states:
+        shape:
+        - 64
+        - 4096
+        dtype: bfloat16
+      positions:
+        shape:
+        - 64
+        dtype: int64
+  - name: tokens-16384/a442f2c5
+    init_args:
+      attn_scale: 0.1
+      attn_temperature_tuning: false
+      floor_scale: 8192.0
+      head_dim: 128
+      k_norm: null
+      k_wl_norm: null
+      nope: false
+      num_heads: 16
+      num_kv_heads: 4
+      q_norm: null
+      q_wl_norm: null
+      sinks: null
+      training: false
+    inputs:
+      hidden_states:
+        shape:
+        - 16384
+        - 4096
+        dtype: bfloat16
+      positions:
+        shape:
+        - 16384
+        dtype: int64
+silu_and_mul:
+  scenarios:
+  - name: tokens-1/2e85cf1d
+    init_args:
+      training: false
+    inputs:
+      x:
+        shape:
+        - 1
+        - 28672
+        dtype: bfloat16
+  - name: tokens-2/ce27546e
+    init_args:
+      training: false
+    inputs:
+      x:
+        shape:
+        - 2
+        - 14336
+        dtype: bfloat16
+  - name: tokens-4/9a58df0f
+    init_args:
+      training: false
+    inputs:
+      x:
+        shape:
+        - 4
+        - 28672
+        dtype: bfloat16
+  - name: tokens-8/3302bdfc
+    init_args:
+      training: false
+    inputs:
+      x:
+        shape:
+        - 8
+        - 14336
+        dtype: bfloat16
+  - name: tokens-16/78a7b05a
+    init_args:
+      training: false
+    inputs:
+      x:
+        shape:
+        - 16
+        - 28672
+        dtype: bfloat16
+  - name: tokens-16/7c7e9567
+    init_args:
+      training: false
+    inputs:
+      x:
+        shape:
+        - 16
+        - 14336
+        dtype: bfloat16
+  - name: tokens-64/0c9186ca
+    init_args:
+      training: false
+    inputs:
+      x:
+        shape:
+        - 64
+        - 28672
+        dtype: bfloat16
+  - name: tokens-128/aa2ec865
+    init_args:
+      training: false
+    inputs:
+      x:
+        shape:
+        - 128
+        - 14336
+        dtype: bfloat16
+  - name: tokens-16384/c24f24b7
+    init_args:
+      training: false
+    inputs:
+      x:
+        shape:
+        - 16384
+        - 28672
+        dtype: bfloat16
+  - name: tokens-32768/ebf6f89c
+    init_args:
+      training: false
+    inputs:
+      x:
+        shape:
+        - 32768
+        - 14336
+        dtype: bfloat16
+llama_mlp:
+  scenarios:
+  - name: tokens-1/2e5041c5
+    init_args:
+      training: false
+    inputs:
+      x:
+        shape:
+        - 1
+        - 4096
+        dtype: bfloat16
+  - name: tokens-4/0d530320
+    init_args:
+      training: false
+    inputs:
+      x:
+        shape:
+        - 4
+        - 4096
+        dtype: bfloat16
+  - name: tokens-16/d8dba72b
+    init_args:
+      training: false
+    inputs:
+      x:
+        shape:
+        - 16
+        - 4096
+        dtype: bfloat16
+  - name: tokens-64/0d7cbd31
+    init_args:
+      training: false
+    inputs:
+      x:
+        shape:
+        - 64
+        - 4096
+        dtype: bfloat16
+  - name: tokens-16384/1a566ae9
+    init_args:
+      training: false
+    inputs:
+      x:
+        shape:
+        - 16384
+        - 4096
+        dtype: bfloat16
+llama_decoder:
+  scenarios:
+  - name: tokens-1/925ac419
+    init_args:
+      training: false
+    inputs:
+      hidden_states:
+        shape:
+        - 1
+        - 4096
+        dtype: bfloat16
+      positions:
+        shape:
+        - 1
+        dtype: int64
+      residual: null
+  - name: tokens-4/1967e0c2
+    init_args:
+      training: false
+    inputs:
+      hidden_states:
+        shape:
+        - 4
+        - 4096
+        dtype: bfloat16
+      positions:
+        shape:
+        - 4
+        dtype: int64
+      residual: null
+  - name: tokens-16/f16a7c08
+    init_args:
+      training: false
+    inputs:
+      hidden_states:
+        shape:
+        - 16
+        - 4096
+        dtype: bfloat16
+      positions:
+        shape:
+        - 16
+        dtype: int64
+      residual: null
+  - name: tokens-64/794a2b33
+    init_args:
+      training: false
+    inputs:
+      hidden_states:
+        shape:
+        - 64
+        - 4096
+        dtype: bfloat16
+      positions:
+        shape:
+        - 64
+        dtype: int64
+      residual: null
+  - name: tokens-16384/bca2926b
+    init_args:
+      training: false
+    inputs:
+      hidden_states:
+        shape:
+        - 16384
+        - 4096
+        dtype: bfloat16
+      positions:
+        shape:
+        - 16384
+        dtype: int64
+      residual: null
+  - name: tokens-1/858d94ae
+    init_args:
+      training: false
+    inputs:
+      hidden_states:
+        shape:
+        - 1
+        - 4096
+        dtype: bfloat16
+      positions:
+        shape:
+        - 1
+        dtype: int64
+      residual:
+        shape:
+        - 1
+        - 4096
+        dtype: bfloat16
+  - name: tokens-4/2cc393c0
+    init_args:
+      training: false
+    inputs:
+      hidden_states:
+        shape:
+        - 4
+        - 4096
+        dtype: bfloat16
+      positions:
+        shape:
+        - 4
+        dtype: int64
+      residual:
+        shape:
+        - 4
+        - 4096
+        dtype: bfloat16
+  - name: tokens-16/f8a9b67a
+    init_args:
+      training: false
+    inputs:
+      hidden_states:
+        shape:
+        - 16
+        - 4096
+        dtype: bfloat16
+      positions:
+        shape:
+        - 16
+        dtype: int64
+      residual:
+        shape:
+        - 16
+        - 4096
+        dtype: bfloat16
+  - name: tokens-64/f4c2ccc0
+    init_args:
+      training: false
+    inputs:
+      hidden_states:
+        shape:
+        - 64
+        - 4096
+        dtype: bfloat16
+      positions:
+        shape:
+        - 64
+        dtype: int64
+      residual:
+        shape:
+        - 64
+        - 4096
+        dtype: bfloat16
+  - name: tokens-16384/ce8370b9
+    init_args:
+      training: false
+    inputs:
+      hidden_states:
+        shape:
+        - 16384
+        - 4096
+        dtype: bfloat16
+      positions:
+        shape:
+        - 16384
+        dtype: int64
+      residual:
+        shape:
+        - 16384
+        - 4096
+        dtype: bfloat16
+llama:
+  scenarios:
+  - name: tokens-1/22514e92
+    init_args:
+      training: false
+    inputs:
+      input_ids:
+        shape:
+        - 1
+        dtype: int64
+      positions:
+        shape:
+        - 1
+        dtype: int64
+  - name: tokens-4/a18ca6b6
+    init_args:
+      training: false
+    inputs:
+      input_ids:
+        shape:
+        - 4
+        dtype: int64
+      positions:
+        shape:
+        - 4
+        dtype: int64
+  - name: tokens-16/242dd3b1
+    init_args:
+      training: false
+    inputs:
+      input_ids:
+        shape:
+        - 16
+        dtype: int64
+      positions:
+        shape:
+        - 16
+        dtype: int64
+  - name: tokens-64/b0b89fe5
+    init_args:
+      training: false
+    inputs:
+      input_ids:
+        shape:
+        - 64
+        dtype: int64
+      positions:
+        shape:
+        - 64
+        dtype: int64
+  - name: tokens-16384/40511f19
+    init_args:
+      training: false
+    inputs:
+      input_ids:
+        shape:
+        - 16384
+        dtype: int64
+      positions:
+        shape:
+        - 16384
+        dtype: int64
+parallel_embedding:
+  scenarios:
+  - name: tokens-1272/20e71db1
+    init_args:
+      embedding_dim: 4096
+      num_embeddings: 128256
+      org_vocab_size: 128256
+      padding_size: 64
+      per_partition: 128256
+      tp_size: 1
+      training: false
+      vocab_end: 128256
+      vocab_start: 0
+    inputs:
+      x:
+        shape:
+        - 1272
+        - 4096
+        dtype: bfloat16
+  - name: tokens-1397/aea0fbdb
+    init_args:
+      embedding_dim: 4096
+      num_embeddings: 128256
+      org_vocab_size: 128256
+      padding_size: 64
+      per_partition: 128256
+      tp_size: 1
+      training: false
+      vocab_end: 128256
+      vocab_start: 0
+    inputs:
+      x:
+        shape:
+        - 1397
+        - 4096
+        dtype: bfloat16
+  - name: tokens-16384/b0bbe131
+    init_args:
+      embedding_dim: 4096
+      num_embeddings: 128256
+      org_vocab_size: 128256
+      padding_size: 64
+      per_partition: 128256
+      tp_size: 1
+      training: false
+      vocab_end: 128256
+      vocab_start: 0
+    inputs:
+      x:
+        shape:
+        - 16384
+        - 4096
+        dtype: bfloat16
+  - name: tokens-6401/a2be5cc6
+    init_args:
+      embedding_dim: 4096
+      num_embeddings: 32000
+      org_vocab_size: 32000
+      padding_size: 64
+      per_partition: 16000
+      tp_size: 2
+      training: false
+      vocab_end: 16000
+      vocab_start: 0
+    inputs:
+      x:
+        shape:
+        - 6401
+        - 4096
+        dtype: bfloat16
+  - name: tokens-10795/4bd98627
+    init_args:
+      embedding_dim: 4096
+      num_embeddings: 32000
+      org_vocab_size: 32000
+      padding_size: 64
+      per_partition: 16000
+      tp_size: 2
+      training: false
+      vocab_end: 16000
+      vocab_start: 0
+    inputs:
+      x:
+        shape:
+        - 10795
+        - 4096
+        dtype: bfloat16
+  - name: tokens-16384/273ad6e3
+    init_args:
+      embedding_dim: 4096
+      num_embeddings: 32000
+      org_vocab_size: 32000
+      padding_size: 64
+      per_partition: 16000
+      tp_size: 2
+      training: false
+      vocab_end: 16000
+      vocab_start: 0
+    inputs:
+      x:
+        shape:
+        - 16384
+        - 4096
+        dtype: bfloat16
+flashinfer_decode:
+  scenarios:
+  - name: tokens-70615/0e38509a
+    init_args:
+      head_dim: 128
+      num_kv_heads: 8
+      num_qo_heads: 32
+      sm_scale: 0.08838834764831845
+      training: false
+    inputs:
+      block_table:
+        shape:
+        - 23
+        - 105
+        dtype: int32
+      cache_seqlens:
+        shape:
+        - 23
+        dtype: int32
+      causal: true
+      k_cache:
+        shape:
+        - 70615
+        - 8
+        - 16
+        - 128
+        dtype: bfloat16
+      max_seq_len: 1677
+      q:
+        shape:
+        - 23
+        - 32
+        - 128
+        dtype: bfloat16
+      softmax_scale: 0.08838834764831845
+      v_cache:
+        shape:
+        - 70615
+        - 8
+        - 16
+        - 128
+        dtype: bfloat16
+  - name: tokens-70615/12673b2a
+    init_args:
+      head_dim: 128
+      num_kv_heads: 8
+      num_qo_heads: 32
+      sm_scale: 0.08838834764831845
+      training: false
+    inputs:
+      block_table:
+        shape:
+        - 13
+        - 105
+        dtype: int32
+      cache_seqlens:
+        shape:
+        - 13
+        dtype: int32
+      causal: true
+      k_cache:
+        shape:
+        - 70615
+        - 8
+        - 16
+        - 128
+        dtype: bfloat16
+      max_seq_len: 1675
+      q:
+        shape:
+        - 13
+        - 32
+        - 128
+        dtype: bfloat16
+      softmax_scale: 0.08838834764831845
+      v_cache:
+        shape:
+        - 70615
+        - 8
+        - 16
+        - 128
+        dtype: bfloat16
+  - name: tokens-70615/1f962063
+    init_args:
+      head_dim: 128
+      num_kv_heads: 8
+      num_qo_heads: 32
+      sm_scale: 0.08838834764831845
+      training: false
+    inputs:
+      block_table:
+        shape:
+        - 13
+        - 105
+        dtype: int32
+      cache_seqlens:
+        shape:
+        - 13
+        dtype: int32
+      causal: true
+      k_cache:
+        shape:
+        - 70615
+        - 8
+        - 16
+        - 128
+        dtype: bfloat16
+      max_seq_len: 1680
+      q:
+        shape:
+        - 13
+        - 32
+        - 128
+        dtype: bfloat16
+      softmax_scale: 0.08838834764831845
+      v_cache:
+        shape:
+        - 70615
+        - 8
+        - 16
+        - 128
+        dtype: bfloat16
+  - name: tokens-70615/202fdcd0
+    init_args:
+      head_dim: 128
+      num_kv_heads: 8
+      num_qo_heads: 32
+      sm_scale: 0.08838834764831845
+      training: false
+    inputs:
+      block_table:
+        shape:
+        - 13
+        - 105
+        dtype: int32
+      cache_seqlens:
+        shape:
+        - 13
+        dtype: int32
+      causal: true
+      k_cache:
+        shape:
+        - 70615
+        - 8
+        - 16
+        - 128
+        dtype: bfloat16
+      max_seq_len: 1676
+      q:
+        shape:
+        - 13
+        - 32
+        - 128
+        dtype: bfloat16
+      softmax_scale: 0.08838834764831845
+      v_cache:
+        shape:
+        - 70615
+        - 8
+        - 16
+        - 128
+        dtype: bfloat16
+  - name: tokens-70615/2db8ff2f
+    init_args:
+      head_dim: 128
+      num_kv_heads: 8
+      num_qo_heads: 32
+      sm_scale: 0.08838834764831845
+      training: false
+    inputs:
+      block_table:
+        shape:
+        - 1
+        - 105
+        dtype: int32
+      cache_seqlens:
+        shape:
+        - 1
+        dtype: int32
+      causal: true
+      k_cache:
+        shape:
+        - 70615
+        - 8
+        - 16
+        - 128
+        dtype: bfloat16
+      max_seq_len: 1677
+      q:
+        shape:
+        - 1
+        - 32
+        - 128
+        dtype: bfloat16
+      softmax_scale: 0.08838834764831845
+      v_cache:
+        shape:
+        - 70615
+        - 8
+        - 16
+        - 128
+        dtype: bfloat16
+  - name: tokens-70615/31c9cb90
+    init_args:
+      head_dim: 128
+      num_kv_heads: 8
+      num_qo_heads: 32
+      sm_scale: 0.08838834764831845
+      training: false
+    inputs:
+      block_table:
+        shape:
+        - 3
+        - 105
+        dtype: int32
+      cache_seqlens:
+        shape:
+        - 3
+        dtype: int32
+      causal: true
+      k_cache:
+        shape:
+        - 70615
+        - 8
+        - 16
+        - 128
+        dtype: bfloat16
+      max_seq_len: 1676
+      q:
+        shape:
+        - 3
+        - 32
+        - 128
+        dtype: bfloat16
+      softmax_scale: 0.08838834764831845
+      v_cache:
+        shape:
+        - 70615
+        - 8
+        - 16
+        - 128
+        dtype: bfloat16
+  - name: tokens-70615/3b5a4d5e
+    init_args:
+      head_dim: 128
+      num_kv_heads: 8
+      num_qo_heads: 32
+      sm_scale: 0.08838834764831845
+      training: false
+    inputs:
+      block_table:
+        shape:
+        - 50
+        - 105
+        dtype: int32
+      cache_seqlens:
+        shape:
+        - 50
+        dtype: int32
+      causal: true
+      k_cache:
+        shape:
+        - 70615
+        - 8
+        - 16
+        - 128
+        dtype: bfloat16
+      max_seq_len: 1677
+      q:
+        shape:
+        - 50
+        - 32
+        - 128
+        dtype: bfloat16
+      softmax_scale: 0.08838834764831845
+      v_cache:
+        shape:
+        - 70615
+        - 8
+        - 16
+        - 128
+        dtype: bfloat16
+  - name: tokens-70615/3e33f0a8
+    init_args:
+      head_dim: 128
+      num_kv_heads: 8
+      num_qo_heads: 32
+      sm_scale: 0.08838834764831845
+      training: false
+    inputs:
+      block_table:
+        shape:
+        - 7
+        - 106
+        dtype: int32
+      cache_seqlens:
+        shape:
+        - 7
+        dtype: int32
+      causal: true
+      k_cache:
+        shape:
+        - 70615
+        - 8
+        - 16
+        - 128
+        dtype: bfloat16
+      max_seq_len: 1691
+      q:
+        shape:
+        - 7
+        - 32
+        - 128
+        dtype: bfloat16
+      softmax_scale: 0.08838834764831845
+      v_cache:
+        shape:
+        - 70615
+        - 8
+        - 16
+        - 128
+        dtype: bfloat16
+  - name: tokens-70615/435184f8
+    init_args:
+      head_dim: 128
+      num_kv_heads: 8
+      num_qo_heads: 32
+      sm_scale: 0.08838834764831845
+      training: false
+    inputs:
+      block_table:
+        shape:
+        - 13
+        - 105
+        dtype: int32
+      cache_seqlens:
+        shape:
+        - 13
+        dtype: int32
+      causal: true
+      k_cache:
+        shape:
+        - 70615
+        - 8
+        - 16
+        - 128
+        dtype: bfloat16
+      max_seq_len: 1677
+      q:
+        shape:
+        - 13
+        - 32
+        - 128
+        dtype: bfloat16
+      softmax_scale: 0.08838834764831845
+      v_cache:
+        shape:
+        - 70615
+        - 8
+        - 16
+        - 128
+        dtype: bfloat16
+  - name: tokens-70615/69ad63e3
+    init_args:
+      head_dim: 128
+      num_kv_heads: 8
+      num_qo_heads: 32
+      sm_scale: 0.08838834764831845
+      training: false
+    inputs:
+      block_table:
+        shape:
+        - 17
+        - 105
+        dtype: int32
+      cache_seqlens:
+        shape:
+        - 17
+        dtype: int32
+      causal: true
+      k_cache:
+        shape:
+        - 70615
+        - 8
+        - 16
+        - 128
+        dtype: bfloat16
+      max_seq_len: 1680
+      q:
+        shape:
+        - 17
+        - 32
+        - 128
+        dtype: bfloat16
+      softmax_scale: 0.08838834764831845
+      v_cache:
+        shape:
+        - 70615
+        - 8
+        - 16
+        - 128
+        dtype: bfloat16
+  - name: tokens-70615/74d7972a
+    init_args:
+      head_dim: 128
+      num_kv_heads: 8
+      num_qo_heads: 32
+      sm_scale: 0.08838834764831845
+      training: false
+    inputs:
+      block_table:
+        shape:
+        - 1
+        - 105
+        dtype: int32
+      cache_seqlens:
+        shape:
+        - 1
+        dtype: int32
+      causal: true
+      k_cache:
+        shape:
+        - 70615
+        - 8
+        - 16
+        - 128
+        dtype: bfloat16
+      max_seq_len: 1675
+      q:
+        shape:
+        - 1
+        - 32
+        - 128
+        dtype: bfloat16
+      softmax_scale: 0.08838834764831845
+      v_cache:
+        shape:
+        - 70615
+        - 8
+        - 16
+        - 128
+        dtype: bfloat16
+  - name: tokens-70615/784d4806
+    init_args:
+      head_dim: 128
+      num_kv_heads: 8
+      num_qo_heads: 32
+      sm_scale: 0.08838834764831845
+      training: false
+    inputs:
+      block_table:
+        shape:
+        - 47
+        - 105
+        dtype: int32
+      cache_seqlens:
+        shape:
+        - 47
+        dtype: int32
+      causal: true
+      k_cache:
+        shape:
+        - 70615
+        - 8
+        - 16
+        - 128
+        dtype: bfloat16
+      max_seq_len: 1680
+      q:
+        shape:
+        - 47
+        - 32
+        - 128
+        dtype: bfloat16
+      softmax_scale: 0.08838834764831845
+      v_cache:
+        shape:
+        - 70615
+        - 8
+        - 16
+        - 128
+        dtype: bfloat16
+  - name: tokens-70615/7a8b0286
+    init_args:
+      head_dim: 128
+      num_kv_heads: 8
+      num_qo_heads: 32
+      sm_scale: 0.08838834764831845
+      training: false
+    inputs:
+      block_table:
+        shape:
+        - 20
+        - 105
+        dtype: int32
+      cache_seqlens:
+        shape:
+        - 20
+        dtype: int32
+      causal: true
+      k_cache:
+        shape:
+        - 70615
+        - 8
+        - 16
+        - 128
+        dtype: bfloat16
+      max_seq_len: 1680
+      q:
+        shape:
+        - 20
+        - 32
+        - 128
+        dtype: bfloat16
+      softmax_scale: 0.08838834764831845
+      v_cache:
+        shape:
+        - 70615
+        - 8
+        - 16
+        - 128
+        dtype: bfloat16
+  - name: tokens-70615/7aa0ee62
+    init_args:
+      head_dim: 128
+      num_kv_heads: 8
+      num_qo_heads: 32
+      sm_scale: 0.08838834764831845
+      training: false
+    inputs:
+      block_table:
+        shape:
+        - 14
+        - 106
+        dtype: int32
+      cache_seqlens:
+        shape:
+        - 14
+        dtype: int32
+      causal: true
+      k_cache:
+        shape:
+        - 70615
+        - 8
+        - 16
+        - 128
+        dtype: bfloat16
+      max_seq_len: 1691
+      q:
+        shape:
+        - 14
+        - 32
+        - 128
+        dtype: bfloat16
+      softmax_scale: 0.08838834764831845
+      v_cache:
+        shape:
+        - 70615
+        - 8
+        - 16
+        - 128
+        dtype: bfloat16
+  - name: tokens-70615/7ce42f16
+    init_args:
+      head_dim: 128
+      num_kv_heads: 8
+      num_qo_heads: 32
+      sm_scale: 0.08838834764831845
+      training: false
+    inputs:
+      block_table:
+        shape:
+        - 18
+        - 105
+        dtype: int32
+      cache_seqlens:
+        shape:
+        - 18
+        dtype: int32
+      causal: true
+      k_cache:
+        shape:
+        - 70615
+        - 8
+        - 16
+        - 128
+        dtype: bfloat16
+      max_seq_len: 1677
+      q:
+        shape:
+        - 18
+        - 32
+        - 128
+        dtype: bfloat16
+      softmax_scale: 0.08838834764831845
+      v_cache:
+        shape:
+        - 70615
+        - 8
+        - 16
+        - 128
+        dtype: bfloat16
+  - name: tokens-70615/7d1d0203
+    init_args:
+      head_dim: 128
+      num_kv_heads: 8
+      num_qo_heads: 32
+      sm_scale: 0.08838834764831845
+      training: false
+    inputs:
+      block_table:
+        shape:
+        - 3
+        - 105
+        dtype: int32
+      cache_seqlens:
+        shape:
+        - 3
+        dtype: int32
+      causal: true
+      k_cache:
+        shape:
+        - 70615
+        - 8
+        - 16
+        - 128
+        dtype: bfloat16
+      max_seq_len: 1675
+      q:
+        shape:
+        - 3
+        - 32
+        - 128
+        dtype: bfloat16
+      softmax_scale: 0.08838834764831845
+      v_cache:
+        shape:
+        - 70615
+        - 8
+        - 16
+        - 128
+        dtype: bfloat16
+  - name: tokens-70615/863b914a
+    init_args:
+      head_dim: 128
+      num_kv_heads: 8
+      num_qo_heads: 32
+      sm_scale: 0.08838834764831845
+      training: false
+    inputs:
+      block_table:
+        shape:
+        - 25
+        - 105
+        dtype: int32
+      cache_seqlens:
+        shape:
+        - 25
+        dtype: int32
+      causal: true
+      k_cache:
+        shape:
+        - 70615
+        - 8
+        - 16
+        - 128
+        dtype: bfloat16
+      max_seq_len: 1675
+      q:
+        shape:
+        - 25
+        - 32
+        - 128
+        dtype: bfloat16
+      softmax_scale: 0.08838834764831845
+      v_cache:
+        shape:
+        - 70615
+        - 8
+        - 16
+        - 128
+        dtype: bfloat16
+  - name: tokens-70615/8ae57609
+    init_args:
+      head_dim: 128
+      num_kv_heads: 8
+      num_qo_heads: 32
+      sm_scale: 0.08838834764831845
+      training: false
+    inputs:
+      block_table:
+        shape:
+        - 51
+        - 105
+        dtype: int32
+      cache_seqlens:
+        shape:
+        - 51
+        dtype: int32
+      causal: true
+      k_cache:
+        shape:
+        - 70615
+        - 8
+        - 16
+        - 128
+        dtype: bfloat16
+      max_seq_len: 1675
+      q:
+        shape:
+        - 51
+        - 32
+        - 128
+        dtype: bfloat16
+      softmax_scale: 0.08838834764831845
+      v_cache:
+        shape:
+        - 70615
+        - 8
+        - 16
+        - 128
+        dtype: bfloat16
+  - name: tokens-70615/af060b9b
+    init_args:
+      head_dim: 128
+      num_kv_heads: 8
+      num_qo_heads: 32
+      sm_scale: 0.08838834764831845
+      training: false
+    inputs:
+      block_table:
+        shape:
+        - 51
+        - 105
+        dtype: int32
+      cache_seqlens:
+        shape:
+        - 51
+        dtype: int32
+      causal: true
+      k_cache:
+        shape:
+        - 70615
+        - 8
+        - 16
+        - 128
+        dtype: bfloat16
+      max_seq_len: 1676
+      q:
+        shape:
+        - 51
+        - 32
+        - 128
+        dtype: bfloat16
+      softmax_scale: 0.08838834764831845
+      v_cache:
+        shape:
+        - 70615
+        - 8
+        - 16
+        - 128
+        dtype: bfloat16
+  - name: tokens-70615/b571080c
+    init_args:
+      head_dim: 128
+      num_kv_heads: 8
+      num_qo_heads: 32
+      sm_scale: 0.08838834764831845
+      training: false
+    inputs:
+      block_table:
+        shape:
+        - 24
+        - 105
+        dtype: int32
+      cache_seqlens:
+        shape:
+        - 24
+        dtype: int32
+      causal: true
+      k_cache:
+        shape:
+        - 70615
+        - 8
+        - 16
+        - 128
+        dtype: bfloat16
+      max_seq_len: 1676
+      q:
+        shape:
+        - 24
+        - 32
+        - 128
+        dtype: bfloat16
+      softmax_scale: 0.08838834764831845
+      v_cache:
+        shape:
+        - 70615
+        - 8
+        - 16
+        - 128
+        dtype: bfloat16
+  - name: tokens-70615/c3aa7e43
+    init_args:
+      head_dim: 128
+      num_kv_heads: 8
+      num_qo_heads: 32
+      sm_scale: 0.08838834764831845
+      training: false
+    inputs:
+      block_table:
+        shape:
+        - 41
+        - 106
+        dtype: int32
+      cache_seqlens:
+        shape:
+        - 41
+        dtype: int32
+      causal: true
+      k_cache:
+        shape:
+        - 70615
+        - 8
+        - 16
+        - 128
+        dtype: bfloat16
+      max_seq_len: 1691
+      q:
+        shape:
+        - 41
+        - 32
+        - 128
+        dtype: bfloat16
+      softmax_scale: 0.08838834764831845
+      v_cache:
+        shape:
+        - 70615
+        - 8
+        - 16
+        - 128
+        dtype: bfloat16
+  - name: tokens-70615/ce5e0a72
+    init_args:
+      head_dim: 128
+      num_kv_heads: 8
+      num_qo_heads: 32
+      sm_scale: 0.08838834764831845
+      training: false
+    inputs:
+      block_table:
+        shape:
+        - 19
+        - 105
+        dtype: int32
+      cache_seqlens:
+        shape:
+        - 19
+        dtype: int32
+      causal: true
+      k_cache:
+        shape:
+        - 70615
+        - 8
+        - 16
+        - 128
+        dtype: bfloat16
+      max_seq_len: 1676
+      q:
+        shape:
+        - 19
+        - 32
+        - 128
+        dtype: bfloat16
+      softmax_scale: 0.08838834764831845
+      v_cache:
+        shape:
+        - 70615
+        - 8
+        - 16
+        - 128
+        dtype: bfloat16
+  - name: tokens-70615/e0fbbd07
+    init_args:
+      head_dim: 128
+      num_kv_heads: 8
+      num_qo_heads: 32
+      sm_scale: 0.08838834764831845
+      training: false
+    inputs:
+      block_table:
+        shape:
+        - 1
+        - 105
+        dtype: int32
+      cache_seqlens:
+        shape:
+        - 1
+        dtype: int32
+      causal: true
+      k_cache:
+        shape:
+        - 70615
+        - 8
+        - 16
+        - 128
+        dtype: bfloat16
+      max_seq_len: 1680
+      q:
+        shape:
+        - 1
+        - 32
+        - 128
+        dtype: bfloat16
+      softmax_scale: 0.08838834764831845
+      v_cache:
+        shape:
+        - 70615
+        - 8
+        - 16
+        - 128
+        dtype: bfloat16
+  - name: tokens-70615/f9bf7147
+    init_args:
+      head_dim: 128
+      num_kv_heads: 8
+      num_qo_heads: 32
+      sm_scale: 0.08838834764831845
+      training: false
+    inputs:
+      block_table:
+        shape:
+        - 13
+        - 106
+        dtype: int32
+      cache_seqlens:
+        shape:
+        - 13
+        dtype: int32
+      causal: true
+      k_cache:
+        shape:
+        - 70615
+        - 8
+        - 16
+        - 128
+        dtype: bfloat16
+      max_seq_len: 1691
+      q:
+        shape:
+        - 13
+        - 32
+        - 128
+        dtype: bfloat16
+      softmax_scale: 0.08838834764831845
+      v_cache:
+        shape:
+        - 70615
+        - 8
+        - 16
+        - 128
+        dtype: bfloat16
+  - name: tokens-109779/0945a270
+    init_args:
+      head_dim: 128
+      num_kv_heads: 4
+      num_qo_heads: 16
+      sm_scale: 0.08838834764831845
+      training: false
+    inputs:
+      block_table:
+        shape:
+        - 1
+        - 265
+        dtype: int32
+      cache_seqlens:
+        shape:
+        - 1
+        dtype: int32
+      causal: true
+      k_cache:
+        shape:
+        - 109779
+        - 4
+        - 16
+        - 128
+        dtype: bfloat16
+      max_seq_len: 4226
+      q:
+        shape:
+        - 1
+        - 16
+        - 128
+        dtype: bfloat16
+      softmax_scale: 0.08838834764831845
+      v_cache:
+        shape:
+        - 109779
+        - 4
+        - 16
+        - 128
+        dtype: bfloat16
+  - name: tokens-109779/0ac1777c
+    init_args:
+      head_dim: 128
+      num_kv_heads: 4
+      num_qo_heads: 16
+      sm_scale: 0.08838834764831845
+      training: false
+    inputs:
+      block_table:
+        shape:
+        - 3
+        - 236
+        dtype: int32
+      cache_seqlens:
+        shape:
+        - 3
+        dtype: int32
+      causal: true
+      k_cache:
+        shape:
+        - 109779
+        - 4
+        - 16
+        - 128
+        dtype: bfloat16
+      max_seq_len: 3762
+      q:
+        shape:
+        - 3
+        - 16
+        - 128
+        dtype: bfloat16
+      softmax_scale: 0.08838834764831845
+      v_cache:
+        shape:
+        - 109779
+        - 4
+        - 16
+        - 128
+        dtype: bfloat16
+  - name: tokens-109779/223bde60
+    init_args:
+      head_dim: 128
+      num_kv_heads: 4
+      num_qo_heads: 16
+      sm_scale: 0.08838834764831845
+      training: false
+    inputs:
+      block_table:
+        shape:
+        - 40
+        - 236
+        dtype: int32
+      cache_seqlens:
+        shape:
+        - 40
+        dtype: int32
+      causal: true
+      k_cache:
+        shape:
+        - 109779
+        - 4
+        - 16
+        - 128
+        dtype: bfloat16
+      max_seq_len: 3762
+      q:
+        shape:
+        - 40
+        - 16
+        - 128
+        dtype: bfloat16
+      softmax_scale: 0.08838834764831845
+      v_cache:
+        shape:
+        - 109779
+        - 4
+        - 16
+        - 128
+        dtype: bfloat16
+  - name: tokens-109779/411e18f4
+    init_args:
+      head_dim: 128
+      num_kv_heads: 4
+      num_qo_heads: 16
+      sm_scale: 0.08838834764831845
+      training: false
+    inputs:
+      block_table:
+        shape:
+        - 4
+        - 217
+        dtype: int32
+      cache_seqlens:
+        shape:
+        - 4
+        dtype: int32
+      causal: true
+      k_cache:
+        shape:
+        - 109779
+        - 4
+        - 16
+        - 128
+        dtype: bfloat16
+      max_seq_len: 3472
+      q:
+        shape:
+        - 4
+        - 16
+        - 128
+        dtype: bfloat16
+      softmax_scale: 0.08838834764831845
+      v_cache:
+        shape:
+        - 109779
+        - 4
+        - 16
+        - 128
+        dtype: bfloat16
+  - name: tokens-109779/4b5e75fc
+    init_args:
+      head_dim: 128
+      num_kv_heads: 4
+      num_qo_heads: 16
+      sm_scale: 0.08838834764831845
+      training: false
+    inputs:
+      block_table:
+        shape:
+        - 100
+        - 216
+        dtype: int32
+      cache_seqlens:
+        shape:
+        - 100
+        dtype: int32
+      causal: true
+      k_cache:
+        shape:
+        - 109779
+        - 4
+        - 16
+        - 128
+        dtype: bfloat16
+      max_seq_len: 3442
+      q:
+        shape:
+        - 100
+        - 16
+        - 128
+        dtype: bfloat16
+      softmax_scale: 0.08838834764831845
+      v_cache:
+        shape:
+        - 109779
+        - 4
+        - 16
+        - 128
+        dtype: bfloat16
+  - name: tokens-109779/52a05caf
+    init_args:
+      head_dim: 128
+      num_kv_heads: 4
+      num_qo_heads: 16
+      sm_scale: 0.08838834764831845
+      training: false
+    inputs:
+      block_table:
+        shape:
+        - 5
+        - 202
+        dtype: int32
+      cache_seqlens:
+        shape:
+        - 5
+        dtype: int32
+      causal: true
+      k_cache:
+        shape:
+        - 109779
+        - 4
+        - 16
+        - 128
+        dtype: bfloat16
+      max_seq_len: 3219
+      q:
+        shape:
+        - 5
+        - 16
+        - 128
+        dtype: bfloat16
+      softmax_scale: 0.08838834764831845
+      v_cache:
+        shape:
+        - 109779
+        - 4
+        - 16
+        - 128
+        dtype: bfloat16
+  - name: tokens-109779/66e35f9f
+    init_args:
+      head_dim: 128
+      num_kv_heads: 4
+      num_qo_heads: 16
+      sm_scale: 0.08838834764831845
+      training: false
+    inputs:
+      block_table:
+        shape:
+        - 4
+        - 216
+        dtype: int32
+      cache_seqlens:
+        shape:
+        - 4
+        dtype: int32
+      causal: true
+      k_cache:
+        shape:
+        - 109779
+        - 4
+        - 16
+        - 128
+        dtype: bfloat16
+      max_seq_len: 3442
+      q:
+        shape:
+        - 4
+        - 16
+        - 128
+        dtype: bfloat16
+      softmax_scale: 0.08838834764831845
+      v_cache:
+        shape:
+        - 109779
+        - 4
+        - 16
+        - 128
+        dtype: bfloat16
+  - name: tokens-109779/9860dfe3
+    init_args:
+      head_dim: 128
+      num_kv_heads: 4
+      num_qo_heads: 16
+      sm_scale: 0.08838834764831845
+      training: false
+    inputs:
+      block_table:
+        shape:
+        - 100
+        - 202
+        dtype: int32
+      cache_seqlens:
+        shape:
+        - 100
+        dtype: int32
+      causal: true
+      k_cache:
+        shape:
+        - 109779
+        - 4
+        - 16
+        - 128
+        dtype: bfloat16
+      max_seq_len: 3219
+      q:
+        shape:
+        - 100
+        - 16
+        - 128
+        dtype: bfloat16
+      softmax_scale: 0.08838834764831845
+      v_cache:
+        shape:
+        - 109779
+        - 4
+        - 16
+        - 128
+        dtype: bfloat16
+  - name: tokens-109779/aa49f2ac
+    init_args:
+      head_dim: 128
+      num_kv_heads: 4
+      num_qo_heads: 16
+      sm_scale: 0.08838834764831845
+      training: false
+    inputs:
+      block_table:
+        shape:
+        - 100
+        - 217
+        dtype: int32
+      cache_seqlens:
+        shape:
+        - 100
+        dtype: int32
+      causal: true
+      k_cache:
+        shape:
+        - 109779
+        - 4
+        - 16
+        - 128
+        dtype: bfloat16
+      max_seq_len: 3472
+      q:
+        shape:
+        - 100
+        - 16
+        - 128
+        dtype: bfloat16
+      softmax_scale: 0.08838834764831845
+      v_cache:
+        shape:
+        - 109779
+        - 4
+        - 16
+        - 128
+        dtype: bfloat16
+allreduce:
+  scenarios:
+  - name: tokens-1/1a3f097c
+    init_args:
+      training: false
+    inputs:
+      tensor:
+        shape:
+        - 1
+        - 4096
+        dtype: bfloat16
+  - name: tokens-4/f9d3db9a
+    init_args:
+      training: false
+    inputs:
+      tensor:
+        shape:
+        - 4
+        - 4096
+        dtype: bfloat16
+  - name: tokens-8/8bbde20a
+    init_args:
+      training: false
+    inputs:
+      tensor:
+        shape:
+        - 8
+        - 4096
+        dtype: bfloat16
+  - name: tokens-64/8a3ea42a
+    init_args:
+      training: false
+    inputs:
+      tensor:
+        shape:
+        - 64
+        - 4096
+        dtype: bfloat16
+  - name: tokens-16384/5b22a522
+    init_args:
+      training: false
+    inputs:
+      tensor:
+        shape:
+        - 16384
+        - 4096
+        dtype: bfloat16
+linear:
+  scenarios:
+  - name: tokens-1/9f66cd1e
+    init_args:
+      bias: null
+      training: false
+    inputs:
+      input:
+        shape:
+        - 1
+        - 4096
+        dtype: bfloat16
+  - name: tokens-4/4465c7f5
+    init_args:
+      bias: null
+      training: false
+    inputs:
+      input:
+        shape:
+        - 4
+        - 4096
+        dtype: bfloat16
+  - name: tokens-8/54ee66d9
+    init_args:
+      bias: null
+      training: false
+    inputs:
+      input:
+        shape:
+        - 8
+        - 4096
+        dtype: bfloat16
+  - name: tokens-64/fda65008
+    init_args:
+      bias: null
+      training: false
+    inputs:
+      input:
+        shape:
+        - 64
+        - 4096
+        dtype: bfloat16
+  - name: tokens-16384/46a53356
+    init_args:
+      bias: null
+      training: false
+    inputs:
+      input:
+        shape:
+        - 16384
+        - 4096
+        dtype: bfloat16
+moe_sum:
+  scenarios:
+  - name: tokens-2/b314e153
+    init_args:
+      training: false
+    inputs:
+      input:
+        shape:
+        - 2
+        - 4096
+        dtype: bfloat16
+      topk: 2
+  - name: tokens-8/babee85d
+    init_args:
+      training: false
+    inputs:
+      input:
+        shape:
+        - 8
+        - 4096
+        dtype: bfloat16
+      topk: 2
+  - name: tokens-16/67020445
+    init_args:
+      training: false
+    inputs:
+      input:
+        shape:
+        - 16
+        - 4096
+        dtype: bfloat16
+      topk: 2
+  - name: tokens-128/2c2c06fc
+    init_args:
+      training: false
+    inputs:
+      input:
+        shape:
+        - 128
+        - 4096
+        dtype: bfloat16
+      topk: 2
+  - name: tokens-32768/d0ef3407
+    init_args:
+      training: false
+    inputs:
+      input:
+        shape:
+        - 32768
+        - 4096
+        dtype: bfloat16
+      topk: 2
+mixtral_moe:
+  scenarios:
+  - name: tokens-1/87343b00
+    init_args:
+      hidden_size: 4096
+      intermediate_per_tp: 7168
+      num_experts: 8
+      top_k: 2
+      tp_size: 2
+      training: false
+    inputs:
+      hidden_states:
+        shape:
+        - 1
+        - 4096
+        dtype: bfloat16
+  - name: tokens-4/bff21a0a
+    init_args:
+      hidden_size: 4096
+      intermediate_per_tp: 7168
+      num_experts: 8
+      top_k: 2
+      tp_size: 2
+      training: false
+    inputs:
+      hidden_states:
+        shape:
+        - 4
+        - 4096
+        dtype: bfloat16
+  - name: tokens-8/f63d3e31
+    init_args:
+      hidden_size: 4096
+      intermediate_per_tp: 7168
+      num_experts: 8
+      top_k: 2
+      tp_size: 2
+      training: false
+    inputs:
+      hidden_states:
+        shape:
+        - 8
+        - 4096
+        dtype: bfloat16
+  - name: tokens-64/64dd68a3
+    init_args:
+      hidden_size: 4096
+      intermediate_per_tp: 7168
+      num_experts: 8
+      top_k: 2
+      tp_size: 2
+      training: false
+    inputs:
+      hidden_states:
+        shape:
+        - 64
+        - 4096
+        dtype: bfloat16
+  - name: tokens-16384/3d96a4d1
+    init_args:
+      hidden_size: 4096
+      intermediate_per_tp: 7168
+      num_experts: 8
+      top_k: 2
+      tp_size: 2
+      training: false
+    inputs:
+      hidden_states:
+        shape:
+        - 16384
+        - 4096
+        dtype: bfloat16
+mixtral_decoder:
+  scenarios:
+  - name: tokens-1/af5a8332
+    init_args:
+      training: false
+    inputs:
+      hidden_states:
+        shape:
+        - 1
+        - 4096
+        dtype: bfloat16
+      positions:
+        shape:
+        - 1
+        dtype: int64
+      residual: null
+  - name: tokens-4/a5095ac4
+    init_args:
+      training: false
+    inputs:
+      hidden_states:
+        shape:
+        - 4
+        - 4096
+        dtype: bfloat16
+      positions:
+        shape:
+        - 4
+        dtype: int64
+      residual: null
+  - name: tokens-8/54110fe5
+    init_args:
+      training: false
+    inputs:
+      hidden_states:
+        shape:
+        - 8
+        - 4096
+        dtype: bfloat16
+      positions:
+        shape:
+        - 8
+        dtype: int64
+      residual: null
+  - name: tokens-64/a6ad9c23
+    init_args:
+      training: false
+    inputs:
+      hidden_states:
+        shape:
+        - 64
+        - 4096
+        dtype: bfloat16
+      positions:
+        shape:
+        - 64
+        dtype: int64
+      residual: null
+  - name: tokens-16384/06fe3ea2
+    init_args:
+      training: false
+    inputs:
+      hidden_states:
+        shape:
+        - 16384
+        - 4096
+        dtype: bfloat16
+      positions:
+        shape:
+        - 16384
+        dtype: int64
+      residual: null
+  - name: tokens-1/de4b1882
+    init_args:
+      training: false
+    inputs:
+      hidden_states:
+        shape:
+        - 1
+        - 4096
+        dtype: bfloat16
+      positions:
+        shape:
+        - 1
+        dtype: int64
+      residual:
+        shape:
+        - 1
+        - 4096
+        dtype: bfloat16
+  - name: tokens-4/d7db1d25
+    init_args:
+      training: false
+    inputs:
+      hidden_states:
+        shape:
+        - 4
+        - 4096
+        dtype: bfloat16
+      positions:
+        shape:
+        - 4
+        dtype: int64
+      residual:
+        shape:
+        - 4
+        - 4096
+        dtype: bfloat16
+  - name: tokens-8/478fa64d
+    init_args:
+      training: false
+    inputs:
+      hidden_states:
+        shape:
+        - 8
+        - 4096
+        dtype: bfloat16
+      positions:
+        shape:
+        - 8
+        dtype: int64
+      residual:
+        shape:
+        - 8
+        - 4096
+        dtype: bfloat16
+  - name: tokens-64/cb79d130
+    init_args:
+      training: false
+    inputs:
+      hidden_states:
+        shape:
+        - 64
+        - 4096
+        dtype: bfloat16
+      positions:
+        shape:
+        - 64
+        dtype: int64
+      residual:
+        shape:
+        - 64
+        - 4096
+        dtype: bfloat16
+  - name: tokens-16384/f1516b4f
+    init_args:
+      training: false
+    inputs:
+      hidden_states:
+        shape:
+        - 16384
+        - 4096
+        dtype: bfloat16
+      positions:
+        shape:
+        - 16384
+        dtype: int64
+      residual:
+        shape:
+        - 16384
+        - 4096
+        dtype: bfloat16
+mixtral:
+  scenarios:
+  - name: tokens-1/ae8c3a1a
+    init_args:
+      training: false
+    inputs:
+      input_ids:
+        shape:
+        - 1
+        dtype: int64
+      positions:
+        shape:
+        - 1
+        dtype: int64
+  - name: tokens-4/5f881269
+    init_args:
+      training: false
+    inputs:
+      input_ids:
+        shape:
+        - 4
+        dtype: int64
+      positions:
+        shape:
+        - 4
+        dtype: int64
+  - name: tokens-8/76fa0300
+    init_args:
+      training: false
+    inputs:
+      input_ids:
+        shape:
+        - 8
+        dtype: int64
+      positions:
+        shape:
+        - 8
+        dtype: int64
+  - name: tokens-64/a8a43cf7
+    init_args:
+      training: false
+    inputs:
+      input_ids:
+        shape:
+        - 64
+        dtype: int64
+      positions:
+        shape:
+        - 64
+        dtype: int64
+  - name: tokens-16384/6fb535b1
+    init_args:
+      training: false
+    inputs:
+      input_ids:
+        shape:
+        - 16384
+        dtype: int64
+      positions:
+        shape:
+        - 16384
+        dtype: int64

@@ -353,6 +353,7 @@ class ModelRunner:
             or self.is_qwen3_next
         )
         self.model_family = "mamba" if self.is_mamba else "attention"
+        self.is_gpt_oss = model_type == "gpt_oss" or "gpt-oss" in model_name.lower()
         self.is_moe = hasattr(self.config, "num_local_experts") or getattr(self.config, "is_moe", False)
         self.is_qwen_vl = hasattr(self.config, "mrope_section")
         self.is_qwen3_vl = self.is_qwen_vl and hasattr(
@@ -3695,6 +3696,8 @@ class ModelRunner:
 
         if self.enforce_eager:
             return self._run_decode_greedy_eager(n, ids_np, pos_np, sm_np, cl_np, bt_np)
+        if n > self.graph_bs_list[-1]:
+            return self._run_decode_greedy_eager(n, ids_np, pos_np, sm_np, cl_np, bt_np)
 
         self._run_graph_from_numpy(n, ids_np, pos_np, sm_np, cl_np, bt_np)
         return self._greedy_from_hidden(n)
@@ -3731,6 +3734,17 @@ class ModelRunner:
         n, ids_np, pos_np, sm_np, cl_np, bt_np = decode_data
 
         if self.enforce_eager:
+            result = self._run_decode_greedy_eager(n, ids_np, pos_np, sm_np, cl_np, bt_np)
+            if result is not None:
+                main_stream = torch.cuda.current_stream()
+                cs = self._copy_stream
+                with torch.cuda.stream(cs):
+                    cs.wait_stream(main_stream)
+                    self._pinned_token_ids[:n].copy_(result, non_blocking=True)
+                    self._copy_event.record(cs)
+                return True, n
+            return False, n
+        if n > self.graph_bs_list[-1]:
             result = self._run_decode_greedy_eager(n, ids_np, pos_np, sm_np, cl_np, bt_np)
             if result is not None:
                 main_stream = torch.cuda.current_stream()
@@ -4557,14 +4571,12 @@ class ModelRunner:
         decode_req_id = torch.arange(max_bs, dtype=torch.int32).cuda()
         self._decode_req_id_buf = decode_req_id
 
-        # Match vLLM's default ``cudagraph_capture_sizes`` for DeepSeek-V3.2:
-        # [1, 2, 4, 8, 16, 24, ..., 256, 272, ..., 512].  vLLM caps captures at
-        # ``max_cudagraph_capture_size=512`` (see logs); larger decode batches
-        # are dispatched to the largest captured graph or fall back to a
-        # piecewise/eager path.  Going past 512 here makes the compile time
-        # dominate (each graph at bs>512 takes seconds) without measurable
-        # decode wins, so we keep the same 512 cap.
-        max_capture = min(max_bs, 512)
+        # Match vLLM's default ``cudagraph_capture_sizes``:
+        # [1, 2, 4, 8, 16, 24, ..., 256, 272, ..., max_capture].
+        # vLLM normally caps captures at 512, but GPT-OSS overrides this to
+        # 1024 for better high-concurrency decode throughput.
+        max_capture_limit = 1024 if self.is_gpt_oss else 512
+        max_capture = min(max_bs, max_capture_limit)
         self.graph_bs_list = [i for i in [1, 2, 4] if i <= max_capture]
         if max_capture >= 8:
             self.graph_bs_list += list(range(8, min(max_capture + 1, 256), 8))
