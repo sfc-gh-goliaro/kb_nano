@@ -587,6 +587,52 @@ Latency (128 output tokens, 5 iterations):
 
 Both models are at or above vLLM throughput across all scenarios (20B: 1.00–1.04x, 120B: 1.02–1.05x). Single-request latency trails vLLM (0.83–0.93x) since vLLM benefits from `torch.compile`/Inductor fusions at small batch sizes, while batched latency is on par. The lower token match rate for the 120B model is expected: with 128 experts and top-4 routing, small numerical differences in router logits cause different expert selections, which cascade into divergent outputs. The 20B model (32 experts) shows higher match rates (~86–91%).
 
+### Gemma4 26B-A4B
+
+Run:
+
+```bash
+CUDA_HOME=/usr/local/cuda-12.8 \
+PATH=/usr/local/cuda-12.8/bin:$PATH \
+LD_LIBRARY_PATH=/usr/local/cuda-12.8/lib64:${LD_LIBRARY_PATH:-} \
+VLLM_GEMMA4_MINIMAL_BUILD=1 \
+python tests/bench_vllm.py \
+  --model google/gemma-4-26B-A4B-it \
+  --tp 1 \
+  --num-seqs 1000 \
+  --skip-latency
+```
+
+Then score generated tokens by feeding both vLLM and kb-nano outputs back into vLLM:
+
+```bash
+CUDA_HOME=/usr/local/cuda-12.8 \
+PATH=/usr/local/cuda-12.8/bin:$PATH \
+LD_LIBRARY_PATH=/usr/local/cuda-12.8/lib64:${LD_LIBRARY_PATH:-} \
+VLLM_GEMMA4_MINIMAL_BUILD=1 \
+python tests/debug/gemma4_rank_align_vllm.py \
+  --result-dir tests/results/H200/gemma-4-26B-A4B-it_tp1/gemma4-throughput-1000-final3 \
+  --num-requests 1000 \
+  --sample 32 \
+  --summary tmp/gemma4_rank_score_1000_sample32_final3.json
+```
+
+Throughput (1000 sequences per scenario, real prompts, real `google/gemma-4-26B-A4B-it` weights, `temperature=0`, CUDA graphs enabled). kb-nano uses a Gemma4 scheduler default of `max_num_batched_tokens=2048`; this keeps the mixed prefill/decode path out of the slow regime while preserving decode-heavy throughput:
+
+| Model | TP | Scenario | Input/Output | vLLM (tok/s) | Ours (tok/s) | Ratio | Avg Match Tokens |
+|-------|---:|----------|:------------:|-------------:|-------------:|------:|-----------------:|
+| Gemma4-26B-A4B-it | 1 | prefill-heavy | var/508 | 5,356 | 5,402 | **1.01x** | 88.9/508 |
+| Gemma4-26B-A4B-it | 1 | balanced      | var/518 | 7,178 | 7,502 | **1.05x** | 99.9/518 |
+| Gemma4-26B-A4B-it | 1 | decode-heavy  | var/986 | 7,030 | 6,686 | **0.95x** | 105.0/986 |
+
+Exact greedy token matching is low because small low-margin differences cascade across long generations. Alignment was checked by feeding generated continuations back into vLLM as a prefill scorer and measuring generated-token ranks. On a 32-request-per-scenario sample from the same 1000-sequence run, kb-nano is effectively identical to vLLM self-scoring at top-k:
+
+| Scenario | Scored Tokens | vLLM self Top-1 | kb-nano Top-1 | kb-nano Top-5 | kb-nano Top-20 | Median Rank |
+|----------|--------------:|----------------:|--------------:|--------------:|---------------:|------------:|
+| prefill-heavy | 16,028 | 98.40% | 98.61% | 99.99% | 99.99% | 1 |
+| balanced      | 17,460 | 98.44% | 98.57% | 99.99% | 99.99% | 1 |
+| decode-heavy  | 31,072 | 98.39% | 98.47% | 100.00% | 100.00% | 1 |
+
 ### Mamba / Mamba2 (Selective State-Space)
 
 Run `tests/bench_vllm.py --model state-spaces/mamba-2.8b-hf` and `tests/bench_vllm.py --model mistralai/Mamba-Codestral-7B-v0.1` to reproduce. 1000 sequences per scenario, `temperature=0`. kb-nano reuses vLLM's `causal_conv1d_fn` / `causal_conv1d_update`, `mamba_chunk_scan_combined_varlen` / `selective_scan_fn`, and `selective_state_update` Triton kernels behind a slot-based recurrent state cache, a chunked-prefill scheduler with a `max_num_batched_tokens` budget, **decode-only CUDA graphs at bucketed batch sizes (1, 2, 4, 8, …, 256)** with `PAD_SLOT_ID = -1` padding, **GPU greedy argmax + async D2H** of next-token IDs (a Mamba mirror of the attention engine's fast greedy path), **batched per-step state slot allocation/deallocation** broadcast over SHM, and **profile-based state pool sizing** that runs a synthetic worst-case prefill before allocating slots (mirrors vLLM's `determine_available_memory` → `get_kv_cache_configs` flow) so the slot count tracks vLLM's KV cache concurrency.

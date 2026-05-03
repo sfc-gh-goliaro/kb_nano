@@ -33,13 +33,11 @@ from concurrent.futures import ThreadPoolExecutor
 from .tp import _tp_size
 from ..tasks.baseline.L4.llama import LlamaConfig, LlamaForCausalLM
 from ..tasks.baseline.L4.llama4 import Llama4Config, Llama4ForCausalLM
-from ..tasks.baseline.L4.mamba import MambaConfig, MambaForCausalLM
-from ..tasks.baseline.L4.mamba2 import Mamba2Config, Mamba2ForCausalLM
 from ..tasks.baseline.L4.mixtral import MixtralConfig, MixtralForCausalLM
 from ..tasks.baseline.L4.qwen2_vl import Qwen2VLConfig, Qwen2VLForConditionalGeneration
 from ..tasks.baseline.L4.qwen3_vl import Qwen3VLConfig, Qwen3VLForConditionalGeneration
-from ..tasks.baseline.L4.deepseek import DeepSeekV3Config, DeepSeekV3ForCausalLM
 from ..tasks.baseline.L4.flux import FluxConfig, FluxPipeline
+from ..tasks.baseline.L4.gemma4 import Gemma4Config, Gemma4ForCausalLM
 from ..tasks.baseline.L4.whisper import WhisperConfig, WhisperForConditionalGeneration
 from ..tasks.baseline.L4.cosyvoice3 import CosyVoice3Config, CosyVoice3ForTTS
 
@@ -132,6 +130,11 @@ _VISION_PATCH_EMBED_RE = re.compile(r"(visual\.patch_embed\.proj)\.(weight|bias)
 _LLAMA4_FUSED_EXPERT_RE = re.compile(
     r"(.+\.feed_forward)\.experts\.(gate_up_proj|down_proj)"
 )
+
+_GEMMA4_FUSED_EXPERT_RE = re.compile(
+    r"(.+\.moe)\.(gate_up_proj|down_proj)$"
+)
+_GEMMA4_LAYER_RE = re.compile(r"model\.layers\.(\d+)\.")
 
 
 def _permute_qk_for_rotary(weight: torch.Tensor, n_heads: int) -> torch.Tensor:
@@ -516,6 +519,36 @@ def _assign_fused_expert(model, key, tensor, scale):
             param.data.copy_(weight[:, :, rank * tp_inter:(rank + 1) * tp_inter])
 
 
+def _assign_gemma4_fused_expert(model, prefix: str, proj: str,
+                                tensor: torch.Tensor) -> None:
+    """Load Gemma4 3D expert tensors directly into fused expert parameters."""
+    from .tp import _tp_rank
+
+    rank = _tp_rank() if _tp_size() > 1 else 0
+    if proj == "gate_up_proj":
+        param = model.get_parameter(f"{prefix}.w13")
+        weight = tensor
+        if weight.shape[1] == model.config.hidden_size:
+            weight = weight.transpose(-1, -2).contiguous()
+        full_inter = weight.shape[1] // 2
+        shard = param.shape[1] // 2
+        gate = weight[:, :full_inter, :]
+        up = weight[:, full_inter:, :]
+        param.data[:, :shard, :].copy_(
+            gate[:, rank * shard:(rank + 1) * shard, :],
+        )
+        param.data[:, shard:, :].copy_(
+            up[:, rank * shard:(rank + 1) * shard, :],
+        )
+    else:
+        param = model.get_parameter(f"{prefix}.w2")
+        weight = tensor
+        if weight.shape[1] != model.config.hidden_size:
+            weight = weight.transpose(-1, -2).contiguous()
+        shard = param.shape[2]
+        param.data.copy_(weight[:, :, rank * shard:(rank + 1) * shard])
+
+
 def _weights_iterator(safetensor_files, use_fastsafetensors=True):
     """Iterate over (weight_name, tensor) from safetensor files.
 
@@ -583,9 +616,17 @@ def load_weights(model, model_path: str, model_type: str = "llama") -> None:
     is_qwen3_vl_moe = model_type == "qwen3_vl_moe"
     is_qwen_vl = is_qwen2_vl or is_qwen3_vl
     is_llama4 = model_type == "llama4"
+    is_gemma4 = model_type == "gemma4"
     is_mamba = model_type in ("mamba", "mamba2")
     if is_llama4:
         llama4_config = model.config
+    if is_gemma4:
+        gemma4_config = model.config
+        gemma4_k_eq_v_layers = {
+            i for i, layer_type in enumerate(gemma4_config.layer_types)
+            if layer_type == "full_attention"
+            and getattr(gemma4_config, "attention_k_eq_v", False)
+        }
 
     import time as _time
     _t_load = _time.perf_counter()
@@ -735,6 +776,48 @@ def load_weights(model, model_path: str, model_type: str = "llama") -> None:
                     param.data.copy_(weight[:, :, rank * tp_inter:(rank + 1) * tp_inter])
                 loaded += 1
                 continue
+
+        # Gemma4 checkpoints are multimodal wrappers.  The text stack lives
+        # under model.language_model.*, while vision/audio weights are skipped.
+        if is_gemma4:
+            if not mapped_name.startswith("model.language_model."):
+                continue
+            mapped_name = "model." + mapped_name[len("model.language_model."):]
+            mapped_name = mapped_name.replace(
+                ".router.per_expert_scale",
+                ".moe.per_expert_scale",
+            )
+            mapped_name = mapped_name.replace(
+                ".experts.gate_up_proj",
+                ".moe.gate_up_proj",
+            )
+            mapped_name = mapped_name.replace(
+                ".experts.down_proj",
+                ".moe.down_proj",
+            )
+
+            m_fused = _GEMMA4_FUSED_EXPERT_RE.match(mapped_name)
+            if m_fused:
+                prefix, proj = m_fused.groups()
+                _assign_gemma4_fused_expert(model, prefix, proj, _get_tensor())
+                loaded += 1
+                continue
+
+            if ".self_attn.k_proj." in mapped_name and gemma4_k_eq_v_layers:
+                m_layer = _GEMMA4_LAYER_RE.search(mapped_name)
+                if m_layer and int(m_layer.group(1)) in gemma4_k_eq_v_layers:
+                    param_name = mapped_name.replace("k_proj", "qkv_proj")
+                    try:
+                        param = model.get_parameter(param_name)
+                    except AttributeError:
+                        pass
+                    else:
+                        weight_loader = getattr(param, "weight_loader")
+                        tensor = _get_tensor()
+                        weight_loader(param, tensor, "k")
+                        weight_loader(param, tensor, "v")
+                        loaded += 2
+                    continue
 
         # Handle Qwen2-VL merger: ln_q -> norm, mlp.0 -> fc1, mlp.2 -> fc2
         if is_qwen2_vl:
@@ -1084,8 +1167,14 @@ def _postprocess_fp8_weights(model: torch.nn.Module) -> None:
 def _is_diffusion_model(model_name: str) -> bool:
     """Check if the model is a diffusion model (e.g., FLUX, HunyuanVideo) by looking for model_index.json."""
     import json as _json
-    model_path = model_name if os.path.isdir(model_name) else download_model(model_name)
-    index_path = os.path.join(model_path, "model_index.json")
+    if os.path.isdir(model_name):
+        index_path = os.path.join(model_name, "model_index.json")
+    else:
+        from huggingface_hub import hf_hub_download
+        try:
+            index_path = hf_hub_download(model_name, "model_index.json")
+        except Exception:
+            return False
     if os.path.exists(index_path):
         with open(index_path) as f:
             data = _json.load(f)
@@ -1098,8 +1187,11 @@ def _is_diffusion_model(model_name: str) -> bool:
 def _detect_diffusion_type(model_name: str) -> str:
     """Distinguish between diffusion model types (flux vs hunyuan_video)."""
     import json as _json
-    model_path = model_name if os.path.isdir(model_name) else download_model(model_name)
-    index_path = os.path.join(model_path, "model_index.json")
+    if os.path.isdir(model_name):
+        index_path = os.path.join(model_name, "model_index.json")
+    else:
+        from huggingface_hub import hf_hub_download
+        index_path = hf_hub_download(model_name, "model_index.json")
     if os.path.exists(index_path):
         with open(index_path) as f:
             data = _json.load(f)
@@ -1225,6 +1317,12 @@ def load_model(
         print(f"  Allocating GPT-OSS model ({config.num_local_experts} experts, "
               f"top-{config.num_experts_per_tok})...")
         model = GptOssForCausalLM(config)
+    elif model_type == "gemma4":
+        config = Gemma4Config.from_pretrained(model_name)
+        config.dtype = dtype
+        print(f"  Allocating Gemma4 model ({config.num_experts} experts, "
+              f"top-{config.top_k_experts})...")
+        model = Gemma4ForCausalLM(config)
     elif model_type == "whisper":
         config = WhisperConfig.from_pretrained(model_name)
         config.dtype = dtype
@@ -1257,6 +1355,7 @@ def load_model(
             print("  Allocating Qwen3-VL model...")
         model = Qwen3VLForConditionalGeneration(config, quant_config=quant_config)
     elif model_type == "mamba2":
+        from ..tasks.baseline.L4.mamba2 import Mamba2Config, Mamba2ForCausalLM
         config = Mamba2Config.from_pretrained(model_path)
         config.dtype = dtype
         print(f"  Allocating Mamba2 model "
@@ -1265,6 +1364,7 @@ def load_model(
               f"groups={config.n_groups}, state={config.state_size})...")
         model = Mamba2ForCausalLM(config)
     elif model_type == "mamba":
+        from ..tasks.baseline.L4.mamba import MambaConfig, MambaForCausalLM
         config = MambaConfig.from_pretrained(model_path)
         config.dtype = dtype
         print(f"  Allocating Mamba model "
@@ -1272,6 +1372,7 @@ def load_model(
               f"intermediate={config.intermediate_size}, state={config.state_size})...")
         model = MambaForCausalLM(config)
     elif model_type == "deepseek_v3":
+        from ..tasks.baseline.L4.deepseek import DeepSeekV3Config, DeepSeekV3ForCausalLM
         config = DeepSeekV3Config.from_pretrained(model_name)
         config.dtype = dtype
         print(f"  Allocating DeepSeek V3.2 model ({config.n_routed_experts} experts, "

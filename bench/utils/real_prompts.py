@@ -8,6 +8,7 @@ tokenized exactly as that model expects.
 from __future__ import annotations
 
 from dataclasses import dataclass
+from collections.abc import Mapping
 from typing import Any
 
 
@@ -81,8 +82,16 @@ def _apply_chat_template(tokenizer: Any, messages: list[dict[str, str]]) -> list
     except (AttributeError, ValueError):
         text = "\n\n".join(m["content"] for m in messages)
         token_ids = tokenizer.encode(text, add_special_tokens=True)
+    if isinstance(token_ids, Mapping):
+        token_ids = token_ids["input_ids"]
     if hasattr(token_ids, "tolist"):
         token_ids = token_ids.tolist()
+    if token_ids and isinstance(token_ids[0], list):
+        if len(token_ids) != 1:
+            raise ValueError(
+                "Expected one chat-templated prompt, got a batched input_ids result"
+            )
+        token_ids = token_ids[0]
     return list(token_ids)
 
 

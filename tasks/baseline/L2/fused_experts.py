@@ -22,6 +22,7 @@ from ..L1.moe_grouped_gemm import (
     m_grouped_fp8_gemm_nt_contiguous,
 )
 from ..L1.moe_sum import MoeSum
+from ..L1.gelu_and_mul import GeluAndMul
 from ..L1.silu_and_mul import SiluAndMul
 from ..L1.silu_mul_quant_fp8 import SiluMulQuantFp8
 
@@ -162,11 +163,17 @@ class FusedExperts(nn.Module):
       MoeAlign -> Triton grouped GEMM1 -> SiLU+mul -> FP8 quant -> Triton grouped GEMM2 -> MoeSum
     """
 
-    def __init__(self):
+    def __init__(self, activation: str = "silu", config_style: str = "legacy"):
         super().__init__()
+        if activation not in ("silu", "gelu_tanh"):
+            raise ValueError(f"Unsupported MoE activation: {activation}")
+        if config_style not in ("legacy", "vllm"):
+            raise ValueError(f"Unsupported MoE config style: {config_style}")
+        self.activation = activation
+        self.config_style = config_style
         self.moe_align = MoeAlign()
         self.moe_grouped_gemm = MoeGroupedGemm()
-        self.act_fn = SiluAndMul()
+        self.act_fn = SiluAndMul() if activation == "silu" else GeluAndMul("tanh")
         self.moe_sum = MoeSum()
         self.per_token_group_quant_fp8 = PerTokenGroupQuantFp8()
         self.silu_mul_quant_fp8 = SiluMulQuantFp8()
@@ -225,7 +232,8 @@ class FusedExperts(nn.Module):
         N = N2 // 2
         top_k = topk_ids.size(1)
 
-        if (use_fp8_w8a8
+        if (self.activation == "silu"
+                and use_fp8_w8a8
                 and _valid_deep_gemm(hidden_states, w13, w2)
                 and not torch.cuda.is_current_stream_capturing()):
             dg_w13_scale = w13_scale_dg if w13_scale_dg is not None else w13_scale
@@ -293,6 +301,7 @@ class FusedExperts(nn.Module):
         config = get_triton_config(
             M, w13.shape, w2.shape, top_k,
             use_fp8=use_fp8_w8a8, block_shape=block_shape,
+            default_style=self.config_style,
         )
 
         use_naive = (M * top_k * SPARSITY_FACTOR <= num_experts)

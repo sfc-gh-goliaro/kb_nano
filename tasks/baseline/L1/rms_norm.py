@@ -73,6 +73,15 @@ class RMSNorm(nn.Module):
         self.elementwise_affine = elementwise_affine
         if elementwise_affine:
             self.weight = nn.Parameter(torch.ones(hidden_size))
+        else:
+            # Match vLLM's has_weight=False path: use the same CUDA RMSNorm
+            # kernel with a non-persistent unit scale instead of falling back
+            # to torch.nn.functional.rms_norm in eager/CUDA-graph decode.
+            self.register_buffer(
+                "_unit_weight",
+                torch.ones(hidden_size),
+                persistent=False,
+            )
 
     # -- Pure PyTorch path (used under torch.compile so Inductor can fuse) --
 
@@ -143,7 +152,9 @@ class RMSNorm(nn.Module):
                 x, self.weight if self.elementwise_affine else None,
                 self.eps, self.hidden_size, residual,
             )
+        weight = self.weight if self.elementwise_affine else self._unit_weight
+        if weight.dtype != x.dtype or weight.device != x.device:
+            weight = weight.to(device=x.device, dtype=x.dtype)
         return self.forward_cuda(
-            x, self.weight if self.elementwise_affine else None,
-            self.eps, residual,
+            x, weight, self.eps, residual,
         )
