@@ -14,9 +14,9 @@ from typing import Literal
 import torch
 import torch.nn as nn
 
-from kb_nano.tasks.baseline.L1.linear import Linear
-from kb_nano.tasks.baseline.L1.log_sigmoid import LogSigmoid
-from kb_nano.tasks.baseline.L1.silu import SiLU
+from kb_nano.tasks.reference.L1.linear import Linear
+from kb_nano.tasks.reference.L1.log_sigmoid import LogSigmoid
+from kb_nano.tasks.reference.L1.silu import SiLU
 from kb_nano.tasks.reference.L1.gla_recurrence import NaiveRecurrentGLA
 from kb_nano.tasks.reference.L1.rms_norm import RMSNorm
 from kb_nano.tasks.reference.L1.rotary_emb import RotaryEmbedding

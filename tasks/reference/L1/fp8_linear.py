@@ -64,6 +64,13 @@ def _quantize_fp8_per_token_group(
     out_scale.copy_(scale.view_as(out_scale))
 
 
+class _Fp8PrefillBufs:
+    def __init__(self):
+        self.input_fp8 = None
+        self.input_scale = None
+        self.output = None
+
+
 class PerTokenGroupQuantFp8(nn.Module):
     def forward(self, x: torch.Tensor, out_fp8: torch.Tensor,
                 out_scale: torch.Tensor) -> None:

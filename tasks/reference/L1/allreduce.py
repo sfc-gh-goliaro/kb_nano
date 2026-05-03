@@ -13,6 +13,7 @@ from typing import Optional
 import torch
 import torch.distributed as dist
 import torch.nn as nn
+from torch.distributed import ProcessGroup
 
 
 _CUSTOM_AR: Optional["CustomAllreduce"] = None
@@ -38,8 +39,13 @@ class CustomAllreduce:
 
     disabled = True
 
-    def __init__(self, *args, **kwargs) -> None:
-        del args, kwargs
+    def __init__(
+        self,
+        group: ProcessGroup,
+        device: int | str | torch.device,
+        max_size: int = 8192 * 1024,
+    ) -> None:
+        del group, device, max_size
 
     def capture(self):
         return nullcontext()

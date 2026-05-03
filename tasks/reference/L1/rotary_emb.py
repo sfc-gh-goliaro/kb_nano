@@ -42,29 +42,18 @@ def _compute_scaled_inv_freq(
 class RotaryEmbedding(nn.Module):
     def __init__(
         self,
-        head_dim: int | None = None,
-        max_position_embeddings: int = 2048,
-        rope_theta: float | None = None,
+        head_dim: int,
+        max_position_embeddings: int,
+        rope_theta: float,
         rope_scaling_factor: float = 1.0,
         rope_low_freq_factor: float = 1.0,
         rope_high_freq_factor: float = 1.0,
         rope_original_max_position_embeddings: int | None = None,
-        *,
-        head_size: int | None = None,
-        rotary_dim: int | None = None,
-        base: float | None = None,
-        is_neox_style: bool = True,
     ):
         super().__init__()
-        del rotary_dim, is_neox_style
-        self.head_dim = head_dim if head_dim is not None else head_size
-        if self.head_dim is None:
-            raise TypeError("head_dim or head_size is required")
-        theta = rope_theta if rope_theta is not None else base
-        if theta is None:
-            raise TypeError("rope_theta or base is required")
+        self.head_dim = head_dim
         inv_freq = 1.0 / (
-            theta ** (torch.arange(0, self.head_dim, 2, dtype=torch.float) / self.head_dim)
+            rope_theta ** (torch.arange(0, self.head_dim, 2, dtype=torch.float) / self.head_dim)
         )
         if rope_scaling_factor != 1.0 and rope_original_max_position_embeddings is not None:
             inv_freq = _compute_scaled_inv_freq(

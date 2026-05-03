@@ -14,7 +14,7 @@ import torch
 import torch.nn as nn
 
 from kb_nano.infra.tp import _tp_rank, _tp_size
-from kb_nano.tasks.baseline.L1.linear import Linear
+from kb_nano.tasks.reference.L1.linear import Linear
 from kb_nano.tasks.reference.L1.allreduce import AllReduce
 from kb_nano.tasks.reference.L1.mxfp4_moe import Mxfp4MoE
 
