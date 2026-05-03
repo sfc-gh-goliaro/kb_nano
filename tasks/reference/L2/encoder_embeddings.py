@@ -1,12 +1,59 @@
 """Shared token/position/type embedding wiring for encoder models."""
 
+
 from __future__ import annotations
 
-import torch
+
+# Inlined from tasks/reference/L1/embedding.py
 import torch.nn as nn
 
-from ..L1.embedding import Embedding
-from ..L1.layer_norm import LayerNorm
+
+class Embedding(nn.Module):
+    def __init__(self, num_embeddings: int, embedding_dim: int,
+                 padding_idx: int | None = None):
+        super().__init__()
+        self.emb = nn.Embedding(num_embeddings, embedding_dim,
+                                padding_idx=padding_idx)
+
+    def forward(self, input_ids):
+        return self.emb(input_ids)
+
+
+# Inlined from tasks/reference/L1/layer_norm.py
+import torch
+import torch.nn.functional as F
+
+
+class LayerNorm(nn.Module):
+    def __init__(
+        self,
+        normalized_shape: int,
+        eps: float = 1e-5,
+        elementwise_affine: bool = True,
+        create_scale: bool = True,
+        create_offset: bool = True,
+    ):
+        super().__init__()
+        self.normalized_shape = (normalized_shape,)
+        self.eps = eps
+        self.elementwise_affine = elementwise_affine
+        if elementwise_affine and create_scale:
+            self.weight = nn.Parameter(torch.ones(normalized_shape))
+        else:
+            self.register_parameter("weight", None)
+        if elementwise_affine and create_offset:
+            self.bias = nn.Parameter(torch.zeros(normalized_shape))
+        else:
+            self.register_parameter("bias", None)
+
+    def forward(self, x: torch.Tensor) -> torch.Tensor:
+        orig_dtype = x.dtype
+        weight = self.weight.float() if self.weight is not None else None
+        bias = self.bias.float() if self.bias is not None else None
+        return F.layer_norm(
+            x.float(), self.normalized_shape, weight, bias, self.eps,
+        ).to(orig_dtype)
+
 
 TOKEN_TYPE_SHIFT = 30
 

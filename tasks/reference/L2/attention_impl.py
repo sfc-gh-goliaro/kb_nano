@@ -9,18 +9,683 @@ metadata is intentionally approximated by the same Python remap helpers as the
 baseline.
 """
 
+
 from __future__ import annotations
 
-import numpy as np
+
+# Inlined from infra/context.py
+import enum
+from contextlib import contextmanager
+from dataclasses import dataclass, field
+from typing import TYPE_CHECKING
+
 import torch
+
+if TYPE_CHECKING:
+    import torch.nn as nn
+
+
+class CUDAGraphMode(enum.IntEnum):
+    """Runtime mode for CUDA graph dispatch (mirrors vLLM CUDAGraphMode)."""
+    NONE = 0
+    PIECEWISE = 1
+    FULL = 2
+
+
+@dataclass(frozen=True)
+class AttnBackendConfig:
+    """Selects attention backend and associated KV cache parameters.
+
+    Blackwell (sm_100+) uses TRTLLM-gen kernels via FlashInfer (HND layout,
+    block_size=16).  Hopper and below use flash_attn (NHD layout,
+    block_size=256).  Auto-detection picks the optimal backend for the
+    current GPU.
+    """
+    backend: str = "flash_attn"
+    block_size: int = 256
+    kv_layout: str = "NHD"
+
+    @classmethod
+    def auto_detect(cls) -> "AttnBackendConfig":
+        if not torch.cuda.is_available():
+            return cls()
+        cc = torch.cuda.get_device_capability()
+        if cc[0] >= 10:
+            try:
+                from flashinfer.decode import trtllm_batch_decode_with_kv_cache  # noqa: F401
+                return cls(backend="trtllm", block_size=16, kv_layout="HND")
+            except ImportError:
+                pass
+        return cls()
+
+    @property
+    def use_trtllm(self) -> bool:
+        return self.backend == "trtllm"
+
+
+_ATTN_BACKEND_CONFIG: AttnBackendConfig | None = None
+
+
+def get_attn_backend_config() -> AttnBackendConfig:
+    global _ATTN_BACKEND_CONFIG
+    if _ATTN_BACKEND_CONFIG is None:
+        _ATTN_BACKEND_CONFIG = AttnBackendConfig.auto_detect()
+    return _ATTN_BACKEND_CONFIG
+
+
+def set_attn_backend_config(config: AttnBackendConfig) -> None:
+    global _ATTN_BACKEND_CONFIG
+    _ATTN_BACKEND_CONFIG = config
+
+
+@dataclass
+class ChunkedContextMetadata:
+    """Metadata for chunked prefill context processing (MLA).
+
+    When a prefill request has prior computed tokens in the KV cache,
+    those tokens must be gathered and attended to in chunks to bound
+    workspace memory.  Matches vllm's MLACommonPrefillMetadata.ChunkedContextMetadata.
+    """
+    cu_seq_lens: torch.Tensor
+    starts: torch.Tensor
+    seq_tot: list[int]
+    max_seq_lens: list[int]
+    seq_lens: torch.Tensor
+    workspace: torch.Tensor
+    token_to_seq: torch.Tensor
+    chunk_total_token: list[int]
+
+
+@dataclass
+class Context:
+    is_prefill: bool = False
+    cu_seqlens_q: torch.Tensor | None = None
+    cu_seqlens_k: torch.Tensor | None = None
+    max_seqlen_q: int = 0
+    max_seqlen_k: int = 0
+    slot_mapping: torch.Tensor | None = None
+    context_lens: torch.Tensor | None = None
+    block_tables: torch.Tensor | None = None
+    max_context_len: int = 0
+
+    # Chunked prefill: mixed batch with both prefill and decode tokens.
+    # Token layout: [prefill_tokens... | decode_tokens...]
+    is_mixed: bool = False
+    num_prefill_tokens: int = 0
+    num_decode_tokens: int = 0
+    num_prefill_seqs: int = 0
+
+    # Prefill-specific metadata (indexed over prefill seqs only)
+    prefill_cu_seqlens_q: torch.Tensor | None = None
+    prefill_cu_seqlens_k: torch.Tensor | None = None
+    prefill_max_seqlen_q: int = 0
+    prefill_max_seqlen_k: int = 0
+    prefill_block_tables: torch.Tensor | None = None
+
+    # Decode-specific metadata (indexed over decode seqs only)
+    decode_context_lens: torch.Tensor | None = None
+    decode_block_tables: torch.Tensor | None = None
+    decode_max_context_len: int = 0
+
+    # Flat indices into concatenated input for extracting one logit per seq
+    logit_indices: torch.Tensor | None = None
+
+    # MLA chunked prefill context (for requests with prior computed tokens)
+    chunked_context: ChunkedContextMetadata | None = None
+
+    # Per-token request ID mapping (for sparse indexer index conversion)
+    req_id_per_token: torch.Tensor | None = None
+
+    # Cross-attention metadata (encoder-decoder models like Whisper)
+    # Slot mapping for writing encoder K/V to paged cache
+    cross_slot_mapping: torch.Tensor | None = None
+    # Prefill: cu_seqlens for decoder Q and encoder K
+    cross_cu_seqlens_q: torch.Tensor | None = None
+    cross_cu_seqlens_k: torch.Tensor | None = None
+    cross_max_seqlen_q: int = 0
+    cross_max_seqlen_k: int = 0
+    cross_block_tables: torch.Tensor | None = None
+    # Decode: context lens = encoder sequence lengths per request
+    cross_context_lens: torch.Tensor | None = None
+    cross_max_context_len: int = 0
+
+    # --- Compilation / CUDA-graph fields (mirror vLLM ForwardContext) ---
+    # Maps layer prefix -> live nn.Module for custom-op runtime lookup.
+    no_compile_layers: dict[str, "nn.Module"] = field(default_factory=dict)
+    # Runtime mode for CUDAGraphWrapper dispatch.
+    cudagraph_runtime_mode: CUDAGraphMode = CUDAGraphMode.NONE
+    # Batch size key used by CUDAGraphWrapper for per-shape graph caching.
+    batch_size_for_graph: int = 0
+
+    # --- Mamba / SSM fields (mirror vLLM ForwardContext.attn_metadata
+    # for Mamba layers).  ``mamba_state`` owns the global conv/ssm state
+    # tensors; ``mamba_metadata`` is a per-batch dataclass (Mamba2Metadata
+    # or MambaMetadata) carrying state slot indices and prefill/decode
+    # metadata read by every Mamba mixer in its forward pass.
+    mamba_state: object = None
+    mamba_metadata: object = None
+
+
+# Global module registry populated once at model init; copied into each
+# Context so compiled custom ops can resolve their target modules.
+_STATIC_NO_COMPILE_LAYERS: dict[str, "nn.Module"] = {}
+
+
+def register_no_compile_layers(layers: dict[str, "nn.Module"]) -> None:
+    """Register attention/MoE modules for custom-op lookup during compiled
+    execution.  Called once after model construction."""
+    _STATIC_NO_COMPILE_LAYERS.update(layers)
+
+
+def get_no_compile_layers() -> dict[str, "nn.Module"]:
+    return _STATIC_NO_COMPILE_LAYERS
+
+
+def auto_register_no_compile_layers(model: "nn.Module") -> None:
+    """Walk *model* and register every MoE and Attention sub-module by its
+    fully-qualified prefix so custom ops can find them at runtime.
+
+    Recognized types (by class name to avoid circular imports):
+      - ``Qwen3MoE``, ``MixtralMoE``, ``GptOssMoE``, ``DeepSeekMoE`` (MoE blocks)
+      - ``Attention``, ``MLAAttention``, ``SparseAttnIndexer``       (attention impls)
+      - ``Mamba2Mixer``                                              (Mamba2 compile boundary)
+
+    Also sets ``_layer_name`` on each module so it knows its own key.
+    ``_use_custom_op`` remains ``False`` until compilation is enabled.
+    """
+    _TARGET_NAMES = {
+        "Qwen3MoE", "MixtralMoE", "GptOssMoE", "DeepSeekMoE",
+        "Attention", "MLAAttention", "SparseAttnIndexer",
+        "Mamba2Mixer",
+    }
+    layers: dict[str, "nn.Module"] = {}
+    for name, mod in model.named_modules():
+        if type(mod).__name__ in _TARGET_NAMES:
+            layers[name] = mod
+            mod._layer_name = name  # type: ignore[attr-defined]
+    register_no_compile_layers(layers)
+
+
+def enable_custom_ops() -> None:
+    """Switch all registered no-compile layers to dispatch through custom ops.
+    Called once after torch.compile is applied to the model."""
+    for mod in _STATIC_NO_COMPILE_LAYERS.values():
+        mod._use_custom_op = True  # type: ignore[attr-defined]
+
+
+def disable_custom_ops() -> None:
+    """Revert to eager dispatch (used for testing/fallback)."""
+    for mod in _STATIC_NO_COMPILE_LAYERS.values():
+        mod._use_custom_op = False  # type: ignore[attr-defined]
+
+
+_CONTEXT = Context()
+
+
+def get_context() -> Context:
+    return _CONTEXT
+
+
+def set_context(is_prefill, cu_seqlens_q=None, cu_seqlens_k=None,
+                max_seqlen_q=0, max_seqlen_k=0, slot_mapping=None,
+                context_lens=None, block_tables=None,
+                max_context_len=0, chunked_context=None,
+                req_id_per_token=None):
+    global _CONTEXT
+    # For pure-decode batches (``is_prefill=False`` with no mixed fields),
+    # mirror the generic ``context_lens`` / ``block_tables`` / ``max_context_len``
+    # into the decode-specific fields so that DSA indexer and other
+    # decode-specialised paths (which consult ``decode_context_lens`` /
+    # ``decode_block_tables`` — matching vLLM's FlashInfer metadata) can
+    # find them.  Without this, ``SparseAttnIndexer._decode_topk`` would
+    # early-return all -1 indices and attention would degenerate.
+    dc_cl = context_lens if not is_prefill else None
+    dc_bt = block_tables if not is_prefill else None
+    dc_max = max_context_len if not is_prefill else 0
+    _CONTEXT = Context(is_prefill, cu_seqlens_q, cu_seqlens_k,
+                       max_seqlen_q, max_seqlen_k, slot_mapping,
+                       context_lens, block_tables, max_context_len,
+                       chunked_context=chunked_context,
+                       req_id_per_token=req_id_per_token,
+                       no_compile_layers=_STATIC_NO_COMPILE_LAYERS,
+                       decode_context_lens=dc_cl,
+                       decode_block_tables=dc_bt,
+                       decode_max_context_len=dc_max)
+
+
+def set_mixed_context(
+    slot_mapping,
+    num_prefill_tokens, num_decode_tokens, num_prefill_seqs,
+    prefill_cu_seqlens_q, prefill_cu_seqlens_k,
+    prefill_max_seqlen_q, prefill_max_seqlen_k,
+    prefill_block_tables,
+    decode_context_lens, decode_block_tables, decode_max_context_len,
+    logit_indices,
+    chunked_context=None,
+    req_id_per_token=None,
+):
+    global _CONTEXT
+    _CONTEXT = Context(
+        is_prefill=True, is_mixed=True,
+        slot_mapping=slot_mapping,
+        num_prefill_tokens=num_prefill_tokens,
+        num_decode_tokens=num_decode_tokens,
+        num_prefill_seqs=num_prefill_seqs,
+        prefill_cu_seqlens_q=prefill_cu_seqlens_q,
+        prefill_cu_seqlens_k=prefill_cu_seqlens_k,
+        prefill_max_seqlen_q=prefill_max_seqlen_q,
+        prefill_max_seqlen_k=prefill_max_seqlen_k,
+        prefill_block_tables=prefill_block_tables,
+        decode_context_lens=decode_context_lens,
+        decode_block_tables=decode_block_tables,
+        decode_max_context_len=decode_max_context_len,
+        logit_indices=logit_indices,
+        chunked_context=chunked_context,
+        req_id_per_token=req_id_per_token,
+        no_compile_layers=_STATIC_NO_COMPILE_LAYERS,
+    )
+
+
+def set_mamba_context(
+    is_prefill: bool,
+    mamba_state,
+    mamba_metadata,
+):
+    """Install per-batch Mamba state + metadata in the global Context.
+
+    Used by ``ModelRunner.run_mamba`` -- mirrors how the attention path
+    uses ``set_context`` / ``set_mixed_context``.  Mamba mixers read
+    ``ctx.mamba_state`` and ``ctx.mamba_metadata`` in their forward.
+    """
+    global _CONTEXT
+    _CONTEXT = Context(
+        is_prefill=is_prefill,
+        mamba_state=mamba_state,
+        mamba_metadata=mamba_metadata,
+        no_compile_layers=_STATIC_NO_COMPILE_LAYERS,
+    )
+
+
+def reset_context():
+    global _CONTEXT
+    _CONTEXT = Context(no_compile_layers=_STATIC_NO_COMPILE_LAYERS)
+
+
+@contextmanager
+def set_forward_context(
+    is_prefill: bool = False,
+    cudagraph_runtime_mode: CUDAGraphMode = CUDAGraphMode.NONE,
+    batch_size_for_graph: int = 0,
+    **ctx_kwargs,
+):
+    """Context manager that sets both KV-cache metadata and compile/graph
+    fields for the duration of a forward pass.
+
+    ``no_compile_layers`` is always populated from the global registry so
+    custom ops can resolve modules without the caller threading it through.
+    """
+    global _CONTEXT
+    prev = _CONTEXT
+    _CONTEXT = Context(
+        is_prefill=is_prefill,
+        no_compile_layers=_STATIC_NO_COMPILE_LAYERS,
+        cudagraph_runtime_mode=cudagraph_runtime_mode,
+        batch_size_for_graph=batch_size_for_graph,
+        **ctx_kwargs,
+    )
+    try:
+        yield _CONTEXT
+    finally:
+        _CONTEXT = prev
+
+
+# Inlined from tasks/reference/L1/_attention.py
+import torch.nn.functional as F
+
+
+def repeat_kv(k: torch.Tensor, target_heads: int) -> torch.Tensor:
+    if k.shape[-2] == target_heads:
+        return k
+    if target_heads % k.shape[-2] != 0:
+        raise ValueError(
+            f"Cannot repeat {k.shape[-2]} KV heads to {target_heads} query heads"
+        )
+    return k.repeat_interleave(target_heads // k.shape[-2], dim=-2)
+
+
+def dense_attention(
+    q: torch.Tensor,
+    k: torch.Tensor,
+    v: torch.Tensor,
+    *,
+    softmax_scale: float | None,
+    causal: bool,
+    window_size: tuple[int, int] | list[int] | None = (-1, -1),
+    s_aux: torch.Tensor | None = None,
+    softcap: float = 0.0,
+) -> torch.Tensor:
+    window_size = (-1, -1) if window_size is None else tuple(window_size)
+    q_in = q.transpose(-3, -2)
+    k_in = repeat_kv(k, q.shape[-2]).transpose(-3, -2)
+    v_in = repeat_kv(v, q.shape[-2]).transpose(-3, -2)
+    scale = softmax_scale if softmax_scale is not None else q.shape[-1] ** -0.5
+    has_backend_specific_mask = (
+        window_size != (-1, -1)
+        or s_aux is not None
+        or softcap > 0.0
+    )
+    if q.is_cuda and not has_backend_specific_mask and q_in.shape[-2] == k_in.shape[-2]:
+        out = torch.ops.aten._scaled_dot_product_flash_attention(
+            q_in, k_in, v_in, 0.0, causal, scale=scale,
+        )[0]
+        return out.transpose(-3, -2)
+    if (
+        q.is_cuda
+        and causal
+        and not has_backend_specific_mask
+        and q_in.shape[-2] == 1
+    ):
+        out = torch.ops.aten._scaled_dot_product_flash_attention(
+            q_in, k_in, v_in, 0.0, False, scale=scale,
+        )[0]
+        return out.transpose(-3, -2)
+    if causal or has_backend_specific_mask:
+        q_len = q_in.shape[-2]
+        k_len = k_in.shape[-2]
+        left, right = window_size
+        if causal:
+            right = 0
+        q_pos = torch.arange(q_len, device=q.device).unsqueeze(1) + (k_len - q_len)
+        k_pos = torch.arange(k_len, device=q.device).unsqueeze(0)
+        if left < 0:
+            mask = k_pos <= q_pos + right
+        else:
+            mask = (k_pos <= torch.minimum(q_pos + right, torch.full_like(q_pos, k_len))) & (
+                k_pos >= q_pos - left
+            )
+        scores = torch.matmul(q_in.float(), k_in.float().transpose(-2, -1)) * scale
+        if softcap > 0.0:
+            scores = torch.tanh(scores / softcap) * softcap
+        scores = scores.masked_fill(~mask, torch.finfo(scores.dtype).min)
+        if s_aux is not None:
+            sink = s_aux.to(device=scores.device, dtype=scores.dtype).view(1, -1, 1, 1)
+            sink = sink.expand(scores.shape[0], -1, scores.shape[-2], -1)
+            probs = torch.softmax(torch.cat((scores, sink), dim=-1), dim=-1)[..., :-1]
+        else:
+            probs = torch.softmax(scores, dim=-1)
+        probs = probs.masked_fill(torch.all(~mask, dim=-1, keepdim=True), 0.0)
+        if s_aux is not None:
+            out = torch.matmul(probs, v_in.float()).to(v_in.dtype)
+        else:
+            out = torch.matmul(probs.to(v_in.dtype), v_in)
+        return out.transpose(-3, -2)
+    out = F.scaled_dot_product_attention(
+        q_in, k_in, v_in, is_causal=False, scale=scale,
+    )
+    return out.transpose(-3, -2)
+
+
+def varlen_attention(
+    q: torch.Tensor,
+    k: torch.Tensor,
+    v: torch.Tensor,
+    cu_seqlens_q: torch.Tensor,
+    cu_seqlens_k: torch.Tensor,
+    *,
+    softmax_scale: float | None,
+    causal: bool,
+    window_size: tuple[int, int] | list[int] | None = (-1, -1),
+    s_aux: torch.Tensor | None = None,
+    softcap: float = 0.0,
+) -> torch.Tensor:
+    window_size = (-1, -1) if window_size is None else tuple(window_size)
+    outputs = []
+    batch = cu_seqlens_q.numel() - 1
+    for i in range(batch):
+        q_start = int(cu_seqlens_q[i].item())
+        q_end = int(cu_seqlens_q[i + 1].item())
+        k_start = int(cu_seqlens_k[i].item())
+        k_end = int(cu_seqlens_k[i + 1].item())
+        out = dense_attention(
+            q[q_start:q_end].unsqueeze(0),
+            k[k_start:k_end].unsqueeze(0),
+            v[k_start:k_end].unsqueeze(0),
+            softmax_scale=softmax_scale,
+            causal=causal,
+            window_size=window_size,
+            s_aux=s_aux,
+            softcap=softcap,
+        ).squeeze(0)
+        outputs.append(out)
+    if not outputs:
+        return q.new_empty(q.shape)
+    return torch.cat(outputs, dim=0)
+
+
+def gather_paged_cache(
+    cache: torch.Tensor,
+    block_table: torch.Tensor | None,
+    seq_idx: int,
+    seq_len: int,
+    *,
+    hnd: bool = False,
+) -> torch.Tensor:
+    if block_table is None:
+        if cache.ndim == 4 and hnd:
+            return cache.reshape(-1, cache.shape[1], cache.shape[-1])[:seq_len]
+        if cache.ndim == 4:
+            return cache.reshape(-1, cache.shape[-2], cache.shape[-1])[:seq_len]
+        return cache[:seq_len]
+
+    blocks = block_table[seq_idx]
+    pieces = []
+    remaining = seq_len
+    for block in blocks:
+        if remaining <= 0:
+            break
+        block_idx = int(block.item())
+        if block_idx < 0:
+            continue
+        block_cache = cache[block_idx]
+        if hnd:
+            block_cache = block_cache.transpose(0, 1)
+        take = min(remaining, block_cache.shape[0])
+        pieces.append(block_cache[:take])
+        remaining -= take
+    if not pieces:
+        shape = (0, cache.shape[1], cache.shape[-1]) if hnd else (0, cache.shape[-2], cache.shape[-1])
+        return cache.new_empty(shape)
+    return torch.cat(pieces, dim=0)
+
+
+# Inlined from tasks/reference/L1/flash_attn_decode.py
 import torch.nn as nn
 
-from kb_nano.infra.context import get_attn_backend_config, get_context
-from kb_nano.tasks.reference.L1.flash_attn_decode import FlashAttnDecode
-from kb_nano.tasks.reference.L1.flash_attn_prefill import FlashAttnPrefill
-from kb_nano.tasks.reference.L1.flashinfer_decode import TRTLLMDecode
-from kb_nano.tasks.reference.L1.flashinfer_prefill import TRTLLMPrefill
-from kb_nano.tasks.reference.L1.store_kvcache import StoreKVCache, StoreKVCacheHND
+
+class FlashAttnDecode(nn.Module):
+    def __init__(self, num_heads: int, num_kv_heads: int, head_dim: int):
+        super().__init__()
+        self.num_heads = num_heads
+        self.num_kv_heads = num_kv_heads
+        self.head_dim = head_dim
+
+    def forward(self, q, k_cache, v_cache, cache_seqlens=None, **kwargs):
+        block_table = kwargs.get("block_table", None)
+        softmax_scale = kwargs.get("softmax_scale", self.head_dim ** -0.5)
+        window_size = kwargs.get("window_size", (-1, -1))
+        window_size = (-1, -1) if window_size is None else tuple(window_size)
+        s_aux = kwargs.get("s_aux", None)
+        softcap = kwargs.get("softcap", 0.0)
+        if cache_seqlens is None:
+            cache_seqlens = torch.full((q.shape[0],), k_cache.shape[0], device=q.device, dtype=torch.int32)
+
+        outs = []
+        for i in range(q.shape[0]):
+            seq_len = int(cache_seqlens[i].item())
+            k = gather_paged_cache(k_cache, block_table, i, seq_len)
+            v = gather_paged_cache(v_cache, block_table, i, seq_len)
+            out = dense_attention(
+                q[i:i + 1].unsqueeze(0), k.unsqueeze(0), v.unsqueeze(0),
+                softmax_scale=softmax_scale, causal=True,
+                window_size=window_size, s_aux=s_aux, softcap=softcap,
+            ).squeeze(0).squeeze(0)
+            outs.append(out)
+        return torch.stack(outs, dim=0)
+
+
+# Inlined from tasks/reference/L1/flash_attn_prefill.py
+
+
+class FlashAttnPrefill(nn.Module):
+    def __init__(self, num_heads: int, num_kv_heads: int, head_dim: int):
+        super().__init__()
+        self.num_heads = num_heads
+        self.num_kv_heads = num_kv_heads
+        self.head_dim = head_dim
+        self.sm_scale = head_dim ** -0.5
+
+    def forward(self, q, k, v, cu_seqlens_q, cu_seqlens_k, max_seqlen_q, max_seqlen_k, **kwargs):
+        del max_seqlen_q, max_seqlen_k
+        block_table = kwargs.get("block_table")
+        window_size = kwargs.get("window_size", (-1, -1))
+        window_size = (-1, -1) if window_size is None else tuple(window_size)
+        if block_table is not None and k.ndim == 4:
+            k_parts = []
+            v_parts = []
+            cu_k = [0]
+            for i in range(cu_seqlens_k.numel() - 1):
+                seq_len = int((cu_seqlens_k[i + 1] - cu_seqlens_k[i]).item())
+                k_seq = gather_paged_cache(k, block_table, i, seq_len)
+                v_seq = gather_paged_cache(v, block_table, i, seq_len)
+                k_parts.append(k_seq)
+                v_parts.append(v_seq)
+                cu_k.append(cu_k[-1] + k_seq.shape[0])
+            k = torch.cat(k_parts, dim=0) if k_parts else k.new_empty((0, self.num_kv_heads, self.head_dim))
+            v = torch.cat(v_parts, dim=0) if v_parts else v.new_empty((0, self.num_kv_heads, self.head_dim))
+            cu_seqlens_k = torch.tensor(cu_k, device=cu_seqlens_k.device, dtype=cu_seqlens_k.dtype)
+        return varlen_attention(
+            q, k, v, cu_seqlens_q, cu_seqlens_k,
+            softmax_scale=kwargs.get("softmax_scale", self.sm_scale),
+            causal=kwargs.get("causal", True),
+            window_size=window_size,
+            s_aux=kwargs.get("s_aux", None),
+            softcap=kwargs.get("softcap", 0.0),
+        )
+
+
+# Inlined from tasks/reference/L1/flashinfer_decode.py
+
+
+class TRTLLMDecode(nn.Module):
+    def __init__(
+        self,
+        num_qo_heads: int,
+        num_kv_heads: int,
+        head_dim: int,
+        workspace: torch.Tensor | None = None,
+    ):
+        super().__init__()
+        self.num_qo_heads = num_qo_heads
+        self.num_kv_heads = num_kv_heads
+        self.head_dim = head_dim
+        self.sm_scale = head_dim ** -0.5
+        self._workspace = workspace
+
+    def forward(self, q, k_cache, v_cache, cache_seqlens=None,
+                block_table=None, softmax_scale=None, causal=True,
+                max_seq_len=None, **kwargs):
+        del causal, max_seq_len, kwargs
+        if cache_seqlens is None:
+            cache_seqlens = torch.full((q.shape[0],), k_cache.shape[2], device=q.device, dtype=torch.int32)
+        scale = softmax_scale if softmax_scale is not None else self.sm_scale
+        outs = []
+        for i in range(q.shape[0]):
+            seq_len = int(cache_seqlens[i].item())
+            k = gather_paged_cache(k_cache, block_table, i, seq_len, hnd=True)
+            v = gather_paged_cache(v_cache, block_table, i, seq_len, hnd=True)
+            out = dense_attention(
+                q[i:i + 1].unsqueeze(0), k.unsqueeze(0), v.unsqueeze(0),
+                softmax_scale=scale, causal=False,
+            ).squeeze(0).squeeze(0)
+            outs.append(out)
+        return torch.stack(outs, dim=0)
+
+
+# Inlined from tasks/reference/L1/flashinfer_prefill.py
+
+
+class TRTLLMPrefill(nn.Module):
+    def __init__(
+        self,
+        num_qo_heads: int,
+        num_kv_heads: int,
+        head_dim: int,
+        workspace: torch.Tensor | None = None,
+    ):
+        super().__init__()
+        self.num_qo_heads = num_qo_heads
+        self.num_kv_heads = num_kv_heads
+        self.head_dim = head_dim
+        self.sm_scale = head_dim ** -0.5
+        self._workspace = workspace
+
+    def forward(self, q, k, v, cu_seqlens_q, cu_seqlens_k,
+                max_seqlen_q, max_seqlen_k, softmax_scale=None,
+                causal=True, block_table=None, **kwargs):
+        del max_seqlen_q, max_seqlen_k, kwargs
+        if block_table is not None and k.ndim == 4:
+            k_parts = []
+            v_parts = []
+            cu_k = [0]
+            for i in range(cu_seqlens_k.numel() - 1):
+                seq_len = int((cu_seqlens_k[i + 1] - cu_seqlens_k[i]).item())
+                k_seq = gather_paged_cache(k, block_table, i, seq_len, hnd=True)
+                v_seq = gather_paged_cache(v, block_table, i, seq_len, hnd=True)
+                k_parts.append(k_seq)
+                v_parts.append(v_seq)
+                cu_k.append(cu_k[-1] + k_seq.shape[0])
+            k = torch.cat(k_parts, dim=0) if k_parts else k.new_empty((0, self.num_kv_heads, self.head_dim))
+            v = torch.cat(v_parts, dim=0) if v_parts else v.new_empty((0, self.num_kv_heads, self.head_dim))
+            cu_seqlens_k = torch.tensor(cu_k, device=cu_seqlens_k.device, dtype=cu_seqlens_k.dtype)
+        return varlen_attention(
+            q, k, v, cu_seqlens_q, cu_seqlens_k,
+            softmax_scale=softmax_scale if softmax_scale is not None else self.sm_scale,
+            causal=causal,
+        )
+
+
+# Inlined from tasks/reference/L1/store_kvcache.py
+
+
+class StoreKVCache(nn.Module):
+    """NHD layout store: [num_blocks, block_size, num_kv_heads, head_dim]."""
+
+    def forward(self, key, value, k_cache, v_cache, slot_mapping):
+        flat_k = k_cache.view(-1, k_cache.shape[-2], k_cache.shape[-1])
+        flat_v = v_cache.view(-1, v_cache.shape[-2], v_cache.shape[-1])
+        valid = slot_mapping >= 0
+        slots = slot_mapping[valid].long()
+        flat_k.index_copy_(0, slots, key[valid])
+        flat_v.index_copy_(0, slots, value[valid])
+
+
+class StoreKVCacheHND(nn.Module):
+    """HND layout store: [num_blocks, num_kv_heads, block_size, head_dim]."""
+
+    def __init__(self, page_size: int):
+        super().__init__()
+        self.page_size = page_size
+
+    def forward(self, key, value, k_cache, v_cache, slot_mapping):
+        valid = slot_mapping >= 0
+        slots = slot_mapping[valid].long()
+        block_idx = slots // self.page_size
+        slot_in_block = slots % self.page_size
+        k_cache[block_idx, :, slot_in_block, :] = key[valid]
+        v_cache[block_idx, :, slot_in_block, :] = value[valid]
+
+
+import numpy as np
 
 
 def _chunked_prefill_remap(

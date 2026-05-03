@@ -1,13 +1,168 @@
 """YOLOv10 Conv-BN-Act building block."""
 
+
 from __future__ import annotations
 
+
+# Inlined from tasks/reference/L1/batch_norm2d.py
 import torch
 import torch.nn as nn
+import torch.nn.functional as F
 
-from ..L1.batch_norm2d import BatchNorm2d
-from ..L1.conv2d import Conv2d
-from ..L1.silu import SiLU
+
+class BatchNorm2d(nn.Module):
+    def __init__(
+        self,
+        num_features: int,
+        eps: float = 1e-5,
+        momentum: float = 0.1,
+        affine: bool = True,
+        track_running_stats: bool = True,
+    ):
+        super().__init__()
+        self.num_features = num_features
+        self.eps = eps
+        self.momentum = momentum
+        self.affine = affine
+        self.track_running_stats = track_running_stats
+
+        if affine:
+            self.weight = nn.Parameter(torch.ones(num_features))
+            self.bias = nn.Parameter(torch.zeros(num_features))
+        else:
+            self.register_parameter("weight", None)
+            self.register_parameter("bias", None)
+
+        if track_running_stats:
+            self.register_buffer("running_mean", torch.zeros(num_features))
+            self.register_buffer("running_var", torch.ones(num_features))
+            self.register_buffer("num_batches_tracked", torch.tensor(0, dtype=torch.long))
+        else:
+            self.register_buffer("running_mean", None)
+            self.register_buffer("running_var", None)
+            self.register_buffer("num_batches_tracked", None)
+
+    def forward(self, x: torch.Tensor) -> torch.Tensor:
+        if self.training and self.track_running_stats and self.num_batches_tracked is not None:
+            self.num_batches_tracked.add_(1)
+        return F.batch_norm(
+            x,
+            self.running_mean,
+            self.running_var,
+            self.weight,
+            self.bias,
+            self.training or not self.track_running_stats,
+            self.momentum,
+            self.eps,
+        )
+
+
+# Inlined from tasks/reference/L1/conv2d.py
+
+
+class Conv2d(nn.Module):
+    """Parametric 2D convolution: stores weight and bias internally."""
+
+    def __init__(
+        self,
+        in_channels: int,
+        out_channels: int,
+        kernel_size: int | tuple[int, int],
+        stride: int | tuple[int, int] = 1,
+        padding: int | tuple[int, int] = 0,
+        groups: int = 1,
+        dilation: int | tuple[int, int] = 1,
+        bias: bool = True,
+    ):
+        super().__init__()
+        if isinstance(kernel_size, int):
+            kernel_size = (kernel_size, kernel_size)
+        if isinstance(stride, int):
+            stride = (stride, stride)
+        if isinstance(padding, int):
+            padding = (padding, padding)
+        if isinstance(dilation, int):
+            dilation = (dilation, dilation)
+
+        self.stride = stride
+        self.padding = padding
+        self.groups = groups
+        self.dilation = dilation
+
+        self.weight = nn.Parameter(
+            torch.empty(out_channels, in_channels // groups, *kernel_size)
+        )
+        self.bias = nn.Parameter(torch.empty(out_channels)) if bias else None
+
+    def forward(self, x: torch.Tensor) -> torch.Tensor:
+        return F.conv2d(
+            x,
+            self.weight,
+            self.bias,
+            stride=self.stride,
+            padding=self.padding,
+            dilation=self.dilation,
+            groups=self.groups,
+        )
+
+
+# Inlined from tasks/reference/L1/silu.py
+
+
+class SiLU(nn.Module):
+    def forward(self, x: torch.Tensor) -> torch.Tensor:
+        return F.silu(x)
+
+
+# Inlined from tasks/reference/L1/tensor_ops.py
+
+
+class Pad(nn.Module):
+    """Functional padding op."""
+
+    def forward(
+        self, x: torch.Tensor, pad: tuple[int, ...], value: float = 0.0,
+    ) -> torch.Tensor:
+        return F.pad(x, pad, value=value)
+
+
+class OneHot(nn.Module):
+    """Functional one-hot encoding op."""
+
+    def forward(self, x: torch.Tensor, num_classes: int) -> torch.Tensor:
+        return F.one_hot(x, num_classes)
+
+
+# Inlined from tasks/reference/L2/yolov10_repvggdw.py
+
+
+class YOLORepVGGDW(nn.Module):
+    def __init__(self, ed: int):
+        super().__init__()
+        self.conv = YOLOConv(ed, ed, 7, 1, 3, g=ed, act=False)
+        self.conv1 = YOLOConv(ed, ed, 3, 1, 1, g=ed, act=False)
+        self.act = SiLU()
+        self._pad = Pad()
+        self._is_fused = False
+
+    def forward(self, x: torch.Tensor) -> torch.Tensor:
+        if self._is_fused:
+            return self.act(self.conv(x))
+        return self.act(self.conv(x) + self.conv1(x))
+
+    @torch.no_grad()
+    def fuse(self):
+        if self._is_fused:
+            return self
+        self.conv.fuse()
+        self.conv1.fuse()
+        final_conv_w = self.conv.conv.weight.data + self._pad(self.conv1.conv.weight.data, [2, 2, 2, 2])
+        final_conv_b = self.conv.conv.bias.data + self.conv1.conv.bias.data
+        self.conv.conv.weight.data.copy_(final_conv_w)
+        self.conv.conv.bias.data.copy_(final_conv_b)
+        delattr(self, "conv1")
+        self._is_fused = True
+        return self
 
 
 def autopad(k: int | tuple[int, int], p=None, d: int = 1):
@@ -82,7 +237,6 @@ class YOLOConv(nn.Module):
 
 
 def fuse_module(module: nn.Module) -> nn.Module:
-    from .yolov10_repvggdw import YOLORepVGGDW
 
     for child in module.children():
         fuse_module(child)

@@ -5,12 +5,26 @@ forward() interpolates these onto arbitrary (h, w) grids using bilinear
 weights, then reshuffles by spatial_merge_size for the vision encoder.
 """
 
+
 from __future__ import annotations
 
-import torch
+
+# Inlined from tasks/reference/L1/embedding.py
 import torch.nn as nn
 
-from ..L1.embedding import Embedding
+
+class Embedding(nn.Module):
+    def __init__(self, num_embeddings: int, embedding_dim: int,
+                 padding_idx: int | None = None):
+        super().__init__()
+        self.emb = nn.Embedding(num_embeddings, embedding_dim,
+                                padding_idx=padding_idx)
+
+    def forward(self, input_ids):
+        return self.emb(input_ids)
+
+
+import torch
 
 
 class VisionPosEmbedInterpolate(nn.Module):
