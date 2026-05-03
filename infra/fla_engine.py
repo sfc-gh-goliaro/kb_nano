@@ -240,7 +240,7 @@ class FLAEngine:
         device: str = "cuda",
         dtype: torch.dtype = torch.bfloat16,
         seed: int = 42,
-        max_num_seqs: int = 256,
+        max_num_seqs: int = 512,
         chunked_prefill_size: int = 1024,
         max_prefill_tokens: int = 196608,
         trust_remote_code: bool = True,
@@ -292,6 +292,14 @@ class FLAEngine:
         ]
         self._is_rwkv7 = any(
             isinstance(m, RWKV7Attention) for m in self.model.modules()
+        )
+        self._supports_padded_initial_prefill = (
+            not self._is_rwkv7
+            and all(
+                not getattr(m, "use_rotary", False)
+                for m in self.model.modules()
+                if isinstance(m, GatedLinearAttention)
+            )
         )
 
         # Persistent slot cache + free-slot pool (per-generate state).
@@ -417,13 +425,14 @@ class FLAEngine:
     # ------------------------------------------------------------------
     @torch.no_grad()
     def _prefill_chunk_batched(
-        self, seqs: list[_ActiveSeq], chunk_size: int,
+        self, seqs: list[_ActiveSeq], chunk_sizes: int | list[int],
     ) -> list[torch.Tensor | None]:
-        """Run one batched prefill chunk over ``seqs`` (all same chunk size).
+        """Run one packed, variable-length prefill chunk over ``seqs``.
 
-        Each seq in ``seqs`` consumes ``chunk_size`` tokens starting at its
-        own ``prefill_pos``. Per-row absolute positions for rotary are
-        passed via ``cache.seq_offsets`` as a [B] int64 tensor.
+        Each seq consumes its own next chunk starting at ``prefill_pos``.
+        GLA prefill is packed as ``[1, sum(chunk_sizes)]`` plus
+        ``cu_seqlens`` so different prompt lengths share one kernel launch
+        without padding or using unknown decode lengths for batching.
 
         Returns a list of per-row logits ([T, V]) for seqs whose prefill
         is complete after this chunk (so the caller can sample the first
@@ -440,8 +449,12 @@ class FLAEngine:
                 and any(s in self._live_active for s in seqs)):
             self._flush_live()
 
-        chunks = [s.prompt_ids[s.prefill_pos:s.prefill_pos + chunk_size] for s in seqs]
-        ids = torch.tensor(chunks, dtype=torch.long, device=self.device)
+        if isinstance(chunk_sizes, int):
+            chunk_sizes = [chunk_sizes] * len(seqs)
+        chunks = [
+            s.prompt_ids[s.prefill_pos:s.prefill_pos + chunk_size]
+            for s, chunk_size in zip(seqs, chunk_sizes, strict=True)
+        ]
         slot_ids = torch.tensor(
             [s.slot_id for s in seqs], dtype=torch.int64, device=self.device,
         )
@@ -457,21 +470,47 @@ class FLAEngine:
             [s.prefill_pos for s in seqs], dtype=torch.int64, device=self.device,
         )
 
-        # We only ever need the LAST token's logits (sample first
-        # generated token for completed prefills); the L4 layer slices
-        # before lm_head + fp32 upcast so we don't materialize a
-        # ``[B, T, V]`` fp32 tensor (which OOMs at B=200, T=1024,
-        # vocab=65k -> 50 GB).
-        out = self.model(
-            input_ids=ids, past_key_values=cache, use_cache=True,
-            num_logits_to_keep=1,
+        # Fast dense path for first chunks: left-pad with zero embeddings.
+        # With a zero recurrent state, leading all-zero tokens leave the
+        # state unchanged, so real tokens end at the last column and we can
+        # use the dense chunk kernel instead of the slower varlen path.
+        use_dense_leftpad = (
+            self._supports_padded_initial_prefill
+            and all(s.prefill_pos == 0 for s in seqs)
         )
+        if use_dense_leftpad:
+            max_len = max(len(chunk) for chunk in chunks)
+            ids = torch.zeros((len(chunks), max_len), dtype=torch.long, device=self.device)
+            pad_mask = torch.zeros((len(chunks), max_len, 1), dtype=self.dtype, device=self.device)
+            for i, chunk in enumerate(chunks):
+                start = max_len - len(chunk)
+                ids[i, start:] = torch.tensor(chunk, dtype=torch.long, device=self.device)
+                pad_mask[i, start:, 0] = 1
+            embeds = self.model.model.embeddings(ids) * pad_mask
+            out = self.model(
+                inputs_embeds=embeds, past_key_values=cache, use_cache=True,
+                num_logits_to_keep=1,
+            )
+        else:
+            flat_ids = [tok for chunk in chunks for tok in chunk]
+            ids = torch.tensor([flat_ids], dtype=torch.long, device=self.device)
+            lengths = torch.tensor(
+                [len(chunk) for chunk in chunks], dtype=torch.int64, device=self.device,
+            )
+            cu_seqlens = torch.empty(len(chunks) + 1, dtype=torch.int64, device=self.device)
+            cu_seqlens[0] = 0
+            cu_seqlens[1:] = lengths.cumsum(0)
+            logits_indices = cu_seqlens[1:] - 1
+            out = self.model(
+                input_ids=ids, past_key_values=cache, use_cache=True,
+                logits_indices=logits_indices, cu_seqlens=cu_seqlens,
+            )
         self._slot_cache.scatter(slot_ids, out.past_key_values)
 
-        # out.logits has shape [B, 1, V] -- index by batch row, take
+        # out.logits has shape [N, 1, V] -- index by request row, take
         # position 0, hand back to caller.
         results: list[torch.Tensor | None] = []
-        for i, s in enumerate(seqs):
+        for i, (s, chunk_size) in enumerate(zip(seqs, chunk_sizes, strict=True)):
             s.prefill_pos += chunk_size
             results.append(out.logits[i, 0] if s.prefill_pos >= len(s.prompt_ids) else None)
         return results
@@ -512,32 +551,40 @@ class FLAEngine:
 
     def _next_prefill_batch(
         self, prefilling: list[_ActiveSeq],
-    ) -> tuple[list[_ActiveSeq], int]:
-        """Pop the longest prefix of ``prefilling`` whose seqs all want the
-        same next chunk size.
+    ) -> tuple[list[_ActiveSeq], list[int]]:
+        """Select the next packed varlen prefill batch by prompt state.
 
-        Bench prompts share lengths so this typically batches everything
-        in one shot; mixed-length workloads still get partial batching.
-        Cap is ``max_num_seqs`` to keep activation memory bounded; for
-        max_num_seqs=256 with input_len=1024 the activation peak stays
-        well under H200 capacity.
+        The only batching inputs are current prompt progress, available
+        sequence slots, and the prefill token budget. Requested output
+        lengths are intentionally ignored because a real engine does not
+        know them before generation.
         """
         if not prefilling:
-            return [], 0
-        target = self._next_chunk_size(prefilling[0])
-        # Token-budget cap (B * chunk_size <= max_prefill_tokens) plus a
-        # hard cap at max_num_seqs so the slot cache addressing stays in
-        # range.
-        token_cap = max(1, self.max_prefill_tokens // max(target, 1))
-        cap = min(self.max_num_seqs, token_cap)
+            return [], []
         batch: list[_ActiveSeq] = []
+        chunk_sizes: list[int] = []
+        token_count = 0
+        dense_leftpad = (
+            self._supports_padded_initial_prefill
+            and prefilling[0].prefill_pos == 0
+        )
+        dense_len = self._next_chunk_size(prefilling[0]) if dense_leftpad else 0
         for seq in prefilling:
-            if len(batch) >= cap:
+            if len(batch) >= self.max_num_seqs:
                 break
-            if self._next_chunk_size(seq) != target:
-                break
+            chunk_size = self._next_chunk_size(seq)
+            if dense_leftpad:
+                if seq.prefill_pos != 0:
+                    break
+                if batch and (len(batch) + 1) * dense_len > self.max_prefill_tokens:
+                    break
+            else:
+                if batch and token_count + chunk_size > self.max_prefill_tokens:
+                    break
             batch.append(seq)
-        return batch, target
+            chunk_sizes.append(chunk_size)
+            token_count += chunk_size
+        return batch, chunk_sizes
 
     # ------------------------------------------------------------------
     # Public API
@@ -581,7 +628,14 @@ class FLAEngine:
             pbar = _tqdm(total=len(all_seqs), desc="FLAEngine prompts")
         finished_count = 0
 
-        waiting: deque[_ActiveSeq] = deque(all_seqs)
+        # Schedule by prompt length, using only information known at
+        # admission time. Recurrent prefill cannot use padded varlen
+        # batches in this local model path, so grouping long prompts
+        # first maximizes full-size chunk batches and reduces the small
+        # tail-fragmentation that real WildChat prompts otherwise cause.
+        waiting: deque[_ActiveSeq] = deque(
+            sorted(all_seqs, key=lambda s: len(s.prompt_ids), reverse=True)
+        )
         # In-progress prefill (not yet sampled their first token)
         prefilling: list[_ActiveSeq] = []
         # Decoding (have at least one generated token, still under max_tokens)
@@ -606,8 +660,9 @@ class FLAEngine:
         while prefilling or running:
             # ---- prefill: gather a chunk-aligned batch and run ONE forward
             if prefilling:
-                batch, chunk_size = self._next_prefill_batch(prefilling)
-                results = self._prefill_chunk_batched(batch, chunk_size)
+                prefilling.sort(key=self._next_chunk_size, reverse=True)
+                batch, chunk_sizes = self._next_prefill_batch(prefilling)
+                results = self._prefill_chunk_batched(batch, chunk_sizes)
                 # Sample first tokens for completed seqs in one batched
                 # argmax / multinomial call.
                 completed: list[_ActiveSeq] = []

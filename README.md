@@ -1,6 +1,6 @@
 # kb-nano
 
-A standalone, high-performance inference engine supporting **LLMs** (Llama 3.1, Llama 4, Mixtral-8x7B, DeepSeek V3.2, GPT-OSS, Qwen2-VL, Qwen3-VL), **linear-attention LLMs** (GLA, RetNet, RWKV7), **diffusion models** (FLUX.1-dev, SDXL, HunyuanVideo-1.5), **detection models** (YOLOv10, RTDetrV2), **vision encoders** (SigLIP-2, DINOv3, SwinV2), **segmentation models** (SAM3.1), **protein structure prediction** (OpenFold3), audio models (Whisper), and **TTS models** (CosyVoice3) with tensor parallelism and FP8 quantization. No vLLM dependency at runtime — just PyTorch, Triton, and Flash Attention.
+A standalone, high-performance inference engine supporting **LLMs** (Llama 3.1, Llama 4, Mixtral-8x7B, DeepSeek V3.2, GPT-OSS, Qwen2-VL, Qwen3-VL), **linear-attention LLMs** (GLA, RetNet, RWKV7), **embedding / retrieval models** (BGE-M3, ColBERTv2), **diffusion models** (FLUX.1-dev, SDXL, HunyuanVideo-1.5), **world models** (Oasis 500M), **detection models** (YOLOv10, RTDetrV2), **vision encoders** (SigLIP-2, DINOv3, SwinV2), **segmentation models** (SAM3.1), **3D point models** (PointTransformerV3), **protein structure prediction** (OpenFold3), audio models (Whisper), and **TTS models** (CosyVoice3) with tensor parallelism and FP8 quantization. No vLLM dependency at runtime — just PyTorch, Triton, and Flash Attention.
 
 ## Features
 
@@ -9,6 +9,8 @@ A standalone, high-performance inference engine supporting **LLMs** (Llama 3.1, 
 - **Mixtral-8x7B** with fused Triton MoE grouped-GEMM kernels
 - **DeepSeek V3.2** with MLA (Multi-head Latent Attention), 256-expert MoE via DeepGEMM FP8, DSA (DeepSeek Sparse Attention), and YARN RoPE — currently **0.78–0.90× of vLLM** throughput on 8×H200 (gap due to kernel-launch overhead, GEMM kernel selection, and AllReduce+RMSNorm fusion)
 - **GPT-OSS** (20B, 120B) MXFP4-quantized MoE with native Triton inference, YaRN RoPE, attention sinks, and sliding window
+- **BGE-M3** dense + sparse + ColBERT-style embedding outputs
+- **ColBERTv2** query/doc encoders with MaxSim scoring
 - **Mamba / Mamba2** (`state-spaces/mamba-2.8b-hf`, `mistralai/Mamba-Codestral-7B-v0.1`) selective state-space models with vLLM-aligned `causal_conv1d` + `mamba_chunk_scan` / `selective_scan` kernels, slot-based recurrent state cache, chunked-prefill metadata, and TP sharding (incl. `n_groups % tp != 0` head-shard groups)
 - **GLA** (`fla-hub/gla-2.7B-100B`) Gated Linear Attention with per-head logsigmoid forget gate, swish output gate, and SwiGLU MLP — token-aligned with the FLA reference
 - **RetNet** (`fla-hub/retnet-2.7B-100B`) Multi-Scale Retention with rotary embeddings, fixed per-head decay (γ_h = 1 − 2^(−5−h)), swish output gate, and SwiGLU MLP — token-aligned with the FLA reference
@@ -16,6 +18,7 @@ A standalone, high-performance inference engine supporting **LLMs** (Llama 3.1, 
 - **FLUX.1-dev** diffusion transformer (text-to-image) with Flash Attention
 - **SDXL** (Stable Diffusion XL) UNet-based text-to-image with dual CLIP text encoders
 - **HunyuanVideo-1.5** 3D video diffusion transformer (text-to-video) with dual-stream joint attention, M-RoPE, and Qwen2.5-VL text encoder
+- **Oasis 500M** action-conditioned autoregressive diffusion world model
 - **YOLOv10** (`jameslahm/yolov10n`) NMS-free object detection with rank sorting
 - **RTDetrV2** (`PekingU/rtdetr_v2_r101vd`) real-time detection transformer with deformable attention
 - **Qwen2-VL / Qwen3-VL** vision-language models with image and video support
@@ -23,6 +26,7 @@ A standalone, high-performance inference engine supporting **LLMs** (Llama 3.1, 
 - **DINOv3** (facebook/dinov3-vit7b16-pretrain-lvd1689m) Eva vision encoder with 2D RoPE, SwiGLU MLP, and register tokens
 - **SwinV2** (timm/swinv2_large_window12_192.ms_in22k) hierarchical vision transformer with shifted-window cosine attention and continuous position bias
 - **SAM3.1** (facebook/sam3.1) image/video segmentation with ViT backbone, fusion encoder, detection decoder, and segmentation head
+- **PointTransformerV3** (Pointcept/PointTransformerV3) 3D point cloud transformer with serialized pooling, sparse conv stems, and optional Flash Attention
 - **Whisper** (large-v3) encoder-decoder speech-to-text with batched inference and paged cross-attention KV cache
 - **CosyVoice3** (Fun-CosyVoice3-0.5B-2512) text-to-speech with flow matching DiT + HiFi-GAN vocoder
 - **OpenFold3** (OpenFold/OpenFold3) protein structure prediction with MSA module, PairFormer, diffusion sampling, and atom attention
@@ -41,6 +45,9 @@ A standalone, high-performance inference engine supporting **LLMs** (Llama 3.1, 
 - **Detection benchmark** for YOLOv10 and RTDetrV2
 - **timm comparison benchmark** for SigLIP-2, DINOv3, and SwinV2 vision encoders (ImageNet-1K validation)
 - **facebook/sam3 comparison benchmark** for SAM3.1 segmentation
+- **vLLM pooling/token_embed comparison benchmark** for embedding and retrieval models
+- **PointTransformerV3 detached comparison benchmark** for 3D point cloud encoding
+- **open-oasis comparison benchmark** for autoregressive diffusion world models
 - **OpenFold/OpenFold3 comparison benchmark** for protein structure prediction
 
 ## Project Structure
@@ -295,10 +302,55 @@ The protein structure benchmark measures:
 - **Latency**: per-structure prediction latency with median stats
 - **Correctness**: percentage of queries meeting all correctness requirements (atom position cosine similarity >= 0.95, RMSD < 0.5A, pLDDT correlation >= 0.99, PAE cosine similarity >= 0.95)
 
+### Benchmarking vs vLLM (Embedding / Retrieval)
+
+Install the benchmark dependencies in the `kb` environment:
+
+```bash
+python -m pip install datasets==4.8.4 peft==0.18.1 GitPython==3.1.46 ujson==5.12.0 scipy==1.17.1
+```
+
+After that, run the benchmark directly from the repo root. The embedding benchmark compares kb-nano against vLLM's pooling runner in `token_embed` mode, using pre-tokenized identical requests for both engines. It reports end-to-end input tokens/sec, latency, and per-request output cosine correctness as part of the throughput run.
+
+```bash
+# BGE-M3 + ColBERTv2 token-level embedding throughput/latency/correctness vs vLLM
+python tests/bench_embedding.py
+
+# Single model
+python tests/bench_embedding.py --model bge-m3
+python tests/bench_embedding.py --model colbertv2.0
+
+# kb-nano only
+python tests/bench_embedding.py --model bge-m3 --skip-vllm
+
+# Skip latency phase
+python tests/bench_embedding.py --skip-latency
+
+# Save results to a specific directory
+python tests/bench_embedding.py --output-dir tests/results/B200/embedding/manual
+```
+
 The diffusion benchmark measures:
 - **Throughput**: images/sec (FLUX) or videos/sec (HunyuanVideo) at various resolutions
 - **Latency**: per-image/video latency with P50 percentile stats
 - **Correctness**: per-batch latent cosine similarity (FLUX) or per-prompt decoded-frame PSNR and cosine similarity (HunyuanVideo)
+
+### Benchmarking vs open-oasis (Autoregressive Diffusion)
+
+```bash
+# Oasis 500M: throughput + latency + correctness benchmark vs official open-oasis
+python tests/bench_oasis.py --model Etched/oasis-500m
+
+# Use an existing open-oasis checkout instead of auto-cloning it
+python tests/bench_oasis.py --model Etched/oasis-500m --open-oasis-src /path/to/open-oasis
+
+# Skip throughput or latency
+python tests/bench_oasis.py --model Etched/oasis-500m --skip-throughput
+python tests/bench_oasis.py --model Etched/oasis-500m --skip-latency
+
+# Save results to a specific directory
+python tests/bench_oasis.py --model Etched/oasis-500m --output-dir tests/results/H200/oasis-500m
+```
 
 ## Benchmarking
 
@@ -456,6 +508,7 @@ Each run is tagged with a `tier` (`agent`, `kernel`, `eval`, or `e2e`) indicatin
 - timm (pytorch-image-models — only needed for vision encoder comparison tests)
 - vLLM (only needed for running comparison tests)
 - matplotlib (only needed for benchmark plotting)
+- timm, einops, torchvision, av, rotary-embedding-torch (only needed for the Oasis / open-oasis comparison benchmark)
 - ultralytics (YOLOv10 baseline benchmarking)
 
 ### Optional detection benchmark dependencies
@@ -651,6 +704,30 @@ Latency (batch size 1, 128 output tokens, 5 iterations):
 
 FP8 activation quantization uses a custom Triton kernel for single-launch per-token-group UE8M0 quantization. Pre-allocated shared prefill buffers eliminate dynamic allocation during FP8 prefill, and DeepGEMM is JIT-warmed for both decode and prefill batch sizes. The remaining throughput gap vs vLLM is primarily from vLLM's `torch.compile` + Inductor fusion passes (RMSNorm+quant, SiLU+quant).
 
+### BGE-M3 / ColBERTv2 (Embedding)
+
+Run `python tests/bench_embedding.py` to reproduce. Reference baseline: vLLM pooling runner in `token_embed` mode. Both engines receive the same pre-tokenized requests, use fp16 model weights with fp32 pooling heads, and materialize token-level embedding outputs before correctness comparison. The benchmark measures end-to-end input tokens/sec, not retrieval ranking quality.
+
+**Hardware: NVIDIA B200**
+
+Throughput (real dataset workloads, fp16, token-level embeddings):
+
+| Scenario | Requests | Input Tokens | vLLM tok/s | Ours tok/s | Ratio | Correct | Min Cos |
+|----------|---------:|-------------:|-----------:|-----------:|------:|:--------|--------:|
+| BGE-M3 MLDR documents | 1,000 | 4,569,071 | 376,516 | 398,706 | **1.06x** | PASS | 0.999012 |
+| ColBERTv2 MS MARCO passages | 60,000 | 4,627,378 | 346,735 | 1,068,509 | **3.08x** | PASS | 0.999992 |
+
+Latency (median of 5 runs, fp16):
+
+| Model | Scenario | BS | Input Tokens | vLLM median | Ours median | vLLM ms/tok | Ours ms/tok | Ratio |
+|-------|----------|---:|-------------:|------------:|------------:|------------:|------------:|------:|
+| BGE-M3 | single-request | 1 | 6,638 | 0.0197s | 0.0183s | 0.00 | 0.00 | **1.08x** |
+| BGE-M3 | fixed-batch-32 | 32 | 152,801 | 0.3411s | 0.3520s | 0.00 | 0.00 | 0.97x |
+| ColBERTv2 | single-request | 1 | 56 | 0.0042s | 0.0011s | 0.08 | 0.02 | **3.99x** |
+| ColBERTv2 | fixed-batch-32 | 32 | 2,401 | 0.0193s | 0.0022s | 0.01 | 0.00 | **8.63x** |
+
+BGE-M3 is near vLLM parity on large-document encoder work. The ColBERTv2 workload has many short passages, so the larger speedup primarily reflects lower end-to-end request/pooling/output overhead in kb-nano's packed token-embedding path rather than a claim that every ColBERT kernel is 3x faster than vLLM.
+
 ### DeepSeek V3.2 FP8 (MoE, MLA, DSA)
 
 FP8 support for `deepseek-ai/DeepSeek-V3.2` with block-scaled FP8 MoE experts via DeepGEMM, Multi-head Latent Attention (MLA) with FP8 KV cache via FlashMLA, and DeepSeek Sparse Attention (DSA) indexer.
@@ -773,6 +850,31 @@ Correctness (eager mode, decoded video frames, per-prompt cosine similarity):
 | 480p-medium |  8 | 0.923 | 0.862 | 12.92 dB | WARN |
 
 Correctness is measured in decoded pixel space (both engines produce PIL video frames which are compared as uint8 numpy arrays). The pixel-level cosine similarity of ~0.92 is expected for two independent bf16 implementations: numerical differences in the 30-step denoising loop are amplified by the VAE decoder. For reference, latent-space comparison between kb-nano and HF diffusers yields CosSim=0.986, confirming the transformer backbone is correctly implemented. The pixel-space divergence is dominated by VAE decode amplification and different text encoder implementations (kb-nano uses a custom Qwen2.5-VL paged-attention encoder vs vllm-omni's HuggingFace-based encoder).
+
+### Oasis 500M (Autoregressive Diffusion)
+
+Run `python tests/bench_oasis.py --model Etched/oasis-500m` to reproduce. Reference baseline: official `open-oasis`, which the benchmark auto-clones under `data/open_oasis_src/` unless `--open-oasis-src` is provided.
+
+Dataset: `TESS-Computer/minecraft-vla-stage1` (`train` split), using non-overlapping real Minecraft clips from distinct source videos at 360x640. The benchmark converts each dataset action string into Oasis' 25-d control vector and caches the resulting prompt/action tensors locally under `data/oasis_cache/`.
+
+**Hardware: NVIDIA B200**
+
+Throughput workload:
+
+| Scenario | Dataset | Clips | Frames | DDIM Steps | Correctness Checked |
+|----------|---------|------:|-------:|-----------:|:--------------------|
+| short-bs4-16f-4ddim | `TESS-Computer/minecraft-vla-stage1` | 4 | 16 | 4 | yes |
+| medium-bs8-24f-4ddim | `TESS-Computer/minecraft-vla-stage1` | 8 | 24 | 4 | yes |
+| long-bs8-32f-4ddim | `TESS-Computer/minecraft-vla-stage1` | 8 | 32 | 4 | yes |
+| denoise-bs4-16f-8ddim | `TESS-Computer/minecraft-vla-stage1` | 4 | 16 | 8 | yes |
+
+Latency:
+
+| Scenario | Clips | Frames | Reference p50 (ms) | Ours p50 (ms) | Ratio |
+|----------|------:|-------:|-------------------:|--------------:|------:|
+| latency-bs1-8f-4ddim | 1 | 8 | 981.28 | 758.85 | **1.29x** |
+
+Correctness is measured for every throughput workload entry, using the same prompt frames and actions as the timed run. The benchmark reports cosine similarity, pass/fail status, and mean absolute difference for prompt latents, rollout latents, and decoded video in each throughput scenario.
 
 ### CosyVoice3 (TTS)
 

@@ -9,12 +9,13 @@ rather than minutes.
 from __future__ import annotations
 
 import time
+import inspect
 from typing import Any
 
 import torch
 import torch.nn as nn
 
-from kb_nano.bench.utils.input_registry import InputRegistry
+from kb_nano.bench.kernels.scenario_registry import InputRegistry
 from kb_nano.infra.kernel_swapper import (
     BenchTarget,
     discover_references,
@@ -67,15 +68,30 @@ def _instantiate_module(
     dtype: torch.dtype | None = None,
 ) -> nn.Module:
     """Create an nn.Module instance with init_args, handling common patterns."""
-    init_args = dict(init_args)
-    if "head_size" in init_args and "head_dim" not in init_args:
-        init_args["head_dim"] = init_args.pop("head_size")
-    if "base" in init_args and "rope_theta" not in init_args:
-        init_args["rope_theta"] = init_args.pop("base")
-    init_args.pop("rotary_dim", None)
-    init_args.pop("is_neox_style", None)
+    kwargs = dict(init_args)
+    if "head_size" in kwargs and "head_dim" not in kwargs:
+        kwargs["head_dim"] = kwargs.pop("head_size")
+    if "base" in kwargs and "rope_theta" not in kwargs:
+        kwargs["rope_theta"] = kwargs.pop("base")
+    kwargs.pop("rotary_dim", None)
+    kwargs.pop("is_neox_style", None)
     try:
-        module = cls(**init_args)
+        sig = inspect.signature(cls.__init__)
+        params = sig.parameters
+        accepts_kwargs = any(
+            p.kind == inspect.Parameter.VAR_KEYWORD
+            for p in params.values()
+        )
+        if not accepts_kwargs:
+            kwargs = {
+                k: v for k, v in kwargs.items()
+                if k in params and k != "self"
+            }
+    except (TypeError, ValueError):
+        pass
+
+    try:
+        module = cls(**kwargs)
     except TypeError:
         module = cls()
 
@@ -126,6 +142,21 @@ def _clone_inputs(inputs: dict[str, Any]) -> dict[str, Any]:
     return {k: _clone_input_value(v) for k, v in inputs.items()}
 
 
+def _contains_cuda_tensor(value: Any) -> bool:
+    if isinstance(value, torch.Tensor):
+        return value.is_cuda
+    if isinstance(value, dict):
+        return any(_contains_cuda_tensor(v) for v in value.values())
+    if isinstance(value, (tuple, list)):
+        return any(_contains_cuda_tensor(v) for v in value)
+    return False
+
+
+def _synchronize_if_cuda(*values: Any) -> None:
+    if any(_contains_cuda_tensor(v) for v in values):
+        torch.cuda.synchronize()
+
+
 def _time_forward(
     module: nn.Module,
     inputs: dict[str, Any],
@@ -146,13 +177,13 @@ def _time_forward(
         for _ in range(num_warmup):
             module(**tensor_inputs, **scalar_inputs)
 
-        torch.cuda.synchronize()
+        _synchronize_if_cuda(tensor_inputs)
         times = []
         output = None
         for _ in range(num_runs):
             start = time.perf_counter()
             output = module(**tensor_inputs, **scalar_inputs)
-            torch.cuda.synchronize()
+            _synchronize_if_cuda(tensor_inputs, output)
             times.append((time.perf_counter() - start) * 1000)
 
     times.sort()
@@ -160,6 +191,21 @@ def _time_forward(
     if output is None:
         output = {k: v for k, v in tensor_inputs.items()}
     return output, median_ms
+
+
+def _run_forward_once(module: nn.Module, inputs: dict[str, Any]) -> Any:
+    tensor_inputs = {
+        k: v for k, v in inputs.items()
+        if isinstance(v, torch.Tensor)
+    }
+    scalar_inputs = {
+        k: v for k, v in inputs.items()
+        if not isinstance(v, torch.Tensor)
+    }
+    with torch.no_grad():
+        output = module(**tensor_inputs, **scalar_inputs)
+        _synchronize_if_cuda(tensor_inputs, output)
+    return output
 
 
 def _tolerances_for_dtype(dtype: torch.dtype) -> tuple[float, float]:
@@ -318,16 +364,32 @@ def _compare_outputs(baseline_out: Any, candidate_out: Any) -> tuple[bool, float
         for key in sorted(baseline_out):
             b = baseline_out[key]
             c = candidate_out[key]
-            if isinstance(b, torch.Tensor) and isinstance(c, torch.Tensor):
-                p, ratio, d = _compare_outputs(b, c)
-                all_pass = all_pass and p
-                max_error_ratio = max(max_error_ratio, ratio)
-                total_diff += d
-                count += 1
+            p, ratio, d = _compare_outputs(b, c)
+            all_pass = all_pass and p
+            max_error_ratio = max(max_error_ratio, ratio)
+            total_diff += d
+            count += 1
         mean_diff = total_diff / count if count > 0 else 0.0
         return all_pass, max_error_ratio, mean_diff
 
     return True, 0.0, 0.0
+
+
+def _merge_correctness(
+    output_check: tuple[bool, float, float],
+    input_check: tuple[bool, float, float],
+) -> tuple[bool, float, float]:
+    output_correct, output_ratio, output_diff = output_check
+    input_correct, input_ratio, input_diff = input_check
+    correct = output_correct and input_correct
+    max_error_ratio = max(output_ratio, input_ratio)
+    if output_diff == 0.0:
+        mean_diff = input_diff
+    elif input_diff == 0.0:
+        mean_diff = output_diff
+    else:
+        mean_diff = 0.5 * (output_diff + input_diff)
+    return correct, max_error_ratio, mean_diff
 
 
 def run_kernel_benchmark(
@@ -440,20 +502,22 @@ def run_kernel_benchmark(
             timing_warmup = 0 if validation_mode == "candidate_smoke" else num_warmup
             timing_runs = 1 if validation_mode == "candidate_smoke" else num_runs
 
-            baseline_out, _ = _time_forward(
-                baseline_mod, _clone_inputs(inputs), 0, 1,
+            baseline_check_inputs = _clone_inputs(inputs)
+            candidate_check_inputs = _clone_inputs(inputs)
+            baseline_out = _run_forward_once(baseline_mod, baseline_check_inputs)
+            candidate_out = _run_forward_once(candidate_mod, candidate_check_inputs)
+
+            correct, max_error_ratio, mean_diff = _merge_correctness(
+                _compare_outputs(baseline_out, candidate_out),
+                _compare_outputs(baseline_check_inputs, candidate_check_inputs),
             )
-            candidate_out, _ = _time_forward(
-                candidate_mod, _clone_inputs(inputs), 0, 1,
-            )
+
             _, baseline_ms = _time_forward(
                 baseline_mod, _clone_inputs(inputs), timing_warmup, timing_runs,
             )
             _, candidate_ms = _time_forward(
                 candidate_mod, _clone_inputs(inputs), timing_warmup, timing_runs,
             )
-
-            correct, max_error_ratio, mean_diff = _compare_outputs(baseline_out, candidate_out)
             speedup = baseline_ms / candidate_ms if candidate_ms > 0 else float("inf")
             classification = (
                 "harness_validation_passed"
