@@ -260,6 +260,11 @@ def _is_whisper_model(model_name: str) -> bool:
     return "whisper" in lower
 
 
+def _needs_trust_remote_code(model_name: str) -> bool:
+    lower = model_name.lower()
+    return "kimi" in lower or "qwen3-next" in lower
+
+
 # ---------------------------------------------------------------------------
 # Multi-scenario vLLM subprocess worker (LLM, text-only)
 # ---------------------------------------------------------------------------
@@ -310,6 +315,8 @@ def main():
         max_model_len=cfg["max_model_len"],
         enable_prefix_caching=False,
     )
+    if cfg.get("trust_remote_code"):
+        llm_kwargs["trust_remote_code"] = True
     if cfg.get("load_format"):
         llm_kwargs["load_format"] = cfg["load_format"]
     llm = LLM(**llm_kwargs)
@@ -759,6 +766,8 @@ def main():
         max_model_len=cfg["max_model_len"],
         enable_prefix_caching=False,
     )
+    if cfg.get("trust_remote_code"):
+        llm_kwargs["trust_remote_code"] = True
     if cfg.get("load_format"):
         llm_kwargs["load_format"] = cfg["load_format"]
     llm = LLM(**llm_kwargs)
@@ -1167,6 +1176,8 @@ def main():
         max_model_len=cfg["max_model_len"],
         enable_prefix_caching=False,
     )
+    if cfg.get("trust_remote_code"):
+        llm_kwargs["trust_remote_code"] = True
     if cfg.get("load_format"):
         llm_kwargs["load_format"] = cfg["load_format"]
     llm = LLM(**llm_kwargs)
@@ -1508,6 +1519,11 @@ def main():
     parser.add_argument("--num-seqs", type=int, default=None)
     parser.add_argument("--seed", type=int, default=42)
     parser.add_argument(
+        "--trust-remote-code",
+        action="store_true",
+        help="Pass trust_remote_code=True to the reference vLLM worker when required.",
+    )
+    parser.add_argument(
         "--temperature", type=float, default=0.0,
         help="Sampling temperature (default: 0.0 for deterministic alignment)",
     )
@@ -1541,6 +1557,9 @@ def main():
              "'balanced'). Default: run all scenarios for the model type.",
     )
     args = parser.parse_args()
+    args.trust_remote_code = (
+        args.trust_remote_code or _needs_trust_remote_code(args.model)
+    )
 
     if args.num_seqs is None:
         args.num_seqs = 100 if _is_whisper_model(args.model) else 1000
@@ -1770,6 +1789,7 @@ def main():
     print(f"  Temperature    : {args.temperature}")
     print(f"  Enforce eager  : {args.enforce_eager}")
     print(f"  Seed           : {args.seed}")
+    print(f"  Trust RC       : {args.trust_remote_code}")
     print(f"  Max seq len    : {global_max_seq_len}")
     print(f"  kb-nano port   : {kb_nccl_port}")
     if vllm_port is not None:
@@ -1812,6 +1832,7 @@ def main():
             "max_model_len": global_max_seq_len,
             "scenarios": scenario_data,
             "latency_scenarios": latency_data,
+            "trust_remote_code": args.trust_remote_code,
             "load_format": "fastsafetensors",
         }
         os.environ["MASTER_ADDR"] = "127.0.0.1"

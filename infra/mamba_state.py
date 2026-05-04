@@ -225,6 +225,211 @@ class MambaStateManager:
         return cache
 
 
+class KimiLinearStateManager:
+    """Flat recurrent state plus optional paged KV cache for hybrid models.
+
+    Kimi-Linear uses separate q/k/v convolution states for KDA layers.
+    Qwen3-Next uses one packed qkv convolution state for GDN layers plus
+    regular paged full-attention KV for dense-attention layers.
+    """
+
+    def __init__(
+        self,
+        *,
+        config,
+        num_slots: int,
+        block_size: int,
+        num_mla_blocks: int,
+        allocate_mla_kv_tensors: bool,
+        tp_size: int,
+        device: torch.device,
+        dtype: torch.dtype,
+    ):
+        self.config = config
+        self.num_layers = config.num_hidden_layers
+        self.num_slots = num_slots
+        self.block_size = block_size
+        self.num_mla_blocks = num_mla_blocks
+        self.tp_size = tp_size
+        self.device = device
+        self.dtype = dtype
+        self.model_type = getattr(config, "model_type", "kimi_linear")
+
+        self._free_slots: deque[int] = deque(range(num_slots))
+        self._in_use: set[int] = set()
+
+        self.conv_q: list[torch.Tensor | None] = [None] * self.num_layers
+        self.conv_k: list[torch.Tensor | None] = [None] * self.num_layers
+        self.conv_v: list[torch.Tensor | None] = [None] * self.num_layers
+        self.gdn_conv: list[torch.Tensor | None] = [None] * self.num_layers
+        self.recurrent: list[torch.Tensor | None] = [None] * self.num_layers
+
+        self.k_cache: list[torch.Tensor | None] = [None] * self.num_layers
+        self.v_cache: list[torch.Tensor | None] = [None] * self.num_layers
+
+        self._free_blocks: deque[int] | None = None
+        if num_mla_blocks > 0:
+            self._free_blocks = deque(range(num_mla_blocks))
+
+        if self.model_type == "qwen3_next":
+            self._allocate_qwen3_next(allocate_mla_kv_tensors)
+            return
+
+        local_kda_heads = config.kda_num_heads // tp_size
+        local_kda_proj = config.kda_num_heads * config.kda_head_dim // tp_size
+        kernel = config.short_conv_kernel_size
+
+        local_mla_heads = config.num_attention_heads // tp_size
+        qk_head_dim = config.qk_nope_head_dim + config.qk_rope_head_dim
+
+        for i in range(self.num_layers):
+            if config.is_kda_layer(i):
+                self.conv_q[i] = torch.zeros(
+                    num_slots, kernel - 1, local_kda_proj,
+                    device=device, dtype=dtype,
+                )
+                self.conv_k[i] = torch.zeros(
+                    num_slots, kernel - 1, local_kda_proj,
+                    device=device, dtype=dtype,
+                )
+                self.conv_v[i] = torch.zeros(
+                    num_slots, kernel - 1, local_kda_proj,
+                    device=device, dtype=dtype,
+                )
+                self.recurrent[i] = torch.zeros(
+                    num_slots, local_kda_heads,
+                    config.kda_head_dim, config.kda_head_dim,
+                    device=device, dtype=torch.float32,
+                )
+            elif allocate_mla_kv_tensors:
+                self.k_cache[i] = torch.zeros(
+                    num_mla_blocks, block_size, local_mla_heads, qk_head_dim,
+                    device=device, dtype=dtype,
+                )
+                self.v_cache[i] = torch.zeros(
+                    num_mla_blocks, block_size, local_mla_heads, qk_head_dim,
+                    device=device, dtype=dtype,
+                )
+
+    def _allocate_qwen3_next(self, allocate_mha_kv_tensors: bool) -> None:
+        cfg = self.config
+        local_k_heads = cfg.linear_num_key_heads // self.tp_size
+        local_v_heads = cfg.linear_num_value_heads // self.tp_size
+        head_k_dim = cfg.linear_key_head_dim
+        head_v_dim = cfg.linear_value_head_dim
+        conv_kernel = cfg.linear_conv_kernel_dim
+        local_conv_dim = (
+            2 * local_k_heads * head_k_dim
+            + local_v_heads * head_v_dim
+        )
+
+        local_kv_heads = (
+            cfg.num_key_value_heads // self.tp_size
+            if cfg.num_key_value_heads % self.tp_size == 0
+            else cfg.num_key_value_heads
+        )
+        head_dim = getattr(
+            cfg, "head_dim", cfg.hidden_size // cfg.num_attention_heads,
+        )
+
+        for i in range(self.num_layers):
+            if cfg.is_linear_attn_layer(i):
+                self.gdn_conv[i] = torch.zeros(
+                    self.num_slots,
+                    conv_kernel - 1,
+                    local_conv_dim,
+                    device=self.device,
+                    dtype=self.dtype,
+                ).transpose(-1, -2)
+                self.recurrent[i] = torch.zeros(
+                    self.num_slots,
+                    local_v_heads,
+                    head_k_dim,
+                    head_v_dim,
+                    device=self.device,
+                    dtype=self.dtype,
+                )
+            elif allocate_mha_kv_tensors:
+                self.k_cache[i] = torch.zeros(
+                    self.num_mla_blocks,
+                    self.block_size,
+                    local_kv_heads,
+                    head_dim,
+                    device=self.device,
+                    dtype=self.dtype,
+                )
+                self.v_cache[i] = torch.zeros(
+                    self.num_mla_blocks,
+                    self.block_size,
+                    local_kv_heads,
+                    head_dim,
+                    device=self.device,
+                    dtype=self.dtype,
+                )
+
+    def has_free_slot(self) -> bool:
+        return bool(self._free_slots)
+
+    def reset_slot(self, slot: int) -> None:
+        for layer_id in range(self.num_layers):
+            if self.conv_q[layer_id] is not None:
+                self.conv_q[layer_id][slot].zero_()
+                self.conv_k[layer_id][slot].zero_()
+                self.conv_v[layer_id][slot].zero_()
+                self.recurrent[layer_id][slot].zero_()
+            if self.gdn_conv[layer_id] is not None:
+                self.gdn_conv[layer_id][slot].zero_()
+                self.recurrent[layer_id][slot].zero_()
+
+    def allocate(self, seq) -> int:
+        if getattr(seq, "state_slot", None) is not None:
+            return seq.state_slot
+        if not self._free_slots:
+            raise RuntimeError("No free recurrent state slots")
+        slot = self._free_slots.popleft()
+        self._in_use.add(slot)
+        self.reset_slot(slot)
+        seq.state_slot = slot
+        seq.block_table = []
+        return slot
+
+    def ensure_blocks_for(self, seq, total_tokens: int) -> None:
+        if self._free_blocks is None:
+            return
+        blocks_needed = (total_tokens + self.block_size - 1) // self.block_size
+        while len(seq.block_table) < blocks_needed:
+            if not self._free_blocks:
+                raise RuntimeError("No free MLA KV cache blocks")
+            seq.block_table.append(self._free_blocks.popleft())
+
+    def deallocate(self, seq) -> None:
+        slot = getattr(seq, "state_slot", None)
+        if slot is not None and slot in self._in_use:
+            self._in_use.remove(slot)
+            self.reset_slot(slot)
+            self._free_slots.append(slot)
+            seq.state_slot = None
+        if self._free_blocks is not None and seq.block_table:
+            self._free_blocks.extend(seq.block_table)
+            seq.block_table = []
+
+    @property
+    def q_conv_states(self):
+        return self.conv_q
+
+    @property
+    def k_conv_states(self):
+        return self.conv_k
+
+    @property
+    def v_conv_states(self):
+        return self.conv_v
+
+    @property
+    def recurrent_states(self):
+        return self.recurrent
+
+
 @dataclass
 class MambaMetadata:
     """Per-batch metadata for a Mamba v1 forward pass.
