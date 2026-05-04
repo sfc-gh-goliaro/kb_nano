@@ -303,8 +303,19 @@ class TTTE2EPipeline(nn.Module):
         # we trace once per chunk_id, hitting the recompile limit at long
         # sequences). pretrain mode keeps the int form so the cached mask
         # path is hit (no compile in pretrain).
+        # NB: the persistent buffer ``self._chunk_id_buf`` is hoisted out of
+        # the per-forward path so callers wrapping ``forward`` in a CUDA
+        # Graph capture don't allocate during stream capture (which CUDA
+        # forbids).
         meta_active = train_mode == "meta" and cfg.has_prime
-        chunk_id_t = torch.tensor(0, dtype=torch.int64, device=device) if meta_active else None
+        if meta_active:
+            buf = getattr(self, "_chunk_id_buf", None)
+            if buf is None or buf.device != device:
+                buf = torch.zeros((), dtype=torch.int64, device=device)
+                self._chunk_id_buf = buf
+            chunk_id_t = buf
+        else:
+            chunk_id_t = None
         for ci in range(n_chunks):
             s = ci * cfg.chunk_size
             e = s + cfg.chunk_size
