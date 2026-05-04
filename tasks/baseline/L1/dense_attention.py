@@ -21,6 +21,17 @@ Backend selection is controlled via the ``backend`` parameter:
   ``"flash_attn"`` — always use the flash-attention fallback chain
     (FA3 > FA2); raises if none is installed.
 
+  ``"cudnn"`` — pin the cuDNN flash attention backend via
+    ``torch.nn.attention.sdpa_kernel``. Required to actually get cuDNN
+    selection through ``torch.compile``: without the context, Inductor
+    bakes ``mem_efficient`` (cutlass FMHA, ``sm80`` fallback on
+    Blackwell) into the compiled graph and runtime
+    ``enable_*_sdp`` toggles don't override it. cuDNN's
+    ``sdpa_sm100_flash_*`` kernels are ~2.7× faster than cutlass FMHA
+    at typical (1024×9216 with mask) attention shapes on B200.
+    ``MATH`` is included as a last-resort fallback for masks cuDNN
+    can't handle.
+
 Used by diffusion models (FLUX, SDXL) and any architecture that needs
 stateless multi-head attention without KV cache, including encoder-style
 bidirectional attention.
@@ -59,15 +70,25 @@ class DenseAttention(nn.Module):
         backend: Which kernel to use.
             ``"auto"`` selects flash-attention on Ampere/Hopper when
             available, SDPA everywhere else.
-            ``"sdpa"`` always uses ``F.scaled_dot_product_attention``.
+            ``"sdpa"`` always uses ``F.scaled_dot_product_attention``
+            (PyTorch's heuristic chooses among flash/cuDNN/mem_eff/math).
             ``"flash_attn"`` always uses the flash-attention package.
+            ``"cudnn"`` pins the cuDNN flash backend via
+            ``torch.nn.attention.sdpa_kernel`` (with MATH fallback for
+            masks cuDNN can't handle). Required to get cuDNN flash
+            through ``torch.compile`` on Blackwell.
     """
 
-    def __init__(self, backend: Literal["auto", "sdpa", "flash_attn"] = "auto"):
+    def __init__(self, backend: Literal["auto", "sdpa", "flash_attn", "cudnn"] = "auto"):
         super().__init__()
         self.fa_func = None
+        self.use_cudnn_kernel = False
 
         if backend == "sdpa":
+            return
+
+        if backend == "cudnn":
+            self.use_cudnn_kernel = True
             return
 
         if backend == "flash_attn":
@@ -108,11 +129,43 @@ class DenseAttention(nn.Module):
         q = query.permute(0, 2, 1, 3)
         k = key.permute(0, 2, 1, 3)
         v = value.permute(0, 2, 1, 3)
-        out = F.scaled_dot_product_attention(
-            q, k, v,
-            attn_mask=attn_mask,
-            dropout_p=0.0,
-            is_causal=causal,
-            scale=softmax_scale,
-        )
+        if self.use_cudnn_kernel:
+            from torch.nn.attention import sdpa_kernel, SDPBackend
+            # cuDNN flash needs contiguous tensors. The permute above
+            # produces non-contiguous strides; without ``.contiguous()``
+            # cuDNN silently falls back to whatever's next on the list.
+            q = q.contiguous(); k = k.contiguous(); v = v.contiguous()
+            if attn_mask is not None and not attn_mask.is_contiguous():
+                attn_mask = attn_mask.contiguous()
+            # Try strict cuDNN first. Adding MATH as a fallback in the
+            # ``sdpa_kernel`` list causes PyTorch's selection heuristic to
+            # pick MATH over cuDNN (~10× slower) for inputs both can
+            # handle. If cuDNN rejects (e.g. head_dim=16, fp32, or some
+            # mask shape it doesn't support), fall back through MATH.
+            try:
+                with sdpa_kernel([SDPBackend.CUDNN_ATTENTION]):
+                    out = F.scaled_dot_product_attention(
+                        q, k, v,
+                        attn_mask=attn_mask,
+                        dropout_p=0.0,
+                        is_causal=causal,
+                        scale=softmax_scale,
+                    )
+            except RuntimeError:
+                with sdpa_kernel([SDPBackend.EFFICIENT_ATTENTION, SDPBackend.MATH]):
+                    out = F.scaled_dot_product_attention(
+                        q, k, v,
+                        attn_mask=attn_mask,
+                        dropout_p=0.0,
+                        is_causal=causal,
+                        scale=softmax_scale,
+                    )
+        else:
+            out = F.scaled_dot_product_attention(
+                q, k, v,
+                attn_mask=attn_mask,
+                dropout_p=0.0,
+                is_causal=causal,
+                scale=softmax_scale,
+            )
         return out.permute(0, 2, 1, 3)

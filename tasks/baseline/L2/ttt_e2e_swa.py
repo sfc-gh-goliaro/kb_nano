@@ -81,12 +81,15 @@ class TTTE2ESWA(nn.Module):
         rope_len = max(max_position_embeddings, window_size + chunk_size)
         self.rope = TTTE2ERoPE(self.head_dim, rope_len, rope_theta=rope_theta)
 
-        # SDPA dispatcher (auto-selects flash on Hopper, SDPA elsewhere).
-        # We always pass attn_mask, which forces the SDPA fallback path —
-        # acceptable here because the windowed mask is small (chunk_size by
-        # window+chunk_size keys) and the TTT-E2E inner loop is not the
-        # attention bottleneck anyway.
-        self.attn = DenseAttention(backend="sdpa")
+        # Two attention dispatchers, one per path:
+        # - prefix path is causal-no-mask → ``auto`` lets PyTorch pick the
+        #   fastest path (flash / cuDNN-flash auto-selected on Blackwell).
+        # - suffix path passes a non-trivial bool mask → PyTorch's
+        #   heuristic routes that to cutlass FMHA (``sm80`` fallback on
+        #   Blackwell, ~2.7× slower than cuDNN at our 1024×9216 shape).
+        #   Pin cuDNN to actually get the Blackwell-native flash kernel.
+        self.attn_prefix = DenseAttention(backend="auto")
+        self.attn_suffix = DenseAttention(backend="cudnn")
 
         # Cache for the chunk-suffix attention masks and the RoPE position
         # vectors. All keyed by ``device`` so we lazily materialize on the
@@ -122,6 +125,19 @@ class TTTE2ESWA(nn.Module):
         Args:
             x: (B, T, hidden)
             position_ids: (T,) int positions for RoPE. If None, uses 0..T-1.
+
+        Two attention paths:
+        - ``T <= self.window_size`` (no sliding-window pruning needed): we
+          dispatch to the L1 ``DenseAttention`` with ``is_causal=True`` and
+          no ``attn_mask``. SDPA picks the fast cuDNN/flash backend
+          internally. Materializing a (T, T) bool mask just to encode pure
+          causal would force the kernel into the ``mem_efficient`` fallback;
+          on a 8192-token prefix that costs us ~10× over the flash path
+          (verified empirically vs the JAX reference).
+        - ``T  > self.window_size``: we DO need to mask out keys that are
+          more than W-1 positions back. We build a windowed-causal mask
+          and pay the slower path. Flash-attn-with-window would help here
+          too, but flash isn't installed on this venv (Blackwell pre-FA3).
         """
         b, t, _ = x.shape
         xq, xk, xv = self._project_qkv(x)
@@ -132,15 +148,19 @@ class TTTE2ESWA(nn.Module):
         xq = self.rope(xq, position_ids)
         xk = self.rope(xk, position_ids)
 
-        # Sliding causal window: position i attends to j iff j <= i and i - j < W.
-        i = torch.arange(t, device=x.device).unsqueeze(1)
-        j = torch.arange(t, device=x.device).unsqueeze(0)
-        attn_mask = (j <= i) & (i - j < self.window_size)
-        attn_mask = attn_mask.unsqueeze(0).unsqueeze(0)  # (1, 1, T, T)
-
-        # DenseAttention takes (B, T, H, D), softmax_scale, causal, attn_mask.
-        out = self.attn(xq, xk, xv, softmax_scale=self.head_dim ** -0.5,
-                        causal=False, attn_mask=attn_mask)
+        if t <= self.window_size:
+            # Pure causal — no mask materialization. SDPA picks flash.
+            out = self.attn_prefix(xq, xk, xv, softmax_scale=self.head_dim ** -0.5,
+                                   causal=True, attn_mask=None)
+        else:
+            # Sliding causal: position i attends to j iff j <= i and i - j < W.
+            # Force cuDNN here since this path needs a mask.
+            i = torch.arange(t, device=x.device).unsqueeze(1)
+            j = torch.arange(t, device=x.device).unsqueeze(0)
+            attn_mask = (j <= i) & (i - j < self.window_size)
+            attn_mask = attn_mask.unsqueeze(0).unsqueeze(0)  # (1, 1, T, T)
+            out = self.attn_suffix(xq, xk, xv, softmax_scale=self.head_dim ** -0.5,
+                                   causal=False, attn_mask=attn_mask)
         out = out.reshape(b, t, self.hidden_size)
         return self.wo(out)
 
@@ -224,9 +244,9 @@ class TTTE2ESWA(nn.Module):
                 attn_mask = mask.unsqueeze(0).unsqueeze(0).contiguous()  # (1, 1, C, W+C)
                 self._suffix_mask_cache[cache_key] = attn_mask
 
-        out = self.attn(xq, full_k, full_v,
-                        softmax_scale=self.head_dim ** -0.5,
-                        causal=False, attn_mask=attn_mask)
+        out = self.attn_suffix(xq, full_k, full_v,
+                               softmax_scale=self.head_dim ** -0.5,
+                               causal=False, attn_mask=attn_mask)
         out = out.reshape(b, C, self.hidden_size)
         out = self.wo(out)
 

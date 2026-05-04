@@ -204,12 +204,18 @@ class TTTE2EEngine:
         ~7K kernel-launch overhead seen at 8K-seq meta forward by ~50%.
         Idempotent. Costs ~5-10s of warmup compile on first forward.
 
-        We don't use ``mode="reduce-overhead"`` (which would CUDA-Graph the
-        per-layer forward) because consecutive layers share output buffers
-        and the per-layer graphs clobber each other; the "default" mode is
-        the right granularity here. Closing the remaining gap to JAX would
-        likely require capturing the WHOLE chunk-step (forward + grad +
-        SGD update) as a single CUDA Graph — left as future work.
+        We don't use ``mode="reduce-overhead"`` (CUDA Graphs) because
+        adjacent layers share output buffers and the per-layer graphs
+        clobber each other; default mode is the right granularity.
+
+        Note on attention backend: cuDNN's Blackwell-native flash kernel
+        is the right backend for our suffix-attention shape, but the
+        ``torch.backends.cuda.enable_*_sdp`` global flags don't actually
+        force selection — PyTorch's internal heuristic still picks
+        ``mem_efficient`` (cutlass FMHA, sm80 fallback) for masked input.
+        The way to actually pin the kernel is the ``sdpa_kernel`` context
+        manager, which we apply around every forward via ``forward()`` /
+        ``compute_logits``-like wrappers. See ``forward()``.
         """
         if self._compiled:
             return

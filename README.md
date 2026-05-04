@@ -386,45 +386,52 @@ tokens) sliced into 8192-token windows.
 
 | Mode | Description | JAX (jit) | kb-nano | Ratio |
 |---|---|---|---|---|
-| `pretrain` | Sliding-window transformer, prime FFN frozen | 78 ms | **48 ms** | **1.62× faster** |
-| `meta` | Inner-loop SGD on prime FFN per 1024-token chunk | 42 ms | 116 ms | 0.36× |
+| `pretrain` | Sliding-window transformer, prime FFN frozen | 76 ms | **26 ms** | **2.92× faster** |
+| `meta` | Inner-loop SGD on prime FFN per 1024-token chunk | 43 ms | 54-93 ms (median 73) | **0.59×** |
 
-Optimizations layered on top of the L1-only refactor:
+Optimizations layered on top of the L1-only refactor, justified by
+component-level timing on both sides:
 
 1. **`torch.func.grad` → `torch.autograd.grad`** for the inner-loop
-   gradient (218 → 122 ms in meta). The TTT-E2E inner loop only needs
-   the gradient of the loss w.r.t. the prime FFN params, so leaf
-   tensors with `requires_grad=True` + `torch.autograd.grad(loss,
-   leaves)` matches the reference semantics with much lower per-call
-   tracing overhead than `torch.func.grad`.
+   gradient. Drops meta from 218 → 122 ms; ``torch.func.grad`` traces
+   per call, ``autograd.grad`` doesn't.
 2. **Cache per-chunk masks + RoPE positions** so the suffix-attn
    forward doesn't rebuild small constant tensors each call.
-3. **Pass `chunk_id` as a 0-dim tensor** instead of a Python int. Lets
-   `torch.compile` produce a single graph that handles every chunk_id
-   dynamically, instead of tracing once per int value (which used to
-   hit `torch._dynamo.config.recompile_limit` at long sequences and
-   cost 60 s of warmup compile). Now ~9 s for the first sequence;
-   later sequences hit the cache (sub-1s warmup).
+3. **Pass `chunk_id` as a 0-dim tensor** instead of a Python int. One
+   `torch.compile` graph for all 8 chunks instead of 8 specialized
+   traces (warmup 60 → 9 s for first seq, sub-1s for later seqs).
 4. **`torch.compile(default)`** on each layer's `forward_prefix` and
-   `forward_suffix_chunk` via `TTTE2EEngine.compile_layers()`. Inductor
-   fuses the per-layer kernel sequence (RMSNorm + linear + RoPE + SDPA
-   + MLP) into fewer launches. We intentionally do NOT use
-   `mode="reduce-overhead"` (CUDA Graphs) — adjacent layers share
-   output buffers and the per-layer graphs clobber each other; the
-   right level for full graph capture is the whole chunk step.
+   `forward_suffix_chunk` via `TTTE2EEngine.compile_layers()`. Drops
+   the kernel-launch count on the meta forward from ~6900 to ~500.
+5. **Skip the explicit prefix-attention mask when `T ≤ W`.** With
+   the prefix mask materialized as a (8192, 8192) bool tensor, SDPA
+   was forced into the `mem_efficient` (cutlass FMHA, sm80 fallback)
+   path. For `T ≤ W` the sliding-window constraint is a no-op — pure
+   causal — so we drop the mask and let SDPA pick `flash`. **Drops
+   prefix from 49 → 5.7 ms (8.6× speedup).** This was the single
+   biggest win and the part of the gap I was hand-waving over before.
+6. **Pin cuDNN flash on the suffix-attention path.** The suffix
+   genuinely needs the chunk_id-dependent bool mask, which forces
+   PyTorch's heuristic to pick `mem_efficient` (cutlass FMHA) by
+   default. cuDNN's Blackwell-tuned flash kernel
+   (`cudnn_generated_fort_native_sdpa_sm100_flash_*`) is **3.7×
+   faster on the masked backward** at our shape (0.55 ms vs 2.05 ms
+   per call). PyTorch's `sdpa_kernel` context manager is the only
+   thing that actually overrides the heuristic — `enable_*_sdp` global
+   toggles and runtime `sdpa_kernel` around a compiled call do not.
+   We bake it into `L1.DenseAttention(backend="cudnn")` so the
+   selection survives `torch.compile` tracing. **Drops meta from
+   94 ms → 73 ms.** Tiny configs (head_dim=16, fp32) fall back to
+   `mem_efficient` automatically — cuDNN raises and we catch it.
 
-`pretrain` mode is now decisively faster than JAX (1.62×). For `meta`,
-JAX's `jax.lax.scan` + `eqx.filter_jit` fuses the 8-chunk inner loop
-(forward + grad + SGD update + cache rotation) into a single XLA
-program. kb-nano runs the loop in Python with `torch.autograd.grad` per
-chunk; the per-layer compile reduces dispatch overhead but Python-level
-chunk iteration still pays ~20 ms across 8 chunks. The remaining 70 ms
-gap is split roughly evenly between (a) attention backward — PyTorch
-on B200 falls back to cutlass FMHA backward where JAX uses cuDNN flash,
-and (b) the unavoidable chunk-loop Python iteration. Closing further
-would require either flash-attn-with-windowing on Blackwell (not yet
-available in this environment) or full chunk-loop CUDA Graph capture
-(future work — left in the engine as the documented next step).
+The headline numbers above are the result of all six. The per-component
+attribution from a side-by-side audit:
+
+| Component | PyTorch v0 (original) | PyTorch v1 (post-optim) | JAX | Notes |
+|---|---|---|---|---|
+| Prefix-only forward (9 layers, 8K seq) | 49 ms | **5.7 ms** | 4.5 ms | Now 1.27× JAX (was 11×). |
+| One inner_loop_step (1 chunk fwd+bwd+SGD) | 11.6 ms | **9.8 ms** | 6.6 ms | 1.48× JAX (was 1.79×). |
+| Full meta forward (8 chunks) | 218 ms | **73 ms (median), 54 ms (best)** | 43 ms | 1.69×–1.26× JAX. |
 
 ### Correctness vs the JAX reference
 
