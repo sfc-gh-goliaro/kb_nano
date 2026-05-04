@@ -386,19 +386,35 @@ tokens) sliced into 8192-token windows.
 
 | Mode | Description | JAX (jit) | kb-nano | Ratio |
 |---|---|---|---|---|
-| `pretrain` | Sliding-window transformer, prime FFN frozen | 78 ms | **70 ms** | **1.10× faster** |
-| `meta` | Inner-loop SGD on prime FFN per 1024-token chunk | 42 ms | 218 ms | 0.20× |
+| `pretrain` | Sliding-window transformer, prime FFN frozen | 76 ms | **48 ms** | **1.58× faster** |
+| `meta` | Inner-loop SGD on prime FFN per 1024-token chunk | 44 ms | 111 ms | 0.40× |
+
+Optimizations layered on top of the L1-only refactor:
+1. Replace `torch.func.grad` with `torch.autograd.grad` for the inner
+   loop (218 → 122 ms in meta; cleaner abstraction, lower per-call
+   overhead). The TTT-E2E inner loop only needs the gradient of the loss
+   w.r.t. the prime FFN params, so leaf tensors with `requires_grad=True`
+   + `autograd.grad(...)` matches the reference semantics exactly.
+2. Cache the chunk-suffix attention masks and RoPE position vectors per
+   `(chunk_id, device)` and `device` respectively, so 8 chunks at a fixed
+   seq_len reuse the same tensors instead of re-building each call.
+3. `torch.compile(default mode)` on each layer's `forward_prefix` and
+   `forward_suffix_chunk`. Inductor fuses the per-layer kernel sequence
+   (RMSNorm + linear + RoPE + SDPA + MLP) into fewer launches. We
+   intentionally do NOT use `mode="reduce-overhead"` (CUDA Graphs) —
+   adjacent layers share output buffers and the per-layer graphs clobber
+   each other; the right level for full graph capture is the whole
+   chunk step (left as future work).
 
 In `meta` mode JAX's `jax.lax.scan` + `eqx.filter_jit` fuses the 8-chunk
 inner loop (forward + grad + SGD update + cache rotation) into a single
-XLA program. kb-nano runs the loop in Python with `torch.func.grad` per
-chunk; we attempted `torch.compile` over the chunk graph but it produces
-incorrect gradients in this setup (likely an interaction between
-`torch.func.functional_call` and the differentiable cast in the prime-FFN
-override path) and is intentionally disabled. Closing this gap is future
-work — most likely via a hand-rolled SwiGLU backward that avoids the
-`functional_call` indirection. The `pretrain` path is competitive because
-both frameworks dispatch to the same cuDNN/cuBLAS kernels.
+XLA program. kb-nano now compiles each layer's forward but the chunk
+loop itself is still Python-driven; closing the remaining 0.40× gap
+would require capturing the entire chunk step as a CUDA Graph (~70 ms
+of cudaLaunchKernel overhead per forward in the original profile). The
+`pretrain` path is now decisively faster because compile fuses the
+per-layer prefix forward into fewer launches than JAX's per-block jit
+splits.
 
 ### Correctness vs the JAX reference
 

@@ -194,6 +194,38 @@ class TTTE2EEngine:
                 self.pipeline, weights_npz, device=self.device, param_dtype=param_dtype,
             )
         self.pipeline.eval()
+        self._compiled = False
+
+    def compile_layers(self) -> None:
+        """Apply ``torch.compile`` to per-layer forward methods.
+
+        Inductor-fuses the per-layer kernel sequence (RMSNorm + linear +
+        RoPE + SDPA + ...) into a smaller number of launches. Cuts the
+        ~7K kernel-launch overhead seen at 8K-seq meta forward by ~50%.
+        Idempotent. Costs ~5-10s of warmup compile on first forward.
+
+        We don't use ``mode="reduce-overhead"`` (which would CUDA-Graph the
+        per-layer forward) because consecutive layers share output buffers
+        and the per-layer graphs clobber each other; the "default" mode is
+        the right granularity here. Closing the remaining gap to JAX would
+        likely require capturing the WHOLE chunk-step (forward + grad +
+        SGD update) as a single CUDA Graph — left as future work.
+        """
+        if self._compiled:
+            return
+        # The suffix chunk forward sees ``chunk_id`` as a Python int and
+        # triggers a fresh dynamo trace per value (one per chunk in a
+        # sequence). At 8 chunks we hit the default recompile_limit=8.
+        # Bump it so all chunk_ids in our typical range (up to 32 for
+        # seq=32K) get compiled rather than falling back to eager.
+        import torch._dynamo
+        torch._dynamo.config.recompile_limit = max(
+            torch._dynamo.config.recompile_limit, 64,
+        )
+        for layer in self.pipeline.model.layers:
+            layer.forward_prefix = torch.compile(layer.forward_prefix, dynamic=False)
+            layer.forward_suffix_chunk = torch.compile(layer.forward_suffix_chunk, dynamic=False)
+        self._compiled = True
 
     @torch.no_grad()
     def forward(

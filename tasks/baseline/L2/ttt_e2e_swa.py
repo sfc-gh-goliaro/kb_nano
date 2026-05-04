@@ -88,6 +88,15 @@ class TTTE2ESWA(nn.Module):
         # attention bottleneck anyway.
         self.attn = DenseAttention(backend="sdpa")
 
+        # Cache for the chunk-suffix attention masks and the RoPE position
+        # vectors. All keyed by ``device`` so we lazily materialize on the
+        # right GPU on first call. Mask cache is also per-chunk_id since
+        # the mask depends on chunk_id (early chunks have masked-out cache
+        # padding via ``ki >= 0``); position vectors are chunk-invariant.
+        self._suffix_mask_cache: dict[tuple[int, torch.device], torch.Tensor] = {}
+        self._suffix_q_pos: dict[torch.device, torch.Tensor] = {}
+        self._suffix_k_pos: dict[torch.device, torch.Tensor] = {}
+
     # ------------------------------------------------------------------ helpers
 
     def _project_qkv(self, x: torch.Tensor) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
@@ -178,19 +187,32 @@ class TTTE2ESWA(nn.Module):
         full_k_pre = torch.cat([k_cache, xk], dim=1)          # (B, W+C, H, D)
         full_v = torch.cat([v_cache, xv], dim=1)
 
-        q_pos = torch.arange(W, W + C, device=device)
-        k_pos = torch.arange(W + C, device=device)
+        q_pos = self._suffix_q_pos.get(device)
+        if q_pos is None:
+            q_pos = torch.arange(W, W + C, device=device)
+            self._suffix_q_pos[device] = q_pos
+        k_pos = self._suffix_k_pos.get(device)
+        if k_pos is None:
+            k_pos = torch.arange(W + C, device=device)
+            self._suffix_k_pos[device] = k_pos
         xq = self.rope(xq, q_pos)
         full_k = self.rope(full_k_pre, k_pos)
 
         # JAX sw_causal_mask: query index in (chunk_id*C, chunk_id*C + C),
         # key index in (chunk_id*C - W, chunk_id*C + C - 1). Constraints:
         #   qi >= ki, qi < ki + W, ki >= 0.
-        starting_q = chunk_id * C
-        qi = (torch.arange(C, device=device) + starting_q).unsqueeze(1)
-        ki = (torch.arange(-(W + C), 0, device=device) + (starting_q + C)).unsqueeze(0)
-        mask = (qi >= ki) & (qi < ki + W) & (ki >= 0)
-        attn_mask = mask.unsqueeze(0).unsqueeze(0)             # (1, 1, C, W+C)
+        # The mask is fully determined by (chunk_id, C, W) and is reused
+        # across every chunk-by-chunk call at the same chunk_id, so we
+        # cache it to avoid a handful of Python+GPU launches per call.
+        cache_key = (chunk_id, device)
+        attn_mask = self._suffix_mask_cache.get(cache_key)
+        if attn_mask is None:
+            starting_q = chunk_id * C
+            qi = (torch.arange(C, device=device) + starting_q).unsqueeze(1)
+            ki = (torch.arange(-(W + C), 0, device=device) + (starting_q + C)).unsqueeze(0)
+            mask = (qi >= ki) & (qi < ki + W) & (ki >= 0)
+            attn_mask = mask.unsqueeze(0).unsqueeze(0).contiguous()  # (1, 1, C, W+C)
+            self._suffix_mask_cache[cache_key] = attn_mask
 
         out = self.attn(xq, full_k, full_v,
                         softmax_scale=self.head_dim ** -0.5,

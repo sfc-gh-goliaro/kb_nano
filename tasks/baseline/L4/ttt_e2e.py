@@ -157,23 +157,6 @@ class TTTE2EPipeline(nn.Module):
             for layer in self.model.suffix_layers
         ]
 
-    @staticmethod
-    def _flatten_prime_state(prime_state: list[dict[str, torch.Tensor]]) -> dict[str, torch.Tensor]:
-        out: dict[str, torch.Tensor] = {}
-        for i, d in enumerate(prime_state):
-            for k, v in d.items():
-                out[f"{i}.{k}"] = v
-        return out
-
-    @staticmethod
-    def _unflatten_prime_state(flat: dict[str, torch.Tensor]) -> list[dict[str, torch.Tensor]]:
-        out: dict[int, dict[str, torch.Tensor]] = {}
-        for k, v in flat.items():
-            i_str, name = k.split(".", 1)
-            i = int(i_str)
-            out.setdefault(i, {})[name] = v
-        return [out[i] for i in sorted(out.keys())]
-
     # ----------------------------------------------------- chunk-level forward
 
     def _suffix_chunk_forward(
@@ -234,40 +217,47 @@ class TTTE2EPipeline(nn.Module):
           update prime params take effect on the NEXT chunk.
         """
         cfg = self.config
-        flat_init = self._flatten_prime_state(prime_state)
 
-        def loss_fn(flat_prime: dict[str, torch.Tensor]):
-            ps = self._unflatten_prime_state(flat_prime)
-            h, new_caches = self._suffix_chunk_forward(
-                prefix_chunk, kv_caches, chunk_id, prime_state=ps,
-            )
-            logits = self.model.project_logits(h)
-            log_probs = self.log_softmax(logits.float())
-            nll = _token_nll(log_probs, target_chunk)            # (B, C)
-            return nll.mean(), (nll, new_caches)
+        # Build leaf tensors that require grad — fresh per chunk so we don't
+        # accumulate grads across the inner loop. ``torch.autograd.grad``
+        # gives us functional gradients (no .grad attribute pollution) and
+        # plays nicely with CUDA Graph capture later.
+        leaves: list[dict[str, torch.Tensor]] = [
+            {k: v.detach().requires_grad_(True) for k, v in d.items()}
+            for d in prime_state
+        ]
+        flat_leaves = [v for d in leaves for v in d.values()]      # in deterministic order
 
-        # NOTE: a naive ``torch.compile(loss_fn) + torch.func.grad(...)``
-        # produces incorrect gradients in this setup (verified empirically
-        # on the tiny 4L+2S+prime config: compiled meta-mode mean NLL drifts
-        # ~0.06 vs eager). The likely cause is torch.compile's interaction
-        # with ``torch.func.functional_call`` + the differentiable ``.to()``
-        # cast in the prime-FFN override path. This is the path we'd want
-        # to take to close the ~5× gap to JAX's lax.scan + jit fusion.
-        # Future work, intentionally not enabled here.
-        grad_fn = torch.func.grad(loss_fn, has_aux=True)
-        flat_grads, (chunk_nll, new_caches) = grad_fn(flat_init)
+        h, new_caches = self._suffix_chunk_forward(
+            prefix_chunk, kv_caches, chunk_id, prime_state=leaves,
+        )
+        logits = self.model.project_logits(h)
+        log_probs = self.log_softmax(logits.float())
+        chunk_nll = _token_nll(log_probs, target_chunk)            # (B, C)
+        loss = chunk_nll.mean()
+
+        flat_grads = torch.autograd.grad(loss, flat_leaves, create_graph=False, retain_graph=False)
 
         # Global-norm clip (matches optax.clip_by_global_norm).
-        global_sq = sum(g.float().pow(2).sum() for g in flat_grads.values())
-        global_norm = global_sq.sqrt()
+        global_norm = torch.sqrt(sum(g.float().pow(2).sum() for g in flat_grads))
         scale = (cfg.inner_clip_grad_norm / (global_norm + 1e-9)).clamp(max=1.0)
 
-        # SGD step: param -= lr * (scale * grad)
+        # SGD step: param -= lr * (scale * grad). Build new prime_state in
+        # the same list-of-dicts shape, detached so the next chunk's grads
+        # don't backprop through this chunk's update.
         lr = cfg.inner_lr * cfg.ilr_init
-        flat_new = {k: (p - lr * (scale * flat_grads[k])) for k, p in flat_init.items()}
-        new_prime_state = self._unflatten_prime_state(flat_new)
+        new_prime_state: list[dict[str, torch.Tensor]] = []
+        gi = 0
+        for d in leaves:
+            new_d: dict[str, torch.Tensor] = {}
+            for k, p in d.items():
+                new_d[k] = (p.detach() - lr * (scale * flat_grads[gi])).detach()
+                gi += 1
+            new_prime_state.append(new_d)
 
-        return chunk_nll, new_caches, new_prime_state
+        # Detach caches and chunk_nll so downstream Python state is grad-free.
+        new_caches = [(k.detach(), v.detach()) for k, v in new_caches]
+        return chunk_nll.detach(), new_caches, new_prime_state
 
     # ------------------------------------------------------------------ entry
 

@@ -247,6 +247,7 @@ def _run_kbnano(
         kcfg, weights_npz=str(weights_npz), device=device,
         param_dtype=cdt, compute_dtype=cdt,
     )
+    engine.compile_layers()
     build_s = time.time() - t0
     print(f"[bench] kb-nano: engine built in {build_s:.2f}s", flush=True)
 
