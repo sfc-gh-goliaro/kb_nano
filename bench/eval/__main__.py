@@ -13,7 +13,7 @@ Usage:
     # Restrict TP degrees
     python -m kb_nano.bench.eval --tp 1 4
 
-    # Custom output path (default: bench/results/eval.json)
+    # Custom output path (default: bench/results/eval_<timestamp>.json)
     python -m kb_nano.bench.eval --output-json results/my_eval.json
 """
 

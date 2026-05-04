@@ -3,7 +3,7 @@
 These workloads are constants that ensure reproducible, comparable results
 across runs and users. They are not configurable by design.
 
-LLM workloads (text-only, random token IDs):
+LLM workloads (text-only, real WildChat-derived requests):
   Throughput: 3 scenarios (prefill-heavy, balanced, decode-heavy), 1000 reqs each.
   Latency: 2 scenarios (single-request, fixed-batch-32).
 
@@ -16,13 +16,14 @@ from __future__ import annotations
 
 from dataclasses import dataclass
 
+from kb_nano.bench.utils.real_prompts import DEFAULT_WORKLOAD_DATASETS
+
 
 @dataclass(frozen=True)
 class ThroughputWorkload:
     name: str
-    input_len: int
-    output_len: int
     num_requests: int = 1000
+    dataset_name: str = ""
 
 
 @dataclass(frozen=True)
@@ -36,9 +37,18 @@ class LatencyWorkload:
 
 
 THROUGHPUT_WORKLOADS: list[ThroughputWorkload] = [
-    ThroughputWorkload(name="prefill-heavy", input_len=1024, output_len=512),
-    ThroughputWorkload(name="balanced",      input_len=512,  output_len=512),
-    ThroughputWorkload(name="decode-heavy",  input_len=512,  output_len=1024),
+    ThroughputWorkload(
+        name="prefill-heavy",
+        dataset_name=DEFAULT_WORKLOAD_DATASETS["prefill-heavy"],
+    ),
+    ThroughputWorkload(
+        name="balanced",
+        dataset_name=DEFAULT_WORKLOAD_DATASETS["balanced"],
+    ),
+    ThroughputWorkload(
+        name="decode-heavy",
+        dataset_name=DEFAULT_WORKLOAD_DATASETS["decode-heavy"],
+    ),
 ]
 
 LATENCY_WORKLOADS: list[LatencyWorkload] = [
@@ -53,6 +63,62 @@ ALL_WORKLOADS = {
 
 
 # ---------------------------------------------------------------------------
+# Whisper / ASR workloads (audio transcription)
+# ---------------------------------------------------------------------------
+
+@dataclass(frozen=True)
+class ASRThroughputWorkload:
+    name: str
+    output_len: int
+    dataset_name: str
+    dataset_split: str
+    use_full_dataset: bool = True
+
+
+@dataclass(frozen=True)
+class ASRLatencyWorkload:
+    name: str
+    output_len: int
+    batch_size: int
+    dataset_name: str
+    dataset_split: str
+    num_warmup: int = 3
+    num_iters: int = 5
+
+
+ASR_THROUGHPUT_WORKLOADS: list[ASRThroughputWorkload] = [
+    ASRThroughputWorkload(
+        name="librispeech",
+        output_len=448,
+        dataset_name="openslr/librispeech_asr",
+        dataset_split="test.clean",
+    ),
+]
+
+ASR_LATENCY_WORKLOADS: list[ASRLatencyWorkload] = [
+    ASRLatencyWorkload(
+        name="single-utterance",
+        output_len=448,
+        batch_size=1,
+        dataset_name="openslr/librispeech_asr",
+        dataset_split="test.clean",
+    ),
+    ASRLatencyWorkload(
+        name="fixed-batch-32",
+        output_len=448,
+        batch_size=32,
+        dataset_name="openslr/librispeech_asr",
+        dataset_split="test.clean",
+    ),
+]
+
+ALL_ASR_WORKLOADS = {
+    "throughput": ASR_THROUGHPUT_WORKLOADS,
+    "latency": ASR_LATENCY_WORKLOADS,
+}
+
+
+# ---------------------------------------------------------------------------
 # VLM workloads (multi-modal)
 # ---------------------------------------------------------------------------
 
@@ -63,6 +129,7 @@ class VLMThroughputWorkload:
     input_len: int | None  # fixed input token length (text only)
     output_len: int
     dataset_name: str | None = None  # HF dataset (image/video only)
+    dataset_split: str | None = None
     num_requests: int = 1000
 
 
@@ -71,10 +138,10 @@ VLM_THROUGHPUT_WORKLOADS: list[VLMThroughputWorkload] = [
         "text-only", "text", input_len=512, output_len=1024),
     VLMThroughputWorkload(
         "image", "image", input_len=None, output_len=512,
-        dataset_name="lmarena-ai/VisionArena-Chat"),
+        dataset_name="lmarena-ai/VisionArena-Chat", dataset_split="train"),
     VLMThroughputWorkload(
         "video", "video", input_len=None, output_len=512,
-        dataset_name="yale-nlp/MMVU"),
+        dataset_name="yale-nlp/MMVU", dataset_split="validation"),
 ]
 
 
@@ -85,6 +152,7 @@ class VLMLatencyWorkload:
     output_len: int
     batch_size: int = 1
     dataset_name: str | None = None
+    dataset_split: str | None = None
     num_warmup: int = 3
     num_iters: int = 5
 
@@ -92,10 +160,10 @@ class VLMLatencyWorkload:
 VLM_LATENCY_WORKLOADS: list[VLMLatencyWorkload] = [
     VLMLatencyWorkload(
         "single-image", "image", output_len=128,
-        dataset_name="lmarena-ai/VisionArena-Chat"),
+        dataset_name="lmarena-ai/VisionArena-Chat", dataset_split="train"),
     VLMLatencyWorkload(
         "single-video", "video", output_len=128,
-        dataset_name="yale-nlp/MMVU"),
+        dataset_name="yale-nlp/MMVU", dataset_split="validation"),
 ]
 
 ALL_VLM_WORKLOADS = {
@@ -338,10 +406,12 @@ ALL_DETECTION_WORKLOADS = {
 
 
 def get_max_seq_len() -> int:
-    """Return the maximum sequence length across all standardized LLM workloads."""
+    """Return the maximum static sequence length for standardized LLM workloads.
+
+    Throughput decode lengths are data-dependent for real-prompt workloads, so
+    eval computes their max sequence length after loading the dataset.
+    """
     max_len = 0
-    for w in THROUGHPUT_WORKLOADS:
-        max_len = max(max_len, w.input_len + w.output_len)
     for w in LATENCY_WORKLOADS:
         max_len = max(max_len, w.input_len + w.output_len)
     return max_len
@@ -402,6 +472,65 @@ ALL_VIDEO_DIFFUSION_WORKLOADS = {
 
 
 # ---------------------------------------------------------------------------
+# Oasis workloads (autoregressive video diffusion)
+# ---------------------------------------------------------------------------
+
+@dataclass(frozen=True)
+class OasisWorkload:
+    name: str
+    batch_clips: int
+    num_frames: int
+    ddim_steps: int
+    n_prompt_frames: int = 1
+    kind: str = "throughput"
+    dataset_name: str = "TESS-Computer/minecraft-vla-stage1"
+    dataset_split: str = "train"
+
+
+OASIS_THROUGHPUT_WORKLOADS: list[OasisWorkload] = [
+    OasisWorkload(
+        name="short-bs4-16f-4ddim",
+        batch_clips=4,
+        num_frames=16,
+        ddim_steps=4,
+    ),
+    OasisWorkload(
+        name="medium-bs8-24f-4ddim",
+        batch_clips=8,
+        num_frames=24,
+        ddim_steps=4,
+    ),
+    OasisWorkload(
+        name="long-bs8-32f-4ddim",
+        batch_clips=8,
+        num_frames=32,
+        ddim_steps=4,
+    ),
+    OasisWorkload(
+        name="denoise-bs4-16f-8ddim",
+        batch_clips=4,
+        num_frames=16,
+        ddim_steps=8,
+    ),
+]
+
+OASIS_LATENCY_WORKLOADS: list[OasisWorkload] = [
+    OasisWorkload(
+        name="latency-bs1-8f-4ddim",
+        batch_clips=1,
+        num_frames=8,
+        ddim_steps=4,
+        kind="latency",
+    ),
+]
+
+ALL_OASIS_WORKLOADS = {
+    "throughput": OASIS_THROUGHPUT_WORKLOADS,
+    "latency": OASIS_LATENCY_WORKLOADS,
+}
+
+
+# ---------------------------------------------------------------------------
 # Vision encoder workloads (pure image feature extraction, e.g. SigLIP-2, DINOv3)
 # ---------------------------------------------------------------------------
 
@@ -448,4 +577,144 @@ VISION_ENCODER_LATENCY_WORKLOADS: list[VisionEncoderLatencyWorkload] = [
 ALL_VISION_ENCODER_WORKLOADS = {
     "throughput": VISION_ENCODER_THROUGHPUT_WORKLOADS,
     "latency": VISION_ENCODER_LATENCY_WORKLOADS,
+}
+
+
+# ---------------------------------------------------------------------------
+# Text embedding workloads (token-level retrieval embeddings)
+# ---------------------------------------------------------------------------
+
+@dataclass(frozen=True)
+class EmbeddingThroughputWorkload:
+    """Throughput workload for token-level text embedding models."""
+
+    name: str
+    model_key: str
+    model_name: str
+    dataset_name: str
+    dataset_config: str
+    dataset_split: str
+    id_column: str | None
+    text_column: str
+    jsonl_name: str
+    num_requests: int = 1000
+
+
+@dataclass(frozen=True)
+class EmbeddingLatencyWorkload:
+    """Latency workload for token-level text embedding models."""
+
+    name: str
+    batch_size: int
+    num_warmup: int = 3
+    num_iters: int = 5
+
+
+EMBEDDING_THROUGHPUT_WORKLOADS: list[EmbeddingThroughputWorkload] = [
+    EmbeddingThroughputWorkload(
+        name="bge-m3-mldr-docs",
+        model_key="bge_m3",
+        model_name="BAAI/bge-m3",
+        dataset_name="sentence-transformers/mldr",
+        dataset_config="en-triplet",
+        dataset_split="train",
+        id_column=None,
+        text_column="positive",
+        jsonl_name="bge_m3_mldr_documents.jsonl",
+    ),
+    EmbeddingThroughputWorkload(
+        name="colbertv2-msmarco-passages",
+        model_key="colbertv2",
+        model_name="colbert-ir/colbertv2.0",
+        dataset_name="sentence-transformers/msmarco",
+        dataset_config="corpus",
+        dataset_split="train",
+        id_column="passage_id",
+        text_column="passage",
+        jsonl_name="colbertv2_msmarco_passages.jsonl",
+        num_requests=60_000,
+    ),
+]
+
+EMBEDDING_LATENCY_WORKLOADS: list[EmbeddingLatencyWorkload] = [
+    EmbeddingLatencyWorkload(name="single-request", batch_size=1),
+    EmbeddingLatencyWorkload(name="fixed-batch-32", batch_size=32),
+]
+
+ALL_EMBEDDING_WORKLOADS = {
+    "throughput": EMBEDDING_THROUGHPUT_WORKLOADS,
+    "latency": EMBEDDING_LATENCY_WORKLOADS,
+}
+
+
+# ---------------------------------------------------------------------------
+# Structure prediction workloads (OpenFold3 / AlphaFold3-style models)
+# ---------------------------------------------------------------------------
+
+@dataclass(frozen=True)
+class StructurePredictionThroughputWorkload:
+    name: str
+    num_queries: int
+    description: str
+    dataset_name: str = "OpenProteinSet"
+
+
+@dataclass(frozen=True)
+class StructurePredictionLatencyWorkload:
+    name: str
+    length_bucket: str
+    num_warmup: int = 1
+    num_iters: int = 3
+    dataset_name: str = "OpenProteinSet"
+
+
+STRUCTURE_PREDICTION_THROUGHPUT_WORKLOADS: list[
+    StructurePredictionThroughputWorkload
+] = [
+    StructurePredictionThroughputWorkload(
+        name="short",
+        num_queries=50,
+        description="short proteins (<=150 residues) x 50 queries",
+    ),
+    StructurePredictionThroughputWorkload(
+        name="medium",
+        num_queries=20,
+        description="medium proteins (150-400 residues) x 20 queries",
+    ),
+    StructurePredictionThroughputWorkload(
+        name="long",
+        num_queries=10,
+        description="long proteins (400-700 residues) x 10 queries",
+    ),
+    StructurePredictionThroughputWorkload(
+        name="extra-long",
+        num_queries=5,
+        description="extra-long proteins (700+ residues) x 5 queries",
+    ),
+]
+
+STRUCTURE_PREDICTION_LATENCY_WORKLOADS: list[
+    StructurePredictionLatencyWorkload
+] = [
+    StructurePredictionLatencyWorkload(
+        name="single-short",
+        length_bucket="short",
+    ),
+    StructurePredictionLatencyWorkload(
+        name="single-medium",
+        length_bucket="medium",
+    ),
+    StructurePredictionLatencyWorkload(
+        name="single-long",
+        length_bucket="long",
+    ),
+    StructurePredictionLatencyWorkload(
+        name="single-extra-long",
+        length_bucket="extra-long",
+    ),
+]
+
+ALL_STRUCTURE_PREDICTION_WORKLOADS = {
+    "throughput": STRUCTURE_PREDICTION_THROUGHPUT_WORKLOADS,
+    "latency": STRUCTURE_PREDICTION_LATENCY_WORKLOADS,
 }

@@ -40,8 +40,12 @@ class LlamaConfig:
     @classmethod
     def from_pretrained(cls, model_name: str) -> "LlamaConfig":
         hf = AutoConfig.from_pretrained(model_name)
-        rope = hf.rope_scaling or getattr(hf, "rope_parameters", None) or {}
-        rope_theta = getattr(hf, "rope_theta", None) or rope.get("rope_theta", 500000.0)
+        # transformers 5.x moved rope config into rope_parameters dict
+        rope_params = getattr(hf, "rope_parameters", None) or {}
+        rope = getattr(hf, "rope_scaling", None) or {}
+        # Merge: rope_parameters takes priority (transformers 5.x)
+        rope = {**rope, **rope_params}
+        rope_theta = rope.get("rope_theta") or getattr(hf, "rope_theta", 500000.0)
         is_qwen2 = getattr(hf, "model_type", "") in ("qwen2", "qwen2_moe")
         return cls(
             hidden_size=hf.hidden_size,

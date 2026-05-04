@@ -3,7 +3,8 @@
 Throughput and alignment benchmark: kb-nano baseline vs vLLM.
 
 For LLM models: runs three text-only scenarios (prefill-heavy, balanced,
-decode-heavy) with random token IDs.
+decode-heavy) using WildChat-derived HuggingFace datasets, tokenized with
+the target model's chat template.
 
 For VLM models (Qwen2-VL, Qwen3-VL): runs three throughput scenarios
 (text-only, image, video) and two latency scenarios (single-image,
@@ -25,16 +26,20 @@ Usage:
 from __future__ import annotations
 
 import argparse
+import fcntl
 import json
 import os
 import random
+import socket
 import sys
+import time
 from pathlib import Path
 from random import randint
 
 import subprocess
 
 import numpy as np
+from transformers import AutoTokenizer
 
 
 def _detect_gpu_name() -> str:
@@ -51,6 +56,115 @@ def _detect_gpu_name() -> str:
     except Exception:
         return "unknown"
 
+
+def _parse_port_env(name: str) -> int | None:
+    value = os.environ.get(name)
+    if value is None or value == "":
+        return None
+    try:
+        port = int(value)
+    except ValueError as exc:
+        raise SystemExit(f"{name} must be an integer TCP port, got {value!r}") from exc
+    if not (1 <= port <= 65535):
+        raise SystemExit(f"{name} must be between 1 and 65535, got {port}")
+    return port
+
+
+def _reserve_tcp_port(preferred: int | None = None) -> tuple[int, object]:
+    """Reserve a local TCP port across concurrent benchmark processes.
+
+    The lock avoids two copies of this script choosing the same port before
+    their subprocesses initialize torch/vLLM distributed state.
+    """
+    min_port = int(os.environ.get("KB_NANO_BENCH_PORT_MIN", "20000"))
+    max_port = int(os.environ.get("KB_NANO_BENCH_PORT_MAX", "60999"))
+    if min_port > max_port:
+        raise SystemExit("KB_NANO_BENCH_PORT_MIN must be <= KB_NANO_BENCH_PORT_MAX")
+
+    lock_dir = Path(os.environ.get(
+        "KB_NANO_BENCH_PORT_LOCK_DIR",
+        "/tmp/kb_nano_bench_ports",
+    ))
+    lock_dir.mkdir(parents=True, exist_ok=True)
+
+    candidates: list[int] = []
+    if preferred is not None:
+        candidates.append(preferred)
+    rng = random.Random((os.getpid() << 16) ^ time.time_ns())
+    candidates.extend(rng.sample(range(min_port, max_port + 1),
+                                 max_port - min_port + 1))
+
+    for port in candidates:
+        lock = open(lock_dir / f"{port}.lock", "w")
+        try:
+            fcntl.flock(lock, fcntl.LOCK_EX | fcntl.LOCK_NB)
+        except BlockingIOError:
+            lock.close()
+            continue
+
+        with socket.socket(socket.AF_INET, socket.SOCK_STREAM) as sock:
+            try:
+                sock.bind(("127.0.0.1", port))
+            except OSError:
+                fcntl.flock(lock, fcntl.LOCK_UN)
+                lock.close()
+                continue
+
+        return port, lock
+
+    raise SystemExit(
+        f"Could not reserve a free local TCP port in {min_port}-{max_port}"
+    )
+
+
+def _make_run_id(requested: str | None) -> str:
+    run_id = requested or f"{time.strftime('%Y%m%d-%H%M%S')}-pid{os.getpid()}"
+    safe = "".join(c if c.isalnum() or c in "._-" else "-" for c in run_id)
+    safe = safe.strip(".-_")
+    if not safe:
+        raise SystemExit("--run-id must contain at least one path-safe character")
+    return safe
+
+
+def _install_flashinfer_sitecustomize() -> None:
+    """Patch FlashInfer IPC socket IDs in every spawned vLLM rank."""
+    site_dir = Path(os.environ.get(
+        "KB_NANO_FLASHINFER_SITECUSTOMIZE_DIR",
+        "/tmp/kb_nano_flashinfer_sitecustomize",
+    ))
+    site_dir.mkdir(parents=True, exist_ok=True)
+    (site_dir / "sitecustomize.py").write_text(r'''
+import os
+
+namespace = os.environ.get("KB_NANO_FLASHINFER_SOCKET_NAMESPACE")
+if namespace:
+    try:
+        import hashlib
+        from flashinfer.comm import mnnvl
+    except Exception:
+        pass
+    else:
+        if not getattr(mnnvl.IpcSocket, "_kb_nano_namespaced", False):
+            original_init = mnnvl.IpcSocket.__init__
+            namespace_bits = int.from_bytes(
+                hashlib.blake2b(namespace.encode(), digest_size=8).digest(),
+                "little",
+            )
+
+            def namespaced_init(self, rank, op_id, use_abstract=True):
+                if isinstance(op_id, int):
+                    op_id = (op_id ^ namespace_bits) & ((1 << 64) - 1)
+                original_init(self, rank, op_id, use_abstract)
+
+            mnnvl.IpcSocket.__init__ = namespaced_init
+            mnnvl.IpcSocket._kb_nano_namespaced = True
+''')
+
+    current = os.environ.get("PYTHONPATH", "")
+    parts = [p for p in current.split(os.pathsep) if p]
+    if str(site_dir) not in parts:
+        os.environ["PYTHONPATH"] = os.pathsep.join([str(site_dir), *parts])
+
 _THIS_DIR = Path(__file__).resolve().parent
 _PACKAGE_DIR = _THIS_DIR.parent
 _PROJECT_ROOT = _PACKAGE_DIR.parent
@@ -58,45 +172,81 @@ _PROJECT_ROOT = _PACKAGE_DIR.parent
 sys.path.insert(0, str(_PROJECT_ROOT))
 
 from kb_nano.bench.utils.worker import run_worker
+from kb_nano.bench.utils.real_prompts import load_real_prompt_workload
+from kb_nano.bench.utils.workloads import (
+    ASR_LATENCY_WORKLOADS,
+    ASR_THROUGHPUT_WORKLOADS,
+    LATENCY_WORKLOADS,
+    THROUGHPUT_WORKLOADS,
+    VLM_LATENCY_WORKLOADS,
+    VLM_THROUGHPUT_WORKLOADS,
+)
+
+_HELD_PORT_LOCKS: list[object] = []
 
 
 SCENARIOS = [
-    {"name": "prefill-heavy", "input_len": 1024, "output_len": 512},
-    {"name": "balanced",      "input_len": 512,  "output_len": 512},
-    {"name": "decode-heavy",  "input_len": 512,  "output_len": 1024},
+    {
+        "name": w.name,
+        "dataset": w.dataset_name,
+    }
+    for w in THROUGHPUT_WORKLOADS
 ]
 
 LATENCY_SCENARIOS = [
-    {"name": "single-request",  "input_len": 128, "output_len": 128, "batch_size": 1},
-    {"name": "fixed-batch-32",  "input_len": 128, "output_len": 128, "batch_size": 32},
+    {
+        "name": w.name,
+        "input_len": w.input_len,
+        "output_len": w.output_len,
+        "batch_size": w.batch_size,
+    }
+    for w in LATENCY_WORKLOADS
 ]
 
 VLM_SCENARIOS = [
-    {"name": "text-only",  "modality": "text",  "input_len": 512, "output_len": 1024},
-    {"name": "image",      "modality": "image", "output_len": 512,
-     "dataset": "lmarena-ai/VisionArena-Chat", "dataset_split": "train"},
-    {"name": "video",      "modality": "video", "output_len": 512,
-     "dataset": "yale-nlp/MMVU", "dataset_split": "validation"},
+    {
+        "name": w.name,
+        "modality": w.modality,
+        "input_len": w.input_len,
+        "output_len": w.output_len,
+        "dataset": w.dataset_name,
+        "dataset_split": w.dataset_split,
+    }
+    for w in VLM_THROUGHPUT_WORKLOADS
 ]
 
 WHISPER_SCENARIOS = [
-    {"name": "librispeech", "output_len": 448,
-     "dataset": "openslr/librispeech_asr", "dataset_split": "test.clean",
-     "use_full_dataset": True},
+    {
+        "name": w.name,
+        "output_len": w.output_len,
+        "dataset": w.dataset_name,
+        "dataset_split": w.dataset_split,
+        "use_full_dataset": w.use_full_dataset,
+    }
+    for w in ASR_THROUGHPUT_WORKLOADS
 ]
 
 WHISPER_LATENCY_SCENARIOS = [
-    {"name": "single-utterance", "output_len": 448, "batch_size": 1,
-     "dataset": "openslr/librispeech_asr", "dataset_split": "test.clean"},
-    {"name": "fixed-batch-32", "output_len": 448, "batch_size": 32,
-     "dataset": "openslr/librispeech_asr", "dataset_split": "test.clean"},
+    {
+        "name": w.name,
+        "output_len": w.output_len,
+        "batch_size": w.batch_size,
+        "dataset": w.dataset_name,
+        "dataset_split": w.dataset_split,
+    }
+    for w in ASR_LATENCY_WORKLOADS
 ]
 
 VLM_LATENCY_SCENARIOS = [
-    {"name": "single-image", "modality": "image", "output_len": 128, "batch_size": 1,
-     "dataset": "lmarena-ai/VisionArena-Chat", "dataset_split": "train"},
-    {"name": "single-video", "modality": "video", "output_len": 128, "batch_size": 1,
-     "dataset": "yale-nlp/MMVU", "dataset_split": "validation"},
+    {
+        "name": w.name,
+        "modality": w.modality,
+        "output_len": w.output_len,
+        "batch_size": w.batch_size,
+        "dataset": w.dataset_name,
+        "dataset_split": w.dataset_split,
+    }
+    for w in VLM_LATENCY_WORKLOADS
 ]
 
 
@@ -117,6 +267,34 @@ VLLM_WORKER = r'''
 import json, os, sys, time
 os.environ.setdefault("VLLM_WORKER_MULTIPROC_METHOD", "spawn")
 os.environ.setdefault("VLLM_DEEP_GEMM_WARMUP", "skip")
+
+def _configure_parallel_safe_flashinfer():
+    namespace = os.environ.get("KB_NANO_FLASHINFER_SOCKET_NAMESPACE")
+    if not namespace:
+        return
+    try:
+        import hashlib
+        from flashinfer.comm import mnnvl
+    except Exception:
+        return
+    if getattr(mnnvl.IpcSocket, "_kb_nano_namespaced", False):
+        return
+
+    original_init = mnnvl.IpcSocket.__init__
+    namespace_bits = int.from_bytes(
+        hashlib.blake2b(namespace.encode(), digest_size=8).digest(),
+        "little",
+    )
+
+    def namespaced_init(self, rank, op_id, use_abstract=True):
+        if isinstance(op_id, int):
+            op_id = (op_id ^ namespace_bits) & ((1 << 64) - 1)
+        original_init(self, rank, op_id, use_abstract)
+
+    mnnvl.IpcSocket.__init__ = namespaced_init
+    mnnvl.IpcSocket._kb_nano_namespaced = True
+
+_configure_parallel_safe_flashinfer()
 
 def main():
     from vllm import LLM, SamplingParams
@@ -186,8 +364,15 @@ def main():
     latency_results = []
     for ls in cfg.get("latency_scenarios", []):
         prompts = [dict(prompt_token_ids=p) for p in ls["prompt_token_ids"]]
-        sp = SamplingParams(temperature=0.0,
-                            ignore_eos=True, max_tokens=ls["output_len"])
+        output_lens = ls.get("output_lens")
+        if output_lens is None:
+            sp = SamplingParams(temperature=0.0,
+                                ignore_eos=True, max_tokens=ls["output_len"])
+        else:
+            sp = [
+                SamplingParams(temperature=0.0, ignore_eos=True, max_tokens=ol)
+                for ol in output_lens
+            ]
         num_warmup = ls.get("num_warmup", 3)
         num_iters = ls.get("num_iters", 5)
         for _ in range(num_warmup):
@@ -219,7 +404,8 @@ if __name__ == "__main__":
 # Multi-scenario kb-nano subprocess worker
 # ---------------------------------------------------------------------------
 KB_NANO_WORKER = r'''
-import json, sys, time
+import json, os, sys, time
+os.environ.setdefault("VLLM_DEEP_GEMM_WARMUP", "skip")
 
 def main():
     with open(sys.argv[1]) as f:
@@ -292,8 +478,15 @@ def main():
     latency_results = []
     for ls in cfg.get("latency_scenarios", []):
         prompts = ls["prompt_token_ids"]
-        sp = SamplingParams(temperature=0.0,
-                            ignore_eos=True, max_tokens=ls["output_len"])
+        output_lens = ls.get("output_lens")
+        if output_lens is None:
+            sp = SamplingParams(temperature=0.0,
+                                ignore_eos=True, max_tokens=ls["output_len"])
+        else:
+            sp = [
+                SamplingParams(temperature=0.0, ignore_eos=True, max_tokens=ol)
+                for ol in output_lens
+            ]
         num_warmup = ls.get("num_warmup", 3)
         num_iters = ls.get("num_iters", 5)
         for _ in range(num_warmup):
@@ -518,6 +711,34 @@ import json, os, sys, time
 os.environ.setdefault("VLLM_WORKER_MULTIPROC_METHOD", "spawn")
 os.environ.setdefault("VLLM_DEEP_GEMM_WARMUP", "skip")
 
+def _configure_parallel_safe_flashinfer():
+    namespace = os.environ.get("KB_NANO_FLASHINFER_SOCKET_NAMESPACE")
+    if not namespace:
+        return
+    try:
+        import hashlib
+        from flashinfer.comm import mnnvl
+    except Exception:
+        return
+    if getattr(mnnvl.IpcSocket, "_kb_nano_namespaced", False):
+        return
+
+    original_init = mnnvl.IpcSocket.__init__
+    namespace_bits = int.from_bytes(
+        hashlib.blake2b(namespace.encode(), digest_size=8).digest(),
+        "little",
+    )
+
+    def namespaced_init(self, rank, op_id, use_abstract=True):
+        if isinstance(op_id, int):
+            op_id = (op_id ^ namespace_bits) & ((1 << 64) - 1)
+        original_init(self, rank, op_id, use_abstract)
+
+    mnnvl.IpcSocket.__init__ = namespaced_init
+    mnnvl.IpcSocket._kb_nano_namespaced = True
+
+_configure_parallel_safe_flashinfer()
+
 
 def main():
     from vllm import LLM, SamplingParams
@@ -626,8 +847,15 @@ def main():
 
         if modality == "text":
             prompts = [dict(prompt_token_ids=p) for p in ls["prompt_token_ids"]]
-            sp = SamplingParams(temperature=0.0,
-                                ignore_eos=True, max_tokens=ls["output_len"])
+            output_lens = ls.get("output_lens")
+            if output_lens is None:
+                sp = SamplingParams(temperature=0.0,
+                                    ignore_eos=True, max_tokens=ls["output_len"])
+            else:
+                sp = [
+                    SamplingParams(temperature=0.0, ignore_eos=True, max_tokens=ol)
+                    for ol in output_lens
+                ]
             run_fn = lambda: llm.generate(prompts, sp, use_tqdm=False)
         else:
             mm_data = _preload_mm_data(
@@ -680,7 +908,8 @@ if __name__ == "__main__":
 # Multi-scenario kb-nano subprocess worker (VLM, multi-modal)
 # ---------------------------------------------------------------------------
 KB_NANO_VLM_WORKER = _MM_PRELOAD_FN + r'''
-import json, sys, time
+import json, os, sys, time
+os.environ.setdefault("VLLM_DEEP_GEMM_WARMUP", "skip")
 
 
 def main():
@@ -800,8 +1029,15 @@ def main():
 
         if modality == "text":
             prompts = ls["prompt_token_ids"]
-            sp = SamplingParams(temperature=0.0, ignore_eos=True,
-                                max_tokens=ls["output_len"])
+            output_lens = ls.get("output_lens")
+            if output_lens is None:
+                sp = SamplingParams(temperature=0.0, ignore_eos=True,
+                                    max_tokens=ls["output_len"])
+            else:
+                sp = [
+                    SamplingParams(temperature=0.0, ignore_eos=True, max_tokens=ol)
+                    for ol in output_lens
+                ]
             def run_fn():
                 engine.block_manager.reset()
                 torch.cuda.synchronize()
@@ -872,6 +1108,34 @@ import json, os, sys, time
 import numpy as np
 os.environ.setdefault("VLLM_WORKER_MULTIPROC_METHOD", "spawn")
 os.environ.setdefault("VLLM_DEEP_GEMM_WARMUP", "skip")
+
+def _configure_parallel_safe_flashinfer():
+    namespace = os.environ.get("KB_NANO_FLASHINFER_SOCKET_NAMESPACE")
+    if not namespace:
+        return
+    try:
+        import hashlib
+        from flashinfer.comm import mnnvl
+    except Exception:
+        return
+    if getattr(mnnvl.IpcSocket, "_kb_nano_namespaced", False):
+        return
+
+    original_init = mnnvl.IpcSocket.__init__
+    namespace_bits = int.from_bytes(
+        hashlib.blake2b(namespace.encode(), digest_size=8).digest(),
+        "little",
+    )
+
+    def namespaced_init(self, rank, op_id, use_abstract=True):
+        if isinstance(op_id, int):
+            op_id = (op_id ^ namespace_bits) & ((1 << 64) - 1)
+        original_init(self, rank, op_id, use_abstract)
+
+    mnnvl.IpcSocket.__init__ = namespaced_init
+    mnnvl.IpcSocket._kb_nano_namespaced = True
+
+_configure_parallel_safe_flashinfer()
 
 def _load_librispeech(dataset_name, dataset_split, num_seqs, seed):
     """Load audio samples from LibriSpeech and return as list of numpy arrays."""
@@ -1258,12 +1522,23 @@ def main():
     parser.add_argument(
         "--output-dir", type=str, default=None,
         help="Directory to save per-scenario outputs and results JSON "
-             "(default: tests/results/<gpu>/<model>_tp<tp>)",
+             "(default: tests/results/<gpu>/<model>_tp<tp>/<run-id>)",
+    )
+    parser.add_argument(
+        "--run-id", type=str, default=None,
+        help="Run subdirectory appended to the default output dir. Defaults "
+             "to a timestamp+pid so concurrent runs do not overwrite each "
+             "other. Ignored when --output-dir is provided.",
     )
     parser.add_argument(
         "--modality", type=str, default="all",
         choices=["all", "text", "image", "video"],
         help="Run only scenarios matching this modality (VLM models only, default: all)",
+    )
+    parser.add_argument(
+        "--scenario", type=str, default=None,
+        help="Run only the throughput scenario with this name (e.g. "
+             "'balanced'). Default: run all scenarios for the model type.",
     )
     args = parser.parse_args()
 
@@ -1276,8 +1551,38 @@ def main():
 
     if args.output_dir is None:
         short = args.model.split("/")[-1]
+        run_id = _make_run_id(args.run_id)
         repo_root = Path(__file__).resolve().parent.parent
-        args.output_dir = str(repo_root / "tests" / "results" / gpu / f"{short}_tp{args.tp}")
+        args.output_dir = str(
+            repo_root / "tests" / "results" / gpu / f"{short}_tp{args.tp}" / run_id
+        )
+    elif args.run_id is not None:
+        print("  NOTE: --run-id is ignored because --output-dir was provided.")
+
+    kb_nccl_port, kb_nccl_lock = _reserve_tcp_port(
+        preferred=_parse_port_env("KB_NANO_NCCL_PORT"),
+    )
+    _HELD_PORT_LOCKS.append(kb_nccl_lock)
+    os.environ["KB_NANO_NCCL_PORT"] = str(kb_nccl_port)
+
+    vllm_port = None
+    flashinfer_namespace = None
+    previous_flashinfer_namespace_env = os.environ.get(
+        "KB_NANO_FLASHINFER_SOCKET_NAMESPACE",
+    )
+    if not args.skip_vllm:
+        vllm_port, vllm_port_lock = _reserve_tcp_port(
+            preferred=_parse_port_env("VLLM_PORT"),
+        )
+        _HELD_PORT_LOCKS.append(vllm_port_lock)
+        os.environ["VLLM_PORT"] = str(vllm_port)
+        if args.tp > 1:
+            flashinfer_namespace = (
+                os.environ.get("KB_NANO_FLASHINFER_SOCKET_NAMESPACE")
+                or f"bench-vllm-{os.getpid()}-{vllm_port}"
+            )
+            os.environ["KB_NANO_FLASHINFER_SOCKET_NAMESPACE"] = flashinfer_namespace
+            _install_flashinfer_sitecustomize()
 
     if is_whisper:
         throughput_scenarios = WHISPER_SCENARIOS
@@ -1299,9 +1604,24 @@ def main():
             if s.get("modality", "text") == args.modality
         ]
 
+    if args.scenario is not None:
+        throughput_scenarios = [
+            s for s in throughput_scenarios if s["name"] == args.scenario
+        ]
+        if not throughput_scenarios:
+            raise SystemExit(
+                f"--scenario={args.scenario!r} did not match any throughput "
+                f"scenario for this model type."
+            )
+
     # Pre-generate all scenario data
     scenario_data = []
     global_max_seq_len = 0
+    tokenizer = None
+    if not is_whisper:
+        tokenizer = AutoTokenizer.from_pretrained(
+            args.model, trust_remote_code=True,
+        )
     if not args.skip_throughput:
         for i, scenario in enumerate(throughput_scenarios):
             if is_whisper:
@@ -1323,24 +1643,37 @@ def main():
 
             modality = scenario.get("modality", "text") if is_vlm else "text"
             if modality == "text":
-                rng_seed = args.seed + i
-                random.seed(rng_seed)
-                np.random.seed(rng_seed)
-                input_len = scenario["input_len"]
-                output_len = scenario["output_len"]
-                prompt_token_ids = [
-                    [randint(0, 10000) for _ in range(input_len)]
-                    for _ in range(args.num_seqs)
-                ]
-                output_lens = [output_len] * args.num_seqs
-                max_seq_len = input_len + output_len
+                if scenario.get("dataset") is not None:
+                    samples = load_real_prompt_workload(
+                        scenario["name"],
+                        tokenizer,
+                        num_requests=args.num_seqs,
+                        decode_cap=None,
+                        dataset_name=scenario["dataset"],
+                        seed=args.seed + i,
+                    )
+                    prompt_token_ids = [s.prompt_token_ids for s in samples]
+                    output_lens = [s.output_len for s in samples]
+                else:
+                    input_len = scenario["input_len"]
+                    output_len = scenario["output_len"]
+                    rng_seed = args.seed + i
+                    random.seed(rng_seed)
+                    np.random.seed(rng_seed)
+                    prompt_token_ids = [
+                        [randint(0, 10000) for _ in range(input_len)]
+                        for _ in range(args.num_seqs)
+                    ]
+                    output_lens = [output_len] * args.num_seqs
+                max_seq_len = max(
+                    len(p) + ol
+                    for p, ol in zip(prompt_token_ids, output_lens)
+                )
                 if max_seq_len > global_max_seq_len:
                     global_max_seq_len = max_seq_len
                 scenario_data.append({
                     "name": scenario["name"],
                     "modality": "text",
-                    "input_len": input_len,
-                    "output_len": output_len,
                     "prompt_token_ids": prompt_token_ids,
                     "output_lens": output_lens,
                 })
@@ -1380,15 +1713,20 @@ def main():
 
             modality = ls.get("modality", "text") if is_vlm else "text"
             if modality == "text":
-                rng_seed = args.seed + 100 + j
-                random.seed(rng_seed)
-                np.random.seed(rng_seed)
                 bs = ls["batch_size"]
-                prompt_token_ids = [
-                    [randint(0, 10000) for _ in range(ls["input_len"])]
-                    for _ in range(bs)
-                ]
-                seq_len = ls["input_len"] + ls["output_len"]
+                samples = load_real_prompt_workload(
+                    "balanced",
+                    tokenizer,
+                    num_requests=bs,
+                    decode_cap=None,
+                    seed=args.seed + 100 + j,
+                )
+                prompt_token_ids = [s.prompt_token_ids for s in samples]
+                output_lens = [s.output_len for s in samples]
+                seq_len = max(
+                    len(p) + ol
+                    for p, ol in zip(prompt_token_ids, output_lens)
+                )
                 if seq_len > global_max_seq_len:
                     global_max_seq_len = seq_len
                 latency_data.append({
@@ -1398,6 +1736,7 @@ def main():
                     "output_len": ls["output_len"],
                     "batch_size": bs,
                     "prompt_token_ids": prompt_token_ids,
+                    "output_lens": output_lens,
                     "num_warmup": 3,
                     "num_iters": args.latency_iters,
                 })
@@ -1432,6 +1771,11 @@ def main():
     print(f"  Enforce eager  : {args.enforce_eager}")
     print(f"  Seed           : {args.seed}")
     print(f"  Max seq len    : {global_max_seq_len}")
+    print(f"  kb-nano port   : {kb_nccl_port}")
+    if vllm_port is not None:
+        print(f"  vLLM port      : {vllm_port}")
+        if flashinfer_namespace is not None:
+            print(f"  vLLM FI ns     : {flashinfer_namespace}")
     print(f"  Output dir     : {args.output_dir}")
     if not args.skip_throughput:
         print(f"  Scenarios      : {', '.join(s['name'] for s in throughput_scenarios)}")
@@ -1470,10 +1814,19 @@ def main():
             "latency_scenarios": latency_data,
             "load_format": "fastsafetensors",
         }
+        os.environ["MASTER_ADDR"] = "127.0.0.1"
+        os.environ["MASTER_PORT"] = str(vllm_port)
         vllm_raw = run_worker(
             vllm_worker, vllm_config,
             f"vLLM [{short_name}] all scenarios (TP={args.tp})",
+            timeout=10800,
         )
+        if previous_flashinfer_namespace_env is None:
+            os.environ.pop("KB_NANO_FLASHINFER_SOCKET_NAMESPACE", None)
+        else:
+            os.environ["KB_NANO_FLASHINFER_SOCKET_NAMESPACE"] = (
+                previous_flashinfer_namespace_env
+            )
 
     # -- Run kb-nano (one subprocess, all scenarios) --
     kb_root = str(_PROJECT_ROOT)
@@ -1491,9 +1844,12 @@ def main():
         "latency_scenarios": latency_data,
     }
     short_name = args.model.split("/")[-1]
+    os.environ["MASTER_ADDR"] = "127.0.0.1"
+    os.environ["MASTER_PORT"] = str(kb_nccl_port)
     kb_raw = run_worker(
         kb_worker, kb_config,
         f"kb-nano [{short_name}] all scenarios (TP={args.tp})",
+        timeout=10800,
     )
     if kb_raw is None:
         print("  ERROR: kb-nano subprocess failed.")
@@ -1521,10 +1877,16 @@ def main():
             }
             if "input_len" in scenario:
                 result["input_len"] = scenario["input_len"]
+            if "output_len" in scenario:
+                result["output_len"] = scenario["output_len"]
+            elif kb_data.get("num_seqs", args.num_seqs):
+                result["avg_output_len"] = (
+                    kb_data["total_output_tokens"]
+                    / kb_data.get("num_seqs", args.num_seqs)
+                )
             if is_whisper:
                 result["total_audio_duration_s"] = kb_data.get(
                     "total_audio_duration_s", 0)
-            result["output_len"] = scenario["output_len"]
 
             if vllm_results is not None:
                 v_data = vllm_results[i]
@@ -1599,21 +1961,33 @@ def main():
                 total_audio_s = r.get("total_audio_duration_s", 0)
                 audio_min = total_audio_s / 60.0
                 audio_str = f"{audio_min:.1f}m"
+                out_str = f"{r.get('output_len', r.get('avg_output_len', 0)):>5.0f}"
                 print(
                     f"  {r['scenario']:<16} {r['num_seqs']:>5} {audio_str:>8} "
-                    f"{r['output_len']:>5} "
+                    f"{out_str} "
                     f"{kb_tps_str:>15} {v_tps_str:>12} {speedup_str:>8} "
                     f"{match_str:>15}"
                 )
             elif is_vlm:
+                out_str = (
+                    f"{r['output_len']:>5}"
+                    if "output_len" in r
+                    else f"{r.get('avg_output_len', 0):>5.0f}"
+                )
                 print(
-                    f"  {r['scenario']:<16} {r['output_len']:>5} "
+                    f"  {r['scenario']:<16} {out_str} "
                     f"{kb_tps_str:>15} {v_tps_str:>12} {speedup_str:>8} "
                     f"{match_str:>15}"
                 )
             else:
+                out_str = (
+                    f"{r['output_len']:>5}"
+                    if "output_len" in r
+                    else f"{r.get('avg_output_len', 0):>5.0f}"
+                )
+                in_str = f"{r['input_len']:>5}" if "input_len" in r else f"{'var':>5}"
                 print(
-                    f"  {r['scenario']:<16} {r['input_len']:>5} {r['output_len']:>5} "
+                    f"  {r['scenario']:<16} {in_str} {out_str} "
                     f"{kb_tps_str:>15} {v_tps_str:>12} {speedup_str:>8} "
                     f"{match_str:>15}"
                 )
@@ -1697,7 +2071,11 @@ def main():
             "temperature": args.temperature,
             "num_seqs": args.num_seqs,
             "enforce_eager": args.enforce_eager,
+            "kb_nano_nccl_port": kb_nccl_port,
+            "vllm_flashinfer_socket_namespace": flashinfer_namespace,
         }
+        if vllm_port is not None:
+            combined["vllm_port"] = vllm_port
         if all_results:
             combined["scenarios"] = all_results
         if latency_combined:

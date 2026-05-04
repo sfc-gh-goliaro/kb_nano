@@ -33,6 +33,26 @@ void verify_tree_greedy(at::Tensor predicts, at::Tensor accept_index,
                         at::Tensor retrive_index, at::Tensor retrive_next_token,
                         at::Tensor retrive_next_sibling, at::Tensor target_predict);
 
+// DeepSeek-V3 router ops (ported verbatim from vLLM csrc/moe).
+//
+// ``dsv3_router_gemm`` is the SM90+ specialised BF16xBF16->{FP32,BF16}
+// gate matmul (num_tokens<=16, num_experts in {256,384}, hidden=7168).
+//
+// ``router_gemm_bf16_fp32`` is the cuBLAS BF16xBF16->FP32 fallback used
+// for batches > 16.
+//
+// ``grouped_topk`` is the fully-fused noaux_tc grouped top-k kernel
+// (sigmoid + grouped top-k + e_score_correction_bias + renormalize +
+// scaling) returning (topk_values, topk_indices) as a 2-tensor tuple.
+void dsv3_router_gemm(at::Tensor& output, const at::Tensor& mat_a,
+                      const at::Tensor& mat_b);
+torch::Tensor router_gemm_bf16_fp32(torch::Tensor const& input,
+                                    torch::Tensor const& weight);
+std::tuple<torch::Tensor, torch::Tensor> grouped_topk(
+    torch::Tensor const& scores, int64_t n_group, int64_t topk_group,
+    int64_t topk, bool renormalize, double routed_scaling_factor,
+    torch::Tensor const& bias, int64_t scoring_func);
+
 PYBIND11_MODULE(TORCH_EXTENSION_NAME, m) {
   m.def("rmsnorm", &rmsnorm, "RMSNorm (CUDA)");
   m.def("fused_add_rmsnorm", &fused_add_rmsnorm, "Fused add + RMSNorm (CUDA)");
@@ -46,4 +66,10 @@ PYBIND11_MODULE(TORCH_EXTENSION_NAME, m) {
   m.def("build_tree_kernel_efficient", &build_tree_kernel_efficient,
         "EAGLE build tree kernel efficient (CUDA)");
   m.def("verify_tree_greedy", &verify_tree_greedy, "EAGLE verify tree greedy (CUDA)");
+  m.def("dsv3_router_gemm", &dsv3_router_gemm,
+        "DeepSeek-V3 router GEMM (SM90+, BF16->{FP32,BF16}) (CUDA)");
+  m.def("router_gemm_bf16_fp32", &router_gemm_bf16_fp32,
+        "cuBLAS BF16xBF16->FP32 router GEMM fallback (CUDA)");
+  m.def("grouped_topk", &grouped_topk,
+        "Fused noaux_tc grouped top-k for MoE routing (CUDA)");
 }

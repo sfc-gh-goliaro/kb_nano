@@ -47,6 +47,10 @@ _PROJECT_ROOT = _PACKAGE_DIR.parent
 sys.path.insert(0, str(_PROJECT_ROOT))
 
 from kb_nano.bench.utils.worker import run_worker
+from kb_nano.bench.utils.workloads import (
+    STRUCTURE_PREDICTION_LATENCY_WORKLOADS,
+    STRUCTURE_PREDICTION_THROUGHPUT_WORKLOADS,
+)
 
 
 def _detect_gpu_name() -> str:
@@ -261,17 +265,22 @@ def download_checkpoint() -> str:
 # ---------------------------------------------------------------------------
 
 SCENARIOS = [
-    {"name": "short",      "num_queries":  50, "description": "short proteins (≤150 res) × 50 queries"},
-    {"name": "medium",     "num_queries":  20, "description": "medium proteins (150-400 res) × 20 queries"},
-    {"name": "long",       "num_queries":  10, "description": "long proteins (400-700 res) × 10 queries"},
-    {"name": "extra-long", "num_queries":   5, "description": "extra-long proteins (700+ res) × 5 queries"},
+    {
+        "name": w.name,
+        "num_queries": w.num_queries,
+        "description": w.description,
+    }
+    for w in STRUCTURE_PREDICTION_THROUGHPUT_WORKLOADS
 ]
 
 LATENCY_SCENARIOS = [
-    {"name": "single-short",      "length_bucket": "short",      "num_warmup": 1, "num_iters": 3},
-    {"name": "single-medium",     "length_bucket": "medium",     "num_warmup": 1, "num_iters": 3},
-    {"name": "single-long",       "length_bucket": "long",       "num_warmup": 1, "num_iters": 3},
-    {"name": "single-extra-long", "length_bucket": "extra-long", "num_warmup": 1, "num_iters": 3},
+    {
+        "name": w.name,
+        "length_bucket": w.length_bucket,
+        "num_warmup": w.num_warmup,
+        "num_iters": w.num_iters,
+    }
+    for w in STRUCTURE_PREDICTION_LATENCY_WORKLOADS
 ]
 
 
