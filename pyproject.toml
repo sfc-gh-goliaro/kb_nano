@@ -35,6 +35,15 @@ dependencies = [
     "fastsafetensors",
     "ultralytics",
     "flash-linear-attention>=0.4.2",
+    # TTT-E2E benchmark (tests/bench_ttt_e2e.py): the official reference at
+    # github.com/test-time-training/e2e is JAX/Equinox/Optax. We import its
+    # MetaModel from a subprocess worker for cross-framework correctness +
+    # throughput comparison.
+    "jax[cuda12]",
+    "equinox>=0.11.12",
+    "optax>=0.2.4",
+    "jaxtyping>=0.2.36",
+    "hydra-core>=1.3",
 ]
 
 [project.scripts]

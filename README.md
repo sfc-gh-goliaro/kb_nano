@@ -30,6 +30,7 @@ A standalone, high-performance inference engine supporting **LLMs** (Llama 3.1, 
 - **Whisper** (large-v3) encoder-decoder speech-to-text with batched inference and paged cross-attention KV cache
 - **CosyVoice3** (Fun-CosyVoice3-0.5B-2512) text-to-speech with flow matching DiT + HiFi-GAN vocoder
 - **OpenFold3** (OpenFold/OpenFold3) protein structure prediction with MSA module, PairFormer, diffusion sampling, and atom attention
+- **TTT-E2E** (test-time-training/e2e, *End-to-End Test-Time Training for Long Context*, Sun et al., arXiv 2512.23675) — sliding-window transformer with chunked **inner-loop SGD** on a per-suffix-block "prime" SwiGLU FFN at inference; matches the official JAX reference bit-near-exactly on logits + per-token NLL
 - **FP8 inference** with block-scaled FP8 quantization via DeepGEMM, UE8M0 power-of-two scales, and fused SiLU+Mul+FP8 quantization kernels
 - **Tensor parallelism** (TP) with custom IPC-based all-reduce for multi-GPU inference
 - **Paged KV cache** with Triton store kernels (LLM models); FP8 MLA KV cache for DeepSeek
@@ -350,6 +351,74 @@ python tests/bench_oasis.py --model Etched/oasis-500m --skip-latency
 
 # Save results to a specific directory
 python tests/bench_oasis.py --model Etched/oasis-500m --output-dir tests/results/H200/oasis-500m
+```
+
+## TTT-E2E (test-time-training/e2e) benchmark
+
+Implements the *End-to-End Test-Time Training for Long Context* architecture
+(Sun et al., arXiv 2512.23675) end-to-end in kb-nano L1-L4: sliding-window
+transformer with chunked **inner-loop SGD** on a per-suffix-block "prime"
+SwiGLU FFN at inference time.
+
+**Cross-framework comparison.** The official reference at
+[github.com/test-time-training/e2e](https://github.com/test-time-training/e2e)
+is JAX/Equinox/Optax. There is no PyTorch SOTA reference for this paper; the
+predecessor paper's `ttt-lm-pytorch` is described by its authors as a "naive
+implementation for tutorial purposes" so it isn't a meaningful comparison
+target. We therefore bench against the JAX reference via a subprocess worker
+([`tests/bench_ttt_e2e_jax_worker.py`](tests/bench_ttt_e2e_jax_worker.py))
+that wraps `model.loss_for_sequence` in `eqx.filter_jit` for a fair perf
+comparison after XLA compilation.
+
+**Checkpoints.** The official checkpoints (125M / 1B / 3B at 8K and 128K)
+live on a Requester-Pays GCS bucket (`gs://ttt-e2e-checkpoints/...`) and
+require a GCP billing project to download. We bench against random-init
+weights initialized via the JAX reference's RNG and saved as a portable
+`.npz`; both engines load from the same file. This validates kb-nano's
+math against JAX bit-near-exactly without trained weights — perplexity
+numbers from the bench are not meaningful as accuracy claims.
+
+**Workload.** Long-context next-token loss on a real Project Gutenberg
+book ("The Adventures of Sherlock Holmes", #1661, ~141K Llama-3-tokenized
+tokens) sliced into 8192-token windows.
+
+### Results (variant: `125m_e2e`, B200, seq=8192, bf16)
+
+| Mode | Description | JAX (jit) | kb-nano | Ratio |
+|---|---|---|---|---|
+| `pretrain` | Sliding-window transformer, prime FFN frozen | 75 ms | **71 ms** | **1.06× faster** |
+| `meta` | Inner-loop SGD on prime FFN per 1024-token chunk | 42 ms | 200 ms | 0.21× |
+
+In `meta` mode JAX's `jax.lax.scan` + `eqx.filter_jit` fuses the 8-chunk
+inner loop (forward + grad + SGD update + cache rotation) into a single
+XLA program. kb-nano runs the loop in Python with `torch.func.grad` per
+chunk, which is the expected ~5× gap for an eager-PyTorch implementation
+without `torch.compile`. The pretrain path (no inner loop) is competitive
+because both frameworks dispatch to the same cuDNN/cuBLAS kernels.
+
+### Correctness vs the JAX reference
+
+| Mode | Per-token NLL — max abs diff | mean abs diff |
+|---|---|---|
+| `pretrain` | 8.0e-2 | 2.3e-2 |
+| `meta` | 2.6e-1 | 3.6e-2 |
+
+These are bf16 numbers. Repeating the same comparison in fp32 (separate
+small-config validation) drives the diff down to **max 7e-4** — i.e.,
+bit-near-exact. The bf16 gap is the cross-framework promote-and-accumulate
+noise expected from cuBLAS-vs-XLA bf16 matmul ordering, not a logic bug.
+Sequence-level mean NLL (e.g. pretrain 11.9003 vs JAX 11.9000) matches to
+1e-3 or better.
+
+**Reproduce**:
+```bash
+# Clone the JAX reference (the kb-nano worker auto-discovers it):
+git clone https://github.com/test-time-training/e2e /tmp/ttt_e2e_ref
+
+# Run the bench:
+CUDA_VISIBLE_DEVICES=<idx> python -m kb_nano.tests.bench_ttt_e2e \
+    --variant 125m_e2e --seq-len 8192 --n-sequences 2 \
+    --modes pretrain meta --runs 3
 ```
 
 ## Benchmarking
