@@ -103,7 +103,7 @@ class TTTE2EBlock(nn.Module):
         self,
         x: torch.Tensor,
         kv_cache: tuple[torch.Tensor, torch.Tensor],
-        chunk_id: int,
+        chunk_id: int | torch.Tensor,
         prime_override: dict | None = None,
     ) -> tuple[torch.Tensor, tuple[torch.Tensor, torch.Tensor]]:
         """Run one chunk through this suffix block.

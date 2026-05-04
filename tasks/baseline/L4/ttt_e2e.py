@@ -297,15 +297,24 @@ class TTTE2EPipeline(nn.Module):
 
         chunk_nlls: list[torch.Tensor] = []
         chunk_losses: list[torch.Tensor] = []
+        # Use a 0-dim tensor for chunk_id when meta-mode is active. This
+        # lets ``torch.compile`` produce a single graph that handles every
+        # chunk_id (otherwise the int form trips dynamo specialization and
+        # we trace once per chunk_id, hitting the recompile limit at long
+        # sequences). pretrain mode keeps the int form so the cached mask
+        # path is hit (no compile in pretrain).
+        meta_active = train_mode == "meta" and cfg.has_prime
+        chunk_id_t = torch.tensor(0, dtype=torch.int64, device=device) if meta_active else None
         for ci in range(n_chunks):
             s = ci * cfg.chunk_size
             e = s + cfg.chunk_size
             prefix_chunk = prefix_output[:, s:e]
             target_chunk = target_tokens[:, s:e]
-            if train_mode == "meta" and cfg.has_prime:
+            if meta_active:
+                chunk_id_t.fill_(ci)
                 with torch.enable_grad():
                     chunk_nll, kv_caches, prime_state = self._inner_loop_step(
-                        prefix_chunk, kv_caches, ci, target_chunk, prime_state,
+                        prefix_chunk, kv_caches, chunk_id_t, target_chunk, prime_state,
                     )
             else:
                 # Plain forward — use stored prime params directly. Matches

@@ -155,7 +155,7 @@ class TTTE2ESWA(nn.Module):
         self,
         x: torch.Tensor,
         kv_cache: tuple[torch.Tensor, torch.Tensor],
-        chunk_id: int,
+        chunk_id: int | torch.Tensor,
     ) -> tuple[torch.Tensor, tuple[torch.Tensor, torch.Tensor]]:
         """Chunked sliding-window attention with rolling KV cache.
 
@@ -166,6 +166,10 @@ class TTTE2ESWA(nn.Module):
                 (matches the JAX reference's storage layout).
             chunk_id: 0-indexed chunk number within the current sequence;
                 used to mask out cache slots that haven't been written yet.
+                May be a Python int OR a 0-dim int64 tensor — tensor form
+                lets torch.compile produce a single graph that handles all
+                chunk_ids dynamically (instead of one specialized trace per
+                int value, which used to hit the dynamo recompile_limit).
         Returns:
             out:        (B, C, hidden)
             new_kv_cache: (k_cache', v_cache') — last W (post-qk-norm,
@@ -201,18 +205,24 @@ class TTTE2ESWA(nn.Module):
         # JAX sw_causal_mask: query index in (chunk_id*C, chunk_id*C + C),
         # key index in (chunk_id*C - W, chunk_id*C + C - 1). Constraints:
         #   qi >= ki, qi < ki + W, ki >= 0.
-        # The mask is fully determined by (chunk_id, C, W) and is reused
-        # across every chunk-by-chunk call at the same chunk_id, so we
-        # cache it to avoid a handful of Python+GPU launches per call.
-        cache_key = (chunk_id, device)
-        attn_mask = self._suffix_mask_cache.get(cache_key)
-        if attn_mask is None:
-            starting_q = chunk_id * C
-            qi = (torch.arange(C, device=device) + starting_q).unsqueeze(1)
-            ki = (torch.arange(-(W + C), 0, device=device) + (starting_q + C)).unsqueeze(0)
+        # If chunk_id is an int we cache the mask; if it's a tensor we
+        # build via tensor arithmetic so torch.compile sees one signature.
+        if isinstance(chunk_id, torch.Tensor):
+            cid = chunk_id.to(device=device)
+            qi = torch.arange(C, device=device).unsqueeze(1) + cid * C
+            ki = torch.arange(-(W + C), 0, device=device).unsqueeze(0) + (cid + 1) * C
             mask = (qi >= ki) & (qi < ki + W) & (ki >= 0)
-            attn_mask = mask.unsqueeze(0).unsqueeze(0).contiguous()  # (1, 1, C, W+C)
-            self._suffix_mask_cache[cache_key] = attn_mask
+            attn_mask = mask.unsqueeze(0).unsqueeze(0)
+        else:
+            cache_key = (chunk_id, device)
+            attn_mask = self._suffix_mask_cache.get(cache_key)
+            if attn_mask is None:
+                starting_q = chunk_id * C
+                qi = (torch.arange(C, device=device) + starting_q).unsqueeze(1)
+                ki = (torch.arange(-(W + C), 0, device=device) + (starting_q + C)).unsqueeze(0)
+                mask = (qi >= ki) & (qi < ki + W) & (ki >= 0)
+                attn_mask = mask.unsqueeze(0).unsqueeze(0).contiguous()  # (1, 1, C, W+C)
+                self._suffix_mask_cache[cache_key] = attn_mask
 
         out = self.attn(xq, full_k, full_v,
                         softmax_scale=self.head_dim ** -0.5,

@@ -386,35 +386,45 @@ tokens) sliced into 8192-token windows.
 
 | Mode | Description | JAX (jit) | kb-nano | Ratio |
 |---|---|---|---|---|
-| `pretrain` | Sliding-window transformer, prime FFN frozen | 76 ms | **48 ms** | **1.58× faster** |
-| `meta` | Inner-loop SGD on prime FFN per 1024-token chunk | 44 ms | 111 ms | 0.40× |
+| `pretrain` | Sliding-window transformer, prime FFN frozen | 78 ms | **48 ms** | **1.62× faster** |
+| `meta` | Inner-loop SGD on prime FFN per 1024-token chunk | 42 ms | 116 ms | 0.36× |
 
 Optimizations layered on top of the L1-only refactor:
-1. Replace `torch.func.grad` with `torch.autograd.grad` for the inner
-   loop (218 → 122 ms in meta; cleaner abstraction, lower per-call
-   overhead). The TTT-E2E inner loop only needs the gradient of the loss
-   w.r.t. the prime FFN params, so leaf tensors with `requires_grad=True`
-   + `autograd.grad(...)` matches the reference semantics exactly.
-2. Cache the chunk-suffix attention masks and RoPE position vectors per
-   `(chunk_id, device)` and `device` respectively, so 8 chunks at a fixed
-   seq_len reuse the same tensors instead of re-building each call.
-3. `torch.compile(default mode)` on each layer's `forward_prefix` and
-   `forward_suffix_chunk`. Inductor fuses the per-layer kernel sequence
-   (RMSNorm + linear + RoPE + SDPA + MLP) into fewer launches. We
-   intentionally do NOT use `mode="reduce-overhead"` (CUDA Graphs) —
-   adjacent layers share output buffers and the per-layer graphs clobber
-   each other; the right level for full graph capture is the whole
-   chunk step (left as future work).
 
-In `meta` mode JAX's `jax.lax.scan` + `eqx.filter_jit` fuses the 8-chunk
-inner loop (forward + grad + SGD update + cache rotation) into a single
-XLA program. kb-nano now compiles each layer's forward but the chunk
-loop itself is still Python-driven; closing the remaining 0.40× gap
-would require capturing the entire chunk step as a CUDA Graph (~70 ms
-of cudaLaunchKernel overhead per forward in the original profile). The
-`pretrain` path is now decisively faster because compile fuses the
-per-layer prefix forward into fewer launches than JAX's per-block jit
-splits.
+1. **`torch.func.grad` → `torch.autograd.grad`** for the inner-loop
+   gradient (218 → 122 ms in meta). The TTT-E2E inner loop only needs
+   the gradient of the loss w.r.t. the prime FFN params, so leaf
+   tensors with `requires_grad=True` + `torch.autograd.grad(loss,
+   leaves)` matches the reference semantics with much lower per-call
+   tracing overhead than `torch.func.grad`.
+2. **Cache per-chunk masks + RoPE positions** so the suffix-attn
+   forward doesn't rebuild small constant tensors each call.
+3. **Pass `chunk_id` as a 0-dim tensor** instead of a Python int. Lets
+   `torch.compile` produce a single graph that handles every chunk_id
+   dynamically, instead of tracing once per int value (which used to
+   hit `torch._dynamo.config.recompile_limit` at long sequences and
+   cost 60 s of warmup compile). Now ~9 s for the first sequence;
+   later sequences hit the cache (sub-1s warmup).
+4. **`torch.compile(default)`** on each layer's `forward_prefix` and
+   `forward_suffix_chunk` via `TTTE2EEngine.compile_layers()`. Inductor
+   fuses the per-layer kernel sequence (RMSNorm + linear + RoPE + SDPA
+   + MLP) into fewer launches. We intentionally do NOT use
+   `mode="reduce-overhead"` (CUDA Graphs) — adjacent layers share
+   output buffers and the per-layer graphs clobber each other; the
+   right level for full graph capture is the whole chunk step.
+
+`pretrain` mode is now decisively faster than JAX (1.62×). For `meta`,
+JAX's `jax.lax.scan` + `eqx.filter_jit` fuses the 8-chunk inner loop
+(forward + grad + SGD update + cache rotation) into a single XLA
+program. kb-nano runs the loop in Python with `torch.autograd.grad` per
+chunk; the per-layer compile reduces dispatch overhead but Python-level
+chunk iteration still pays ~20 ms across 8 chunks. The remaining 70 ms
+gap is split roughly evenly between (a) attention backward — PyTorch
+on B200 falls back to cutlass FMHA backward where JAX uses cuDNN flash,
+and (b) the unavoidable chunk-loop Python iteration. Closing further
+would require either flash-attn-with-windowing on Blackwell (not yet
+available in this environment) or full chunk-loop CUDA Graph capture
+(future work — left in the engine as the documented next step).
 
 ### Correctness vs the JAX reference
 
