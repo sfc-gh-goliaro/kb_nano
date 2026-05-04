@@ -382,33 +382,57 @@ numbers from the bench are not meaningful as accuracy claims.
 book ("The Adventures of Sherlock Holmes", #1661, ~141K Llama-3-tokenized
 tokens) sliced into 8192-token windows.
 
-### Results (variant: `125m_e2e`, B200, seq=8192, bf16)
+### Results (variant: `125m_e2e`, B200, seq=8192, N=4 sequences, bf16)
 
 | Mode | Description | JAX (jit) | kb-nano | Ratio |
 |---|---|---|---|---|
-| `pretrain` | Sliding-window transformer, prime FFN frozen | 75 ms | **71 ms** | **1.06× faster** |
-| `meta` | Inner-loop SGD on prime FFN per 1024-token chunk | 42 ms | 200 ms | 0.21× |
+| `pretrain` | Sliding-window transformer, prime FFN frozen | 78 ms | **70 ms** | **1.10× faster** |
+| `meta` | Inner-loop SGD on prime FFN per 1024-token chunk | 42 ms | 218 ms | 0.20× |
 
 In `meta` mode JAX's `jax.lax.scan` + `eqx.filter_jit` fuses the 8-chunk
 inner loop (forward + grad + SGD update + cache rotation) into a single
 XLA program. kb-nano runs the loop in Python with `torch.func.grad` per
-chunk, which is the expected ~5× gap for an eager-PyTorch implementation
-without `torch.compile`. The pretrain path (no inner loop) is competitive
-because both frameworks dispatch to the same cuDNN/cuBLAS kernels.
+chunk; we attempted `torch.compile` over the chunk graph but it produces
+incorrect gradients in this setup (likely an interaction between
+`torch.func.functional_call` and the differentiable cast in the prime-FFN
+override path) and is intentionally disabled. Closing this gap is future
+work — most likely via a hand-rolled SwiGLU backward that avoids the
+`functional_call` indirection. The `pretrain` path is competitive because
+both frameworks dispatch to the same cuDNN/cuBLAS kernels.
 
 ### Correctness vs the JAX reference
 
-| Mode | Per-token NLL — max abs diff | mean abs diff |
-|---|---|---|
-| `pretrain` | 8.0e-2 | 2.3e-2 |
-| `meta` | 2.6e-1 | 3.6e-2 |
+| Variant | Mode | Precision | Max abs NLL diff | Mean abs NLL diff |
+|---|---|---|---|---|
+| `125m_e2e` | `pretrain` | bf16 | 8.6e-2 | 2.3e-2 |
+| `125m_e2e` | `pretrain` | **fp32** | **3.4e-3** | **5.5e-4** |
+| `125m_e2e` | `meta` | bf16 | 8.6e-2 | 2.2e-2 |
+| `125m_e2e` | `meta` | fp32 | n/a — JAX `meta` hardcodes cuDNN attn (bf16-only) | |
 
-These are bf16 numbers. Repeating the same comparison in fp32 (separate
-small-config validation) drives the diff down to **max 7e-4** — i.e.,
-bit-near-exact. The bf16 gap is the cross-framework promote-and-accumulate
-noise expected from cuBLAS-vs-XLA bf16 matmul ordering, not a logic bug.
-Sequence-level mean NLL (e.g. pretrain 11.9003 vs JAX 11.9000) matches to
-1e-3 or better.
+The fp32 pretrain row is the bit-near-exact correctness check: kb-nano
+matches the JAX reference to ~1e-3 on individual token NLLs. The bf16
+gap is the cross-framework promote-and-accumulate noise inherent in
+cuBLAS-vs-XLA bf16 matmul ordering, not a logic bug. Sequence-level mean
+NLL matches to 5e-4 or better in fp32 (11.900430 vs 11.900406).
+
+### L1-L4 layering and the kb-nano L1 RMSNorm bug we discovered
+
+The TTT-E2E modules in this PR conform to CLAUDE.md: L2 (`ttt_e2e_swa`,
+`ttt_e2e_block`, `ttt_e2e_swiglu`) compose only from L1 ops (no
+`torch.nn` or `torch.nn.functional` calls), and L4 (`ttt_e2e`) is
+chunk-loop wiring + the SGD update math. We added two new L1 ops:
+
+  - [`tasks/baseline/L1/rms_norm_native.py`](tasks/baseline/L1/rms_norm_native.py) — pure-PyTorch RMSNorm.
+    Used because the existing CUDA L1 RMSNorm (`tasks/baseline/L1/rms_norm.py`)
+    produces incorrect output for hidden sizes that aren't multiples of
+    32 (verified at hidden=16 and hidden=80) and has no autograd backward
+    registered. The doc-string of the CUDA L1 RMSNorm now points future
+    readers at this fix when they hit the same constraint.
+  - [`tasks/baseline/L1/ttt_e2e_rope.py`](tasks/baseline/L1/ttt_e2e_rope.py) — interleaved (GPT-J / JAX-default)
+    rotary embedding. Distinct from the existing L1 RotaryEmbedding which
+    uses NeOX/half-split layout; the layout difference is not weight-
+    translatable, so we have to match the JAX layout directly to keep
+    bit-near-exact parity.
 
 **Reproduce**:
 ```bash

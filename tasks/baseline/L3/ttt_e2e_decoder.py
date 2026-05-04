@@ -14,7 +14,7 @@ import torch
 from torch import nn
 
 from ..L1.embedding import Embedding
-from ..L1.rms_norm import RMSNorm
+from ..L1.rms_norm_native import RMSNormNative
 from ..L2.ttt_e2e_block import TTTE2EBlock
 
 
@@ -62,7 +62,7 @@ class TTTE2EDecoder(nn.Module):
                 )
             )
 
-        self.ln_f = RMSNorm(hidden_size, eps=rms_norm_eps)
+        self.ln_f = RMSNormNative(hidden_size, eps=rms_norm_eps)
 
         if not tie_word_embeddings:
             from ..L1.linear import Linear

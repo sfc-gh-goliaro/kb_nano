@@ -34,8 +34,19 @@ from dataclasses import dataclass, field
 import torch
 from torch import nn
 
-from ..L2.ttt_e2e_block import _rms_native
+from ..L1.softmax import LogSoftmax
 from ..L3.ttt_e2e_decoder import TTTE2EDecoder
+
+
+def _token_nll(log_probs: torch.Tensor, targets: torch.Tensor) -> torch.Tensor:
+    """Per-token negative log-likelihood for ``targets`` given ``log_probs``.
+
+    log_probs: (B, T, V) fp32 log-softmax of logits.
+    targets:   (B, T) int64 token ids.
+    Returns:   (B, T) fp32 NLL.
+    """
+    B, T, _ = log_probs.shape
+    return -log_probs.gather(-1, targets.view(B, T, 1)).squeeze(-1)
 
 
 @dataclass
@@ -89,7 +100,10 @@ class TTTE2EConfig:
 
 @dataclass
 class TTTE2EOutput:
-    logits: torch.Tensor                  # (B, T, vocab_size)
+    logits: torch.Tensor | None           # (B, T, vocab_size) — None unless
+                                           # explicitly materialized; the bench
+                                           # path skips logits to save memory
+                                           # and a wte^T projection per chunk.
     token_nll: torch.Tensor               # (B, T) per-token NLL of input_ids
     chunk_losses: list[torch.Tensor] = field(default_factory=list)
 
@@ -115,6 +129,7 @@ class TTTE2EPipeline(nn.Module):
             rms_norm_eps=config.rms_norm_eps,
             tie_word_embeddings=config.tie_word_embeddings,
         )
+        self.log_softmax = LogSoftmax(dim=-1)
 
     # ------------------------------------------------------------- helpers
 
@@ -183,10 +198,10 @@ class TTTE2EPipeline(nn.Module):
                 override = prime_state[li]
             h, new_cache = layer.forward_suffix_chunk(h, kv_caches[li], chunk_id, prime_override=override)
             new_caches.append(new_cache)
-        if prime_state is None:
-            h = self.model.ln_f(h)
-        else:
-            h = _rms_native(h, self.model.ln_f.weight, self.model.ln_f.eps)
+        # ln_f is RMSNormNative (autograd-friendly), so the same call works for
+        # both the loss-bearing forward inside torch.func.grad and the
+        # ordinary no-grad forward.
+        h = self.model.ln_f(h)
         return h, new_caches
 
     # ------------------------------------------------------ inner-loop helper
@@ -199,92 +214,60 @@ class TTTE2EPipeline(nn.Module):
         target_chunk: torch.Tensor,
         prime_state: list[dict[str, torch.Tensor]],
     ) -> tuple[
-        torch.Tensor,                                            # logits for the chunk
-        list[tuple[torch.Tensor, torch.Tensor]],                  # new kv caches
+        torch.Tensor,                                            # per-token NLL for the chunk (B, C)
+        list[tuple[torch.Tensor, torch.Tensor]],                  # new kv caches (post-chunk)
         list[dict[str, torch.Tensor]],                            # updated prime params
-        torch.Tensor,                                             # chunk loss (scalar)
     ]:
-        """One inner SGD step on prime params, then re-forward with new params.
+        """One inner SGD step on prime params.
 
-        Implementation notes:
-        - ``torch.func.grad`` differentiates a scalar-returning function w.r.t.
-          its first arg. We pass the flat-prime-dict as that arg.
-        - We compute grads in fp32 (params are fp32). The forward computation
-          remains bf16 internally; that's how the JAX reference does it via
-          ``promote_dtype(x, weight, dtype=compute_dtype)``.
-        - We do NOT update KV caches inside the grad-computation forward; we
-          build the cache once with the OLD prime params (pre-update step) and
-          re-use those caches as input to BOTH the loss-for-grad forward and
-          the post-update forward. This matches the JAX reference where the
-          KV caches updated by ``inner_loop_step`` are the ones produced by
-          the SAME forward whose loss we backprop through.
-
-        The reference's chunk advances the suffix state in the loss forward
-        (caches are updated), and the same updated state is carried into the
-        next chunk along with the updated model. We reproduce that here:
-        1. Run forward with ``prime_state`` at the chunk → get logits + new
-           caches + loss. Use ``torch.func.grad`` for the loss-only function.
-        2. Apply SGD update to prime_state.
-        3. Forward result is what we return; the caches we return are the
-           caches from the SAME loss-bearing forward. The post-update prime
-           params take effect on the NEXT chunk.
+        Mirrors the JAX reference's ``inner_loop_step`` exactly:
+        - ``torch.func.grad(loss_fn, has_aux=True)`` returns the grads PLUS
+          the auxiliary outputs (per-token NLL and new caches) in a single
+          forward+backward pass. The JAX side does the same with
+          ``eqx.filter_value_and_grad(..., has_aux=True)``.
+        - Grads are computed in fp32 (prime params live in fp32). The
+          forward casts to compute_dtype (bf16) at each functional_call
+          boundary via differentiable ``.to()``, matching JAX's
+          ``promote_dtype(x, weight, dtype=compute_dtype)`` semantics.
+        - Updated prime params persist into the next chunk; KV caches from
+          the SAME loss-bearing forward are returned unchanged. The post-
+          update prime params take effect on the NEXT chunk.
         """
+        cfg = self.config
         flat_init = self._flatten_prime_state(prime_state)
 
-        # The function we differentiate. It must:
-        #   - take prime params as first arg (a dict of tensors)
-        #   - return a scalar (chunk loss)
-        # Side-quantity: we also want the logits + new caches without paying
-        # for them from inside grad. Easiest: run an identical forward outside
-        # the grad call AFTER computing grads, with the same prime params. The
-        # forward is deterministic so they match bit-exactly.
-        cfg = self.config
-
-        def loss_fn(flat_prime: dict[str, torch.Tensor]) -> torch.Tensor:
+        def loss_fn(flat_prime: dict[str, torch.Tensor]):
             ps = self._unflatten_prime_state(flat_prime)
-            h, _ = self._suffix_chunk_forward(prefix_chunk, kv_caches, chunk_id, prime_state=ps)
+            h, new_caches = self._suffix_chunk_forward(
+                prefix_chunk, kv_caches, chunk_id, prime_state=ps,
+            )
             logits = self.model.project_logits(h)
-            # Cross-entropy: shifted-target LM loss. Match JAX
-            # cross_entropy_loss_and_accuracy: mean over valid positions.
-            B, T, V = logits.shape
-            log_probs = torch.nn.functional.log_softmax(logits.float(), dim=-1)
-            tgt = target_chunk.view(B, T, 1)
-            nll = -log_probs.gather(-1, tgt).squeeze(-1)        # (B, T)
-            loss = nll.mean()
-            return loss
+            log_probs = self.log_softmax(logits.float())
+            nll = _token_nll(log_probs, target_chunk)            # (B, C)
+            return nll.mean(), (nll, new_caches)
 
-        # Compute grads w.r.t. flat_init. ``torch.func.grad`` returns a dict
-        # tree of grads matching the input. Forward+backward in one shot.
-        grad_fn = torch.func.grad(loss_fn)
-        flat_grads = grad_fn(flat_init)
+        # NOTE: a naive ``torch.compile(loss_fn) + torch.func.grad(...)``
+        # produces incorrect gradients in this setup (verified empirically
+        # on the tiny 4L+2S+prime config: compiled meta-mode mean NLL drifts
+        # ~0.06 vs eager). The likely cause is torch.compile's interaction
+        # with ``torch.func.functional_call`` + the differentiable ``.to()``
+        # cast in the prime-FFN override path. This is the path we'd want
+        # to take to close the ~5× gap to JAX's lax.scan + jit fusion.
+        # Future work, intentionally not enabled here.
+        grad_fn = torch.func.grad(loss_fn, has_aux=True)
+        flat_grads, (chunk_nll, new_caches) = grad_fn(flat_init)
 
         # Global-norm clip (matches optax.clip_by_global_norm).
-        global_sq = sum((g.float().pow(2).sum() for g in flat_grads.values()))
+        global_sq = sum(g.float().pow(2).sum() for g in flat_grads.values())
         global_norm = global_sq.sqrt()
-        max_norm = cfg.inner_clip_grad_norm
-        scale = (max_norm / (global_norm + 1e-9)).clamp(max=1.0)
+        scale = (cfg.inner_clip_grad_norm / (global_norm + 1e-9)).clamp(max=1.0)
 
         # SGD step: param -= lr * (scale * grad)
         lr = cfg.inner_lr * cfg.ilr_init
         flat_new = {k: (p - lr * (scale * flat_grads[k])) for k, p in flat_init.items()}
         new_prime_state = self._unflatten_prime_state(flat_new)
 
-        # Re-run forward outside of grad to obtain the matching logits + caches
-        # + scalar loss. (The grad-internal call discards them.) Doing it here
-        # rather than reusing the in-grad ones avoids torch.func's autograd
-        # state tracking on the returned tensors.
-        with torch.no_grad():
-            h, new_caches = self._suffix_chunk_forward(
-                prefix_chunk, kv_caches, chunk_id, prime_state=prime_state,
-            )
-            logits = self.model.project_logits(h)
-            log_probs = torch.nn.functional.log_softmax(logits.float(), dim=-1)
-            B, T, _ = logits.shape
-            tgt = target_chunk.view(B, T, 1)
-            nll = -log_probs.gather(-1, tgt).squeeze(-1)
-            loss = nll.mean()
-
-        return logits, new_caches, new_prime_state, loss
+        return chunk_nll, new_caches, new_prime_state
 
     # ------------------------------------------------------------------ entry
 
@@ -322,7 +305,7 @@ class TTTE2EPipeline(nn.Module):
         prime_state = self._init_prime_state() if (cfg.has_prime and train_mode == "meta") else None
         kv_caches = self._init_kv_caches(B, cfg.dtype, device)
 
-        all_logits: list[torch.Tensor] = []
+        chunk_nlls: list[torch.Tensor] = []
         chunk_losses: list[torch.Tensor] = []
         for ci in range(n_chunks):
             s = ci * cfg.chunk_size
@@ -330,30 +313,22 @@ class TTTE2EPipeline(nn.Module):
             prefix_chunk = prefix_output[:, s:e]
             target_chunk = target_tokens[:, s:e]
             if train_mode == "meta" and cfg.has_prime:
-                # Re-enable autograd tracing only inside the inner-loop step.
                 with torch.enable_grad():
-                    logits_c, kv_caches, prime_state, loss_c = self._inner_loop_step(
+                    chunk_nll, kv_caches, prime_state = self._inner_loop_step(
                         prefix_chunk, kv_caches, ci, target_chunk, prime_state,
                     )
             else:
-                # Plain forward — use stored prime params directly (no
-                # functional_call/dtype-upcast). Matches JAX ``train_mode=
-                # "pretrain"`` where ``prime_storage`` params are frozen.
+                # Plain forward — use stored prime params directly. Matches
+                # JAX ``train_mode="pretrain"`` where prime params are frozen.
                 h, kv_caches = self._suffix_chunk_forward(
                     prefix_chunk, kv_caches, ci, prime_state=None,
                 )
                 logits_c = self.model.project_logits(h)
-                log_probs = torch.nn.functional.log_softmax(logits_c.float(), dim=-1)
-                B_, T_, _ = logits_c.shape
-                tgt = target_chunk.view(B_, T_, 1)
-                nll = -log_probs.gather(-1, tgt).squeeze(-1)
-                loss_c = nll.mean()
-            all_logits.append(logits_c)
-            chunk_losses.append(loss_c)
+                log_probs = self.log_softmax(logits_c.float())
+                chunk_nll = _token_nll(log_probs, target_chunk)
+            chunk_nlls.append(chunk_nll)
+            chunk_losses.append(chunk_nll.mean())
 
-        logits = torch.cat(all_logits, dim=1)         # (B, T, V)
-        log_probs = torch.nn.functional.log_softmax(logits.float(), dim=-1)
-        tgt = target_tokens.view(B, T, 1)
-        token_nll = -log_probs.gather(-1, tgt).squeeze(-1)
+        token_nll = torch.cat(chunk_nlls, dim=1)               # (B, T)
 
-        return TTTE2EOutput(logits=logits, token_nll=token_nll, chunk_losses=chunk_losses)
+        return TTTE2EOutput(logits=None, token_nll=token_nll, chunk_losses=chunk_losses)

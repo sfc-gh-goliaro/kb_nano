@@ -240,7 +240,7 @@ def _run_kbnano(
     print(f"[bench] kb-nano: building engine, dtype={compute_dtype} ...", flush=True)
     t0 = time.time()
     # We store params in compute_dtype (bf16) to hit fast-path matmuls; the
-    # _rms_native helper does fp32-internal math so RMSNorm precision matches
+    # RMSNormNative L1 op does fp32-internal math so RMSNorm precision matches
     # JAX. Inner-loop prime SGD still works in fp32 via .to(bf16) at the
     # functional_call boundary.
     engine = TTTE2EEngine(
