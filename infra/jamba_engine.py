@@ -260,6 +260,23 @@ class JambaEngine:
         self._use_cuda_graphs = (
             os.environ.get("KB_NANO_JAMBA_CUDA_GRAPHS", "1") not in ("0", "false", "False")
         )
+        # ``torch.compile``-fuse the decode forward.  Inductor fuses the
+        # 100k-launch elementwise tail (RMSNorm chains, residual adds,
+        # SwiGLU gate*up, MoE softmax) into a small number of Triton
+        # kernels.  The compile target is the inner ``JambaModel`` plus
+        # ``lm_head``, wrapped in a function taking ``(input_ids,
+        # positions)`` and returning the argmax token; the entire
+        # compiled callable then sits inside the existing decode CUDA
+        # graph capture (capture records the compiled kernels, the host
+        # still mutates ``step_input_ids`` / ``slot_pos`` /
+        # ``decode_mask`` between replays).  Default ``fullgraph=False``
+        # so Dynamo cleanly graph-breaks at vLLM Mamba kernel boundaries
+        # and per-step ``get_context()`` calls; the fusion happens in the
+        # large RMSNorm/SwiGLU/residual tail between mixers.
+        self._use_compile = (
+            os.environ.get("KB_NANO_JAMBA_COMPILE", "1") not in ("0", "false", "False")
+        )
+        self._compiled_decode_step: callable | None = None
 
         # Pre-capture the decode graph immediately so the graph's
         # private memory pool is reserved BEFORE the caching allocator
@@ -396,6 +413,62 @@ class JambaEngine:
             is_decode=True,
         )
 
+        # ``torch.compile`` the decode forward.  We compile the inner
+        # ``JambaModel`` + ``lm_head`` + ``argmax`` as a single function
+        # so Inductor can see the full elementwise tail end-to-end
+        # (RMSNorm + residual + SwiGLU pieces).  Graph breaks happen
+        # automatically at the vLLM Mamba kernel calls (opaque to Dynamo)
+        # and at ``get_context()`` lookups; the *between-break* regions
+        # are exactly where the 100k-launch elementwise overhead lives.
+        if self._use_compile and self._compiled_decode_step is None:
+            inner = self.model.model
+            lm_head = self.model.lm_head
+
+            def _forward_for_compile(
+                input_ids: torch.Tensor,
+                positions: torch.Tensor,
+            ) -> torch.Tensor:
+                hidden = inner(input_ids, positions)
+                # ``inner`` returns ``[B, T, hidden]``; we sample on the
+                # last token only, matching the eager path.
+                logits = lm_head(hidden[:, -1, :])
+                # ``argmax`` on bf16 is fine; we don't need .float() here
+                # because argmax is dtype-invariant.
+                return logits.argmax(dim=-1)
+
+            # Bump Dynamo cache limits.  Jamba has 32 layers; each layer
+            # has a different ``self.layer_idx`` int attribute and
+            # different per-layer slabs in the decoder mixers, so Dynamo
+            # treats every layer as a fresh compile target (no
+            # deduplication).  The default ``recompile_limit=8`` causes
+            # later layers to silently fall back to eager.  Lift to a
+            # comfortable margin over ``num_hidden_layers`` so every
+            # layer gets compiled.  ``allow_unspec_int_on_nn_module``
+            # lets Dynamo treat ``self.layer_idx`` as dynamic so multiple
+            # layers can share one compiled artifact.
+            torch._dynamo.config.cache_size_limit = max(
+                torch._dynamo.config.cache_size_limit,
+                self.config.num_hidden_layers * 2 + 32,
+            )
+            torch._dynamo.config.accumulated_cache_size_limit = max(
+                torch._dynamo.config.accumulated_cache_size_limit,
+                self.config.num_hidden_layers * 4 + 64,
+            )
+            if hasattr(torch._dynamo.config, "allow_unspec_int_on_nn_module"):
+                torch._dynamo.config.allow_unspec_int_on_nn_module = True
+
+            # ``mode="default"`` over ``"reduce-overhead"``: the latter
+            # adds an extra CUDA-graph wrapper that conflicts with our
+            # outer manual capture.  ``dynamic=False`` because static
+            # shapes (B = max_num_seqs, T = 1) are guaranteed at the
+            # capture site.
+            self._compiled_decode_step = torch.compile(
+                _forward_for_compile,
+                mode="default",
+                dynamic=False,
+                fullgraph=False,
+            )
+
         # Closure: one decode step, fully static-shape.
         def _decode_step():
             set_jamba_context(
@@ -404,12 +477,18 @@ class JambaEngine:
                 jamba_mamba_metadata=mamba_meta,
             )
             try:
-                hidden = self.model(
-                    bufs["step_input_ids"],
-                    bufs["step_positions"],
-                )
-                logits = self.model.compute_logits(hidden[:, -1, :])
-                tok = logits.argmax(dim=-1)
+                if self._compiled_decode_step is not None:
+                    tok = self._compiled_decode_step(
+                        bufs["step_input_ids"],
+                        bufs["step_positions"],
+                    )
+                else:
+                    hidden = self.model(
+                        bufs["step_input_ids"],
+                        bufs["step_positions"],
+                    )
+                    logits = self.model.compute_logits(hidden[:, -1, :])
+                    tok = logits.argmax(dim=-1)
                 # Write into the persistent buffer.  Must be in-place so
                 # the graph's output tensor identity is fixed.
                 bufs["next_tokens"].copy_(tok)
