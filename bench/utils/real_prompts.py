@@ -81,6 +81,8 @@ def _apply_chat_template(tokenizer: Any, messages: list[dict[str, str]]) -> list
     except (AttributeError, ValueError):
         text = "\n\n".join(m["content"] for m in messages)
         token_ids = tokenizer.encode(text, add_special_tokens=True)
+    if hasattr(token_ids, "keys") and "input_ids" in token_ids:
+        token_ids = token_ids["input_ids"]
     if hasattr(token_ids, "tolist"):
         token_ids = token_ids.tolist()
     return list(token_ids)

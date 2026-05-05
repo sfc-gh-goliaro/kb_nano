@@ -21,6 +21,28 @@ void rmsnorm_fp8_quant(torch::Tensor& output_fp8, torch::Tensor& output_scales,
 void fused_add_rmsnorm_fp8_quant(torch::Tensor& output_fp8, torch::Tensor& output_scales,
                                  torch::Tensor input, torch::Tensor residual,
                                  torch::Tensor weight, double eps);
+void build_tree_kernel_efficient(at::Tensor parent_list, at::Tensor selected_index,
+                                 at::Tensor verified_seq_len, at::Tensor tree_mask,
+                                 at::Tensor positions, at::Tensor retrive_index,
+                                 at::Tensor retrive_next_token,
+                                 at::Tensor retrive_next_sibling, int64_t topk,
+                                 int64_t depth, int64_t draft_token_num,
+                                 int64_t tree_mask_mode);
+void build_tree_kernel_efficient_with_metadata(
+    at::Tensor parent_list, at::Tensor selected_index,
+    at::Tensor verified_seq_len, at::Tensor positions,
+    at::Tensor retrive_index, at::Tensor retrive_next_token,
+    at::Tensor retrive_next_sibling, at::Tensor slot_mapping,
+    at::Tensor page_table_expand, at::Tensor cache_seqlens_expand,
+    int64_t topk, int64_t depth, int64_t draft_token_num);
+void verify_tree_greedy(at::Tensor predicts, at::Tensor accept_index,
+                        at::Tensor accept_token_num, at::Tensor candidates,
+                        at::Tensor retrive_index, at::Tensor retrive_next_token,
+                        at::Tensor retrive_next_sibling, at::Tensor target_predict);
+void build_tree_cascade_metadata(at::Tensor tree_mask, at::Tensor slot_mapping,
+                                 at::Tensor page_table_expand,
+                                 at::Tensor cache_seqlens_expand,
+                                 int64_t draft_token_num);
 
 // DeepSeek-V3 router ops (ported verbatim from vLLM csrc/moe).
 //
@@ -52,6 +74,14 @@ PYBIND11_MODULE(TORCH_EXTENSION_NAME, m) {
   m.def("topk_softmax", &topk_softmax, "Top-K softmax for MoE (CUDA)");
   m.def("rmsnorm_fp8_quant", &rmsnorm_fp8_quant, "Fused RMSNorm + FP8 quant (CUDA)");
   m.def("fused_add_rmsnorm_fp8_quant", &fused_add_rmsnorm_fp8_quant, "Fused add + RMSNorm + FP8 quant (CUDA)");
+  m.def("build_tree_kernel_efficient", &build_tree_kernel_efficient,
+        "EAGLE build tree kernel efficient (CUDA)");
+  m.def("build_tree_kernel_efficient_with_metadata",
+        &build_tree_kernel_efficient_with_metadata,
+        "EAGLE build tree and FA3 metadata kernel efficient (CUDA)");
+  m.def("verify_tree_greedy", &verify_tree_greedy, "EAGLE verify tree greedy (CUDA)");
+  m.def("build_tree_cascade_metadata", &build_tree_cascade_metadata,
+        "EAGLE build FA3 cascade metadata (CUDA)");
   m.def("dsv3_router_gemm", &dsv3_router_gemm,
         "DeepSeek-V3 router GEMM (SM90+, BF16->{FP32,BF16}) (CUDA)");
   m.def("router_gemm_bf16_fp32", &router_gemm_bf16_fp32,
