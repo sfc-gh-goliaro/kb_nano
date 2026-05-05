@@ -387,7 +387,7 @@ tokens) sliced into 8192-token windows.
 | Mode | Description | JAX (jit) | kb-nano | Ratio |
 |---|---|---|---|---|
 | `pretrain` | Sliding-window transformer, prime FFN frozen | 76 ms | **26 ms** | **2.92× faster** |
-| `meta` | Inner-loop SGD on prime FFN per 1024-token chunk | 43 ms | 54-93 ms (median 73) | **0.59×** |
+| `meta` | Inner-loop SGD on prime FFN per 1024-token chunk | 43 ms | 54-87 ms (min/median/p90 = 54/72/87) | **0.60× median, 0.80× best** |
 
 Optimizations layered on top of the L1-only refactor, justified by
 component-level timing on both sides:
@@ -431,7 +431,62 @@ attribution from a side-by-side audit:
 |---|---|---|---|---|
 | Prefix-only forward (9 layers, 8K seq) | 49 ms | **5.7 ms** | 4.5 ms | Now 1.27× JAX (was 11×). |
 | One inner_loop_step (1 chunk fwd+bwd+SGD) | 11.6 ms | **9.8 ms** | 6.6 ms | 1.48× JAX (was 1.79×). |
-| Full meta forward (8 chunks) | 218 ms | **73 ms (median), 54 ms (best)** | 43 ms | 1.69×–1.26× JAX. |
+| Full meta forward (8 chunks) | 218 ms | **54 ms (min) / 72 ms (median) / 87 ms (p90)** | 43 ms | 1.26× / 1.67× / 2.01× JAX. |
+
+### A real meta-mode variance investigation (justified, not guessed)
+
+PyTorch meta forward has noticeable run-to-run variance: across 60
+back-to-back forwards on the same input through one warmed-up engine,
+we measured `min=54 / median=72 / p90=87 / max=97 / std=10.5 ms`. JAX's
+timed runs are flat (`44 / 44 / 46 ms`). Hypotheses tested and the
+evidence for/against each:
+
+  **H1: cuDNN kernel-knob switching** *(rejected)*. Within a single
+  sequence, runs are stable to ±1 ms (e.g. seq2 = `[54, 54, 54, 54,
+  54]`). cuDNN isn't reselecting kernels mid-bench.
+
+  **H2: input-content dependence** *(rejected)*. Reversing the bench
+  order (3, 2, 1, 0 instead of 0, 1, 2, 3) made every sequence
+  consistently fast. Replaying seq0 in isolation also produced fast
+  steady-state. The "slow seq0" in the bench wasn't about the input
+  ids themselves.
+
+  **H3: GPU thermal / clock throttling** *(rejected)*. Polled
+  `nvidia-smi` shows steady 1965 MHz GPU clock and 36-38°C across the
+  whole run — no throttle.
+
+  **H4: idle / power-state ramp-up** *(partial)*. After a 10 s sleep,
+  the next 5 runs were 150-177 ms (3× normal). After 30 s sleep, runs
+  4-7 dropped back to 54 ms. Long idle does cause a perf hit on
+  resume; the bench's JAX subprocess (~40 s init+compile each
+  sequence) introduces exactly this idle window between kb-nano calls.
+  But idle is only part of the story.
+
+  **H5: PyTorch CUDA caching allocator interaction with autograd**
+  *(supported)*. `torch.cuda.empty_cache()` between forwards drops
+  steady-state to a tighter 56-62 ms (vs 59-73 ms unaided). The
+  `pretrain` path — same model, same compile, **but no autograd in
+  meta's inner-loop pattern** — runs at a tight `25-30 ms` with no
+  variance at all across the same bench. The autograd path allocates
+  many short-lived intermediate tensors per chunk; the caching
+  allocator reuses them but the resulting memory layout subtly affects
+  cuDNN flash kernel L2 cache hit rates. JAX/XLA pre-computes the
+  whole-program memory plan at compile time and reuses static buffers,
+  which is why JAX's variance is ~3 ms.
+
+  **H6: `expandable_segments=True` allocator** *(rejected, hurts)*.
+  Setting `PYTORCH_CUDA_ALLOC_CONF=expandable_segments:True` made it
+  worse (median 91 ms, p90 121 ms). The default allocator is better
+  here.
+
+So: the meta-mode variance is **structural to the PyTorch eager-autograd
++ caching-allocator combination**, not a bug we wrote. Closing it
+properly requires moving to a static-allocation regime — i.e. capturing
+the chunk loop in a CUDA Graph with pre-allocated buffers (so the
+memory layout is identical every call). That's a real engineering
+investment (~200-400 LOC of buffer plumbing in the engine) and the
+expected payoff is closing the remaining 11 ms gap from min-case 54 ms
+to JAX's 43 ms. Marked as the explicit next step.
 
 ### Correctness vs the JAX reference
 
