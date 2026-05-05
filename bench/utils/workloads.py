@@ -16,7 +16,7 @@ from __future__ import annotations
 
 from dataclasses import dataclass
 
-from kb_nano.bench.utils.real_prompts import DEFAULT_WORKLOAD_DATASETS
+from .real_prompts import DEFAULT_WORKLOAD_DATASETS
 
 
 @dataclass(frozen=True)
@@ -170,6 +170,51 @@ ALL_VLM_WORKLOADS = {
     "throughput": VLM_THROUGHPUT_WORKLOADS,
     "latency": VLM_LATENCY_WORKLOADS,
 }
+
+
+# ---------------------------------------------------------------------------
+# Qwen2.5-Omni workloads (text + image + video + audio)
+# ---------------------------------------------------------------------------
+
+QWEN_OMNI_THROUGHPUT_WORKLOADS: list[VLMThroughputWorkload] = [
+    VLMThroughputWorkload(
+        "text", "text", input_len=None, output_len=512,
+        dataset_name=DEFAULT_WORKLOAD_DATASETS["balanced"],
+        dataset_split="train",
+    ),
+    VLMThroughputWorkload(
+        "image", "image", input_len=None, output_len=512,
+        dataset_name="lmarena-ai/VisionArena-Chat", dataset_split="train",
+    ),
+    VLMThroughputWorkload(
+        "video", "video", input_len=None, output_len=512,
+        dataset_name="yale-nlp/MMVU", dataset_split="validation",
+    ),
+    VLMThroughputWorkload(
+        "audio", "audio", input_len=None, output_len=256,
+        dataset_name="openslr/librispeech_asr", dataset_split="test.clean",
+    ),
+]
+
+QWEN_OMNI_LATENCY_WORKLOADS: list[VLMLatencyWorkload] = [
+    VLMLatencyWorkload(
+        "single-text", "text", output_len=128,
+        dataset_name=DEFAULT_WORKLOAD_DATASETS["balanced"],
+        dataset_split="train",
+    ),
+    VLMLatencyWorkload(
+        "single-image", "image", output_len=128,
+        dataset_name="lmarena-ai/VisionArena-Chat", dataset_split="train",
+    ),
+    VLMLatencyWorkload(
+        "single-video", "video", output_len=128,
+        dataset_name="yale-nlp/MMVU", dataset_split="validation",
+    ),
+    VLMLatencyWorkload(
+        "single-audio", "audio", output_len=128,
+        dataset_name="openslr/librispeech_asr", dataset_split="test.clean",
+    ),
+]
 
 
 # ---------------------------------------------------------------------------
