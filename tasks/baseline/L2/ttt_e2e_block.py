@@ -49,6 +49,7 @@ class TTTE2EBlock(nn.Module):
         qk_norm: bool = True,
         rms_norm_eps: float = 1e-6,
         has_prime: bool = False,
+        attention_backend: str = "cudnn",
     ):
         super().__init__()
         self.has_prime = has_prime
@@ -63,6 +64,7 @@ class TTTE2EBlock(nn.Module):
             rope_theta=rope_theta,
             qk_norm=qk_norm,
             rms_norm_eps=rms_norm_eps,
+            attention_backend=attention_backend,
         )
         self.feed_forward = TTTE2ESwiGLU(hidden_size, intermediate_size)
 

@@ -79,16 +79,24 @@ class DenseAttention(nn.Module):
             through ``torch.compile`` on Blackwell.
     """
 
-    def __init__(self, backend: Literal["auto", "sdpa", "flash_attn", "cudnn"] = "auto"):
+    def __init__(self, backend: Literal["auto", "sdpa", "flash_attn", "cudnn", "flex"] = "auto"):
         super().__init__()
         self.fa_func = None
         self.use_cudnn_kernel = False
+        self.use_flex_kernel = False
+        self._flex_fn = None
 
         if backend == "sdpa":
             return
 
         if backend == "cudnn":
             self.use_cudnn_kernel = True
+            return
+
+        if backend == "flex":
+            from torch.nn.attention.flex_attention import flex_attention
+            self.use_flex_kernel = True
+            self._flex_fn = torch.compile(flex_attention, dynamic=False)
             return
 
         if backend == "flash_attn":
@@ -129,7 +137,23 @@ class DenseAttention(nn.Module):
         q = query.permute(0, 2, 1, 3)
         k = key.permute(0, 2, 1, 3)
         v = value.permute(0, 2, 1, 3)
-        if self.use_cudnn_kernel:
+        if self.use_flex_kernel:
+            # FlexAttention generates a fused Triton fwd+bwd kernel autotuned
+            # for the exact (B, H, S_q, S_kv, D) shape and the user-provided
+            # mask. ``attn_mask`` here is repurposed to accept a
+            # ``BlockMask`` (from ``create_block_mask``) instead of a dense
+            # bool tensor. On B200 with chunked-suffix shapes
+            # (Q=1024, KV=9216, D=64), the fused fwd+bwd is ~1.37x faster
+            # than cuDNN flash with the equivalent dense mask
+            # (microbenched). Same numerical agreement vs the fp32 MATH
+            # reference (~1e-2 max-abs-diff in bf16, identical to cuDNN).
+            q = q.contiguous(); k = k.contiguous(); v = v.contiguous()
+            out = self._flex_fn(
+                q, k, v,
+                block_mask=attn_mask,
+                scale=softmax_scale,
+            )
+        elif self.use_cudnn_kernel:
             from torch.nn.attention import sdpa_kernel, SDPBackend
             # cuDNN flash needs contiguous tensors. The permute above
             # produces non-contiguous strides; without ``.contiguous()``

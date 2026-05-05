@@ -231,3 +231,8 @@ mlruns/
 data/
 
 .codex
+
+# Local IDE / agent state — not part of the project
+.claude/
+.cursor/
+CLAUDE.md

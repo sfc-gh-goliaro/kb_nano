@@ -75,6 +75,21 @@ class TTTE2EConfig:
     dtype: torch.dtype = torch.bfloat16  # compute dtype, like JAX compute_dtype="bf16"
     param_dtype: torch.dtype = torch.float32
 
+    # Attention backend used by the chunked-suffix path (the prefix path
+    # always uses cuDNN flash via DenseAttention's "auto" backend, where
+    # cuDNN wins on the long-seq shape). Choices:
+    #   "cudnn" (default) — F.scaled_dot_product_attention pinned to the
+    #       cuDNN flash backend with explicit dense bool mask. Compatible
+    #       with the in-place-tensor chunk_id graph-capture path.
+    #   "flex"           — torch.nn.attention.flex_attention with a
+    #       per-chunk_id BlockMask. Generates a fused Triton fwd+bwd
+    #       autotuned for the (Q=chunk_size, KV=W+chunk_size, head_dim)
+    #       shape. Microbenched ~1.37x faster than cuDNN on
+    #       (1024, 9216, 64) on B200. Requires int chunk_id (BlockMask
+    #       lookup), so the engine threads ints in meta mode rather than
+    #       the in-place tensor buffer trick.
+    attention_backend: str = "cudnn"
+
     @classmethod
     def from_jax_dict(cls, m: dict, t: dict) -> "TTTE2EConfig":
         return cls(
@@ -128,6 +143,7 @@ class TTTE2EPipeline(nn.Module):
             qk_norm=config.qk_norm,
             rms_norm_eps=config.rms_norm_eps,
             tie_word_embeddings=config.tie_word_embeddings,
+            attention_backend=config.attention_backend,
         )
         self.log_softmax = LogSoftmax(dim=-1)
 
@@ -297,18 +313,25 @@ class TTTE2EPipeline(nn.Module):
 
         chunk_nlls: list[torch.Tensor] = []
         chunk_losses: list[torch.Tensor] = []
-        # Use a 0-dim tensor for chunk_id when meta-mode is active. This
-        # lets ``torch.compile`` produce a single graph that handles every
-        # chunk_id (otherwise the int form trips dynamo specialization and
-        # we trace once per chunk_id, hitting the recompile limit at long
-        # sequences). pretrain mode keeps the int form so the cached mask
-        # path is hit (no compile in pretrain).
+        # Use a 0-dim tensor for chunk_id when meta-mode is active AND the
+        # attention backend supports it. This lets ``torch.compile`` produce
+        # a single graph that handles every chunk_id (otherwise the int form
+        # trips dynamo specialization and we trace once per chunk_id, hitting
+        # the recompile limit at long sequences).
+        # The flex backend looks BlockMasks up by int chunk_id (a tensor key
+        # would force a host-sync inside graph-capture territory), so for
+        # that backend we accept per-chunk_id specialization. For our
+        # workload (8K seq, chunk=1024 → 8 chunks), 8 specialized compiles
+        # is well within recompile_limit=64.
+        # pretrain mode keeps the int form so the cached mask path is hit
+        # (no compile in pretrain).
         # NB: the persistent buffer ``self._chunk_id_buf`` is hoisted out of
         # the per-forward path so callers wrapping ``forward`` in a CUDA
         # Graph capture don't allocate during stream capture (which CUDA
         # forbids).
         meta_active = train_mode == "meta" and cfg.has_prime
-        if meta_active:
+        use_tensor_chunk_id = meta_active and cfg.attention_backend != "flex"
+        if use_tensor_chunk_id:
             buf = getattr(self, "_chunk_id_buf", None)
             if buf is None or buf.device != device:
                 buf = torch.zeros((), dtype=torch.int64, device=device)
@@ -316,16 +339,47 @@ class TTTE2EPipeline(nn.Module):
             chunk_id_t = buf
         else:
             chunk_id_t = None
+
+        # Static contiguous chunk buffers, hoisted out of the per-forward path.
+        # The naive ``prefix_chunk = prefix_output[:, s:e]`` returns a view
+        # whose ``stride[0]`` is the parent's full-T stride (8192*H), but
+        # most downstream ops produce contig outputs (stride[0] = chunk*H).
+        # Mixing the two strides in the same compiled function trips
+        # torch._dynamo's stride guards and causes recompile-storm in any
+        # path that doesn't run inside a CUDA Graph capture (e.g. pretrain
+        # mode, where capture is not used). Copying into a static contig
+        # buffer makes ``prefix_chunk`` always have stride (C*H, H, 1),
+        # matching the contig outputs of intermediate Linear layers, so all
+        # 8 chunk specializations share a single dynamo cache entry.
+        # The buffer is allocated once and reused — safe inside CUDA Graph
+        # capture too.
+        chunk_buf = getattr(self, "_chunk_in_buf", None)
+        chunk_shape = (B, cfg.chunk_size, cfg.hidden_size)
+        if chunk_buf is None or tuple(chunk_buf.shape) != chunk_shape or chunk_buf.dtype != cfg.dtype or chunk_buf.device != device:
+            chunk_buf = torch.empty(chunk_shape, dtype=cfg.dtype, device=device)
+            self._chunk_in_buf = chunk_buf
+        target_buf = getattr(self, "_target_chunk_buf", None)
+        target_shape = (B, cfg.chunk_size)
+        if target_buf is None or tuple(target_buf.shape) != target_shape or target_buf.device != device:
+            target_buf = torch.empty(target_shape, dtype=target_tokens.dtype, device=device)
+            self._target_chunk_buf = target_buf
+
         for ci in range(n_chunks):
             s = ci * cfg.chunk_size
             e = s + cfg.chunk_size
-            prefix_chunk = prefix_output[:, s:e]
-            target_chunk = target_tokens[:, s:e]
+            chunk_buf.copy_(prefix_output[:, s:e])
+            target_buf.copy_(target_tokens[:, s:e])
+            prefix_chunk = chunk_buf
+            target_chunk = target_buf
             if meta_active:
-                chunk_id_t.fill_(ci)
+                if use_tensor_chunk_id:
+                    chunk_id_t.fill_(ci)
+                    chunk_id_arg = chunk_id_t
+                else:
+                    chunk_id_arg = ci
                 with torch.enable_grad():
                     chunk_nll, kv_caches, prime_state = self._inner_loop_step(
-                        prefix_chunk, kv_caches, chunk_id_t, target_chunk, prime_state,
+                        prefix_chunk, kv_caches, chunk_id_arg, target_chunk, prime_state,
                     )
             else:
                 # Plain forward — use stored prime params directly. Matches

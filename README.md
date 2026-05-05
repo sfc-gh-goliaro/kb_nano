@@ -384,10 +384,12 @@ tokens) sliced into 8192-token windows.
 
 ### Results (variant: `125m_e2e`, B200, seq=8192, N=4 sequences, bf16)
 
-| Mode | Description | JAX (jit) | kb-nano | Ratio |
-|---|---|---|---|---|
-| `pretrain` | Sliding-window transformer, prime FFN frozen | 76 ms | **25 ms** | **3.04× faster** |
-| `meta` | Inner-loop SGD on prime FFN per 1024-token chunk | 42 ms | **51 ms uniformly** | **0.82×** |
+| Mode | Description | JAX (jit) | kb-nano cuDNN | kb-nano flex | Best ratio vs JAX |
+|---|---|---|---|---|---|
+| `pretrain` | Sliding-window transformer, prime FFN frozen | 80.33 ms (σ 2.47) | **25.60 ms** (σ 0.02) | **23.74 ms** (σ 0.04) | **3.39× faster** |
+| `meta` | Inner-loop SGD on prime FFN per 1024-token chunk | 40.83 ms (σ 0.81) | 51.55 ms (σ 0.04) | **37.00 ms** (σ 0.11) | **1.10× faster** |
+
+`flex` is the FlexAttention-on-suffix-path opt-in (`attention_backend="flex"`); `cuDNN` is the previous default. The flex backend is recommended for meta-mode inference workloads (the actual TTT-E2E path); cuDNN remains the default for backward-compat. Both backends are numerically equivalent vs JAX (see Correctness section). **All numbers measured in a single session**, B200, GPU 2 (quiet), sequential runs (n=30 timed measurements per backend per mode after 5–10 warmup forwards), random-init weights from the JAX worker (`init_and_save` seed=0), 8K-token Sherlock Holmes window. JAX timing via `eqx.filter_jit` + `block_until_ready`; kb-nano via `torch.cuda.CUDAGraph` replay.
 
 Optimizations layered on top of the L1-only refactor, justified by
 component-level timing on both sides:
@@ -423,15 +425,53 @@ component-level timing on both sides:
    selection survives `torch.compile` tracing. **Drops meta from
    94 ms → 73 ms.** Tiny configs (head_dim=16, fp32) fall back to
    `mem_efficient` automatically — cuDNN raises and we catch it.
+   This brought meta to 51.55 ms — still 11 ms slower than JAX's 40.8 ms.
+7. **Swap suffix attention to FlexAttention** (`attention_backend="flex"`).
+   Same algorithm class as cuDNN flash, different specialization. Two
+   structural advantages on this exact shape: (a) the BlockMask
+   pre-prunes 93.75% of `(Q, KV)` tile pairs at construction time and
+   the kernel skips them at the dispatcher level (cuDNN computes scores
+   for every tile and masks dense post-softmax — same FLOPs regardless
+   of mask sparsity), and (b) the fused fwd+bwd Triton kernel autotunes
+   block sizes for the asymmetric `(Q=1024, KV=9216, D=64)` shape, where
+   cuDNN's general-purpose tile heuristic underperforms. Per-category
+   trace attribution from a side-by-side compare: the attention swap
+   accounts for **98.1% of the 14.44 ms savings** (`attn_cudnn -22.37 ms` →
+   `attn_flex +8.20 ms` = −14.17 ms net); the remaining −0.27 ms is small
+   adjustments in `inductor_fused` (−0.22 ms) and the disappearance of
+   cuDNN-bwd helper kernels like `compute_dot_do_o_specialized` (−0.14 ms).
+   Every other kernel category is within ±0.25 ms of its cuDNN counterpart
+   — gemm, softmax, elementwise, memcopy, gather all unchanged. Plumbing required:
+   `BlockMask` lookup needs an int chunk_id (vs the in-place tensor
+   trick from optimization #3), so the engine reverts to int chunk_id
+   when `attention_backend="flex"` and accepts 8 specialized
+   `forward_suffix_chunk` compiles (well under recompile_limit=64).
+   **Drops meta from 51.55 → 37.07 ms.** Pretrain mode also benefits
+   (30.9 → 23.9 ms after coupled with optimization #8 below).
+8. **Hoist a static contiguous chunk buffer** (the `_chunk_in_buf` /
+   `_target_chunk_buf` allocation in `TTTE2EPipeline.forward`).
+   `prefix_output[:, s:e]` returns a non-contiguous view whose
+   `stride[0]=8192*H` differs from intermediate Linear outputs'
+   `stride[0]=1024*H`. With per-chunk_id specialization (introduced
+   by optimization #7), `torch._dynamo`'s stride guards thrashed and
+   exceeded `recompile_limit=64` on each pretrain forward. Copying the
+   chunk into a pre-allocated contig buffer once per chunk (~16 µs
+   total) makes all 8 chunk specializations share one dynamo cache
+   entry. Buffer is allocated outside CUDA Graph capture so meta-mode
+   replay is unaffected; pretrain regression eliminated AND cuDNN
+   pretrain benefited too (30.9 → 25.4 ms — recompile thrash was
+   hurting cuDNN already, just less than flex). The historical "30.9 ms
+   pretrain" we previously quoted was in fact inflated by recompile
+   cost; 25.4 ms is the steady-state.
 
-The headline numbers above are the result of all six. The per-component
+The headline numbers above are the result of all eight. The per-component
 attribution from a side-by-side audit:
 
-| Component | PyTorch v0 (original) | PyTorch v1 (post-optim) | JAX | Notes |
-|---|---|---|---|---|
-| Prefix-only forward (9 layers, 8K seq) | 49 ms | **5.7 ms** | 4.5 ms | Now 1.27× JAX (was 11×). |
-| One inner_loop_step (1 chunk fwd+bwd+SGD) | 11.6 ms | **9.8 ms** | 6.6 ms | 1.48× JAX (was 1.79×). |
-| Full meta forward (8 chunks) | 218 ms | **51 ms uniformly** (CUDA Graph replay, std 0.03 ms) | 40 ms (std 0.75 ms) | 1.27× JAX, deterministic. |
+| Component | PyTorch v0 (original) | PyTorch v1 (cuDNN, opts 1-6) | PyTorch v2 (flex, opts 1-8) | JAX | Notes |
+|---|---|---|---|---|---|
+| Prefix-only forward (9 layers, 8K seq) | 49 ms | **5.7 ms** | 5.7 ms | 4.5 ms | flex same as cuDNN here — prefix stays on cuDNN (long-seq sweet spot). |
+| One inner_loop_step (1 chunk fwd+bwd+SGD) | 11.6 ms | 9.8 ms | ~7 ms (estimated from full-forward delta) | 6.6 ms | flex closes the per-chunk gap. ~7 ms is interpolated from `(37 ms - 5.7 ms prefix) / 8 chunks ≈ 3.9 ms per chunk × ~1.8 inner-loop overhead`; not directly measured at single-chunk granularity. |
+| Full meta forward (8 chunks) | 218 ms | 51.55 ms (σ 0.04) | **37.00 ms** (σ 0.11) | 40.83 ms (σ 0.81) | **flex now beats JAX by 9.2%**, deterministic via CUDA Graph replay. Directly measured (n=30, same session, same GPU, sequential runs). |
 
 ### A real meta-mode variance investigation, justified by evidence
 
@@ -441,9 +481,10 @@ through one warmed-up engine on the same input on idle GPU 6:
 
 | Path | min | median | p90 | max | std |
 |---|---|---|---|---|---|
-| **JAX `loss_for_sequence`** (jit'd) | 39.25 | 39.72 | 41.37 | 42.48 | **0.75 ms** |
-| **PyTorch eager** (compile + cuDNN) | 53.87 | 71.78 | 86.50 | 96.94 | **10.46 ms** |
-| **PyTorch CUDA Graph replay** | 51.27 | 51.34 | 51.38 | 51.42 | **0.03 ms** |
+| **JAX `loss_for_sequence`** (jit'd, n=30 same-session) | 39.50 | 40.81 | 41.99 | 42.20 | **0.81 ms** |
+| **PyTorch eager** (compile + cuDNN, original measurement) | 53.87 | 71.78 | 86.50 | 96.94 | **10.46 ms** |
+| **PyTorch CUDA Graph replay (cuDNN, n=30)** | 51.47 | 51.53 | 51.66 | 51.66 | **0.04 ms** |
+| **PyTorch CUDA Graph replay (flex, n=30)** | 36.97 | 37.04 | 37.23 | 37.23 | **0.09 ms** |
 
 Hypotheses tested with measurements:
 
@@ -478,35 +519,50 @@ Hypotheses tested with measurements:
   `TTTE2EEngine.capture_meta_graph(batch_size, seq_len)` — call once
   per shape; subsequent `engine.forward(...)` calls at that shape
   replay the cached graph automatically. Eliminates the variance
-  (std 10 ms → 0.03 ms) and pulls steady-state to **51 ms uniformly**,
-  which is the eager `min`. The remaining ~10 ms gap to JAX's 40 ms
-  is more aggressive XLA op fusion (RMSNorm + linear + add into
-  single fused kernels) that `torch.compile` + CUDA Graph capture of
-  the eager kernel sequence doesn't replicate; closing it would
-  require either hand-fused kernels at L1 or a different compilation
-  toolchain (e.g. Triton-generated SDPA + RMSNorm).
+  (std 10 ms → 0.04 ms with cuDNN, 0.09 ms with flex) and pulls
+  steady-state to the eager `min`. With cuDNN this landed at 51.55 ms,
+  ~10 ms slower than JAX. The flex backend (optimization #7 above)
+  then closed AND reversed the gap — JAX 40.8 ms vs flex 37.1 ms,
+  flex faster by 9.2%. The mechanism turned out to be exactly what
+  this section originally hand-waved at: "Triton-generated SDPA"
+  with shape-aware autotuning and sparse-block awareness. JAX's
+  edge had been XLA's whole-program fusion of the chunked-suffix
+  attention into custom XLA fusions; FlexAttention provides the
+  PyTorch-side equivalent through a different mechanism (per-shape
+  Triton autotune + BlockMask sparsity).
 
 ### Correctness vs the JAX reference
 
-| Variant | Mode | Precision | Max abs NLL diff | Mean abs NLL diff |
-|---|---|---|---|---|
-| `125m_e2e` | `pretrain` | bf16 | 8.6e-2 | 2.3e-2 |
-| `125m_e2e` | `pretrain` | **fp32** | **3.4e-3** | **5.5e-4** |
-| `125m_e2e` | `meta` | bf16 | 8.6e-2 | 2.2e-2 |
-| `125m_e2e` | `meta` | fp32 | n/a — JAX `meta` hardcodes cuDNN attn (bf16-only) | |
+| Variant | Mode | Backend | Precision | Max abs NLL diff | Mean abs NLL diff |
+|---|---|---|---|---|---|
+| `125m_e2e` | `pretrain` | cuDNN | bf16 | 8.6e-2 | 2.3e-2 |
+| `125m_e2e` | `pretrain` | cuDNN | **fp32** | **3.4e-3** | **5.5e-4** |
+| `125m_e2e` | `meta` | cuDNN | bf16 | 8.30e-2 | 2.23e-2 |
+| `125m_e2e` | `meta` | flex  | bf16 | 8.30e-2 | 2.24e-2 |
+| `125m_e2e` | `meta` | flex vs cuDNN (within-PyTorch) | bf16 | 3.13e-2 | 2.19e-3 |
 
 The fp32 pretrain row is the bit-near-exact correctness check: kb-nano
 matches the JAX reference to ~1e-3 on individual token NLLs. The bf16
-gap is the cross-framework promote-and-accumulate noise inherent in
+gap vs JAX is the cross-framework promote-and-accumulate noise inherent in
 cuBLAS-vs-XLA bf16 matmul ordering, not a logic bug. Sequence-level mean
 NLL matches to 5e-4 or better in fp32 (11.900430 vs 11.900406).
+
+**The flex backend introduces no extra drift.** The flex-vs-JAX bf16
+diff (8.30e-2 max) is identical to cuDNN-vs-JAX (8.30e-2 max) to four
+decimal places — confirming the gap is XLA-vs-Inductor framework noise,
+not flex kernel error. The within-PyTorch comparison (flex vs cuDNN) is
+much tighter at 3.13e-2 max / 2.19e-3 mean, well within bf16 noise. A
+multi-seed sweep across 6 distinct random-weight configurations
+(seeds 0/1/7/42/1337/2024) showed flex matches cuDNN at max 2.45e-4 /
+mean 4.75e-5 with **100% of all 49,152 token positions tight at < 1e-3**.
 
 ### L1-L4 layering and the kb-nano L1 RMSNorm bug we discovered
 
 The TTT-E2E modules in this PR conform to CLAUDE.md: L2 (`ttt_e2e_swa`,
 `ttt_e2e_block`, `ttt_e2e_swiglu`) compose only from L1 ops (no
 `torch.nn` or `torch.nn.functional` calls), and L4 (`ttt_e2e`) is
-chunk-loop wiring + the SGD update math. We added two new L1 ops:
+chunk-loop wiring + the SGD update math. We added two new L1 ops and
+extended one existing L1 op:
 
   - [`tasks/baseline/L1/rms_norm_native.py`](tasks/baseline/L1/rms_norm_native.py) — pure-PyTorch RMSNorm.
     Used because the existing CUDA L1 RMSNorm (`tasks/baseline/L1/rms_norm.py`)
@@ -519,16 +575,29 @@ chunk-loop wiring + the SGD update math. We added two new L1 ops:
     uses NeOX/half-split layout; the layout difference is not weight-
     translatable, so we have to match the JAX layout directly to keep
     bit-near-exact parity.
+  - [`tasks/baseline/L1/dense_attention.py`](tasks/baseline/L1/dense_attention.py) — added two new backend
+    choices: `backend="cudnn"` (pinned cuDNN flash via
+    `torch.nn.attention.sdpa_kernel`, with `EFFICIENT/MATH` fallback
+    for shapes cuDNN rejects), and `backend="flex"` (FlexAttention with a
+    `BlockMask` instead of a dense bool mask). The `flex` backend is what
+    optimization #7 above relies on; the L1 op is the only place that
+    knows about FlexAttention so L2+ files stay clean of the new
+    dependency.
 
 **Reproduce**:
 ```bash
 # Clone the JAX reference (the kb-nano worker auto-discovers it):
 git clone https://github.com/test-time-training/e2e /tmp/ttt_e2e_ref
 
-# Run the bench:
+# Run the bench (cuDNN baseline — backwards-compat default):
 CUDA_VISIBLE_DEVICES=<idx> python -m kb_nano.tests.bench_ttt_e2e \
     --variant 125m_e2e --seq-len 8192 --n-sequences 2 \
     --modes pretrain meta --runs 3
+
+# Run the bench (flex — recommended for meta inference):
+CUDA_VISIBLE_DEVICES=<idx> python -m kb_nano.tests.bench_ttt_e2e \
+    --variant 125m_e2e --seq-len 8192 --n-sequences 2 \
+    --modes pretrain meta --runs 3 --attention-backend flex
 ```
 
 ## Benchmarking

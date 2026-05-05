@@ -204,6 +204,7 @@ def _run_kbnano(
     runs: int = 3,
     compute_dtype: str = "bf16",
     device: str = "cuda",
+    attention_backend: str = "cudnn",
 ) -> dict:
     """Run kb-nano forward and return per-token NLL + timings."""
     import torch
@@ -231,6 +232,7 @@ def _run_kbnano(
         inner_lr=float(t["inner_lr"]),
         inner_clip_grad_norm=float(t["inner_clip"]),
         ilr_init=float(t["ilr_init"]),
+        attention_backend=attention_backend,
     )
 
     dt_map = {"bf16": torch.bfloat16, "fp32": torch.float32, "fp16": torch.float16}
@@ -303,6 +305,9 @@ def main():
     p.add_argument("--skip-kbnano", action="store_true", help="Skip kb-nano (JAX-only).")
     p.add_argument("--runs", type=int, default=3)
     p.add_argument("--results-out", default=None, help="Optional: write a JSON summary to this path.")
+    p.add_argument("--attention-backend", choices=["cudnn", "flex"], default="cudnn",
+                   help="Suffix-path attention backend. flex enables FlexAttention's "
+                        "Triton-fused fwd+bwd autotuned to (chunk_size, W+chunk_size, head_dim).")
     args = p.parse_args()
 
     cache = Path(args.cache_dir)
@@ -367,7 +372,8 @@ def main():
 
             kb_nll = kb_runs = kb_warm = None
             if not args.skip_kbnano:
-                r = _run_kbnano(cfg_run, weights, inputs[si], mode, runs=args.runs)
+                r = _run_kbnano(cfg_run, weights, inputs[si], mode, runs=args.runs,
+                                attention_backend=args.attention_backend)
                 kb_nll = r["token_nll"][0]   # (B=1, T) -> (T,)
                 kb_runs = r["run_times_s"]
                 kb_warm = r["warmup_s"]

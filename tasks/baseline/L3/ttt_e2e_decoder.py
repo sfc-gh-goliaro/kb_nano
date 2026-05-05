@@ -34,6 +34,7 @@ class TTTE2EDecoder(nn.Module):
         qk_norm: bool = True,
         rms_norm_eps: float = 1e-6,
         tie_word_embeddings: bool = True,
+        attention_backend: str = "cudnn",
     ):
         super().__init__()
         self.vocab_size = vocab_size
@@ -59,6 +60,7 @@ class TTTE2EDecoder(nn.Module):
                     qk_norm=qk_norm,
                     rms_norm_eps=rms_norm_eps,
                     has_prime=has_prime,
+                    attention_backend=attention_backend,
                 )
             )
 

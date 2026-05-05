@@ -59,6 +59,7 @@ class TTTE2ESWA(nn.Module):
         rope_theta: float = 500000.0,
         qk_norm: bool = True,
         rms_norm_eps: float = 1e-6,
+        attention_backend: str = "cudnn",
     ):
         super().__init__()
         assert hidden_size % num_heads == 0
@@ -68,6 +69,7 @@ class TTTE2ESWA(nn.Module):
         self.window_size = window_size
         self.chunk_size = chunk_size
         self.qk_norm = qk_norm
+        self.attention_backend = attention_backend
 
         self.wq = Linear(hidden_size, hidden_size, bias=False)
         self.wk = Linear(hidden_size, hidden_size, bias=False)
@@ -82,21 +84,30 @@ class TTTE2ESWA(nn.Module):
         self.rope = TTTE2ERoPE(self.head_dim, rope_len, rope_theta=rope_theta)
 
         # Two attention dispatchers, one per path:
-        # - prefix path is causal-no-mask → ``auto`` lets PyTorch pick the
-        #   fastest path (flash / cuDNN-flash auto-selected on Blackwell).
-        # - suffix path passes a non-trivial bool mask → PyTorch's
-        #   heuristic routes that to cutlass FMHA (``sm80`` fallback on
-        #   Blackwell, ~2.7× slower than cuDNN at our 1024×9216 shape).
-        #   Pin cuDNN to actually get the Blackwell-native flash kernel.
+        # - prefix path: causal-no-mask. ``auto`` lets PyTorch pick the
+        #   fastest path (cuDNN flash on Blackwell). cuDNN wins on long
+        #   sequences (8K prefix), where FlexAttention's Triton kernel is
+        #   slower than cuDNN's hand-tuned flash binary.
+        # - suffix path: chunked sliding-window-causal with explicit mask.
+        #   Two backend choices:
+        #     "cudnn"  — pin cuDNN flash via sdpa_kernel. Works with our
+        #                tensor-chunk_id graph-capture path. Default.
+        #     "flex"   — FlexAttention + Triton-fused fwd+bwd autotuned
+        #                for the (Q=1024, KV=9216, D=64) shape. ~1.37x
+        #                faster than cuDNN at this exact chunked shape
+        #                (microbenched). Requires int chunk_id (BlockMask
+        #                lookup), so the engine threads ints in meta mode
+        #                rather than the in-place tensor buffer trick.
         self.attn_prefix = DenseAttention(backend="auto")
-        self.attn_suffix = DenseAttention(backend="cudnn")
+        self.attn_suffix = DenseAttention(backend=attention_backend)
 
-        # Cache for the chunk-suffix attention masks and the RoPE position
-        # vectors. All keyed by ``device`` so we lazily materialize on the
-        # right GPU on first call. Mask cache is also per-chunk_id since
-        # the mask depends on chunk_id (early chunks have masked-out cache
-        # padding via ``ki >= 0``); position vectors are chunk-invariant.
+        # Cache for the chunk-suffix attention masks (dense bool) and
+        # FlexAttention BlockMasks, plus RoPE position vectors. Keyed by
+        # ``(chunk_id, device)`` for masks (chunk_id determines early-cache
+        # padding via ``ki >= 0``) and by ``device`` for positions (chunk-
+        # invariant). Lazily materialized on first call.
         self._suffix_mask_cache: dict[tuple[int, torch.device], torch.Tensor] = {}
+        self._suffix_block_mask_cache: dict[tuple[int, torch.device], object] = {}
         self._suffix_q_pos: dict[torch.device, torch.Tensor] = {}
         self._suffix_k_pos: dict[torch.device, torch.Tensor] = {}
 
@@ -225,24 +236,52 @@ class TTTE2ESWA(nn.Module):
         # JAX sw_causal_mask: query index in (chunk_id*C, chunk_id*C + C),
         # key index in (chunk_id*C - W, chunk_id*C + C - 1). Constraints:
         #   qi >= ki, qi < ki + W, ki >= 0.
-        # If chunk_id is an int we cache the mask; if it's a tensor we
-        # build via tensor arithmetic so torch.compile sees one signature.
-        if isinstance(chunk_id, torch.Tensor):
-            cid = chunk_id.to(device=device)
-            qi = torch.arange(C, device=device).unsqueeze(1) + cid * C
-            ki = torch.arange(-(W + C), 0, device=device).unsqueeze(0) + (cid + 1) * C
-            mask = (qi >= ki) & (qi < ki + W) & (ki >= 0)
-            attn_mask = mask.unsqueeze(0).unsqueeze(0)
-        else:
+        # In flex-coordinate frame (q_idx in [0,C), kv_idx in [0,W+C)):
+        #   qi = q_idx + cid * C
+        #   ki = kv_idx - W + cid * C
+        # which simplify the constraints to depend only on (q_idx, kv_idx)
+        # plus the cid-shift in ``ki >= 0``.
+        if self.attention_backend == "flex":
+            # FlexAttention path: build a BlockMask per chunk_id (cached).
+            # Tensor chunk_id is not supported here — caller must pass int
+            # so we can index the cache. Engine should use int in meta mode
+            # when this backend is selected.
+            if isinstance(chunk_id, torch.Tensor):
+                chunk_id = int(chunk_id.item())
+            from torch.nn.attention.flex_attention import create_block_mask
             cache_key = (chunk_id, device)
-            attn_mask = self._suffix_mask_cache.get(cache_key)
+            attn_mask = self._suffix_block_mask_cache.get(cache_key)
             if attn_mask is None:
-                starting_q = chunk_id * C
-                qi = (torch.arange(C, device=device) + starting_q).unsqueeze(1)
-                ki = (torch.arange(-(W + C), 0, device=device) + (starting_q + C)).unsqueeze(0)
+                cid = chunk_id
+                def mask_mod(b, h, q_idx, kv_idx, _cid=cid):
+                    qi = q_idx + _cid * C
+                    ki = kv_idx - W + _cid * C
+                    return (qi >= ki) & (qi < ki + W) & (ki >= 0)
+                attn_mask = create_block_mask(
+                    mask_mod, B=None, H=None, Q_LEN=C, KV_LEN=W + C,
+                    device=str(device).split(":")[0],
+                )
+                self._suffix_block_mask_cache[cache_key] = attn_mask
+        else:
+            # Dense bool mask path (cuDNN / efficient / sdpa). Supports both
+            # int chunk_id (cached) and tensor chunk_id (rebuilt every call,
+            # one torch.compile graph for all chunk_ids).
+            if isinstance(chunk_id, torch.Tensor):
+                cid = chunk_id.to(device=device)
+                qi = torch.arange(C, device=device).unsqueeze(1) + cid * C
+                ki = torch.arange(-(W + C), 0, device=device).unsqueeze(0) + (cid + 1) * C
                 mask = (qi >= ki) & (qi < ki + W) & (ki >= 0)
-                attn_mask = mask.unsqueeze(0).unsqueeze(0).contiguous()  # (1, 1, C, W+C)
-                self._suffix_mask_cache[cache_key] = attn_mask
+                attn_mask = mask.unsqueeze(0).unsqueeze(0)
+            else:
+                cache_key = (chunk_id, device)
+                attn_mask = self._suffix_mask_cache.get(cache_key)
+                if attn_mask is None:
+                    starting_q = chunk_id * C
+                    qi = (torch.arange(C, device=device) + starting_q).unsqueeze(1)
+                    ki = (torch.arange(-(W + C), 0, device=device) + (starting_q + C)).unsqueeze(0)
+                    mask = (qi >= ki) & (qi < ki + W) & (ki >= 0)
+                    attn_mask = mask.unsqueeze(0).unsqueeze(0).contiguous()  # (1, 1, C, W+C)
+                    self._suffix_mask_cache[cache_key] = attn_mask
 
         out = self.attn_suffix(xq, full_k, full_v,
                                softmax_scale=self.head_dim ** -0.5,
