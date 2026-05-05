@@ -4,15 +4,17 @@ Mirrors sglang's three captured forwards
 (`/home/yak/vllm_repo/sglang/python/sglang/srt/speculative/`):
 
   * ``TargetVerifyGraphRunner``  -- captures the 32-layer 8B target verify
-    forward (``model + compute_logits``) on ``B*N`` tokens.
+    forward (``model + greedy argmax``) on ``B*N`` tokens.
   * ``DraftChainGraphRunner``    -- captures the entire ``S-1``-step draft
     decode loop on ``B*K`` tokens (one graph per B; **Phase B**).
   * ``DraftExtendGraphRunner``   -- captures ``draft.forward_draft +
     compute_logits + topk`` for the post-verify digest (**Phase C**).
 
 For each runner we capture **one graph per batch size** in
-``[1..cuda_graph_max_bs]``; at replay we ``bisect_left`` the real ``B`` to
-the smallest captured ``B' >= B`` and pad the trailing rows with sentinels
+``[1..cuda_graph_max_bs]``. Target verify additionally captures several
+prefix-length buckets because FA3 bakes ``max_seqlen_k`` into the graph. At
+replay we ``bisect_left`` the real ``B`` to the smallest captured ``B' >= B``
+and pad the trailing rows with sentinels
 (``slot_mapping = scratch_slot``, ``cache_seqlens = 1``,
 ``block_table = scratch_block``).  Outputs are sliced back to ``[:B*N]``.
 
@@ -25,11 +27,10 @@ sized at ``B_max`` and copies real data into the prefix on every replay.
 
 Output handling
 ===============
-Outputs are also written into pre-allocated persistent buffers via an
-explicit ``out_buf[:BN].copy_(out_local)`` at the end of capture.  This
-keeps total output memory bounded (one buffer shared across all bucket
-graphs) and lets the engine read predictably from ``out_buf[:BN_real]``
-after replay.
+Target verify reads graph-owned output tensors directly after replay to avoid
+large per-step aux-hidden copies. Draft graph outputs are still copied into
+runner-owned buffers because those outputs are small and shared across bucket
+graphs.
 
 Scratch slot
 ============
@@ -59,7 +60,7 @@ if TYPE_CHECKING:
 
 @dataclass
 class _VerifyBuffers:
-    """Persistent input + output buffers for ``TargetVerifyGraphRunner``.
+    """Persistent input buffers for ``TargetVerifyGraphRunner``.
 
     All tensors are sized at ``B_max * N`` tokens / ``B_max`` sequences so a
     single set of allocations services every captured bucket.  Captured
@@ -78,10 +79,8 @@ class _VerifyBuffers:
     cu_seqlens_q_expand: torch.Tensor       # [B_max*N+1] int32, fixed arange
     context_lens: torch.Tensor              # [B_max] int32 (legacy, unused)
 
-    # Outputs (shared across all captured buckets)
-    hidden_states: torch.Tensor             # [B_max*N, H_t] dtype
-    aux_list: List[torch.Tensor] = field(default_factory=list)  # 3x [B_max*N, H_t]
-    logits: Optional[torch.Tensor] = None   # [B_max*N, vocab] fp32
+    # Outputs
+    hidden_states: Optional[torch.Tensor] = None  # graph path does not export h
 
 
 # ---------------------------------------------------------------------------
@@ -94,12 +93,12 @@ class TargetVerifyGraphRunner:
     The captured region is::
 
         h, aux = target.model(input_ids, positions)
-        logits = target.compute_logits(h)
+        target_predict = target.compute_logits(h).argmax(dim=-1)
 
-    plus the explicit copy-to-persistent-output trailer.  Everything before
-    the model call (slot/block-table construction, cascade-metadata builds)
-    runs Python-side per replay and writes results into the persistent
-    buffers via ``copy_()``.
+    Everything before the model call (slot/block-table construction,
+    cascade-metadata builds) runs Python-side per replay and writes results
+    into persistent input buffers via ``copy_()``. Outputs are graph-owned
+    tensors saved from capture and read directly after replay.
     """
 
     def __init__(
@@ -117,13 +116,15 @@ class TargetVerifyGraphRunner:
         # Capture every integer batch size up to the max -- mirrors sglang's
         # spec-decoding default schedule.
         self.capture_bs: List[int] = list(range(1, self.B_max + 1))
+        prefix_buckets = [160, 256, 512, 1024, 2048, engine.max_model_len]
+        self.capture_prefix_lens: List[int] = sorted({
+            min(engine.max_model_len, b) for b in prefix_buckets
+            if b > 0
+        })
         self.graph_pool = graph_pool
 
         device = engine.device
-        dtype = engine.dtype
         block_size = engine.block_size
-        H_t = engine.target_config.hidden_size
-        vocab_size = engine.target_config.vocab_size
         max_blocks = (engine.max_model_len + block_size - 1) // block_size
         N = self.N
         B_max = self.B_max
@@ -157,23 +158,16 @@ class TargetVerifyGraphRunner:
                 B_max * N + 1, dtype=torch.int32, device=device,
             ),
             context_lens=torch.ones(B_max, dtype=torch.int32, device=device),
-            hidden_states=torch.zeros(
-                B_max * N, H_t, dtype=dtype, device=device,
-            ),
-        )
-        # The target model captures 3 aux hidden states for EAGLE-3.
-        bufs.aux_list = [
-            torch.zeros(B_max * N, H_t, dtype=dtype, device=device)
-            for _ in range(3)
-        ]
-        bufs.logits = torch.zeros(
-            B_max * N, vocab_size, dtype=torch.float32, device=device,
         )
         self.bufs = bufs
         self.max_blocks = max_blocks
 
-        # Captured graphs (B -> CUDAGraph). Outputs are read from self.bufs.
-        self.graphs: dict[int, torch.cuda.CUDAGraph] = {}
+        # Captured graphs ((B, max_prefix_len) -> CUDAGraph). Outputs are read
+        # directly from graph-owned tensors captured in self.outputs.
+        self.graphs: dict[tuple[int, int], torch.cuda.CUDAGraph] = {}
+        self.outputs: dict[
+            tuple[int, int], tuple[List[torch.Tensor], torch.Tensor]
+        ] = {}
 
     # ------------------------------------------------------------------
     # Capture
@@ -186,11 +180,12 @@ class TargetVerifyGraphRunner:
         reuses those slabs for smaller buckets.  Sglang follows the same
         order for the same reason.
         """
-        for B in sorted(self.capture_bs, reverse=True):
-            self._capture_one(B)
+        for prefix_len in sorted(self.capture_prefix_lens, reverse=True):
+            for B in sorted(self.capture_bs, reverse=True):
+                self._capture_one(B, prefix_len)
         torch.cuda.synchronize()
 
-    def _capture_one(self, B: int) -> None:
+    def _capture_one(self, B: int, max_seqlen_k_prefix: int) -> None:
         bufs = self.bufs
         N = self.N
         BN = B * N
@@ -207,10 +202,9 @@ class TargetVerifyGraphRunner:
         cu_q_expand = bufs.cu_seqlens_q_expand[:BN + 1]
         ctx_lens = bufs.context_lens[:B]
 
-        # max_seqlen_k_prefix is a kernel launch parameter (baked into the
-        # graph). Use the engine's max_model_len so the captured kernel
-        # supports prefixes up to the longest possible.
-        max_seqlen_k_prefix = self.engine.max_model_len
+        # max_seqlen_k_prefix is a kernel launch parameter baked into the graph.
+        # Capture several buckets so replay can use a tight launch shape for
+        # short prompts without sacrificing correctness on longer contexts.
 
         def _run_forward():
             with set_forward_context(
@@ -236,30 +230,29 @@ class TargetVerifyGraphRunner:
                     h_local, aux_local = out
                 else:
                     h_local, aux_local = out, []
-                logits_local = self.engine.target.compute_logits(h_local)
-            return h_local, aux_local, logits_local
+                # Greedy verify only needs argmax. Avoid compute_logits(),
+                # which casts the full [B*N, vocab] projection to fp32.
+                # EAGLE-3 is TP=1 in this engine, so no vocab gather is needed.
+                logits_local = self.engine.target.lm_head.project(h_local)
+                target_predict_local = logits_local.argmax(dim=-1)
+            return h_local, aux_local, target_predict_local
 
         # Warmup: run forward once eagerly to JIT kernels and prime caches.
         # PyTorch's CUDA graph capture requires a separate warmup pass so
         # the caching allocator state is stable.
-        h_w, aux_w, logits_w = _run_forward()
-        del h_w, aux_w, logits_w
+        h_w, aux_w, pred_w = _run_forward()
+        del h_w, aux_w, pred_w
         torch.cuda.synchronize()
 
         graph = torch.cuda.CUDAGraph()
         with torch.cuda.graph(graph, pool=self.graph_pool):
-            h_local, aux_local, logits_local = _run_forward()
-            # Copy outputs into persistent buffers so they're shared across
-            # all bucket graphs (avoids per-bucket output allocation).
-            bufs.hidden_states[:BN].copy_(h_local)
-            for i in range(len(bufs.aux_list)):
-                if i < len(aux_local):
-                    bufs.aux_list[i][:BN].copy_(aux_local[i])
-            bufs.logits[:BN].copy_(logits_local)
+            h_local, aux_local, target_predict_local = _run_forward()
 
         if self.graph_pool is None:
             self.graph_pool = graph.pool()
-        self.graphs[B] = graph
+        key = (B, max_seqlen_k_prefix)
+        self.graphs[key] = graph
+        self.outputs[key] = (aux_local, target_predict_local)
 
     # ------------------------------------------------------------------
     # Replay
@@ -273,15 +266,22 @@ class TargetVerifyGraphRunner:
         cache_seqlens_prefix_real: torch.Tensor,  # [B] int32
         page_table_expand_real: torch.Tensor,     # [B*N, N] int32
         cache_seqlens_expand_real: torch.Tensor,  # [B*N] int32
+        max_seqlen_k_prefix_real: int,
         raw_bs: int,
     ):
         """Pad the real inputs to the smallest captured bucket and replay.
 
         Returns sliced views of the persistent output buffers
-        ``(hidden_states, aux_list, logits)`` of shape ``[raw_bs * N, ...]``.
+        ``(hidden_states, aux_list, target_predict)``. ``hidden_states`` is
+        always ``None`` in the graph path because the caller only needs EAGLE
+        aux hidden states for the accepted path.
         """
         N = self.N
         B_pad = self.capture_bs[bisect.bisect_left(self.capture_bs, raw_bs)]
+        prefix_idx = bisect.bisect_left(
+            self.capture_prefix_lens, max_seqlen_k_prefix_real,
+        )
+        prefix_cap = self.capture_prefix_lens[prefix_idx]
         BN_real = raw_bs * N
         BN_pad = B_pad * N
 
@@ -301,9 +301,12 @@ class TargetVerifyGraphRunner:
             bufs.block_table_prefix[raw_bs:B_pad].fill_(scratch_block)
 
         # --- copy real data into persistent prefixes ---------------------
-        bufs.input_ids[:BN_real].copy_(input_ids_real, non_blocking=True)
-        bufs.positions[:BN_real].copy_(positions_real, non_blocking=True)
-        bufs.slot_mapping[:BN_real].copy_(slot_mapping_real, non_blocking=True)
+        if input_ids_real.data_ptr() != bufs.input_ids[:BN_real].data_ptr():
+            bufs.input_ids[:BN_real].copy_(input_ids_real, non_blocking=True)
+        if positions_real.data_ptr() != bufs.positions[:BN_real].data_ptr():
+            bufs.positions[:BN_real].copy_(positions_real, non_blocking=True)
+        if slot_mapping_real.data_ptr() != bufs.slot_mapping[:BN_real].data_ptr():
+            bufs.slot_mapping[:BN_real].copy_(slot_mapping_real, non_blocking=True)
 
         k_real = block_table_real.shape[1]
         if k_real >= self.max_blocks:
@@ -316,23 +319,37 @@ class TargetVerifyGraphRunner:
             )
             bufs.block_table_prefix[:raw_bs, k_real:].fill_(scratch_block)
 
-        bufs.cache_seqlens_prefix[:raw_bs].copy_(
-            cache_seqlens_prefix_real, non_blocking=True,
-        )
-        bufs.cache_seqlens_expand[:BN_real].copy_(
-            cache_seqlens_expand_real, non_blocking=True,
-        )
-        bufs.page_table_expand[:BN_real].copy_(
-            page_table_expand_real, non_blocking=True,
-        )
+        if (
+            cache_seqlens_prefix_real.data_ptr()
+            != bufs.cache_seqlens_prefix[:raw_bs].data_ptr()
+        ):
+            bufs.cache_seqlens_prefix[:raw_bs].copy_(
+                cache_seqlens_prefix_real, non_blocking=True,
+            )
+        if (
+            cache_seqlens_expand_real.data_ptr()
+            != bufs.cache_seqlens_expand[:BN_real].data_ptr()
+        ):
+            bufs.cache_seqlens_expand[:BN_real].copy_(
+                cache_seqlens_expand_real, non_blocking=True,
+            )
+        if (
+            page_table_expand_real.data_ptr()
+            != bufs.page_table_expand[:BN_real].data_ptr()
+        ):
+            bufs.page_table_expand[:BN_real].copy_(
+                page_table_expand_real, non_blocking=True,
+            )
 
         # --- replay ------------------------------------------------------
-        self.graphs[B_pad].replay()
+        key = (B_pad, prefix_cap)
+        self.graphs[key].replay()
+        aux_list, target_predict = self.outputs[key]
 
         return (
-            bufs.hidden_states[:BN_real],
-            [a[:BN_real] for a in bufs.aux_list],
-            bufs.logits[:BN_real],
+            None,
+            [a[:BN_real] for a in aux_list],
+            target_predict[:BN_real],
         )
 
 
@@ -869,10 +886,10 @@ class DraftExtendGraphRunner:
         scratch_slot = self.scratch_slot_d
         scratch_block = self.scratch_block_d
 
-        # --- reset persistent token-level buffers to ghost defaults -----
-        bufs.input_ids[:BS_pad].zero_()
-        bufs.positions[:BS_pad].zero_()
-        bufs.hidden[:BS_pad].zero_()
+        # --- reset token slots to ghost defaults ------------------------
+        # Unused padded queries are computed but discarded. Their ids,
+        # positions, and hidden states may safely retain previous values as
+        # long as their KV writes go to the scratch slot.
         bufs.slot_mapping[:BS_pad].fill_(scratch_slot)
 
         # --- scatter real per-seq data into persistent slots ------------

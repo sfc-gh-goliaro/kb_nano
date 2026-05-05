@@ -34,14 +34,19 @@ def _merge_state_kernel(
     HEAD_SIZE: tl.constexpr,
     PADDED_HEAD_SIZE: tl.constexpr,
     OUTPUT_LSE: tl.constexpr,
+    LSE_HEAD_MAJOR: tl.constexpr,
 ):
     token_idx = tl.program_id(0)
     num_tokens = tl.num_programs(0)
     head_idx = tl.program_id(1)
     num_heads = tl.num_programs(1)
 
-    p_lse = tl.load(prefix_lse + token_idx * num_heads + head_idx)
-    s_lse = tl.load(suffix_lse + token_idx * num_heads + head_idx)
+    if LSE_HEAD_MAJOR:
+        lse_offset = head_idx * num_tokens + token_idx
+    else:
+        lse_offset = token_idx * num_heads + head_idx
+    p_lse = tl.load(prefix_lse + lse_offset)
+    s_lse = tl.load(suffix_lse + lse_offset)
     p_lse = float("-inf") if p_lse == float("inf") else p_lse
     s_lse = float("-inf") if s_lse == float("inf") else s_lse
 
@@ -88,6 +93,7 @@ def merge_state(
     suffix_lse: torch.Tensor,
     output: Optional[torch.Tensor] = None,
     output_lse: Optional[torch.Tensor] = None,
+    lse_head_major: bool = False,
 ) -> Tuple[torch.Tensor, Optional[torch.Tensor]]:
     """Merge ``(prefix_output, prefix_lse)`` and ``(suffix_output, suffix_lse)``.
 
@@ -99,8 +105,12 @@ def merge_state(
     """
     if output is None:
         output = torch.empty_like(prefix_output)
+    write_lse = output_lse is not None
     if output_lse is None:
-        output_lse = torch.empty_like(prefix_lse)
+        # Dummy pointer: the Triton kernel does not touch it when
+        # ``OUTPUT_LSE`` is false. Avoid allocating/writing LSE for tree
+        # attention, which only consumes the merged output.
+        output_lse = prefix_lse
 
     num_tokens = output.shape[0]
     num_heads = output.shape[1]
@@ -116,6 +126,7 @@ def merge_state(
         suffix_lse,
         head_size,
         padded_head_size,
-        output_lse is not None,
+        write_lse,
+        lse_head_major,
     )
-    return output, output_lse
+    return output, output_lse if write_lse else None

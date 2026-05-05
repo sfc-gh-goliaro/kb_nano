@@ -74,6 +74,8 @@ def build_tree_kernel_efficient(
     retrive_next_sibling, draft_tokens
     """
     draft_tokens = torch.cat((verified_id.unsqueeze(1), draft_tokens), dim=1).flatten()
+    if seq_lens.dtype != torch.int32:
+        seq_lens = seq_lens.to(torch.int32)
 
     bs = seq_lens.numel()
     device = seq_lens.device
@@ -81,7 +83,7 @@ def build_tree_kernel_efficient(
     if tree_mask_buf is not None:
         tree_mask = tree_mask_buf
         if tree_mask_mode == TreeMaskMode.QLEN_ONLY:
-            tree_mask.fill_(True)
+            pass
         elif tree_mask_mode == TreeMaskMode.QLEN_ONLY_BITPACKING:
             tree_mask.fill_(0)
         elif tree_mask_mode == TreeMaskMode.FULL_MASK:
@@ -89,9 +91,10 @@ def build_tree_kernel_efficient(
         else:
             raise NotImplementedError(f"Invalid tree mask: {tree_mask_mode=}")
     elif tree_mask_mode == TreeMaskMode.QLEN_ONLY:
-        tree_mask = torch.full(
+        # ``build_tree_efficient`` writes every [B, N, N] entry in this mode,
+        # so avoid a separate fill kernel on the hot path.
+        tree_mask = torch.empty(
             (num_verify_tokens * bs * num_verify_tokens,),
-            True,
             dtype=torch.bool,
             device=device,
         )
@@ -153,6 +156,81 @@ def build_tree_kernel_efficient(
     )
 
 
+def build_tree_kernel_efficient_with_metadata(
+    verified_id: torch.Tensor,
+    parent_list: torch.Tensor,
+    top_scores_index: torch.Tensor,
+    draft_tokens: torch.Tensor,
+    seq_lens: torch.Tensor,
+    slot_mapping_draft: torch.Tensor,
+    topk: int,
+    spec_steps: int,
+    num_verify_tokens: int,
+    position_buf: Optional[torch.Tensor] = None,
+    page_table_expand_buf: Optional[torch.Tensor] = None,
+    cache_seqlens_expand_buf: Optional[torch.Tensor] = None,
+):
+    """Build the verification tree and FA3 expand metadata in one kernel.
+
+    This is the hot-path variant for QLEN_ONLY tree attention. It avoids
+    materializing the flat bool tree mask and the second metadata kernel.
+    """
+    draft_tokens = torch.cat((verified_id.unsqueeze(1), draft_tokens), dim=1).flatten()
+
+    bs = seq_lens.numel()
+    device = seq_lens.device
+
+    retrive_buf = torch.full(
+        (3, bs, num_verify_tokens), -1, device=device, dtype=torch.long
+    )
+    retrive_index, retrive_next_token, retrive_next_sibling = retrive_buf
+    positions = (
+        position_buf
+        if position_buf is not None
+        else torch.empty((bs * num_verify_tokens,), device=device, dtype=torch.long)
+    )
+    page_table_expand = (
+        page_table_expand_buf
+        if page_table_expand_buf is not None
+        else torch.empty(
+            (bs * num_verify_tokens, num_verify_tokens),
+            device=device,
+            dtype=torch.int32,
+        )
+    )
+    cache_seqlens_expand = (
+        cache_seqlens_expand_buf
+        if cache_seqlens_expand_buf is not None
+        else torch.empty((bs * num_verify_tokens,), device=device, dtype=torch.int32)
+    )
+
+    _C.build_tree_kernel_efficient_with_metadata(
+        parent_list.to(dtype=torch.int64),
+        top_scores_index,
+        seq_lens,
+        positions,
+        retrive_index,
+        retrive_next_token,
+        retrive_next_sibling,
+        slot_mapping_draft,
+        page_table_expand,
+        cache_seqlens_expand,
+        int(topk),
+        int(spec_steps),
+        int(num_verify_tokens),
+    )
+
+    return (
+        positions,
+        retrive_index,
+        retrive_next_token,
+        retrive_next_sibling,
+        draft_tokens,
+        page_table_expand,
+        cache_seqlens_expand,
+    )
+
+
 def verify_tree_greedy(
     predicts: torch.Tensor,
     accept_index: torch.Tensor,
@@ -178,4 +256,33 @@ def verify_tree_greedy(
         retrive_next_sibling,
         target_predict,
     )
-    return predicts, accept_index, accept_token_num
+
+
+def build_tree_cascade_metadata(
+    tree_mask: torch.Tensor,
+    slot_mapping_draft: torch.Tensor,
+    num_verify_tokens: int,
+) -> Tuple[torch.Tensor, torch.Tensor]:
+    """Build FA3 expand metadata from the QLEN_ONLY tree mask.
+
+    Returns ``(page_table_expand, cache_seqlens_expand)`` for the verify
+    tree's draft-token attention pass. The page table keeps live ancestor
+    slots first in ascending tree-column order, matching sglang's metadata.
+    """
+    num_rows = tree_mask.numel() // num_verify_tokens
+    page_table_expand = torch.empty(
+        num_rows, num_verify_tokens,
+        device=tree_mask.device,
+        dtype=torch.int32,
+    )
+    cache_seqlens_expand = torch.empty(
+        num_rows, device=tree_mask.device, dtype=torch.int32,
+    )
+    _C.build_tree_cascade_metadata(
+        tree_mask,
+        slot_mapping_draft,
+        page_table_expand,
+        cache_seqlens_expand,
+        int(num_verify_tokens),
+    )
+    return page_table_expand, cache_seqlens_expand

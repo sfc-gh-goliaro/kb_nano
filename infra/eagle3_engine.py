@@ -39,14 +39,12 @@ from typing import List, Optional
 
 import numpy as np
 import torch
-import torch.distributed as dist
 from transformers import AutoTokenizer
 
 from .context import get_attn_backend_config, set_context, set_forward_context
 from .weight_loader import load_eagle3_draft_model, load_model
 from ..tasks.baseline.L1.eagle_tree_ops import (
-    TreeMaskMode,
-    build_tree_kernel_efficient,
+    build_tree_kernel_efficient_with_metadata,
     organize_draft_results,
     verify_tree_greedy,
 )
@@ -137,8 +135,6 @@ class _Eagle3Sequence:
         # draft extend). Length K per seq.
         self._chain_tail_blocks: List[int] = []
 
-        # Draft hidden state (target hidden3-cat) at the last accepted token.
-        self.last_aux: Optional[torch.Tensor] = None
         # The last accepted token id.
         self.last_token: Optional[int] = None
         # Number of tokens whose KV is committed in the target paged cache.
@@ -206,16 +202,10 @@ class LlamaEagle3Engine:
         self.enforce_eager = enforce_eager
         self.cuda_graph_max_bs = cuda_graph_max_bs
 
-        if not dist.is_initialized():
-            os.environ.setdefault("MASTER_ADDR", "127.0.0.1")
-            os.environ.setdefault(
-                "MASTER_PORT", os.environ.get("KB_NANO_EAGLE3_PORT", "29503"),
-            )
-            torch.cuda.set_device(0)
-            dist.init_process_group(
-                "nccl", rank=0, world_size=1,
-                device_id=torch.device("cuda", 0),
-            )
+        # EAGLE-3 is currently TP=1. Avoid initializing NCCL for world_size=1:
+        # some CUDA/NCCL combinations fail eager_connect_single_device even
+        # though the model itself runs correctly on the selected GPU.
+        torch.cuda.set_device(0)
 
         torch.set_default_dtype(dtype)
         torch.set_default_device("cuda")
@@ -333,6 +323,15 @@ class LlamaEagle3Engine:
         if self.enforce_eager:
             return
         if self._target_verify_runner is not None:
+            return
+
+        from ..tasks.baseline.L1.tree_attn_prefill import _FA3_AVAILABLE
+
+        if not _FA3_AVAILABLE:
+            print(
+                "[EAGLE-3] Skipping CUDA graph capture: FA3 paged tree "
+                "attention is unavailable in this environment."
+            )
             return
 
         from .eagle3_cuda_graph import (
@@ -574,7 +573,6 @@ class LlamaEagle3Engine:
 
         for i, seq in enumerate(seqs):
             seq.last_token = int(next_ids[i])
-            seq.last_aux = aux_per_seq[i][-1].clone()
             seq.token_ids.append(seq.last_token)
             seq.generated_ids.append(seq.last_token)
 
@@ -780,18 +778,16 @@ class LlamaEagle3Engine:
             raw_bs=bs,
         )
 
-        # Clone outputs since they alias persistent buffers that the next
-        # extend replay will overwrite.
-        top_p_c = top_p_view.clone()
-        top_i_c = top_i_view.clone()
-        top_i_t_c = top_i_t_view.clone()
-        last_aux_h_c = last_aux_h_view.clone()
         for i, seq in enumerate(seqs):
             seq.d_committed_len += ext_lens[i]
-            seq.draft_topk_p = top_p_c[i]
-            seq.draft_topk_i = top_i_c[i]
-            seq.draft_topk_i_t = top_i_t_c[i]
-            seq.draft_hidden = last_aux_h_c[i]
+            # These are runner-owned persistent views. They are consumed by
+            # the next draft-chain before the next draft-extend replay can
+            # overwrite them, so keeping views avoids four small device clones
+            # on every speculative step.
+            seq.draft_topk_p = top_p_view[i]
+            seq.draft_topk_i = top_i_view[i]
+            seq.draft_topk_i_t = top_i_t_view[i]
+            seq.draft_hidden = last_aux_h_view[i]
 
     # ------------------------------------------------------------------
     # Draft chain (topk=K, S steps). Tree drafting:
@@ -941,9 +937,9 @@ class LlamaEagle3Engine:
                 raw_bs=bs,
             )
             for f in range(S - 1):
-                score_list.append(score_steps[f].clone())
-                token_list.append(token_steps[f].clone())
-                parents_list.append(parents_steps[f].clone())
+                score_list.append(score_steps[f])
+                token_list.append(token_steps[f])
+                parents_list.append(parents_steps[f])
 
             parent_list, top_scores_index, draft_tokens = (
                 organize_draft_results(
@@ -1056,103 +1052,12 @@ class LlamaEagle3Engine:
     # Verify forward on the target
     # ------------------------------------------------------------------
     @torch.inference_mode()
-    def _build_tree_cascade_metadata(
-        self,
-        prefix_lens_cpu: List[int],
-        slot_mapping_draft: torch.Tensor,
-        tree_mask: torch.Tensor,
-    ) -> dict:
-        """Build the FA3 cascade-attention metadata for ``_target_verify``.
+    def _prepare_target_verify_inputs(self, seqs: List[_Eagle3Sequence]) -> dict:
+        """Allocate target KV slots and build static verify metadata.
 
-        Mirrors sglang's ``target_verify_metadata_topk_normal`` (prefix pass)
-        and ``target_verify_metadata_topk_expand`` (per-query draft pass) in
-        ``flashattention_backend.py``.
-
-        Inputs
-        ------
-        prefix_lens_cpu : list[int]  -- length B; ``t_committed_len`` per seq.
-        slot_mapping_draft : [B*N] int32  -- token-level cache slot for each
-            draft token in linear write order, slot[i*N + k] = slot for seq i,
-            draft token k.
-        tree_mask : flat bool [seq_lens_sum*N + N*N*B] in FULL_MASK layout.
-
-        Returns
-        -------
-        dict with the seven tensors / scalars consumed by ``TreeAttnPrefill``.
+        This runs before tree construction so the fused tree-build kernel can
+        directly produce FA3 expand metadata from the target slot mapping.
         """
-        device = self.device
-        N = self.num_draft_tokens
-        bs = len(prefix_lens_cpu)
-
-        prefix_lens = torch.tensor(prefix_lens_cpu, device=device, dtype=torch.long)
-
-        cu_seqlens_q_prefix = torch.arange(
-            0, (bs + 1) * N, N, device=device, dtype=torch.int32,
-        )
-        cache_seqlens_prefix = prefix_lens.to(torch.int32)
-        max_seqlen_k_prefix = max(prefix_lens_cpu) if prefix_lens_cpu else 0
-
-        # Per-query draft slot list: [bs*N, N], one row per query, each row
-        # contains the N draft slot indices of the query's sequence.
-        draft_slots_per_seq = slot_mapping_draft.view(bs, N).long()
-        draft_slots_per_query = draft_slots_per_seq.repeat_interleave(N, dim=0)
-
-        # Extract the N draft-side bits from the FULL_MASK tree_mask for each
-        # query. For seq i, query j the bits live at:
-        #   start_ij = sum_{i'<i} N*(prefix_lens[i'] + N)
-        #              + j * (prefix_lens[i] + N) + prefix_lens[i]
-        # spanning N consecutive bool entries.
-        row_lens = prefix_lens + N
-        seq_total = N * row_lens
-        seq_offsets = torch.zeros(bs, device=device, dtype=torch.long)
-        if bs > 1:
-            seq_offsets[1:] = torch.cumsum(seq_total[:-1], dim=0)
-
-        i_idx = torch.arange(bs, device=device).repeat_interleave(N)  # [bs*N]
-        j_idx = torch.arange(N, device=device).repeat(bs)             # [bs*N]
-
-        start_offsets = (
-            seq_offsets[i_idx]
-            + j_idx * row_lens[i_idx]
-            + prefix_lens[i_idx]
-        )                                                              # [bs*N]
-        col_offsets = torch.arange(N, device=device, dtype=torch.long) # [N]
-        mask_indices = start_offsets[:, None] + col_offsets[None, :]   # [bs*N, N]
-        draft_mask = tree_mask[mask_indices].to(torch.bool)            # [bs*N, N]
-
-        # Sort each row so the True entries come first (match sglang).
-        col_keys = col_offsets.expand(bs * N, -1)
-        keys = torch.where(draft_mask, col_keys, col_keys + N)         # [bs*N, N]
-        _, sort_order = torch.sort(keys, dim=1)
-
-        page_table_expand = (
-            draft_slots_per_query.gather(1, sort_order).to(torch.int32)
-        )                                                              # [bs*N, N]
-        cache_seqlens_expand = draft_mask.sum(dim=1).to(torch.int32)   # [bs*N]
-        cu_seqlens_q_expand = torch.arange(
-            bs * N + 1, device=device, dtype=torch.int32,
-        )
-
-        return {
-            "cu_seqlens_q_prefix": cu_seqlens_q_prefix,
-            "cache_seqlens_prefix": cache_seqlens_prefix,
-            "max_seqlen_k_prefix": max_seqlen_k_prefix,
-            "page_table_expand": page_table_expand,
-            "cache_seqlens_expand": cache_seqlens_expand,
-            "cu_seqlens_q_expand": cu_seqlens_q_expand,
-        }
-
-    @torch.inference_mode()
-    def _target_verify(
-        self,
-        seqs: List[_Eagle3Sequence],
-        full_draft_tokens: torch.Tensor,
-        tree_mask: torch.Tensor,
-        positions_tensor: torch.Tensor,
-        retrive_index: torch.Tensor,
-        retrive_next_token: torch.Tensor,
-        retrive_next_sibling: torch.Tensor,
-    ):
         bs = len(seqs)
         N = self.num_draft_tokens
 
@@ -1175,32 +1080,54 @@ class LlamaEagle3Engine:
         for i, b in enumerate(block_tables_rows):
             bt[i, :len(b)] = b
 
-        slot_t = torch.tensor(slot_mapping, dtype=torch.int32, device=self.device)
-        bt_t = torch.from_numpy(bt).to(self.device)
-        # Total context length per seq (prefix + N draft tokens). This is the
-        # legacy ``context_lens`` field; the FA3 cascade uses
-        # ``cache_seqlens_prefix`` (prefix only) and ``cache_seqlens_expand``
-        # (per-query attended draft count) instead.
-        ctx_lens_cpu = [p + N for p in prefix_lens_cpu]
-        ctx_t = torch.tensor(ctx_lens_cpu, dtype=torch.int32, device=self.device)
-        max_ctx_cpu = max(ctx_lens_cpu)
+        device = self.device
+        return {
+            "slot_t": torch.tensor(slot_mapping, dtype=torch.int32, device=device),
+            "bt_t": torch.from_numpy(bt).to(device),
+            "prefix_lens_cpu": prefix_lens_cpu,
+            "cache_seqlens_prefix": torch.tensor(
+                prefix_lens_cpu, dtype=torch.int32, device=device,
+            ),
+            "max_seqlen_k_prefix": max(prefix_lens_cpu) if prefix_lens_cpu else 0,
+        }
 
-        cascade = self._build_tree_cascade_metadata(
-            prefix_lens_cpu, slot_t, tree_mask,
-        )
+    @torch.inference_mode()
+    def _target_verify(
+        self,
+        seqs: List[_Eagle3Sequence],
+        full_draft_tokens: torch.Tensor,
+        positions_tensor: torch.Tensor,
+        retrive_index: torch.Tensor,
+        retrive_next_token: torch.Tensor,
+        retrive_next_sibling: torch.Tensor,
+        target_inputs: dict,
+        page_table_expand: torch.Tensor,
+        cache_seqlens_expand: torch.Tensor,
+    ):
+        bs = len(seqs)
+        N = self.num_draft_tokens
+
+        slot_t = target_inputs["slot_t"]
+        bt_t = target_inputs["bt_t"]
+        cascade = {
+            "cache_seqlens_prefix": target_inputs["cache_seqlens_prefix"],
+            "max_seqlen_k_prefix": target_inputs["max_seqlen_k_prefix"],
+            "page_table_expand": page_table_expand,
+            "cache_seqlens_expand": cache_seqlens_expand,
+        }
 
         runner = self._target_verify_runner
         if (
             runner is not None
             and bs <= runner.B_max
         ):
-            # Fast path: replay a captured CUDA graph.  All metadata is
-            # copied into runner-owned persistent buffers; outputs are
-            # views into shared persistent output buffers, so we clone
-            # before they might be overwritten by a subsequent replay.
+            # Fast path: replay a captured CUDA graph. Outputs are views into
+            # runner-owned persistent buffers. They are consumed before the
+            # next target-verify replay, so avoid a large logits/aux clone
+            # on every speculative step.
             ids_t = full_draft_tokens.to(torch.int64)
             pos_t = positions_tensor.to(torch.long)
-            h_view, aux_views, logits_view = runner.replay(
+            h_view, aux_views, target_predict = runner.replay(
                 input_ids_real=ids_t,
                 positions_real=pos_t,
                 slot_mapping_real=slot_t,
@@ -1208,28 +1135,37 @@ class LlamaEagle3Engine:
                 cache_seqlens_prefix_real=cascade["cache_seqlens_prefix"],
                 page_table_expand_real=cascade["page_table_expand"],
                 cache_seqlens_expand_real=cascade["cache_seqlens_expand"],
+                max_seqlen_k_prefix_real=cascade["max_seqlen_k_prefix"],
                 raw_bs=bs,
             )
-            hidden_states = h_view.clone()
-            aux_list = [a.clone() for a in aux_views]
-            logits = logits_view.clone()
+            hidden_states = h_view
+            aux_list = aux_views
         else:
+            prefix_lens_cpu = target_inputs["prefix_lens_cpu"]
+            ctx_lens_cpu = [p + N for p in prefix_lens_cpu]
+            ctx_t = torch.tensor(ctx_lens_cpu, dtype=torch.int32, device=self.device)
+            cu_seqlens_q_prefix = torch.arange(
+                0, (bs + 1) * N, N, device=self.device, dtype=torch.int32,
+            )
+            cu_seqlens_q_expand = torch.arange(
+                bs * N + 1, device=self.device, dtype=torch.int32,
+            )
             with set_forward_context(
                 is_prefill=False,
                 slot_mapping=slot_t,
                 context_lens=ctx_t,
                 block_tables=bt_t,
-                max_context_len=max_ctx_cpu,
+                max_context_len=max(ctx_lens_cpu),
                 is_tree_verify=True,
                 tree_num_verify_tokens=N,
                 tree_block_table_prefix=bt_t,
                 tree_cache_seqlens_prefix=cascade["cache_seqlens_prefix"],
-                tree_cu_seqlens_q_prefix=cascade["cu_seqlens_q_prefix"],
+                tree_cu_seqlens_q_prefix=cu_seqlens_q_prefix,
                 tree_max_seqlen_q_prefix=N,
                 tree_max_seqlen_k_prefix=cascade["max_seqlen_k_prefix"],
                 tree_page_table_expand=cascade["page_table_expand"],
                 tree_cache_seqlens_expand=cascade["cache_seqlens_expand"],
-                tree_cu_seqlens_q_expand=cascade["cu_seqlens_q_expand"],
+                tree_cu_seqlens_q_expand=cu_seqlens_q_expand,
             ):
                 ids_t = full_draft_tokens.to(torch.int64)
                 out = self.target.model(ids_t, positions_tensor.to(torch.long))
@@ -1241,15 +1177,20 @@ class LlamaEagle3Engine:
                 # compute_logits while still in is_prefill=False context so it
                 # returns one logit per *flat tree token* (shape [B*N, vocab]).
                 logits = self.target.compute_logits(hidden_states)
-        target_predict = logits.argmax(dim=-1)  # [B*N]
+            target_predict = logits.argmax(dim=-1)  # [B*N]
 
         candidates = full_draft_tokens.view(bs, N).to(torch.long)
         target_predict_2d = target_predict.view(bs, N).to(torch.long)
-        predicts = torch.full((bs * N,), -1, device=self.device, dtype=torch.int32)
-        accept_index = torch.full(
-            (bs, self.spec_steps + 2), -1, device=self.device, dtype=torch.int32,
+        predicts = torch.empty(
+            bs * N, device=self.device, dtype=torch.int32,
         )
-        accept_token_num = torch.zeros(bs, device=self.device, dtype=torch.int32)
+        accept_index = torch.empty(
+            bs, self.spec_steps + 1,
+            device=self.device, dtype=torch.int32,
+        )
+        accept_token_num = torch.empty(
+            bs, device=self.device, dtype=torch.int32,
+        )
 
         verify_tree_greedy(
             predicts, accept_index, accept_token_num,
@@ -1259,8 +1200,18 @@ class LlamaEagle3Engine:
             retrive_next_sibling.view(bs, N).to(torch.long),
             target_predict_2d,
         )
+        accepted_aux_padded = None
+        verified_ids_padded = None
 
-        return predicts, accept_index, accept_token_num, hidden_states, aux_list
+        return (
+            predicts,
+            accept_index,
+            accept_token_num,
+            hidden_states,
+            aux_list,
+            accepted_aux_padded,
+            verified_ids_padded,
+        )
 
     # ------------------------------------------------------------------
     # Single EAGLE-3 step: draft chain -> tree build -> verify -> accept
@@ -1278,26 +1229,35 @@ class LlamaEagle3Engine:
         if _dbg:
             print(f"[dbg] draft chain done", flush=True)
 
-        # 2. Build tree.
-        seq_lens_cpu_list = [s.t_committed_len for s in seqs]
-        seq_lens = torch.tensor(
-            seq_lens_cpu_list, device=self.device, dtype=torch.long,
-        )
-        seq_lens_sum = sum(seq_lens_cpu_list)
+        # 2. Build tree and the target-verify metadata it depends on.
+        verify_runner = self._target_verify_runner
+        target_inputs = self._prepare_target_verify_inputs(seqs)
+        BN = len(seqs) * self.num_draft_tokens
+        if verify_runner is not None and len(seqs) <= verify_runner.B_max:
+            position_buf = verify_runner.bufs.positions[:BN]
+            page_table_expand_buf = verify_runner.bufs.page_table_expand[:BN]
+            cache_seqlens_expand_buf = verify_runner.bufs.cache_seqlens_expand[:BN]
+        else:
+            position_buf = None
+            page_table_expand_buf = None
+            cache_seqlens_expand_buf = None
         (
-            tree_mask, positions, retrive_index, retrive_next_token,
+            positions, retrive_index, retrive_next_token,
             retrive_next_sibling, full_draft_tokens,
-        ) = build_tree_kernel_efficient(
+            page_table_expand, cache_seqlens_expand,
+        ) = build_tree_kernel_efficient_with_metadata(
             verified_id=verified_id,
             parent_list=parent_list,
             top_scores_index=top_scores_index,
             draft_tokens=draft_tokens,
-            seq_lens=seq_lens,
-            seq_lens_sum=seq_lens_sum,
+            seq_lens=target_inputs["cache_seqlens_prefix"],
+            slot_mapping_draft=target_inputs["slot_t"],
             topk=self.topk,
             spec_steps=self.spec_steps,
             num_verify_tokens=self.num_draft_tokens,
-            tree_mask_mode=TreeMaskMode.FULL_MASK,
+            position_buf=position_buf,
+            page_table_expand_buf=page_table_expand_buf,
+            cache_seqlens_expand_buf=cache_seqlens_expand_buf,
         )
 
         if _dbg:
@@ -1306,9 +1266,11 @@ class LlamaEagle3Engine:
         # 3. Verify.
         (
             predicts, accept_index, accept_token_num, hidden_states, aux_list,
+            accepted_aux_padded, verified_ids_padded,
         ) = self._target_verify(
-            seqs, full_draft_tokens, tree_mask, positions,
+            seqs, full_draft_tokens, positions,
             retrive_index, retrive_next_token, retrive_next_sibling,
+            target_inputs, page_table_expand, cache_seqlens_expand,
         )
         if _dbg:
             print(f"[dbg] verify done, accept_token_num={accept_token_num.tolist()}, "
@@ -1319,6 +1281,11 @@ class LlamaEagle3Engine:
         N = self.num_draft_tokens
         accept_num_cpu = accept_token_num.tolist()
         accept_index_cpu = accept_index.tolist()
+        predicts_cpu = predicts.tolist() if predicts is not None else None
+        verified_ids_cpu = (
+            verified_ids_padded.tolist()
+            if verified_ids_padded is not None else None
+        )
 
         # Remap target K/V so that logical position ``t_committed_len + k``
         # holds the K/V for the k-th accepted token (NOT for the k-th tree
@@ -1327,10 +1294,36 @@ class LlamaEagle3Engine:
         # drafting it is required for correctness.
         self._remap_target_kv_after_verify(seqs, accept_index_cpu, accept_num_cpu)
 
-        if len(aux_list) > 0:
-            aux_cat_full = torch.cat(aux_list, dim=-1)  # [B*N, 3*H_t]
+        accepted_ids_per_seq: list[list[int]] = []
+        flat_accepted_indices: list[int] = []
+        aux_offsets = [0]
+        for i in range(len(seqs)):
+            n_accept = int(accept_num_cpu[i])
+            indices = accept_index_cpu[i][: n_accept + 1]
+            if verified_ids_cpu is not None:
+                accepted_ids_per_seq.append(
+                    [int(x) for x in verified_ids_cpu[i][: n_accept + 1]]
+                )
+            else:
+                accepted_ids_per_seq.append(
+                    [int(predicts_cpu[idx]) for idx in indices]
+                )
+            flat_accepted_indices.extend(indices)
+            aux_offsets.append(len(flat_accepted_indices))
+
+        if accepted_aux_padded is not None:
+            accepted_aux_flat = None
+        elif len(aux_list) > 0:
+            # Only the accepted path feeds the draft extend. Avoid materializing
+            # [B*N, 3H] every step when the accepted set is at most B*(S+1).
+            flat_idx_t = torch.tensor(
+                flat_accepted_indices, device=self.device, dtype=torch.long,
+            )
+            accepted_aux_flat = torch.cat(
+                [a[flat_idx_t] for a in aux_list], dim=-1,
+            )
         else:
-            aux_cat_full = None
+            accepted_aux_flat = None
 
         # Per-seq accepted tokens + aux for the post-verify draft extend.
         accepted_lists: list[list[int]] = []
@@ -1338,8 +1331,7 @@ class LlamaEagle3Engine:
 
         for i, seq in enumerate(seqs):
             n_accept = int(accept_num_cpu[i])  # # accepted SPECULATIVE
-            accepted_indices_flat = accept_index_cpu[i][: n_accept + 1]
-            accepted_ids = [int(predicts[idx]) for idx in accepted_indices_flat]
+            accepted_ids = accepted_ids_per_seq[i]
             seq.token_ids.extend(accepted_ids)
             seq.generated_ids.extend(accepted_ids)
             seq.last_token = accepted_ids[-1]
@@ -1352,16 +1344,17 @@ class LlamaEagle3Engine:
             if new_blocks < old_blocks:
                 released = seq.t_blocks[new_blocks:]
                 self.target_kv.free(released)
-                seq.t_blocks = seq.t_blocks[:new_blocks]
+            seq.t_blocks = seq.t_blocks[:new_blocks]
             seq.t_committed_len = new_committed
 
-            if aux_cat_full is not None:
-                acc_aux = aux_cat_full[
-                    torch.tensor(accepted_indices_flat, device=self.device,
-                                 dtype=torch.long)
+            if accepted_aux_padded is not None:
+                acc_aux = accepted_aux_padded[i, : n_accept + 1]
+                accepted_aux_per_seq.append(acc_aux)
+            elif accepted_aux_flat is not None:
+                acc_aux = accepted_aux_flat[
+                    aux_offsets[i]:aux_offsets[i + 1]
                 ]                                          # [n_accept+1, 3*H_t]
                 accepted_aux_per_seq.append(acc_aux)
-                seq.last_aux = acc_aux[-1].clone()
             else:
                 accepted_aux_per_seq.append(torch.zeros(
                     (len(accepted_ids), self.target_config.hidden_size * 3),
@@ -1404,31 +1397,6 @@ class LlamaEagle3Engine:
                 continue
             acc_ids = accepted_lists[i]
             acc_aux = accepted_aux_per_seq[i]
-            # sglang ``prepare_extend_after_decode``: extend the draft over the
-            # M+1 accepted positions. Input ids are SHIFTED LEFT BY 1, i.e.
-            # for accepted tokens [a_0, a_1, ..., a_M], input = [a_1, ..., a_M, last].
-            # The "last" input is the last accepted token (per
-            # create_extend_after_decode_spec_info, verified_id_data is
-            # accepted_ids[-1] for the next round, but for THIS extend the
-            # input at the final position needs to be the new bonus = a_M).
-            # In sglang's after-decode extend, batch.input_ids = self.verified_id
-            # which contains exactly accept_length per seq slots, with the
-            # LAST slot being the new verified id (= last accepted). So the
-            # input_ids at the M+1 extend positions are [a_0, a_1, ..., a_M].
-            # But that's NOT shifted - matches their `prepare_extend_after_decode`
-            # which sets `batch.input_ids = self.verified_id` directly.
-            #
-            # And `verified_id` is filled per-seq with `verified_id_data` =
-            # the value at `accept_len_cumsum + accept_length - 1` of the
-            # original verified_id buffer. Hmm - that's just the last accepted.
-            # For the EXTEND it actually uses `self.verified_id` after the kernel
-            # which fills it with one entry per seq = last accepted; so the
-            # input at the last extend position is the last accepted. The
-            # earlier positions are filled by the triton kernel writing into
-            # `batch.input_ids` based on the same buffer... let me trust
-            # sglang semantics: input at draft position d_committed_len + j
-            # (j = 0..M) should be accepted_ids[j], and the draft model
-            # then predicts what comes after the LAST accepted token.
             ids = torch.tensor(acc_ids, dtype=torch.int64, device=self.device)
             ext_input_ids.append(ids)
             ext_hiddens.append(acc_aux)
@@ -1458,6 +1426,7 @@ class LlamaEagle3Engine:
         prompts: List[List[int]] | List[str],
         sampling_params: Eagle3SamplingParams | List[Eagle3SamplingParams],
         use_tqdm: bool = False,
+        decode_text: bool = True,
     ) -> List[Eagle3Output]:
         if isinstance(sampling_params, Eagle3SamplingParams):
             sampling_params = [sampling_params] * len(prompts)
@@ -1479,25 +1448,51 @@ class LlamaEagle3Engine:
 
         all_outputs: List[Optional[Eagle3Output]] = [None] * len(prompts)
         idx_pool = list(range(len(prompts)))
+        active: list[tuple[int, _Eagle3Sequence]] = []
         if use_tqdm:
             from tqdm import tqdm
             pbar = tqdm(total=len(prompts), desc="EAGLE-3 generate")
         else:
             pbar = None
 
-        while idx_pool:
-            batch_idx = idx_pool[: self.max_num_seqs]
-            idx_pool = idx_pool[self.max_num_seqs:]
+        def _finalize(seq: _Eagle3Sequence, src_i: int):
+            if seq.t_blocks:
+                self.target_kv.free(seq.t_blocks)
+                seq.t_blocks.clear()
+            if seq.d_blocks:
+                self.draft_kv.free(seq.d_blocks)
+                seq.d_blocks.clear()
+            all_outputs[src_i] = Eagle3Output(
+                prompt_token_ids=seq.prompt_ids,
+                token_ids=list(seq.generated_ids),
+                generated_text=(
+                    self.tokenizer.decode(seq.generated_ids)
+                    if decode_text else ""
+                ),
+            )
+            if pbar is not None:
+                pbar.update(1)
 
-            seqs = [
-                _Eagle3Sequence(
+        def _admit_requests():
+            if not idx_pool or len(active) >= self.max_num_seqs:
+                return
+
+            n_new = min(self.max_num_seqs - len(active), len(idx_pool))
+            batch_idx = idx_pool[:n_new]
+            del idx_pool[:n_new]
+
+            new_pairs: list[tuple[int, _Eagle3Sequence]] = []
+            new_seqs: list[_Eagle3Sequence] = []
+            for i in batch_idx:
+                seq = _Eagle3Sequence(
                     prompt_token_ids[i],
                     sampling_params[i].max_tokens,
                     sampling_params[i].ignore_eos,
                 )
-                for i in batch_idx
-            ]
-            aux_per_seq = self._target_prefill(seqs)
+                new_pairs.append((i, seq))
+                new_seqs.append(seq)
+
+            aux_per_seq = self._target_prefill(new_seqs)
 
             # Initial draft EXTEND on the prompt (sglang's
             # ``forward_draft_extend`` for prefill). Input is the prompt
@@ -1506,47 +1501,48 @@ class LlamaEagle3Engine:
             ext_input_ids: list[torch.Tensor] = []
             ext_hiddens: list[torch.Tensor] = []
             ext_lens: list[int] = []
+            live_pairs: list[tuple[int, _Eagle3Sequence]] = []
             live_for_extend: list[_Eagle3Sequence] = []
-            for i, seq in enumerate(seqs):
+            for i, (src_i, seq) in enumerate(new_pairs):
                 P = len(seq.prompt_ids)
+                if (
+                    (not seq.ignore_eos and seq.last_token == eos_id)
+                    or len(seq.generated_ids) >= seq.max_tokens
+                ):
+                    seq.finished = True
+                    _finalize(seq, src_i)
+                    continue
+
                 ids = list(seq.prompt_ids[1:]) + [seq.last_token]
                 ext_input_ids.append(
                     torch.tensor(ids, dtype=torch.int64, device=self.device)
                 )
                 ext_hiddens.append(aux_per_seq[i])
                 ext_lens.append(P)
+                live_pairs.append((src_i, seq))
                 live_for_extend.append(seq)
+
             if live_for_extend:
                 self._draft_extend(
                     live_for_extend, ext_input_ids, ext_hiddens, ext_lens,
                 )
+                active.extend(live_pairs)
 
-            for seq in seqs:
-                if not seq.ignore_eos and seq.last_token == eos_id:
-                    seq.finished = True
-                if len(seq.generated_ids) >= seq.max_tokens:
-                    seq.finished = True
+        _admit_requests()
+        while active:
+            self._eagle3_step([seq for _, seq in active], eos_id)
 
-            while any(not s.finished for s in seqs):
-                active = [s for s in seqs if not s.finished]
-                self._eagle3_step(active, eos_id)
-
-            for seq, src_i in zip(seqs, batch_idx):
-                if seq.t_blocks:
-                    self.target_kv.free(seq.t_blocks)
-                    seq.t_blocks.clear()
-                if seq.d_blocks:
-                    self.draft_kv.free(seq.d_blocks)
-                    seq.d_blocks.clear()
-                all_outputs[src_i] = Eagle3Output(
-                    prompt_token_ids=seq.prompt_ids,
-                    token_ids=list(seq.generated_ids),
-                    generated_text=self.tokenizer.decode(seq.generated_ids),
-                )
-                if pbar is not None:
-                    pbar.update(1)
+            kept: list[tuple[int, _Eagle3Sequence]] = []
+            for src_i, seq in active:
+                if seq.finished:
+                    _finalize(seq, src_i)
+                else:
+                    kept.append((src_i, seq))
+            active = kept
+            _admit_requests()
 
         if pbar is not None:
             pbar.close()
 
+        assert all(o is not None for o in all_outputs)
         return all_outputs

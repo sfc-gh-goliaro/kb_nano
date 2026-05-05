@@ -13,7 +13,7 @@ benchmark/CI:
   draft  : ``jamesliu1/sglang-EAGLE3-Llama-3.1-Instruct-8B``
            (the "hot-token-id" EAGLE-3 head trained for sglang)
 
-We use real chat-style prompts (random token ids would defeat the purpose of a
+We use fixed chat-style prompts (random token ids would defeat the purpose of a
 spec-decoding benchmark since the draft head has nothing meaningful to predict).
 
 Usage:
@@ -32,6 +32,7 @@ import sys
 from pathlib import Path
 
 import numpy as np
+from transformers import AutoTokenizer
 
 
 # ---------------------------------------------------------------------------
@@ -43,6 +44,10 @@ _PROJECT_ROOT = _PACKAGE_DIR.parent
 
 sys.path.insert(0, str(_PROJECT_ROOT))
 
+from kb_nano.bench.utils.real_prompts import (  # noqa: E402
+    DEFAULT_WORKLOAD_DATASETS,
+    load_real_prompt_workload,
+)
 from kb_nano.bench.utils.worker import run_worker  # noqa: E402
 
 
@@ -64,7 +69,7 @@ def _detect_gpu_name() -> str:
 
 
 # ---------------------------------------------------------------------------
-# EAGLE-3 prompts: real chat-style prompts so spec decoding has signal.
+# EAGLE-3 prompts: fixed chat-style prompts so spec decoding has signal.
 # Roughly mirrors sglang's `scripts/playground/bench_speculative.py`.
 # ---------------------------------------------------------------------------
 PROMPTS = [
@@ -86,6 +91,8 @@ PROMPTS = [
     "Human: Write a Bash one-liner to find the 10 largest files under the current directory and explain it.\n\nAssistant:",
 ]
 
+WILDCHAT_SCENARIOS = ("prefill-heavy", "balanced", "decode-heavy")
+
 
 def _build_prompt_set(num_seqs: int, seed: int) -> list[str]:
     rng = np.random.default_rng(seed)
@@ -98,6 +105,48 @@ def _build_prompt_set(num_seqs: int, seed: int) -> list[str]:
     while len(out) < num_seqs:
         out.extend(pool)
     return out[:num_seqs]
+
+
+def _build_wildchat_scenarios(
+    model: str,
+    scenario_names: list[str],
+    num_seqs: int,
+    seed: int,
+    max_model_len: int,
+) -> list[dict]:
+    tokenizer = AutoTokenizer.from_pretrained(model, trust_remote_code=True)
+    scenarios = []
+    for i, name in enumerate(scenario_names):
+        samples = load_real_prompt_workload(
+            name,
+            tokenizer,
+            num_requests=num_seqs,
+            dataset_name=DEFAULT_WORKLOAD_DATASETS[name],
+            seed=seed + i,
+        )
+        prompt_token_ids = [s.prompt_token_ids for s in samples]
+        output_lens = [s.output_len for s in samples]
+        max_total_len = max(
+            len(p) + ol for p, ol in zip(prompt_token_ids, output_lens)
+        )
+        if max_total_len > max_model_len:
+            raise SystemExit(
+                f"WildChat scenario {name!r} exceeds --max-model-len: "
+                f"{max_total_len} > {max_model_len}"
+            )
+        input_lens = [len(p) for p in prompt_token_ids]
+        scenarios.append({
+            "name": f"wildchat-{name}-{num_seqs}seqs",
+            "dataset": DEFAULT_WORKLOAD_DATASETS[name],
+            "prompt_token_ids": prompt_token_ids,
+            "output_lens": output_lens,
+            "output_len": max(output_lens),
+            "avg_input_len": float(np.mean(input_lens)),
+            "max_input_len": max(input_lens),
+            "avg_output_len": float(np.mean(output_lens)),
+            "max_output_len": max(output_lens),
+        })
+    return scenarios
 
 
 # ---------------------------------------------------------------------------
@@ -153,11 +202,11 @@ def main():
             out.append(ids)
         return out
 
-    def _record_outputs(outputs, prompts):
+    def _record_outputs(outputs, prompts=None, prompt_token_ids=None):
         recs = []
         n_out = 0
         n_in = 0
-        for o, prompt in zip(outputs, prompts):
+        for i, o in enumerate(outputs):
             meta = o.get("meta_info", {}) or {}
             out_ids = list(meta.get("output_token_logprobs") or [])
             if out_ids and isinstance(out_ids[0], (list, tuple)):
@@ -169,8 +218,10 @@ def main():
                 # Fallback to retokenizing the text.
                 out_ids = tok.encode(o.get("text", ""), add_special_tokens=False)
             in_ids = list(meta.get("prompt_tokens_ids") or [])
-            if not in_ids:
-                in_ids = tok.encode(prompt, add_special_tokens=False)
+            if not in_ids and prompt_token_ids is not None:
+                in_ids = list(prompt_token_ids[i])
+            if not in_ids and prompts is not None:
+                in_ids = tok.encode(prompts[i], add_special_tokens=False)
             n_out += len(out_ids)
             n_in += len(in_ids)
             recs.append({"text": o.get("text", ""), "token_ids": out_ids})
@@ -179,14 +230,22 @@ def main():
     scenarios = cfg["scenarios"]
     all_results = []
     for scenario in scenarios:
-        prompts = scenario["prompts"]
-        prompt_token_ids = _tokenize(prompts)
-        output_len = scenario["output_len"]
-        sp = {
-            "temperature": cfg.get("temperature", 0.0),
-            "max_new_tokens": output_len,
-            "ignore_eos": True,
-        }
+        prompts = scenario.get("prompts")
+        if "prompt_token_ids" in scenario:
+            prompt_token_ids = [list(p) for p in scenario["prompt_token_ids"]]
+        else:
+            prompt_token_ids = _tokenize(prompts)
+        output_lens = scenario.get("output_lens")
+        if output_lens is None:
+            output_lens = [scenario["output_len"]] * len(prompt_token_ids)
+        sp = [
+            {
+                "temperature": cfg.get("temperature", 0.0),
+                "max_new_tokens": int(output_len),
+                "ignore_eos": True,
+            }
+            for output_len in output_lens
+        ]
 
         start = time.perf_counter()
         outputs = engine.generate(
@@ -198,7 +257,11 @@ def main():
         )
         elapsed = time.perf_counter() - start
 
-        out_records, n_in, n_out = _record_outputs(outputs, prompts)
+        out_records, n_in, n_out = _record_outputs(
+            outputs,
+            prompts=prompts,
+            prompt_token_ids=prompt_token_ids,
+        )
         all_results.append({
             "name": scenario["name"],
             "elapsed": elapsed,
@@ -303,15 +366,25 @@ def main():
     scenarios = cfg["scenarios"]
     all_results = []
     for scenario in scenarios:
-        prompts = scenario["prompts"]
-        prompt_token_ids = _tokenize(prompts)
-        output_len = scenario["output_len"]
-        sp = Eagle3SamplingParams(max_tokens=output_len, ignore_eos=True)
+        prompts = scenario.get("prompts")
+        if "prompt_token_ids" in scenario:
+            prompt_token_ids = [list(p) for p in scenario["prompt_token_ids"]]
+        else:
+            prompt_token_ids = _tokenize(prompts)
+        output_lens = scenario.get("output_lens")
+        if output_lens is None:
+            output_lens = [scenario["output_len"]] * len(prompt_token_ids)
+        sp = [
+            Eagle3SamplingParams(max_tokens=int(output_len), ignore_eos=True)
+            for output_len in output_lens
+        ]
 
         engine.reset()
         torch.cuda.synchronize()
         start = time.perf_counter()
-        outputs = engine.generate(prompt_token_ids, sp, use_tqdm=True)
+        outputs = engine.generate(
+            prompt_token_ids, sp, use_tqdm=False, decode_text=False,
+        )
         torch.cuda.synchronize()
         elapsed = time.perf_counter() - start
 
@@ -425,21 +498,34 @@ def main():
                         help="Total prompts per throughput scenario.")
     parser.add_argument("--output-len", type=int, default=256,
                         help="Max new tokens per request.")
+    parser.add_argument(
+        "--workload",
+        choices=["fixed", "wildchat"],
+        default="fixed",
+        help="Throughput workload: fixed built-in prompts or WildChat-derived "
+             "HF datasets.",
+    )
+    parser.add_argument(
+        "--scenario",
+        choices=[*WILDCHAT_SCENARIOS, "all"],
+        default="balanced",
+        help="WildChat throughput scenario to run. Ignored for --workload=fixed.",
+    )
     parser.add_argument("--max-model-len", type=int, default=2048)
     parser.add_argument("--seed", type=int, default=42)
     parser.add_argument("--temperature", type=float, default=0.0,
                         help="Sampling temperature (0 = greedy for alignment).")
     parser.add_argument("--latency-iters", type=int, default=5)
     parser.add_argument("--latency-batch-size", type=int, default=1)
-    # The following EAGLE-3 / runtime knobs are intentionally NOT exposed via
-    # --flags. Both engines run with sglang's reference defaults so that
-    # comparisons stay apples-to-apples.
+    # The following EAGLE-3 knobs follow sglang's reference defaults. Runtime
+    # batch/graph limits are exposed below so larger workloads can use a larger
+    # identical batch cap for both engines.
     spec_steps = 3
     spec_topk = 4
-    spec_num_draft_tokens = 16
+    parser.add_argument("--spec-num-draft-tokens", type=int, default=16)
     gpu_memory_utilization = 0.7
-    cuda_graph_max_bs = 8
-    max_running_requests = 8
+    parser.add_argument("--max-running-requests", type=int, default=8)
+    parser.add_argument("--cuda-graph-max-bs", type=int, default=8)
     parser.add_argument("--skip-sglang", action="store_true")
     parser.add_argument("--skip-kb-nano", action="store_true")
     parser.add_argument("--skip-throughput", action="store_true")
@@ -468,10 +554,7 @@ def main():
     args = parser.parse_args()
     args.spec_steps = spec_steps
     args.spec_topk = spec_topk
-    args.spec_num_draft_tokens = spec_num_draft_tokens
     args.gpu_memory_utilization = gpu_memory_utilization
-    args.cuda_graph_max_bs = cuda_graph_max_bs
-    args.max_running_requests = max_running_requests
 
     gpu = _detect_gpu_name()
     if args.output_dir is None:
@@ -483,12 +566,26 @@ def main():
     # Build scenarios.
     scenarios = []
     if not args.skip_throughput:
-        prompts = _build_prompt_set(args.num_seqs, args.seed)
-        scenarios.append({
-            "name": f"eagle3-{args.num_seqs}seqs-out{args.output_len}",
-            "prompts": prompts,
-            "output_len": args.output_len,
-        })
+        if args.workload == "fixed":
+            prompts = _build_prompt_set(args.num_seqs, args.seed)
+            scenarios.append({
+                "name": f"eagle3-{args.num_seqs}seqs-out{args.output_len}",
+                "prompts": prompts,
+                "output_len": args.output_len,
+            })
+        else:
+            scenario_names = (
+                list(WILDCHAT_SCENARIOS)
+                if args.scenario == "all"
+                else [args.scenario]
+            )
+            scenarios.extend(_build_wildchat_scenarios(
+                args.model,
+                scenario_names,
+                args.num_seqs,
+                args.seed,
+                args.max_model_len,
+            ))
 
     latency_scenarios = []
     if not args.skip_latency:
@@ -509,6 +606,9 @@ def main():
     print(f"  Target model           : {args.model}")
     print(f"  Draft  model           : {args.draft_model}")
     print(f"  GPU                    : {gpu}")
+    print(f"  workload               : {args.workload}")
+    if args.workload == "wildchat":
+        print(f"  wildchat scenario      : {args.scenario}")
     print(f"  num_seqs / scenario    : {args.num_seqs}")
     print(f"  output_len             : {args.output_len}")
     print(f"  spec_steps             : {args.spec_steps}")
@@ -597,6 +697,15 @@ def main():
             sg_data = sgl_thr[i] if i < len(sgl_thr) else None
 
             entry = {"scenario": sc["name"], "output_len": sc["output_len"]}
+            for key in (
+                "dataset",
+                "avg_input_len",
+                "max_input_len",
+                "avg_output_len",
+                "max_output_len",
+            ):
+                if key in sc:
+                    entry[key] = sc[key]
             kb_tps_str = "N/A"
             sg_tps_str = "N/A"
             speedup_str = "N/A"
@@ -729,6 +838,8 @@ def main():
             "draft_model": args.draft_model,
             "seed": args.seed,
             "temperature": args.temperature,
+            "workload": args.workload,
+            "wildchat_scenario": args.scenario if args.workload == "wildchat" else None,
             "num_seqs": args.num_seqs,
             "output_len": args.output_len,
             "spec_steps": args.spec_steps,

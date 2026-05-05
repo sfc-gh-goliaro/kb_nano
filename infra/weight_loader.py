@@ -34,12 +34,9 @@ from .tp import _tp_size
 from ..tasks.baseline.L4.llama import LlamaConfig, LlamaForCausalLM
 from ..tasks.baseline.L4.llama_eagle3 import LlamaEagle3Config, LlamaForCausalLMEagle3
 from ..tasks.baseline.L4.llama4 import Llama4Config, Llama4ForCausalLM
-from ..tasks.baseline.L4.mamba import MambaConfig, MambaForCausalLM
-from ..tasks.baseline.L4.mamba2 import Mamba2Config, Mamba2ForCausalLM
 from ..tasks.baseline.L4.mixtral import MixtralConfig, MixtralForCausalLM
 from ..tasks.baseline.L4.qwen2_vl import Qwen2VLConfig, Qwen2VLForConditionalGeneration
 from ..tasks.baseline.L4.qwen3_vl import Qwen3VLConfig, Qwen3VLForConditionalGeneration
-from ..tasks.baseline.L4.deepseek import DeepSeekV3Config, DeepSeekV3ForCausalLM
 from ..tasks.baseline.L4.flux import FluxConfig, FluxPipeline
 from ..tasks.baseline.L4.whisper import WhisperConfig, WhisperForConditionalGeneration
 from ..tasks.baseline.L4.cosyvoice3 import CosyVoice3Config, CosyVoice3ForTTS
@@ -1258,6 +1255,8 @@ def load_model(
             print("  Allocating Qwen3-VL model...")
         model = Qwen3VLForConditionalGeneration(config, quant_config=quant_config)
     elif model_type == "mamba2":
+        from ..tasks.baseline.L4.mamba2 import Mamba2Config, Mamba2ForCausalLM
+
         config = Mamba2Config.from_pretrained(model_path)
         config.dtype = dtype
         print(f"  Allocating Mamba2 model "
@@ -1266,6 +1265,8 @@ def load_model(
               f"groups={config.n_groups}, state={config.state_size})...")
         model = Mamba2ForCausalLM(config)
     elif model_type == "mamba":
+        from ..tasks.baseline.L4.mamba import MambaConfig, MambaForCausalLM
+
         config = MambaConfig.from_pretrained(model_path)
         config.dtype = dtype
         print(f"  Allocating Mamba model "
@@ -1273,6 +1274,8 @@ def load_model(
               f"intermediate={config.intermediate_size}, state={config.state_size})...")
         model = MambaForCausalLM(config)
     elif model_type == "deepseek_v3":
+        from ..tasks.baseline.L4.deepseek import DeepSeekV3Config, DeepSeekV3ForCausalLM
+
         config = DeepSeekV3Config.from_pretrained(model_name)
         config.dtype = dtype
         print(f"  Allocating DeepSeek V3.2 model ({config.n_routed_experts} experts, "

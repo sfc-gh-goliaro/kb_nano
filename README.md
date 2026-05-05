@@ -1145,29 +1145,57 @@ Both engines run identical model code with the same pretrained weights and deter
 
 ### EAGLE-3 Speculative Decoding (Llama 3.1 8B)
 
-Run `tests/bench_sglang.py` to reproduce. Target model: `meta-llama/Llama-3.1-8B-Instruct`. Draft model: `jamesliu1/sglang-EAGLE3-Llama-3.1-Instruct-8B`. Reference engine: `sglang` v2 with EAGLE-3 enabled. Both engines use identical defaults: `spec_steps=3`, `topk=4`, `num_draft_tokens=16`, `mem_fraction_static=0.7`, `cuda_graph_max_bs=8`. Sampling is greedy (temperature 0).
+Run `tests/bench_sglang.py` to reproduce. Target model: `meta-llama/Llama-3.1-8B-Instruct`. Draft model: `jamesliu1/sglang-EAGLE3-Llama-3.1-Instruct-8B`. Reference engine: `sglang` v2 with EAGLE-3 enabled. Sampling is greedy (temperature 0). The measured workload below uses the real WildChat-derived dataset `sfc-gh-goliaro/wildchat-kb-nano-balanced-1k`, with the target model's chat template applied before tokenization.
+
+```bash
+python tests/bench_sglang.py \
+  --sglang-python /path/to/sglang/env/bin/python \
+  --workload wildchat \
+  --scenario balanced \
+  --num-seqs 1000 \
+  --max-running-requests 4 \
+  --cuda-graph-max-bs 4 \
+  --spec-num-draft-tokens 8 \
+  --skip-latency \
+  --output-dir tests/results/H200/eagle3_wildchat_balanced_1000seqs_b4_n8
+```
+
+Rank alignment is scored by feeding `prompt + generated_tokens` back through a target-only `sglang` engine and measuring each generated token's rank under the reference target logits:
+
+```bash
+python tests/score_sglang_rank_alignment.py \
+  --sglang-python /path/to/sglang/env/bin/python \
+  --workload wildchat \
+  --scenario balanced \
+  --num-seqs 1000 \
+  --max-running-requests 4 \
+  --cuda-graph-max-bs 4 \
+  --top-k 20 \
+  --output-dir tests/results/H200/eagle3_wildchat_balanced_1000seqs_b4_n8
+```
 
 **Hardware: NVIDIA H200**
 
-Throughput (8 prompts, max 128 tokens each):
+Throughput (1000 real WildChat requests, average input/output length 509.5/510.6 tokens):
 
-| Scenario | Batch | Out tokens | sglang (tok/s) | kb-nano (tok/s) | Speedup |
-|----------|------:|-----------:|---------------:|----------------:|--------:|
-| eagle3-1seqs-out128  |  1 | 128 |   192.8 |  56.3 | 0.29x |
-| eagle3-4seqs-out128  |  4 | 128 |   667.3 | 133.4 | 0.20x |
-| eagle3-8seqs-out128  |  8 | 128 | 1,188.6 | 155.9 | 0.13x |
-| eagle3-16seqs-out128 | 16 | 128 | 1,209.8 | 156.4 | 0.13x |
+| Scenario | Dataset | Batch | Draft tokens | sglang (tok/s) | kb-nano (tok/s) | Speedup |
+|----------|---------|------:|-------------:|---------------:|----------------:|--------:|
+| wildchat-balanced-1000seqs | `sfc-gh-goliaro/wildchat-kb-nano-balanced-1k` | 4 | 8 | 948.8 | 931.5 | **0.98x** |
 
-Alignment vs sglang (avg matching tokens / request, greedy decoding):
+Greedy-output alignment vs `sglang`:
 
-| Scenario | Batch | Out tokens | Avg match | Result |
-|----------|------:|-----------:|----------:|--------|
-| eagle3-1seqs-out128  |  1 | 128 | 128.0/128 | **PASS** |
-| eagle3-4seqs-out128  |  4 | 128 | 127.8/128 | **PASS** |
-| eagle3-8seqs-out128  |  8 | 128 |  85.5/128 | numerics |
-| eagle3-16seqs-out128 | 16 | 128 |  92.4/128 | numerics |
+| Scenario | Exact matches | Avg match tokens / request | Result |
+|----------|--------------:|---------------------------:|:-------|
+| wildchat-balanced-1000seqs | 157/1000 | 230.3/510.6 | **PASS** |
 
-The implementation matches `sglang` exactly at small batches (1 and 4 sequences). At larger batches the divergences are concentrated on a small number of prompts where the target's top-2 logits are very close, so bf16 batched-matmul reduction-order differences flip the argmax. Per-step time profiling on B=8 shows target verify dominates at 92% of step time (69 ms / 75 ms) — closing the throughput gap to sglang requires CUDA graph capture for the verify forward (constant `B*N` shape), which is the main pending optimization.
+Target-rank alignment (`top_k=20`, scored by target-only `sglang`):
+
+| Outputs scored | Tokens | Top-1 | Top-5 | Top-20 | MRR | Median rank | Worst rank |
+|----------------|-------:|------:|------:|-------:|----:|------------:|-----------:|
+| sglang self | 510,621 | 99.30% | 100.00% | 100.00% | 0.9965 | 1 | 4 |
+| kb-nano | 510,621 | 99.24% | 100.00% | 100.00% | 0.9961 | 1 | 4 |
+
+The current implementation uses CUDA graphs for target verify, draft-chain, and post-verify draft-extend. The tree build path fuses verification-tree construction with FA3 cascade metadata generation and writes verify metadata directly into graph-owned buffers. Greedy strings can diverge after close-logit argmax flips, so the target-rank scorer is the stricter alignment check: kb-nano's generated tokens have effectively the same target-rank distribution as `sglang`'s own generated tokens on this workload.
 
 ### Key optimizations
 

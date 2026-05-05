@@ -264,6 +264,199 @@ void build_tree_kernel_efficient(
   }
 }
 
+__global__ void build_tree_efficient_with_metadata(
+    int64_t* parent_list,
+    int64_t* selected_index,
+    int32_t* verified_seq_len,
+    int64_t* positions,
+    int64_t* retrive_index,
+    int64_t* retrive_next_token,
+    int64_t* retrive_next_sibling,
+    const int32_t* slot_mapping,
+    int32_t* page_table_expand,
+    int32_t* cache_seqlens_expand,
+    int topk,
+    int depth,
+    int draft_token_num) {
+  int bid = blockIdx.x;
+  int tid = threadIdx.x;
+
+  if (tid >= draft_token_num) {
+    return;
+  }
+
+  int seq_len = verified_seq_len[bid];
+  int row = bid * draft_token_num + tid;
+  int row_offset = row * draft_token_num;
+  int slot_offset = bid * draft_token_num;
+  uint32_t attend_mask = 1u;  // root token always attends to itself.
+
+  int position = 0;
+  if (tid == 0) {
+    positions[bid * draft_token_num] = seq_len;
+
+    int retrive_index_offset = bid * draft_token_num;
+    for (int i = draft_token_num - 1; i > 0; --i) {
+      int current_token_idx = retrive_index_offset + i;
+      retrive_index[bid * draft_token_num + i] = current_token_idx;
+      int parent_tb_idx = selected_index[bid * (draft_token_num - 1) + i - 1] / topk;
+      int parent_position = 0;
+      if (parent_tb_idx > 0) {
+        int parent_token_idx = parent_list[bid * (topk * (depth - 1) + 1) + parent_tb_idx];
+        for (; parent_position < draft_token_num; ++parent_position) {
+          if (selected_index[bid * (draft_token_num - 1) + parent_position] == parent_token_idx) {
+            ++parent_position;
+            break;
+          }
+        }
+      }
+      if (parent_position == draft_token_num) {
+        printf(
+            "WARNING: invalid eagle tree!!! Detected a token with no parent token selected. "
+            "Please check if the logprob has nan. The token will be ignored to keep proceeding.\n");
+        continue;
+      }
+
+      if (retrive_next_token[bid * draft_token_num + parent_position] == -1) {
+        retrive_next_token[bid * draft_token_num + parent_position] = i;
+      } else {
+        int origin_next_token = retrive_next_token[bid * draft_token_num + parent_position];
+        retrive_next_token[bid * draft_token_num + parent_position] = i;
+        retrive_next_sibling[bid * draft_token_num + i] = origin_next_token;
+      }
+    }
+    retrive_index[bid * draft_token_num] = bid * draft_token_num;
+  } else {
+    int cur_position = tid - 1;
+    while (true) {
+      position += 1;
+      attend_mask |= (1u << (cur_position + 1));
+      int parent_tb_idx = selected_index[bid * (draft_token_num - 1) + cur_position] / topk;
+      if (parent_tb_idx == 0) {
+        break;
+      }
+
+      int token_idx = parent_list[bid * (topk * (depth - 1) + 1) + parent_tb_idx];
+      for (cur_position = 0; cur_position < draft_token_num; ++cur_position) {
+        if (selected_index[bid * (draft_token_num - 1) + cur_position] == token_idx) {
+          break;
+        }
+      }
+    }
+    positions[bid * draft_token_num + tid] = position + seq_len;
+  }
+
+  int count = 0;
+  for (int col = 0; col < draft_token_num; ++col) {
+    if (attend_mask & (1u << col)) {
+      page_table_expand[row_offset + count] = slot_mapping[slot_offset + col];
+      ++count;
+    }
+  }
+  int fallback_slot = slot_mapping[slot_offset];
+  for (int col = count; col < draft_token_num; ++col) {
+    page_table_expand[row_offset + col] = fallback_slot;
+  }
+  cache_seqlens_expand[row] = count;
+}
+
+void build_tree_kernel_efficient_with_metadata(
+    at::Tensor parent_list,
+    at::Tensor selected_index,
+    at::Tensor verified_seq_len,
+    at::Tensor positions,
+    at::Tensor retrive_index,
+    at::Tensor retrive_next_token,
+    at::Tensor retrive_next_sibling,
+    at::Tensor slot_mapping,
+    at::Tensor page_table_expand,
+    at::Tensor cache_seqlens_expand,
+    int64_t topk,
+    int64_t depth,
+    int64_t draft_token_num) {
+  int bs = verified_seq_len.size(0);
+  dim3 grid(bs);
+  dim3 block(draft_token_num);
+  const cudaStream_t stream = at::cuda::getCurrentCUDAStream();
+
+  build_tree_efficient_with_metadata<<<grid, block, 0, stream>>>(
+      static_cast<int64_t*>(parent_list.data_ptr()),
+      static_cast<int64_t*>(selected_index.data_ptr()),
+      static_cast<int32_t*>(verified_seq_len.data_ptr()),
+      static_cast<int64_t*>(positions.data_ptr()),
+      static_cast<int64_t*>(retrive_index.data_ptr()),
+      static_cast<int64_t*>(retrive_next_token.data_ptr()),
+      static_cast<int64_t*>(retrive_next_sibling.data_ptr()),
+      static_cast<const int32_t*>(slot_mapping.data_ptr()),
+      static_cast<int32_t*>(page_table_expand.data_ptr()),
+      static_cast<int32_t*>(cache_seqlens_expand.data_ptr()),
+      int32_t(topk),
+      int32_t(depth),
+      int32_t(draft_token_num));
+}
+
+__global__ void build_tree_cascade_metadata_kernel(
+    const bool* tree_mask,
+    const int32_t* slot_mapping,
+    int32_t* page_table_expand,
+    int32_t* cache_seqlens_expand,
+    int draft_token_num,
+    int num_rows) {
+  int row = blockIdx.x * blockDim.x + threadIdx.x;
+  if (row >= num_rows) {
+    return;
+  }
+
+  int bid = row / draft_token_num;
+  int row_offset = row * draft_token_num;
+  int slot_offset = bid * draft_token_num;
+  int count = 0;
+
+  for (int col = 0; col < draft_token_num; ++col) {
+    if (tree_mask[row_offset + col]) {
+      page_table_expand[row_offset + count] = slot_mapping[slot_offset + col];
+      ++count;
+    }
+  }
+  int fallback_slot = slot_mapping[slot_offset];
+  for (int col = count; col < draft_token_num; ++col) {
+    page_table_expand[row_offset + col] = fallback_slot;
+  }
+  cache_seqlens_expand[row] = count;
+}
+
+void build_tree_cascade_metadata(
+    at::Tensor tree_mask,
+    at::Tensor slot_mapping,
+    at::Tensor page_table_expand,
+    at::Tensor cache_seqlens_expand,
+    int64_t draft_token_num) {
+  CHECK_INPUT(tree_mask);
+  CHECK_INPUT(slot_mapping);
+  CHECK_INPUT(page_table_expand);
+  CHECK_INPUT(cache_seqlens_expand);
+  CHECK_EQ(tree_mask.scalar_type(), at::ScalarType::Bool);
+  CHECK_EQ(slot_mapping.scalar_type(), at::ScalarType::Int);
+  CHECK_EQ(page_table_expand.scalar_type(), at::ScalarType::Int);
+  CHECK_EQ(cache_seqlens_expand.scalar_type(), at::ScalarType::Int);
+
+  int64_t num_rows = cache_seqlens_expand.numel();
+  CHECK_EQ(tree_mask.numel(), num_rows * draft_token_num);
+  CHECK_EQ(slot_mapping.numel(), num_rows);
+  CHECK_EQ(page_table_expand.numel(), num_rows * draft_token_num);
+
+  const int threads = 128;
+  const dim3 grid(CEILDIV(num_rows, threads));
+  const cudaStream_t stream = at::cuda::getCurrentCUDAStream();
+  build_tree_cascade_metadata_kernel<<<grid, threads, 0, stream>>>(
+      static_cast<const bool*>(tree_mask.data_ptr()),
+      static_cast<const int32_t*>(slot_mapping.data_ptr()),
+      static_cast<int32_t*>(page_table_expand.data_ptr()),
+      static_cast<int32_t*>(cache_seqlens_expand.data_ptr()),
+      int32_t(draft_token_num),
+      int32_t(num_rows));
+}
+
 template <typename IdType, typename IdType2>
 __global__ void VerifyTreeGreedy(
     IdType* predicts,

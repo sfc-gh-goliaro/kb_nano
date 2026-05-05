@@ -43,22 +43,56 @@ import torch.nn as nn
 
 from .merge_state import merge_state
 
+_SGL_FA3_AVAILABLE = False
+_SGL_FA3_WITH_KVCACHE = None
+_SGL_MERGE_STATE_V2 = None
+try:
+    from sgl_kernel import merge_state_v2 as _sgl_merge_state_v2
+    from sgl_kernel.flash_attn import (
+        flash_attn_with_kvcache as _sgl_flash_attn_with_kvcache,
+    )
+    if torch.cuda.is_available():
+        cc = torch.cuda.get_device_capability()
+        if cc[0] == 9:
+            _SGL_FA3_AVAILABLE = True
+            _SGL_FA3_WITH_KVCACHE = _sgl_flash_attn_with_kvcache
+            _SGL_MERGE_STATE_V2 = _sgl_merge_state_v2
+except ImportError:
+    pass
+
 _FA3_AVAILABLE = False
 _FA3_VARLEN_FUNC = None
 try:
-    from vllm.vllm_flash_attn import (
+    from vllm.vllm_flash_attn.flash_attn_interface import (
+        FA3_AVAILABLE as _VLLM_FA3_AVAILABLE,
         flash_attn_varlen_func as _vllm_fa_varlen,
-        is_fa_version_supported,
     )
-    if is_fa_version_supported(3) and torch.cuda.is_available():
+    if _VLLM_FA3_AVAILABLE and torch.cuda.is_available():
         cc = torch.cuda.get_device_capability()
-        if cc[0] >= 9:
+        if cc[0] == 9:
             _FA3_AVAILABLE = True
             _FA3_VARLEN_FUNC = _vllm_fa_varlen
 except ImportError:
     pass
 
 from flash_attn import flash_attn_varlen_func as _FA2_VARLEN_FUNC
+
+
+def _sgl_fa3_paged(q, k_cache, v_cache, cu_seqlens_q, cache_seqlens,
+                   max_seqlen_q, max_seqlen_k, page_table, softmax_scale):
+    out, lse, *_ = _SGL_FA3_WITH_KVCACHE(
+        q=q.contiguous(),
+        k_cache=k_cache,
+        v_cache=v_cache,
+        page_table=page_table,
+        cache_seqlens=cache_seqlens,
+        cu_seqlens_q=cu_seqlens_q,
+        max_seqlen_q=max_seqlen_q,
+        softmax_scale=softmax_scale,
+        causal=False,
+        return_softmax_lse=True,
+    )
+    return out, lse
 
 
 def _fa3_paged(q, k_cache, v_cache, cu_seqlens_q, seqused_k,
@@ -168,6 +202,36 @@ class TreeAttnPrefill(nn.Module):
         kc_blk = k_cache.view(-1, block_size, H_kv, D)
         vc_blk = v_cache.view(-1, block_size, H_kv, D)
 
+        if _SGL_FA3_AVAILABLE:
+            o_prefix, lse_prefix = _sgl_fa3_paged(
+                q, kc_blk, vc_blk,
+                cu_seqlens_q=cu_seqlens_q_prefix,
+                cache_seqlens=cache_seqlens_prefix,
+                max_seqlen_q=max_seqlen_q_prefix,
+                max_seqlen_k=max_seqlen_k_prefix,
+                page_table=block_table_prefix,
+                softmax_scale=scale,
+            )
+
+            kc_tok = k_cache.view(-1, 1, H_kv, D)
+            vc_tok = v_cache.view(-1, 1, H_kv, D)
+            o_expand, lse_expand = _sgl_fa3_paged(
+                q, kc_tok, vc_tok,
+                cu_seqlens_q=cu_seqlens_q_expand,
+                cache_seqlens=cache_seqlens_expand,
+                max_seqlen_q=1,
+                max_seqlen_k=max_seqlen_k_expand,
+                page_table=page_table_expand,
+                softmax_scale=scale,
+            )
+            out, _ = _SGL_MERGE_STATE_V2(
+                o_prefix,
+                lse_prefix.T.contiguous(),
+                o_expand,
+                lse_expand.T.contiguous(),
+            )
+            return out
+
         if _FA3_AVAILABLE:
             o_prefix, lse_prefix = _fa3_paged(
                 q, kc_blk, vc_blk,
@@ -233,10 +297,9 @@ class TreeAttnPrefill(nn.Module):
                 softmax_scale=scale,
             )
 
-        lse_prefix_t = lse_prefix.transpose(0, 1).contiguous()
-        lse_expand_t = lse_expand.transpose(0, 1).contiguous()
         out, _ = merge_state(
-            o_prefix, lse_prefix_t,
-            o_expand, lse_expand_t,
+            o_prefix, lse_prefix,
+            o_expand, lse_expand,
+            lse_head_major=True,
         )
         return out
