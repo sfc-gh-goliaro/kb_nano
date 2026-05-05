@@ -31,7 +31,7 @@ from ..L1.topk_softmax import TopKSoftmax
 from .fused_experts import FusedExperts
 
 
-class JambaSparseMoE(nn.Module):
+class JambaMoE(nn.Module):
     """Jamba sparse MoE FFN: router (Linear, no bias) -> softmax+top-k
     (no renormalise) -> fused expert grouped GEMM.
 

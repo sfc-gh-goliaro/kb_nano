@@ -1,6 +1,6 @@
 #!/usr/bin/env python3
 """
-Throughput, latency, and alignment benchmark: kb-nano JambaEngine vs HF reference.
+Throughput, latency, and alignment benchmark: kb-nano JambaEngine vs vLLM (or HF) reference.
 
 Mirrors the structure of ``tests/bench_fla.py``: each engine runs in its
 own long-lived subprocess that processes all scenarios sequentially,
@@ -275,6 +275,142 @@ if __name__ == "__main__":
 
 
 # ---------------------------------------------------------------------------
+# vLLM reference subprocess worker (preferred reference: continuous batching,
+# paged-KV, CUDA-graph captured decode -- the apples-to-apples SOTA setup vs
+# kb-nano's own continuous-batched JambaEngine)
+# ---------------------------------------------------------------------------
+VLLM_REF_WORKER = r'''
+import json, os, sys, time
+
+
+def main():
+    with open(sys.argv[1]) as f:
+        cfg = json.load(f)
+
+    from vllm import LLM, SamplingParams
+    from vllm.inputs import TokensPrompt
+
+    model_name = cfg["model"]
+    print(f"  [vLLM reference] loading {model_name} (dtype=bfloat16)...", flush=True)
+    t0 = time.time()
+    llm = LLM(
+        model=model_name,
+        dtype="bfloat16",
+        gpu_memory_utilization=cfg.get("ref_gpu_memory_utilization", 0.6),
+        max_model_len=cfg.get("ref_max_model_len") or 4096,
+        max_num_seqs=cfg.get("ref_max_num_seqs", 32),
+        seed=cfg["seed"],
+        trust_remote_code=True,
+        enforce_eager=False,  # vLLM uses CUDA-graph capture by default; keep it
+    )
+    load_s = time.time() - t0
+    print(f"  [vLLM reference] loaded in {load_s:.1f}s", flush=True)
+
+    import torch
+    scenarios = cfg["scenarios"]
+    all_results = []
+    for sc in scenarios:
+        prompts_ids = sc["prompt_token_ids"]
+        out_lens = sc["output_lens"]
+        max_out = max(out_lens) if out_lens else cfg.get("default_output_len", 128)
+
+        # vLLM accepts pre-tokenized prompts via TokensPrompt; per-prompt
+        # SamplingParams so each request honors its own ``max_tokens``.
+        inputs = [TokensPrompt(prompt_token_ids=list(p)) for p in prompts_ids]
+        sp_list = [
+            SamplingParams(temperature=cfg.get("temperature", 0.0),
+                           top_p=1.0, max_tokens=ol, ignore_eos=True)
+            for ol in out_lens
+        ]
+
+        print(
+            f"  [vLLM reference] throughput {sc['name']}: "
+            f"{len(prompts_ids)} requests, max_out={max_out}", flush=True,
+        )
+        torch.cuda.synchronize()
+        t0 = time.perf_counter()
+        outputs = llm.generate(inputs, sp_list, use_tqdm=True)
+        torch.cuda.synchronize()
+        elapsed = time.perf_counter() - t0
+
+        gen_tokens = []
+        gen_texts = []
+        for o in outputs:
+            tok_ids = list(o.outputs[0].token_ids)
+            gen_tokens.append(tok_ids)
+            gen_texts.append(o.outputs[0].text)
+
+        total_in = sum(len(p) for p in prompts_ids)
+        total_out = sum(len(g) for g in gen_tokens)
+        tps = total_out / elapsed if elapsed else 0.0
+        print(
+            f"  [vLLM reference] throughput {sc['name']} done: "
+            f"{elapsed:.2f}s, {tps:,.0f} tok/s", flush=True,
+        )
+        all_results.append({
+            "name": sc["name"],
+            "elapsed": elapsed,
+            "total_prompt_tokens": total_in,
+            "total_output_tokens": total_out,
+            "outputs": [
+                {"text": t, "token_ids": ids}
+                for t, ids in zip(gen_texts, gen_tokens)
+            ],
+        })
+
+    latency_results = []
+    for ls in cfg.get("latency_scenarios", []):
+        prompts_ids = ls["prompt_token_ids"]
+        out_lens = ls["output_lens"]
+        out_len = max(out_lens)
+        bs = len(prompts_ids)
+        inputs = [TokensPrompt(prompt_token_ids=list(p)) for p in prompts_ids]
+        sp_list = [
+            SamplingParams(temperature=cfg.get("temperature", 0.0),
+                           top_p=1.0, max_tokens=ol, ignore_eos=True)
+            for ol in out_lens
+        ]
+        print(
+            f"  [vLLM reference] latency {ls['name']}: bs={bs}, max_out={out_len}",
+            flush=True,
+        )
+        num_warmup = ls.get("num_warmup", 1)
+        num_iters = ls.get("num_iters", 3)
+        for _ in range(num_warmup):
+            llm.generate(inputs, sp_list, use_tqdm=False)
+            torch.cuda.synchronize()
+        latencies = []
+        for _ in range(num_iters):
+            torch.cuda.synchronize()
+            t0 = time.perf_counter()
+            llm.generate(inputs, sp_list, use_tqdm=False)
+            torch.cuda.synchronize()
+            latencies.append(time.perf_counter() - t0)
+        print(
+            f"  [vLLM reference] latency {ls['name']} done: "
+            f"median={sorted(latencies)[len(latencies)//2]:.4f}s",
+            flush=True,
+        )
+        latency_results.append({
+            "name": ls["name"],
+            "batch_size": bs,
+            "input_len": ls["input_len"],
+            "output_len": out_len,
+            "num_iters": num_iters,
+            "latencies": latencies,
+        })
+
+    del llm
+    with open(cfg["output_file"], "w") as f:
+        json.dump({"throughput": all_results, "latency": latency_results}, f)
+
+
+if __name__ == "__main__":
+    main()
+'''
+
+
+# ---------------------------------------------------------------------------
 # kb-nano JambaEngine subprocess worker
 # ---------------------------------------------------------------------------
 KB_NANO_JAMBA_WORKER = r'''
@@ -419,7 +555,7 @@ def _fit_prompt_to_context(
 
 def main():
     parser = argparse.ArgumentParser(
-        description="Throughput & alignment benchmark: kb-nano JambaEngine vs HF reference",
+        description="Throughput & alignment benchmark: kb-nano JambaEngine vs vLLM (or HF) reference",
     )
     parser.add_argument("--model", type=str, default="ai21labs/Jamba-tiny-dev")
     parser.add_argument("--num-seqs", type=int, default=200,
@@ -431,8 +567,29 @@ def main():
     parser.add_argument("--temperature", type=float, default=0.0)
     parser.add_argument("--max-num-seqs", type=int, default=32,
                         help="Max concurrent sequences in JambaEngine.")
-    parser.add_argument("--ref-max-num-seqs", type=int, default=8,
-                        help="Max micro-batch size for the HF reference.")
+    parser.add_argument(
+        "--ref", type=str, choices=["vllm", "hf"], default="vllm",
+        help=(
+            "Reference engine for the bench. 'vllm' (default) runs vLLM's "
+            "production Jamba server (continuous batching, paged-KV, "
+            "flashinfer kernels) — the apples-to-apples SOTA reference. "
+            "'hf' runs HuggingFace transformers' .generate() loop (no "
+            "continuous batching; useful for token-level alignment "
+            "comparisons but not for fair throughput numbers)."
+        ),
+    )
+    parser.add_argument("--ref-max-num-seqs", type=int, default=32,
+                        help="Max concurrent sequences in the reference "
+                             "engine (vLLM continuous-batched scheduler) "
+                             "or max micro-batch (HF .generate). Default "
+                             "32 matches kb-nano's max_num_seqs default.")
+    parser.add_argument("--ref-gpu-memory-utilization", type=float, default=0.6,
+                        help="vLLM-only: fraction of GPU memory vLLM may "
+                             "use. kb-nano runs in a separate subprocess "
+                             "after vLLM exits, so 0.6 is fine.")
+    parser.add_argument("--ref-max-model-len", type=int, default=None,
+                        help="vLLM-only: max_model_len for vLLM. Defaults "
+                             "to the model's max_position_embeddings.")
     parser.add_argument("--max-prompt-tokens", type=int, default=1024,
                         help="Cap each prompt to at most this many tokens "
                              "(left-truncated).")
@@ -543,7 +700,8 @@ def main():
             })
 
     print("=" * 70)
-    print("  kb-nano JambaEngine vs HF reference -- Multi-Scenario Benchmark")
+    ref_name = "vLLM" if args.ref == "vllm" else "HF"
+    print(f"  kb-nano JambaEngine vs {ref_name} reference -- Multi-Scenario Benchmark")
     print("=" * 70)
     print(f"  Model            : {args.model}")
     print(f"  Seqs/scenario    : {args.num_seqs}")
@@ -557,9 +715,17 @@ def main():
     print(f"  GPU              : {gpu}")
     print(f"  Seed             : {args.seed}")
     if not args.skip_ref:
-        ref_label = "HF slow_forward (Python loop)" if args.ref_slow_mamba \
-            else "HF fast Mamba kernels (causal_conv1d + mamba_ssm)"
-        print(f"  HF reference     : {ref_label}")
+        if args.ref == "vllm":
+            ref_label = (
+                f"vLLM {args.ref} (continuous batching, paged KV, "
+                f"max_num_seqs={args.ref_max_num_seqs})"
+            )
+        else:
+            ref_label = (
+                "HF slow_forward (Python loop)" if args.ref_slow_mamba
+                else "HF fast Mamba kernels (causal_conv1d + mamba_ssm)"
+            )
+        print(f"  Reference engine : {ref_label}")
     print(f"  Output dir       : {args.output_dir}")
     if scenario_data:
         print(f"  Throughput       : {', '.join(s['name'] for s in throughput_scenarios)}")
@@ -583,10 +749,18 @@ def main():
     if not args.skip_ref:
         ref_cfg = dict(base_cfg)
         ref_cfg["ref_max_num_seqs"] = args.ref_max_num_seqs
-        ref_cfg["use_mamba_kernels"] = not args.ref_slow_mamba
+        if args.ref == "vllm":
+            ref_cfg["ref_gpu_memory_utilization"] = args.ref_gpu_memory_utilization
+            ref_cfg["ref_max_model_len"] = args.ref_max_model_len
+            worker_src = VLLM_REF_WORKER
+            ref_label_short = f"vLLM reference [{short_name}]"
+        else:
+            ref_cfg["use_mamba_kernels"] = not args.ref_slow_mamba
+            worker_src = HF_REF_WORKER
+            ref_label_short = f"HF reference [{short_name}]"
         ref_raw = run_worker(
-            HF_REF_WORKER, ref_cfg,
-            f"HF reference [{short_name}] all scenarios",
+            worker_src, ref_cfg,
+            f"{ref_label_short} all scenarios",
             timeout=21600,
         )
 
@@ -647,11 +821,11 @@ def main():
             all_results.append(r)
 
         print(f"\n\n{'=' * 100}")
-        print("  THROUGHPUT SUMMARY (kb-nano JambaEngine vs HF reference)")
+        print(f"  THROUGHPUT SUMMARY (kb-nano JambaEngine vs {ref_name} reference)")
         print(f"{'=' * 100}")
         print(
             f"  {'SCENARIO':<16} {'OUT':>5} "
-            f"{'KB-NANO tok/s':>15} {'HF tok/s':>12} {'SPEEDUP':>9} "
+            f"{'KB-NANO tok/s':>15} {f'{ref_name} tok/s':>12} {'SPEEDUP':>9} "
             f"{'AVG MATCH TOKS':>18}"
         )
         print(f"  {'-' * 95}")

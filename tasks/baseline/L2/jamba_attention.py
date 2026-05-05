@@ -75,6 +75,8 @@ class JambaAttention(nn.Module):
         past_value: torch.Tensor | None = None,
         attention_mask: torch.Tensor | None = None,
         cache_writeback: tuple[torch.Tensor, torch.Tensor] | None = None,
+        kv_slab: tuple[torch.Tensor, torch.Tensor] | None = None,
+        slot_pos: torch.Tensor | None = None,
     ) -> torch.Tensor:
         """Forward.
 
@@ -91,9 +93,66 @@ class JambaAttention(nn.Module):
             cache slabs.  When provided, the new (concatenated) K/V are
             copied into ``k_buf[:, :, :T+S, :]`` so the caller can hold
             on to a single growing tensor without per-step alloc.
+        kv_slab : optional ``(k_buf, v_buf)`` of shape
+            ``[B, H_kv, max_total, D]``.  When provided together with
+            ``slot_pos`` and a single-token query (T == 1), this is the
+            **static-shape decode path** used for CUDA-graph capture:
+            the new K/V are written via ``index_copy_`` at ``slot_pos``,
+            attention is computed against the **full** slab, and the
+            caller's ``attention_mask`` is responsible for masking out
+            the unused (future) positions and any left-pad keys.
+        slot_pos : 0-d int64 tensor.  Position in ``kv_slab`` where the
+            new token's K/V should be written.  Required iff ``kv_slab``
+            is given.
         """
         b, t, _ = hidden_states.shape
 
+        # ------------------------------------------------------------------
+        # Static-shape decode path (CUDA-graph friendly).
+        # ------------------------------------------------------------------
+        if kv_slab is not None and slot_pos is not None and t == 1:
+            k_slab, v_slab = kv_slab  # [B, H_kv, max_total, D]
+
+            q = self.q_proj(hidden_states).view(b, 1, self.num_heads, self.head_dim)
+            k = self.k_proj(hidden_states).view(b, 1, self.num_kv_heads, self.head_dim)
+            v = self.v_proj(hidden_states).view(b, 1, self.num_kv_heads, self.head_dim)
+
+            # Move to [B, H_kv, 1, D] before writing into the slab.
+            k = k.transpose(1, 2)
+            v = v.transpose(1, 2)
+
+            # In-place write at slot_pos.  ``index_copy_`` accepts a 1-d
+            # index tensor, so we view the 0-d scalar as 1-d.  This is
+            # CUDA-graph safe: the index tensor's storage is fixed; the
+            # caller mutates its **value** in-place between replays.
+            slot_idx_1d = slot_pos.view(1)
+            k_slab.index_copy_(2, slot_idx_1d, k)
+            v_slab.index_copy_(2, slot_idx_1d, v)
+
+            # Attention against the full slab.  The caller-supplied mask
+            # is what enforces "ignore positions >= cur_len" and the
+            # original left-padding -- it is shape [B, 1, 1, max_total].
+            k_full = self._repeat_kv(k_slab, self.num_kv_groups)
+            v_full = self._repeat_kv(v_slab, self.num_kv_groups)
+
+            # DenseAttention wants [B, T, H, D].
+            q_ = q.contiguous()
+            k_ = k_full.transpose(1, 2).contiguous()
+            v_ = v_full.transpose(1, 2).contiguous()
+            out = self.attn(
+                q_, k_, v_,
+                softmax_scale=self.scaling, attn_mask=attention_mask,
+            )
+            out = out.contiguous().view(b, 1, self.num_heads * self.head_dim)
+            # Returning the slab views keeps the caller-side interface
+            # parallel with the eager path.  The caller can ignore them
+            # (the slab has already been mutated in place).
+            return self.o_proj(out), k_slab, v_slab
+
+        # ------------------------------------------------------------------
+        # Eager (variable-shape) path -- prefill or backwards-compatible
+        # decode when the caller hasn't pre-allocated a static slab.
+        # ------------------------------------------------------------------
         q = self.q_proj(hidden_states).view(b, t, self.num_heads, self.head_dim)
         k = self.k_proj(hidden_states).view(b, t, self.num_kv_heads, self.head_dim)
         v = self.v_proj(hidden_states).view(b, t, self.num_kv_heads, self.head_dim)

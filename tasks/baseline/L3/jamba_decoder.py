@@ -39,7 +39,7 @@ We keep the standard ``[B, T, hidden]`` layout end-to-end.
 
 L1 ops used: ``RMSNorm`` (full hidden_size, multiple of 32, safe path).
 L2 ops used: ``JambaAttention``, ``JambaMambaMixer``, ``JambaMLP``,
-             ``JambaSparseMoE``.
+             ``JambaMoE``.
 """
 
 from __future__ import annotations
@@ -51,12 +51,12 @@ from ..L1.rms_norm import RMSNorm
 from ..L2.jamba_attention import JambaAttention
 from ..L2.jamba_mamba_mixer import JambaMambaMixer
 from ..L2.jamba_mlp import JambaMLP
-from ..L2.jamba_moe import JambaSparseMoE
+from ..L2.jamba_moe import JambaMoE
 
 
 def _make_feed_forward(config, num_experts: int) -> nn.Module:
     if num_experts > 1:
-        return JambaSparseMoE(
+        return JambaMoE(
             hidden_size=config.hidden_size,
             intermediate_size=config.intermediate_size,
             num_experts=num_experts,
@@ -87,6 +87,8 @@ class JambaAttentionDecoderLayer(nn.Module):
         past_key: torch.Tensor | None = None,
         past_value: torch.Tensor | None = None,
         cache_writeback: tuple[torch.Tensor, torch.Tensor] | None = None,
+        kv_slab: tuple[torch.Tensor, torch.Tensor] | None = None,
+        slot_pos: torch.Tensor | None = None,
     ) -> tuple[torch.Tensor, torch.Tensor | None, torch.Tensor | None]:
         residual = hidden_states
         hidden_states = self.input_layernorm(hidden_states)
@@ -95,6 +97,8 @@ class JambaAttentionDecoderLayer(nn.Module):
             past_key=past_key, past_value=past_value,
             attention_mask=attention_mask,
             cache_writeback=cache_writeback,
+            kv_slab=kv_slab,
+            slot_pos=slot_pos,
         )
         hidden_states = residual + hidden_states
 

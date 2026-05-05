@@ -6,7 +6,7 @@ Implementation matches Llama-style SwiGLU exactly:
 
     down(silu(gate(x)) * up(x))
 
-Layer-uniform with :class:`JambaSparseMoE`: both expose ``forward(x) -> y``
+Layer-uniform with :class:`JambaMoE`: both expose ``forward(x) -> y``
 with the same shape so the L3 decoder can switch between them based on
 ``layers_num_experts[layer_idx]``.
 

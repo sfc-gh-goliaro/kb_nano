@@ -196,6 +196,13 @@ class JambaModel(nn.Module):
         attn_past_kv: list[tuple[torch.Tensor, torch.Tensor] | None] | None = None,
         attn_cache_writeback: list[tuple[torch.Tensor, torch.Tensor] | None] | None = None,
         attn_mask_4d: torch.Tensor | None = None,
+        # Static-shape decode path (CUDA-graph friendly).  When
+        # ``attn_kv_slabs`` is provided, the per-layer KV is held in a
+        # fixed-shape ``[B, H_kv, max_total, D]`` slab and the new
+        # token's K/V are written at ``attn_slot_pos`` via ``index_copy_``.
+        # Mutually exclusive with ``attn_past_kv``/``attn_cache_writeback``.
+        attn_kv_slabs: list[tuple[torch.Tensor, torch.Tensor]] | None = None,
+        attn_slot_pos: torch.Tensor | None = None,
         # Mamba-side cache + metadata.  Each is a *list* parallel to
         # ``mamba_layer_indices`` so per-layer state is independent.
         mamba_conv_states: list[torch.Tensor] | None = None,
@@ -231,17 +238,27 @@ class JambaModel(nn.Module):
 
         for layer in self.layers:
             if isinstance(layer, JambaAttentionDecoderLayer):
-                pkv = attn_past_kv[attn_idx]
-                writeback = attn_cache_writeback[attn_idx]
-                past_k = pkv[0] if pkv is not None else None
-                past_v = pkv[1] if pkv is not None else None
-                hidden_states, new_k, new_v = layer(
-                    hidden_states,
-                    attention_mask=attn_mask_4d,
-                    past_key=past_k,
-                    past_value=past_v,
-                    cache_writeback=writeback,
-                )
+                if attn_kv_slabs is not None:
+                    # Static-shape decode path.
+                    k_slab, v_slab = attn_kv_slabs[attn_idx]
+                    hidden_states, new_k, new_v = layer(
+                        hidden_states,
+                        attention_mask=attn_mask_4d,
+                        kv_slab=(k_slab, v_slab),
+                        slot_pos=attn_slot_pos,
+                    )
+                else:
+                    pkv = attn_past_kv[attn_idx]
+                    writeback = attn_cache_writeback[attn_idx]
+                    past_k = pkv[0] if pkv is not None else None
+                    past_v = pkv[1] if pkv is not None else None
+                    hidden_states, new_k, new_v = layer(
+                        hidden_states,
+                        attention_mask=attn_mask_4d,
+                        past_key=past_k,
+                        past_value=past_v,
+                        cache_writeback=writeback,
+                    )
                 attn_kv_outputs.append((new_k, new_v))
                 attn_idx += 1
             else:
