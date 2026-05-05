@@ -252,10 +252,7 @@ class MRotaryEmbedding(nn.Module):
             self.mrope_interleaved,
         )
 
-        query.copy_(q_flat.view_as(query))
-        key.copy_(k_flat.view_as(key))
-
-        return query, key
+        return q_flat.view_as(query), k_flat.view_as(key)
 
     def _apply_interleaved(self, x):
         """Reorganize from [TTT...HHH...WWW] to interleaved [THWTHW...]."""
