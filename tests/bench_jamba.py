@@ -7,11 +7,18 @@ own long-lived subprocess that processes all scenarios sequentially,
 avoiding repeated model loading.
 
 The reference engine is HuggingFace transformers' ``JambaForCausalLM``
-driven via ``.generate()``.  We use HF rather than vLLM because vLLM's
-Jamba path requires causal-conv1d (a separate wheel), which is not
-available in this environment.  vLLM otherwise gives roughly identical
-generations under greedy decoding -- HF's ``slow_forward`` Mamba path
-matches vLLM token-for-token at low temperatures.
+driven via ``.generate()``.  By default we use HF's *fast* Mamba kernel
+path (``use_mamba_kernels=True``), which dispatches to the same
+``causal_conv1d_*`` / ``selective_*`` kernels that kb-nano consumes as
+L1 ops.  This is the fair reference: both sides are pinned to the same
+underlying CUDA primitives, and the only difference is the pipeline
+wiring (kb-nano's flat-varlen JambaEngine vs HF's per-step
+``.generate``).  Pass ``--ref-slow-mamba`` to fall back to HF's pure
+PyTorch ``slow_forward`` (Python-loop) path -- only useful for
+debugging / numerical comparison, not for honest perf claims.
+
+vLLM Jamba would be a stronger reference but requires its own
+serving setup; in this environment HF is the supported path.
 
 Usage:
     python tests/bench_jamba.py --model ai21labs/Jamba-tiny-dev
@@ -87,17 +94,16 @@ import torch
 from transformers import AutoConfig, AutoTokenizer, JambaForCausalLM
 
 
-def _load_jamba_ref(model_name, dtype, device):
-    # Jamba 4.57.6 forces fast_kernels when available (selective_scan_fn,
-    # selective_state_update from mamba_ssm + causal_conv1d_fn/update from
-    # the causal-conv1d wheel).  causal-conv1d is not installable on this
-    # environment (CUDA 13 / torch 12.8 mismatch), so we explicitly turn
-    # off use_mamba_kernels and rely on the slow PyTorch path.  HF's
-    # slow_forward is mathematically identical to the fast path under
-    # greedy decoding (temp=0).  This is the strongest reference we
-    # have without a working causal-conv1d wheel.
+def _load_jamba_ref(model_name, dtype, device, use_mamba_kernels=True):
+    # By default HF uses its fused Mamba CUDA path (selective_scan_fn /
+    # selective_state_update from mamba_ssm + causal_conv1d_fn / update
+    # from causal_conv1d).  These are the same kernels kb-nano calls as
+    # L1 ops, so the perf comparison is a fair pipeline-vs-pipeline
+    # measurement.  ``use_mamba_kernels=False`` forces HF down its
+    # Python-loop ``slow_forward`` -- not a fair perf reference, only
+    # useful for debugging numerical drift.
     config = AutoConfig.from_pretrained(model_name)
-    config.use_mamba_kernels = False
+    config.use_mamba_kernels = use_mamba_kernels
     model = JambaForCausalLM.from_pretrained(
         model_name, config=config, torch_dtype=dtype,
         attn_implementation="sdpa",
@@ -153,8 +159,15 @@ def main():
     model_name = cfg["model"]
     micro_batch = cfg.get("ref_max_num_seqs", 8)
 
-    print(f"  [HF reference] loading {model_name}...", flush=True)
-    model = _load_jamba_ref(model_name, dtype, device)
+    use_mamba_kernels = cfg.get("use_mamba_kernels", True)
+    print(
+        f"  [HF reference] loading {model_name} "
+        f"(use_mamba_kernels={use_mamba_kernels})...",
+        flush=True,
+    )
+    model = _load_jamba_ref(
+        model_name, dtype, device, use_mamba_kernels=use_mamba_kernels,
+    )
     tokenizer = AutoTokenizer.from_pretrained(model_name, trust_remote_code=True)
     if tokenizer.pad_token_id is None and tokenizer.eos_token_id is not None:
         tokenizer.pad_token_id = tokenizer.eos_token_id
@@ -427,6 +440,15 @@ def main():
                         help="Cap each scenario's output_len to this value.")
     parser.add_argument("--skip-ref", action="store_true",
                         help="Skip the HF reference (kb-nano only)")
+    parser.add_argument(
+        "--ref-slow-mamba", action="store_true",
+        help=(
+            "Force HF to use its Python-loop slow_forward Mamba path "
+            "(use_mamba_kernels=False).  Useful for debugging numerical "
+            "drift; NOT a fair perf reference, since slow_forward runs a "
+            "Python loop per token instead of a fused CUDA kernel."
+        ),
+    )
     parser.add_argument("--skip-throughput", action="store_true")
     parser.add_argument("--skip-latency", action="store_true")
     parser.add_argument("--latency-iters", type=int, default=3)
@@ -534,6 +556,10 @@ def main():
     print(f"  Temperature      : {args.temperature}")
     print(f"  GPU              : {gpu}")
     print(f"  Seed             : {args.seed}")
+    if not args.skip_ref:
+        ref_label = "HF slow_forward (Python loop)" if args.ref_slow_mamba \
+            else "HF fast Mamba kernels (causal_conv1d + mamba_ssm)"
+        print(f"  HF reference     : {ref_label}")
     print(f"  Output dir       : {args.output_dir}")
     if scenario_data:
         print(f"  Throughput       : {', '.join(s['name'] for s in throughput_scenarios)}")
@@ -557,6 +583,7 @@ def main():
     if not args.skip_ref:
         ref_cfg = dict(base_cfg)
         ref_cfg["ref_max_num_seqs"] = args.ref_max_num_seqs
+        ref_cfg["use_mamba_kernels"] = not args.ref_slow_mamba
         ref_raw = run_worker(
             HF_REF_WORKER, ref_cfg,
             f"HF reference [{short_name}] all scenarios",
