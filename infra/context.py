@@ -160,6 +160,19 @@ class Context:
     mamba_state: object = None
     mamba_metadata: object = None
 
+    # --- Jamba-specific fields (hybrid attention + Mamba + MoE).
+    # Jamba uses a dense-batched left-padded KV layout rather than the
+    # generic paged ``Attention``'s ``k_cache``/``v_cache`` slabs, so it
+    # needs its own per-step metadata.  ``jamba_attn_metadata`` is a
+    # ``JambaAttnMetadata`` dataclass (defined alongside the engine)
+    # carrying the per-batch KV slabs, slot position, attention mask,
+    # and per-layer past/writeback views read by every
+    # ``JambaAttention`` in its forward pass.  Mamba layers in Jamba
+    # consume the standard ``mamba_state`` / ``mamba_metadata`` fields
+    # above (Jamba uses a Mamba-v1-style flat-varlen mixer).
+    jamba_attn_metadata: object = None
+    jamba_mamba_metadata: object = None
+
 
 # Global module registry populated once at model init; copied into each
 # Context so compiled custom ops can resolve their target modules.
@@ -298,6 +311,30 @@ def set_mamba_context(
         mamba_state=mamba_state,
         mamba_metadata=mamba_metadata,
         no_compile_layers=_STATIC_NO_COMPILE_LAYERS,
+    )
+
+
+def set_jamba_context(
+    is_prefill: bool,
+    jamba_attn_metadata,
+    jamba_mamba_metadata,
+):
+    """Install per-step Jamba metadata (attention + Mamba) on the global Context.
+
+    Jamba is a hybrid model with a dense-batched left-padded KV layout
+    for its attention layers and a flat-varlen Mamba state for its
+    Mamba layers.  Both kinds of layers read their per-step state from
+    this Context inside their forward pass -- mirroring the
+    ``set_context`` (paged attention) / ``set_mamba_context`` (Mamba)
+    split used elsewhere, but combined into a single helper because
+    every Jamba forward runs both layer kinds.
+    """
+    global _CONTEXT
+    _CONTEXT = Context(
+        is_prefill=is_prefill,
+        no_compile_layers=_STATIC_NO_COMPILE_LAYERS,
+        jamba_attn_metadata=jamba_attn_metadata,
+        jamba_mamba_metadata=jamba_mamba_metadata,
     )
 
 

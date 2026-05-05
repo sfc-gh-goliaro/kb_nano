@@ -21,6 +21,14 @@ decode use the *same* flat-varlen layout into the Mamba kernels
 (query_start_loc, cache_indices) so we reuse vLLM's SOTA Mamba
 kernels directly.
 
+Per-step KV / Mamba state is published on the global ``Context``
+(``infra/context.py``) via ``set_jamba_context`` and consumed by
+:class:`L2.jamba_attention.JambaAttention` and
+:class:`L2.jamba_mamba_mixer.JambaMambaMixer` -- the same pattern used
+by Llama (``set_context``) and Mamba / Mamba2 (``set_mamba_context``).
+This keeps Jamba's ``forward`` signature aligned with the rest of the
+codebase: ``model(input_ids, positions)`` returns hidden states.
+
 Tensor parallel: NOT supported -- single-GPU only.  Open Jamba models
 fit on a B200 (Jamba-tiny-dev = 318M, Jamba-v0.1 = 52B).
 """
@@ -33,6 +41,8 @@ from dataclasses import dataclass, field
 
 import numpy as np
 import torch
+
+from .context import reset_context, set_jamba_context
 
 # Re-export the same SamplingParams / GenerationOutput dataclasses the
 # rest of the codebase uses.  We import them lazily because
@@ -62,6 +72,66 @@ except ImportError:  # pragma: no cover -- minimal-deps fallback
         logits_history: list | None = None
 
 __all__ = ["JambaEngine", "SamplingParams", "GenerationOutput"]
+
+
+# ---------------------------------------------------------------------------
+# Per-step Jamba metadata.  These are the dataclasses installed on the
+# global ``Context`` by ``set_jamba_context`` and consumed by the L2
+# attention / Mamba mixers in their forward pass.  Fields chosen to
+# parallel vLLM's ``ForwardContext.attn_metadata`` (per-layer slabs,
+# slot mapping, mask) and ``mamba_state`` / ``mamba_metadata`` (state
+# slot indices, prefill/decode split).
+# ---------------------------------------------------------------------------
+@dataclass
+class JambaAttnMetadata:
+    """Per-step attention metadata for Jamba.
+
+    Two paths share this dataclass:
+
+    * **Static-shape decode** (CUDA-graph friendly).  ``kv_slabs`` is a
+      list (one entry per attention layer) of ``(k_buf, v_buf)`` of
+      shape ``[B, H_kv, max_total, D]``; ``slot_pos`` is a 0-d int64
+      tensor whose value is the position the new token writes to;
+      ``attn_mask_4d`` is shape ``[B, 1, 1, max_total]`` and is
+      mutated in-place between graph replays to unmask one new key
+      position per step.  ``past_kv`` and ``cache_writeback`` are
+      ``None`` in this path.
+
+    * **Eager (variable shape)** prefill or non-graph decode.
+      ``kv_slabs`` is ``None``; ``past_kv`` holds per-layer
+      ``(past_k, past_v)`` slabs that get concatenated to the new
+      tokens; ``cache_writeback`` optionally provides a per-layer
+      ``(k_buf, v_buf)`` to copy the concat result into; the mask is
+      ``[B, 1, T_q, T_q+T_past]``.
+    """
+    attn_mask_4d: torch.Tensor | None = None
+    # Static-shape decode path
+    kv_slabs: list[tuple[torch.Tensor, torch.Tensor]] | None = None
+    slot_pos: torch.Tensor | None = None
+    # Eager path
+    past_kv: list[tuple[torch.Tensor, torch.Tensor] | None] | None = None
+    cache_writeback: list[tuple[torch.Tensor, torch.Tensor] | None] | None = None
+
+
+@dataclass
+class JambaMambaMetadata:
+    """Per-step Mamba metadata for Jamba.
+
+    Mirrors vLLM ``Mamba1AttentionMetadata`` (fields named to match the
+    flat-varlen kernel API).  Per-layer state slabs are owned by the
+    engine; layer indices on the mixer pick which slab to consume.
+
+    ``conv_states[i]``: ``[num_slots, intermediate, K-1]`` with
+                       ``stride(intermediate) == 1``.
+    ``ssm_states[i]``:  ``[num_slots, intermediate, ssm_state_size]``.
+    """
+    conv_states: list[torch.Tensor]
+    ssm_states: list[torch.Tensor]
+    cache_indices: torch.Tensor          # int32 [num_seqs]
+    is_decode: bool = True
+    query_start_loc: torch.Tensor | None = None    # int32 [num_seqs+1] (prefill)
+    has_initial_state: torch.Tensor | None = None  # bool [num_seqs] (prefill)
+    pad_mask_flat: torch.Tensor | None = None      # bool [total_tokens] (prefill)
 
 
 # ---------------------------------------------------------------------------
@@ -258,6 +328,12 @@ class JambaEngine:
         step_input_ids = torch.zeros(
             (batch_size, 1), dtype=torch.long, device=device,
         )
+        # Positions: not used by Jamba mixers (no RoPE; Mamba carries
+        # position via recurrence) but produced anyway to keep the
+        # forward signature uniform with Llama / Mamba.
+        step_positions = torch.zeros(
+            (batch_size, 1), dtype=torch.long, device=device,
+        )
         slot_pos = torch.zeros(1, dtype=torch.long, device=device)
         # Mask is initialised in ``_run_batch`` per-batch (because it
         # depends on the prompt-padding pattern).  We allocate it here
@@ -273,6 +349,7 @@ class JambaEngine:
             "ssm_states": ssm_states,
             "cache_indices": cache_indices,
             "step_input_ids": step_input_ids,
+            "step_positions": step_positions,
             "slot_pos": slot_pos,
             "decode_mask": decode_mask,
             "next_tokens": next_tokens,
@@ -293,32 +370,51 @@ class JambaEngine:
           3. Unmask position ``cur_len - 1`` in ``decode_mask`` (set to 0).
           4. Replay the graph.
           5. (Async) read ``next_tokens`` into a host history buffer.
+
+        Build the per-step ``JambaAttnMetadata`` / ``JambaMambaMetadata``
+        ONCE up front (their tensor identities are stable -- only their
+        contents are mutated between replays) and install them on the
+        global ``Context`` via ``set_jamba_context`` *inside* the
+        captured region, the same way ``infra/engine.py`` calls
+        ``set_mamba_context`` inside its ``capture_mamba_cudagraph``
+        capture region.
         """
         if self._decode_graph is not None:
             return self._decode_graph
 
         bufs = self._get_or_alloc_static_buffers()
 
+        attn_meta = JambaAttnMetadata(
+            attn_mask_4d=bufs["decode_mask"],
+            kv_slabs=bufs["kv_slabs"],
+            slot_pos=bufs["slot_pos"],
+        )
+        mamba_meta = JambaMambaMetadata(
+            conv_states=bufs["conv_states"],
+            ssm_states=bufs["ssm_states"],
+            cache_indices=bufs["cache_indices"],
+            is_decode=True,
+        )
+
         # Closure: one decode step, fully static-shape.
         def _decode_step():
-            hidden, _ = self.model(
-                input_ids=bufs["step_input_ids"],
-                attn_kv_slabs=bufs["kv_slabs"],
-                attn_slot_pos=bufs["slot_pos"],
-                attn_mask_4d=bufs["decode_mask"],
-                mamba_conv_states=bufs["conv_states"],
-                mamba_ssm_states=bufs["ssm_states"],
-                mamba_cache_indices=bufs["cache_indices"],
-                mamba_query_start_loc=None,
-                mamba_has_initial_state=None,
-                mamba_is_decode=True,
-                mamba_pad_mask_flat=None,
+            set_jamba_context(
+                is_prefill=False,
+                jamba_attn_metadata=attn_meta,
+                jamba_mamba_metadata=mamba_meta,
             )
-            logits = self.model.compute_logits(hidden[:, -1, :])
-            tok = logits.argmax(dim=-1)
-            # Write into the persistent buffer.  Must be in-place so the
-            # graph's output tensor identity is fixed.
-            bufs["next_tokens"].copy_(tok)
+            try:
+                hidden = self.model(
+                    bufs["step_input_ids"],
+                    bufs["step_positions"],
+                )
+                logits = self.model.compute_logits(hidden[:, -1, :])
+                tok = logits.argmax(dim=-1)
+                # Write into the persistent buffer.  Must be in-place so
+                # the graph's output tensor identity is fixed.
+                bufs["next_tokens"].copy_(tok)
+            finally:
+                reset_context()
 
         # Warmup outside the graph-capture stream to populate workspace
         # tensors / autotune caches.  vLLM does this in ``_dummy_run``.
@@ -339,11 +435,6 @@ class JambaEngine:
         # the previous graph's reserved pool.
         torch.cuda.empty_cache()
 
-        # Each (batch_size, max_total) gets its OWN private graph pool.
-        # Sharing a pool across distinct decode shapes is unsafe: the
-        # captured graphs' workspace tensors can alias and produce
-        # ``illegal memory access`` on replay.  vLLM solves this with a
-        # dedicated ``MemoryPool`` per shape bucket; we mirror that.
         graph = torch.cuda.CUDAGraph()
         with torch.cuda.graph(graph):
             _decode_step()
@@ -402,8 +493,6 @@ class JambaEngine:
         ssm_states: list[torch.Tensor] = []
         K_minus_1 = max(self._mamba_conv_kernel - 1, 1)
         for _ in range(self._n_mamba_layers):
-            # Allocate [B, K-1, intermediate] and transpose to
-            # [B, intermediate, K-1].  This makes stride(intermediate) = 1.
             raw_conv = torch.zeros(
                 batch_size, K_minus_1, self._mamba_intermediate,
                 dtype=self.dtype, device=self.device,
@@ -487,6 +576,19 @@ class JambaEngine:
             pbar.close()
         return outputs  # type: ignore[return-value]
 
+    @staticmethod
+    def _make_positions(B: int, T: int, device, attention_mask=None) -> torch.Tensor:
+        """Build a ``[B, T]`` positions tensor.  Jamba's mixers ignore
+        positions (no RoPE; Mamba carries position via recurrence) but
+        we produce them anyway so the forward signature aligns with
+        Llama / Mamba / Mixtral.
+        """
+        if attention_mask is not None:
+            # HF-style: positions = cumsum(mask) - 1, clamped at 0 for pads.
+            pos = attention_mask.long().cumsum(dim=-1) - 1
+            return pos.clamp_(min=0)
+        return torch.arange(T, dtype=torch.long, device=device).unsqueeze(0).expand(B, T)
+
     @torch.inference_mode()
     def _run_batch(
         self,
@@ -555,21 +657,32 @@ class JambaEngine:
         mamba_has_init = torch.zeros(B, dtype=torch.bool, device=device)
         mamba_pad_flat = attention_mask.bool().reshape(-1)
 
-        hidden, _ = self.model(
-            input_ids=input_ids,
-            attn_past_kv=None,
-            attn_cache_writeback=attn_writeback,
-            attn_mask_4d=attn_mask_4d,
-            mamba_conv_states=conv_states,
-            mamba_ssm_states=ssm_states,
-            mamba_cache_indices=cache_indices,
-            mamba_query_start_loc=mamba_qsl_p,
-            mamba_has_initial_state=mamba_has_init,
-            mamba_is_decode=False,
-            mamba_pad_mask_flat=mamba_pad_flat,
-        )
+        positions = self._make_positions(B, max_prompt, device, attention_mask)
 
-        logits = self.model.compute_logits(hidden[:, -1, :])
+        attn_meta_p = JambaAttnMetadata(
+            attn_mask_4d=attn_mask_4d,
+            past_kv=None,
+            cache_writeback=attn_writeback,
+        )
+        mamba_meta_p = JambaMambaMetadata(
+            conv_states=conv_states,
+            ssm_states=ssm_states,
+            cache_indices=cache_indices,
+            is_decode=False,
+            query_start_loc=mamba_qsl_p,
+            has_initial_state=mamba_has_init,
+            pad_mask_flat=mamba_pad_flat,
+        )
+        set_jamba_context(
+            is_prefill=True,
+            jamba_attn_metadata=attn_meta_p,
+            jamba_mamba_metadata=mamba_meta_p,
+        )
+        try:
+            hidden = self.model(input_ids, positions)
+            logits = self.model.compute_logits(hidden[:, -1, :])
+        finally:
+            reset_context()
         next_tokens = self._sample_step(logits, sampling_params)
 
         generated: list[list[int]] = [[] for _ in range(B)]
@@ -598,6 +711,9 @@ class JambaEngine:
                 [[generated[i][-1]] for i in range(B)],
                 dtype=torch.long, device=device,
             )
+            step_positions = torch.full(
+                (B, 1), cur_len - 1, dtype=torch.long, device=device,
+            )
             past_kv = [
                 (kv[0][:, :, :cur_len - 1, :], kv[1][:, :, :cur_len - 1, :])
                 for kv in kv_slabs
@@ -608,20 +724,27 @@ class JambaEngine:
             ]
             decode_mask = decode_key_mask_full[:, :, :, :cur_len]
 
-            hidden, _ = self.model(
-                input_ids=step_ids,
-                attn_past_kv=past_kv,
-                attn_cache_writeback=writeback,
+            attn_meta_d = JambaAttnMetadata(
                 attn_mask_4d=decode_mask,
-                mamba_conv_states=conv_states,
-                mamba_ssm_states=ssm_states,
-                mamba_cache_indices=cache_indices,
-                mamba_query_start_loc=None,
-                mamba_has_initial_state=None,
-                mamba_is_decode=True,
-                mamba_pad_mask_flat=None,
+                past_kv=past_kv,
+                cache_writeback=writeback,
             )
-            logits = self.model.compute_logits(hidden[:, -1, :])
+            mamba_meta_d = JambaMambaMetadata(
+                conv_states=conv_states,
+                ssm_states=ssm_states,
+                cache_indices=cache_indices,
+                is_decode=True,
+            )
+            set_jamba_context(
+                is_prefill=False,
+                jamba_attn_metadata=attn_meta_d,
+                jamba_mamba_metadata=mamba_meta_d,
+            )
+            try:
+                hidden = self.model(step_ids, step_positions)
+                logits = self.model.compute_logits(hidden[:, -1, :])
+            finally:
+                reset_context()
             next_tokens = self._sample_step(logits, sampling_params)
             for i, t in enumerate(next_tokens):
                 if finished[i]:
@@ -667,8 +790,6 @@ class JambaEngine:
 
         # ---- Pad prompts up to B_pad with a dummy sequence ----
         if B < B_pad:
-            # Pad with copies of the first prompt's input_ids.  The
-            # padding rows are computed but their outputs are dropped.
             input_ids = self._pad_to_b(input_ids, B_pad, pad_id)
             attention_mask = self._pad_to_b(attention_mask, B_pad, 0)
 
@@ -709,20 +830,32 @@ class JambaEngine:
         mamba_has_init = torch.zeros(B_pad, dtype=torch.bool, device=device)
         mamba_pad_flat = attention_mask.bool().reshape(-1)
 
-        hidden, _ = self.model(
-            input_ids=input_ids,
-            attn_past_kv=None,
-            attn_cache_writeback=attn_writeback,
+        positions = self._make_positions(B_pad, max_prompt, device, attention_mask)
+
+        attn_meta_p = JambaAttnMetadata(
             attn_mask_4d=attn_mask_4d_p,
-            mamba_conv_states=conv_states,
-            mamba_ssm_states=ssm_states,
-            mamba_cache_indices=cache_indices,
-            mamba_query_start_loc=mamba_qsl_p,
-            mamba_has_initial_state=mamba_has_init,
-            mamba_is_decode=False,
-            mamba_pad_mask_flat=mamba_pad_flat,
+            past_kv=None,
+            cache_writeback=attn_writeback,
         )
-        prefill_logits = self.model.compute_logits(hidden[:, -1, :])
+        mamba_meta_p = JambaMambaMetadata(
+            conv_states=conv_states,
+            ssm_states=ssm_states,
+            cache_indices=cache_indices,
+            is_decode=False,
+            query_start_loc=mamba_qsl_p,
+            has_initial_state=mamba_has_init,
+            pad_mask_flat=mamba_pad_flat,
+        )
+        set_jamba_context(
+            is_prefill=True,
+            jamba_attn_metadata=attn_meta_p,
+            jamba_mamba_metadata=mamba_meta_p,
+        )
+        try:
+            hidden = self.model(input_ids, positions)
+            prefill_logits = self.model.compute_logits(hidden[:, -1, :])
+        finally:
+            reset_context()
         first_tok = prefill_logits.argmax(dim=-1)  # [B_pad]
 
         # ---- Initialise the static decode mask ----

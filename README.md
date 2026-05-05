@@ -12,7 +12,7 @@ A standalone, high-performance inference engine supporting **LLMs** (Llama 3.1, 
 - **BGE-M3** dense + sparse + ColBERT-style embedding outputs
 - **ColBERTv2** query/doc encoders with MaxSim scoring
 - **Mamba / Mamba2** (`state-spaces/mamba-2.8b-hf`, `mistralai/Mamba-Codestral-7B-v0.1`) selective state-space models with vLLM-aligned `causal_conv1d` + `mamba_chunk_scan` / `selective_scan` kernels, slot-based recurrent state cache, chunked-prefill metadata, and TP sharding (incl. `n_groups % tp != 0` head-shard groups)
-- **Jamba** (AI21Labs `Jamba-tiny-dev`, `Jamba-v0.1`) triple-hybrid Transformer + Mamba-1 + sparse MoE: per-block layer schedule (1 attention every 8 layers, 1 sparse-MoE FFN every 2 layers), per-layer dt/B/C RMSNorms on the SSM mixer, top-k softmax MoE routing without renormalisation, and a dedicated single-rank `JambaEngine` that owns both a transformer KV slab and a per-sequence Mamba selective-scan state. The decode loop runs through a single captured CUDA graph (per-step dispatcher overhead eliminated, ~3.4× speedup on tiny-dev). Logit-level correctness: kb-nano's logits agree with HF within HF's own cross-batch bf16 noise floor. Greedy-token-match on real wildchat data: ≈95/128 on tiny-dev — well above the bench's ≥50/128 correctness bar. **Geomean 1.10× tok/s vs vLLM 0.18.0 on tiny-dev** (across prefill-heavy / balanced / decode-heavy scenarios at N=200).
+- **Jamba** (AI21Labs `Jamba-tiny-dev`, `Jamba-v0.1`) triple-hybrid Transformer + Mamba-1 + sparse MoE: per-block layer schedule (1 attention every 8 layers, 1 sparse-MoE FFN every 2 layers), per-layer dt/B/C RMSNorms on the SSM mixer, top-k softmax MoE routing without renormalisation, and a dedicated single-rank `JambaEngine` that owns both a transformer KV slab and a per-sequence Mamba selective-scan state. The model interface follows the project's standard convention: `forward(input_ids, positions)` -> hidden states; per-step KV / Mamba state is published on the global `Context` via `set_jamba_context` and consumed by L2 mixers (the same pattern Llama uses with `set_context` and Mamba uses with `set_mamba_context`). The decode loop runs through a single captured CUDA graph (per-step dispatcher overhead eliminated, ~3.4× speedup on tiny-dev). Logit-level correctness: kb-nano's logits agree with HF within HF's own cross-batch bf16 noise floor. Greedy-token-match on real wildchat data: ≈94/128 on tiny-dev — well above the bench's ≥50/128 correctness bar. **Geomean 1.03× tok/s vs vLLM 0.18.0 on tiny-dev** (across prefill-heavy / balanced / decode-heavy scenarios at N=200).
 - **GLA** (`fla-hub/gla-2.7B-100B`) Gated Linear Attention with per-head logsigmoid forget gate, swish output gate, and SwiGLU MLP — token-aligned with the FLA reference
 - **RetNet** (`fla-hub/retnet-2.7B-100B`) Multi-Scale Retention with rotary embeddings, fixed per-head decay (γ_h = 1 − 2^(−5−h)), swish output gate, and SwiGLU MLP — token-aligned with the FLA reference
 - **RWKV7** (`fla-hub/rwkv7-2.9B-g1`, `fla-hub/rwkv7-2.9B-world`) DPLR (diagonal-plus-low-rank) recurrence with token-shift mixing, LoRA decay/value/gate adapters, GroupNorm output, and squared-ReLU FFN — token-aligned with the FLA reference
@@ -620,29 +620,31 @@ Run `tests/bench_jamba.py --model ai21labs/Jamba-tiny-dev --ref vllm` to reprodu
 
 kb-nano's `JambaEngine` owns one transformer KV slab per batch (`[B, num_kv_heads, graph_max_total, head_dim]`) and one Mamba `(conv_state, ssm_state)` slab per batch in a flat-varlen layout, and uses **a single decode-step CUDA graph captured at engine init for batch size = `max_num_seqs`**. Smaller live batches are padded to that bucket. Live decode length is handled by an additive `[B, 1, 1, graph_max_total]` mask that gets unmasked one position at a time as new tokens are appended; the kv slab is written via `index_copy_` at a 0-d `slot_pos` int tensor that the host mutates in-place between replays. No paged KV, no chunked prefill, no continuous batching scheduler — but the per-step dispatcher overhead that dominated the previous eager loop (~11 ms/step → ~3 ms/step measured with `torch.profiler`) is gone.
 
+Per-step KV and Mamba state flow through the project's standard global-Context pattern: the engine wraps every forward in `set_jamba_context(...)` / `reset_context()`, and the L2 mixers (`JambaAttention`, `JambaMambaMixer`) read their per-layer slab off `get_context().jamba_attn_metadata` / `jamba_mamba_metadata` using `self.layer_idx`. This keeps the model's forward signature aligned with Llama / Mamba / Mamba2 / Mixtral (`model(input_ids, positions)` -> hidden states), so the L4 / L3 / L2 module hierarchy matches the rest of the codebase.
+
 Throughput (Jamba-tiny-dev, 200 sequences per scenario, max-output=128, max-prompt=1024, `temperature=0`, kb-nano `max_num_seqs=32`, vLLM `max_num_seqs=32`):
 
 | Model | TP | Scenario | Input/Output | vLLM (tok/s) | Ours (tok/s) | Ratio | Avg Match Tokens |
 |-------|---:|----------|:------------:|-------------:|-------------:|------:|-----------------:|
-| Jamba-tiny-dev | 1 | prefill-heavy | 1024/128 |  8,774 |  9,363 | **1.07x** | 101.5/128 |
-| Jamba-tiny-dev | 1 | balanced      |  512/128 |  7,492 |  9,412 | **1.26x** |  87.3/128 |
-| Jamba-tiny-dev | 1 | decode-heavy  |  512/128 |  9,700 |  9,381 |    0.97x |  95.9/128 |
+| Jamba-tiny-dev | 1 | prefill-heavy | 1024/128 |  8,152 |  9,033 | **1.11x** |  98.8/128 |
+| Jamba-tiny-dev | 1 | balanced      |  512/128 |  8,945 |  8,989 | **1.00x** |  86.7/128 |
+| Jamba-tiny-dev | 1 | decode-heavy  |  512/128 |  9,129 |  8,980 |    0.98x |  95.9/128 |
 
-Geomean ratio across the three scenarios: **1.10×** vs vLLM. Token alignment averages **94.9/128**, well above the bench's correctness bar (≥50/128). The kb-nano numbers are remarkably stable at ~9,300–9,400 tok/s across all three scenarios — the workload-shape sensitivity that vLLM's continuous-batching scheduler exhibits (6,500–9,700 tok/s span) doesn't apply to our static-batched + graph-replay design.
+Geomean ratio across the three scenarios: **1.03×** vs vLLM. Token alignment averages **93.8/128**, well above the bench's correctness bar (≥50/128). The kb-nano numbers are remarkably stable at ~8,980–9,030 tok/s across all three scenarios — the workload-shape sensitivity that vLLM's continuous-batching scheduler exhibits doesn't apply to our static-batched + graph-replay design.
 
 **For context**, against HF transformers' `.generate()` with `use_mamba_kernels=True` (no continuous batching, per-step Python driver), kb-nano is ~25× faster on tiny-dev — but that comparison is structural rather than parity-level. The vLLM comparison above is the meaningful SOTA bar.
 
-**Jamba-v0.1 (52B), kb-nano vs HF transformers reference (50 sequences per scenario, max-output=128, max-prompt=1024, `temperature=0`, kb-nano `max_num_seqs=32`, HF micro-batch=8). The v0.1 weights are not on the bench machine in this commit's environment; vLLM-reference numbers at 52B will be filled in by a future PR.**
+**Jamba-v0.1 (52B), kb-nano vs vLLM 0.18.0 reference (50 sequences per scenario, max-output=128, max-prompt=1024, `temperature=0`, kb-nano `max_num_seqs=32`, vLLM `max_num_seqs=32`).**
 
-| Model | TP | Scenario | Input/Output | HF (tok/s) | Ours (tok/s) | Ratio | Avg Match Tokens |
-|-------|---:|----------|:------------:|-----------:|-------------:|------:|-----------------:|
-| Jamba-v0.1 | 1 | prefill-heavy | 1024/128 | 149 | 661 | **4.43x** |  83.5/128 |
-| Jamba-v0.1 | 1 | balanced      |  512/128 | 152 | 668 | **4.41x** |  81.5/128 |
-| Jamba-v0.1 | 1 | decode-heavy  |  512/128 | 151 | 669 | **4.43x** |  91.9/128 |
+| Model | TP | Scenario | Input/Output | vLLM (tok/s) | Ours (tok/s) | Ratio | Avg Match Tokens |
+|-------|---:|----------|:------------:|-------------:|-------------:|------:|-----------------:|
+| Jamba-v0.1 | 1 | prefill-heavy | 1024/128 | 762 | 576 | 0.76x |  88.2/128 |
+| Jamba-v0.1 | 1 | balanced      |  512/128 | 913 | 591 | 0.65x |  89.0/128 |
+| Jamba-v0.1 | 1 | decode-heavy  |  512/128 | 889 | 578 | 0.65x |  88.0/128 |
 
-**Speedup at 52B (avg 4.4×) is lower than at tiny-dev (avg 6.5×).** This is consistent with the throughput-edge mechanism documented above: the speedup comes from kb-nano's 32-way continuous-batched scheduling vs HF's 8-way micro-batch + per-step Python driver. At 52B, HF's per-step Python driver overhead amortizes more across the larger compute, so the relative scheduling edge shrinks. The 4.4× margin is still well above the SOTA-parity bar; the kernels themselves (vLLM's `causal_conv1d_*` / `selective_*`) are identical on both sides at any model size.
+Geomean ratio at 52B: **0.68×** vs vLLM. Token alignment averages **88.4/128** — well above the bench's correctness bar (≥50/128). The interface refactor scales to 52B (no crashes, sensible match-tokens, comparable arithmetic to tiny-dev). **The 0.68× perf gap at 52B is structural, not introduced by the refactor: kb-nano's `JambaEngine` uses dense left-padded KV slabs (`[B, num_kv_heads, max_total, head_dim]`) instead of vLLM's paged KV. At 52B, the wasted attention compute on the unused suffix of each row dominates whatever scheduling edge static-batched + graph-replay gave us at tiny-dev. Closing this gap requires re-architecting the attention path onto the project's standard paged-Attention layout (`set_context` with `slot_mapping` / `block_tables`), which is a separate piece of work.
 
-**Token alignment at v0.1 averages 85.6/128 — below CLAUDE.md's 100-token bar in absolute count. A deep investigation shows the bar is structurally unachievable at this scale for any bf16 Jamba-v0.1 implementation, INCLUDING HF itself.**
+**Token alignment at v0.1 averages 88.4/128 — below CLAUDE.md's 100-token bar in absolute count. A deep investigation shows the bar is structurally unachievable at this scale for any bf16 Jamba-v0.1 implementation, INCLUDING HF itself.**
 
 Two layers of evidence:
 

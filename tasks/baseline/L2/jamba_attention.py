@@ -9,9 +9,10 @@ ordering of attention layers; no positional embedding is applied to Q
 or K.
 
 Layout: works with HuggingFace-style batched ``[B, T, hidden]`` input,
-emits ``[B, T, hidden]`` output.  KV cache is owned by the engine
-(``JambaCacheView``) and passed as ``past_key`` / ``past_value`` slabs
-that we concatenate to the new K / V before the attention call.
+emits ``[B, T, hidden]`` output.  KV cache is owned by the engine and
+read from the global ``Context`` (populated via ``set_jamba_context``),
+matching the project's ``set_context`` / ``get_context()`` convention
+used by Llama / Mamba / Mamba2 / Mixtral.
 
 L1 ops: ``Linear`` (q/k/v/o projections), ``DenseAttention`` (kernel
 launch).  No ``F.linear``/``F.scaled_dot_product_attention`` leak.
@@ -22,6 +23,7 @@ from __future__ import annotations
 import torch
 import torch.nn as nn
 
+from ....infra.context import get_context
 from ..L1.dense_attention import DenseAttention
 from ..L1.linear import Linear
 
@@ -33,6 +35,7 @@ class JambaAttention(nn.Module):
         num_attention_heads: int,
         num_key_value_heads: int,
         head_dim: int | None = None,
+        layer_idx: int = 0,
     ):
         super().__init__()
         self.hidden_size = hidden_size
@@ -41,6 +44,7 @@ class JambaAttention(nn.Module):
         self.head_dim = head_dim or (hidden_size // num_attention_heads)
         self.num_kv_groups = num_attention_heads // num_key_value_heads
         self.scaling = self.head_dim ** -0.5
+        self.layer_idx = layer_idx
 
         self.q_proj = Linear(
             hidden_size, num_attention_heads * self.head_dim, bias=False,
@@ -70,48 +74,44 @@ class JambaAttention(nn.Module):
 
     def forward(
         self,
-        hidden_states: torch.Tensor,
-        past_key: torch.Tensor | None = None,
-        past_value: torch.Tensor | None = None,
-        attention_mask: torch.Tensor | None = None,
-        cache_writeback: tuple[torch.Tensor, torch.Tensor] | None = None,
-        kv_slab: tuple[torch.Tensor, torch.Tensor] | None = None,
-        slot_pos: torch.Tensor | None = None,
+        positions: torch.Tensor | None,    # unused (no RoPE); kept for
+                                            # signature parity with Llama.
+        hidden_states: torch.Tensor,        # [B, T, hidden]
     ) -> torch.Tensor:
-        """Forward.
+        """Forward.  Reads per-step KV state and attention mask from the
+        global ``Context`` populated by the engine's ``set_jamba_context``.
 
-        Parameters
-        ----------
-        hidden_states : [B, T, hidden]
-        past_key / past_value : [B, H_kv, S, D] (S = number of cached
-            tokens) or None for the first call.
-        attention_mask : optional additive mask of shape ``[B, 1, T, T+S]``
-            (broadcast over heads).  Standard HF semantics: 0 for valid
-            positions, ``-inf`` (or large negative) for masked.  Caller
-            handles causality there.
-        cache_writeback : optional ``(k_buf, v_buf)`` pre-allocated
-            cache slabs.  When provided, the new (concatenated) K/V are
-            copied into ``k_buf[:, :, :T+S, :]`` so the caller can hold
-            on to a single growing tensor without per-step alloc.
-        kv_slab : optional ``(k_buf, v_buf)`` of shape
-            ``[B, H_kv, max_total, D]``.  When provided together with
-            ``slot_pos`` and a single-token query (T == 1), this is the
-            **static-shape decode path** used for CUDA-graph capture:
-            the new K/V are written via ``index_copy_`` at ``slot_pos``,
-            attention is computed against the **full** slab, and the
-            caller's ``attention_mask`` is responsible for masking out
-            the unused (future) positions and any left-pad keys.
-        slot_pos : 0-d int64 tensor.  Position in ``kv_slab`` where the
-            new token's K/V should be written.  Required iff ``kv_slab``
-            is given.
+        Two modes are dispatched off ``ctx.jamba_attn_metadata``:
+
+          * **Static-shape decode** (CUDA-graph friendly).  ``meta.kv_slabs``
+            is a list of ``(k_buf, v_buf)`` of shape
+            ``[B, H_kv, max_total, D]``.  The new K/V are written via
+            ``index_copy_`` at ``meta.slot_pos`` and attention is
+            computed against the **full** slab; ``meta.attn_mask_4d``
+            masks out future and pad positions.
+
+          * **Eager (variable shape)** prefill / decode.  ``meta.past_kv``
+            holds per-layer ``(past_k, past_v)`` slabs that we
+            concatenate to the new tokens; ``meta.cache_writeback``
+            optionally provides a pre-allocated ``(k_buf, v_buf)`` to
+            copy the concat result into.
         """
+        ctx = get_context()
+        meta = ctx.jamba_attn_metadata
+        assert meta is not None, (
+            "JambaAttention.forward called without a JambaAttnMetadata "
+            "installed on the global Context (use set_jamba_context)."
+        )
+
         b, t, _ = hidden_states.shape
 
         # ------------------------------------------------------------------
         # Static-shape decode path (CUDA-graph friendly).
         # ------------------------------------------------------------------
-        if kv_slab is not None and slot_pos is not None and t == 1:
-            k_slab, v_slab = kv_slab  # [B, H_kv, max_total, D]
+        if meta.kv_slabs is not None and t == 1:
+            k_slab, v_slab = meta.kv_slabs[self.layer_idx]
+            slot_pos = meta.slot_pos
+            attention_mask = meta.attn_mask_4d
 
             q = self.q_proj(hidden_states).view(b, 1, self.num_heads, self.head_dim)
             k = self.k_proj(hidden_states).view(b, 1, self.num_kv_heads, self.head_dim)
@@ -144,15 +144,23 @@ class JambaAttention(nn.Module):
                 softmax_scale=self.scaling, attn_mask=attention_mask,
             )
             out = out.contiguous().view(b, 1, self.num_heads * self.head_dim)
-            # Returning the slab views keeps the caller-side interface
-            # parallel with the eager path.  The caller can ignore them
-            # (the slab has already been mutated in place).
-            return self.o_proj(out), k_slab, v_slab
+            return self.o_proj(out)
 
         # ------------------------------------------------------------------
-        # Eager (variable-shape) path -- prefill or backwards-compatible
-        # decode when the caller hasn't pre-allocated a static slab.
+        # Eager (variable-shape) path -- prefill or non-graph decode.
         # ------------------------------------------------------------------
+        past_key = past_value = None
+        if meta.past_kv is not None:
+            pkv = meta.past_kv[self.layer_idx]
+            if pkv is not None:
+                past_key, past_value = pkv
+
+        cache_writeback = None
+        if meta.cache_writeback is not None:
+            cache_writeback = meta.cache_writeback[self.layer_idx]
+
+        attention_mask = meta.attn_mask_4d
+
         q = self.q_proj(hidden_states).view(b, t, self.num_heads, self.head_dim)
         k = self.k_proj(hidden_states).view(b, t, self.num_kv_heads, self.head_dim)
         v = self.v_proj(hidden_states).view(b, t, self.num_kv_heads, self.head_dim)
@@ -186,8 +194,6 @@ class JambaAttention(nn.Module):
         # diagonal incorrectly, so callers are expected to pass either
         # a proper mask or rely on T_q==1 + the trivial diagonal.
         if attention_mask is None:
-            # T_q == T_kv => causal=True is correct.
-            # T_q < T_kv  => decode step, all KV positions are visible.
             causal = (q_.size(1) == k_.size(1))
             out = self.attn(q_, k_, v_, softmax_scale=self.scaling, causal=causal)
         else:
@@ -196,4 +202,4 @@ class JambaAttention(nn.Module):
 
         # [B, T, H, D] -> [B, T, hidden]
         out = out.contiguous().view(b, t, self.num_heads * self.head_dim)
-        return self.o_proj(out), k, v
+        return self.o_proj(out)

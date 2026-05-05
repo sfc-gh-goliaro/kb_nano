@@ -21,13 +21,16 @@ Key differences from the plain Mamba v1 mixer
     on every forward.
   * Tensor parallel removed: targeted at single-GPU :class:`JambaEngine`.
 
+Forward signature: ``forward(positions, hidden_states)`` -- matches the
+project's ``(positions, hidden_states)`` mixer convention used by
+Llama / Mamba / Mamba2.  Per-step Mamba state and metadata are read
+from the global ``Context`` (populated by ``set_jamba_context``); the
+mixer reaches into it for its per-layer slab using ``self.layer_idx``.
+
 L1 ops used (no torch.nn.functional or external libs leaked into L2):
 
   - ``L1.linear.Linear``                   -- in_proj, x_proj, dt_proj, out_proj
   - ``L1.rms_norm_native.RMSNormNative``   -- dt/B/C layernorms
-  - ``L1.silu.SiLU``                       -- (the SSM kernel applies the
-                                              gate's silu internally; SiLU is
-                                              imported for explicitness only)
   - vLLM ``causal_conv1d_*`` / ``selective_*``  -- single-kernel L1 ops in our
                                                    taxonomy: each is one CUDA
                                                    kernel launch.
@@ -47,6 +50,7 @@ from vllm.model_executor.layers.mamba.ops.mamba_ssm import (
     selective_state_update,
 )
 
+from ....infra.context import get_context
 from ..L1.linear import Linear
 from ..L1.rms_norm_native import RMSNormNative
 
@@ -54,27 +58,19 @@ from ..L1.rms_norm_native import RMSNormNative
 class JambaMambaMixer(nn.Module):
     """Mamba v1 mixer with Jamba's per-layer dt/B/C RMSNorms.
 
-    Forward expects a *flat varlen* layout that the engine builds:
+    Forward signature is ``(positions, hidden_states)`` matching the
+    project's mixer convention.  The mixer reads ``conv_state`` /
+    ``ssm_state`` (per-layer) and the per-batch metadata
+    (``query_start_loc``, ``cache_indices``, ``has_initial_state``,
+    ``is_decode``, ``mamba_pad_mask``) from the global ``Context``
+    populated by the engine via ``set_jamba_context``.
 
-      hidden_states_flat: ``[total_tokens, hidden_size]``
+    Input is ``[B, T, hidden]``; we reshape to flat ``[total_tokens,
+    hidden]`` internally, run the vLLM Mamba kernels, then reshape back
+    to ``[B, T, hidden]`` on output.
 
-      ``query_start_loc``: int32 ``[num_seqs + 1]`` with cumulative
-                            token starts (in prefill).  ``None`` in
-                            decode.
-      ``cache_indices``:   int32 ``[num_seqs]`` -- which slot in
-                            ``conv_state`` / ``ssm_state`` each seq owns.
-      ``has_initial_state``: bool ``[num_seqs]`` -- True iff this seq
-                              already has prior conv/ssm state in its slot.
-      ``conv_state``:       fp16/bf16 ``[num_slots, intermediate, K-1]``
-      ``ssm_state``:        fp16/bf16 ``[num_slots, intermediate, ssm_state_size]``
-      ``mode``:             ``"prefill"`` or ``"decode"`` -- decode uses
-                              the single-token kernels and ignores
-                              ``query_start_loc``.
-
-    The mixer mutates ``conv_state`` / ``ssm_state`` in place at the
-    given slot indices (vLLM kernels do this internally).
-
-    Output: ``[total_tokens, hidden_size]``.
+    The mixer mutates the per-layer ``conv_state`` / ``ssm_state`` slabs
+    in place at the given slot indices (vLLM kernels do this internally).
     """
 
     def __init__(
@@ -184,21 +180,46 @@ class JambaMambaMixer(nn.Module):
 
     def forward(
         self,
-        hidden_states: torch.Tensor,        # [total_tokens, hidden_size]
-        conv_state: torch.Tensor,           # [num_slots, intermediate, K-1]
-        ssm_state: torch.Tensor,            # [num_slots, intermediate, ssm_state_size]
-        cache_indices: torch.Tensor,        # int32 [num_seqs]
-        query_start_loc: torch.Tensor | None,   # int32 [num_seqs + 1] (prefill only)
-        has_initial_state: torch.Tensor | None,  # bool [num_seqs] (prefill only)
-        is_decode: bool,
-        mamba_pad_mask: torch.Tensor | None = None,  # bool [total_tokens] -- True for valid
+        positions: torch.Tensor | None,    # unused (Mamba handles position
+                                            # via recurrence); kept for
+                                            # mixer-uniform signature.
+        hidden_states: torch.Tensor,        # [B, T, hidden]
     ) -> torch.Tensor:
-        """Mamba v1 selective-scan forward over a flat varlen batch.
+        """Mamba v1 selective-scan forward.
 
-        Returns ``[total_tokens, hidden_size]``.
+        Reads per-step state from the global ``Context``:
+
+          - ``meta.conv_states[layer_idx]``: ``[num_slots, intermediate, K-1]``
+          - ``meta.ssm_states[layer_idx]``:  ``[num_slots, intermediate, ssm_state_size]``
+          - ``meta.cache_indices``:           int32 ``[num_seqs]``
+          - ``meta.query_start_loc``:         int32 ``[num_seqs+1]`` (prefill only)
+          - ``meta.has_initial_state``:       bool  ``[num_seqs]`` (prefill only)
+          - ``meta.is_decode``:               bool
+          - ``meta.pad_mask_flat``:           bool ``[total_tokens]`` (prefill only)
+
+        Returns ``[B, T, hidden]``.
         """
+        ctx = get_context()
+        meta = ctx.jamba_mamba_metadata
+        assert meta is not None, (
+            "JambaMambaMixer.forward called without a JambaMambaMetadata "
+            "installed on the global Context (use set_jamba_context)."
+        )
+
+        conv_state = meta.conv_states[self.layer_idx]
+        ssm_state = meta.ssm_states[self.layer_idx]
+        cache_indices = meta.cache_indices
+        query_start_loc = meta.query_start_loc
+        has_initial_state = meta.has_initial_state
+        is_decode = meta.is_decode
+        mamba_pad_mask = meta.pad_mask_flat
+
+        # ``hidden_states`` arrives as [B, T, hidden]; reshape to flat.
+        b, t, d = hidden_states.shape
+        flat = hidden_states.reshape(b * t, d)
+
         # 1. Gated MLP-style input projection: produces [total, intermediate*2]
-        projected = self.in_proj(hidden_states)
+        projected = self.in_proj(flat)
         # The Mamba kernels expect [intermediate, total_tokens].
         projected = projected.transpose(-2, -1)
         x_states, gate = projected.chunk(2, dim=-2)
@@ -295,5 +316,7 @@ class JambaMambaMixer(nn.Module):
                 query_start_loc=query_start_loc,
             )
 
-        # 3. Final out projection.  scan_out is [intermediate, total].
-        return self.out_proj(scan_out.transpose(-2, -1))
+        # 3. Final out projection.  scan_out is [intermediate, total_tokens].
+        out_flat = self.out_proj(scan_out.transpose(-2, -1))
+        # Reshape back to [B, T, hidden].
+        return out_flat.reshape(b, t, d)

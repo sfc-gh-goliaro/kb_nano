@@ -190,94 +190,57 @@ class JambaModel(nn.Module):
             i for i, t in enumerate(config.layers_block_type) if t == "mamba"
         ]
 
+        # Each L2 mixer (``JambaAttention`` / ``JambaMambaMixer``) reads
+        # its per-layer slab from the per-step metadata installed on the
+        # global ``Context`` using ``self.layer_idx``.  The slab list is
+        # sized to the *count* of attention (or Mamba) layers, not the
+        # full layer count, so we remap the physical layer index to its
+        # position in the per-kind slab list here once at init time.
+        attn_layer_to_slab = {li: si for si, li in enumerate(self.attention_layer_indices)}
+        mamba_layer_to_slab = {li: si for si, li in enumerate(self.mamba_layer_indices)}
+        for layer in self.layers:
+            if hasattr(layer, "self_attn"):
+                layer.self_attn.layer_idx = attn_layer_to_slab[layer.layer_idx]
+            elif hasattr(layer, "mamba"):
+                layer.mamba.layer_idx = mamba_layer_to_slab[layer.layer_idx]
+
     def forward(
         self,
-        input_ids: torch.Tensor,                                         # [B, T]
-        attn_past_kv: list[tuple[torch.Tensor, torch.Tensor] | None] | None = None,
-        attn_cache_writeback: list[tuple[torch.Tensor, torch.Tensor] | None] | None = None,
-        attn_mask_4d: torch.Tensor | None = None,
-        # Static-shape decode path (CUDA-graph friendly).  When
-        # ``attn_kv_slabs`` is provided, the per-layer KV is held in a
-        # fixed-shape ``[B, H_kv, max_total, D]`` slab and the new
-        # token's K/V are written at ``attn_slot_pos`` via ``index_copy_``.
-        # Mutually exclusive with ``attn_past_kv``/``attn_cache_writeback``.
-        attn_kv_slabs: list[tuple[torch.Tensor, torch.Tensor]] | None = None,
-        attn_slot_pos: torch.Tensor | None = None,
-        # Mamba-side cache + metadata.  Each is a *list* parallel to
-        # ``mamba_layer_indices`` so per-layer state is independent.
-        mamba_conv_states: list[torch.Tensor] | None = None,
-        mamba_ssm_states: list[torch.Tensor] | None = None,
-        mamba_cache_indices: torch.Tensor | None = None,
-        mamba_query_start_loc: torch.Tensor | None = None,
-        mamba_has_initial_state: torch.Tensor | None = None,
-        mamba_is_decode: bool = False,
-        mamba_pad_mask_flat: torch.Tensor | None = None,
-    ) -> tuple[torch.Tensor, list]:
-        """Forward.
+        input_ids: torch.Tensor,
+        positions: torch.Tensor | None = None,
+        inputs_embeds: torch.Tensor | None = None,
+    ) -> torch.Tensor:
+        """Forward following the project convention.
 
-        Parameters mirror the structure HF uses, but specialised for our
-        engine which holds the caches externally.
+        Per-step KV / Mamba state is read from the global ``Context``
+        (populated by ``set_jamba_context`` in the engine) so that this
+        ``forward`` matches the ``(input_ids, positions, inputs_embeds=None)``
+        signature used by every other LLM model in the project (Llama,
+        Mamba, Mamba2, Mixtral, ...).
 
-        Returns
-        -------
-        (hidden_states, attn_kv_outputs)
-            ``attn_kv_outputs`` is a list, parallel to
-            ``attention_layer_indices``, of (k, v) tensors that include
-            the new tokens (caller decides whether to keep them).
+        Returns the post-final-layernorm hidden states; the LM-head
+        projection is performed separately in ``compute_logits`` to keep
+        graph capture / sampling logic out of the model body.
         """
-        hidden_states = self.embed_tokens(input_ids)
+        if inputs_embeds is not None:
+            hidden_states = inputs_embeds
+        else:
+            hidden_states = self.embed_tokens(input_ids)
 
-        if attn_past_kv is None:
-            attn_past_kv = [None] * len(self.attention_layer_indices)
-        if attn_cache_writeback is None:
-            attn_cache_writeback = [None] * len(self.attention_layer_indices)
-
-        attn_kv_outputs: list = []
-        attn_idx = 0
-        mamba_idx = 0
-
+        # ``positions`` is unused by Jamba's mixers (no RoPE; Mamba
+        # carries position via its recurrence) but kept in the signature
+        # for parity with Llama / Mamba / Mixtral / etc.  Jamba's L3
+        # decoder layers eagerly fold any pending ``residual`` back into
+        # ``hidden_states`` at entry (Jamba uses non-fused pre-norm), so
+        # ``residual`` is always ``None`` between layers here -- but we
+        # keep the ``(positions, hidden_states, residual)`` call shape
+        # for uniform L3-layer interface.
+        residual = None
         for layer in self.layers:
-            if isinstance(layer, JambaAttentionDecoderLayer):
-                if attn_kv_slabs is not None:
-                    # Static-shape decode path.
-                    k_slab, v_slab = attn_kv_slabs[attn_idx]
-                    hidden_states, new_k, new_v = layer(
-                        hidden_states,
-                        attention_mask=attn_mask_4d,
-                        kv_slab=(k_slab, v_slab),
-                        slot_pos=attn_slot_pos,
-                    )
-                else:
-                    pkv = attn_past_kv[attn_idx]
-                    writeback = attn_cache_writeback[attn_idx]
-                    past_k = pkv[0] if pkv is not None else None
-                    past_v = pkv[1] if pkv is not None else None
-                    hidden_states, new_k, new_v = layer(
-                        hidden_states,
-                        attention_mask=attn_mask_4d,
-                        past_key=past_k,
-                        past_value=past_v,
-                        cache_writeback=writeback,
-                    )
-                attn_kv_outputs.append((new_k, new_v))
-                attn_idx += 1
-            else:
-                conv_state = mamba_conv_states[mamba_idx]
-                ssm_state = mamba_ssm_states[mamba_idx]
-                hidden_states = layer(
-                    hidden_states,
-                    conv_state=conv_state,
-                    ssm_state=ssm_state,
-                    cache_indices=mamba_cache_indices,
-                    query_start_loc=mamba_query_start_loc,
-                    has_initial_state=mamba_has_initial_state,
-                    is_decode=mamba_is_decode,
-                    mamba_pad_mask_flat=mamba_pad_mask_flat,
-                )
-                mamba_idx += 1
+            hidden_states, residual = layer(positions, hidden_states, residual)
 
         hidden_states = self.final_layernorm(hidden_states)
-        return hidden_states, attn_kv_outputs
+        return hidden_states
 
 
 class JambaForCausalLM(nn.Module):
@@ -329,8 +292,12 @@ class JambaForCausalLM(nn.Module):
         if config.tie_word_embeddings:
             self.lm_head.weight = self.model.embed_tokens.emb.weight
 
-    def forward(self, *args, **kwargs):
-        return self.model(*args, **kwargs)
+    def forward(
+        self,
+        input_ids: torch.Tensor,
+        positions: torch.Tensor | None = None,
+    ) -> torch.Tensor:
+        return self.model(input_ids, positions)
 
     def compute_logits(self, hidden_states: torch.Tensor) -> torch.Tensor:
         logits = self.lm_head(hidden_states)
