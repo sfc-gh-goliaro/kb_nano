@@ -248,6 +248,12 @@ def _run_kbnano(
         param_dtype=cdt, compute_dtype=cdt,
     )
     engine.compile_layers()
+    if train_mode == "meta":
+        # Capture a CUDA Graph of the meta forward at this (B=1, T) shape
+        # so replay produces deterministic timing — eager has structural
+        # autograd-driven variance (std 10 ms vs JAX's std 0.75 ms).
+        T = int(input_ids.shape[-1])
+        engine.capture_meta_graph(batch_size=1, seq_len=T)
     build_s = time.time() - t0
     print(f"[bench] kb-nano: engine built in {build_s:.2f}s", flush=True)
 
