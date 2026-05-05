@@ -245,21 +245,56 @@ class JambaEngine:
         # re-capturing a new graph per shape.  vLLM uses the same trick
         # (paged KV makes the attention shape constant).
         #
-        # Single-bucket strategy: we capture exactly one decode graph
-        # at ``B = max_num_seqs`` and pad smaller batches up to that
-        # size.  Pre-capturing once at init time avoids the well-known
+        # Multi-bucket strategy (mirrors ``LlamaEngine``'s decode buckets
+        # at [1, 2, 4, ..., max_num_seqs]): we capture decode graphs at
+        # several B values and dispatch each batch to the smallest
+        # bucket >= actual B.  This eliminates the "trailing batch
+        # padded to ``max_num_seqs``" waste that otherwise dominates
+        # decode time when N is not a multiple of ``max_num_seqs``
+        # (e.g. v0.1 bench at N=50, max=32: trailing batch of 18 was
+        # previously padded to 32 = 44% wasted compute on that batch).
+        # Pre-capturing all buckets at init time avoids the well-known
         # "graph pool overlaps caching-allocator block" issue that
         # can corrupt replay state when a graph is captured *after*
         # other work has fragmented the pool.
         self.graph_max_total = graph_max_total
-        self._decode_graph: _JambaDecodeGraph | None = None
-        self._decode_graph_buffers: dict | None = None
+        # Per-bucket graph state, keyed by bucket B.
+        self._decode_graphs: dict[int, "_JambaDecodeGraph"] = {}
+        self._decode_graph_buffers: dict[int, dict] = {}
         # Disable graph capture if requested (e.g. for debugging,
         # profiling the eager path, or when the CUDA driver disallows
         # graph capture in the current process).
         self._use_cuda_graphs = (
             os.environ.get("KB_NANO_JAMBA_CUDA_GRAPHS", "1") not in ("0", "false", "False")
         )
+        # Build the bucket list.  We capture two bucket sizes so a
+        # trailing batch (e.g. 18 prompts when ``max_num_seqs=32``) can
+        # be padded to the *smaller* bucket (24) instead of all the
+        # way to ``max_num_seqs``.  This eliminates the wasted compute
+        # the single-bucket version paid on padded slots.  The default
+        # [3*B/4, B] is a memory-vs-perf tradeoff: each bucket
+        # pre-allocates KV slabs of size ``B x num_kv_heads x
+        # graph_max_total x head_dim`` per attention layer (e.g. 2 GB
+        # at B=32 for v0.1) so capturing many buckets eats GPU memory
+        # the model needs for the giant Linear / MoE / Mamba SSM
+        # kernels.  Two buckets is the sweet spot: covers the
+        # worst-case trailing-batch waste (44%-padding becomes 25%) at
+        # ~2x the KV-slab footprint.  Override via
+        # ``KB_NANO_JAMBA_BUCKETS=8,16,24,32`` env for benchmarking.
+        env_buckets = os.environ.get("KB_NANO_JAMBA_BUCKETS")
+        if env_buckets:
+            buckets = sorted({int(x) for x in env_buckets.split(",") if x.strip()})
+        else:
+            mns = self.max_num_seqs
+            candidates: set[int] = {mns}
+            small = max(1, mns * 3 // 4)
+            if small < mns:
+                candidates.add(small)
+            buckets = sorted(candidates)
+            if mns not in buckets:
+                buckets.append(mns)
+                buckets = sorted(set(buckets))
+        self._decode_graph_buckets = buckets
         # ``torch.compile``-fuse the decode forward.  Inductor fuses the
         # 100k-launch elementwise tail (RMSNorm chains, residual adds,
         # SwiGLU gate*up, MoE softmax) into a small number of Triton
@@ -278,15 +313,21 @@ class JambaEngine:
         )
         self._compiled_decode_step: callable | None = None
 
-        # Pre-capture the decode graph immediately so the graph's
+        # Pre-capture the decode graphs immediately so each graph's
         # private memory pool is reserved BEFORE the caching allocator
         # has a chance to fragment GPU memory with prefill / mask
         # tensors on subsequent ``_run_batch`` calls.  Skipping this
         # leads to ``cudaErrorIllegalAddress`` on graph replay when
         # the allocator hands out a block from inside the captured
-        # graph's reserved region.
+        # graph's reserved region.  We capture in increasing-B order so
+        # later buckets see a memory state similar to the first capture.
         if self._use_cuda_graphs:
-            self._capture_decode_graph()
+            print(
+                f"  [JambaEngine] Capturing decode graphs at "
+                f"B={self._decode_graph_buckets}"
+            )
+            for bucket in self._decode_graph_buckets:
+                self._capture_decode_graph(bucket)
 
     # ------------------------------------------------------------------
     # Random seeds
@@ -304,12 +345,19 @@ class JambaEngine:
     # tensor pointers stay valid.  The contents are reset at the start
     # of each batch.
     # ------------------------------------------------------------------
-    def _get_or_alloc_static_buffers(self) -> dict:
-        if self._decode_graph_buffers is not None:
-            return self._decode_graph_buffers
+    def _get_or_alloc_static_buffers(self, batch_size: int | None = None) -> dict:
+        """Return the static decode-graph buffers for the given bucket B.
+
+        ``batch_size`` defaults to ``max_num_seqs`` (the largest bucket).
+        Multiple bucket sizes coexist; each has its own KV slabs / Mamba
+        state slabs / step buffers / mask buffer keyed by ``B``.
+        """
+        if batch_size is None:
+            batch_size = self.max_num_seqs
+        if batch_size in self._decode_graph_buffers:
+            return self._decode_graph_buffers[batch_size]
 
         device = self.device
-        batch_size = self.max_num_seqs
         max_total = self.graph_max_total
         # KV slabs (per attention layer): [B, H_kv, max_total, D].
         kv_slabs: list[tuple[torch.Tensor, torch.Tensor]] = []
@@ -361,6 +409,7 @@ class JambaEngine:
         next_tokens = torch.zeros(batch_size, dtype=torch.long, device=device)
 
         bufs = {
+            "B": batch_size,
             "kv_slabs": kv_slabs,
             "conv_states": conv_states,
             "ssm_states": ssm_states,
@@ -371,15 +420,16 @@ class JambaEngine:
             "decode_mask": decode_mask,
             "next_tokens": next_tokens,
         }
-        self._decode_graph_buffers = bufs
+        self._decode_graph_buffers[batch_size] = bufs
         return bufs
 
-    def _capture_decode_graph(self) -> _JambaDecodeGraph:
-        """Capture (or replay-cached) the decode-step CUDA graph.
+    def _capture_decode_graph(self, batch_size: int | None = None) -> _JambaDecodeGraph:
+        """Capture (or replay-cached) the decode-step CUDA graph at bucket B.
 
-        The graph reads from the static buffers in ``_decode_graph_buffers``
-        and writes the sampled token to ``next_tokens``.  The host loop
-        in ``_run_batch`` must:
+        ``batch_size`` defaults to ``max_num_seqs`` (the largest bucket).
+        The graph reads from the static buffers in
+        ``_decode_graph_buffers[B]`` and writes the sampled token to
+        ``next_tokens``.  The host loop in ``_run_batch_graph`` must:
 
           1. Update ``step_input_ids`` (in-place) to the previous step's
              output token (or the prefill output for the first step).
@@ -396,10 +446,12 @@ class JambaEngine:
         ``set_mamba_context`` inside its ``capture_mamba_cudagraph``
         capture region.
         """
-        if self._decode_graph is not None:
-            return self._decode_graph
+        if batch_size is None:
+            batch_size = self.max_num_seqs
+        if batch_size in self._decode_graphs:
+            return self._decode_graphs[batch_size]
 
-        bufs = self._get_or_alloc_static_buffers()
+        bufs = self._get_or_alloc_static_buffers(batch_size)
 
         attn_meta = JambaAttnMetadata(
             attn_mask_4d=bufs["decode_mask"],
@@ -525,7 +577,7 @@ class JambaEngine:
             decode_mask=bufs["decode_mask"],
             next_tokens=bufs["next_tokens"],
         )
-        self._decode_graph = entry
+        self._decode_graphs[batch_size] = entry
         return entry
 
     # ------------------------------------------------------------------
@@ -855,17 +907,17 @@ class JambaEngine:
         attention_mask: torch.Tensor,
         pad_id: int,
     ) -> list[GenerationOutput]:
-        """Greedy-decode using a captured CUDA graph at fixed
-        B = ``max_num_seqs``.  Smaller ``B`` is padded up to
-        ``max_num_seqs`` using a dummy prompt; the dummy outputs are
-        discarded.  This single-bucket strategy (vs per-B captures)
-        avoids the well-known issue where a captured graph's reserved
-        memory pool can be reused by the caching allocator after
-        capture, producing illegal-memory-access on replay.
+        """Greedy-decode using a captured CUDA graph at the smallest
+        bucket >= actual ``B``.  Smaller ``B`` is padded up to that
+        bucket using a dummy prompt; the dummy outputs are discarded.
+        Multiple buckets coexist (mirroring vLLM's per-batch-size
+        capture); pre-capturing all buckets at init keeps each graph's
+        private memory pool reserved before fragmentation.
         """
         device = self.device
         eos = self.tokenizer.eos_token_id
-        B_pad = self.max_num_seqs
+        # Pick the smallest bucket >= B (the actual batch size).
+        B_pad = self._pick_bucket(B)
 
         # ---- Pad prompts up to B_pad with a dummy sequence ----
         if B < B_pad:
@@ -873,10 +925,10 @@ class JambaEngine:
             attention_mask = self._pad_to_b(attention_mask, B_pad, 0)
 
         # ---- Capture graph (no-op after first call) ----
-        graph_entry = self._capture_decode_graph()
+        graph_entry = self._capture_decode_graph(B_pad)
 
         # ---- Get static buffers ----
-        bufs = self._get_or_alloc_static_buffers()
+        bufs = self._get_or_alloc_static_buffers(B_pad)
         kv_slabs = bufs["kv_slabs"]
         conv_states = bufs["conv_states"]
         ssm_states = bufs["ssm_states"]
@@ -982,6 +1034,18 @@ class JambaEngine:
             generated[i] = tokens_i
 
         return self._materialise(generated)
+
+    def _pick_bucket(self, B: int) -> int:
+        """Return the smallest captured decode-graph bucket >= ``B``.
+
+        Falls back to ``max_num_seqs`` if every bucket is smaller (which
+        shouldn't happen because ``max_num_seqs`` is always in the bucket
+        list).  Mirrors vLLM's ``_graph_bs_for_n`` lookup.
+        """
+        for b in self._decode_graph_buckets:
+            if b >= B:
+                return b
+        return self.max_num_seqs
 
     @staticmethod
     def _pad_to_b(t: torch.Tensor, B_pad: int, pad_value) -> torch.Tensor:
