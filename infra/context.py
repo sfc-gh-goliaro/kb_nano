@@ -322,7 +322,7 @@ def set_mamba_context(
 def set_jamba_context(
     is_prefill: bool,
     *,
-    # Standard paged-attention fields (for the 4 attention layers).
+    # Standard paged-attention fields (homogeneous prefill or decode).
     slot_mapping=None,
     context_lens=None,
     block_tables=None,
@@ -332,7 +332,24 @@ def set_jamba_context(
     max_seqlen_q=0,
     max_seqlen_k=0,
     flat_to_grid=None,
-    # Mamba state + metadata (for the 28 Mamba layers).
+    # Mixed prefill+decode batch (chunked-prefill mid-decode).  When
+    # ``is_mixed=True``, the L2 ``Attention._forward_mixed`` and the L2
+    # JambaMambaMixer mixed path read these fields instead of the
+    # homogeneous ones.  ``slot_mapping`` (above) carries one entry per
+    # token in the mixed batch (prefill rows first, then decode rows).
+    is_mixed: bool = False,
+    num_prefill_tokens: int = 0,
+    num_decode_tokens: int = 0,
+    num_prefill_seqs: int = 0,
+    prefill_cu_seqlens_q=None,
+    prefill_cu_seqlens_k=None,
+    prefill_max_seqlen_q=0,
+    prefill_max_seqlen_k=0,
+    prefill_block_tables=None,
+    decode_context_lens=None,
+    decode_block_tables=None,
+    decode_max_context_len=0,
+    # Mamba state + metadata.
     mamba_state=None,
     mamba_metadata=None,
 ):
@@ -345,16 +362,48 @@ def set_jamba_context(
     installs into a single Context so a Jamba forward can run both
     kinds of layers off one ``get_context()``.
 
-    Both prefill and decode go through paged attention so JambaAttention
-    matches vLLM's TRTLLM/FA3 kernel choice.  Prefill uses paged-context
-    attention (``TRTLLMPrefill`` / ``FlashAttnPrefill``) on flat-varlen
-    Q/K/V; ``flat_to_grid`` carries the [B*T_max] → [N] index map the
-    L2 mixer uses to gather/scatter against the L4 model's left-padded
-    ``[B, T_max, hidden]`` view.  Decode uses paged attention via
-    ``TRTLLMDecode`` / ``FlashAttnDecode`` reading
-    ``slot_mapping`` / ``block_tables`` / ``context_lens``.
+    Three batch shapes are supported:
+
+      * **Homogeneous prefill** (``is_prefill=True, is_mixed=False``):
+        flat-varlen ``[total_real_tokens, hidden]`` input with
+        ``cu_seqlens_q`` etc.; Mamba reads ``mamba_metadata.cache_indices``.
+      * **Homogeneous decode** (``is_prefill=False, is_mixed=False``):
+        ``[B_running, hidden]`` input; paged-attn reads
+        ``slot_mapping`` / ``block_tables`` / ``context_lens``.
+      * **Mixed prefill + decode** (``is_mixed=True``): input is
+        ``[num_prefill_tokens + num_decode_tokens, hidden]`` with
+        prefill rows first.  Attention dispatches via ``_forward_mixed``
+        using the ``prefill_*`` and ``decode_*`` ctx fields; Mamba
+        splits at ``num_prefill_tokens`` and runs both kernel families.
     """
     global _CONTEXT
+    if is_mixed:
+        # Mixed batch -- populate the dedicated split fields for both
+        # the Attention.forward_mixed dispatcher and the Mamba mixer's
+        # mixed path.  The top-level ``slot_mapping`` carries the full
+        # [num_prefill_tokens + num_decode_tokens] map; the kernel
+        # store_kvcache uses it indiscriminately because it's just a
+        # write to the paged cache.
+        _CONTEXT = Context(
+            is_prefill=True, is_mixed=True,
+            slot_mapping=slot_mapping,
+            num_prefill_tokens=num_prefill_tokens,
+            num_decode_tokens=num_decode_tokens,
+            num_prefill_seqs=num_prefill_seqs,
+            prefill_cu_seqlens_q=prefill_cu_seqlens_q,
+            prefill_cu_seqlens_k=prefill_cu_seqlens_k,
+            prefill_max_seqlen_q=prefill_max_seqlen_q,
+            prefill_max_seqlen_k=prefill_max_seqlen_k,
+            prefill_block_tables=prefill_block_tables,
+            decode_context_lens=decode_context_lens,
+            decode_block_tables=decode_block_tables,
+            decode_max_context_len=decode_max_context_len,
+            no_compile_layers=_STATIC_NO_COMPILE_LAYERS,
+            mamba_state=mamba_state,
+            mamba_metadata=mamba_metadata,
+        )
+        return
+
     dc_cl = context_lens if not is_prefill else None
     dc_bt = block_tables if not is_prefill else None
     dc_max = max_context_len if not is_prefill else 0

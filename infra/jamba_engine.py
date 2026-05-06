@@ -206,13 +206,28 @@ __all__ = ["JambaEngine", "SamplingParams", "GenerationOutput"]
 # ---------------------------------------------------------------------------
 @dataclass
 class JambaMambaMetadata:
+    """Per-batch Mamba metadata.  Supports homogeneous prefill, homogeneous
+    decode, and mixed prefill+decode batches (the latter for chunked-prefill
+    mid-decode steps -- mirrors ``infra.engine.run_mamba_mixed``'s metadata).
+
+    Homogeneous paths use ``cache_indices`` (per-seq Mamba slot for the
+    one phase) plus ``query_start_loc`` / ``has_initial_state`` for the
+    prefill case.
+
+    Mixed path (``set_jamba_context(is_mixed=True, ...)``) uses
+    ``state_indices_p`` / ``state_indices_d`` plus ``query_start_loc`` /
+    ``has_initial_state`` referring to the prefill subset only.
+    """
     conv_states: list[torch.Tensor]
     ssm_states: list[torch.Tensor]
-    cache_indices: torch.Tensor          # int32 [num_seqs] -- per-seq slot index
+    cache_indices: torch.Tensor          # int32 [num_seqs] -- homogeneous slot index
     is_decode: bool = True
-    query_start_loc: torch.Tensor | None = None    # int32 [num_seqs+1] (prefill)
-    has_initial_state: torch.Tensor | None = None  # bool [num_seqs] (prefill)
+    query_start_loc: torch.Tensor | None = None    # int32 [num_prefills+1] (prefill / mixed-prefill subset)
+    has_initial_state: torch.Tensor | None = None  # bool [num_prefills] (prefill / mixed-prefill subset)
     pad_mask_flat: torch.Tensor | None = None      # legacy; unused with flat layout
+    # Mixed-batch fields (None unless ctx.is_mixed=True).
+    state_indices_p: torch.Tensor | None = None    # int32 [num_prefills]
+    state_indices_d: torch.Tensor | None = None    # int32 [num_decodes]
 
 
 # ---------------------------------------------------------------------------
@@ -782,24 +797,74 @@ class JambaEngine:
         # block_tables[i] padded to ``self._max_blocks_per_seq``; we
         # pre-fill the static buffer with -1 (kernel skips -1 slots).
 
+        def _finalize_token(seq, tok):
+            """Apply a sampled token to ``seq`` and report (done, finished)."""
+            seq.append_token(tok)
+            seq.num_computed_tokens = len(seq)
+            done = (
+                len(seq.generated_ids) >= seq.max_tokens
+                or (not seq.ignore_eos and eos is not None and tok == eos)
+            )
+            return done
+
         while waiting or running:
             new_seqs = _admit()
-            if new_seqs:
-                # ----- batched prefill over admitted seqs -----
-                self._run_prefill(new_seqs)
-                # First sampled token from prefill goes into
-                # generated_ids and the seq joins ``running``.
-                first_toks = self._sample_after_prefill(new_seqs, seq_sp)
+
+            if new_seqs and running:
+                # ============================================================
+                # MIXED STEP: chunked-prefill new seqs + decode running seqs
+                # in one forward pass.  Mirrors LlamaEngine._generate_mamba's
+                # ``run_mamba_mixed`` pattern.  This branch fires when slot
+                # pool freed up between iterations (a running seq finished
+                # via eos / max_tokens) while waiting still has prompts --
+                # then we admit new prompts AND keep decoding the survivors
+                # in a single mixed batch instead of stalling.
+                # ============================================================
+                prefill_logits, decode_logits = self._run_mixed_step(
+                    prefill_seqs=new_seqs, decode_seqs=running,
+                )
+                # Sample + apply.  Prefill seqs sample their FIRST decode
+                # token and join running; decode seqs sample their NEXT
+                # token and stay running unless finished.
+                p_toks = (
+                    prefill_logits.argmax(dim=-1).tolist()
+                    if all(seq_sp[id(s)].temperature == 0.0 for s in new_seqs)
+                    else [self._sample_one(prefill_logits[i], seq_sp[id(s)])
+                          for i, s in enumerate(new_seqs)]
+                )
+                d_toks = (
+                    decode_logits.argmax(dim=-1).tolist()
+                    if all(seq_sp[id(s)].temperature == 0.0 for s in running)
+                    else [self._sample_one(decode_logits[i], seq_sp[id(s)])
+                          for i, s in enumerate(running)]
+                )
                 still_running: list[Sequence] = []
                 finished_now: list[Sequence] = []
+                for seq, tok in zip(new_seqs, p_toks):
+                    if _finalize_token(seq, tok):
+                        finished_now.append(seq)
+                    else:
+                        still_running.append(seq)
+                for seq, tok in zip(running, d_toks):
+                    if _finalize_token(seq, tok):
+                        finished_now.append(seq)
+                    else:
+                        still_running.append(seq)
+                for seq in finished_now:
+                    self._finish_seq(seq, outputs, eos, seq_idx_for_id)
+                    if pbar is not None:
+                        pbar.update(1)
+                running = still_running
+                continue
+
+            if new_seqs:
+                # ----- batched pure-prefill step over admitted seqs -----
+                self._run_prefill(new_seqs)
+                first_toks = self._sample_after_prefill(new_seqs, seq_sp)
+                still_running = []
+                finished_now = []
                 for seq, tok in zip(new_seqs, first_toks):
-                    seq.append_token(tok)
-                    seq.num_computed_tokens = len(seq)
-                    done = (
-                        len(seq.generated_ids) >= seq.max_tokens
-                        or (not seq.ignore_eos and eos is not None and tok == eos)
-                    )
-                    if done:
+                    if _finalize_token(seq, tok):
                         finished_now.append(seq)
                     else:
                         still_running.append(seq)
@@ -812,18 +877,12 @@ class JambaEngine:
             if not running:
                 continue
 
-            # ----- batched decode step over running seqs -----
+            # ----- batched pure-decode step over running seqs (CUDA graph) -----
             tokens = self._run_decode_step(running)
             still_running = []
             finished_now = []
             for seq, tok in zip(running, tokens):
-                seq.append_token(tok)
-                seq.num_computed_tokens = len(seq)
-                done = (
-                    len(seq.generated_ids) >= seq.max_tokens
-                    or (not seq.ignore_eos and eos is not None and tok == eos)
-                )
-                if done:
+                if _finalize_token(seq, tok):
                     finished_now.append(seq)
                 else:
                     still_running.append(seq)
@@ -968,6 +1027,176 @@ class JambaEngine:
             self._sample_one(logits[i], seq_sp[id(s)])
             for i, s in enumerate(new_seqs)
         ]
+
+    # ------------------------------------------------------------------
+    # _run_mixed_step: ONE forward pass over a combined batch of
+    # prefill_seqs (newly admitted, contributing their full prompts) +
+    # decode_seqs (already running, contributing one new token each).
+    # Mirrors the project's chunked-prefill mid-decode pattern:
+    #
+    #   * ``infra.engine.run_mamba_mixed`` (Mamba-only models)
+    #   * ``infra.engine.LlamaEngine`` mixed-batch via
+    #     ``prepare_mixed_batch`` + ``set_mixed_context``
+    #
+    # For Jamba (hybrid) the batch is laid out **prefill-first** to match
+    # the Attention class's :meth:`_forward_mixed` ctx-field convention
+    # (``q[:num_prefill_tokens]`` is prefill, ``q[num_prefill_tokens:]``
+    # is decode).  The Mamba mixer's own mixed-path branch (see L2)
+    # consumes the same per-phase metadata.
+    #
+    # Eager only -- no CUDA graph for mixed steps.  The combined-batch
+    # shape varies per call (depends on which seqs admit when), so a
+    # captured graph would have to be re-captured every shape.  The
+    # mixed step is rare relative to pure-decode steps (only fires when
+    # a running seq finishes early via eos / max_tokens AND there's a
+    # waiting seq to admit), so the eager-step latency cost is small.
+    #
+    # Returns (prefill_logits[N_p_seqs, V], decode_logits[N_d_seqs, V])
+    # so the caller can sample each phase's tokens independently.
+    # ------------------------------------------------------------------
+    def _run_mixed_step(
+        self,
+        prefill_seqs: list["Sequence"],
+        decode_seqs: list["Sequence"],
+    ) -> tuple[torch.Tensor, torch.Tensor]:
+        device = self.device
+        page_size = self._page_size
+
+        # ---- Prefill chunk (full-prompt for newly-admitted seqs) ----
+        prefill_input_ids: list[int] = []
+        prefill_pos: list[int] = []
+        prefill_plens: list[int] = []
+        for s in prefill_seqs:
+            prefill_input_ids.extend(s.prompt_ids)
+            prefill_pos.extend(range(len(s.prompt_ids)))
+            prefill_plens.append(len(s.prompt_ids))
+        n_p = sum(prefill_plens)
+        n_p_seqs = len(prefill_seqs)
+        plens_p = np.array(prefill_plens, dtype=np.int32)
+        cu_q_p_np = np.zeros(n_p_seqs + 1, dtype=np.int32)
+        np.cumsum(plens_p, out=cu_q_p_np[1:])
+        cu_q_p = torch.from_numpy(cu_q_p_np).to(device)
+
+        # ---- Decode tokens (one per running seq) ----
+        n_d = len(decode_seqs)
+        d_input_ids = [s.last_token for s in decode_seqs]
+        d_positions = [len(s) - 1 for s in decode_seqs]
+        d_context_lens_np = np.array(
+            [len(s) for s in decode_seqs], dtype=np.int32,
+        )
+
+        # ---- Combined input (prefill-first) ----
+        all_ids = prefill_input_ids + d_input_ids
+        all_pos = prefill_pos + d_positions
+        input_ids = torch.tensor(all_ids, dtype=torch.long, device=device)
+        positions = torch.tensor(all_pos, dtype=torch.long, device=device)
+
+        # ---- Per-seq paged-KV block_tables ----
+        bps = self._max_blocks_per_seq
+        prefill_bt_np = np.full((n_p_seqs, bps), -1, dtype=np.int32)
+        for i, s in enumerate(prefill_seqs):
+            prefill_bt_np[i, :len(s.block_table)] = s.block_table
+        prefill_block_tables = torch.from_numpy(prefill_bt_np).to(device)
+
+        decode_bt_np = np.full((n_d, bps), -1, dtype=np.int32)
+        for i, s in enumerate(decode_seqs):
+            decode_bt_np[i, :len(s.block_table)] = s.block_table
+        decode_block_tables = torch.from_numpy(decode_bt_np).to(device)
+
+        # ---- Per-token slot_mapping (prefill rows + decode rows) ----
+        # Prefill: vectorized like _run_prefill.
+        seq_idx_p = np.repeat(np.arange(n_p_seqs, dtype=np.int64), plens_p)
+        within_p = np.array(prefill_pos, dtype=np.int64)
+        block_idxs_p = within_p // page_size
+        slot_in_p = within_p % page_size
+        slot_p_np = (
+            prefill_bt_np[seq_idx_p, block_idxs_p].astype(np.int64) * page_size
+            + slot_in_p
+        )
+        # Decode: per-seq slot for the new token's position.
+        slot_d_np = np.empty(n_d, dtype=np.int64)
+        for i, s in enumerate(decode_seqs):
+            new_pos = len(s) - 1
+            block_idx = new_pos // page_size
+            slot_in_block = new_pos % page_size
+            slot_d_np[i] = int(s.block_table[block_idx]) * page_size + slot_in_block
+        slot_mapping_np = np.concatenate([slot_p_np, slot_d_np])
+        slot_mapping = torch.from_numpy(slot_mapping_np).to(device)
+
+        # ---- Mamba metadata (state indices split by phase) ----
+        state_indices_p_np = np.array(
+            [s.state_slot for s in prefill_seqs], dtype=np.int32,
+        )
+        state_indices_d_np = np.array(
+            [s.state_slot for s in decode_seqs], dtype=np.int32,
+        )
+        state_indices_p = torch.from_numpy(state_indices_p_np).to(device)
+        state_indices_d = torch.from_numpy(state_indices_d_np).to(device)
+        # cache_indices for homogeneous-fallback compatibility -- not
+        # read by the mixed path but populated for debugging clarity.
+        cache_indices_combined = torch.cat([state_indices_p, state_indices_d], dim=0)
+        has_initial_state_p = torch.zeros(n_p_seqs, dtype=torch.bool, device=device)
+
+        mamba_meta = JambaMambaMetadata(
+            conv_states=self.mamba_pool.conv_states,
+            ssm_states=self.mamba_pool.ssm_states,
+            cache_indices=cache_indices_combined,
+            is_decode=False,
+            query_start_loc=cu_q_p,
+            has_initial_state=has_initial_state_p,
+            state_indices_p=state_indices_p,
+            state_indices_d=state_indices_d,
+        )
+
+        # Decode-side context_lens / max for the Attention class's
+        # decode-half kernel call.
+        decode_context_lens = torch.from_numpy(d_context_lens_np).to(device)
+        decode_max_context_len = int(d_context_lens_np.max()) if n_d > 0 else 0
+
+        max_seqlen_p = int(plens_p.max()) if n_p_seqs > 0 else 0
+
+        set_jamba_context(
+            is_prefill=True,  # ignored when is_mixed=True; required by signature
+            is_mixed=True,
+            slot_mapping=slot_mapping,
+            num_prefill_tokens=n_p,
+            num_decode_tokens=n_d,
+            num_prefill_seqs=n_p_seqs,
+            prefill_cu_seqlens_q=cu_q_p,
+            prefill_cu_seqlens_k=cu_q_p,
+            prefill_max_seqlen_q=max_seqlen_p,
+            prefill_max_seqlen_k=max_seqlen_p,
+            prefill_block_tables=prefill_block_tables,
+            decode_context_lens=decode_context_lens,
+            decode_block_tables=decode_block_tables,
+            decode_max_context_len=decode_max_context_len,
+            mamba_metadata=mamba_meta,
+        )
+        try:
+            hidden = self.model(input_ids, positions)
+            # hidden: [n_p + n_d, hidden].
+            # Prefill last-token indices: cu_q_p[1:] - 1 (within prefill range).
+            # Decode token indices: n_p..n_p+n_d-1.
+            if n_p_seqs > 0:
+                prefill_last_idx = (cu_q_p[1:].long() - 1)
+                prefill_hidden = hidden.index_select(0, prefill_last_idx)
+                prefill_logits = self.model.compute_logits(prefill_hidden)
+            else:
+                prefill_logits = torch.empty(
+                    (0, self.config.vocab_size),
+                    dtype=hidden.dtype, device=device,
+                )
+            if n_d > 0:
+                decode_hidden = hidden[n_p:n_p + n_d]
+                decode_logits = self.model.compute_logits(decode_hidden)
+            else:
+                decode_logits = torch.empty(
+                    (0, self.config.vocab_size),
+                    dtype=hidden.dtype, device=device,
+                )
+        finally:
+            reset_context()
+        return prefill_logits, decode_logits
 
     # ------------------------------------------------------------------
     # _run_decode_step: one decode step over ``running``.  Picks the

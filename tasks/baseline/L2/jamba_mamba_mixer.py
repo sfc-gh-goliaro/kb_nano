@@ -187,18 +187,24 @@ class JambaMambaMixer(nn.Module):
     ) -> torch.Tensor:
         """Mamba v1 selective-scan forward, flat-varlen layout.
 
-        Mirrors vLLM's Jamba mamba mixer: input is ``[N, hidden]`` where
-        ``N = sum(prompt_lens)`` for prefill or ``N = num_decode_seqs``
-        for decode; ``query_start_loc`` describes per-seq boundaries.
+        Supports three batch shapes (selected by per-step metadata):
 
-        Reads per-step state from the global ``Context``:
-
-          - ``meta.conv_states[layer_idx]``: ``[num_slots, intermediate, K-1]``
-          - ``meta.ssm_states[layer_idx]``:  ``[num_slots, intermediate, ssm_state_size]``
-          - ``meta.cache_indices``:           int32 ``[num_seqs]``
-          - ``meta.query_start_loc``:         int32 ``[num_seqs+1]`` (prefill only)
-          - ``meta.has_initial_state``:       bool  ``[num_seqs]`` (prefill only)
-          - ``meta.is_decode``:               bool
+          * **Pure decode** (``is_decode=True``, no prefill):
+            ``[num_decode, hidden]`` -- one new token per row.  Runs
+            ``causal_conv1d_update`` + ``selective_state_update``.
+          * **Pure prefill** (``is_decode=False``, no decode):
+            ``[total_prefill_tokens, hidden]`` flat varlen.  Runs
+            ``causal_conv1d_fn`` + ``selective_scan_fn``.
+          * **Mixed prefill + decode**
+            (``num_prefill_tokens > 0`` AND ``num_decode_tokens > 0``):
+            input is ``[num_prefill_tokens + num_decode_tokens, hidden]``
+            with prefill rows first.  Splits, runs prefill kernels on
+            the prefill range and decode kernels on the decode range,
+            concatenates outputs.  Same kernel pair as the homogeneous
+            paths -- just two calls per layer instead of one.
+            Mirrors ``infra.engine.run_mamba_mixed``'s convention but
+            uses prefill-first ordering to match the project's
+            ``Attention._forward_mixed`` ctx fields.
 
         Returns ``[N, hidden]`` (same shape as input).
         """
@@ -211,43 +217,128 @@ class JambaMambaMixer(nn.Module):
 
         conv_state = meta.conv_states[self.layer_idx]
         ssm_state = meta.ssm_states[self.layer_idx]
-        cache_indices = meta.cache_indices
-        query_start_loc = meta.query_start_loc
-        has_initial_state = meta.has_initial_state
-        is_decode = meta.is_decode
 
-        # 1. Gated MLP-style input projection: [N, hidden] -> [N, intermediate*2]
+        # Detect mixed batches via the project's standard ctx fields
+        # (set by ``set_jamba_context`` when ``is_mixed=True``).  Falls
+        # back to the binary ``is_decode`` flag for homogeneous batches.
+        is_mixed = bool(getattr(ctx, "is_mixed", False))
+        if is_mixed:
+            num_prefill_tokens = ctx.num_prefill_tokens
+            num_decode_tokens = ctx.num_decode_tokens
+            # Per-phase Mamba metadata installed by ``set_jamba_context``
+            # under dedicated mamba_metadata fields.
+            state_indices_p = meta.state_indices_p
+            state_indices_d = meta.state_indices_d
+            query_start_loc_p = meta.query_start_loc
+            has_initial_state_p = meta.has_initial_state
+        else:
+            cache_indices = meta.cache_indices
+            query_start_loc = meta.query_start_loc
+            has_initial_state = meta.has_initial_state
+            is_decode = meta.is_decode
+
+        # 1. Gated MLP-style input projection (one big matmul over the
+        # full mixed batch -- same as vLLM's mamba mixer).
         projected = self.in_proj(hidden_states)
-        # The Mamba kernels expect [intermediate, total_tokens].
+        # Mamba kernels expect [intermediate, total_tokens].
         projected = projected.transpose(-2, -1)
         x_states, gate = projected.chunk(2, dim=-2)
 
-        # ``causal_conv1d_*`` expects the weight as [intermediate, K].
         conv_w = self.conv1d_weight.view(
             self.conv1d_weight.size(0), self.conv1d_weight.size(2),
         )
         conv_b = self.conv1d_bias
+        time_proj_bias = (
+            self.dt_proj.bias.float() if self.dt_proj.bias is not None else None
+        )
 
+        # ------------------------------------------------------------------
+        # MIXED PATH: split into prefill rows [0:n_p] and decode rows
+        # [n_p:n_p+n_d], run both kernel families, concat outputs.
+        # ------------------------------------------------------------------
+        if is_mixed:
+            n_p = num_prefill_tokens
+            n_d = num_decode_tokens
+
+            x_p = x_states[:, :n_p]                                  # [I, n_p]
+            x_d = x_states[:, n_p:].transpose(0, 1).contiguous()     # [n_d, I]
+            gate_p = gate[:, :n_p]                                   # [I, n_p]
+            gate_d = gate[:, n_p:]                                   # [I, n_d]
+
+            # Conv: prefill (range update) + decode (single-step update).
+            # Both update the SAME global conv_state slabs at their own
+            # state indices.  Pad rows in either set use slot index -1
+            # (the vendored kernels skip those rows).
+            conv_out_p = causal_conv1d_fn(
+                x_p, conv_w, conv_b,
+                conv_states=conv_state,
+                query_start_loc=query_start_loc_p,
+                cache_indices=state_indices_p,
+                has_initial_state=has_initial_state_p,
+                activation="silu",
+            )                                                        # [I, n_p]
+            conv_out_d_t = causal_conv1d_update(
+                x_d, conv_state, conv_w, conv_b, "silu",
+                conv_state_indices=state_indices_d,
+            )                                                        # [n_d, I]
+            conv_out_d = conv_out_d_t.transpose(0, 1).contiguous()   # [I, n_d]
+            conv_out = torch.cat([conv_out_p, conv_out_d], dim=-1)   # [I, n_p+n_d]
+
+            # SSM transform on the combined post-conv output.
+            dt, B_bts, C_bts = self._ssm_transform(conv_out.transpose(-2, -1))
+            dt_p = dt[:, :n_p]                                       # [I, n_p]
+            dt_d = dt[:, n_p:].transpose(0, 1).contiguous()          # [n_d, I]
+            B_p = B_bts[:n_p]                                        # [n_p, S]
+            B_d = B_bts[n_p:]                                        # [n_d, S]
+            C_p = C_bts[:n_p]                                        # [n_p, S]
+            C_d = C_bts[n_p:]                                        # [n_d, S]
+
+            # Prefill scan.
+            scan_out_p = selective_scan_fn(
+                conv_out_p, ssm_state, dt_p,
+                self.A,
+                B_p.transpose(-2, -1),
+                C_p.transpose(-2, -1),
+                self.D.float(),
+                gate_p, time_proj_bias,
+                delta_softplus=True,
+                cache_indices=state_indices_p,
+                has_initial_state=has_initial_state_p,
+                query_start_loc=query_start_loc_p,
+            )                                                        # [I, n_p]
+
+            # Decode scan (single-step state update).
+            scan_out_d = torch.empty_like(conv_out_d.transpose(0, 1))  # [n_d, I]
+            selective_state_update(
+                ssm_state,
+                conv_out_d.transpose(0, 1).contiguous(),
+                dt_d,
+                self.A,
+                B_d, C_d, self.D,
+                gate_d.transpose(0, 1).contiguous(),
+                time_proj_bias,
+                dt_softplus=True,
+                state_batch_indices=state_indices_d,
+                out=scan_out_d,
+            )
+            scan_out_d = scan_out_d.transpose(0, 1).contiguous()     # [I, n_d]
+
+            scan_out = torch.cat([scan_out_p, scan_out_d], dim=-1)   # [I, n_p+n_d]
+            return self.out_proj(scan_out.transpose(-2, -1))
+
+        # ------------------------------------------------------------------
+        # HOMOGENEOUS PATH: pure decode OR pure prefill.
+        # ------------------------------------------------------------------
         if is_decode:
-            # x_states is [intermediate, num_decode_seqs] (T=1 each).
-            # ``causal_conv1d_update`` expects ``[num_decode, intermediate]``.
             x_t = x_states.transpose(0, 1).contiguous()
             conv_out_t = causal_conv1d_update(
-                x_t,
-                conv_state,
-                conv_w,
-                conv_b,
-                "silu",
+                x_t, conv_state, conv_w, conv_b, "silu",
                 conv_state_indices=cache_indices,
-            )  # [num_decode, intermediate]
-            conv_out = conv_out_t.transpose(0, 1).contiguous()  # [inter, num_d]
+            )
+            conv_out = conv_out_t.transpose(0, 1).contiguous()
         else:
-            # Prefill: ``causal_conv1d_fn`` expects [intermediate, total],
-            # writes per-seq state to ``conv_states[cache_indices[i]]``.
             conv_out = causal_conv1d_fn(
-                x_states,
-                conv_w,
-                conv_b,
+                x_states, conv_w, conv_b,
                 conv_states=conv_state,
                 query_start_loc=query_start_loc,
                 cache_indices=cache_indices,
@@ -255,54 +346,34 @@ class JambaMambaMixer(nn.Module):
                 activation="silu",
             )
 
-        # 2. SSM transform on the post-conv output: (dt, B, C).  The
-        # ``_ssm_transform`` expects [total, intermediate], so we
-        # transpose into and out of it.
         dt, B_bts, C_bts = self._ssm_transform(conv_out.transpose(-2, -1))
 
-        time_proj_bias = (
-            self.dt_proj.bias.float() if self.dt_proj.bias is not None else None
-        )
-
         if is_decode:
-            # Single-step state update.  Shapes:
-            #   conv_out:    [intermediate, num_decode] -> transpose to [n_d, intermediate]
-            #   dt:          [intermediate, num_decode] -> transpose to [n_d, intermediate]
-            #   B_bts/C_bts: [num_decode, ssm_state_size]
-            #   gate:        [intermediate, num_decode] -> transpose
-            scan_out = torch.empty_like(conv_out.transpose(0, 1))  # [n_d, intermediate]
+            scan_out = torch.empty_like(conv_out.transpose(0, 1))
             selective_state_update(
                 ssm_state,
                 conv_out.transpose(0, 1).contiguous(),
                 dt.transpose(0, 1).contiguous(),
-                self.A,
-                B_bts,
-                C_bts,
-                self.D,
+                self.A, B_bts, C_bts, self.D,
                 gate.transpose(0, 1).contiguous(),
                 time_proj_bias,
                 dt_softplus=True,
                 state_batch_indices=cache_indices,
                 out=scan_out,
             )
-            scan_out = scan_out.transpose(0, 1).contiguous()  # [inter, n_d]
+            scan_out = scan_out.transpose(0, 1).contiguous()
         else:
-            # Prefill scan over the full flat sequence.
             scan_out = selective_scan_fn(
-                conv_out,
-                ssm_state,
-                dt,
+                conv_out, ssm_state, dt,
                 self.A,
                 B_bts.transpose(-2, -1),
                 C_bts.transpose(-2, -1),
                 self.D.float(),
-                gate,
-                time_proj_bias,
+                gate, time_proj_bias,
                 delta_softplus=True,
                 cache_indices=cache_indices,
                 has_initial_state=has_initial_state,
                 query_start_loc=query_start_loc,
             )
 
-        # 3. Final out projection.  scan_out is [intermediate, total_tokens] -> [N, hidden].
         return self.out_proj(scan_out.transpose(-2, -1))
