@@ -2,10 +2,12 @@
 
 Mirrors ``diffusion_policy_3d.model.diffusion.conv1d_components.Conv1dBlock``
 exactly, including the same ``block`` Sequential layout so checkpoint keys
-load without remapping. Uses ``torch.nn.Conv1d`` / ``ConvTranspose1d``
-directly (the same pragmatic pattern as ``L2/cosyvoice3_hifigan.py``) to
-preserve the ``block.0.weight`` / ``conv.weight`` parameter names from the
-reference state_dict.
+load without remapping.  L2 composes only L1 ops per CLAUDE.md: the
+1-D conv ops are :class:`L1.conv1d_native.Conv1dNative` and
+:class:`L1.conv_transpose1d.ConvTranspose1d`, both of which expose
+``weight`` and ``bias`` as direct ``nn.Parameter`` attributes (matching
+the reference's ``nn.Conv1d`` / ``nn.ConvTranspose1d`` parameter naming
+under ``block.0.weight`` etc.).
 """
 
 from __future__ import annotations
@@ -13,6 +15,8 @@ from __future__ import annotations
 import torch
 import torch.nn as nn
 
+from ..L1.conv1d_native import Conv1dNative
+from ..L1.conv_transpose1d import ConvTranspose1d
 from ..L1.group_norm import GroupNorm
 from ..L1.mish import Mish
 
@@ -29,7 +33,7 @@ class Conv1dBlock(nn.Module):
     ):
         super().__init__()
         self.block = nn.Sequential(
-            nn.Conv1d(
+            Conv1dNative(
                 inp_channels, out_channels, kernel_size,
                 padding=kernel_size // 2,
             ),
@@ -49,7 +53,7 @@ class Downsample1d(nn.Module):
 
     def __init__(self, dim: int):
         super().__init__()
-        self.conv = nn.Conv1d(dim, dim, 3, stride=2, padding=1)
+        self.conv = Conv1dNative(dim, dim, 3, stride=2, padding=1)
 
     def forward(self, x: torch.Tensor) -> torch.Tensor:
         return self.conv(x)
@@ -60,7 +64,7 @@ class Upsample1d(nn.Module):
 
     def __init__(self, dim: int):
         super().__init__()
-        self.conv = nn.ConvTranspose1d(dim, dim, 4, stride=2, padding=1)
+        self.conv = ConvTranspose1d(dim, dim, 4, stride=2, padding=1)
 
     def forward(self, x: torch.Tensor) -> torch.Tensor:
         return self.conv(x)
