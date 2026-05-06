@@ -20,25 +20,35 @@ tanh,tasks/baseline/L1/tanh.py,Tanh,direct
 quick_gelu,tasks/baseline/L1/quickgelu.py,QuickGELU,direct
 log_sigmoid,tasks/baseline/L1/log_sigmoid.py,LogSigmoid,direct
 mish,,, NOT IN L1 (used by DP3 only - dp3 branch unmerged)
+leaky_relu,tasks/baseline/L1/leaky_relu.py,LeakyReLU,direct (added in audit branch; numerically verified)
+elu,tasks/baseline/L1/elu.py,ELU,direct (added in audit branch; numerically verified)
+hardsigmoid,tasks/baseline/L1/hardsigmoid.py,Hardsigmoid,direct (added in audit branch; numerically verified)
+hardswish,tasks/baseline/L1/hardswish.py,Hardswish,direct (added in audit branch; numerically verified)
+batch_norm_1d,tasks/baseline/L1/batch_norm1d.py,BatchNorm1d,direct (added in audit branch; numerically verified)
+batch_norm_3d,tasks/baseline/L1/batch_norm3d.py,BatchNorm3d,direct (added in audit branch; numerically verified)
+chunk_gated_delta_rule,tasks/baseline/L1/chunk_gated_delta_rule.py,ChunkGatedDeltaRule,direct (added in audit branch; wraps fla.ops.gated_delta_rule.chunk_gated_delta_rule; same import pattern as chunk_gla.py)
+fused_recurrent_gated_delta_rule,tasks/baseline/L1/chunk_gated_delta_rule.py,FusedRecurrentGatedDeltaRule,direct (added in audit branch)
+multihead_attention,tasks/baseline/L1/dense_attention.py,DenseAttention,direct (legacy nn.MultiheadAttention is a wrapper around 3xLinear+SDPA+Linear; all primitives in kb-nano. Per mentor: do not add a literal wrapper for the deprecated class API)
+lstm,tasks/baseline/L1/lstm.py,LSTM,direct (added in audit branch; numerically verified vs nn.LSTM)
 squared_relu,tasks/baseline/L1/squared_relu.py,SquaredReLU,direct
 silu_and_mul,tasks/baseline/L1/silu_and_mul.py,SiluAndMul,fused SwiGLU activation
 swiglu_oai,tasks/baseline/L1/swiglu_oai.py,SwigluOai,fused GPT-OSS swiglu (clipped)
 conv1d,tasks/baseline/L1/conv1d.py,Conv1d,direct (note: this is the Whisper-style wrapper with self.conv nesting)
 conv2d,tasks/baseline/L1/conv2d.py,Conv2d,direct
 conv3d,tasks/baseline/L1/conv3d.py,Conv3d,direct
-conv_transpose1d,,, UNSUPPORTED on origin/experiments (added on add-dp3-support; not yet merged)
-conv_transpose2d,,, UNSUPPORTED on origin/experiments (no class)
-conv_transpose3d,,, UNSUPPORTED on origin/experiments
+conv_transpose1d,tasks/baseline/L1/conv_transpose1d.py,ConvTranspose1d,direct (added in audit branch; numerically verified vs nn.ConvTranspose1d)
+conv_transpose2d,tasks/baseline/L1/conv_transpose2d.py,ConvTranspose2d,direct (added in audit branch; numerically verified vs nn.ConvTranspose2d)
+conv_transpose3d,tasks/baseline/L1/conv_transpose3d.py,ConvTranspose3d,direct (added in audit branch; numerically verified vs nn.ConvTranspose3d)
 max_pool_2d,tasks/baseline/L1/max_pool2d.py,MaxPool2d,direct
 avg_pool_2d,tasks/baseline/L1/avg_pool2d.py,AvgPool2d,direct
-adaptive_avg_pool_2d,,, NOT FOUND as L1 class (composable from avg_pool_2d + dynamic kernel; partial)
-adaptive_avg_pool_1d,,, NOT FOUND as L1 class (composable; partial)
-max_pool_1d,,, NOT FOUND
-avg_pool_1d,,, NOT FOUND
-max_pool_3d,,, NOT FOUND
-avg_pool_3d,,, NOT FOUND
+adaptive_avg_pool_2d,tasks/baseline/L1/adaptive_avg_pool2d.py,AdaptiveAvgPool2d,direct (added in audit branch; numerically verified)
+adaptive_avg_pool_1d,tasks/baseline/L1/adaptive_avg_pool1d.py,AdaptiveAvgPool1d,direct (added in audit branch; numerically verified)
+max_pool_1d,tasks/baseline/L1/max_pool1d.py,MaxPool1d,direct (added in audit branch; numerically verified)
+avg_pool_1d,tasks/baseline/L1/avg_pool1d.py,AvgPool1d,direct (added in audit branch; numerically verified)
+max_pool_3d,,, NOT FOUND (no HF model in pinned commit needs it)
+avg_pool_3d,,, NOT FOUND (no HF model in pinned commit needs it)
 interpolate,tasks/baseline/L1/interpolate.py,Interpolate,direct
-grid_sample,,, UNSUPPORTED on origin/experiments (no L1 class)
+grid_sample,tasks/baseline/L1/grid_sample.py,GridSample,direct (added in audit branch; numerically verified)
 deformable_attention,tasks/baseline/L1/rtdetrv2_deformable_attention.py,MultiScaleDeformableAttentionV2,direct (RTDETR-v2 variant; v1/DeformableDETR may differ in normalization or sampling)
 sdpa,tasks/baseline/L1/dense_attention.py,DenseAttention,direct (dense SDPA)
 flash_attention,tasks/baseline/L1/flash_attn_prefill.py,FlashAttnPrefill,direct (varlen at flash_attn_varlen.py)

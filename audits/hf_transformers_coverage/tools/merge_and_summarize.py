@@ -116,7 +116,77 @@ def normalize_row(r: dict) -> dict:
             if "override_note" in ov:
                 cur_notes = r.get("notes", "") or ""
                 r["notes"] = (cur_notes + " " + ov["override_note"]).strip()
+
+    # Auto-reclassify: partial -> composable when every flagged op is now supported
+    # by a kb-nano L1 (added in this audit branch) OR is a documented "deprecated
+    # wrapper" we will not implement (multihead_attention).
+    if r.get("support_status") == "partial":
+        flagged = r.get("partial_or_unsupported_ops") or ""
+        ops_in_row = set()
+        for entry in _split_outside_parens(flagged):
+            op = entry.split("(", 1)[0].strip().lower()
+            op = {"conv_transpose_1d": "conv_transpose1d",
+                  "conv_transpose_2d": "conv_transpose2d",
+                  "conv_transpose_3d": "conv_transpose3d"}.get(op, op)
+            if op:
+                ops_in_row.add(op)
+        if ops_in_row and ops_in_row.issubset(NEWLY_SUPPORTED_OPS):
+            r["support_status"] = "composable"
+            note = f"[auto-reclassify] All flagged ops now have kb-nano L1 wrappers added in this audit branch: {sorted(ops_in_row)}"
+            cur_notes = r.get("notes", "") or ""
+            r["notes"] = (cur_notes + " " + note).strip()
+            # Move flagged ops into a separate column for traceability via notes;
+            # clear partial_or_unsupported_ops (now empty since composable).
+            r["partial_or_unsupported_ops"] = ""
+
     return r
+
+
+# Ops that are now supported by kb-nano (either via newly-added L1 wrappers in this audit branch,
+# or via existing infrastructure that the original audit was overly conservative about).
+NEWLY_SUPPORTED_OPS = {
+    # New L1 wrappers added in this audit branch (each numerically verified vs torch.nn.X):
+    "adaptive_avg_pool_1d",
+    "adaptive_avg_pool_2d",
+    "conv_transpose1d",
+    "conv_transpose2d",
+    "conv_transpose3d",
+    "batch_norm_1d",
+    "batch_norm_3d",
+    "max_pool_1d",
+    "avg_pool_1d",
+    "leaky_relu",
+    "elu",
+    "hardsigmoid",
+    "hardswish",
+    "grid_sample",
+    "chunk_gated_delta_rule",
+    "fused_recurrent_gated_delta_rule",
+    "lstm",
+    # Pre-existing kb-nano support that the original audit flagged as partial:
+    "multihead_attention",  # nn.MultiheadAttention is a wrapper around 3*Linear+SDPA+Linear; all in kb-nano (per mentor: don't add a literal wrapper for the deprecated class API)
+    "causal_conv1d",  # pre-existing in tasks/baseline/L2/mamba_mixer.py via vllm; same package as HF qwen3_5
+    "deformable_attention_v1_normalization",  # kb-nano L1 with method="default" is bit-identical to v1 (verified)
+}
+
+
+def _split_outside_parens(s: str, sep: str = ";") -> list[str]:
+    out, cur, depth = [], [], 0
+    for c in s:
+        if c == "(":
+            depth += 1
+            cur.append(c)
+        elif c == ")":
+            depth = max(0, depth - 1)
+            cur.append(c)
+        elif c == sep and depth == 0:
+            out.append("".join(cur).strip())
+            cur = []
+        else:
+            cur.append(c)
+    if cur:
+        out.append("".join(cur).strip())
+    return [x for x in out if x]
 
 
 def read_csv(path: Path) -> list[dict]:
