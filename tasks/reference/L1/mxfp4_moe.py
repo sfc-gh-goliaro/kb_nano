@@ -32,6 +32,10 @@ def _dequant_mxfp4(
     scales: torch.Tensor,
     dtype: torch.dtype = torch.bfloat16,
 ) -> torch.Tensor:
+    if blocks.ndim >= 3 and blocks.shape[-1] != 16:
+        if blocks.shape[-1] % 16 != 0:
+            raise ValueError("Flattened MXFP4 blocks must have last dim divisible by 16")
+        blocks = blocks.reshape(*blocks.shape[:-1], blocks.shape[-1] // 16, 16)
     lut = _FP4_E2M1_LUT.to(blocks.device)
     low = (blocks & 0x0F).long()
     high = ((blocks >> 4) & 0x0F).long()

@@ -1,0 +1,95 @@
+{
+  "timestamp": "2026-05-06T21:38:54.587908",
+  "wall_clock_seconds": 174.7459736370074,
+  "gpu": "H200",
+  "num_gpus": 8,
+  "total_models": 1,
+  "total_jobs": 1,
+  "avg_throughput_speedup": 0.8755313728435844,
+  "avg_latency_speedup": 0.5725686375222742,
+  "alignment_rate": 0.0,
+  "macro_correctness": 0.0,
+  "macro_coverage": 0.0,
+  "macro_speedup": 1.0,
+  "macro_score": 0.0,
+  "failed_jobs": 0,
+  "categories": [
+    {
+      "name": "llm",
+      "num_models": 1,
+      "avg_throughput_speedup": 0.8755313728435844,
+      "avg_latency_speedup": 0.5725686375222742,
+      "alignment_rate": 0.0,
+      "macro_correctness": 0.0,
+      "macro_coverage": 0.0,
+      "macro_speedup": 1.0,
+      "macro_score": 0.0,
+      "models": [
+        {
+          "model": "meta-llama/Llama-3.1-8B-Instruct",
+          "tp": 1,
+          "status": "OK",
+          "throughput_speedup": 0.8755313728435844,
+          "latency_speedup": 0.5725686375222742,
+          "alignment_rate": 0.0,
+          "correctness_score": 0.0,
+          "valid": false,
+          "blended_speedup": 0.0,
+          "error": null,
+          "throughput_results": [
+            {
+              "name": "prefill-heavy",
+              "baseline_tok_s": 89.93776735693484,
+              "candidate_tok_s": 79.80273404832415,
+              "speedup": 0.8873105970221841,
+              "baseline_elapsed": 6.248765302007087,
+              "candidate_elapsed": 7.042365236004116,
+              "aligned_matches": 0,
+              "aligned_total": 1
+            },
+            {
+              "name": "balanced",
+              "baseline_tok_s": 92.24188194965976,
+              "candidate_tok_s": 80.53113654912441,
+              "speedup": 0.8730430781222961,
+              "baseline_elapsed": 6.136041329998989,
+              "candidate_elapsed": 7.028337413998088,
+              "aligned_matches": 0,
+              "aligned_total": 1
+            },
+            {
+              "name": "decode-heavy",
+              "baseline_tok_s": 92.80805663480777,
+              "candidate_tok_s": 80.40618843161961,
+              "speedup": 0.866370780157713,
+              "baseline_elapsed": 11.432197143993108,
+              "candidate_elapsed": 13.19550174800679,
+              "aligned_matches": 0,
+              "aligned_total": 1
+            }
+          ],
+          "latency_results": [
+            {
+              "name": "single-request",
+              "baseline_median": 5.66963124400354,
+              "candidate_median": 6.595620134001365,
+              "speedup": 0.8596054849756705,
+              "batch_size": 1,
+              "input_len": 128,
+              "output_len": 128
+            },
+            {
+              "name": "fixed-batch-32",
+              "baseline_median": 6.9174720979935955,
+              "candidate_median": 18.1380870709836,
+              "speedup": 0.38137826061381186,
+              "batch_size": 32,
+              "input_len": 128,
+              "output_len": 128
+            }
+          ]
+        }
+      ]
+    }
+  ]
+}

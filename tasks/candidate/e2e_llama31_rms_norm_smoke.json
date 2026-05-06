@@ -1,0 +1,43 @@
+{
+  "timestamp": "2026-05-06T21:16:56.558777",
+  "wall_clock_seconds": 396.05965980302426,
+  "gpu": "H200",
+  "num_gpus": 8,
+  "total_models": 1,
+  "total_jobs": 1,
+  "avg_throughput_speedup": 0.8299916317532459,
+  "avg_latency_speedup": 0.8238423318895173,
+  "alignment_rate": 0.3333333333333333,
+  "macro_correctness": 0.3333333333333333,
+  "macro_coverage": 0.0,
+  "macro_speedup": 1.0,
+  "macro_score": 0.0,
+  "failed_jobs": 0,
+  "categories": [
+    {
+      "name": "llm",
+      "num_models": 1,
+      "avg_throughput_speedup": 0.8299916317532459,
+      "avg_latency_speedup": 0.8238423318895173,
+      "alignment_rate": 0.3333333333333333,
+      "macro_correctness": 0.3333333333333333,
+      "macro_coverage": 0.0,
+      "macro_speedup": 1.0,
+      "macro_score": 0.0,
+      "models": [
+        {
+          "model": "meta-llama/Llama-3.1-8B-Instruct",
+          "tp": 1,
+          "status": "OK",
+          "throughput_speedup": 0.8299916317532459,
+          "latency_speedup": 0.8238423318895173,
+          "alignment_rate": 0.3333333333333333,
+          "correctness_score": 0.3333333333333333,
+          "valid": false,
+          "blended_speedup": 0.0,
+          "error": null
+        }
+      ]
+    }
+  ]
+}

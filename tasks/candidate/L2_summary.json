@@ -1,0 +1,21 @@
+{
+  "operators": 40,
+  "total_scenarios": 258,
+  "passed": 258,
+  "failed": 0,
+  "mean_speedup_unweighted_scenarios": 0.7894806306647637,
+  "mean_speedup_passed_scenarios": 0.7894806306647637,
+  "mean_speedup_unweighted_operators": 0.8826931719400981,
+  "highest_speedup": {
+    "operator": "vision_attention",
+    "scenario": "tokens-1320/912015e5",
+    "speedup": 1.7086037441732986
+  },
+  "lowest_speedup": {
+    "operator": "attention_impl",
+    "scenario": "tokens-16384/89738da6",
+    "speedup": 0.011011056822321114
+  },
+  "per_scenario_csv": "tasks/candidate/L2_per_scenario_speedups.csv",
+  "per_operator_csv": "tasks/candidate/L2_op_speedups.csv"
+}

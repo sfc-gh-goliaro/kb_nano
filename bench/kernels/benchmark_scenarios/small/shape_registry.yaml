@@ -21736,6 +21736,7 @@ flash_attn_decode:
       cache_seqlens:
         shape: [4]
         dtype: int32
+      max_seq_len: 128
       softmax_scale: null
       causal: true
 

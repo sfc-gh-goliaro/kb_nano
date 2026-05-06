@@ -1,0 +1,95 @@
+{
+  "timestamp": "2026-05-06T21:21:22.743420",
+  "wall_clock_seconds": 168.38441090399283,
+  "gpu": "H200",
+  "num_gpus": 8,
+  "total_models": 1,
+  "total_jobs": 1,
+  "avg_throughput_speedup": 0.8242141476464268,
+  "avg_latency_speedup": 0.8313427437211992,
+  "alignment_rate": 0.3333333333333333,
+  "macro_correctness": 0.3333333333333333,
+  "macro_coverage": 0.0,
+  "macro_speedup": 1.0,
+  "macro_score": 0.0,
+  "failed_jobs": 0,
+  "categories": [
+    {
+      "name": "llm",
+      "num_models": 1,
+      "avg_throughput_speedup": 0.8242141476464268,
+      "avg_latency_speedup": 0.8313427437211992,
+      "alignment_rate": 0.3333333333333333,
+      "macro_correctness": 0.3333333333333333,
+      "macro_coverage": 0.0,
+      "macro_speedup": 1.0,
+      "macro_score": 0.0,
+      "models": [
+        {
+          "model": "meta-llama/Llama-3.1-8B-Instruct",
+          "tp": 1,
+          "status": "OK",
+          "throughput_speedup": 0.8242141476464268,
+          "latency_speedup": 0.8313427437211992,
+          "alignment_rate": 0.3333333333333333,
+          "correctness_score": 0.3333333333333333,
+          "valid": false,
+          "blended_speedup": 0.0,
+          "error": null,
+          "throughput_results": [
+            {
+              "name": "prefill-heavy",
+              "baseline_tok_s": 89.06627209289262,
+              "candidate_tok_s": 74.25247850841973,
+              "speedup": 0.8336767304123531,
+              "baseline_elapsed": 6.309908193012234,
+              "candidate_elapsed": 7.568770919024246,
+              "aligned_matches": 0,
+              "aligned_total": 1
+            },
+            {
+              "name": "balanced",
+              "baseline_tok_s": 91.30092708055555,
+              "candidate_tok_s": 74.34682186545848,
+              "speedup": 0.8143052238654891,
+              "baseline_elapsed": 6.199279876978835,
+              "candidate_elapsed": 7.612968325993279,
+              "aligned_matches": 1,
+              "aligned_total": 1
+            },
+            {
+              "name": "decode-heavy",
+              "baseline_tok_s": 90.55417128729299,
+              "candidate_tok_s": 74.68678323200578,
+              "speedup": 0.8247746312541894,
+              "baseline_elapsed": 11.716743523982586,
+              "candidate_elapsed": 14.205994074000046,
+              "aligned_matches": 0,
+              "aligned_total": 1
+            }
+          ],
+          "latency_results": [
+            {
+              "name": "single-request",
+              "baseline_median": 5.824677497002995,
+              "candidate_median": 7.0197650250047445,
+              "speedup": 0.8297539128810166,
+              "batch_size": 1,
+              "input_len": 128,
+              "output_len": 128
+            },
+            {
+              "name": "fixed-batch-32",
+              "baseline_median": 7.0489256759756245,
+              "candidate_median": 8.46275990101276,
+              "speedup": 0.8329346168892328,
+              "batch_size": 32,
+              "input_len": 128,
+              "output_len": 128
+            }
+          ]
+        }
+      ]
+    }
+  ]
+}

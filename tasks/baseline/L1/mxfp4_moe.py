@@ -310,11 +310,6 @@ def _fused_experts(
     return output_tensor.view(M, K)
 
 
-# ---------------------------------------------------------------------------
-# Public nn.Module interface
-# ---------------------------------------------------------------------------
-
-
 class Mxfp4MoE(nn.Module):
     """MXFP4-quantized fused MoE primitive (routing + matmul_ogs experts).
 

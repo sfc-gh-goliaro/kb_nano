@@ -1,0 +1,43 @@
+{
+  "timestamp": "2026-05-06T20:56:13.636996",
+  "wall_clock_seconds": 204.42931923398282,
+  "gpu": "H200",
+  "num_gpus": 8,
+  "total_models": 1,
+  "total_jobs": 1,
+  "avg_throughput_speedup": 1.0,
+  "avg_latency_speedup": 1.0,
+  "alignment_rate": 1.0,
+  "macro_correctness": 0.0,
+  "macro_coverage": 0.0,
+  "macro_speedup": 1.0,
+  "macro_score": 0.0,
+  "failed_jobs": 1,
+  "categories": [
+    {
+      "name": "llm",
+      "num_models": 0,
+      "avg_throughput_speedup": 0.0,
+      "avg_latency_speedup": 0.0,
+      "alignment_rate": 0.0,
+      "macro_correctness": 0.0,
+      "macro_coverage": 0.0,
+      "macro_speedup": 1.0,
+      "macro_score": 0.0,
+      "models": [
+        {
+          "model": "meta-llama/Llama-3.1-8B-Instruct",
+          "tp": 1,
+          "status": "FAILED",
+          "throughput_speedup": 0.0,
+          "latency_speedup": 0.0,
+          "alignment_rate": 0.0,
+          "correctness_score": 0.0,
+          "valid": false,
+          "blended_speedup": 0.0,
+          "error": "Candidate subprocess failed"
+        }
+      ]
+    }
+  ]
+}

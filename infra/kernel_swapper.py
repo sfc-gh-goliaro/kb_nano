@@ -86,6 +86,8 @@ class BenchTarget:
 
 
 _TARGETS: list[BenchTarget] | None = None
+_TARGET_BY_NAME: dict[str, BenchTarget] = {}
+_MODEL_MAP: dict[str, set[str]] | None = None
 
 
 def _resolve_internal_imports(filepath: Path, visited: set[Path] | None = None) -> set[Path]:
@@ -179,13 +181,73 @@ def _build_model_map() -> dict[str, set[str]]:
     return path_to_models
 
 
+def _get_model_map() -> dict[str, set[str]]:
+    global _MODEL_MAP
+    if _MODEL_MAP is None:
+        _MODEL_MAP = _build_model_map()
+    return _MODEL_MAP
+
+
+def _load_target(name: str, level_num: int, model_map: dict[str, set[str]] | None = None) -> BenchTarget | None:
+    """Load one target module without importing every benchmark target."""
+    if model_map is None:
+        model_map = _get_model_map()
+    pkg_root = __package__.rsplit(".", 1)[0]
+    module_path = f"tasks.baseline.L{level_num}.{name}"
+    models = sorted(model_map.get(module_path, []))
+    if not models:
+        return None
+
+    mod = importlib.import_module(f"{pkg_root}.{module_path}")
+    target_cls = _find_module_class(mod)
+    if target_cls is None:
+        return None
+    return BenchTarget(
+        name=name,
+        level=level_num,
+        module_path=module_path,
+        models=models,
+        target_cls=target_cls,
+        requires_recompile=(level_num == 1),
+    )
+
+
+def _discover_target_by_name(name: str) -> BenchTarget | None:
+    if name in _TARGET_BY_NAME:
+        return _TARGET_BY_NAME[name]
+
+    model_map = _get_model_map()
+    for level_num in (1, 2, 3, 4):
+        level_dir = _KB_ROOT / "tasks" / "baseline" / f"L{level_num}"
+        target_file = level_dir / f"{name}.py"
+        if not target_file.is_file():
+            continue
+        target = _load_target(name, level_num, model_map)
+        if target is not None:
+            _TARGET_BY_NAME[name] = target
+            return target
+    return None
+
+
+def _available_target_names() -> list[str]:
+    names = []
+    for level_num in (1, 2, 3, 4):
+        level_dir = _KB_ROOT / "tasks" / "baseline" / f"L{level_num}"
+        if not level_dir.is_dir():
+            continue
+        names.extend(
+            path.stem for path in level_dir.glob("*.py")
+            if not path.name.startswith("_")
+        )
+    return sorted(set(names))
+
+
 def discover_targets() -> list[BenchTarget]:
-    global _TARGETS
+    global _TARGETS, _TARGET_BY_NAME
     if _TARGETS is not None:
         return _TARGETS
 
-    pkg_root = __package__.rsplit(".", 1)[0]
-    model_map = _build_model_map()
+    model_map = _get_model_map()
     targets = []
 
     for level_num in (1, 2, 3, 4):
@@ -196,35 +258,26 @@ def discover_targets() -> list[BenchTarget]:
             if fname.startswith("_") or not fname.endswith(".py"):
                 continue
             name = fname[:-3]
-            module_path = f"tasks.baseline.L{level_num}.{name}"
-            models = sorted(model_map.get(module_path, []))
-            if not models:
-                continue
-
-            mod = importlib.import_module(f"{pkg_root}.{module_path}")
-            target_cls = _find_module_class(mod)
-            if target_cls is None:
-                continue
-
-            targets.append(BenchTarget(
-                name=name,
-                level=level_num,
-                module_path=module_path,
-                models=models,
-                target_cls=target_cls,
-                requires_recompile=(level_num == 1),
-            ))
+            target = _load_target(name, level_num, model_map)
+            if target is not None:
+                targets.append(target)
 
     _TARGETS = targets
+    _TARGET_BY_NAME.update({target.name: target for target in targets})
     return _TARGETS
 
 
 def get(name: str) -> BenchTarget:
-    targets = discover_targets()
-    for t in targets:
-        if t.name == name:
-            return t
-    available = ", ".join(sorted(t.name for t in targets))
+    if _TARGETS is not None:
+        for t in _TARGETS:
+            if t.name == name:
+                return t
+
+    target = _discover_target_by_name(name)
+    if target is not None:
+        return target
+
+    available = ", ".join(_available_target_names())
     raise KeyError(f"Unknown bench target {name!r}. Available: {available}")
 
 
@@ -389,34 +442,46 @@ def load_reference(target_name: str) -> type | None:
 
 def discover_candidates() -> list[tuple[BenchTarget, type]]:
     """Scan tasks/candidate/ and return all valid (target, candidate_class) pairs."""
-    targets = discover_targets()
     results: list[tuple[BenchTarget, type]] = []
 
-    for target in targets:
-        level_dir = _CANDIDATE_DIR / f"L{target.level}"
-        candidate_file = level_dir / f"{target.name}.py"
-        if not candidate_file.is_file():
+    model_map = _get_model_map()
+    for level_num in (1, 2, 3, 4):
+        level_dir = _CANDIDATE_DIR / f"L{level_num}"
+        if not level_dir.is_dir():
             continue
-        cls = load_candidate(target.name)
-        if cls is not None:
-            results.append((target, cls))
+        for candidate_file in sorted(level_dir.glob("*.py")):
+            if candidate_file.name.startswith("_"):
+                continue
+            target = _load_target(candidate_file.stem, level_num, model_map)
+            if target is None:
+                continue
+            _TARGET_BY_NAME.setdefault(target.name, target)
+            cls = load_candidate(target.name)
+            if cls is not None:
+                results.append((target, cls))
 
     return results
 
 
 def discover_references() -> list[tuple[BenchTarget, type]]:
     """Scan tasks/reference/ and return valid semantic reference classes."""
-    targets = discover_targets()
     results: list[tuple[BenchTarget, type]] = []
 
-    for target in targets:
-        level_dir = _REFERENCE_DIR / f"L{target.level}"
-        reference_file = level_dir / f"{target.name}.py"
-        if not reference_file.is_file():
+    model_map = _get_model_map()
+    for level_num in (1, 2, 3, 4):
+        level_dir = _REFERENCE_DIR / f"L{level_num}"
+        if not level_dir.is_dir():
             continue
-        cls = load_reference(target.name)
-        if cls is not None:
-            results.append((target, cls))
+        for reference_file in sorted(level_dir.glob("*.py")):
+            if reference_file.name.startswith("_"):
+                continue
+            target = _load_target(reference_file.stem, level_num, model_map)
+            if target is None:
+                continue
+            _TARGET_BY_NAME.setdefault(target.name, target)
+            cls = load_reference(target.name)
+            if cls is not None:
+                results.append((target, cls))
 
     return results
 
