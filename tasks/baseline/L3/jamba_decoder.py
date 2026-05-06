@@ -1,14 +1,12 @@
-"""Jamba decoder layer wiring.
-
-Reference: ``transformers.models.jamba.modeling_jamba``
-            (``JambaAttentionDecoderLayer`` and ``JambaMambaDecoderLayer``).
+"""Jamba decoder layer wiring -- mirrors vLLM's JambaAttentionDecoderLayer
+and JambaMambaDecoderLayer (and our project's LlamaDecoderLayer).
 
 Each Jamba layer is one of two flavours:
 
-  * **Attention layer**  -- pre-norm + multi-head attention + pre-FF
-                            norm + (MLP or sparse MoE).
-  * **Mamba layer**      -- pre-norm + Mamba mixer + pre-FF norm
-                            + (MLP or sparse MoE).
+  * **Attention layer**  -- fused-residual pre-norm + multi-head attention
+                            + fused-residual pre-FF norm + (MLP or sparse MoE).
+  * **Mamba layer**      -- fused-residual pre-norm + Mamba mixer
+                            + fused-residual pre-FF norm + (MLP or sparse MoE).
 
 The attn/Mamba choice and the MLP-vs-MoE choice are encoded in the
 config:
@@ -16,35 +14,28 @@ config:
     config.layers_block_type[layer_idx] in {"attention", "mamba"}
     config.layers_num_experts[layer_idx]   # 1 -> dense MLP, >1 -> MoE
 
-Forward signature follows the project convention (matches Llama, Mamba,
-Mamba2, Mixtral, ...):
+Forward signature follows the project convention (matches Llama, vLLM):
 
     forward(self, positions, hidden_states, residual) -> (hidden_states, residual)
 
-Per-step KV / Mamba state is read from the global ``Context`` populated
-by the engine via ``set_jamba_context``; the L2 mixers
-(``JambaAttention``, ``JambaMambaMixer``) reach into the context for
-their per-layer slab using ``self.layer_idx``.
+**Residual handling: Llama-style fused (matching vLLM's Jamba).**
+``self.input_layernorm(hidden_states, residual)`` returns
+``(normed, residual + hidden_states)`` in a single CUDA kernel
+(vLLM's ``fused_add_rms_norm``) -- the residual is the *running residual
+stream* and ``hidden_states`` carries the per-block *delta*.  The L4
+model's final ``self.final_layernorm(hidden_states, residual)`` folds
+the trailing residual into the output.
 
-Residual handling.  Jamba's HF reference uses *non-fused* pre-norm:
+This is bf16-identical with vLLM at the kernel level; the previous
+non-fused HF-style residual (``h0 + norm(h)``) added a small drift
+relative to vLLM that compounded over 32 layers and showed up as
+~25/128 match-tokens in the bench.
 
-    h0 = h
-    h  = norm1(h);   h = mixer(h);   h = h + h0
-    h0 = h
-    h  = norm2(h);   h = ffn(h);     h = h + h0
+Hidden-states layout: flat ``[N, hidden]`` (vLLM convention).  The
+engine packs prefill prompts as flat varlen ``[total_tokens, hidden]``
+and decode steps as ``[B, hidden]``; both go through the same forward.
 
-(rather than Llama's add-then-RMS fused residual).  We honour that
-exact arithmetic but expose the same ``(positions, h, residual)``
-signature as the rest of the project so the L4 wiring stays uniform.
-The convention here: if ``residual`` is non-None, we add it into
-``hidden_states`` first (closing out the previous layer's pending
-residual), then run the two Jamba sub-blocks in their natural form,
-returning ``(new_hidden, None)`` -- residual is fully closed every
-layer.
-
-We keep the standard ``[B, T, hidden]`` layout end-to-end.
-
-L1 ops used: ``RMSNorm`` (full hidden_size, multiple of 32, safe path).
+L1 ops used: ``RMSNorm`` (with the fused-add path).
 L2 ops used: ``JambaAttention``, ``JambaMambaMixer``, ``JambaMLP``,
              ``JambaMoE``.
 """
@@ -93,25 +84,22 @@ class JambaAttentionDecoderLayer(nn.Module):
         positions: torch.Tensor | None,
         hidden_states: torch.Tensor,
         residual: torch.Tensor | None = None,
-    ) -> tuple[torch.Tensor, None]:
-        # Close out a pending residual from a prior layer (Llama-style
-        # delayed add).  Jamba itself uses non-fused pre-norm, so we
-        # eagerly fold any incoming residual back into ``hidden_states``.
-        if residual is not None:
-            hidden_states = hidden_states + residual
+    ) -> tuple[torch.Tensor, torch.Tensor]:
+        # Fused add + RMSNorm (Llama-style, matching vLLM).  See module
+        # docstring for why this matters numerically vs the HF non-fused
+        # residual.
+        if residual is None:
+            residual = hidden_states
+            hidden_states = self.input_layernorm(hidden_states)
+        else:
+            hidden_states, residual = self.input_layernorm(hidden_states, residual)
 
-        # Attention block: pre-norm, mixer, residual add.
-        h0 = hidden_states
-        hidden_states = self.input_layernorm(hidden_states)
         hidden_states = self.self_attn(positions, hidden_states)
-        hidden_states = h0 + hidden_states
 
-        # FFN block: pre-norm, MLP / MoE, residual add.
-        h0 = hidden_states
-        hidden_states = self.pre_ff_layernorm(hidden_states)
+        # Fully-connected (MLP / MoE) block with fused residual.
+        hidden_states, residual = self.pre_ff_layernorm(hidden_states, residual)
         hidden_states = self.feed_forward(hidden_states)
-        hidden_states = h0 + hidden_states
-        return hidden_states, None
+        return hidden_states, residual
 
 
 class JambaMambaDecoderLayer(nn.Module):
@@ -140,20 +128,17 @@ class JambaMambaDecoderLayer(nn.Module):
         positions: torch.Tensor | None,
         hidden_states: torch.Tensor,
         residual: torch.Tensor | None = None,
-    ) -> tuple[torch.Tensor, None]:
-        # Close out any pending residual (see JambaAttentionDecoderLayer).
-        if residual is not None:
-            hidden_states = hidden_states + residual
+    ) -> tuple[torch.Tensor, torch.Tensor]:
+        # Fused add + RMSNorm (Llama-style, matching vLLM).
+        if residual is None:
+            residual = hidden_states
+            hidden_states = self.input_layernorm(hidden_states)
+        else:
+            hidden_states, residual = self.input_layernorm(hidden_states, residual)
 
-        # Mamba block: pre-norm, mixer, residual add.
-        h0 = hidden_states
-        hidden_states = self.input_layernorm(hidden_states)
         hidden_states = self.mamba(positions, hidden_states)
-        hidden_states = h0 + hidden_states
 
-        # FFN block: pre-norm, MLP / MoE, residual add.
-        h0 = hidden_states
-        hidden_states = self.pre_ff_layernorm(hidden_states)
+        # Fully-connected (MLP / MoE) block with fused residual.
+        hidden_states, residual = self.pre_ff_layernorm(hidden_states, residual)
         hidden_states = self.feed_forward(hidden_states)
-        hidden_states = h0 + hidden_states
-        return hidden_states, None
+        return hidden_states, residual

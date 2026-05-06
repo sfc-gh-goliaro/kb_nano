@@ -183,9 +183,13 @@ class JambaMambaMixer(nn.Module):
         positions: torch.Tensor | None,    # unused (Mamba handles position
                                             # via recurrence); kept for
                                             # mixer-uniform signature.
-        hidden_states: torch.Tensor,        # [B, T, hidden]
+        hidden_states: torch.Tensor,        # [N, hidden] flat varlen
     ) -> torch.Tensor:
-        """Mamba v1 selective-scan forward.
+        """Mamba v1 selective-scan forward, flat-varlen layout.
+
+        Mirrors vLLM's Jamba mamba mixer: input is ``[N, hidden]`` where
+        ``N = sum(prompt_lens)`` for prefill or ``N = num_decode_seqs``
+        for decode; ``query_start_loc`` describes per-seq boundaries.
 
         Reads per-step state from the global ``Context``:
 
@@ -195,9 +199,8 @@ class JambaMambaMixer(nn.Module):
           - ``meta.query_start_loc``:         int32 ``[num_seqs+1]`` (prefill only)
           - ``meta.has_initial_state``:       bool  ``[num_seqs]`` (prefill only)
           - ``meta.is_decode``:               bool
-          - ``meta.pad_mask_flat``:           bool ``[total_tokens]`` (prefill only)
 
-        Returns ``[B, T, hidden]``.
+        Returns ``[N, hidden]`` (same shape as input).
         """
         ctx = get_context()
         meta = ctx.mamba_metadata
@@ -212,23 +215,12 @@ class JambaMambaMixer(nn.Module):
         query_start_loc = meta.query_start_loc
         has_initial_state = meta.has_initial_state
         is_decode = meta.is_decode
-        mamba_pad_mask = meta.pad_mask_flat
 
-        # ``hidden_states`` arrives as [B, T, hidden]; reshape to flat.
-        b, t, d = hidden_states.shape
-        flat = hidden_states.reshape(b * t, d)
-
-        # 1. Gated MLP-style input projection: produces [total, intermediate*2]
-        projected = self.in_proj(flat)
+        # 1. Gated MLP-style input projection: [N, hidden] -> [N, intermediate*2]
+        projected = self.in_proj(hidden_states)
         # The Mamba kernels expect [intermediate, total_tokens].
         projected = projected.transpose(-2, -1)
         x_states, gate = projected.chunk(2, dim=-2)
-
-        # Zero out padded positions so they don't pollute the recurrent
-        # state.  Matches HF's behaviour during left-padded prefill.
-        if mamba_pad_mask is not None:
-            mask_row = mamba_pad_mask.to(x_states.dtype).unsqueeze(0)
-            x_states = x_states * mask_row
 
         # ``causal_conv1d_*`` expects the weight as [intermediate, K].
         conv_w = self.conv1d_weight.view(
@@ -262,10 +254,6 @@ class JambaMambaMixer(nn.Module):
                 has_initial_state=has_initial_state,
                 activation="silu",
             )
-
-        if mamba_pad_mask is not None:
-            mask_row = mamba_pad_mask.to(conv_out.dtype).unsqueeze(0)
-            conv_out = conv_out * mask_row
 
         # 2. SSM transform on the post-conv output: (dt, B, C).  The
         # ``_ssm_transform`` expects [total, intermediate], so we
@@ -316,7 +304,5 @@ class JambaMambaMixer(nn.Module):
                 query_start_loc=query_start_loc,
             )
 
-        # 3. Final out projection.  scan_out is [intermediate, total_tokens].
-        out_flat = self.out_proj(scan_out.transpose(-2, -1))
-        # Reshape back to [B, T, hidden].
-        return out_flat.reshape(b, t, d)
+        # 3. Final out projection.  scan_out is [intermediate, total_tokens] -> [N, hidden].
+        return self.out_proj(scan_out.transpose(-2, -1))

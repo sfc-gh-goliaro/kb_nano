@@ -227,19 +227,22 @@ class JambaModel(nn.Module):
         else:
             hidden_states = self.embed_tokens(input_ids)
 
+        # Llama-style fused residual: ``hidden_states`` carries the
+        # per-block delta and ``residual`` is the running residual stream;
+        # the L3 layer's input_layernorm / pre_ff_layernorm both call
+        # ``norm(hidden_states, residual)`` which fuses the add + norm
+        # into one CUDA kernel (vLLM ``fused_add_rms_norm``) for
+        # bf16-identical numerics with vLLM's Jamba forward.
         # ``positions`` is unused by Jamba's mixers (no RoPE; Mamba
-        # carries position via its recurrence) but kept in the signature
-        # for parity with Llama / Mamba / Mixtral / etc.  Jamba's L3
-        # decoder layers eagerly fold any pending ``residual`` back into
-        # ``hidden_states`` at entry (Jamba uses non-fused pre-norm), so
-        # ``residual`` is always ``None`` between layers here -- but we
-        # keep the ``(positions, hidden_states, residual)`` call shape
-        # for uniform L3-layer interface.
+        # carries position via its recurrence) but kept for signature
+        # parity with Llama / Mamba / Mixtral.
         residual = None
         for layer in self.layers:
             hidden_states, residual = layer(positions, hidden_states, residual)
 
-        hidden_states = self.final_layernorm(hidden_states)
+        # Fold the trailing residual into the final norm (same pattern
+        # as LlamaModel.forward).
+        hidden_states, _ = self.final_layernorm(hidden_states, residual)
         return hidden_states
 
 
@@ -310,6 +313,22 @@ class JambaForCausalLM(nn.Module):
     # ``Pattern 2`` per-pipeline loader documented in CLAUDE.md, since
     # Jamba's hybrid wiring needs custom routing.
     # ------------------------------------------------------------------
+    # vLLM-style fused-projection mapping: HF stores Q, K, V and gate, up
+    # as separate weights but our L2 modules use fused projections
+    # (``QKVParallelLinear`` for attention, ``MergedColumnParallelLinear``
+    # for the dense MLP).  The loader translates each HF ``.q_proj`` /
+    # ``.k_proj`` / ``.v_proj`` / ``.gate_proj`` / ``.up_proj`` tensor
+    # into the appropriate shard of the fused parameter via the
+    # corresponding ``_weight_loader(param, tensor, shard_id)``.
+    # Mirrors :class:`LlamaForCausalLM.packed_modules_mapping`.
+    packed_modules_mapping = {
+        "q_proj": ("qkv_proj", "q"),
+        "k_proj": ("qkv_proj", "k"),
+        "v_proj": ("qkv_proj", "v"),
+        "gate_proj": ("gate_up_proj", 0),
+        "up_proj": ("gate_up_proj", 1),
+    }
+
     def load_weights(self, model_path: str) -> int:
         """Load Jamba weights from a local snapshot directory.
 
@@ -329,6 +348,18 @@ class JambaForCausalLM(nn.Module):
             r"^model\.layers\.(\d+)\.feed_forward\.experts\.(\d+)\."
             r"(gate_proj|up_proj|down_proj)\.weight$"
         )
+        # Pattern for HF self_attn projections that need to be packed
+        # into the fused qkv_proj.  Captured groups: (layer_idx, proj).
+        qkv_re = re.compile(
+            r"^model\.layers\.(\d+)\.self_attn\.(q_proj|k_proj|v_proj)\.weight$"
+        )
+        # Pattern for HF dense-MLP gate/up projections (only present in
+        # layers where layers_num_experts == 1 -- the MoE layers use the
+        # ``feed_forward.experts.*`` path which moe_re catches above).
+        # Packs into the fused ``gate_up_proj`` via shard_id 0/1.
+        mlp_re = re.compile(
+            r"^model\.layers\.(\d+)\.feed_forward\.(gate_proj|up_proj)\.weight$"
+        )
 
         sf_files = sorted(glob(os.path.join(model_path, "*.safetensors")))
         if not sf_files:
@@ -340,11 +371,8 @@ class JambaForCausalLM(nn.Module):
             with safe_open(sf, "pt", "cpu") as f:
                 for name in f.keys():
                     tensor = f.get_tensor(name)
-                    mapped = self._remap_name(name)
-                    if mapped is None:
-                        unmatched.append(name)
-                        continue
-                    # MoE expert: pack into 3D tensor at (expert_idx, ...)
+
+                    # MoE expert: pack into 3D tensor at (expert_idx, ...).
                     m = moe_re.match(name)
                     if m is not None:
                         layer_idx = int(m.group(1))
@@ -363,8 +391,35 @@ class JambaForCausalLM(nn.Module):
                         loaded += 1
                         continue
 
-                    # Direct copy / A_log transform.
-                    if mapped not in params:
+                    # Fused QKV: pack q_proj/k_proj/v_proj into qkv_proj
+                    # via QKVParallelLinear._weight_loader(param, tensor, shard_id).
+                    qm = qkv_re.match(name)
+                    if qm is not None:
+                        layer_idx = int(qm.group(1))
+                        proj = qm.group(2)  # q_proj / k_proj / v_proj
+                        shard_id = proj[0]  # "q" / "k" / "v"
+                        param = params[f"model.layers.{layer_idx}.self_attn.qkv_proj.weight"]
+                        param.weight_loader(param, tensor, shard_id)
+                        loaded += 1
+                        continue
+
+                    # Fused gate_up: pack gate_proj/up_proj into gate_up_proj
+                    # for dense-MLP layers (layers_num_experts == 1).
+                    mm = mlp_re.match(name)
+                    if mm is not None:
+                        layer_idx = int(mm.group(1))
+                        proj = mm.group(2)  # gate_proj / up_proj
+                        shard_id = 0 if proj == "gate_proj" else 1
+                        param = params[
+                            f"model.layers.{layer_idx}.feed_forward.gate_up_proj.weight"
+                        ]
+                        param.weight_loader(param, tensor, shard_id)
+                        loaded += 1
+                        continue
+
+                    # Generic path: name remap + direct copy / weight_loader.
+                    mapped = self._remap_name(name)
+                    if mapped is None or mapped not in params:
                         unmatched.append(name)
                         continue
                     param = params[mapped]
@@ -390,7 +445,7 @@ class JambaForCausalLM(nn.Module):
     @staticmethod
     def _remap_name(name: str) -> str | None:
         """HF checkpoint -> our param path.  Returns None if MoE expert
-        (handled separately) or a name we should silently skip."""
+        / fused-QKV (handled separately) or a name we should silently skip."""
         # Embedding wrapper: HF stores at model.embed_tokens.weight,
         # our L1 ``Embedding`` nests an nn.Embedding as ``self.emb``.
         if name == "model.embed_tokens.weight":
@@ -410,12 +465,6 @@ class JambaForCausalLM(nn.Module):
         if "mamba.conv1d.bias" in name:
             return name.replace("mamba.conv1d.bias", "mamba.conv1d_bias")
 
-        # MoE expert weights are packed via the param's weight_loader,
-        # not a direct copy -- signal that by returning ``None`` so the
-        # caller skips the direct-copy path.  We still reach the MoE
-        # handling because it uses the original (un-mapped) name.
-        if ".feed_forward.experts." in name:
-            return name  # placeholder; caller checks moe_re
-
-        # Everything else is a 1-to-1 mapping.
+        # Everything else is a 1-to-1 mapping (input_layernorm,
+        # pre_ff_layernorm, o_proj, layernorms, etc.).
         return name
