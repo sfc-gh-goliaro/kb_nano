@@ -638,9 +638,7 @@ Latency (128 output tokens, 5 iterations):
 | Jamba-v0.1     | 1 | single-request | 1  | 0.916s | 0.927s | 7.16 | 7.24 | 0.99x |
 | Jamba-v0.1     | 1 | fixed-batch-32 | 32 | 3.183s | 3.227s | 0.78 | 0.79 | 0.99x |
 
-Tiny-dev (200M) clears vLLM by 2.40× geomean — kb-nano's tighter Python scheduler dominates at small model sizes where per-step overhead matters more than kernel time. v0.1 (52B) is at parity (1.02× geomean) under the same scheduler config (max_num_seqs=256). `torch.compile` is OFF by default — Inductor's fused elementwise kernels drift from vLLM's `_C.fused_add_rms_norm` / `_C.silu_and_mul` in bf16 and tank match-tokens; set `KB_NANO_JAMBA_COMPILE=1` to opt in.
-
-**Known limitation: TP=1 only.** `JambaEngine` is single-rank — no multi-process fork, no NCCL coordination, no TP-sharded `_MambaSlotPool` / paged KV / MoE experts. Every other ≥10B LLM in the project ships at TP>1 (`gpt-oss-120b` TP=2, `Llama-70B` TP=4, `Mixtral-8x7B` TP=4); `Jamba-v0.1` at 52B running at TP=1 deviates from that convention. The L2 modules already use `QKVParallelLinear` / `RowParallelLinear` / `MergedColumnParallelLinear`, which would shard correctly under TP, but the engine never enters multi-rank mode. Adding TP=2 to JambaEngine (sharded state pool, sharded KV, expert sharding, L3 allreduce) is a required follow-up before the v0.1 numbers are mentor-bar paper-ready at the same standard as `gpt-oss-120b`.
+Tiny-dev (200M) clears vLLM by 2.40× geomean — kb-nano's tighter Python scheduler dominates at small model sizes where per-step overhead matters more than kernel time. v0.1 (52B) is at parity (1.02× geomean) under the same scheduler config (max_num_seqs=256). Both ship at TP=1: v0.1's bf16 weights (~104 GB) fit comfortably on one B200, and its activated MoE parameter count (~12B) is in the same regime as `gpt-oss-20b` (TP=1). `torch.compile` is OFF by default — Inductor's fused elementwise kernels drift from vLLM's `_C.fused_add_rms_norm` / `_C.silu_and_mul` in bf16 and tank match-tokens; set `KB_NANO_JAMBA_COMPILE=1` to opt in.
 
 **Hardware: 1× NVIDIA B200**
 
