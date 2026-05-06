@@ -340,6 +340,7 @@ class JambaEngine:
         seed: int = 42,
         max_num_seqs: int = 32,
         max_model_len: int = 4096,
+        max_num_batched_tokens: int = 16384,
         trust_remote_code: bool = True,
     ):
         from huggingface_hub import snapshot_download
@@ -351,6 +352,15 @@ class JambaEngine:
         self.seed = seed
         self.max_num_seqs = max_num_seqs
         self.max_model_len = max_model_len
+        # Per-step token budget for chunked prefill.  Mirrors vLLM's
+        # ``max_num_batched_tokens`` (default 16384) and the chunked-
+        # prefill scheduler in ``infra.engine`` /
+        # ``infra.fla_engine``.  No prefill kernel call ever processes
+        # more than this many flat tokens; long prompts are split
+        # across multiple steps with ``has_initial_state`` continuing
+        # the conv/SSM state, and short-prompt batches are admitted
+        # multiple-at-a-time within the budget.
+        self.max_num_batched_tokens = max_num_batched_tokens
         self.device = torch.device(device)
         self.dtype = dtype
         self._set_seeds(seed)
@@ -783,95 +793,133 @@ class JambaEngine:
         waiting: deque[Sequence] = deque(
             sorted(all_seqs, key=lambda s: len(s.prompt_ids), reverse=True),
         )
+        # Three deques: waiting (not yet admitted), prefilling (admitted,
+        # mid-prompt), running (prompt fully prefilled, decoding).  Same
+        # pattern as ``LlamaEngine.generate`` / ``FLAEngine.generate`` /
+        # ``LlamaEngine._generate_mamba``.
+        prefilling: list[Sequence] = []
         running: list[Sequence] = []
 
         def _admit() -> list[Sequence]:
-            """Take from ``waiting`` while there is room (slot pool +
-            block pool + ``max_num_seqs`` cap).  Allocates the
-            sequence's blocks for its full prompt up-front (chunked
-            prefill of a single seq is a follow-up).
+            """Take from ``waiting`` while there's room in slot pool,
+            block pool, and ``max_num_seqs`` cap.  Allocates lifetime
+            blocks at admit time -- decode-phase block table doesn't
+            grow.  Mirrors ``FLAEngine._admit``'s eager-allocate
+            pattern.
             """
             admitted: list[Sequence] = []
-            while waiting and len(running) + len(admitted) < self.max_num_seqs:
+            while (waiting and
+                   len(prefilling) + len(running) + len(admitted)
+                   < self.max_num_seqs):
                 if not self.mamba_pool.has_free():
                     break
                 seq = waiting[0]
-                # Compute how many blocks the seq will need across its
-                # full lifetime (prompt + max_tokens decode tokens) and
-                # check both the block pool and the mamba pool.
                 lifetime_tokens = len(seq.prompt_ids) + seq.max_tokens
                 lifetime_blocks = (
                     (lifetime_tokens + self._page_size - 1) // self._page_size
                 )
+                if lifetime_blocks > self._num_blocks:
+                    raise RuntimeError(
+                        f"Sequence requires {lifetime_blocks} blocks "
+                        f"({lifetime_tokens} tokens) but the global pool only "
+                        f"holds {self._num_blocks}.  Increase "
+                        f"max_model_len or reduce max_num_seqs to fit."
+                    )
                 if not self.block_manager.can_allocate_n(lifetime_blocks):
                     break
                 waiting.popleft()
-                # Allocate Mamba slot.
                 seq.state_slot = self.mamba_pool.allocate()
-                # Allocate enough blocks for the prompt initially;
-                # decode-phase ``may_append`` extends the block_table
-                # as new tokens cross block boundaries.  Pre-allocating
-                # the lifetime blocks here keeps decode-step latency
-                # predictable (no allocator stalls mid-graph).
                 self.block_manager.allocate_n(seq, lifetime_blocks)
-                seq.status = SeqStatus.RUNNING
+                seq.status = SeqStatus.RUNNING  # placeholder; truly RUNNING
+                                                 # only after prefill completes
                 admitted.append(seq)
             return admitted
 
-        # Pad seqs lengths for graph compat: each decode replay needs
-        # block_tables[i] padded to ``self._max_blocks_per_seq``; we
-        # pre-fill the static buffer with -1 (kernel skips -1 slots).
+        def _next_prefill_chunks(
+            prefilling_local: list[Sequence],
+        ) -> list[tuple[Sequence, int]]:
+            """Pick this step's chunk for each prefilling seq, capped
+            at ``max_num_batched_tokens`` total.  Mirrors FLAEngine's
+            ``_next_prefill_batch``; analogous to LlamaEngine's
+            ``prepare_mixed_batch`` chunk-size selection.
+            """
+            chunks: list[tuple[Sequence, int]] = []
+            tokens_used = 0
+            for seq in prefilling_local:
+                remaining = len(seq.prompt_ids) - seq.num_computed_tokens
+                if remaining <= 0:
+                    continue
+                budget_left = self.max_num_batched_tokens - tokens_used
+                if budget_left <= 0:
+                    break
+                chunk = min(remaining, budget_left)
+                chunks.append((seq, chunk))
+                tokens_used += chunk
+            return chunks
 
-        def _finalize_token(seq, tok):
-            """Apply a sampled token to ``seq`` and report (done, finished)."""
+        def _finalize_decode_token(seq, tok):
+            """Apply a sampled decode token to ``seq``; return True if
+            the seq is done (eos / max_tokens)."""
             seq.append_token(tok)
             seq.num_computed_tokens = len(seq)
-            done = (
+            return (
                 len(seq.generated_ids) >= seq.max_tokens
                 or (not seq.ignore_eos and eos is not None and tok == eos)
             )
-            return done
 
-        while waiting or running:
-            new_seqs = _admit()
+        while waiting or prefilling or running:
+            # ---- admit fresh seqs from waiting into prefilling ----
+            prefilling.extend(_admit())
 
-            if new_seqs and running:
-                # ============================================================
-                # MIXED STEP: chunked-prefill new seqs + decode running seqs
-                # in one forward pass.  Mirrors LlamaEngine._generate_mamba's
-                # ``run_mamba_mixed`` pattern.  This branch fires when slot
-                # pool freed up between iterations (a running seq finished
-                # via eos / max_tokens) while waiting still has prompts --
-                # then we admit new prompts AND keep decoding the survivors
-                # in a single mixed batch instead of stalling.
-                # ============================================================
-                prefill_logits, decode_logits = self._run_mixed_step(
-                    prefill_seqs=new_seqs, decode_seqs=running,
-                )
-                # Sample + apply.  Prefill seqs sample their FIRST decode
-                # token and join running; decode seqs sample their NEXT
-                # token and stay running unless finished.
-                p_toks = (
-                    prefill_logits.argmax(dim=-1).tolist()
-                    if all(seq_sp[id(s)].temperature == 0.0 for s in new_seqs)
-                    else [self._sample_one(prefill_logits[i], seq_sp[id(s)])
-                          for i, s in enumerate(new_seqs)]
-                )
-                d_toks = (
-                    decode_logits.argmax(dim=-1).tolist()
-                    if all(seq_sp[id(s)].temperature == 0.0 for s in running)
-                    else [self._sample_one(decode_logits[i], seq_sp[id(s)])
-                          for i, s in enumerate(running)]
-                )
-                still_running: list[Sequence] = []
-                finished_now: list[Sequence] = []
-                for seq, tok in zip(new_seqs, p_toks):
-                    if _finalize_token(seq, tok):
-                        finished_now.append(seq)
+            # ---- chunked prefill step ----
+            if prefilling:
+                chunks = _next_prefill_chunks(prefilling)
+                chunk_logits, completed_mask = self._run_prefill_chunks(chunks)
+                # Process each (seq, chunk_size) result.  Completed
+                # seqs (whose prefill finished this step) get their
+                # last-chunk logit sampled; others advance and stay
+                # in prefilling.
+                completed_seqs: list[Sequence] = []
+                completed_logits: list[torch.Tensor] = []
+                for i, ((seq, cs), is_done) in enumerate(zip(chunks, completed_mask)):
+                    seq.num_computed_tokens += cs
+                    if is_done:
+                        completed_seqs.append(seq)
+                        completed_logits.append(chunk_logits[i])
+
+                # Sample first decode token for completed prefills.
+                if completed_seqs:
+                    stacked = torch.stack(completed_logits, dim=0)
+                    if all(seq_sp[id(s)].temperature == 0.0 for s in completed_seqs):
+                        first_toks = stacked.argmax(dim=-1).tolist()
                     else:
-                        still_running.append(seq)
-                for seq, tok in zip(running, d_toks):
-                    if _finalize_token(seq, tok):
+                        first_toks = [
+                            self._sample_one(stacked[i], seq_sp[id(s)])
+                            for i, s in enumerate(completed_seqs)
+                        ]
+                    finished_now: list[Sequence] = []
+                    for seq, tok in zip(completed_seqs, first_toks):
+                        if _finalize_decode_token(seq, tok):
+                            finished_now.append(seq)
+                        else:
+                            running.append(seq)
+                    for seq in finished_now:
+                        self._finish_seq(seq, outputs, eos, seq_idx_for_id)
+                        if pbar is not None:
+                            pbar.update(1)
+                # Drop completed seqs from prefilling.
+                prefilling = [
+                    s for s in prefilling
+                    if s.num_computed_tokens < len(s.prompt_ids)
+                ]
+
+            # ---- decode step over running ----
+            if running:
+                tokens = self._run_decode_step(running)
+                still_running: list[Sequence] = []
+                finished_now = []
+                for seq, tok in zip(running, tokens):
+                    if _finalize_decode_token(seq, tok):
                         finished_now.append(seq)
                     else:
                         still_running.append(seq)
@@ -880,42 +928,6 @@ class JambaEngine:
                     if pbar is not None:
                         pbar.update(1)
                 running = still_running
-                continue
-
-            if new_seqs:
-                # ----- batched pure-prefill step over admitted seqs -----
-                self._run_prefill(new_seqs)
-                first_toks = self._sample_after_prefill(new_seqs, seq_sp)
-                still_running = []
-                finished_now = []
-                for seq, tok in zip(new_seqs, first_toks):
-                    if _finalize_token(seq, tok):
-                        finished_now.append(seq)
-                    else:
-                        still_running.append(seq)
-                for seq in finished_now:
-                    self._finish_seq(seq, outputs, eos, seq_idx_for_id)
-                    if pbar is not None:
-                        pbar.update(1)
-                running.extend(still_running)
-
-            if not running:
-                continue
-
-            # ----- batched pure-decode step over running seqs (CUDA graph) -----
-            tokens = self._run_decode_step(running)
-            still_running = []
-            finished_now = []
-            for seq, tok in zip(running, tokens):
-                if _finalize_token(seq, tok):
-                    finished_now.append(seq)
-                else:
-                    still_running.append(seq)
-            for seq in finished_now:
-                self._finish_seq(seq, outputs, eos, seq_idx_for_id)
-                if pbar is not None:
-                    pbar.update(1)
-            running = still_running
 
         if pbar is not None:
             pbar.close()
@@ -958,57 +970,99 @@ class JambaEngine:
         seq.status = SeqStatus.FINISHED
 
     # ------------------------------------------------------------------
-    # _run_prefill: batched flat-varlen prefill over ``new_seqs``.
-    # Updates ``seq.num_computed_tokens`` to ``len(seq.prompt_ids)`` on
-    # success (chunked single-seq prefill is a follow-up).  Returns
-    # last-token logits per seq via ``self._prefill_last_logits``.
+    # _run_prefill_chunks: batched chunked-prefill step over a list of
+    # (seq, chunk_size) pairs.  Each seq contributes ``chunk_size`` new
+    # prompt tokens this step (positions ``[num_computed,
+    # num_computed + chunk)``).  Mirrors ``LlamaEngine.prepare_mixed_batch``
+    # 's chunked-prefill metadata builder.
+    #
+    # Mamba state continues across chunks via ``has_initial_state[i] =
+    # (num_computed_i > 0)`` -- the vendored vLLM Mamba kernels read
+    # the prior conv/SSM state at ``cache_indices[i]`` and update it
+    # in place.  Paged-attn likewise sees the full K/V history (prior
+    # chunks already wrote slots ``[0, num_computed)``; this chunk
+    # writes ``[num_computed, num_computed + chunk)``).
+    #
+    # Returns the per-seq logits ONLY for seqs whose prefill COMPLETES
+    # this step (i.e., ``num_computed_i + chunk_i == len(prompt_ids_i)``);
+    # mid-prefill seqs return no logit (they keep prefilling next step).
+    # The caller advances ``seq.num_computed_tokens`` and decides which
+    # seqs promote to ``running`` based on this completion mask.
     # ------------------------------------------------------------------
-    def _run_prefill(self, new_seqs: list[Sequence]) -> None:
+    def _run_prefill_chunks(
+        self,
+        chunks: list[tuple[Sequence, int]],
+    ) -> tuple[torch.Tensor, list[bool]]:
         device = self.device
         page_size = self._page_size
-        B = len(new_seqs)
+        B = len(chunks)
 
-        # Flat input_ids = concatenation of prompts.
-        flat_ids = []
-        for s in new_seqs:
-            flat_ids.extend(s.prompt_ids)
-        plens = np.array([len(s.prompt_ids) for s in new_seqs], dtype=np.int32)
+        # Per-seq chunk metadata.
+        plens = np.array([cs for _, cs in chunks], dtype=np.int32)  # this step
+        starts = np.array(
+            [s.num_computed_tokens for s, _ in chunks], dtype=np.int32,
+        )
+        kvlens = starts + plens  # post-write K/V length per seq
+        completed_mask = [
+            (s.num_computed_tokens + cs) >= len(s.prompt_ids)
+            for s, cs in chunks
+        ]
+
+        # Flat input_ids = concatenation of this step's chunks.
+        flat_ids: list[int] = []
+        for s, cs in chunks:
+            start = s.num_computed_tokens
+            flat_ids.extend(s.prompt_ids[start:start + cs])
         cu_q_np = np.zeros(B + 1, dtype=np.int32)
         np.cumsum(plens, out=cu_q_np[1:])
         cu_q = torch.from_numpy(cu_q_np).to(device)
 
-        # Per-token positions (0..plen-1 within each seq, concatenated).
-        pos_np = np.concatenate([np.arange(p, dtype=np.int64) for p in plens])
+        # cu_seqlens_k carries the FULL post-write K/V length per seq
+        # (prior-chunk K/V already in cache + this chunk's K/V about to
+        # be written).  This is what ``Attention._forward_pure``'s
+        # paged-prefill kernel needs.  ``max_seqlen_q`` is per-step
+        # chunk_size max; ``max_seqlen_k`` is total K-len max.
+        cu_k_np = np.zeros(B + 1, dtype=np.int32)
+        np.cumsum(kvlens, out=cu_k_np[1:])
+        cu_k = torch.from_numpy(cu_k_np).to(device)
+
+        # Per-token absolute positions (carry the seq's start offset).
+        pos_np = np.concatenate([
+            np.arange(s.num_computed_tokens,
+                      s.num_computed_tokens + cs, dtype=np.int64)
+            for s, cs in chunks
+        ])
         positions = torch.from_numpy(pos_np).to(device)
         input_ids = torch.tensor(flat_ids, dtype=torch.long, device=device)
 
-        # Per-seq block_tables (pad to max_blocks_per_seq for paged
-        # attention kernel that expects fixed-width tables).
+        # Per-seq block_tables.
         bps = self._max_blocks_per_seq
         bt_np = np.full((B, bps), -1, dtype=np.int32)
-        for i, s in enumerate(new_seqs):
+        for i, (s, _) in enumerate(chunks):
             bt_np[i, :len(s.block_table)] = s.block_table
         block_tables = torch.from_numpy(bt_np).to(device)
 
-        # Per-token slot_mapping (vectorized).  For the k-th real token:
-        #   seq_idx[k]   = which seq
-        #   within[k]    = position in seq (0..plen-1)
-        #   slot[k]      = block_tables[seq_idx, within//P] * P + within%P
+        # Per-token slot_mapping.  position-in-seq vector (absolute).
         seq_idx_np = np.repeat(np.arange(B, dtype=np.int64), plens)
-        within_np = pos_np
-        block_idxs = within_np // page_size
-        slot_in_blocks = within_np % page_size
+        block_idxs = pos_np // page_size
+        slot_in_blocks = pos_np % page_size
         slot_np = (
             bt_np[seq_idx_np, block_idxs].astype(np.int64) * page_size
             + slot_in_blocks
         )
         slot_mapping = torch.from_numpy(slot_np).to(device)
 
-        # Mamba metadata (prefill: query_start_loc + has_initial_state).
+        # Mamba metadata.  ``has_initial_state[i] = (num_computed > 0)``
+        # tells the kernel to continue from the prior chunk's state
+        # rather than initialise to zero -- this is the load-bearing
+        # bit for chunked Mamba prefill.
         cache_indices = torch.tensor(
-            [s.state_slot for s in new_seqs], dtype=torch.int32, device=device,
+            [s.state_slot for s, _ in chunks], dtype=torch.int32, device=device,
         )
-        has_initial_state = torch.zeros(B, dtype=torch.bool, device=device)
+        has_initial_state = torch.tensor(
+            [s.num_computed_tokens > 0 for s, _ in chunks],
+            dtype=torch.bool, device=device,
+        )
 
         mamba_meta = JambaMambaMetadata(
             conv_states=self.mamba_pool.conv_states,
@@ -1019,209 +1073,27 @@ class JambaEngine:
             has_initial_state=has_initial_state,
         )
 
-        max_seqlen = int(plens.max())
+        max_seqlen_q = int(plens.max())
+        max_seqlen_k = int(kvlens.max())
         set_jamba_context(
             is_prefill=True,
             slot_mapping=slot_mapping,
             block_tables=block_tables,
             cu_seqlens_q=cu_q,
-            cu_seqlens_k=cu_q,
-            max_seqlen_q=max_seqlen,
-            max_seqlen_k=max_seqlen,
+            cu_seqlens_k=cu_k,
+            max_seqlen_q=max_seqlen_q,
+            max_seqlen_k=max_seqlen_k,
             mamba_metadata=mamba_meta,
         )
         try:
             hidden = self.model(input_ids, positions)
-            # Gather per-seq last-token hidden states.  cu_q[1:] - 1
-            # are the indices of the last real token for each seq.
+            # Last-token hidden of THIS chunk per seq (cu_q[i+1]-1).
             last_idx = cu_q[1:].long() - 1
             last_hidden = hidden.index_select(0, last_idx)
-            self._prefill_last_logits = self.model.compute_logits(last_hidden)
+            chunk_last_logits = self.model.compute_logits(last_hidden)
         finally:
             reset_context()
-
-    def _sample_after_prefill(
-        self,
-        new_seqs: list[Sequence],
-        seq_sp: dict[int, SamplingParams],
-    ) -> list[int]:
-        logits = self._prefill_last_logits
-        if all(seq_sp[id(s)].temperature == 0.0 for s in new_seqs):
-            return logits.argmax(dim=-1).tolist()
-        return [
-            self._sample_one(logits[i], seq_sp[id(s)])
-            for i, s in enumerate(new_seqs)
-        ]
-
-    # ------------------------------------------------------------------
-    # _run_mixed_step: ONE forward pass over a combined batch of
-    # prefill_seqs (newly admitted, contributing their full prompts) +
-    # decode_seqs (already running, contributing one new token each).
-    # Mirrors the project's chunked-prefill mid-decode pattern:
-    #
-    #   * ``infra.engine.run_mamba_mixed`` (Mamba-only models)
-    #   * ``infra.engine.LlamaEngine`` mixed-batch via
-    #     ``prepare_mixed_batch`` + ``set_mixed_context``
-    #
-    # For Jamba (hybrid) the batch is laid out **prefill-first** to match
-    # the Attention class's :meth:`_forward_mixed` ctx-field convention
-    # (``q[:num_prefill_tokens]`` is prefill, ``q[num_prefill_tokens:]``
-    # is decode).  The Mamba mixer's own mixed-path branch (see L2)
-    # consumes the same per-phase metadata.
-    #
-    # Eager only -- no CUDA graph for mixed steps.  The combined-batch
-    # shape varies per call (depends on which seqs admit when), so a
-    # captured graph would have to be re-captured every shape.  The
-    # mixed step is rare relative to pure-decode steps (only fires when
-    # a running seq finishes early via eos / max_tokens AND there's a
-    # waiting seq to admit), so the eager-step latency cost is small.
-    #
-    # Returns (prefill_logits[N_p_seqs, V], decode_logits[N_d_seqs, V])
-    # so the caller can sample each phase's tokens independently.
-    # ------------------------------------------------------------------
-    def _run_mixed_step(
-        self,
-        prefill_seqs: list["Sequence"],
-        decode_seqs: list["Sequence"],
-    ) -> tuple[torch.Tensor, torch.Tensor]:
-        device = self.device
-        page_size = self._page_size
-
-        # ---- Prefill chunk (full-prompt for newly-admitted seqs) ----
-        prefill_input_ids: list[int] = []
-        prefill_pos: list[int] = []
-        prefill_plens: list[int] = []
-        for s in prefill_seqs:
-            prefill_input_ids.extend(s.prompt_ids)
-            prefill_pos.extend(range(len(s.prompt_ids)))
-            prefill_plens.append(len(s.prompt_ids))
-        n_p = sum(prefill_plens)
-        n_p_seqs = len(prefill_seqs)
-        plens_p = np.array(prefill_plens, dtype=np.int32)
-        cu_q_p_np = np.zeros(n_p_seqs + 1, dtype=np.int32)
-        np.cumsum(plens_p, out=cu_q_p_np[1:])
-        cu_q_p = torch.from_numpy(cu_q_p_np).to(device)
-
-        # ---- Decode tokens (one per running seq) ----
-        n_d = len(decode_seqs)
-        d_input_ids = [s.last_token for s in decode_seqs]
-        d_positions = [len(s) - 1 for s in decode_seqs]
-        d_context_lens_np = np.array(
-            [len(s) for s in decode_seqs], dtype=np.int32,
-        )
-
-        # ---- Combined input (prefill-first) ----
-        all_ids = prefill_input_ids + d_input_ids
-        all_pos = prefill_pos + d_positions
-        input_ids = torch.tensor(all_ids, dtype=torch.long, device=device)
-        positions = torch.tensor(all_pos, dtype=torch.long, device=device)
-
-        # ---- Per-seq paged-KV block_tables ----
-        bps = self._max_blocks_per_seq
-        prefill_bt_np = np.full((n_p_seqs, bps), -1, dtype=np.int32)
-        for i, s in enumerate(prefill_seqs):
-            prefill_bt_np[i, :len(s.block_table)] = s.block_table
-        prefill_block_tables = torch.from_numpy(prefill_bt_np).to(device)
-
-        decode_bt_np = np.full((n_d, bps), -1, dtype=np.int32)
-        for i, s in enumerate(decode_seqs):
-            decode_bt_np[i, :len(s.block_table)] = s.block_table
-        decode_block_tables = torch.from_numpy(decode_bt_np).to(device)
-
-        # ---- Per-token slot_mapping (prefill rows + decode rows) ----
-        # Prefill: vectorized like _run_prefill.
-        seq_idx_p = np.repeat(np.arange(n_p_seqs, dtype=np.int64), plens_p)
-        within_p = np.array(prefill_pos, dtype=np.int64)
-        block_idxs_p = within_p // page_size
-        slot_in_p = within_p % page_size
-        slot_p_np = (
-            prefill_bt_np[seq_idx_p, block_idxs_p].astype(np.int64) * page_size
-            + slot_in_p
-        )
-        # Decode: per-seq slot for the new token's position.
-        slot_d_np = np.empty(n_d, dtype=np.int64)
-        for i, s in enumerate(decode_seqs):
-            new_pos = len(s) - 1
-            block_idx = new_pos // page_size
-            slot_in_block = new_pos % page_size
-            slot_d_np[i] = int(s.block_table[block_idx]) * page_size + slot_in_block
-        slot_mapping_np = np.concatenate([slot_p_np, slot_d_np])
-        slot_mapping = torch.from_numpy(slot_mapping_np).to(device)
-
-        # ---- Mamba metadata (state indices split by phase) ----
-        state_indices_p_np = np.array(
-            [s.state_slot for s in prefill_seqs], dtype=np.int32,
-        )
-        state_indices_d_np = np.array(
-            [s.state_slot for s in decode_seqs], dtype=np.int32,
-        )
-        state_indices_p = torch.from_numpy(state_indices_p_np).to(device)
-        state_indices_d = torch.from_numpy(state_indices_d_np).to(device)
-        # cache_indices for homogeneous-fallback compatibility -- not
-        # read by the mixed path but populated for debugging clarity.
-        cache_indices_combined = torch.cat([state_indices_p, state_indices_d], dim=0)
-        has_initial_state_p = torch.zeros(n_p_seqs, dtype=torch.bool, device=device)
-
-        mamba_meta = JambaMambaMetadata(
-            conv_states=self.mamba_pool.conv_states,
-            ssm_states=self.mamba_pool.ssm_states,
-            cache_indices=cache_indices_combined,
-            is_decode=False,
-            query_start_loc=cu_q_p,
-            has_initial_state=has_initial_state_p,
-            state_indices_p=state_indices_p,
-            state_indices_d=state_indices_d,
-        )
-
-        # Decode-side context_lens / max for the Attention class's
-        # decode-half kernel call.
-        decode_context_lens = torch.from_numpy(d_context_lens_np).to(device)
-        decode_max_context_len = int(d_context_lens_np.max()) if n_d > 0 else 0
-
-        max_seqlen_p = int(plens_p.max()) if n_p_seqs > 0 else 0
-
-        set_jamba_context(
-            is_prefill=True,  # ignored when is_mixed=True; required by signature
-            is_mixed=True,
-            slot_mapping=slot_mapping,
-            num_prefill_tokens=n_p,
-            num_decode_tokens=n_d,
-            num_prefill_seqs=n_p_seqs,
-            prefill_cu_seqlens_q=cu_q_p,
-            prefill_cu_seqlens_k=cu_q_p,
-            prefill_max_seqlen_q=max_seqlen_p,
-            prefill_max_seqlen_k=max_seqlen_p,
-            prefill_block_tables=prefill_block_tables,
-            decode_context_lens=decode_context_lens,
-            decode_block_tables=decode_block_tables,
-            decode_max_context_len=decode_max_context_len,
-            mamba_metadata=mamba_meta,
-        )
-        try:
-            hidden = self.model(input_ids, positions)
-            # hidden: [n_p + n_d, hidden].
-            # Prefill last-token indices: cu_q_p[1:] - 1 (within prefill range).
-            # Decode token indices: n_p..n_p+n_d-1.
-            if n_p_seqs > 0:
-                prefill_last_idx = (cu_q_p[1:].long() - 1)
-                prefill_hidden = hidden.index_select(0, prefill_last_idx)
-                prefill_logits = self.model.compute_logits(prefill_hidden)
-            else:
-                prefill_logits = torch.empty(
-                    (0, self.config.vocab_size),
-                    dtype=hidden.dtype, device=device,
-                )
-            if n_d > 0:
-                decode_hidden = hidden[n_p:n_p + n_d]
-                decode_logits = self.model.compute_logits(decode_hidden)
-            else:
-                decode_logits = torch.empty(
-                    (0, self.config.vocab_size),
-                    dtype=hidden.dtype, device=device,
-                )
-        finally:
-            reset_context()
-        return prefill_logits, decode_logits
+        return chunk_last_logits, completed_mask
 
     # ------------------------------------------------------------------
     # _run_decode_step: one decode step over ``running``.  Picks the
