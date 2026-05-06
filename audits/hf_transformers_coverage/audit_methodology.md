@@ -189,14 +189,16 @@ The merge tool then auto-reclassifies any `partial` row whose flagged ops are *a
 
 **Effect on numbers (denominator: 447 PT-modeling rows, NIR excluded):**
 
-| status | before re-audit | after re-audit | delta |
+| status | before re-audit (post-coordinator-overrides at commit 1f0c60a) | after re-audit | delta |
 |---|---:|---:|---:|
 | `kb_nano_l4` | 17 | 17 | 0 |
-| `composable` | 326 | 422 | +96 |
-| `partial` | 96 | 4 | -92 |
+| `composable` | 330 | 422 | **+92** |
+| `partial` | 96 | 4 | **−92** |
 | `unsupported` | 4 | 4 | 0 |
 
-Coverage (L4 + composable): **77.5% → 98.2%**.
+Coverage (L4 + composable): **77.9% → 98.2%**.
+
+(Earlier draft of this table claimed `composable` went `326 → 422 (+96)`. That was an arithmetic error — I used the *pre-coordinator-overrides* baseline (326) for composable but the *post-overrides* baseline (96) for partial. The correct deltas are `+92` and `−92`. The post-re-audit numbers (422 / 4) are unaffected.)
 
 The 4 remaining `partial` rows all have at least one flagged op that genuinely cannot be wrapped trivially:
 - `layoutlmv2` — needs `detectron2_backbone` (external library, runtime-loaded).
@@ -205,7 +207,36 @@ The 4 remaining `partial` rows all have at least one flagged op that genuinely c
 
 The 4 `unsupported` rows are unchanged (mra/reformer/rwkv-v4/xlstm — each requires a custom non-SDPA kernel).
 
-### List of new L1 wrappers added (all numerically verified vs torch.nn.X with 0.0 max-abs diff)
+### Honest framing of the new L1 ops vs the multihead_attention case
+
+The multihead_attention case (where kb-nano did not add a wrapper because the underlying compute is already in kb-nano) raises a fair consistency question for the new L1 ops. The honest answer is that **8 of the 16 new L1 ops are mathematically equivalent to compositions of pre-existing kb-nano L1 ops + standard torch arithmetic**. They are stylistic L1 wrappers (consistent with kb-nano's existing one-file-per-torch.nn-op convention — see `silu.py`, `gelu.py`, `relu.py`, `sigmoid.py`, `tanh.py`, all of which are also one-line F.x wraps), not new compute primitives.
+
+The composition equivalence is proven numerically by `tools/test_composition_equivalence.py` — every test passes with max-abs diff ≤ 6e-8 (perfect for the integer-arithmetic ones; tiny floating-point noise for `ELU` (`exp` ordering) and `Hardswish` (multiplication ordering)):
+
+| New L1 op | Equivalent composition | could-be-composable? |
+|---|---|---|
+| `BatchNorm1d` | `BatchNorm2d(x.unsqueeze(-1)).squeeze(-1)` | yes (stylistic L1) |
+| `BatchNorm3d` | `BatchNorm2d(reshape(x, [B, C, D*H*W, 1]))` reshaped back | yes (stylistic L1) |
+| `MaxPool1d` | `MaxPool2d((1, k))(x.unsqueeze(-2)).squeeze(-2)` | yes (stylistic L1) |
+| `AvgPool1d` | `AvgPool2d((1, k))(x.unsqueeze(-2)).squeeze(-2)` | yes (stylistic L1) |
+| `LeakyReLU` | `where(x > 0, x, alpha * x)` | yes (stylistic L1) |
+| `ELU` | `where(x >= 0, x, alpha * (exp(x) - 1))` | yes (stylistic L1) |
+| `Hardsigmoid` | `clamp((x + 3) / 6, 0, 1)` | yes (stylistic L1) |
+| `Hardswish` | `x * hardsigmoid(x)` | yes (stylistic L1) |
+| `AdaptiveAvgPool1d` | — | NO (adaptive sizing is non-trivial) |
+| `AdaptiveAvgPool2d` | — | NO |
+| `ConvTranspose1d` | — | NO (different op direction; cannot be composed from Conv) |
+| `ConvTranspose2d` | — | NO |
+| `ConvTranspose3d` | — | NO |
+| `GridSample` | — | NO (fundamental sampling op) |
+| `LSTM` | — | NO (recurrent state, multiple gates) |
+| `ChunkGatedDeltaRule` | — | NO (specific FLA recurrent algorithm) |
+
+**Implication for the headline number.** Under a strict consistency reading (treating compositions as `composable` even without a dedicated L1 file, the same way we treat `nn.MultiheadAttention`), the 8 stylistic-wrapper ops would have been `composable` from the start. The pre-re-audit `composable` count would have been ≈ 330 + (# of partial rows whose only flagged op is a stylistic case) instead of 330. Either way, the post-re-audit count is the same: **422 composable, 4 partial, 4 unsupported**.
+
+The choice to add L1 files for these 8 stylistic ops is consistent with kb-nano's existing style and gives the kernel-benchmark scaffolding a clean per-op target. Documenting the equivalence here makes the audit honest about the choice rather than implying the 8 ops are new primitives.
+
+### List of new L1 wrappers added (all numerically verified vs torch.nn.X / fla; max-abs diff = 0.00e+00)
 
 In `tasks/baseline/L1/`:
 

@@ -32,6 +32,13 @@ from tasks.baseline.L1.conv_transpose2d import ConvTranspose2d
 from tasks.baseline.L1.conv_transpose3d import ConvTranspose3d
 from tasks.baseline.L1.batch_norm1d import BatchNorm1d
 from tasks.baseline.L1.batch_norm3d import BatchNorm3d
+from tasks.baseline.L1.lstm import LSTM
+
+try:
+    from tasks.baseline.L1.chunk_gated_delta_rule import ChunkGatedDeltaRule
+    _HAVE_FLA = True
+except ImportError:
+    _HAVE_FLA = False
 
 
 def _check(name: str, kb_out: torch.Tensor, ref_out: torch.Tensor):
@@ -170,6 +177,36 @@ def main():
     if ref_keys != kb_keys:
         raise AssertionError(f"ConvTranspose2d state_dict keys differ: ref={ref_keys}, kb={kb_keys}")
     print(f"  ConvTranspose2d state_dict keys  PASS  ({sorted(ref_keys)})")
+
+    # LSTM
+    ref = nn.LSTM(8, 16, 2, batch_first=True)
+    kb = LSTM(8, 16, 2, batch_first=True)
+    kb.lstm.load_state_dict(ref.state_dict())
+    x = torch.randn(2, 5, 8)
+    out_ref, _ = ref(x)
+    out_kb, _ = kb(x)
+    _check("LSTM", out_kb, out_ref)
+
+    # ChunkGatedDeltaRule (requires fla; needs CUDA for fla kernels)
+    if _HAVE_FLA and torch.cuda.is_available():
+        from fla.ops.gated_delta_rule import chunk_gated_delta_rule
+        torch.manual_seed(0)
+        B, T, H, D, V = 2, 16, 4, 32, 32
+        device = "cuda"
+        dtype = torch.bfloat16
+        q = torch.randn(B, T, H, D, device=device, dtype=dtype)
+        k = torch.randn(B, T, H, D, device=device, dtype=dtype)
+        v = torch.randn(B, T, H, V, device=device, dtype=dtype)
+        g = torch.randn(B, T, H, device=device, dtype=dtype).log_softmax(-1)
+        beta = torch.randn(B, T, H, device=device, dtype=dtype).sigmoid()
+        kb = ChunkGatedDeltaRule()
+        out_kb, _ = kb(q=q, k=k, v=v, g=g, beta=beta)
+        out_ref, _ = chunk_gated_delta_rule(q=q, k=k, v=v, g=g, beta=beta)
+        _check("ChunkGatedDeltaRule (fla, CUDA)", out_kb, out_ref)
+    elif _HAVE_FLA:
+        print("  ChunkGatedDeltaRule              SKIP (no CUDA available)")
+    else:
+        print("  ChunkGatedDeltaRule              SKIP (fla not installed)")
 
     print("\nAll new L1 ops pass numerical + state_dict compatibility checks.")
 
