@@ -462,13 +462,14 @@ class JambaEngine:
             )
         register_no_compile_layers(no_compile_layers)
         auto_register_no_compile_layers(self.model)
-        self._attn_modules = attn_modules
 
-        # Share TRTLLM workspace across all Attention modules.
-        # Mirrors :meth:`infra.engine.LlamaEngine._share_trtllm_workspace`:
+        # Share TRTLLM workspace across all Attention modules.  Mirrors
+        # :meth:`infra.engine.LlamaEngine._share_trtllm_workspace`:
         # without this, each TRTLLMDecode and TRTLLMPrefill allocates
         # its own 512 MB workspace -- 4 attn layers x 2 ops x 512 MB =
-        # 4 GB wasted on duplicate scratch buffers.
+        # 4 GB wasted on duplicate scratch buffers.  The shared tensor
+        # stays alive because each ``attn.{decode_op,prefill_op}._workspace``
+        # holds a ref after ``set_trtllm_workspace``.
         if self._use_trtllm:
             shared_workspace = torch.zeros(
                 512 * 1024 * 1024, dtype=torch.uint8, device=self.device,
@@ -477,7 +478,6 @@ class JambaEngine:
                 if hasattr(attn, "set_trtllm_workspace"):
                     attn.set_trtllm_workspace(shared_workspace)
             torch.cuda.empty_cache()
-            self._trtllm_workspace = shared_workspace
 
         # ------------------------------------------------------------------
         # Block manager (paged KV) + Mamba state slot pool.
