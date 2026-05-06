@@ -558,15 +558,18 @@ def main():
         description="Throughput & alignment benchmark: kb-nano JambaEngine vs vLLM (or HF) reference",
     )
     parser.add_argument("--model", type=str, default="ai21labs/Jamba-tiny-dev")
-    parser.add_argument("--num-seqs", type=int, default=200,
-                        help="Sequences per throughput scenario.  Default 200 "
-                             "(reduced from bench_vllm's 1000) since HF "
-                             "transformers' Jamba reference has no continuous "
-                             "batching and is the bottleneck.")
+    parser.add_argument("--num-seqs", type=int, default=1000,
+                        help="Sequences per throughput scenario.  Default 1000 "
+                             "matches bench_vllm.py and bench_fla.py.  Use "
+                             "--num-seqs 200 with --ref hf if you want to "
+                             "compare against HF's slow .generate() loop.")
     parser.add_argument("--seed", type=int, default=42)
     parser.add_argument("--temperature", type=float, default=0.0)
-    parser.add_argument("--max-num-seqs", type=int, default=32,
-                        help="Max concurrent sequences in JambaEngine.")
+    parser.add_argument("--max-num-seqs", type=int, default=256,
+                        help="Max concurrent sequences in JambaEngine.  "
+                             "Default 256 matches bench_vllm.py defaults and "
+                             "the bench_mamba README.  Lower this if v0.1 "
+                             "OOMs at full per-seq Mamba state.")
     parser.add_argument(
         "--ref", type=str, choices=["vllm", "hf"], default="vllm",
         help=(
@@ -578,15 +581,15 @@ def main():
             "comparisons but not for fair throughput numbers)."
         ),
     )
-    parser.add_argument("--ref-max-num-seqs", type=int, default=32,
+    parser.add_argument("--ref-max-num-seqs", type=int, default=256,
                         help="Max concurrent sequences in the reference "
                              "engine (vLLM continuous-batched scheduler) "
                              "or max micro-batch (HF .generate). Default "
-                             "32 matches kb-nano's max_num_seqs default.")
-    parser.add_argument("--ref-gpu-memory-utilization", type=float, default=0.6,
+                             "256 matches kb-nano's max_num_seqs default "
+                             "and bench_vllm.py.")
+    parser.add_argument("--ref-gpu-memory-utilization", type=float, default=0.9,
                         help="vLLM-only: fraction of GPU memory vLLM may "
-                             "use. kb-nano runs in a separate subprocess "
-                             "after vLLM exits, so 0.6 is fine.")
+                             "use.  Default 0.9 matches bench_vllm.py.")
     parser.add_argument("--ref-max-model-len", type=int, default=None,
                         help="vLLM-only: max_model_len for vLLM. Defaults "
                              "to the model's max_position_embeddings.")
@@ -608,7 +611,10 @@ def main():
     )
     parser.add_argument("--skip-throughput", action="store_true")
     parser.add_argument("--skip-latency", action="store_true")
-    parser.add_argument("--latency-iters", type=int, default=3)
+    parser.add_argument("--latency-iters", type=int, default=5,
+                        help="Median over this many timed iterations after "
+                             "warmup.  Default 5 matches bench_vllm.py and "
+                             "bench_fla.py.")
     parser.add_argument(
         "--scenario", type=str, default=None,
         help="Run only the throughput scenario with this name "
