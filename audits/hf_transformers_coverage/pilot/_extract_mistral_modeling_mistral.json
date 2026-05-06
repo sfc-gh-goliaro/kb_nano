@@ -1,0 +1,245 @@
+{
+  "file": "/tmp/hf_transformers_pinned/src/transformers/models/mistral/modeling_mistral.py",
+  "lines": 493,
+  "n_classes": 11,
+  "architecture_classes": [
+    "MistralForCausalLM",
+    "MistralForQuestionAnswering",
+    "MistralForSequenceClassification",
+    "MistralForTokenClassification",
+    "MistralModel",
+    "MistralPreTrainedModel"
+  ],
+  "classes": [
+    {
+      "name": "MistralMLP",
+      "bases": [
+        "nn.Module"
+      ],
+      "lineno": 35
+    },
+    {
+      "name": "MistralAttention",
+      "bases": [
+        "nn.Module"
+      ],
+      "lineno": 122
+    },
+    {
+      "name": "MistralRMSNorm",
+      "bases": [
+        "nn.Module"
+      ],
+      "lineno": 182
+    },
+    {
+      "name": "MistralDecoderLayer",
+      "bases": [
+        "GradientCheckpointingLayer"
+      ],
+      "lineno": 202
+    },
+    {
+      "name": "MistralPreTrainedModel",
+      "bases": [
+        "PreTrainedModel"
+      ],
+      "lineno": 244
+    },
+    {
+      "name": "MistralRotaryEmbedding",
+      "bases": [
+        "nn.Module"
+      ],
+      "lineno": 262
+    },
+    {
+      "name": "MistralModel",
+      "bases": [
+        "MistralPreTrainedModel"
+      ],
+      "lineno": 328
+    },
+    {
+      "name": "MistralForCausalLM",
+      "bases": [
+        "MistralPreTrainedModel",
+        "GenerationMixin"
+      ],
+      "lineno": 402
+    },
+    {
+      "name": "MistralForTokenClassification",
+      "bases": [
+        "GenericForTokenClassification",
+        "MistralPreTrainedModel"
+      ],
+      "lineno": 475
+    },
+    {
+      "name": "MistralForSequenceClassification",
+      "bases": [
+        "GenericForSequenceClassification",
+        "MistralPreTrainedModel"
+      ],
+      "lineno": 479
+    },
+    {
+      "name": "MistralForQuestionAnswering",
+      "bases": [
+        "GenericForQuestionAnswering",
+        "MistralPreTrainedModel"
+      ],
+      "lineno": 483
+    }
+  ],
+  "ops": {
+    "act2fn_dynamic": {
+      "count": 1,
+      "refs": [
+        "modeling_mistral.py:ACT2FN['__dynamic__']"
+      ]
+    },
+    "arange": {
+      "count": 2,
+      "refs": [
+        "modeling_mistral.py:369",
+        "modeling_mistral.py:307"
+      ]
+    },
+    "cat": {
+      "count": 2,
+      "refs": [
+        "modeling_mistral.py:55",
+        "modeling_mistral.py:320"
+      ]
+    },
+    "dropout": {
+      "count": 1,
+      "refs": [
+        "modeling_mistral.py:114"
+      ]
+    },
+    "embedding": {
+      "count": 1,
+      "refs": [
+        "modeling_mistral.py:334"
+      ]
+    },
+    "kv_cache": {
+      "count": 1,
+      "refs": [
+        "modeling_mistral.py:365"
+      ]
+    },
+    "linear": {
+      "count": 8,
+      "refs": [
+        "modeling_mistral.py:41",
+        "modeling_mistral.py:42",
+        "modeling_mistral.py:43",
+        "modeling_mistral.py:134",
+        "modeling_mistral.py:135"
+      ]
+    },
+    "matmul": {
+      "count": 2,
+      "refs": [
+        "modeling_mistral.py:115",
+        "modeling_mistral.py:109"
+      ]
+    },
+    "pow": {
+      "count": 1,
+      "refs": [
+        "modeling_mistral.py:194"
+      ]
+    },
+    "rotary_pos_emb": {
+      "count": 3,
+      "refs": [
+        "modeling_mistral.py:155",
+        "modeling_mistral.py:79",
+        "modeling_mistral.py:80"
+      ]
+    },
+    "rsqrt": {
+      "count": 1,
+      "refs": [
+        "modeling_mistral.py:195"
+      ]
+    },
+    "softmax": {
+      "count": 1,
+      "refs": [
+        "modeling_mistral.py:113"
+      ]
+    }
+  },
+  "unresolved_top": {
+    "super": 7,
+    "getattr": 3,
+    "repeat_kv": 2,
+    "self.register_buffer": 2,
+    "self.post_init": 2,
+    "isinstance": 2,
+    "use_kernel_func_from_hub": 1,
+    "use_kernelized_func": 1,
+    "use_kernel_forward_from_hub": 1,
+    "cos.unsqueeze": 1,
+    "sin.unsqueeze": 1,
+    "hidden_states.reshape": 1,
+    "torch.no_grad": 1,
+    "self.down_proj": 1,
+    "ALL_ATTENTION_FUNCTIONS.get_interface": 1,
+    "attention_interface": 1,
+    "self.o_proj": 1,
+    "self.input_layernorm": 1,
+    "self.self_attn": 1,
+    "self.post_attention_layernorm": 1,
+    "self.mlp": 1,
+    "rope_init_fn": 1,
+    "mask_function": 1,
+    "self.rotary_emb": 1,
+    "self.norm": 1,
+    "self.model": 1,
+    "self.lm_head": 1,
+    "key_states.transpose": 1,
+    "attn_output.transpose": 1,
+    "past_key_values.update": 1
+  },
+  "imports": [
+    "activations.ACT2FN",
+    "cache_utils.Cache",
+    "cache_utils.DynamicCache",
+    "collections.abc.Callable",
+    "configuration_mistral.MistralConfig",
+    "generation.GenerationMixin",
+    "integrations.use_kernel_forward_from_hub",
+    "integrations.use_kernel_func_from_hub",
+    "integrations.use_kernelized_func",
+    "masking_utils.create_causal_mask",
+    "masking_utils.create_sliding_window_causal_mask",
+    "modeling_flash_attention_utils.FlashAttentionKwargs",
+    "modeling_layers.GenericForQuestionAnswering",
+    "modeling_layers.GenericForSequenceClassification",
+    "modeling_layers.GenericForTokenClassification",
+    "modeling_layers.GradientCheckpointingLayer",
+    "modeling_outputs.BaseModelOutputWithPast",
+    "modeling_outputs.CausalLMOutputWithPast",
+    "modeling_rope_utils.ROPE_INIT_FUNCTIONS",
+    "modeling_rope_utils.dynamic_rope_update",
+    "modeling_utils.ALL_ATTENTION_FUNCTIONS",
+    "modeling_utils.PreTrainedModel",
+    "processing_utils.Unpack",
+    "torch",
+    "torch.nn",
+    "typing.Optional",
+    "utils.TransformersKwargs",
+    "utils.auto_docstring",
+    "utils.can_return_tuple",
+    "utils.generic.maybe_autocast",
+    "utils.generic.merge_with_config_defaults",
+    "utils.output_capturing.capture_outputs"
+  ]
+}

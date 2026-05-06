@@ -1,0 +1,344 @@
+{
+  "file": "/tmp/hf_transformers_pinned/src/transformers/models/swin/modeling_swin.py",
+  "lines": 1209,
+  "n_classes": 21,
+  "architecture_classes": [
+    "SwinBackbone",
+    "SwinForImageClassification",
+    "SwinForMaskedImageModeling",
+    "SwinModel",
+    "SwinPreTrainedModel"
+  ],
+  "classes": [
+    {
+      "name": "SwinEncoderOutput",
+      "bases": [
+        "ModelOutput"
+      ],
+      "lineno": 46
+    },
+    {
+      "name": "SwinModelOutput",
+      "bases": [
+        "ModelOutput"
+      ],
+      "lineno": 68
+    },
+    {
+      "name": "SwinMaskedImageModelingOutput",
+      "bases": [
+        "ModelOutput"
+      ],
+      "lineno": 93
+    },
+    {
+      "name": "SwinImageClassifierOutput",
+      "bases": [
+        "ModelOutput"
+      ],
+      "lineno": 120
+    },
+    {
+      "name": "SwinEmbeddings",
+      "bases": [
+        "nn.Module"
+      ],
+      "lineno": 163
+    },
+    {
+      "name": "SwinPatchEmbeddings",
+      "bases": [
+        "nn.Module"
+      ],
+      "lineno": 255
+    },
+    {
+      "name": "SwinPatchMerging",
+      "bases": [
+        "nn.Module"
+      ],
+      "lineno": 298
+    },
+    {
+      "name": "SwinDropPath",
+      "bases": [
+        "nn.Module"
+      ],
+      "lineno": 369
+    },
+    {
+      "name": "SwinSelfAttention",
+      "bases": [
+        "nn.Module"
+      ],
+      "lineno": 383
+    },
+    {
+      "name": "SwinSelfOutput",
+      "bases": [
+        "nn.Module"
+      ],
+      "lineno": 476
+    },
+    {
+      "name": "SwinAttention",
+      "bases": [
+        "nn.Module"
+      ],
+      "lineno": 489
+    },
+    {
+      "name": "SwinIntermediate",
+      "bases": [
+        "nn.Module"
+      ],
+      "lineno": 507
+    },
+    {
+      "name": "SwinOutput",
+      "bases": [
+        "nn.Module"
+      ],
+      "lineno": 522
+    },
+    {
+      "name": "SwinLayer",
+      "bases": [
+        "nn.Module"
+      ],
+      "lineno": 534
+    },
+    {
+      "name": "SwinStage",
+      "bases": [
+        "GradientCheckpointingLayer"
+      ],
+      "lineno": 656
+    },
+    {
+      "name": "SwinEncoder",
+      "bases": [
+        "nn.Module"
+      ],
+      "lineno": 711
+    },
+    {
+      "name": "SwinPreTrainedModel",
+      "bases": [
+        "PreTrainedModel"
+      ],
+      "lineno": 798
+    },
+    {
+      "name": "SwinModel",
+      "bases": [
+        "SwinPreTrainedModel"
+      ],
+      "lineno": 821
+    },
+    {
+      "name": "SwinForMaskedImageModeling",
+      "bases": [
+        "SwinPreTrainedModel"
+      ],
+      "lineno": 916
+    },
+    {
+      "name": "SwinForImageClassification",
+      "bases": [
+        "SwinPreTrainedModel"
+      ],
+      "lineno": 1034
+    },
+    {
+      "name": "SwinBackbone",
+      "bases": [
+        "BackboneMixin",
+        "SwinPreTrainedModel"
+      ],
+      "lineno": 1102
+    }
+  ],
+  "ops": {
+    "act2fn_dynamic": {
+      "count": 1,
+      "refs": [
+        "modeling_swin.py:ACT2FN['__dynamic__']"
+      ]
+    },
+    "adaptive_avg_pool_1d": {
+      "count": 1,
+      "refs": [
+        "modeling_swin.py:838"
+      ]
+    },
+    "arange": {
+      "count": 2,
+      "refs": [
+        "modeling_swin.py:463",
+        "modeling_swin.py:464"
+      ]
+    },
+    "cat": {
+      "count": 2,
+      "refs": [
+        "modeling_swin.py:225",
+        "modeling_swin.py:343"
+      ]
+    },
+    "conv2d": {
+      "count": 2,
+      "refs": [
+        "modeling_swin.py:275",
+        "modeling_swin.py:924"
+      ]
+    },
+    "dropout": {
+      "count": 4,
+      "refs": [
+        "modeling_swin.py:182",
+        "modeling_swin.py:408",
+        "modeling_swin.py:480",
+        "modeling_swin.py:526"
+      ]
+    },
+    "identity": {
+      "count": 2,
+      "refs": [
+        "modeling_swin.py:543",
+        "modeling_swin.py:1043"
+      ]
+    },
+    "interpolate": {
+      "count": 1,
+      "refs": [
+        "modeling_swin.py:216"
+      ]
+    },
+    "layer_norm": {
+      "count": 5,
+      "refs": [
+        "modeling_swin.py:181",
+        "modeling_swin.py:541",
+        "modeling_swin.py:544",
+        "modeling_swin.py:837",
+        "modeling_swin.py:1113"
+      ]
+    },
+    "linear": {
+      "count": 8,
+      "refs": [
+        "modeling_swin.py:315",
+        "modeling_swin.py:404",
+        "modeling_swin.py:405",
+        "modeling_swin.py:406",
+        "modeling_swin.py:479"
+      ]
+    },
+    "masked_fill": {
+      "count": 1,
+      "refs": [
+        "modeling_swin.py:579"
+      ]
+    },
+    "matmul": {
+      "count": 2,
+      "refs": [
+        "modeling_swin.py:424",
+        "modeling_swin.py:452"
+      ]
+    },
+    "pad": {
+      "count": 4,
+      "refs": [
+        "modeling_swin.py:588",
+        "modeling_swin.py:280",
+        "modeling_swin.py:283",
+        "modeling_swin.py:322"
+      ]
+    },
+    "pixel_shuffle": {
+      "count": 1,
+      "refs": [
+        "modeling_swin.py:927"
+      ]
+    },
+    "roll": {
+      "count": 2,
+      "refs": [
+        "modeling_swin.py:616",
+        "modeling_swin.py:636"
+      ]
+    },
+    "softmax": {
+      "count": 1,
+      "refs": [
+        "modeling_swin.py:446"
+      ]
+    },
+    "sqrt": {
+      "count": 1,
+      "refs": [
+        "modeling_swin.py:426"
+      ]
+    },
+    "stack": {
+      "count": 1,
+      "refs": [
+        "modeling_swin.py:465"
+      ]
+    }
+  },
+  "unresolved_top": {
+    "super": 17,
+    "auto_docstring": 7,
+    "int": 7,
+    "isinstance": 6,
+    "slice": 6,
+    "self.dropout": 4,
+    "self.post_init": 4,
+    "torch.zeros": 4,
+    "input_feature.view": 3,
+    "self.maybe_pad": 3,
+    "self.dense": 3,
+    "hidden_states.view": 3,
+    "len": 3,
+    "reshaped_hidden_state.permute": 3,
+    "init.zeros_": 3,
+    "range": 3,
+    "sum": 3,
+    "torch_int": 2,
+    "patch_pos_embed.permute": 2,
+    "self.norm": 2,
+    "torch.flatten": 2,
+    "self.output": 2,
+    "window_partition": 2,
+    "enumerate": 2,
+    "self.embeddings": 2,
+    "self.encoder": 2,
+    "self.swin": 2,
+    "sequence_output.transpose": 2,
+    "zip": 2,
+    "attention_scores.view": 2
+  },
+  "imports": [
+    "activations.ACT2FN",
+    "backbone_utils.BackboneMixin",
+    "backbone_utils.filter_output_hidden_states",
+    "collections.abc",
+    "configuration_swin.SwinConfig",
+    "dataclasses.dataclass",
+    "initialization",
+    "math",
+    "modeling_layers.GradientCheckpointingLayer",
+    "modeling_outputs.BackboneOutput",
+    "modeling_utils.PreTrainedModel",
+    "torch",
+    "torch.nn",
+    "utils.ModelOutput",
+    "utils.auto_docstring",
+    "utils.generic.can_return_tuple",
+    "utils.logging",
+    "utils.torch_int"
+  ]
+}

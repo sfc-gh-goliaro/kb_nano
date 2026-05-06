@@ -1,0 +1,326 @@
+{
+  "file": "/tmp/hf_transformers_pinned/src/transformers/models/data2vec/modeling_data2vec_text.py",
+  "lines": 1208,
+  "n_classes": 20,
+  "architecture_classes": [
+    "Data2VecTextForCausalLM",
+    "Data2VecTextForMaskedLM",
+    "Data2VecTextForMultipleChoice",
+    "Data2VecTextForQuestionAnswering",
+    "Data2VecTextForSequenceClassification",
+    "Data2VecTextForTokenClassification",
+    "Data2VecTextModel",
+    "Data2VecTextPreTrainedModel"
+  ],
+  "classes": [
+    {
+      "name": "Data2VecTextEmbeddings",
+      "bases": [
+        "nn.Module"
+      ],
+      "lineno": 55
+    },
+    {
+      "name": "Data2VecTextSelfAttention",
+      "bases": [
+        "nn.Module"
+      ],
+      "lineno": 189
+    },
+    {
+      "name": "Data2VecTextCrossAttention",
+      "bases": [
+        "nn.Module"
+      ],
+      "lineno": 256
+    },
+    {
+      "name": "Data2VecTextSelfOutput",
+      "bases": [
+        "nn.Module"
+      ],
+      "lineno": 332
+    },
+    {
+      "name": "Data2VecTextAttention",
+      "bases": [
+        "nn.Module"
+      ],
+      "lineno": 346
+    },
+    {
+      "name": "Data2VecTextIntermediate",
+      "bases": [
+        "nn.Module"
+      ],
+      "lineno": 375
+    },
+    {
+      "name": "Data2VecTextOutput",
+      "bases": [
+        "nn.Module"
+      ],
+      "lineno": 390
+    },
+    {
+      "name": "Data2VecTextLayer",
+      "bases": [
+        "GradientCheckpointingLayer"
+      ],
+      "lineno": 404
+    },
+    {
+      "name": "Data2VecTextPreTrainedModel",
+      "bases": [
+        "PreTrainedModel"
+      ],
+      "lineno": 470
+    },
+    {
+      "name": "Data2VecTextEncoder",
+      "bases": [
+        "nn.Module"
+      ],
+      "lineno": 492
+    },
+    {
+      "name": "Data2VecTextPooler",
+      "bases": [
+        "nn.Module"
+      ],
+      "lineno": 524
+    },
+    {
+      "name": "Data2VecTextModel",
+      "bases": [
+        "Data2VecTextPreTrainedModel"
+      ],
+      "lineno": 540
+    },
+    {
+      "name": "Data2VecTextLMHead",
+      "bases": [
+        "nn.Module"
+      ],
+      "lineno": 667
+    },
+    {
+      "name": "Data2VecTextClassificationHead",
+      "bases": [
+        "nn.Module"
+      ],
+      "lineno": 689
+    },
+    {
+      "name": "Data2VecTextForCausalLM",
+      "bases": [
+        "Data2VecTextPreTrainedModel",
+        "GenerationMixin"
+      ],
+      "lineno": 716
+    },
+    {
+      "name": "Data2VecTextForMaskedLM",
+      "bases": [
+        "Data2VecTextPreTrainedModel"
+      ],
+      "lineno": 816
+    },
+    {
+      "name": "Data2VecTextForSequenceClassification",
+      "bases": [
+        "Data2VecTextPreTrainedModel"
+      ],
+      "lineno": 898
+    },
+    {
+      "name": "Data2VecTextForMultipleChoice",
+      "bases": [
+        "Data2VecTextPreTrainedModel"
+      ],
+      "lineno": 974
+    },
+    {
+      "name": "Data2VecTextForTokenClassification",
+      "bases": [
+        "Data2VecTextPreTrainedModel"
+      ],
+      "lineno": 1070
+    },
+    {
+      "name": "Data2VecTextForQuestionAnswering",
+      "bases": [
+        "Data2VecTextPreTrainedModel"
+      ],
+      "lineno": 1132
+    }
+  ],
+  "ops": {
+    "act2fn_dynamic": {
+      "count": 1,
+      "refs": [
+        "modeling_data2vec_text.py:ACT2FN['__dynamic__']"
+      ]
+    },
+    "arange": {
+      "count": 3,
+      "refs": [
+        "modeling_data2vec_text.py:139",
+        "modeling_data2vec_text.py:67",
+        "modeling_data2vec_text.py:488"
+      ]
+    },
+    "cumsum": {
+      "count": 1,
+      "refs": [
+        "modeling_data2vec_text.py:157"
+      ]
+    },
+    "dropout": {
+      "count": 9,
+      "refs": [
+        "modeling_data2vec_text.py:181",
+        "modeling_data2vec_text.py:64",
+        "modeling_data2vec_text.py:208",
+        "modeling_data2vec_text.py:275",
+        "modeling_data2vec_text.py:337"
+      ]
+    },
+    "embedding": {
+      "count": 3,
+      "refs": [
+        "modeling_data2vec_text.py:60",
+        "modeling_data2vec_text.py:61",
+        "modeling_data2vec_text.py:74"
+      ]
+    },
+    "encoder_decoder_cache": {
+      "count": 1,
+      "refs": [
+        "modeling_data2vec_text.py:592"
+      ]
+    },
+    "gather": {
+      "count": 1,
+      "refs": [
+        "modeling_data2vec_text.py:109"
+      ]
+    },
+    "kv_cache": {
+      "count": 3,
+      "refs": [
+        "modeling_data2vec_text.py:594",
+        "modeling_data2vec_text.py:592",
+        "modeling_data2vec_text.py:592"
+      ]
+    },
+    "layer_norm": {
+      "count": 4,
+      "refs": [
+        "modeling_data2vec_text.py:63",
+        "modeling_data2vec_text.py:336",
+        "modeling_data2vec_text.py:394",
+        "modeling_data2vec_text.py:673"
+      ]
+    },
+    "linear": {
+      "count": 17,
+      "refs": [
+        "modeling_data2vec_text.py:204",
+        "modeling_data2vec_text.py:205",
+        "modeling_data2vec_text.py:206",
+        "modeling_data2vec_text.py:271",
+        "modeling_data2vec_text.py:272"
+      ]
+    },
+    "matmul": {
+      "count": 2,
+      "refs": [
+        "modeling_data2vec_text.py:183",
+        "modeling_data2vec_text.py:175"
+      ]
+    },
+    "softmax": {
+      "count": 1,
+      "refs": [
+        "modeling_data2vec_text.py:180"
+      ]
+    },
+    "tanh": {
+      "count": 2,
+      "refs": [
+        "modeling_data2vec_text.py:528",
+        "modeling_data2vec_text.py:705"
+      ]
+    }
+  },
+  "unresolved_top": {
+    "super": 20,
+    "loss_fct": 9,
+    "self.dropout": 7,
+    "self.post_init": 7,
+    "self.dense": 6,
+    "self.data2vec_text": 6,
+    "isinstance": 4,
+    "hasattr": 4,
+    "inputs_embeds.size": 4,
+    "self.classifier": 3,
+    "logits.view": 3,
+    "torch.zeros": 3,
+    "labels.view": 3,
+    "auto_docstring": 2,
+    "self.register_buffer": 2,
+    "int": 2,
+    "ALL_ATTENTION_FUNCTIONS.get_interface": 2,
+    "attention_interface": 2,
+    "self.output": 2,
+    "self.lm_head": 2,
+    "input_ids.size": 2,
+    "create_bidirectional_mask": 2,
+    "logger.warning": 2,
+    "attn_output.reshape": 2,
+    "len": 2,
+    "self.query": 2,
+    "self.key": 2,
+    "self.value": 2,
+    "logging.get_logger": 1,
+    "self.token_type_embeddings": 1
+  },
+  "imports": [
+    "activations.ACT2FN",
+    "activations.gelu",
+    "cache_utils.Cache",
+    "cache_utils.DynamicCache",
+    "cache_utils.EncoderDecoderCache",
+    "collections.abc.Callable",
+    "configuration_data2vec_text.Data2VecTextConfig",
+    "generation.GenerationMixin",
+    "initialization",
+    "masking_utils.create_bidirectional_mask",
+    "masking_utils.create_causal_mask",
+    "modeling_layers.GradientCheckpointingLayer",
+    "modeling_outputs.BaseModelOutputWithPastAndCrossAttentions",
+    "modeling_outputs.BaseModelOutputWithPoolingAndCrossAttentions",
+    "modeling_outputs.CausalLMOutputWithCrossAttentions",
+    "modeling_outputs.MaskedLMOutput",
+    "modeling_outputs.MultipleChoiceModelOutput",
+    "modeling_outputs.QuestionAnsweringModelOutput",
+    "modeling_outputs.SequenceClassifierOutput",
+    "modeling_outputs.TokenClassifierOutput",
+    "modeling_utils.ALL_ATTENTION_FUNCTIONS",
+    "modeling_utils.PreTrainedModel",
+    "processing_utils.Unpack",
+    "pytorch_utils.apply_chunking_to_forward",
+    "torch",
+    "torch.nn",
+    "torch.nn.BCEWithLogitsLoss",
+    "torch.nn.CrossEntropyLoss",
+    "torch.nn.MSELoss",
+    "utils.TransformersKwargs",
+    "utils.auto_docstring",
+    "utils.generic.can_return_tuple",
+    "utils.generic.merge_with_config_defaults",
+    "utils.logging",
+    "utils.output_capturing.capture_outputs"
+  ]
+}

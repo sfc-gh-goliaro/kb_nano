@@ -1,0 +1,381 @@
+{
+  "file": "/tmp/hf_transformers_pinned/src/transformers/models/data2vec/modeling_data2vec_vision.py",
+  "lines": 1244,
+  "n_classes": 23,
+  "architecture_classes": [
+    "Data2VecVisionForImageClassification",
+    "Data2VecVisionForSemanticSegmentation",
+    "Data2VecVisionModel",
+    "Data2VecVisionPreTrainedModel"
+  ],
+  "classes": [
+    {
+      "name": "Data2VecVisionModelOutputWithPooling",
+      "bases": [
+        "BaseModelOutputWithPooling"
+      ],
+      "lineno": 50
+    },
+    {
+      "name": "Data2VecVisionDropPath",
+      "bases": [
+        "nn.Module"
+      ],
+      "lineno": 76
+    },
+    {
+      "name": "Data2VecVisionEmbeddings",
+      "bases": [
+        "nn.Module"
+      ],
+      "lineno": 91
+    },
+    {
+      "name": "Data2VecVisionPatchEmbeddings",
+      "bases": [
+        "nn.Module"
+      ],
+      "lineno": 187
+    },
+    {
+      "name": "Data2VecVisionSelfAttention",
+      "bases": [
+        "nn.Module"
+      ],
+      "lineno": 226
+    },
+    {
+      "name": "Data2VecVisionSdpaSelfAttention",
+      "bases": [
+        "Data2VecVisionSelfAttention"
+      ],
+      "lineno": 300
+    },
+    {
+      "name": "Data2VecVisionSelfOutput",
+      "bases": [
+        "nn.Module"
+      ],
+      "lineno": 352
+    },
+    {
+      "name": "Data2VecVisionAttention",
+      "bases": [
+        "nn.Module"
+      ],
+      "lineno": 377
+    },
+    {
+      "name": "Data2VecVisionIntermediate",
+      "bases": [
+        "nn.Module"
+      ],
+      "lineno": 404
+    },
+    {
+      "name": "Data2VecVisionOutput",
+      "bases": [
+        "nn.Module"
+      ],
+      "lineno": 421
+    },
+    {
+      "name": "Data2VecVisionLayer",
+      "bases": [
+        "GradientCheckpointingLayer"
+      ],
+      "lineno": 435
+    },
+    {
+      "name": "Data2VecVisionRelativePositionBias",
+      "bases": [
+        "nn.Module"
+      ],
+      "lineno": 501
+    },
+    {
+      "name": "Data2VecVisionEncoder",
+      "bases": [
+        "nn.Module"
+      ],
+      "lineno": 585
+    },
+    {
+      "name": "Data2VecVisionPreTrainedModel",
+      "bases": [
+        "PreTrainedModel"
+      ],
+      "lineno": 659
+    },
+    {
+      "name": "Data2VecVisionModel",
+      "bases": [
+        "Data2VecVisionPreTrainedModel"
+      ],
+      "lineno": 689
+    },
+    {
+      "name": "Data2VecVisionPooler",
+      "bases": [
+        "nn.Module"
+      ],
+      "lineno": 761
+    },
+    {
+      "name": "Data2VecVisionForImageClassification",
+      "bases": [
+        "Data2VecVisionPreTrainedModel"
+      ],
+      "lineno": 787
+    },
+    {
+      "name": "Data2VecVisionConvModule",
+      "bases": [
+        "nn.Module"
+      ],
+      "lineno": 847
+    },
+    {
+      "name": "Data2VecVisionPyramidPoolingBlock",
+      "bases": [
+        "nn.Module"
+      ],
+      "lineno": 885
+    },
+    {
+      "name": "Data2VecVisionPyramidPoolingModule",
+      "bases": [
+        "nn.Module"
+      ],
+      "lineno": 903
+    },
+    {
+      "name": "Data2VecVisionUperHead",
+      "bases": [
+        "nn.Module"
+      ],
+      "lineno": 943
+    },
+    {
+      "name": "Data2VecVisionFCNHead",
+      "bases": [
+        "nn.Module"
+      ],
+      "lineno": 1029
+    },
+    {
+      "name": "Data2VecVisionForSemanticSegmentation",
+      "bases": [
+        "Data2VecVisionPreTrainedModel"
+      ],
+      "lineno": 1094
+    }
+  ],
+  "ops": {
+    "act2fn_dynamic": {
+      "count": 1,
+      "refs": [
+        "modeling_data2vec_vision.py:ACT2FN['__dynamic__']"
+      ]
+    },
+    "adaptive_avg_pool_2d": {
+      "count": 1,
+      "refs": [
+        "modeling_data2vec_vision.py:889"
+      ]
+    },
+    "arange": {
+      "count": 2,
+      "refs": [
+        "modeling_data2vec_vision.py:521",
+        "modeling_data2vec_vision.py:521"
+      ]
+    },
+    "batch_norm_2d": {
+      "count": 2,
+      "refs": [
+        "modeling_data2vec_vision.py:873",
+        "modeling_data2vec_vision.py:1110"
+      ]
+    },
+    "cat": {
+      "count": 6,
+      "refs": [
+        "modeling_data2vec_vision.py:158",
+        "modeling_data2vec_vision.py:176",
+        "modeling_data2vec_vision.py:559",
+        "modeling_data2vec_vision.py:993",
+        "modeling_data2vec_vision.py:1021"
+      ]
+    },
+    "conv2d": {
+      "count": 4,
+      "refs": [
+        "modeling_data2vec_vision.py:209",
+        "modeling_data2vec_vision.py:865",
+        "modeling_data2vec_vision.py:958",
+        "modeling_data2vec_vision.py:1080"
+      ]
+    },
+    "conv_transpose2d": {
+      "count": 3,
+      "refs": [
+        "modeling_data2vec_vision.py:1109",
+        "modeling_data2vec_vision.py:1112",
+        "modeling_data2vec_vision.py:1115"
+      ]
+    },
+    "dropout": {
+      "count": 4,
+      "refs": [
+        "modeling_data2vec_vision.py:117",
+        "modeling_data2vec_vision.py:244",
+        "modeling_data2vec_vision.py:361",
+        "modeling_data2vec_vision.py:425"
+      ]
+    },
+    "gelu": {
+      "count": 1,
+      "refs": [
+        "modeling_data2vec_vision.py:1111"
+      ]
+    },
+    "identity": {
+      "count": 5,
+      "refs": [
+        "modeling_data2vec_vision.py:1117",
+        "modeling_data2vec_vision.py:448",
+        "modeling_data2vec_vision.py:702",
+        "modeling_data2vec_vision.py:795",
+        "modeling_data2vec_vision.py:1072"
+      ]
+    },
+    "interpolate": {
+      "count": 8,
+      "refs": [
+        "modeling_data2vec_vision.py:149",
+        "modeling_data2vec_vision.py:554",
+        "modeling_data2vec_vision.py:1129",
+        "modeling_data2vec_vision.py:935",
+        "modeling_data2vec_vision.py:1018"
+      ]
+    },
+    "layer_norm": {
+      "count": 4,
+      "refs": [
+        "modeling_data2vec_vision.py:447",
+        "modeling_data2vec_vision.py:449",
+        "modeling_data2vec_vision.py:702",
+        "modeling_data2vec_vision.py:765"
+      ]
+    },
+    "linear": {
+      "count": 7,
+      "refs": [
+        "modeling_data2vec_vision.py:240",
+        "modeling_data2vec_vision.py:241",
+        "modeling_data2vec_vision.py:242",
+        "modeling_data2vec_vision.py:360",
+        "modeling_data2vec_vision.py:407"
+      ]
+    },
+    "matmul": {
+      "count": 2,
+      "refs": [
+        "modeling_data2vec_vision.py:265",
+        "modeling_data2vec_vision.py:288"
+      ]
+    },
+    "max_pool_2d": {
+      "count": 1,
+      "refs": [
+        "modeling_data2vec_vision.py:1118"
+      ]
+    },
+    "relu": {
+      "count": 1,
+      "refs": [
+        "modeling_data2vec_vision.py:874"
+      ]
+    },
+    "sdpa": {
+      "count": 1,
+      "refs": [
+        "modeling_data2vec_vision.py:336"
+      ]
+    },
+    "softmax": {
+      "count": 1,
+      "refs": [
+        "modeling_data2vec_vision.py:282"
+      ]
+    },
+    "sqrt": {
+      "count": 2,
+      "refs": [
+        "modeling_data2vec_vision.py:267",
+        "modeling_data2vec_vision.py:335"
+      ]
+    },
+    "stack": {
+      "count": 1,
+      "refs": [
+        "modeling_data2vec_vision.py:522"
+      ]
+    }
+  },
+  "unresolved_top": {
+    "super": 21,
+    "isinstance": 7,
+    "range": 6,
+    "torch.zeros": 5,
+    "enumerate": 5,
+    "len": 5,
+    "self.dropout": 4,
+    "init.zeros_": 4,
+    "torch_int": 3,
+    "self.dense": 3,
+    "self.post_init": 3,
+    "self.classifier": 3,
+    "self.relative_position_bias": 3,
+    "auto_docstring": 2,
+    "patch_pos_embed.permute": 2,
+    "context_layer.view": 2,
+    "self.attention": 2,
+    "self.output": 2,
+    "relative_position_bias.unsqueeze": 2,
+    "self.layernorm": 2,
+    "self.data2vec_vision": 2,
+    "convs.append": 2,
+    "loss_fct": 2,
+    "self.drop_path": 2,
+    "self.add_module": 2,
+    "context_layer.permute": 2,
+    "context_layer.size": 2,
+    "str": 2,
+    "torch.ones": 2,
+    "self.query": 2
+  },
+  "imports": [
+    "activations.ACT2FN",
+    "collections.abc",
+    "configuration_data2vec_vision.Data2VecVisionConfig",
+    "dataclasses.dataclass",
+    "initialization",
+    "math",
+    "modeling_layers.GradientCheckpointingLayer",
+    "modeling_outputs.BaseModelOutput",
+    "modeling_outputs.BaseModelOutputWithPooling",
+    "modeling_outputs.ImageClassifierOutput",
+    "modeling_outputs.SemanticSegmenterOutput",
+    "modeling_utils.PreTrainedModel",
+    "pytorch_utils.compile_compatible_method_lru_cache",
+    "torch",
+    "torch.nn",
+    "torch.nn.CrossEntropyLoss",
+    "typing.Optional",
+    "utils.auto_docstring",
+    "utils.logging",
+    "utils.torch_int"
+  ]
+}

@@ -1,0 +1,303 @@
+{
+  "file": "/tmp/hf_transformers_pinned/src/transformers/models/whisper/modeling_whisper.py",
+  "lines": 1359,
+  "n_classes": 12,
+  "architecture_classes": [
+    "WhisperDecoder",
+    "WhisperDecoderWrapper",
+    "WhisperEncoder",
+    "WhisperForAudioClassification",
+    "WhisperForCausalLM",
+    "WhisperForConditionalGeneration",
+    "WhisperModel",
+    "WhisperPreTrainedModel"
+  ],
+  "classes": [
+    {
+      "name": "WhisperPositionalEmbedding",
+      "bases": [
+        "nn.Embedding"
+      ],
+      "lineno": 204
+    },
+    {
+      "name": "WhisperAttention",
+      "bases": [
+        "nn.Module"
+      ],
+      "lineno": 241
+    },
+    {
+      "name": "WhisperEncoderLayer",
+      "bases": [
+        "GradientCheckpointingLayer"
+      ],
+      "lineno": 360
+    },
+    {
+      "name": "WhisperDecoderLayer",
+      "bases": [
+        "GradientCheckpointingLayer"
+      ],
+      "lineno": 416
+    },
+    {
+      "name": "WhisperPreTrainedModel",
+      "bases": [
+        "PreTrainedModel"
+      ],
+      "lineno": 509
+    },
+    {
+      "name": "WhisperEncoder",
+      "bases": [
+        "WhisperPreTrainedModel"
+      ],
+      "lineno": 540
+    },
+    {
+      "name": "WhisperDecoder",
+      "bases": [
+        "WhisperPreTrainedModel"
+      ],
+      "lineno": 649
+    },
+    {
+      "name": "WhisperModel",
+      "bases": [
+        "WhisperPreTrainedModel"
+      ],
+      "lineno": 799
+    },
+    {
+      "name": "WhisperForConditionalGeneration",
+      "bases": [
+        "WhisperGenerationMixin",
+        "WhisperPreTrainedModel"
+      ],
+      "lineno": 963
+    },
+    {
+      "name": "WhisperDecoderWrapper",
+      "bases": [
+        "WhisperPreTrainedModel"
+      ],
+      "lineno": 1102
+    },
+    {
+      "name": "WhisperForCausalLM",
+      "bases": [
+        "WhisperPreTrainedModel",
+        "GenerationMixin"
+      ],
+      "lineno": 1129
+    },
+    {
+      "name": "WhisperForAudioClassification",
+      "bases": [
+        "WhisperPreTrainedModel"
+      ],
+      "lineno": 1241
+    }
+  ],
+  "ops": {
+    "act2fn_dynamic": {
+      "count": 1,
+      "refs": [
+        "modeling_whisper.py:ACT2FN['__dynamic__']"
+      ]
+    },
+    "arange": {
+      "count": 4,
+      "refs": [
+        "modeling_whisper.py:622",
+        "modeling_whisper.py:62",
+        "modeling_whisper.py:63",
+        "modeling_whisper.py:749"
+      ]
+    },
+    "cat": {
+      "count": 1,
+      "refs": [
+        "modeling_whisper.py:64"
+      ]
+    },
+    "clamp": {
+      "count": 1,
+      "refs": [
+        "modeling_whisper.py:411"
+      ]
+    },
+    "conv1d": {
+      "count": 2,
+      "refs": [
+        "modeling_whisper.py:566",
+        "modeling_whisper.py:567"
+      ]
+    },
+    "dropout": {
+      "count": 10,
+      "refs": [
+        "modeling_whisper.py:234",
+        "modeling_whisper.py:398",
+        "modeling_whisper.py:404",
+        "modeling_whisper.py:406",
+        "modeling_whisper.py:479"
+      ]
+    },
+    "embedding": {
+      "count": 2,
+      "refs": [
+        "modeling_whisper.py:569",
+        "modeling_whisper.py:675"
+      ]
+    },
+    "encoder_decoder_cache": {
+      "count": 1,
+      "refs": [
+        "modeling_whisper.py:741"
+      ]
+    },
+    "exp": {
+      "count": 1,
+      "refs": [
+        "modeling_whisper.py:62"
+      ]
+    },
+    "gelu": {
+      "count": 2,
+      "refs": [
+        "modeling_whisper.py:618",
+        "modeling_whisper.py:619"
+      ]
+    },
+    "kv_cache": {
+      "count": 3,
+      "refs": [
+        "modeling_whisper.py:743",
+        "modeling_whisper.py:741",
+        "modeling_whisper.py:741"
+      ]
+    },
+    "layer_norm": {
+      "count": 7,
+      "refs": [
+        "modeling_whisper.py:371",
+        "modeling_whisper.py:377",
+        "modeling_whisper.py:434",
+        "modeling_whisper.py:443",
+        "modeling_whisper.py:446"
+      ]
+    },
+    "linear": {
+      "count": 12,
+      "refs": [
+        "modeling_whisper.py:279",
+        "modeling_whisper.py:280",
+        "modeling_whisper.py:281",
+        "modeling_whisper.py:282",
+        "modeling_whisper.py:375"
+      ]
+    },
+    "log": {
+      "count": 1,
+      "refs": [
+        "modeling_whisper.py:61"
+      ]
+    },
+    "matmul": {
+      "count": 2,
+      "refs": [
+        "modeling_whisper.py:235",
+        "modeling_whisper.py:228"
+      ]
+    },
+    "softmax": {
+      "count": 2,
+      "refs": [
+        "modeling_whisper.py:232",
+        "modeling_whisper.py:1328"
+      ]
+    },
+    "sqrt": {
+      "count": 2,
+      "refs": [
+        "modeling_whisper.py:564",
+        "modeling_whisper.py:673"
+      ]
+    },
+    "stack": {
+      "count": 1,
+      "refs": [
+        "modeling_whisper.py:1327"
+      ]
+    }
+  },
+  "unresolved_top": {
+    "super": 12,
+    "self.post_init": 7,
+    "isinstance": 6,
+    "len": 5,
+    "auto_docstring": 3,
+    "self.embed_positions": 3,
+    "loss_fct": 3,
+    "range": 3,
+    "compute_num_masked_span": 2,
+    "np.broadcast_to": 2,
+    "max": 2,
+    "np.arange": 2,
+    "self.self_attn_layer_norm": 2,
+    "self.self_attn": 2,
+    "self.final_layer_norm": 2,
+    "self.activation_fn": 2,
+    "self.fc2": 2,
+    "enumerate": 2,
+    "self.layer_norm": 2,
+    "self.decoder": 2,
+    "self.model.get_input_embeddings": 2,
+    "self.proj_out": 2,
+    "self.fc1": 2,
+    "torch.tensor": 2,
+    "self.encoder": 2,
+    "torch.rand": 2,
+    "logits.view": 2,
+    "labels.view": 2,
+    "logging.get_logger": 1,
+    "input_ids.new_zeros": 1
+  },
+  "imports": [
+    "activations.ACT2FN",
+    "cache_utils.Cache",
+    "cache_utils.DynamicCache",
+    "cache_utils.EncoderDecoderCache",
+    "collections.abc.Callable",
+    "configuration_whisper.WhisperConfig",
+    "generation.GenerationMixin",
+    "generation_whisper.WhisperGenerationMixin",
+    "initialization",
+    "masking_utils.create_causal_mask",
+    "math",
+    "modeling_flash_attention_utils.FlashAttentionKwargs",
+    "modeling_layers.GradientCheckpointingLayer",
+    "modeling_outputs.BaseModelOutput",
+    "modeling_outputs.BaseModelOutputWithPastAndCrossAttentions",
+    "modeling_outputs.CausalLMOutputWithCrossAttentions",
+    "modeling_outputs.Seq2SeqLMOutput",
+    "modeling_outputs.Seq2SeqModelOutput",
+    "modeling_outputs.SequenceClassifierOutput",
+    "modeling_utils.ALL_ATTENTION_FUNCTIONS",
+    "modeling_utils.PreTrainedModel",
+    "numpy",
+    "processing_utils.Unpack",
+    "torch",
+    "torch.nn",
+    "torch.nn.CrossEntropyLoss",
+    "utils.TransformersKwargs",
+    "utils.auto_docstring",
+    "utils.can_return_tuple",
+    "utils.generic.merge_with_config_defaults",
+    "utils.logging",
+    "utils.output_capturing.OutputRecorder",
+    "utils.output_capturing.capture_outputs"
+  ]
+}

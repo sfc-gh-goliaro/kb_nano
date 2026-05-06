@@ -1,0 +1,248 @@
+{
+  "file": "/tmp/hf_transformers_pinned/src/transformers/models/mamba/modeling_mamba.py",
+  "lines": 720,
+  "n_classes": 8,
+  "architecture_classes": [
+    "MambaForCausalLM",
+    "MambaModel",
+    "MambaPreTrainedModel"
+  ],
+  "classes": [
+    {
+      "name": "MambaMixer",
+      "bases": [
+        "nn.Module"
+      ],
+      "lineno": 58
+    },
+    {
+      "name": "MambaRMSNorm",
+      "bases": [
+        "nn.Module"
+      ],
+      "lineno": 381
+    },
+    {
+      "name": "MambaBlock",
+      "bases": [
+        "GradientCheckpointingLayer"
+      ],
+      "lineno": 401
+    },
+    {
+      "name": "MambaPreTrainedModel",
+      "bases": [
+        "PreTrainedModel"
+      ],
+      "lineno": 428
+    },
+    {
+      "name": "MambaOutput",
+      "bases": [
+        "ModelOutput"
+      ],
+      "lineno": 479
+    },
+    {
+      "name": "MambaCausalLMOutput",
+      "bases": [
+        "ModelOutput"
+      ],
+      "lineno": 499
+    },
+    {
+      "name": "MambaModel",
+      "bases": [
+        "MambaPreTrainedModel"
+      ],
+      "lineno": 519
+    },
+    {
+      "name": "MambaForCausalLM",
+      "bases": [
+        "MambaPreTrainedModel",
+        "GenerationMixin"
+      ],
+      "lineno": 614
+    }
+  ],
+  "ops": {
+    "act2fn_dynamic": {
+      "count": 1,
+      "refs": [
+        "modeling_mamba.py:ACT2FN['__dynamic__']"
+      ]
+    },
+    "arange": {
+      "count": 1,
+      "refs": [
+        "modeling_mamba.py:124"
+      ]
+    },
+    "causal_conv1d": {
+      "count": 2,
+      "refs": [
+        "modeling_mamba.py:204",
+        "modeling_mamba.py:218"
+      ]
+    },
+    "conv1d": {
+      "count": 1,
+      "refs": [
+        "modeling_mamba.py:76"
+      ]
+    },
+    "embedding": {
+      "count": 1,
+      "refs": [
+        "modeling_mamba.py:523"
+      ]
+    },
+    "exp": {
+      "count": 5,
+      "refs": [
+        "modeling_mamba.py:322",
+        "modeling_mamba.py:321",
+        "modeling_mamba.py:135",
+        "modeling_mamba.py:233",
+        "modeling_mamba.py:185"
+      ]
+    },
+    "kv_cache": {
+      "count": 1,
+      "refs": [
+        "modeling_mamba.py:579"
+      ]
+    },
+    "linear": {
+      "count": 5,
+      "refs": [
+        "modeling_mamba.py:92",
+        "modeling_mamba.py:94",
+        "modeling_mamba.py:96",
+        "modeling_mamba.py:104",
+        "modeling_mamba.py:620"
+      ]
+    },
+    "log": {
+      "count": 5,
+      "refs": [
+        "modeling_mamba.py:126",
+        "modeling_mamba.py:141",
+        "modeling_mamba.py:138",
+        "modeling_mamba.py:137",
+        "modeling_mamba.py:137"
+      ]
+    },
+    "matmul": {
+      "count": 2,
+      "refs": [
+        "modeling_mamba.py:351",
+        "modeling_mamba.py:344"
+      ]
+    },
+    "pad": {
+      "count": 2,
+      "refs": [
+        "modeling_mamba.py:291",
+        "modeling_mamba.py:214"
+      ]
+    },
+    "pow": {
+      "count": 1,
+      "refs": [
+        "modeling_mamba.py:393"
+      ]
+    },
+    "rsqrt": {
+      "count": 1,
+      "refs": [
+        "modeling_mamba.py:394"
+      ]
+    },
+    "selective_scan": {
+      "count": 1,
+      "refs": [
+        "modeling_mamba.py:250"
+      ]
+    },
+    "split": {
+      "count": 2,
+      "refs": [
+        "modeling_mamba.py:314",
+        "modeling_mamba.py:228"
+      ]
+    },
+    "sqrt": {
+      "count": 3,
+      "refs": [
+        "modeling_mamba.py:461",
+        "modeling_mamba.py:444",
+        "modeling_mamba.py:447"
+      ]
+    },
+    "stack": {
+      "count": 1,
+      "refs": [
+        "modeling_mamba.py:353"
+      ]
+    }
+  },
+  "unresolved_top": {
+    "super": 6,
+    "isinstance": 5,
+    "self.act": 5,
+    "getattr": 4,
+    "attention_mask.unsqueeze": 4,
+    "auto_docstring": 3,
+    "cache_params.has_previous_state": 3,
+    "cache_params.update_conv_state": 3,
+    "self.A_log.float": 3,
+    "is_mambapy_available": 2,
+    "torch.no_grad": 2,
+    "lazy_load_kernel": 2,
+    "init.copy_": 2,
+    "init.ones_": 2,
+    "all": 2,
+    "projected_states.chunk": 2,
+    "self.x_proj": 2,
+    "self.out_proj": 2,
+    "self.post_init": 2,
+    "torch.empty": 2,
+    "hidden_states.transpose": 2,
+    "init.kaiming_uniform_": 2,
+    "init.normal_": 2,
+    "logger.warning_once": 2,
+    "self.in_proj": 2,
+    "self.D.float": 2,
+    "self.conv1d.weight.size": 2,
+    "self.dt_proj.bias.float": 2,
+    "is_tracing": 2,
+    "range": 2
+  },
+  "imports": [
+    "activations.ACT2FN",
+    "cache_utils.Cache",
+    "cache_utils.DynamicCache",
+    "configuration_mamba.MambaConfig",
+    "dataclasses.dataclass",
+    "generation.GenerationMixin",
+    "initialization",
+    "integrations.lazy_load_kernel",
+    "mambapy.pscan.pscan",
+    "math",
+    "modeling_layers.GradientCheckpointingLayer",
+    "modeling_utils.PreTrainedModel",
+    "torch",
+    "torch._higher_order_ops.associative_scan.associative_scan",
+    "torch.nn",
+    "torch.nn.CrossEntropyLoss",
+    "utils.ModelOutput",
+    "utils.auto_docstring",
+    "utils.import_utils.is_mambapy_available",
+    "utils.import_utils.is_torch_greater_or_equal",
+    "utils.import_utils.is_tracing",
+    "utils.import_utils.resolve_internal_import",
+    "utils.logging"
+  ]
+}

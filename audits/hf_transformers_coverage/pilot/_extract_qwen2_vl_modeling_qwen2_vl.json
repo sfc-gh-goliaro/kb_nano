@@ -1,0 +1,362 @@
+{
+  "file": "/tmp/hf_transformers_pinned/src/transformers/models/qwen2_vl/modeling_qwen2_vl.py",
+  "lines": 1673,
+  "n_classes": 18,
+  "architecture_classes": [
+    "Qwen2VLForConditionalGeneration",
+    "Qwen2VLModel",
+    "Qwen2VLPreTrainedModel",
+    "Qwen2VLTextModel",
+    "Qwen2VisionTransformerPretrainedModel"
+  ],
+  "classes": [
+    {
+      "name": "Qwen2VLModelOutputWithPast",
+      "bases": [
+        "ModelOutput"
+      ],
+      "lineno": 68
+    },
+    {
+      "name": "Qwen2VLCausalLMOutputWithPast",
+      "bases": [
+        "ModelOutput"
+      ],
+      "lineno": 92
+    },
+    {
+      "name": "Qwen2VLRMSNorm",
+      "bases": [
+        "nn.Module"
+      ],
+      "lineno": 117
+    },
+    {
+      "name": "Qwen2VLRotaryEmbedding",
+      "bases": [
+        "nn.Module"
+      ],
+      "lineno": 138
+    },
+    {
+      "name": "VisionRotaryEmbedding",
+      "bases": [
+        "nn.Module"
+      ],
+      "lineno": 271
+    },
+    {
+      "name": "PatchEmbed",
+      "bases": [
+        "nn.Module"
+      ],
+      "lineno": 287
+    },
+    {
+      "name": "PatchMerger",
+      "bases": [
+        "nn.Module"
+      ],
+      "lineno": 313
+    },
+    {
+      "name": "VisionMlp",
+      "bases": [
+        "nn.Module"
+      ],
+      "lineno": 329
+    },
+    {
+      "name": "VisionAttention",
+      "bases": [
+        "nn.Module"
+      ],
+      "lineno": 378
+    },
+    {
+      "name": "Qwen2VLVisionBlock",
+      "bases": [
+        "GradientCheckpointingLayer"
+      ],
+      "lineno": 461
+    },
+    {
+      "name": "Qwen2MLP",
+      "bases": [
+        "nn.Module"
+      ],
+      "lineno": 491
+    },
+    {
+      "name": "Qwen2VLAttention",
+      "bases": [
+        "nn.Module"
+      ],
+      "lineno": 507
+    },
+    {
+      "name": "Qwen2VLDecoderLayer",
+      "bases": [
+        "GradientCheckpointingLayer"
+      ],
+      "lineno": 597
+    },
+    {
+      "name": "Qwen2VLPreTrainedModel",
+      "bases": [
+        "PreTrainedModel"
+      ],
+      "lineno": 666
+    },
+    {
+      "name": "Qwen2VisionTransformerPretrainedModel",
+      "bases": [
+        "Qwen2VLPreTrainedModel"
+      ],
+      "lineno": 687
+    },
+    {
+      "name": "Qwen2VLTextModel",
+      "bases": [
+        "Qwen2VLPreTrainedModel"
+      ],
+      "lineno": 799
+    },
+    {
+      "name": "Qwen2VLModel",
+      "bases": [
+        "Qwen2VLPreTrainedModel"
+      ],
+      "lineno": 914
+    },
+    {
+      "name": "Qwen2VLForConditionalGeneration",
+      "bases": [
+        "Qwen2VLPreTrainedModel",
+        "GenerationMixin"
+      ],
+      "lineno": 1305
+    }
+  ],
+  "ops": {
+    "act2fn_dynamic": {
+      "count": 1,
+      "refs": [
+        "modeling_qwen2_vl.py:ACT2FN['__dynamic__']"
+      ]
+    },
+    "arange": {
+      "count": 12,
+      "refs": [
+        "modeling_qwen2_vl.py:282",
+        "modeling_qwen2_vl.py:978",
+        "modeling_qwen2_vl.py:979",
+        "modeling_qwen2_vl.py:980",
+        "modeling_qwen2_vl.py:851"
+      ]
+    },
+    "cat": {
+      "count": 12,
+      "refs": [
+        "modeling_qwen2_vl.py:209",
+        "modeling_qwen2_vl.py:748",
+        "modeling_qwen2_vl.py:769",
+        "modeling_qwen2_vl.py:1529",
+        "modeling_qwen2_vl.py:197"
+      ]
+    },
+    "conv3d": {
+      "count": 1,
+      "refs": [
+        "modeling_qwen2_vl.py:302"
+      ]
+    },
+    "dropout": {
+      "count": 1,
+      "refs": [
+        "modeling_qwen2_vl.py:371"
+      ]
+    },
+    "embedding": {
+      "count": 1,
+      "refs": [
+        "modeling_qwen2_vl.py:812"
+      ]
+    },
+    "gelu": {
+      "count": 1,
+      "refs": [
+        "modeling_qwen2_vl.py:320"
+      ]
+    },
+    "kv_cache": {
+      "count": 1,
+      "refs": [
+        "modeling_qwen2_vl.py:843"
+      ]
+    },
+    "linear": {
+      "count": 14,
+      "refs": [
+        "modeling_qwen2_vl.py:332",
+        "modeling_qwen2_vl.py:334",
+        "modeling_qwen2_vl.py:385",
+        "modeling_qwen2_vl.py:386",
+        "modeling_qwen2_vl.py:497"
+      ]
+    },
+    "masked_fill": {
+      "count": 1,
+      "refs": [
+        "modeling_qwen2_vl.py:1218"
+      ]
+    },
+    "matmul": {
+      "count": 2,
+      "refs": [
+        "modeling_qwen2_vl.py:372",
+        "modeling_qwen2_vl.py:366"
+      ]
+    },
+    "outer": {
+      "count": 1,
+      "refs": [
+        "modeling_qwen2_vl.py:283"
+      ]
+    },
+    "pad": {
+      "count": 1,
+      "refs": [
+        "modeling_qwen2_vl.py:780"
+      ]
+    },
+    "pow": {
+      "count": 1,
+      "refs": [
+        "modeling_qwen2_vl.py:129"
+      ]
+    },
+    "repeat_interleave": {
+      "count": 1,
+      "refs": [
+        "modeling_qwen2_vl.py:772"
+      ]
+    },
+    "roll": {
+      "count": 1,
+      "refs": [
+        "modeling_qwen2_vl.py:1578"
+      ]
+    },
+    "rotary_pos_emb": {
+      "count": 4,
+      "refs": [
+        "modeling_qwen2_vl.py:252",
+        "modeling_qwen2_vl.py:253",
+        "modeling_qwen2_vl.py:264",
+        "modeling_qwen2_vl.py:265"
+      ]
+    },
+    "rsqrt": {
+      "count": 1,
+      "refs": [
+        "modeling_qwen2_vl.py:130"
+      ]
+    },
+    "softmax": {
+      "count": 1,
+      "refs": [
+        "modeling_qwen2_vl.py:370"
+      ]
+    },
+    "split": {
+      "count": 6,
+      "refs": [
+        "modeling_qwen2_vl.py:1113",
+        "modeling_qwen2_vl.py:1135",
+        "modeling_qwen2_vl.py:437",
+        "modeling_qwen2_vl.py:1609",
+        "modeling_qwen2_vl.py:1617"
+      ]
+    },
+    "stack": {
+      "count": 2,
+      "refs": [
+        "modeling_qwen2_vl.py:988",
+        "modeling_qwen2_vl.py:747"
+      ]
+    }
+  },
+  "unresolved_top": {
+    "super": 18,
+    "model_kwargs.get": 8,
+    "list": 6,
+    "torch.tensor": 6,
+    "self.get_input_embeddings": 6,
+    "isinstance": 5,
+    "enumerate": 5,
+    "self.post_init": 4,
+    "self.register_buffer": 3,
+    "self.mlp": 3,
+    "attention_interface": 3,
+    "position_ids.view": 3,
+    "auto_docstring": 2,
+    "repeat_kv": 2,
+    "ALL_ATTENTION_FUNCTIONS.get_interface": 2,
+    "is_flash_attention_requested": 2,
+    "self.proj": 2,
+    "torch.zeros": 2,
+    "self.visual": 2,
+    "torch.sum": 2,
+    "key_states.transpose": 2,
+    "logger.warning_once": 2,
+    "emb.cos": 2,
+    "emb.sin": 2,
+    "torch_compilable_check": 2,
+    "past_key_values.get_seq_length": 2,
+    "self.get_placeholder_mask": 2,
+    "inputs_embeds.masked_scatter": 2,
+    "attn_output.reshape": 2,
+    "torch.jit.is_tracing": 2
+  },
+  "imports": [
+    "activations.ACT2FN",
+    "cache_utils.Cache",
+    "cache_utils.DynamicCache",
+    "collections.abc.Callable",
+    "configuration_qwen2_vl.Qwen2VLConfig",
+    "configuration_qwen2_vl.Qwen2VLTextConfig",
+    "configuration_qwen2_vl.Qwen2VLVisionConfig",
+    "dataclasses.dataclass",
+    "generation.GenerationMixin",
+    "initialization",
+    "integrations.use_kernel_forward_from_hub",
+    "itertools",
+    "masking_utils.create_causal_mask",
+    "masking_utils.create_sliding_window_causal_mask",
+    "modeling_flash_attention_utils.FlashAttentionKwargs",
+    "modeling_layers.GradientCheckpointingLayer",
+    "modeling_outputs.BaseModelOutputWithPast",
+    "modeling_outputs.BaseModelOutputWithPooling",
+    "modeling_outputs.ModelOutput",
+    "modeling_rope_utils.ROPE_INIT_FUNCTIONS",
+    "modeling_utils.ALL_ATTENTION_FUNCTIONS",
+    "modeling_utils.PreTrainedModel",
+    "processing_utils.Unpack",
+    "torch",
+    "torch.nn",
+    "torch.nn.LayerNorm",
+    "torch.nn.functional",
+    "typing.Any",
+    "typing.Optional",
+    "utils.TransformersKwargs",
+    "utils.auto_docstring",
+    "utils.can_return_tuple",
+    "utils.generic.is_flash_attention_requested",
+    "utils.generic.maybe_autocast",
+    "utils.generic.merge_with_config_defaults",
+    "utils.logging",
+    "utils.output_capturing.capture_outputs",
+    "utils.torch_compilable_check"
+  ]
+}

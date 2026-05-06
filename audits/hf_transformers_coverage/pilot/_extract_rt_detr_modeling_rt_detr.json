@@ -1,0 +1,430 @@
+{
+  "file": "/tmp/hf_transformers_pinned/src/transformers/models/rt_detr/modeling_rt_detr.py",
+  "lines": 1847,
+  "n_classes": 22,
+  "architecture_classes": [
+    "RTDetrDecoder",
+    "RTDetrForObjectDetection",
+    "RTDetrHybridEncoder",
+    "RTDetrModel",
+    "RTDetrPreTrainedModel"
+  ],
+  "classes": [
+    {
+      "name": "RTDetrDecoderOutput",
+      "bases": [
+        "ModelOutput"
+      ],
+      "lineno": 59
+    },
+    {
+      "name": "RTDetrModelOutput",
+      "bases": [
+        "ModelOutput"
+      ],
+      "lineno": 94
+    },
+    {
+      "name": "RTDetrObjectDetectionOutput",
+      "bases": [
+        "ModelOutput"
+      ],
+      "lineno": 152
+    },
+    {
+      "name": "RTDetrMLP",
+      "bases": [
+        "nn.Module"
+      ],
+      "lineno": 224
+    },
+    {
+      "name": "RTDetrFrozenBatchNorm2d",
+      "bases": [
+        "nn.Module"
+      ],
+      "lineno": 241
+    },
+    {
+      "name": "RTDetrSelfAttention",
+      "bases": [
+        "nn.Module"
+      ],
+      "lineno": 308
+    },
+    {
+      "name": "RTDetrConvEncoder",
+      "bases": [
+        "nn.Module"
+      ],
+      "lineno": 398
+    },
+    {
+      "name": "RTDetrConvNormLayer",
+      "bases": [
+        "nn.Module"
+      ],
+      "lineno": 430
+    },
+    {
+      "name": "RTDetrEncoderLayer",
+      "bases": [
+        "nn.Module"
+      ],
+      "lineno": 451
+    },
+    {
+      "name": "RTDetrRepVggBlock",
+      "bases": [
+        "nn.Module"
+      ],
+      "lineno": 520
+    },
+    {
+      "name": "RTDetrCSPRepLayer",
+      "bases": [
+        "nn.Module"
+      ],
+      "lineno": 539
+    },
+    {
+      "name": "MultiScaleDeformableAttention",
+      "bases": [
+        "nn.Module"
+      ],
+      "lineno": 569
+    },
+    {
+      "name": "RTDetrMultiscaleDeformableAttention",
+      "bases": [
+        "nn.Module"
+      ],
+      "lineno": 623
+    },
+    {
+      "name": "RTDetrDecoderLayer",
+      "bases": [
+        "nn.Module"
+      ],
+      "lineno": 730
+    },
+    {
+      "name": "RTDetrSinePositionEmbedding",
+      "bases": [
+        "nn.Module"
+      ],
+      "lineno": 829
+    },
+    {
+      "name": "RTDetrAIFILayer",
+      "bases": [
+        "nn.Module"
+      ],
+      "lineno": 868
+    },
+    {
+      "name": "RTDetrMLPPredictionHead",
+      "bases": [
+        "nn.Module"
+      ],
+      "lineno": 925
+    },
+    {
+      "name": "RTDetrPreTrainedModel",
+      "bases": [
+        "PreTrainedModel"
+      ],
+      "lineno": 945
+    },
+    {
+      "name": "RTDetrHybridEncoder",
+      "bases": [
+        "RTDetrPreTrainedModel"
+      ],
+      "lineno": 1020
+    },
+    {
+      "name": "RTDetrDecoder",
+      "bases": [
+        "RTDetrPreTrainedModel"
+      ],
+      "lineno": 1141
+    },
+    {
+      "name": "RTDetrModel",
+      "bases": [
+        "RTDetrPreTrainedModel"
+      ],
+      "lineno": 1378
+    },
+    {
+      "name": "RTDetrForObjectDetection",
+      "bases": [
+        "RTDetrPreTrainedModel"
+      ],
+      "lineno": 1693
+    }
+  ],
+  "ops": {
+    "abs": {
+      "count": 1,
+      "refs": [
+        "modeling_rt_detr.py:980"
+      ]
+    },
+    "act2fn_dynamic": {
+      "count": 1,
+      "refs": [
+        "modeling_rt_detr.py:ACT2FN['__dynamic__']"
+      ]
+    },
+    "arange": {
+      "count": 6,
+      "refs": [
+        "modeling_rt_detr.py:853",
+        "modeling_rt_detr.py:854",
+        "modeling_rt_detr.py:859",
+        "modeling_rt_detr.py:1470",
+        "modeling_rt_detr.py:1471"
+      ]
+    },
+    "batch_norm_2d": {
+      "count": 4,
+      "refs": [
+        "modeling_rt_detr.py:441",
+        "modeling_rt_detr.py:1395",
+        "modeling_rt_detr.py:1434",
+        "modeling_rt_detr.py:1441"
+      ]
+    },
+    "cat": {
+      "count": 2,
+      "refs": [
+        "modeling_rt_detr.py:1583",
+        "modeling_rt_detr.py:1584"
+      ]
+    },
+    "clamp": {
+      "count": 1,
+      "refs": [
+        "modeling_rt_detr.py:515"
+      ]
+    },
+    "conv2d": {
+      "count": 4,
+      "refs": [
+        "modeling_rt_detr.py:433",
+        "modeling_rt_detr.py:1394",
+        "modeling_rt_detr.py:1433",
+        "modeling_rt_detr.py:1440"
+      ]
+    },
+    "dropout": {
+      "count": 6,
+      "refs": [
+        "modeling_rt_detr.py:300",
+        "modeling_rt_detr.py:235",
+        "modeling_rt_detr.py:237",
+        "modeling_rt_detr.py:497",
+        "modeling_rt_detr.py:797"
+      ]
+    },
+    "embedding": {
+      "count": 2,
+      "refs": [
+        "modeling_rt_detr.py:1405",
+        "modeling_rt_detr.py:1411"
+      ]
+    },
+    "gather": {
+      "count": 3,
+      "refs": [
+        "modeling_rt_detr.py:1629",
+        "modeling_rt_detr.py:1637",
+        "modeling_rt_detr.py:1645"
+      ]
+    },
+    "grid_sample": {
+      "count": 1,
+      "refs": [
+        "modeling_rt_detr.py:601"
+      ]
+    },
+    "identity": {
+      "count": 3,
+      "refs": [
+        "modeling_rt_detr.py:442",
+        "modeling_rt_detr.py:532",
+        "modeling_rt_detr.py:559"
+      ]
+    },
+    "interpolate": {
+      "count": 2,
+      "refs": [
+        "modeling_rt_detr.py:1114",
+        "modeling_rt_detr.py:425"
+      ]
+    },
+    "layer_norm": {
+      "count": 6,
+      "refs": [
+        "modeling_rt_detr.py:464",
+        "modeling_rt_detr.py:467",
+        "modeling_rt_detr.py:744",
+        "modeling_rt_detr.py:751",
+        "modeling_rt_detr.py:754"
+      ]
+    },
+    "linear": {
+      "count": 14,
+      "refs": [
+        "modeling_rt_detr.py:227",
+        "modeling_rt_detr.py:228",
+        "modeling_rt_detr.py:330",
+        "modeling_rt_detr.py:331",
+        "modeling_rt_detr.py:332"
+      ]
+    },
+    "log": {
+      "count": 4,
+      "refs": [
+        "modeling_rt_detr.py:1138",
+        "modeling_rt_detr.py:1484",
+        "modeling_rt_detr.py:963",
+        "modeling_rt_detr.py:997"
+      ]
+    },
+    "masked_fill": {
+      "count": 1,
+      "refs": [
+        "modeling_rt_detr.py:688"
+      ]
+    },
+    "matmul": {
+      "count": 2,
+      "refs": [
+        "modeling_rt_detr.py:302",
+        "modeling_rt_detr.py:294"
+      ]
+    },
+    "ones_like": {
+      "count": 1,
+      "refs": [
+        "modeling_rt_detr.py:1478"
+      ]
+    },
+    "relu": {
+      "count": 1,
+      "refs": [
+        "modeling_rt_detr.py:940"
+      ]
+    },
+    "sigmoid": {
+      "count": 3,
+      "refs": [
+        "modeling_rt_detr.py:1202",
+        "modeling_rt_detr.py:1633",
+        "modeling_rt_detr.py:1224"
+      ]
+    },
+    "softmax": {
+      "count": 2,
+      "refs": [
+        "modeling_rt_detr.py:299",
+        "modeling_rt_detr.py:696"
+      ]
+    },
+    "split": {
+      "count": 1,
+      "refs": [
+        "modeling_rt_detr.py:1326"
+      ]
+    },
+    "stack": {
+      "count": 7,
+      "refs": [
+        "modeling_rt_detr.py:1237",
+        "modeling_rt_detr.py:1238",
+        "modeling_rt_detr.py:702",
+        "modeling_rt_detr.py:1240",
+        "modeling_rt_detr.py:1474"
+      ]
+    },
+    "topk": {
+      "count": 1,
+      "refs": [
+        "modeling_rt_detr.py:1627"
+      ]
+    },
+    "where": {
+      "count": 2,
+      "refs": [
+        "modeling_rt_detr.py:1336",
+        "modeling_rt_detr.py:1485"
+      ]
+    }
+  },
+  "unresolved_top": {
+    "super": 18,
+    "range": 15,
+    "len": 14,
+    "enumerate": 10,
+    "init.constant_": 9,
+    "isinstance": 7,
+    "torch.concat": 7,
+    "init.xavier_uniform_": 6,
+    "auto_docstring": 5,
+    "torch.zeros": 5,
+    "self.register_buffer": 4,
+    "int": 4,
+    "self.post_init": 4,
+    "zip": 4,
+    "init.zeros_": 4,
+    "torch_int": 3,
+    "self.self_attn_layer_norm": 3,
+    "self.final_layer_norm": 3,
+    "torch.ones": 3,
+    "layer": 3,
+    "sources.append": 3,
+    "float": 3,
+    "topk_ind.unsqueeze": 3,
+    "compile_compatible_method_lru_cache": 2,
+    "torch.no_grad": 2,
+    "x.clamp": 2,
+    "torch.full": 2,
+    "self.activation": 2,
+    "self.self_attn": 2,
+    "self.mlp": 2
+  },
+  "imports": [
+    "activations.ACT2CLS",
+    "activations.ACT2FN",
+    "backbone_utils.load_backbone",
+    "collections.abc.Callable",
+    "configuration_rt_detr.RTDetrConfig",
+    "dataclasses.dataclass",
+    "image_transforms.center_to_corners_format",
+    "image_transforms.corners_to_center_format",
+    "initialization",
+    "integrations.use_kernel_forward_from_hub",
+    "math",
+    "modeling_outputs.BaseModelOutput",
+    "modeling_utils.ALL_ATTENTION_FUNCTIONS",
+    "modeling_utils.PreTrainedModel",
+    "processing_utils.Unpack",
+    "pytorch_utils.compile_compatible_method_lru_cache",
+    "torch",
+    "torch.Tensor",
+    "torch.nn",
+    "torch.nn.functional",
+    "utils.ModelOutput",
+    "utils.TransformersKwargs",
+    "utils.auto_docstring",
+    "utils.generic.can_return_tuple",
+    "utils.generic.merge_with_config_defaults",
+    "utils.output_capturing.capture_outputs",
+    "utils.torch_compilable_check",
+    "utils.torch_int",
+    "warnings"
+  ]
+}

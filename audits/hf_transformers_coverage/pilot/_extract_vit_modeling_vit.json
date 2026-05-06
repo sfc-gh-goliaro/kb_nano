@@ -1,0 +1,248 @@
+{
+  "file": "/tmp/hf_transformers_pinned/src/transformers/models/vit/modeling_vit.py",
+  "lines": 656,
+  "n_classes": 14,
+  "architecture_classes": [
+    "ViTForImageClassification",
+    "ViTForMaskedImageModeling",
+    "ViTModel",
+    "ViTPreTrainedModel"
+  ],
+  "classes": [
+    {
+      "name": "ViTEmbeddings",
+      "bases": [
+        "nn.Module"
+      ],
+      "lineno": 43
+    },
+    {
+      "name": "ViTPatchEmbeddings",
+      "bases": [
+        "nn.Module"
+      ],
+      "lineno": 131
+    },
+    {
+      "name": "ViTSelfAttention",
+      "bases": [
+        "nn.Module"
+      ],
+      "lineno": 199
+    },
+    {
+      "name": "ViTSelfOutput",
+      "bases": [
+        "nn.Module"
+      ],
+      "lineno": 254
+    },
+    {
+      "name": "ViTAttention",
+      "bases": [
+        "nn.Module"
+      ],
+      "lineno": 271
+    },
+    {
+      "name": "ViTIntermediate",
+      "bases": [
+        "nn.Module"
+      ],
+      "lineno": 287
+    },
+    {
+      "name": "ViTOutput",
+      "bases": [
+        "nn.Module"
+      ],
+      "lineno": 302
+    },
+    {
+      "name": "ViTLayer",
+      "bases": [
+        "GradientCheckpointingLayer"
+      ],
+      "lineno": 315
+    },
+    {
+      "name": "ViTEncoder",
+      "bases": [
+        "nn.Module"
+      ],
+      "lineno": 349
+    },
+    {
+      "name": "ViTPreTrainedModel",
+      "bases": [
+        "PreTrainedModel"
+      ],
+      "lineno": 368
+    },
+    {
+      "name": "ViTModel",
+      "bases": [
+        "ViTPreTrainedModel"
+      ],
+      "lineno": 402
+    },
+    {
+      "name": "ViTPooler",
+      "bases": [
+        "nn.Module"
+      ],
+      "lineno": 461
+    },
+    {
+      "name": "ViTForMaskedImageModeling",
+      "bases": [
+        "ViTPreTrainedModel"
+      ],
+      "lineno": 488
+    },
+    {
+      "name": "ViTForImageClassification",
+      "bases": [
+        "ViTPreTrainedModel"
+      ],
+      "lineno": 605
+    }
+  ],
+  "ops": {
+    "act2fn_dynamic": {
+      "count": 1,
+      "refs": [
+        "modeling_vit.py:ACT2FN['__dynamic__']"
+      ]
+    },
+    "cat": {
+      "count": 2,
+      "refs": [
+        "modeling_vit.py:98",
+        "modeling_vit.py:118"
+      ]
+    },
+    "conv2d": {
+      "count": 2,
+      "refs": [
+        "modeling_vit.py:151",
+        "modeling_vit.py:495"
+      ]
+    },
+    "dropout": {
+      "count": 4,
+      "refs": [
+        "modeling_vit.py:191",
+        "modeling_vit.py:56",
+        "modeling_vit.py:263",
+        "modeling_vit.py:306"
+      ]
+    },
+    "identity": {
+      "count": 1,
+      "refs": [
+        "modeling_vit.py:613"
+      ]
+    },
+    "interpolate": {
+      "count": 1,
+      "refs": [
+        "modeling_vit.py:89"
+      ]
+    },
+    "layer_norm": {
+      "count": 3,
+      "refs": [
+        "modeling_vit.py:325",
+        "modeling_vit.py:326",
+        "modeling_vit.py:416"
+      ]
+    },
+    "linear": {
+      "count": 8,
+      "refs": [
+        "modeling_vit.py:216",
+        "modeling_vit.py:217",
+        "modeling_vit.py:218",
+        "modeling_vit.py:262",
+        "modeling_vit.py:290"
+      ]
+    },
+    "matmul": {
+      "count": 2,
+      "refs": [
+        "modeling_vit.py:193",
+        "modeling_vit.py:185"
+      ]
+    },
+    "pixel_shuffle": {
+      "count": 1,
+      "refs": [
+        "modeling_vit.py:500"
+      ]
+    },
+    "softmax": {
+      "count": 1,
+      "refs": [
+        "modeling_vit.py:190"
+      ]
+    }
+  },
+  "unresolved_top": {
+    "super": 13,
+    "isinstance": 6,
+    "self.dense": 4,
+    "self.dropout": 3,
+    "self.post_init": 3,
+    "init.trunc_normal_": 3,
+    "init.zeros_": 3,
+    "auto_docstring": 2,
+    "patch_pos_embed.permute": 2,
+    "self.attention": 2,
+    "self.output": 2,
+    "self.vit": 2,
+    "torch.randn": 2,
+    "logging.get_logger": 1,
+    "torch.no_grad": 1,
+    "capture_outputs": 1,
+    "torch_int": 1,
+    "patch_pos_embed.reshape": 1,
+    "self.patch_embeddings": 1,
+    "self.cls_token.expand": 1,
+    "int": 1,
+    "ALL_ATTENTION_FUNCTIONS.get_interface": 1,
+    "attention_interface": 1,
+    "context_layer.reshape": 1,
+    "self.intermediate_act_fn": 1,
+    "self.layernorm_before": 1,
+    "self.layernorm_after": 1,
+    "self.intermediate": 1,
+    "self.embeddings": 1,
+    "self.encoder": 1
+  },
+  "imports": [
+    "activations.ACT2FN",
+    "collections.abc",
+    "collections.abc.Callable",
+    "configuration_vit.ViTConfig",
+    "initialization",
+    "math",
+    "modeling_layers.GradientCheckpointingLayer",
+    "modeling_outputs.BaseModelOutput",
+    "modeling_outputs.BaseModelOutputWithPooling",
+    "modeling_outputs.ImageClassifierOutput",
+    "modeling_outputs.MaskedImageModelingOutput",
+    "modeling_utils.ALL_ATTENTION_FUNCTIONS",
+    "modeling_utils.PreTrainedModel",
+    "processing_utils.Unpack",
+    "torch",
+    "torch.nn",
+    "utils.TransformersKwargs",
+    "utils.auto_docstring",
+    "utils.generic.can_return_tuple",
+    "utils.generic.merge_with_config_defaults",
+    "utils.logging",
+    "utils.output_capturing.capture_outputs",
+    "utils.torch_int"
+  ]
+}

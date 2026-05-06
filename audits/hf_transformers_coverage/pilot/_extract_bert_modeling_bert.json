@@ -1,0 +1,364 @@
+{
+  "file": "/tmp/hf_transformers_pinned/src/transformers/models/bert/modeling_bert.py",
+  "lines": 1394,
+  "n_classes": 26,
+  "architecture_classes": [
+    "BertForMaskedLM",
+    "BertForMultipleChoice",
+    "BertForNextSentencePrediction",
+    "BertForPreTraining",
+    "BertForQuestionAnswering",
+    "BertForSequenceClassification",
+    "BertForTokenClassification",
+    "BertLMHeadModel",
+    "BertModel",
+    "BertPreTrainedModel"
+  ],
+  "classes": [
+    {
+      "name": "BertEmbeddings",
+      "bases": [
+        "nn.Module"
+      ],
+      "lineno": 53
+    },
+    {
+      "name": "BertSelfAttention",
+      "bases": [
+        "nn.Module"
+      ],
+      "lineno": 143
+    },
+    {
+      "name": "BertCrossAttention",
+      "bases": [
+        "nn.Module"
+      ],
+      "lineno": 210
+    },
+    {
+      "name": "BertSelfOutput",
+      "bases": [
+        "nn.Module"
+      ],
+      "lineno": 286
+    },
+    {
+      "name": "BertAttention",
+      "bases": [
+        "nn.Module"
+      ],
+      "lineno": 300
+    },
+    {
+      "name": "BertIntermediate",
+      "bases": [
+        "nn.Module"
+      ],
+      "lineno": 329
+    },
+    {
+      "name": "BertOutput",
+      "bases": [
+        "nn.Module"
+      ],
+      "lineno": 344
+    },
+    {
+      "name": "BertLayer",
+      "bases": [
+        "GradientCheckpointingLayer"
+      ],
+      "lineno": 358
+    },
+    {
+      "name": "BertEncoder",
+      "bases": [
+        "nn.Module"
+      ],
+      "lineno": 423
+    },
+    {
+      "name": "BertPooler",
+      "bases": [
+        "nn.Module"
+      ],
+      "lineno": 455
+    },
+    {
+      "name": "BertPredictionHeadTransform",
+      "bases": [
+        "nn.Module"
+      ],
+      "lineno": 470
+    },
+    {
+      "name": "BertLMPredictionHead",
+      "bases": [
+        "nn.Module"
+      ],
+      "lineno": 487
+    },
+    {
+      "name": "BertOnlyMLMHead",
+      "bases": [
+        "nn.Module"
+      ],
+      "lineno": 503
+    },
+    {
+      "name": "BertOnlyNSPHead",
+      "bases": [
+        "nn.Module"
+      ],
+      "lineno": 513
+    },
+    {
+      "name": "BertPreTrainingHeads",
+      "bases": [
+        "nn.Module"
+      ],
+      "lineno": 523
+    },
+    {
+      "name": "BertPreTrainedModel",
+      "bases": [
+        "PreTrainedModel"
+      ],
+      "lineno": 536
+    },
+    {
+      "name": "BertForPreTrainingOutput",
+      "bases": [
+        "ModelOutput"
+      ],
+      "lineno": 567
+    },
+    {
+      "name": "BertModel",
+      "bases": [
+        "BertPreTrainedModel"
+      ],
+      "lineno": 598
+    },
+    {
+      "name": "BertForPreTraining",
+      "bases": [
+        "BertPreTrainedModel"
+      ],
+      "lineno": 731
+    },
+    {
+      "name": "BertLMHeadModel",
+      "bases": [
+        "BertPreTrainedModel",
+        "GenerationMixin"
+      ],
+      "lineno": 828
+    },
+    {
+      "name": "BertForMaskedLM",
+      "bases": [
+        "BertPreTrainedModel"
+      ],
+      "lineno": 913
+    },
+    {
+      "name": "BertForNextSentencePrediction",
+      "bases": [
+        "BertPreTrainedModel"
+      ],
+      "lineno": 994
+    },
+    {
+      "name": "BertForSequenceClassification",
+      "bases": [
+        "BertPreTrainedModel"
+      ],
+      "lineno": 1076
+    },
+    {
+      "name": "BertForMultipleChoice",
+      "bases": [
+        "BertPreTrainedModel"
+      ],
+      "lineno": 1157
+    },
+    {
+      "name": "BertForTokenClassification",
+      "bases": [
+        "BertPreTrainedModel"
+      ],
+      "lineno": 1255
+    },
+    {
+      "name": "BertForQuestionAnswering",
+      "bases": [
+        "BertPreTrainedModel"
+      ],
+      "lineno": 1315
+    }
+  ],
+  "ops": {
+    "act2fn_dynamic": {
+      "count": 1,
+      "refs": [
+        "modeling_bert.py:ACT2FN['__dynamic__']"
+      ]
+    },
+    "arange": {
+      "count": 2,
+      "refs": [
+        "modeling_bert.py:66",
+        "modeling_bert.py:557"
+      ]
+    },
+    "dropout": {
+      "count": 9,
+      "refs": [
+        "modeling_bert.py:135",
+        "modeling_bert.py:63",
+        "modeling_bert.py:162",
+        "modeling_bert.py:229",
+        "modeling_bert.py:291"
+      ]
+    },
+    "embedding": {
+      "count": 3,
+      "refs": [
+        "modeling_bert.py:58",
+        "modeling_bert.py:59",
+        "modeling_bert.py:60"
+      ]
+    },
+    "encoder_decoder_cache": {
+      "count": 1,
+      "refs": [
+        "modeling_bert.py:650"
+      ]
+    },
+    "gather": {
+      "count": 1,
+      "refs": [
+        "modeling_bert.py:97"
+      ]
+    },
+    "kv_cache": {
+      "count": 3,
+      "refs": [
+        "modeling_bert.py:652",
+        "modeling_bert.py:650",
+        "modeling_bert.py:650"
+      ]
+    },
+    "layer_norm": {
+      "count": 4,
+      "refs": [
+        "modeling_bert.py:62",
+        "modeling_bert.py:290",
+        "modeling_bert.py:348",
+        "modeling_bert.py:478"
+      ]
+    },
+    "linear": {
+      "count": 18,
+      "refs": [
+        "modeling_bert.py:158",
+        "modeling_bert.py:159",
+        "modeling_bert.py:160",
+        "modeling_bert.py:225",
+        "modeling_bert.py:226"
+      ]
+    },
+    "matmul": {
+      "count": 2,
+      "refs": [
+        "modeling_bert.py:137",
+        "modeling_bert.py:129"
+      ]
+    },
+    "softmax": {
+      "count": 1,
+      "refs": [
+        "modeling_bert.py:134"
+      ]
+    },
+    "tanh": {
+      "count": 1,
+      "refs": [
+        "modeling_bert.py:459"
+      ]
+    }
+  },
+  "unresolved_top": {
+    "super": 25,
+    "loss_fct": 12,
+    "self.post_init": 9,
+    "self.bert": 8,
+    "auto_docstring": 6,
+    "self.dropout": 6,
+    "isinstance": 6,
+    "self.dense": 5,
+    "labels.view": 5,
+    "self.cls": 4,
+    "hasattr": 4,
+    "self.classifier": 3,
+    "logits.view": 3,
+    "torch.zeros": 3,
+    "inputs_embeds.size": 3,
+    "self.register_buffer": 2,
+    "int": 2,
+    "ALL_ATTENTION_FUNCTIONS.get_interface": 2,
+    "attention_interface": 2,
+    "self.output": 2,
+    "self.predictions": 2,
+    "self.seq_relationship": 2,
+    "input_ids.size": 2,
+    "init.zeros_": 2,
+    "create_bidirectional_mask": 2,
+    "logger.warning": 2,
+    "attn_output.reshape": 2,
+    "prediction_scores.view": 2,
+    "len": 2,
+    "self.query": 2
+  },
+  "imports": [
+    "activations.ACT2FN",
+    "cache_utils.Cache",
+    "cache_utils.DynamicCache",
+    "cache_utils.EncoderDecoderCache",
+    "collections.abc.Callable",
+    "configuration_bert.BertConfig",
+    "dataclasses.dataclass",
+    "generation.GenerationMixin",
+    "initialization",
+    "masking_utils.create_bidirectional_mask",
+    "masking_utils.create_causal_mask",
+    "modeling_layers.GradientCheckpointingLayer",
+    "modeling_outputs.BaseModelOutputWithPastAndCrossAttentions",
+    "modeling_outputs.BaseModelOutputWithPoolingAndCrossAttentions",
+    "modeling_outputs.CausalLMOutputWithCrossAttentions",
+    "modeling_outputs.MaskedLMOutput",
+    "modeling_outputs.MultipleChoiceModelOutput",
+    "modeling_outputs.NextSentencePredictorOutput",
+    "modeling_outputs.QuestionAnsweringModelOutput",
+    "modeling_outputs.SequenceClassifierOutput",
+    "modeling_outputs.TokenClassifierOutput",
+    "modeling_utils.ALL_ATTENTION_FUNCTIONS",
+    "modeling_utils.PreTrainedModel",
+    "processing_utils.Unpack",
+    "pytorch_utils.apply_chunking_to_forward",
+    "torch",
+    "torch.nn",
+    "torch.nn.BCEWithLogitsLoss",
+    "torch.nn.CrossEntropyLoss",
+    "torch.nn.MSELoss",
+    "utils.ModelOutput",
+    "utils.TransformersKwargs",
+    "utils.auto_docstring",
+    "utils.generic.can_return_tuple",
+    "utils.generic.merge_with_config_defaults",
+    "utils.logging",
+    "utils.output_capturing.capture_outputs"
+  ]
+}

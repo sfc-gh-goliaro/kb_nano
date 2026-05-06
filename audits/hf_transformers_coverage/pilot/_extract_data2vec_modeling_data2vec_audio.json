@@ -1,0 +1,364 @@
+{
+  "file": "/tmp/hf_transformers_pinned/src/transformers/models/data2vec/modeling_data2vec_audio.py",
+  "lines": 1324,
+  "n_classes": 20,
+  "architecture_classes": [
+    "Data2VecAudioForAudioFrameClassification",
+    "Data2VecAudioForCTC",
+    "Data2VecAudioForSequenceClassification",
+    "Data2VecAudioForXVector",
+    "Data2VecAudioModel",
+    "Data2VecAudioPreTrainedModel"
+  ],
+  "classes": [
+    {
+      "name": "Data2VecAudioConvLayer",
+      "bases": [
+        "GradientCheckpointingLayer"
+      ],
+      "lineno": 51
+    },
+    {
+      "name": "Data2VecAudioPadLayer",
+      "bases": [
+        "nn.Module"
+      ],
+      "lineno": 78
+    },
+    {
+      "name": "Data2VecAudioPositionalConvLayer",
+      "bases": [
+        "nn.Module"
+      ],
+      "lineno": 89
+    },
+    {
+      "name": "Data2VecAudioPositionalConvEmbedding",
+      "bases": [
+        "nn.Module"
+      ],
+      "lineno": 116
+    },
+    {
+      "name": "Data2VecAudioFeatureEncoder",
+      "bases": [
+        "nn.Module"
+      ],
+      "lineno": 131
+    },
+    {
+      "name": "Data2VecAudioFeatureProjection",
+      "bases": [
+        "nn.Module"
+      ],
+      "lineno": 160
+    },
+    {
+      "name": "Data2VecAudioAttention",
+      "bases": [
+        "nn.Module"
+      ],
+      "lineno": 203
+    },
+    {
+      "name": "Data2VecAudioFeedForward",
+      "bases": [
+        "nn.Module"
+      ],
+      "lineno": 288
+    },
+    {
+      "name": "Data2VecAudioEncoderLayer",
+      "bases": [
+        "GradientCheckpointingLayer"
+      ],
+      "lineno": 312
+    },
+    {
+      "name": "Data2VecAudioEncoder",
+      "bases": [
+        "nn.Module"
+      ],
+      "lineno": 348
+    },
+    {
+      "name": "Data2VecAudioAdapterLayer",
+      "bases": [
+        "nn.Module"
+      ],
+      "lineno": 420
+    },
+    {
+      "name": "Data2VecAudioAdapter",
+      "bases": [
+        "nn.Module"
+      ],
+      "lineno": 438
+    },
+    {
+      "name": "Data2VecAudioPreTrainedModel",
+      "bases": [
+        "PreTrainedModel"
+      ],
+      "lineno": 470
+    },
+    {
+      "name": "Data2VecAudioModel",
+      "bases": [
+        "Data2VecAudioPreTrainedModel"
+      ],
+      "lineno": 671
+    },
+    {
+      "name": "Data2VecAudioForCTC",
+      "bases": [
+        "Data2VecAudioPreTrainedModel"
+      ],
+      "lineno": 810
+    },
+    {
+      "name": "Data2VecAudioForSequenceClassification",
+      "bases": [
+        "Data2VecAudioPreTrainedModel"
+      ],
+      "lineno": 924
+    },
+    {
+      "name": "Data2VecAudioForAudioFrameClassification",
+      "bases": [
+        "Data2VecAudioPreTrainedModel"
+      ],
+      "lineno": 1029
+    },
+    {
+      "name": "AMSoftmaxLoss",
+      "bases": [
+        "nn.Module"
+      ],
+      "lineno": 1123
+    },
+    {
+      "name": "TDNNLayer",
+      "bases": [
+        "nn.Module"
+      ],
+      "lineno": 1146
+    },
+    {
+      "name": "Data2VecAudioForXVector",
+      "bases": [
+        "Data2VecAudioPreTrainedModel"
+      ],
+      "lineno": 1183
+    }
+  ],
+  "ops": {
+    "act2fn_dynamic": {
+      "count": 1,
+      "refs": [
+        "modeling_data2vec_audio.py:ACT2FN['__dynamic__']"
+      ]
+    },
+    "arange": {
+      "count": 1,
+      "refs": [
+        "modeling_data2vec_audio.py:543"
+      ]
+    },
+    "argmax": {
+      "count": 1,
+      "refs": [
+        "modeling_data2vec_audio.py:1109"
+      ]
+    },
+    "cat": {
+      "count": 1,
+      "refs": [
+        "modeling_data2vec_audio.py:1295"
+      ]
+    },
+    "conv1d": {
+      "count": 4,
+      "refs": [
+        "modeling_data2vec_audio.py:57",
+        "modeling_data2vec_audio.py:92",
+        "modeling_data2vec_audio.py:423",
+        "modeling_data2vec_audio.py:1171"
+      ]
+    },
+    "ctc_loss": {
+      "count": 1,
+      "refs": [
+        "modeling_data2vec_audio.py:899"
+      ]
+    },
+    "cumsum": {
+      "count": 1,
+      "refs": [
+        "modeling_data2vec_audio.py:532"
+      ]
+    },
+    "dropout": {
+      "count": 7,
+      "refs": [
+        "modeling_data2vec_audio.py:195",
+        "modeling_data2vec_audio.py:165",
+        "modeling_data2vec_audio.py:291",
+        "modeling_data2vec_audio.py:300",
+        "modeling_data2vec_audio.py:323"
+      ]
+    },
+    "layer_norm": {
+      "count": 7,
+      "refs": [
+        "modeling_data2vec_audio.py:64",
+        "modeling_data2vec_audio.py:103",
+        "modeling_data2vec_audio.py:163",
+        "modeling_data2vec_audio.py:324",
+        "modeling_data2vec_audio.py:326"
+      ]
+    },
+    "linear": {
+      "count": 16,
+      "refs": [
+        "modeling_data2vec_audio.py:164",
+        "modeling_data2vec_audio.py:232",
+        "modeling_data2vec_audio.py:233",
+        "modeling_data2vec_audio.py:234",
+        "modeling_data2vec_audio.py:235"
+      ]
+    },
+    "log_softmax": {
+      "count": 1,
+      "refs": [
+        "modeling_data2vec_audio.py:896"
+      ]
+    },
+    "masked_select": {
+      "count": 1,
+      "refs": [
+        "modeling_data2vec_audio.py:893"
+      ]
+    },
+    "matmul": {
+      "count": 3,
+      "refs": [
+        "modeling_data2vec_audio.py:197",
+        "modeling_data2vec_audio.py:189",
+        "modeling_data2vec_audio.py:1136"
+      ]
+    },
+    "one_hot": {
+      "count": 1,
+      "refs": [
+        "modeling_data2vec_audio.py:1139"
+      ]
+    },
+    "ones_like": {
+      "count": 1,
+      "refs": [
+        "modeling_data2vec_audio.py:885"
+      ]
+    },
+    "relu": {
+      "count": 1,
+      "refs": [
+        "modeling_data2vec_audio.py:1155"
+      ]
+    },
+    "softmax": {
+      "count": 4,
+      "refs": [
+        "modeling_data2vec_audio.py:194",
+        "modeling_data2vec_audio.py:995",
+        "modeling_data2vec_audio.py:1099",
+        "modeling_data2vec_audio.py:1271"
+      ]
+    },
+    "sqrt": {
+      "count": 2,
+      "refs": [
+        "modeling_data2vec_audio.py:484",
+        "modeling_data2vec_audio.py:503"
+      ]
+    },
+    "stack": {
+      "count": 5,
+      "refs": [
+        "modeling_data2vec_audio.py:994",
+        "modeling_data2vec_audio.py:1098",
+        "modeling_data2vec_audio.py:1270",
+        "modeling_data2vec_audio.py:1293",
+        "modeling_data2vec_audio.py:1294"
+      ]
+    },
+    "where": {
+      "count": 1,
+      "refs": [
+        "modeling_data2vec_audio.py:1140"
+      ]
+    }
+  },
+  "unresolved_top": {
+    "super": 19,
+    "hidden_states.transpose": 10,
+    "isinstance": 7,
+    "range": 7,
+    "self.layer_norm": 5,
+    "self.post_init": 5,
+    "self.dropout": 4,
+    "self.data2vec_audio": 4,
+    "auto_docstring": 3,
+    "self.conv": 3,
+    "self.activation": 3,
+    "self.data2vec_audio.parameters": 3,
+    "self.classifier": 3,
+    "layer": 3,
+    "init.uniform_": 3,
+    "hasattr": 3,
+    "torch.ones": 3,
+    "norm_weights.view": 3,
+    "compute_num_masked_span": 2,
+    "np.broadcast_to": 2,
+    "max": 2,
+    "np.arange": 2,
+    "self.feature_extractor": 2,
+    "self.projector": 2,
+    "nn.functional.normalize": 2,
+    "is_peft_available": 2,
+    "len": 2,
+    "torch.tensor": 2,
+    "hidden_states.mean": 2,
+    "loss_fct": 2
+  },
+  "imports": [
+    "activations.ACT2FN",
+    "collections.abc.Callable",
+    "configuration_data2vec_audio.Data2VecAudioConfig",
+    "initialization",
+    "integrations.deepspeed.is_deepspeed_zero3_enabled",
+    "integrations.fsdp.is_fsdp_managed_module",
+    "masking_utils.create_bidirectional_mask",
+    "math",
+    "modeling_flash_attention_utils.FlashAttentionKwargs",
+    "modeling_layers.GradientCheckpointingLayer",
+    "modeling_outputs.BaseModelOutput",
+    "modeling_outputs.CausalLMOutput",
+    "modeling_outputs.SequenceClassifierOutput",
+    "modeling_outputs.TokenClassifierOutput",
+    "modeling_outputs.Wav2Vec2BaseModelOutput",
+    "modeling_outputs.XVectorOutput",
+    "modeling_utils.ALL_ATTENTION_FUNCTIONS",
+    "modeling_utils.PreTrainedModel",
+    "numpy",
+    "peft.tuners.lora.LoraLayer",
+    "processing_utils.Unpack",
+    "torch",
+    "torch.nn",
+    "torch.nn.CrossEntropyLoss",
+    "utils.TransformersKwargs",
+    "utils.auto_docstring",
+    "utils.is_peft_available",
+    "warnings"
+  ]
+}

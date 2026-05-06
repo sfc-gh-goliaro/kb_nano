@@ -1,0 +1,244 @@
+{
+  "file": "/tmp/hf_transformers_pinned/src/transformers/models/llama/modeling_llama.py",
+  "lines": 519,
+  "n_classes": 11,
+  "architecture_classes": [
+    "LlamaForCausalLM",
+    "LlamaForQuestionAnswering",
+    "LlamaForSequenceClassification",
+    "LlamaForTokenClassification",
+    "LlamaModel",
+    "LlamaPreTrainedModel"
+  ],
+  "classes": [
+    {
+      "name": "LlamaRMSNorm",
+      "bases": [
+        "nn.Module"
+      ],
+      "lineno": 53
+    },
+    {
+      "name": "LlamaRotaryEmbedding",
+      "bases": [
+        "nn.Module"
+      ],
+      "lineno": 73
+    },
+    {
+      "name": "LlamaMLP",
+      "bases": [
+        "nn.Module"
+      ],
+      "lineno": 171
+    },
+    {
+      "name": "LlamaAttention",
+      "bases": [
+        "nn.Module"
+      ],
+      "lineno": 225
+    },
+    {
+      "name": "LlamaDecoderLayer",
+      "bases": [
+        "GradientCheckpointingLayer"
+      ],
+      "lineno": 292
+    },
+    {
+      "name": "LlamaPreTrainedModel",
+      "bases": [
+        "PreTrainedModel"
+      ],
+      "lineno": 336
+    },
+    {
+      "name": "LlamaModel",
+      "bases": [
+        "LlamaPreTrainedModel"
+      ],
+      "lineno": 355
+    },
+    {
+      "name": "LlamaForCausalLM",
+      "bases": [
+        "LlamaPreTrainedModel",
+        "GenerationMixin"
+      ],
+      "lineno": 429
+    },
+    {
+      "name": "LlamaForSequenceClassification",
+      "bases": [
+        "GenericForSequenceClassification",
+        "LlamaPreTrainedModel"
+      ],
+      "lineno": 502
+    },
+    {
+      "name": "LlamaForQuestionAnswering",
+      "bases": [
+        "GenericForQuestionAnswering",
+        "LlamaPreTrainedModel"
+      ],
+      "lineno": 505
+    },
+    {
+      "name": "LlamaForTokenClassification",
+      "bases": [
+        "GenericForTokenClassification",
+        "LlamaPreTrainedModel"
+      ],
+      "lineno": 509
+    }
+  ],
+  "ops": {
+    "act2fn_dynamic": {
+      "count": 1,
+      "refs": [
+        "modeling_llama.py:ACT2FN['__dynamic__']"
+      ]
+    },
+    "arange": {
+      "count": 2,
+      "refs": [
+        "modeling_llama.py:396",
+        "modeling_llama.py:118"
+      ]
+    },
+    "cat": {
+      "count": 2,
+      "refs": [
+        "modeling_llama.py:142",
+        "modeling_llama.py:131"
+      ]
+    },
+    "dropout": {
+      "count": 1,
+      "refs": [
+        "modeling_llama.py:217"
+      ]
+    },
+    "embedding": {
+      "count": 1,
+      "refs": [
+        "modeling_llama.py:361"
+      ]
+    },
+    "kv_cache": {
+      "count": 1,
+      "refs": [
+        "modeling_llama.py:392"
+      ]
+    },
+    "linear": {
+      "count": 8,
+      "refs": [
+        "modeling_llama.py:177",
+        "modeling_llama.py:178",
+        "modeling_llama.py:179",
+        "modeling_llama.py:238",
+        "modeling_llama.py:241"
+      ]
+    },
+    "matmul": {
+      "count": 2,
+      "refs": [
+        "modeling_llama.py:218",
+        "modeling_llama.py:212"
+      ]
+    },
+    "pow": {
+      "count": 1,
+      "refs": [
+        "modeling_llama.py:65"
+      ]
+    },
+    "rotary_pos_emb": {
+      "count": 3,
+      "refs": [
+        "modeling_llama.py:267",
+        "modeling_llama.py:166",
+        "modeling_llama.py:167"
+      ]
+    },
+    "rsqrt": {
+      "count": 1,
+      "refs": [
+        "modeling_llama.py:66"
+      ]
+    },
+    "softmax": {
+      "count": 1,
+      "refs": [
+        "modeling_llama.py:216"
+      ]
+    }
+  },
+  "unresolved_top": {
+    "super": 7,
+    "repeat_kv": 2,
+    "self.register_buffer": 2,
+    "getattr": 2,
+    "self.post_init": 2,
+    "isinstance": 2,
+    "logging.get_logger": 1,
+    "use_kernel_forward_from_hub": 1,
+    "use_kernel_func_from_hub": 1,
+    "use_kernelized_func": 1,
+    "torch.no_grad": 1,
+    "cos.unsqueeze": 1,
+    "sin.unsqueeze": 1,
+    "hidden_states.reshape": 1,
+    "rope_init_fn": 1,
+    "self.down_proj": 1,
+    "ALL_ATTENTION_FUNCTIONS.get_interface": 1,
+    "attention_interface": 1,
+    "self.o_proj": 1,
+    "self.input_layernorm": 1,
+    "self.self_attn": 1,
+    "self.post_attention_layernorm": 1,
+    "self.mlp": 1,
+    "create_causal_mask": 1,
+    "self.rotary_emb": 1,
+    "self.norm": 1,
+    "self.model": 1,
+    "self.lm_head": 1,
+    "torch.ones": 1,
+    "inv_freq.clone": 1
+  },
+  "imports": [
+    "activations.ACT2FN",
+    "cache_utils.Cache",
+    "cache_utils.DynamicCache",
+    "collections.abc.Callable",
+    "configuration_llama.LlamaConfig",
+    "generation.GenerationMixin",
+    "integrations.use_kernel_forward_from_hub",
+    "integrations.use_kernel_func_from_hub",
+    "integrations.use_kernelized_func",
+    "masking_utils.create_causal_mask",
+    "modeling_layers.GenericForQuestionAnswering",
+    "modeling_layers.GenericForSequenceClassification",
+    "modeling_layers.GenericForTokenClassification",
+    "modeling_layers.GradientCheckpointingLayer",
+    "modeling_outputs.BaseModelOutputWithPast",
+    "modeling_outputs.CausalLMOutputWithPast",
+    "modeling_rope_utils.ROPE_INIT_FUNCTIONS",
+    "modeling_rope_utils.dynamic_rope_update",
+    "modeling_utils.ALL_ATTENTION_FUNCTIONS",
+    "modeling_utils.PreTrainedModel",
+    "processing_utils.Unpack",
+    "torch",
+    "torch.nn",
+    "typing.Optional",
+    "utils.TransformersKwargs",
+    "utils.auto_docstring",
+    "utils.can_return_tuple",
+    "utils.generic.maybe_autocast",
+    "utils.generic.merge_with_config_defaults",
+    "utils.logging",
+    "utils.output_capturing.capture_outputs"
+  ]
+}
