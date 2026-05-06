@@ -1,57 +1,66 @@
 """Jamba inference engine.
 
-Single-rank serving engine for AI21Labs Jamba (triple-hybrid Transformer
-+ Mamba-1 + sparse MoE).  Mirrors :class:`infra.engine.LlamaEngine`'s
-serving pattern -- paged KV cache for the attention layers + slot-based
-state for the Mamba layers -- so the L2 modules
-(:class:`L2.jamba_attention.JambaAttention`,
-:class:`L2.jamba_mamba_mixer.JambaMambaMixer`) match vLLM's interface
-(fused ``QKVParallelLinear`` + the project's ``Attention`` class +
-``RowParallelLinear``; flat varlen ``[N, hidden]`` throughout) and can
-be ported into vLLM directly.
+Single-rank serving engine for AI21Labs Jamba (triple-hybrid
+Transformer + Mamba-1 + sparse MoE).  Mirrors the project's other LLM
+engines (:class:`infra.engine.LlamaEngine`,
+:class:`infra.fla_engine.FLAEngine`, ``LlamaEngine._generate_mamba``):
+**continuous-batching scheduler with `Sequence` + `BlockManager` for
+paged KV + a per-seq Mamba state-slot pool.**  Each iteration of the
+main loop admits as many waiting prompts as fit (slot + block pool +
+``max_num_seqs`` cap), runs one batched prefill kernel call over any
+prefilling sequences, then runs one batched decode kernel call over
+the running sequences.  Sequences finish via EOS or ``max_tokens``;
+their slots and blocks are released back to the pool and the next
+admission picks them up.
 
-Pipeline layout (matches vLLM):
+Layout (matches vLLM / `LlamaAttention`'s convention):
 
-  * ``input_ids``: flat int64 ``[N]`` where ``N = sum(prompt_lens)``
-    for prefill or ``N = num_active_seqs`` for decode.
-  * ``positions``: flat int64 ``[N]`` (unused by Jamba mixers but threaded
-    through for signature uniformity with Llama / Mamba).
-  * Per-step paged-KV metadata flows through ``set_jamba_context`` ->
-    standard ``Context`` fields:
-      - ``slot_mapping``: ``[N]`` int64, paged-cache slot per token.
-      - ``block_tables``: ``[B, max_blocks_per_seq]`` int32.
-      - ``context_lens``: ``[B]`` int32 (decode only).
-      - ``cu_seqlens_q`` / ``cu_seqlens_k``: ``[B+1]`` int32 (prefill).
-      - ``max_seqlen_q`` / ``max_seqlen_k``: int.
-  * Mamba state (per-sequence) flows via ``mamba_state`` /
-    ``mamba_metadata`` Context fields.
-
-Cache allocation (mirrors ``LlamaEngine.allocate_kv_cache``):
-
-  * One global ``[2, num_attn_layers, num_blocks, page_size,
-    num_kv_heads, head_dim]`` (NHD) or ``[2, num_attn_layers, num_blocks,
-    num_kv_heads, page_size, head_dim]`` (HND) tensor; each
+  * Pipeline is **flat-varlen** ``[N, hidden]`` end-to-end.
+    ``input_ids`` is flat ``[N]`` int64; ``positions`` is flat ``[N]``;
+    L3 / L4 layers thread ``hidden_states`` and ``residual`` through
+    unchanged.
+  * **Paged KV cache** for the 4 attention layers, allocated as one
+    global ``[2, num_attn_layers, num_blocks, page_size, num_kv_heads,
+    head_dim]`` (NHD on Hopper) or ``[2, num_attn_layers, num_blocks,
+    num_kv_heads, page_size, head_dim]`` (HND on Blackwell).  Each
     :class:`L2.attention_impl.Attention` gets bound to its slice via
-    ``module.k_cache = kv_cache[0, i]`` / ``module.v_cache = kv_cache[1, i]``.
-  * Per-sequence Mamba state slabs sized for ``max_num_seqs`` slots;
-    sequence ``s`` uses slot ``s.state_slot`` in every Mamba layer.
+    ``module.k_cache = kv_cache[0, i]`` (same as
+    ``LlamaEngine.allocate_kv_cache``).  Blocks are partitioned by a
+    ``BlockManager`` -- per-seq ``block_table`` lists are populated at
+    admit time and may grow during decode (``may_append``).
+  * **Mamba state slots** for the 28 Mamba layers: per-layer slabs of
+    shape ``[num_slots, intermediate, K-1]`` (conv) and ``[num_slots,
+    intermediate, ssm_state_size]`` (ssm), with ``num_slots ==
+    max_num_seqs``.  Each ``Sequence`` is assigned a ``state_slot``
+    on admission and uses it across all Mamba layers; freed on
+    finish.  Same pattern as ``MambaStateManager`` in
+    ``infra.engine`` but without the multi-rank SHM dance (this
+    engine is single-GPU).
+  * Per-step state is published on the global ``Context`` via
+    ``set_jamba_context`` -- standard fields ``slot_mapping`` /
+    ``block_tables`` / ``context_lens`` / ``cu_seqlens_q`` /
+    ``cu_seqlens_k`` / ``mamba_state`` / ``mamba_metadata``.
 
-Scheduler: lockstep micro-batching at ``max_num_seqs``.  Each batch
-runs full prefill once, then loops single-step decode until every
-sequence hits its ``max_tokens`` (or eos).  Continuous batching (admit
-new sequences mid-decode) is not implemented yet; the lockstep pattern
-is what the current bench tolerates and a future commit can extend
-this engine with a Sequence-list scheduler à la LlamaEngine if the
-profile justifies it.
+Scope of continuous batching: **phase-pure** (each step is either a
+batched prefill or a batched decode, never mixed).  This matches
+:class:`FLAEngine`'s scheduler.  vLLM's chunked prefill goes one step
+further (mixed prefill + decode in a single forward pass via
+per-token metadata splits inside the Attention / Mamba kernels);
+that is a meaningful structural piece for prefill-heavy workloads
+where waiting prompts can be admitted *during* an in-flight decode
+step, but it requires per-token kernel dispatch logic in the L2
+modules and is out of scope for this iteration.  Documented as a
+follow-up.
 
-Tensor parallel: NOT supported -- single-GPU only.  Open Jamba models
-fit on a B200 (Jamba-tiny-dev = 318M, Jamba-v0.1 = 52B).
+Tensor parallel: NOT supported -- single-GPU.  Open Jamba models
+(tiny-dev = 318M, v0.1 = 52B) fit on a B200.
 """
 
 from __future__ import annotations
 
 import os
 import random
+from collections import deque
 from dataclasses import dataclass
 
 import numpy as np
@@ -59,54 +68,147 @@ import torch
 
 from .context import (
     auto_register_no_compile_layers,
-    enable_custom_ops,
     get_attn_backend_config,
     register_no_compile_layers,
     reset_context,
     set_jamba_context,
 )
 
-# Re-export the same SamplingParams / GenerationOutput dataclasses the
-# rest of the codebase uses.  We import lazily because ``infra.engine``
-# transitively imports the entire model zoo -- JambaEngine has no need
-# for any of it.  Fallback definitions match the originals
-# field-for-field so callers can use either dataclass interchangeably.
-try:
-    from .engine import GenerationOutput, SamplingParams
-except ImportError:  # pragma: no cover -- minimal-deps fallback
-    from dataclasses import dataclass as _dc
-    from dataclasses import field as _field
 
-    @_dc
-    class SamplingParams:  # type: ignore[no-redef]
-        temperature: float = 0.0
-        top_p: float = 1.0
-        max_tokens: int = 512
-        seed: int | None = None
-        ignore_eos: bool = False
+# ---------------------------------------------------------------------------
+# Re-exported / locally defined dataclasses.
+#
+# We don't ``from .engine import Sequence, BlockManager, SamplingParams,
+# GenerationOutput`` because ``infra.engine`` transitively imports the
+# whole model zoo (vision encoders, MLA, encoder-decoder, ...) and
+# pulls in heavy deps like the standalone ``flash_attn`` package that
+# JambaEngine has no use for.  FLAEngine takes the same approach: it
+# defines its own per-request bookkeeping struct (``_ActiveSeq``) for
+# this same reason, so "consistency with the project pattern" means
+# *pattern-level* (waiting/running deques + slot pools + admit/release
+# loop), not *class-level* identity.  The dataclasses below match the
+# ones in ``infra.engine`` field-for-field so callers can use either
+# interchangeably and the scheduler logic is a 1-to-1 translation of
+# what LlamaEngine / `_generate_mamba` / FLAEngine do.
+# ---------------------------------------------------------------------------
+@dataclass
+class SamplingParams:
+    temperature: float = 0.0
+    top_p: float = 1.0
+    max_tokens: int = 512
+    seed: int | None = None
+    ignore_eos: bool = False
 
-    @_dc
-    class GenerationOutput:  # type: ignore[no-redef]
-        prompt: str
-        generated_text: str
-        token_ids: list[int] = _field(default_factory=list)
-        logits_history: list | None = None
+
+@dataclass
+class GenerationOutput:
+    prompt: str
+    generated_text: str
+    token_ids: list[int]
+    logits_history: list | None = None
+
+
+from enum import Enum
+
+
+class SeqStatus(Enum):
+    WAITING = 0
+    RUNNING = 1
+    FINISHED = 2
+
+
+# Block size for the paged KV cache.  Matches
+# ``infra.context.AttnBackendConfig.block_size`` for the auto-detected
+# backend (16 for TRTLLM-gen on Blackwell, 256 for FA3 elsewhere) --
+# we read it from the config inside ``__init__`` so the engine state
+# matches whatever ``L2.attention_impl.Attention`` will dispatch to.
+
+
+class Sequence:
+    """Per-request bookkeeping.  Field-compatible with
+    ``infra.engine.Sequence`` for the slice the JambaEngine scheduler
+    actually uses (``token_ids``, ``generated_ids``, ``block_table``,
+    ``num_computed_tokens``, ``state_slot``, ``status``,
+    ``max_tokens``, ``ignore_eos``).
+    """
+
+    _next_id = 0
+
+    def __init__(
+        self, prompt_ids: list[int],
+        max_tokens: int = 512,
+        ignore_eos: bool = False,
+    ):
+        self.seq_id = Sequence._next_id
+        Sequence._next_id += 1
+        self.prompt_ids = list(prompt_ids)
+        self.token_ids = list(prompt_ids)
+        self.generated_ids: list[int] = []
+        self.max_tokens = max_tokens
+        self.ignore_eos = ignore_eos
+        self.block_table: list[int] = []
+        self.status = SeqStatus.WAITING
+        self.num_computed_tokens: int = 0
+        # Mamba slot index (None for non-mamba models).
+        self.state_slot: int | None = None
+
+    def __len__(self) -> int:
+        return len(self.token_ids)
+
+    @property
+    def last_token(self) -> int:
+        return self.token_ids[-1]
+
+    @property
+    def num_prompt_tokens(self) -> int:
+        return len(self.prompt_ids)
+
+    def append_token(self, token_id: int) -> None:
+        self.token_ids.append(token_id)
+        self.generated_ids.append(token_id)
+
+
+class BlockManager:
+    """Free-block pool with deque-based allocation.  Field-compatible
+    with ``infra.engine.BlockManager`` for the methods the JambaEngine
+    scheduler uses (``reset``, ``can_allocate_n``, ``allocate_n``,
+    ``deallocate``).
+    """
+
+    def __init__(self, num_blocks: int):
+        self._num_blocks = num_blocks
+        self.free_block_ids: deque[int] = deque(range(num_blocks))
+
+    def reset(self) -> None:
+        self.free_block_ids = deque(range(self._num_blocks))
+
+    def can_allocate_n(self, n_blocks: int) -> bool:
+        return len(self.free_block_ids) >= n_blocks
+
+    def allocate_n(self, seq: Sequence, n_blocks: int) -> None:
+        for _ in range(n_blocks):
+            seq.block_table.append(self.free_block_ids.popleft())
+
+    def deallocate(self, seq: Sequence) -> None:
+        self.free_block_ids.extend(seq.block_table)
+        seq.block_table.clear()
+
 
 __all__ = ["JambaEngine", "SamplingParams", "GenerationOutput"]
 
 
 # ---------------------------------------------------------------------------
-# Mamba metadata (per-batch, per-step).  Mirrors vLLM
-# ``Mamba1AttentionMetadata`` / kb-nano's existing pattern; the L2 mamba
-# mixer reads ``conv_states`` / ``ssm_states`` / ``cache_indices`` plus
-# ``query_start_loc`` (prefill) or just ``cache_indices`` (decode) and
+# Mamba metadata (per-batch, per-step).  Mirrors the project's existing
+# ``Mamba1AttentionMetadata`` pattern; the L2 mamba mixer reads
+# ``conv_states`` / ``ssm_states`` / ``cache_indices`` plus
+# ``query_start_loc`` (prefill) / ``has_initial_state`` (prefill) and
 # runs the flat-varlen vendor kernels.
 # ---------------------------------------------------------------------------
 @dataclass
 class JambaMambaMetadata:
     conv_states: list[torch.Tensor]
     ssm_states: list[torch.Tensor]
-    cache_indices: torch.Tensor          # int32 [num_seqs]
+    cache_indices: torch.Tensor          # int32 [num_seqs] -- per-seq slot index
     is_decode: bool = True
     query_start_loc: torch.Tensor | None = None    # int32 [num_seqs+1] (prefill)
     has_initial_state: torch.Tensor | None = None  # bool [num_seqs] (prefill)
@@ -114,17 +216,101 @@ class JambaMambaMetadata:
 
 
 # ---------------------------------------------------------------------------
-# Decode-step CUDA graph entry.  Static-identity tensors that callers
-# mutate in-place between replays.
+# Mamba state slot pool.  Each Sequence holds a ``state_slot`` index
+# into this pool; the per-layer slabs stay live for the whole engine
+# lifetime (allocated once at __init__) and slots are recycled as
+# sequences finish.
+# ---------------------------------------------------------------------------
+class _MambaSlotPool:
+    """Persistent per-layer Mamba ``(conv_state, ssm_state)`` slabs with
+    a free-slot deque.  Single-rank counterpart of
+    ``infra.engine.MambaStateManager``.
+
+    Allocate one slot per active sequence; deallocate on
+    ``Sequence.preempt`` or finish.  ``zero_slot`` resets a slot to
+    all-zero between reuses so a new sequence's recurrence starts from
+    a clean state.
+    """
+
+    def __init__(
+        self,
+        max_num_seqs: int,
+        num_mamba_layers: int,
+        intermediate_size: int,
+        ssm_state_size: int,
+        conv_kernel: int,
+        dtype: torch.dtype,
+        device: torch.device,
+    ):
+        self.max_num_seqs = max_num_seqs
+        self.num_mamba_layers = num_mamba_layers
+        K_minus_1 = max(conv_kernel - 1, 1)
+
+        # Per-layer slabs.  conv_state stride convention follows the
+        # vLLM kernel contract (``stride(intermediate) == 1``): allocate
+        # as ``[num_slots, K-1, intermediate]`` and transpose the last
+        # two dims to expose the kernel-required layout.
+        self.conv_states: list[torch.Tensor] = []
+        self.ssm_states: list[torch.Tensor] = []
+        for _ in range(num_mamba_layers):
+            raw_conv = torch.zeros(
+                max_num_seqs, K_minus_1, intermediate_size,
+                dtype=dtype, device=device,
+            )
+            self.conv_states.append(raw_conv.transpose(-1, -2))
+            self.ssm_states.append(torch.zeros(
+                max_num_seqs, intermediate_size, ssm_state_size,
+                dtype=dtype, device=device,
+            ))
+
+        self._free: deque[int] = deque(range(max_num_seqs))
+        self._in_use: set[int] = set()
+
+    def has_free(self) -> bool:
+        return len(self._free) > 0
+
+    def num_free(self) -> int:
+        return len(self._free)
+
+    def allocate(self) -> int:
+        slot = self._free.popleft()
+        self._in_use.add(slot)
+        self._zero_slot(slot)
+        return slot
+
+    def free(self, slot: int) -> None:
+        if slot in self._in_use:
+            self._in_use.remove(slot)
+            self._zero_slot(slot)
+            self._free.append(slot)
+
+    def reset(self) -> None:
+        """Return all slots to the free pool (called between generate() calls)."""
+        for slot in list(self._in_use):
+            self.free(slot)
+
+    def _zero_slot(self, slot: int) -> None:
+        for cs in self.conv_states:
+            cs[slot].zero_()
+        for ss in self.ssm_states:
+            ss[slot].zero_()
+
+
+# ---------------------------------------------------------------------------
+# Decode-step CUDA graph entry.  All tensor identities are stable
+# across replays; callers mutate values in-place between replays.
 # ---------------------------------------------------------------------------
 @dataclass
 class _JambaDecodeGraph:
+    bucket_size: int
     graph: torch.cuda.CUDAGraph
-    step_input_ids: torch.Tensor    # [B]      int64 -- previous step's token
-    step_positions: torch.Tensor    # [B]      int64 -- absolute pos for new token
-    slot_mapping: torch.Tensor      # [B]      int64 -- paged cache slot
-    context_lens: torch.Tensor      # [B]      int32 -- valid len after write
-    next_tokens: torch.Tensor       # [B]      int64 -- argmax output
+    step_input_ids: torch.Tensor    # [B]                      int64
+    step_positions: torch.Tensor    # [B]                      int64
+    slot_mapping: torch.Tensor      # [B]                      int64
+    context_lens: torch.Tensor      # [B]                      int32
+    block_tables: torch.Tensor      # [B, max_blocks_per_seq]  int32
+    cache_indices: torch.Tensor     # [B]                      int32 (Mamba slot map)
+    next_tokens: torch.Tensor       # [B]                      int64 (output)
 
 
 # ---------------------------------------------------------------------------
@@ -138,9 +324,8 @@ class JambaEngine:
         dtype: torch.dtype = torch.bfloat16,
         seed: int = 42,
         max_num_seqs: int = 32,
-        max_model_len: int | None = None,
+        max_model_len: int = 4096,
         trust_remote_code: bool = True,
-        graph_max_total: int = 2048,
     ):
         from huggingface_hub import snapshot_download
         from transformers import AutoTokenizer
@@ -150,18 +335,20 @@ class JambaEngine:
         self.model_name = model_name
         self.seed = seed
         self.max_num_seqs = max_num_seqs
+        self.max_model_len = max_model_len
         self.device = torch.device(device)
         self.dtype = dtype
         self._set_seeds(seed)
 
+        # ------------------------------------------------------------------
+        # Model + tokenizer
+        # ------------------------------------------------------------------
         model_path = snapshot_download(
             model_name, allow_patterns=["*.safetensors", "*.json", "tokenizer*"],
         )
         self.model_path = model_path
-
         self.config = JambaConfig.from_pretrained(model_path)
         self.config.dtype = dtype
-        self.max_model_len = max_model_len  # caller decides
 
         self.tokenizer = AutoTokenizer.from_pretrained(
             model_name, trust_remote_code=trust_remote_code,
@@ -169,9 +356,6 @@ class JambaEngine:
         if self.tokenizer.pad_token_id is None and self.tokenizer.eos_token_id is not None:
             self.tokenizer.pad_token_id = self.tokenizer.eos_token_id
 
-        # ------------------------------------------------------------------
-        # Build the model on CPU then move to GPU + cast to dtype.
-        # ------------------------------------------------------------------
         print(f"  [JambaEngine] Loading config from {model_path}")
         print(f"  [JambaEngine] Architecture: "
               f"L={self.config.num_hidden_layers}, "
@@ -185,24 +369,17 @@ class JambaEngine:
 
         with torch.device("cpu"):
             self.model = JambaForCausalLM(self.config)
-
         n_loaded = self.model.load_weights(model_path)
         print(f"  [JambaEngine] Loaded {n_loaded} weight tensors")
 
-        # Move to GPU.  A and conv_state must remain fp32 / bf16 as
-        # configured -- cast everything to ``dtype`` for now, then
-        # restore A to fp32 (the Mamba SSM kernels require A fp32).
+        # GPU + dtype (Mamba A must be fp32 for the SSM kernel).
         self.model = self.model.to(device=self.device, dtype=dtype).eval()
         for layer in self.model.model.layers:
             mamba = getattr(layer, "mamba", None)
             if mamba is not None:
                 mamba.A.data = mamba.A.data.float()
-
         torch.cuda.synchronize()
 
-        # ------------------------------------------------------------------
-        # Cache shapes
-        # ------------------------------------------------------------------
         cfg = self.config
         self._mamba_intermediate = cfg.mamba_expand * cfg.hidden_size
         self._mamba_d_state = cfg.mamba_d_state
@@ -212,30 +389,27 @@ class JambaEngine:
         self._head_dim = cfg.hidden_size // cfg.num_attention_heads
         self._n_kv_heads = cfg.num_key_value_heads
 
-        # Auto-detect attention backend & paged-cache layout (TRTLLM-gen
-        # HND on Blackwell, FA3/FA2 NHD elsewhere).  Must match the
-        # dispatcher in :class:`L2.attention_impl.Attention`.
+        # ------------------------------------------------------------------
+        # Attention backend & paged-cache layout (auto-detected; matches
+        # the L2 dispatcher in JambaAttention).
+        # ------------------------------------------------------------------
         attn_cfg = get_attn_backend_config()
         self._page_size = attn_cfg.block_size
-        self._kv_layout = attn_cfg.kv_layout  # "HND" or "NHD"
+        self._kv_layout = attn_cfg.kv_layout
         self._use_trtllm = attn_cfg.use_trtllm
 
-        self.graph_max_total = graph_max_total
-        # blocks_per_seq covers ``graph_max_total`` (the longest seq we
-        # support).  Round up so the last token's slot doesn't spill.
-        self._blocks_per_seq = (graph_max_total + self._page_size - 1) // self._page_size
-
-        # ------------------------------------------------------------------
-        # Paged KV cache allocation -- mirrors LlamaEngine.allocate_kv_cache.
-        # One global tensor; each :class:`Attention` gets bound to a slice
-        # (``module.k_cache = kv_cache[0, i]``,
-        # ``module.v_cache = kv_cache[1, i]``).  Engine partitions blocks
-        # per row in the bucket so each row's block_table is fixed.
-        # ------------------------------------------------------------------
-        bps = self._blocks_per_seq
-        total_blocks = self.max_num_seqs * bps
+        # Block budget: enough blocks for every seq in the bucket to
+        # cover the full max_model_len prompt + decode horizon.
+        # Conservative -- LlamaEngine sizes this dynamically from
+        # available GPU memory; we round up to keep the engine simple
+        # since the open Jamba models leave plenty of memory headroom.
+        self._max_blocks_per_seq = (
+            (max_model_len + self._page_size - 1) // self._page_size
+        )
+        total_blocks = self.max_num_seqs * self._max_blocks_per_seq
         self._num_blocks = total_blocks
 
+        # Allocate the global paged KV cache and bind per-layer slices.
         if self._kv_layout == "HND":
             self._kv_cache = torch.zeros(
                 2, self._n_attn_layers, total_blocks,
@@ -249,19 +423,14 @@ class JambaEngine:
                 dtype=dtype, device=self.device,
             )
 
-        # Bind per-layer cache slices to each Attention module.  The L4
-        # model wraps the inner ``Attention`` as ``layer.self_attn.attn``;
-        # we walk the model's attention decoder layers in physical order
-        # and assign cache index ``i`` based on the order we see them
-        # (matching the ``attention_layer_indices`` order used by the
-        # weight loader and the L4 layer schedule).
+        # Bind k_cache/v_cache slices to each L2 ``Attention`` instance.
+        # Walk model.modules() in order; the inner Attention sits at
+        # ``model.layers.{i}.self_attn.attn`` for attention decoder
+        # layers and is identifiable by the ``k_cache`` / ``v_cache``
+        # attributes the Attention class sets in __init__.
         attn_modules = []
         no_compile_layers: dict[str, "torch.nn.Module"] = {}
         for name, mod in self.model.named_modules():
-            # Inner ``Attention`` instances live at e.g.
-            # ``model.layers.4.self_attn.attn`` -- detect by the
-            # presence of ``k_cache`` / ``v_cache`` attributes set in
-            # ``Attention.__init__``.
             if (hasattr(mod, "k_cache") and hasattr(mod, "v_cache")
                     and type(mod).__name__ == "Attention"):
                 attn_modules.append(mod)
@@ -273,104 +442,93 @@ class JambaEngine:
         for i, attn in enumerate(attn_modules):
             attn.k_cache = self._kv_cache[0, i]
             attn.v_cache = self._kv_cache[1, i]
-            # The Attention class stores its own layer name for custom-op
-            # dispatch; populate it now (matches LlamaEngine pattern).
             attn._layer_name = next(
                 n for n, m in no_compile_layers.items() if m is attn
             )
-        # Register the Attention modules so torch.compile custom ops
-        # can resolve them at runtime.  Mirrors LlamaEngine's
-        # ``auto_register_no_compile_layers(self.model)`` call.
         register_no_compile_layers(no_compile_layers)
         auto_register_no_compile_layers(self.model)
         self._attn_modules = attn_modules
 
-        # Static block_tables: row i in the lockstep bucket uses blocks
-        # ``[i*bps, (i+1)*bps)``.  These never change.
-        bt = torch.empty(
-            self.max_num_seqs, bps, dtype=torch.int32, device=self.device,
-        )
-        for i in range(self.max_num_seqs):
-            row_base = i * bps
-            bt[i].copy_(torch.arange(
-                row_base, row_base + bps, dtype=torch.int32, device=self.device,
-            ))
-        self._block_tables = bt
-
-        # ------------------------------------------------------------------
-        # Mamba state slabs -- one slot per row in the lockstep bucket.
-        # Same convention as MambaEngine / FLAEngine: ``cache_indices``
-        # is a fixed ``arange(max_num_seqs)`` int32 tensor.
-        # ------------------------------------------------------------------
-        K_minus_1 = max(self._mamba_conv_kernel - 1, 1)
-        self._conv_states: list[torch.Tensor] = []
-        self._ssm_states: list[torch.Tensor] = []
-        for _ in range(self._n_mamba_layers):
-            raw_conv = torch.zeros(
-                self.max_num_seqs, K_minus_1, self._mamba_intermediate,
-                dtype=dtype, device=self.device,
+        # Share TRTLLM workspace across all Attention modules.
+        # Mirrors :meth:`infra.engine.LlamaEngine._share_trtllm_workspace`:
+        # without this, each TRTLLMDecode and TRTLLMPrefill allocates
+        # its own 512 MB workspace -- 4 attn layers x 2 ops x 512 MB =
+        # 4 GB wasted on duplicate scratch buffers.
+        if self._use_trtllm:
+            shared_workspace = torch.zeros(
+                512 * 1024 * 1024, dtype=torch.uint8, device=self.device,
             )
-            self._conv_states.append(raw_conv.transpose(-1, -2))
-            self._ssm_states.append(torch.zeros(
-                self.max_num_seqs, self._mamba_intermediate, self._mamba_d_state,
-                dtype=dtype, device=self.device,
-            ))
-        self._cache_indices = torch.arange(
-            self.max_num_seqs, dtype=torch.int32, device=self.device,
+            for attn in attn_modules:
+                if hasattr(attn, "set_trtllm_workspace"):
+                    attn.set_trtllm_workspace(shared_workspace)
+            torch.cuda.empty_cache()
+            self._trtllm_workspace = shared_workspace
+
+        # ------------------------------------------------------------------
+        # Block manager (paged KV) + Mamba state slot pool.
+        # ------------------------------------------------------------------
+        self.block_manager = BlockManager(num_blocks=total_blocks)
+        self.mamba_pool = _MambaSlotPool(
+            max_num_seqs=max_num_seqs,
+            num_mamba_layers=self._n_mamba_layers,
+            intermediate_size=self._mamba_intermediate,
+            ssm_state_size=self._mamba_d_state,
+            conv_kernel=self._mamba_conv_kernel,
+            dtype=dtype,
+            device=self.device,
         )
 
         # ------------------------------------------------------------------
-        # Decode static buffers.  All shapes are fixed at B=max_num_seqs
-        # so the captured CUDA graph reads from stable identities.
-        # ------------------------------------------------------------------
-        B = self.max_num_seqs
-        self._step_input_ids = torch.zeros(B, dtype=torch.long, device=self.device)
-        self._step_positions = torch.zeros(B, dtype=torch.long, device=self.device)
-        self._step_slot_mapping = torch.zeros(B, dtype=torch.long, device=self.device)
-        self._step_context_lens = torch.zeros(B, dtype=torch.int32, device=self.device)
-        self._step_next_tokens = torch.zeros(B, dtype=torch.long, device=self.device)
-
-        # ------------------------------------------------------------------
-        # CUDA graph capture / torch.compile.  Decode forward is wrapped
-        # with ``torch.compile(mode="default")`` before capture so
-        # Inductor fuses the elementwise tail (RMSNorm + residual +
-        # SwiGLU + MoE softmax pieces) into Triton kernels.
+        # CUDA graph capture (multi-bucket).  Captures the pure-decode
+        # forward at several batch sizes ([1, 2, 4, ..., max_num_seqs])
+        # so the scheduler can dispatch each step to the smallest
+        # bucket >= the live running batch size.  Mirrors
+        # :meth:`LlamaEngine.capture_cudagraph`'s shared-mempool
+        # largest-first strategy.
         # ------------------------------------------------------------------
         self._use_cuda_graphs = (
             os.environ.get("KB_NANO_JAMBA_CUDA_GRAPHS", "1") not in ("0", "false", "False")
         )
-        # ``torch.compile`` is OFF by default.  Inductor's fused
-        # elementwise paths (RMSNorm + residual + SwiGLU pieces) produce
-        # bf16 intermediates that drift from vLLM's hand-written CUDA
-        # kernels by ~1e-3 per layer; over 32 layers and 128 decode
-        # steps this flips greedy top-1 within ~5 tokens for most
-        # prompts, dropping match-tokens vs vLLM from ~85/128 to ~25/128.
-        # The eager path uses the SAME vLLM ``_C.fused_add_rms_norm`` /
-        # ``_C.silu_and_mul`` kernels vLLM itself uses, so numerics are
-        # bit-identical with the reference.
-        #
-        # Perf cost of disabling compile: small at v0.1 scale (0.89 ->
-        # 0.90 avg, since the GEMMs / Mamba / MoE kernels dominate at
-        # 52B and the elementwise tail is a small fraction); ~25-30%
-        # at tiny-dev scale (1.85 -> 1.48 avg, where elementwise
-        # dominates the 16-layer 512-hidden model).  Match-tokens
-        # correctness is the higher-priority bar so eager wins by default.
-        # Set ``KB_NANO_JAMBA_COMPILE=1`` to enable compile if you
-        # specifically need the elementwise fusion and can tolerate
-        # the bf16 drift vs vLLM.
         self._use_compile = (
             os.environ.get("KB_NANO_JAMBA_COMPILE", "0") not in ("0", "false", "False")
         )
-        self._compiled_decode_step: callable | None = None
-        self._decode_graph: _JambaDecodeGraph | None = None
+        # Decode bucket schedule.  vLLM uses [1, 2, 4, 8, 16, 24, 32,
+        # 40, ...]; we cap at max_num_seqs.  Override via
+        # ``KB_NANO_JAMBA_BUCKETS=1,2,4,8,16,32`` if you need a denser
+        # or sparser schedule for a specific workload.
+        env_buckets = os.environ.get("KB_NANO_JAMBA_BUCKETS")
+        if env_buckets:
+            buckets = sorted({int(x) for x in env_buckets.split(",") if x.strip()})
+        else:
+            base = [1, 2, 4]
+            base += list(range(8, max_num_seqs + 1, 8))
+            buckets = sorted(set(b for b in base if b <= max_num_seqs))
+        if max_num_seqs not in buckets:
+            buckets.append(max_num_seqs)
+            buckets = sorted(set(buckets))
+        self._decode_buckets = buckets
+        # Pre-create a shared CUDA-graph mempool so all bucket captures
+        # share one address space (avoids ``cudaErrorIllegalAddress``
+        # when smaller-bucket replays alias larger-bucket pool blocks).
+        self._cuda_graph_mempool_id = (
+            torch.cuda.graph_pool_handle() if self._use_cuda_graphs else None
+        )
+        self._compiled_decode_step = None
+        self._decode_graphs: dict[int, _JambaDecodeGraph] = {}
+        self._decode_static_buffers: dict[int, dict] = {}
         if self._use_cuda_graphs:
             print(
-                f"  [JambaEngine] Capturing decode graph at B={self.max_num_seqs} "
-                f"(paged KV: {total_blocks} blocks x {self._page_size} = "
-                f"{total_blocks * self._page_size} token slots, "
-                f"{self._n_attn_layers} attn layers, {self._kv_layout} layout)"
+                f"  [JambaEngine] Capturing decode graphs at "
+                f"B={self._decode_buckets} (paged KV: {total_blocks} blocks "
+                f"x {self._page_size} = {total_blocks * self._page_size} "
+                f"token slots, {self._n_attn_layers} attn layers, "
+                f"{self._kv_layout} layout)"
             )
-            self._decode_graph = self._capture_decode_graph()
+            # Capture LARGEST bucket first so subsequent smaller-bucket
+            # captures see a memory layout consistent with what their
+            # tensors will be in at runtime (LlamaEngine pattern).
+            for bucket in reversed(self._decode_buckets):
+                self._capture_decode_graph(bucket)
 
     # ------------------------------------------------------------------
     # Random seeds
@@ -383,43 +541,58 @@ class JambaEngine:
             torch.cuda.manual_seed_all(seed)
 
     # ------------------------------------------------------------------
-    # Decode CUDA-graph capture.  Captures one decode step at
-    # B=max_num_seqs; host loop mutates step_input_ids/positions/
-    # slot_mapping/context_lens between replays.
+    # Decode-graph static buffers + capture.
     # ------------------------------------------------------------------
-    def _capture_decode_graph(self) -> _JambaDecodeGraph:
-        B = self.max_num_seqs
-        max_context_len = self._blocks_per_seq * self._page_size
+    def _alloc_decode_buffers(self, B: int) -> dict:
+        """Allocate the static-identity tensors a B-bucket decode graph
+        reads from.  Tensors are reused across replays; the host loop
+        mutates their values in-place between replays.
+        """
+        if B in self._decode_static_buffers:
+            return self._decode_static_buffers[B]
+        device = self.device
+        bps = self._max_blocks_per_seq
+        bufs = {
+            "step_input_ids": torch.zeros(B, dtype=torch.long, device=device),
+            "step_positions": torch.zeros(B, dtype=torch.long, device=device),
+            "slot_mapping": torch.zeros(B, dtype=torch.long, device=device),
+            "context_lens": torch.zeros(B, dtype=torch.int32, device=device),
+            "block_tables": torch.zeros(B, bps, dtype=torch.int32, device=device),
+            "cache_indices": torch.zeros(B, dtype=torch.int32, device=device),
+            "next_tokens": torch.zeros(B, dtype=torch.long, device=device),
+        }
+        self._decode_static_buffers[B] = bufs
+        return bufs
+
+    def _capture_decode_graph(self, B: int) -> _JambaDecodeGraph:
+        if B in self._decode_graphs:
+            return self._decode_graphs[B]
+        bufs = self._alloc_decode_buffers(B)
+        max_context_len = self._max_blocks_per_seq * self._page_size
 
         mamba_meta = JambaMambaMetadata(
-            conv_states=self._conv_states,
-            ssm_states=self._ssm_states,
-            cache_indices=self._cache_indices,
+            conv_states=self.mamba_pool.conv_states,
+            ssm_states=self.mamba_pool.ssm_states,
+            cache_indices=bufs["cache_indices"],
             is_decode=True,
         )
 
-        # ``torch.compile`` the decode forward.  We compile the inner
-        # ``JambaModel`` + ``lm_head`` + ``argmax`` so Inductor can see
-        # the full elementwise tail end-to-end (RMSNorm + residual +
-        # SwiGLU pieces).  Graph breaks happen automatically at vLLM
-        # mamba kernel calls and at ``get_context()`` lookups.
+        # Optional: torch.compile the inner JambaModel + lm_head + argmax.
+        # OFF by default because Inductor's fused elementwise paths
+        # (RMSNorm + residual + SwiGLU) drift from vLLM's hand-written
+        # CUDA kernels by ~1e-3 per layer in bf16 and tank match-tokens
+        # vs vLLM (see README).  The eager path uses the same vLLM
+        # ``_C.fused_add_rms_norm`` / ``_C.silu_and_mul`` kernels vLLM
+        # itself uses, so bf16 numerics are bit-identical.
         if self._use_compile and self._compiled_decode_step is None:
             inner = self.model.model
             lm_head = self.model.lm_head
 
-            def _forward_for_compile(
-                input_ids: torch.Tensor,
-                positions: torch.Tensor,
-            ) -> torch.Tensor:
+            def _forward_for_compile(input_ids, positions):
                 hidden = inner(input_ids, positions)
-                # ``inner`` returns ``[N, hidden]`` flat; for decode N==B
-                # and we sample on every row.
                 logits = lm_head(hidden)
                 return logits.argmax(dim=-1)
 
-            # Bump Dynamo cache limits.  Jamba has 32 layers; each layer
-            # has a different ``self.layer_idx`` int attribute, so Dynamo
-            # treats every layer as a fresh compile target.
             torch._dynamo.config.cache_size_limit = max(
                 torch._dynamo.config.cache_size_limit,
                 self.config.num_hidden_layers * 2 + 32,
@@ -430,7 +603,6 @@ class JambaEngine:
             )
             if hasattr(torch._dynamo.config, "allow_unspec_int_on_nn_module"):
                 torch._dynamo.config.allow_unspec_int_on_nn_module = True
-
             self._compiled_decode_step = torch.compile(
                 _forward_for_compile,
                 mode="default",
@@ -441,29 +613,28 @@ class JambaEngine:
         def _decode_step():
             set_jamba_context(
                 is_prefill=False,
-                slot_mapping=self._step_slot_mapping,
-                context_lens=self._step_context_lens,
-                block_tables=self._block_tables,
+                slot_mapping=bufs["slot_mapping"],
+                context_lens=bufs["context_lens"],
+                block_tables=bufs["block_tables"],
                 max_context_len=max_context_len,
                 mamba_metadata=mamba_meta,
             )
             try:
                 if self._compiled_decode_step is not None:
                     tok = self._compiled_decode_step(
-                        self._step_input_ids, self._step_positions,
+                        bufs["step_input_ids"], bufs["step_positions"],
                     )
                 else:
                     hidden = self.model(
-                        self._step_input_ids, self._step_positions,
+                        bufs["step_input_ids"], bufs["step_positions"],
                     )
                     logits = self.model.compute_logits(hidden)
                     tok = logits.argmax(dim=-1)
-                self._step_next_tokens.copy_(tok)
+                bufs["next_tokens"].copy_(tok)
             finally:
                 reset_context()
 
-        # Warmup outside the graph stream so allocator state is settled
-        # before capture.  vLLM does the same trick.
+        # Warmup outside the graph stream so allocator state settles.
         torch.cuda.synchronize()
         s = torch.cuda.Stream()
         s.wait_stream(torch.cuda.current_stream())
@@ -475,51 +646,49 @@ class JambaEngine:
         torch.cuda.empty_cache()
 
         graph = torch.cuda.CUDAGraph()
-        with torch.cuda.graph(graph):
+        with torch.cuda.graph(graph, pool=self._cuda_graph_mempool_id):
             _decode_step()
 
-        return _JambaDecodeGraph(
+        entry = _JambaDecodeGraph(
+            bucket_size=B,
             graph=graph,
-            step_input_ids=self._step_input_ids,
-            step_positions=self._step_positions,
-            slot_mapping=self._step_slot_mapping,
-            context_lens=self._step_context_lens,
-            next_tokens=self._step_next_tokens,
+            step_input_ids=bufs["step_input_ids"],
+            step_positions=bufs["step_positions"],
+            slot_mapping=bufs["slot_mapping"],
+            context_lens=bufs["context_lens"],
+            block_tables=bufs["block_tables"],
+            cache_indices=bufs["cache_indices"],
+            next_tokens=bufs["next_tokens"],
         )
+        self._decode_graphs[B] = entry
+        return entry
+
+    def _pick_bucket(self, n_active: int) -> int:
+        for b in self._decode_buckets:
+            if b >= n_active:
+                return b
+        return self.max_num_seqs
 
     # ------------------------------------------------------------------
-    # Sampling
+    # Sampling helpers
     # ------------------------------------------------------------------
     @staticmethod
-    def _greedy_argmax(logits: torch.Tensor) -> torch.Tensor:
-        return logits.argmax(dim=-1)
-
-    def _sample_step(
-        self, logits: torch.Tensor, sampling_params: list[SamplingParams],
-    ) -> list[int]:
-        """logits: ``[B, V]`` -- one sampled token per row."""
-        if all(p.temperature == 0.0 for p in sampling_params):
-            return self._greedy_argmax(logits).tolist()
-        out: list[int] = []
-        for i, p in enumerate(sampling_params):
-            row = logits[i]
-            if p.temperature == 0.0:
-                out.append(int(row.argmax().item()))
-                continue
-            scaled = row.float() / p.temperature
-            if p.top_p < 1.0:
-                sorted_logits, sorted_idx = torch.sort(scaled, descending=True)
-                probs = torch.softmax(sorted_logits, dim=-1)
-                cum = torch.cumsum(probs, dim=-1)
-                mask = cum - probs >= p.top_p
-                sorted_logits[mask] = float("-inf")
-                scaled = scaled.scatter(0, sorted_idx, sorted_logits)
-            probs = torch.softmax(scaled, dim=-1)
-            out.append(int(torch.multinomial(probs, 1).item()))
-        return out
+    def _sample_one(logits_row: torch.Tensor, sp: SamplingParams) -> int:
+        if sp.temperature == 0.0:
+            return int(logits_row.argmax().item())
+        scaled = logits_row.float() / sp.temperature
+        if sp.top_p < 1.0:
+            sorted_logits, sorted_idx = torch.sort(scaled, descending=True)
+            probs = torch.softmax(sorted_logits, dim=-1)
+            cum = torch.cumsum(probs, dim=-1)
+            mask = cum - probs >= sp.top_p
+            sorted_logits[mask] = float("-inf")
+            scaled = scaled.scatter(0, sorted_idx, sorted_logits)
+        probs = torch.softmax(scaled, dim=-1)
+        return int(torch.multinomial(probs, 1).item())
 
     # ------------------------------------------------------------------
-    # generate()
+    # generate() -- continuous-batching scheduler.
     # ------------------------------------------------------------------
     @torch.inference_mode()
     def generate(
@@ -528,174 +697,249 @@ class JambaEngine:
         sampling_params: SamplingParams | list[SamplingParams],
         use_tqdm: bool = False,
     ) -> list[GenerationOutput]:
-        """Batched generate.  Splits prompts into micro-batches of
-        ``max_num_seqs`` and runs each through prefill + decode loop.
-        """
         if isinstance(sampling_params, SamplingParams):
-            sampling_params = [sampling_params] * len(prompt_token_ids)
-        assert len(sampling_params) == len(prompt_token_ids)
+            sp_list = [sampling_params] * len(prompt_token_ids)
+        else:
+            sp_list = list(sampling_params)
+        assert len(sp_list) == len(prompt_token_ids)
 
-        outputs: list[GenerationOutput | None] = [None] * len(prompt_token_ids)
+        seed = sp_list[0].seed
+        if seed is not None:
+            self._set_seeds(seed)
 
-        n = len(prompt_token_ids)
+        eos = self.tokenizer.eos_token_id
+        # Reset state pools for a fresh generate() call.
+        self.block_manager.reset()
+        self.mamba_pool.reset()
+
+        # Build sequences in input order.  Sequence carries
+        # block_table, num_computed_tokens, generated_ids, state_slot,
+        # status -- all the bookkeeping fields the scheduler needs.
+        all_seqs: list[Sequence] = []
+        seq_idx_for_id: dict[int, int] = {}
+        seq_sp: dict[int, SamplingParams] = {}
+        for i, ids in enumerate(prompt_token_ids):
+            sp = sp_list[i]
+            seq = Sequence(
+                list(ids),
+                max_tokens=sp.max_tokens,
+                ignore_eos=sp.ignore_eos,
+            )
+            all_seqs.append(seq)
+            seq_idx_for_id[id(seq)] = i
+            seq_sp[id(seq)] = sp
+
+        outputs: list[list[int]] = [[] for _ in range(len(all_seqs))]
+
         if use_tqdm:
             from tqdm import tqdm
-            pbar = tqdm(total=n, desc="kb-nano Jamba")
+            pbar = tqdm(total=len(all_seqs), desc="kb-nano Jamba")
         else:
             pbar = None
 
-        for start in range(0, n, self.max_num_seqs):
-            end = min(start + self.max_num_seqs, n)
-            indices = list(range(start, end))
-            batch_prompts = [prompt_token_ids[i] for i in indices]
-            batch_sps = [sampling_params[i] for i in indices]
-            batch_outputs = self._run_batch(batch_prompts, batch_sps)
-            for i, out in zip(indices, batch_outputs):
-                outputs[i] = out
-            if pbar is not None:
-                pbar.update(len(indices))
+        # Schedule: longer prompts first.  Same heuristic as FLAEngine:
+        # batches its full-size prefill chunks and minimises tail
+        # fragmentation on real WildChat-shape data.
+        waiting: deque[Sequence] = deque(
+            sorted(all_seqs, key=lambda s: len(s.prompt_ids), reverse=True),
+        )
+        running: list[Sequence] = []
+
+        def _admit() -> list[Sequence]:
+            """Take from ``waiting`` while there is room (slot pool +
+            block pool + ``max_num_seqs`` cap).  Allocates the
+            sequence's blocks for its full prompt up-front (chunked
+            prefill of a single seq is a follow-up).
+            """
+            admitted: list[Sequence] = []
+            while waiting and len(running) + len(admitted) < self.max_num_seqs:
+                if not self.mamba_pool.has_free():
+                    break
+                seq = waiting[0]
+                # Compute how many blocks the seq will need across its
+                # full lifetime (prompt + max_tokens decode tokens) and
+                # check both the block pool and the mamba pool.
+                lifetime_tokens = len(seq.prompt_ids) + seq.max_tokens
+                lifetime_blocks = (
+                    (lifetime_tokens + self._page_size - 1) // self._page_size
+                )
+                if not self.block_manager.can_allocate_n(lifetime_blocks):
+                    break
+                waiting.popleft()
+                # Allocate Mamba slot.
+                seq.state_slot = self.mamba_pool.allocate()
+                # Allocate enough blocks for the prompt initially;
+                # decode-phase ``may_append`` extends the block_table
+                # as new tokens cross block boundaries.  Pre-allocating
+                # the lifetime blocks here keeps decode-step latency
+                # predictable (no allocator stalls mid-graph).
+                self.block_manager.allocate_n(seq, lifetime_blocks)
+                seq.status = SeqStatus.RUNNING
+                admitted.append(seq)
+            return admitted
+
+        # Pad seqs lengths for graph compat: each decode replay needs
+        # block_tables[i] padded to ``self._max_blocks_per_seq``; we
+        # pre-fill the static buffer with -1 (kernel skips -1 slots).
+
+        while waiting or running:
+            new_seqs = _admit()
+            if new_seqs:
+                # ----- batched prefill over admitted seqs -----
+                self._run_prefill(new_seqs)
+                # First sampled token from prefill goes into
+                # generated_ids and the seq joins ``running``.
+                first_toks = self._sample_after_prefill(new_seqs, seq_sp)
+                still_running: list[Sequence] = []
+                finished_now: list[Sequence] = []
+                for seq, tok in zip(new_seqs, first_toks):
+                    seq.append_token(tok)
+                    seq.num_computed_tokens = len(seq)
+                    done = (
+                        len(seq.generated_ids) >= seq.max_tokens
+                        or (not seq.ignore_eos and eos is not None and tok == eos)
+                    )
+                    if done:
+                        finished_now.append(seq)
+                    else:
+                        still_running.append(seq)
+                for seq in finished_now:
+                    self._finish_seq(seq, outputs, eos, seq_idx_for_id)
+                    if pbar is not None:
+                        pbar.update(1)
+                running.extend(still_running)
+
+            if not running:
+                continue
+
+            # ----- batched decode step over running seqs -----
+            tokens = self._run_decode_step(running)
+            still_running = []
+            finished_now = []
+            for seq, tok in zip(running, tokens):
+                seq.append_token(tok)
+                seq.num_computed_tokens = len(seq)
+                done = (
+                    len(seq.generated_ids) >= seq.max_tokens
+                    or (not seq.ignore_eos and eos is not None and tok == eos)
+                )
+                if done:
+                    finished_now.append(seq)
+                else:
+                    still_running.append(seq)
+            for seq in finished_now:
+                self._finish_seq(seq, outputs, eos, seq_idx_for_id)
+                if pbar is not None:
+                    pbar.update(1)
+            running = still_running
+
         if pbar is not None:
             pbar.close()
-        return outputs  # type: ignore[return-value]
+
+        # Materialise outputs in input order.
+        results: list[GenerationOutput] = []
+        for tokens in outputs:
+            text = self.tokenizer.decode(tokens, skip_special_tokens=True)
+            results.append(GenerationOutput(
+                prompt="", generated_text=text, token_ids=list(tokens),
+            ))
+        return results
 
     # ------------------------------------------------------------------
-    # _run_batch: prefill (flat varlen) + decode loop (single-step graph).
+    # _finish_seq: release slot + blocks, capture final tokens.
     # ------------------------------------------------------------------
-    @torch.inference_mode()
-    def _run_batch(
+    def _finish_seq(
         self,
-        prompt_token_ids: list[list[int]],
-        sampling_params: list[SamplingParams],
-    ) -> list[GenerationOutput]:
-        B = len(prompt_token_ids)
-        device = self.device
-        eos = self.tokenizer.eos_token_id
-
-        max_out = max(p.max_tokens for p in sampling_params)
-        prompt_lens = [len(p) for p in prompt_token_ids]
-        max_prompt = max(prompt_lens)
-        max_total = max_prompt + max_out
-
-        all_greedy = all(p.temperature == 0.0 for p in sampling_params)
-        fits_static = max_total <= self.graph_max_total
-        use_graph = self._use_cuda_graphs and all_greedy and fits_static
-
-        # Pad to ``max_num_seqs`` by cloning the first real prompt.  Each
-        # padded row gets its own paged-KV blocks and Mamba slot via the
-        # static block_tables / cache_indices, runs alongside real rows,
-        # and its output is discarded.  Cloning instead of dummy short
-        # prompts keeps cache_seqlens uniform across the lockstep batch
-        # (TRTLLM kernels misbehave under wide cache_seqlens variance).
-        B_pad = self.max_num_seqs
-        if B < B_pad:
-            extra = B_pad - B
-            prompt_token_ids = list(prompt_token_ids) + [prompt_token_ids[0]] * extra
-            prompt_lens = prompt_lens + [prompt_lens[0]] * extra
-
-        # ------------------------------------------------------------------
-        # Reset cache state for the new batch.  Only zero the Mamba state
-        # (paged KV slots are overwritten by the prefill side-write so
-        # don't need clearing).
-        # ------------------------------------------------------------------
-        for cs in self._conv_states:
-            cs.zero_()
-        for ss in self._ssm_states:
-            ss.zero_()
-
-        # ------------------------------------------------------------------
-        # Prefill: pack flat varlen, run model with standard
-        # ``set_jamba_context`` (paged-attn + Mamba metadata in one).
-        # ------------------------------------------------------------------
-        first_tok = self._run_prefill(
-            prompt_token_ids, prompt_lens, B_pad, max_prompt,
-        )
-
-        # ------------------------------------------------------------------
-        # Decode loop (greedy + graph fast-path).
-        # ------------------------------------------------------------------
-        if use_graph:
-            generated = self._run_decode_graph(
-                first_tok, prompt_lens, max_out, sampling_params, B,
-            )
-        else:
-            generated = self._run_decode_eager(
-                first_tok, prompt_lens, max_out, sampling_params, B,
-            )
-
-        return self._materialise(generated)
+        seq: Sequence,
+        outputs: list[list[int]],
+        eos: int | None,
+        seq_idx_for_id: dict[int, int],
+    ) -> None:
+        idx = seq_idx_for_id[id(seq)]
+        # Trim trailing eos (callers don't include it in token_ids
+        # by convention -- mirrors what the prior engine did).
+        toks = list(seq.generated_ids)
+        if (not seq.ignore_eos and eos is not None
+                and toks and toks[-1] == eos
+                and len(toks) > 1):
+            # Keep eos in output -- bench's match-tokens metric
+            # consumes the raw token sequence including the
+            # final eos, so don't trim it here.
+            pass
+        outputs[idx] = toks
+        if seq.state_slot is not None:
+            self.mamba_pool.free(seq.state_slot)
+            seq.state_slot = None
+        self.block_manager.deallocate(seq)
+        seq.status = SeqStatus.FINISHED
 
     # ------------------------------------------------------------------
-    # Prefill: flat-varlen forward.  Returns ``first_tok`` of shape [B_pad].
+    # _run_prefill: batched flat-varlen prefill over ``new_seqs``.
+    # Updates ``seq.num_computed_tokens`` to ``len(seq.prompt_ids)`` on
+    # success (chunked single-seq prefill is a follow-up).  Returns
+    # last-token logits per seq via ``self._prefill_last_logits``.
     # ------------------------------------------------------------------
-    def _run_prefill(
-        self,
-        prompt_token_ids: list[list[int]],
-        prompt_lens: list[int],
-        B_pad: int,
-        max_prompt: int,
-    ) -> torch.Tensor:
+    def _run_prefill(self, new_seqs: list[Sequence]) -> None:
         device = self.device
         page_size = self._page_size
+        B = len(new_seqs)
 
-        # Flat input_ids: concatenate all prompts.
-        flat_ids: list[int] = []
-        for p in prompt_token_ids:
-            flat_ids.extend(p)
-        input_ids = torch.tensor(flat_ids, dtype=torch.long, device=device)
-
-        # cu_seqlens (Q == K for prefill).  Cumulative real-token counts.
-        plens_np = np.array(prompt_lens, dtype=np.int32)
-        cu_q_np = np.zeros(B_pad + 1, dtype=np.int32)
-        np.cumsum(plens_np, out=cu_q_np[1:])
+        # Flat input_ids = concatenation of prompts.
+        flat_ids = []
+        for s in new_seqs:
+            flat_ids.extend(s.prompt_ids)
+        plens = np.array([len(s.prompt_ids) for s in new_seqs], dtype=np.int32)
+        cu_q_np = np.zeros(B + 1, dtype=np.int32)
+        np.cumsum(plens, out=cu_q_np[1:])
         cu_q = torch.from_numpy(cu_q_np).to(device)
 
-        # Per-token positions (real position within each seq, 0..plen-1).
-        pos_np = np.concatenate([
-            np.arange(p, dtype=np.int64) for p in prompt_lens
-        ])
+        # Per-token positions (0..plen-1 within each seq, concatenated).
+        pos_np = np.concatenate([np.arange(p, dtype=np.int64) for p in plens])
         positions = torch.from_numpy(pos_np).to(device)
+        input_ids = torch.tensor(flat_ids, dtype=torch.long, device=device)
 
-        # Per-token slot_mapping (vectorized).  For the k-th real token
-        # (in the concatenated flat layout):
-        #   seq_idx[k]      = which seq
-        #   within_seq[k]   = position 0..plen_seq-1 within that seq
-        #   slot[k]         = block_tables[seq_idx[k], within_seq[k]//P] * P
-        #                     + (within_seq[k] % P)
-        # The Python double-loop over 32*1024=32K tokens used to take
-        # ~50ms per prefill on tiny-dev (dominating the prefill-heavy
-        # scenario at 1024 prompt tokens); the numpy vector form
-        # takes ~0.5ms.
-        bt_host = self._block_tables.cpu().numpy()              # [B_pad, bps]
-        seq_idx = np.repeat(
-            np.arange(len(prompt_lens), dtype=np.int64), plens_np,
-        )                                                       # [N_real]
-        within_seq = pos_np                                     # [N_real]
-        block_idxs = within_seq // page_size                    # [N_real]
-        slot_in_blocks = within_seq % page_size                 # [N_real]
+        # Per-seq block_tables (pad to max_blocks_per_seq for paged
+        # attention kernel that expects fixed-width tables).
+        bps = self._max_blocks_per_seq
+        bt_np = np.full((B, bps), -1, dtype=np.int32)
+        for i, s in enumerate(new_seqs):
+            bt_np[i, :len(s.block_table)] = s.block_table
+        block_tables = torch.from_numpy(bt_np).to(device)
+
+        # Per-token slot_mapping (vectorized).  For the k-th real token:
+        #   seq_idx[k]   = which seq
+        #   within[k]    = position in seq (0..plen-1)
+        #   slot[k]      = block_tables[seq_idx, within//P] * P + within%P
+        seq_idx_np = np.repeat(np.arange(B, dtype=np.int64), plens)
+        within_np = pos_np
+        block_idxs = within_np // page_size
+        slot_in_blocks = within_np % page_size
         slot_np = (
-            bt_host[seq_idx, block_idxs].astype(np.int64) * page_size
+            bt_np[seq_idx_np, block_idxs].astype(np.int64) * page_size
             + slot_in_blocks
         )
         slot_mapping = torch.from_numpy(slot_np).to(device)
 
-        # Mamba prefill metadata: query_start_loc + has_initial_state.
-        mamba_qsl = cu_q  # same as cu_seqlens for prefill
-        mamba_has_init = torch.zeros(B_pad, dtype=torch.bool, device=device)
+        # Mamba metadata (prefill: query_start_loc + has_initial_state).
+        cache_indices = torch.tensor(
+            [s.state_slot for s in new_seqs], dtype=torch.int32, device=device,
+        )
+        has_initial_state = torch.zeros(B, dtype=torch.bool, device=device)
 
         mamba_meta = JambaMambaMetadata(
-            conv_states=self._conv_states,
-            ssm_states=self._ssm_states,
-            cache_indices=self._cache_indices,
+            conv_states=self.mamba_pool.conv_states,
+            ssm_states=self.mamba_pool.ssm_states,
+            cache_indices=cache_indices,
             is_decode=False,
-            query_start_loc=mamba_qsl,
-            has_initial_state=mamba_has_init,
+            query_start_loc=cu_q,
+            has_initial_state=has_initial_state,
         )
 
-        max_seqlen = int(plens_np.max())
+        max_seqlen = int(plens.max())
         set_jamba_context(
             is_prefill=True,
             slot_mapping=slot_mapping,
-            block_tables=self._block_tables,
+            block_tables=block_tables,
             cu_seqlens_q=cu_q,
             cu_seqlens_k=cu_q,
             max_seqlen_q=max_seqlen,
@@ -704,190 +948,147 @@ class JambaEngine:
         )
         try:
             hidden = self.model(input_ids, positions)
-            # Hidden is ``[total_real_tokens, hidden]`` -- gather the
-            # last token of each seq for the LM head.  cu_q[1:] - 1 are
-            # the per-seq last-token indices.
+            # Gather per-seq last-token hidden states.  cu_q[1:] - 1
+            # are the indices of the last real token for each seq.
             last_idx = cu_q[1:].long() - 1
-            last_hidden = hidden.index_select(0, last_idx)        # [B_pad, hidden]
-            prefill_logits = self.model.compute_logits(last_hidden)
+            last_hidden = hidden.index_select(0, last_idx)
+            self._prefill_last_logits = self.model.compute_logits(last_hidden)
         finally:
             reset_context()
-        return prefill_logits.argmax(dim=-1)                     # [B_pad]
 
-    # ------------------------------------------------------------------
-    # Decode: graph fast-path.  Greedy, lockstep, fixed B=max_num_seqs.
-    # ------------------------------------------------------------------
-    def _run_decode_graph(
+    def _sample_after_prefill(
         self,
-        first_tok: torch.Tensor,
-        prompt_lens: list[int],
-        max_out: int,
-        sampling_params: list[SamplingParams],
-        B_real: int,
-    ) -> list[list[int]]:
-        device = self.device
-        eos = self.tokenizer.eos_token_id
-        B_pad = self.max_num_seqs
-        page_size = self._page_size
-        graph_entry = self._decode_graph
-        assert graph_entry is not None
-
-        # Pre-compute the per-step slot_mapping / context_lens / positions
-        # tables on host (vectorized -- the python loop took ~5ms/batch
-        # at max_out=128, B_pad=32 prior).
-        bt_host = self._block_tables.cpu().numpy()
-        prompt_lens_np = np.array(prompt_lens, dtype=np.int64)
-
-        s_arr = np.arange(max_out, dtype=np.int64)[:, None]       # [max_out, 1]
-        positions_table = prompt_lens_np[None, :] + s_arr         # [max_out, B_pad]
-        block_idxs = positions_table // page_size
-        slot_in_blocks = positions_table % page_size
-        row_idx = np.arange(B_pad, dtype=np.int64)[None, :]
-        slot_table = (
-            bt_host[row_idx, block_idxs].astype(np.int64) * page_size
-            + slot_in_blocks
-        )
-        ctxlen_table = (positions_table + 1).astype(np.int32)
-        slot_table_t = torch.from_numpy(slot_table).to(device)
-        ctxlen_table_t = torch.from_numpy(ctxlen_table).to(device)
-        positions_table_t = torch.from_numpy(positions_table).to(device)
-
-        # Token history buffer: [max_out, B_pad] int64.  pin_memory + non
-        # blocking copies make the host->device round-trip overlap with
-        # the next graph replay.
-        tok_history = torch.empty(
-            max_out, B_pad, dtype=torch.long, pin_memory=True,
-        )
-        tok_history[0].copy_(first_tok, non_blocking=True)
-
-        # Step 0 input: first_tok (sampled from prefill logits).
-        self._step_input_ids.copy_(first_tok)
-
-        for step in range(1, max_out):
-            # Update static buffers in-place: the captured graph reads
-            # from these identities each replay.
-            self._step_slot_mapping.copy_(slot_table_t[step - 1])
-            self._step_context_lens.copy_(ctxlen_table_t[step - 1])
-            self._step_positions.copy_(positions_table_t[step - 1])
-            graph_entry.graph.replay()
-            tok_history[step].copy_(self._step_next_tokens, non_blocking=True)
-            self._step_input_ids.copy_(self._step_next_tokens)
-
-        torch.cuda.synchronize()
-
-        # Build per-row generated lists, dropping padding rows.
-        history_t = tok_history.numpy()
-        generated: list[list[int]] = [[] for _ in range(B_real)]
-        for i in range(B_real):
-            limit = sampling_params[i].max_tokens
-            tokens_i: list[int] = []
-            for s in range(min(max_out, limit)):
-                t = int(history_t[s, i])
-                tokens_i.append(t)
-                if (not sampling_params[i].ignore_eos
-                        and eos is not None and t == eos):
-                    break
-            generated[i] = tokens_i
-        return generated
+        new_seqs: list[Sequence],
+        seq_sp: dict[int, SamplingParams],
+    ) -> list[int]:
+        logits = self._prefill_last_logits
+        if all(seq_sp[id(s)].temperature == 0.0 for s in new_seqs):
+            return logits.argmax(dim=-1).tolist()
+        return [
+            self._sample_one(logits[i], seq_sp[id(s)])
+            for i, s in enumerate(new_seqs)
+        ]
 
     # ------------------------------------------------------------------
-    # Decode: eager fallback (graph disabled or sampling != greedy).
+    # _run_decode_step: one decode step over ``running``.  Picks the
+    # smallest CUDA-graph bucket >= len(running), pads block_tables /
+    # context_lens / slot_mapping / cache_indices into the static
+    # buffer slots [:n] (and -1 / 0 for the trailing pad slots), then
+    # replays the captured graph.  Reads back next_tokens[:n].
     # ------------------------------------------------------------------
-    def _run_decode_eager(
-        self,
-        first_tok: torch.Tensor,
-        prompt_lens: list[int],
-        max_out: int,
-        sampling_params: list[SamplingParams],
-        B_real: int,
-    ) -> list[list[int]]:
+    def _run_decode_step(self, running: list[Sequence]) -> list[int]:
+        n = len(running)
+        if self._use_cuda_graphs:
+            B = self._pick_bucket(n)
+            graph = self._decode_graphs.get(B)
+            if graph is None:
+                graph = self._capture_decode_graph(B)
+        else:
+            graph = None
+            B = n
+
         device = self.device
-        eos = self.tokenizer.eos_token_id
-        B_pad = self.max_num_seqs
         page_size = self._page_size
-        max_context_len = self._blocks_per_seq * self._page_size
 
-        bt_host = self._block_tables.cpu().numpy()
-        prompt_lens_np = np.array(prompt_lens, dtype=np.int64)
+        # Per-seq decode arrays for the active rows.  Last-token id
+        # (input for this step), absolute position, paged slot for the
+        # new K/V, post-write context_len, padded block_table row, and
+        # Mamba state slot.
+        ids_np = np.empty(n, dtype=np.int64)
+        pos_np = np.empty(n, dtype=np.int64)
+        slot_np = np.empty(n, dtype=np.int64)
+        ctx_np = np.empty(n, dtype=np.int32)
+        cache_idx_np = np.empty(n, dtype=np.int32)
+        bps = self._max_blocks_per_seq
+        bt_np = np.full((n, bps), -1, dtype=np.int32)
+        for i, s in enumerate(running):
+            ids_np[i] = s.last_token
+            new_pos = len(s) - 1  # absolute position of the new token
+            pos_np[i] = new_pos
+            block_idx = new_pos // page_size
+            slot_in_block = new_pos % page_size
+            slot_np[i] = (
+                int(s.block_table[block_idx]) * page_size + slot_in_block
+            )
+            ctx_np[i] = new_pos + 1  # post-write context length
+            bt_np[i, :len(s.block_table)] = s.block_table
+            cache_idx_np[i] = s.state_slot
 
-        generated: list[list[int]] = [[] for _ in range(B_pad)]
-        for i in range(B_pad):
-            generated[i].append(int(first_tok[i].item()))
-        finished = [False] * B_pad
-        for i in range(B_real):
-            if (not sampling_params[i].ignore_eos
-                    and eos is not None and generated[i][0] == eos):
-                finished[i] = True
-            if len(generated[i]) >= sampling_params[i].max_tokens:
-                finished[i] = True
+        if graph is not None:
+            # Pad to bucket B by writing -1 / safe defaults into the
+            # trailing pad rows; the captured graph will run those rows
+            # as no-ops (slot_mapping=-1 makes store_kvcache skip; the
+            # paged attention kernel does work at those rows but we
+            # ignore the outputs).  To avoid kernel issues with very
+            # small / zero context_lens, we set pad rows to a sentinel
+            # using row 0's block_table (any valid block; output is
+            # discarded).
+            bufs_input_ids = graph.step_input_ids
+            bufs_positions = graph.step_positions
+            bufs_slot_mapping = graph.slot_mapping
+            bufs_context_lens = graph.context_lens
+            bufs_block_tables = graph.block_tables
+            bufs_cache_indices = graph.cache_indices
 
-        step_input_ids = first_tok.clone()
-        slot_mapping = torch.empty(B_pad, dtype=torch.long, device=device)
-        context_lens = torch.empty(B_pad, dtype=torch.int32, device=device)
-        positions = torch.empty(B_pad, dtype=torch.long, device=device)
+            # Build full bucket-sized arrays with pad fill from row 0.
+            full_ids = np.zeros(B, dtype=np.int64)
+            full_ids[:n] = ids_np
+            full_pos = np.zeros(B, dtype=np.int64)
+            full_pos[:n] = pos_np
+            full_slot = np.full(B, -1, dtype=np.int64)
+            full_slot[:n] = slot_np
+            full_ctx = np.ones(B, dtype=np.int32)  # min seqlen=1 for pad rows
+            full_ctx[:n] = ctx_np
+            full_cache_idx = np.zeros(B, dtype=np.int32)
+            full_cache_idx[:n] = cache_idx_np
+            full_bt = np.full((B, bps), -1, dtype=np.int32)
+            full_bt[:n] = bt_np
+            # Pad rows reuse row 0's block_table so paged-attn finds
+            # SOMETHING (output is discarded); avoids the kernel crash
+            # on all-(-1) block_tables seen during earlier multi-bucket
+            # debugging.
+            if n < B and n > 0:
+                full_bt[n:] = bt_np[0]
+                full_cache_idx[n:] = cache_idx_np[0]
 
-        for step in range(1, max_out):
-            if all(finished[:B_real]):
-                break
-            slots_h = np.empty(B_pad, dtype=np.int64)
-            ctx_h = np.empty(B_pad, dtype=np.int32)
-            pos_h = np.empty(B_pad, dtype=np.int64)
-            for i in range(B_pad):
-                pos = int(prompt_lens_np[i]) + step - 1
-                block_idx = pos // page_size
-                slot_in_block = pos % page_size
-                slots_h[i] = int(bt_host[i, block_idx]) * page_size + slot_in_block
-                ctx_h[i] = pos + 1
-                pos_h[i] = pos
-            slot_mapping.copy_(torch.from_numpy(slots_h))
-            context_lens.copy_(torch.from_numpy(ctx_h))
-            positions.copy_(torch.from_numpy(pos_h))
+            bufs_input_ids.copy_(torch.from_numpy(full_ids))
+            bufs_positions.copy_(torch.from_numpy(full_pos))
+            bufs_slot_mapping.copy_(torch.from_numpy(full_slot))
+            bufs_context_lens.copy_(torch.from_numpy(full_ctx))
+            bufs_block_tables.copy_(torch.from_numpy(full_bt))
+            bufs_cache_indices.copy_(torch.from_numpy(full_cache_idx))
 
+            graph.graph.replay()
+            torch.cuda.synchronize()
+            tokens = graph.next_tokens[:n].tolist()
+        else:
+            # Eager fallback (no graph capture).  Same kernel calls,
+            # just with fresh tensors each step.
+            input_ids = torch.from_numpy(ids_np).to(device)
+            positions = torch.from_numpy(pos_np).to(device)
+            slot_mapping = torch.from_numpy(slot_np).to(device)
+            context_lens = torch.from_numpy(ctx_np).to(device)
+            block_tables = torch.from_numpy(bt_np).to(device)
+            cache_indices = torch.from_numpy(cache_idx_np).to(device)
             mamba_meta = JambaMambaMetadata(
-                conv_states=self._conv_states,
-                ssm_states=self._ssm_states,
-                cache_indices=self._cache_indices,
+                conv_states=self.mamba_pool.conv_states,
+                ssm_states=self.mamba_pool.ssm_states,
+                cache_indices=cache_indices,
                 is_decode=True,
             )
             set_jamba_context(
                 is_prefill=False,
                 slot_mapping=slot_mapping,
                 context_lens=context_lens,
-                block_tables=self._block_tables,
-                max_context_len=max_context_len,
+                block_tables=block_tables,
+                max_context_len=self._max_blocks_per_seq * self._page_size,
                 mamba_metadata=mamba_meta,
             )
             try:
-                hidden = self.model(step_input_ids, positions)
+                hidden = self.model(input_ids, positions)
                 logits = self.model.compute_logits(hidden)
+                tokens = logits.argmax(dim=-1).tolist()
             finally:
                 reset_context()
-            next_tokens = self._sample_step(logits, sampling_params[:B_real]
-                                            + [sampling_params[0]] * (B_pad - B_real))
-            step_input_ids = torch.tensor(
-                next_tokens, dtype=torch.long, device=device,
-            )
-            for i in range(B_pad):
-                if i < B_real and finished[i]:
-                    continue
-                t = next_tokens[i]
-                generated[i].append(int(t))
-                if i < B_real:
-                    sp = sampling_params[i]
-                    if not sp.ignore_eos and eos is not None and t == eos:
-                        finished[i] = True
-                    if len(generated[i]) >= sp.max_tokens:
-                        finished[i] = True
 
-        return generated[:B_real]
-
-    def _materialise(self, generated: list[list[int]]) -> list[GenerationOutput]:
-        results: list[GenerationOutput] = []
-        for tokens in generated:
-            text = self.tokenizer.decode(tokens, skip_special_tokens=True)
-            results.append(GenerationOutput(
-                prompt="",
-                generated_text=text,
-                token_ids=tokens,
-            ))
-        return results
+        return tokens
