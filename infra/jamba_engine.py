@@ -1015,14 +1015,18 @@ class JambaEngine:
             cache_idx_np[i] = s.state_slot
 
         if graph is not None:
-            # Pad to bucket B by writing -1 / safe defaults into the
-            # trailing pad rows; the captured graph will run those rows
-            # as no-ops (slot_mapping=-1 makes store_kvcache skip; the
-            # paged attention kernel does work at those rows but we
-            # ignore the outputs).  To avoid kernel issues with very
-            # small / zero context_lens, we set pad rows to a sentinel
-            # using row 0's block_table (any valid block; output is
-            # discarded).
+            # Pad to bucket B with the project-standard sentinels so
+            # the captured graph runs cleanly on partial buckets.
+            # Mirrors LlamaEngine._run_graph_from_numpy
+            # (slot_mapping[pad]=-1, context_lens[pad]=0) and
+            # _generate_mamba's _MAMBA_PAD_SLOT_ID = -1 (the vendored
+            # vLLM Mamba kernels skip rows whose state_indices is -1).
+            #
+            # An earlier version of this method copied row 0's
+            # block_table and cache_indices into the pad rows -- that
+            # was a CORRECTNESS bug for the Mamba layer: multiple pad
+            # rows pointing at the same Mamba slot would race-write
+            # the real seq's state.  Using -1 sentinels skips them.
             bufs_input_ids = graph.step_input_ids
             bufs_positions = graph.step_positions
             bufs_slot_mapping = graph.slot_mapping
@@ -1030,26 +1034,26 @@ class JambaEngine:
             bufs_block_tables = graph.block_tables
             bufs_cache_indices = graph.cache_indices
 
-            # Build full bucket-sized arrays with pad fill from row 0.
             full_ids = np.zeros(B, dtype=np.int64)
             full_ids[:n] = ids_np
             full_pos = np.zeros(B, dtype=np.int64)
             full_pos[:n] = pos_np
+            # Paged-attn pad rows: slot=-1 (skip store), ctx_len=0
+            # (kernel attends to nothing), block_table all-(-1)
+            # (sentinel; never read because ctx_len=0).
             full_slot = np.full(B, -1, dtype=np.int64)
             full_slot[:n] = slot_np
-            full_ctx = np.ones(B, dtype=np.int32)  # min seqlen=1 for pad rows
+            full_ctx = np.zeros(B, dtype=np.int32)
             full_ctx[:n] = ctx_np
-            full_cache_idx = np.zeros(B, dtype=np.int32)
-            full_cache_idx[:n] = cache_idx_np
             full_bt = np.full((B, bps), -1, dtype=np.int32)
             full_bt[:n] = bt_np
-            # Pad rows reuse row 0's block_table so paged-attn finds
-            # SOMETHING (output is discarded); avoids the kernel crash
-            # on all-(-1) block_tables seen during earlier multi-bucket
-            # debugging.
-            if n < B and n > 0:
-                full_bt[n:] = bt_np[0]
-                full_cache_idx[n:] = cache_idx_np[0]
+            # Mamba pad rows: cache_indices=-1 -- the vendored
+            # causal_conv1d_update / selective_state_update kernels
+            # skip rows whose state index is -1 (per
+            # ``_MAMBA_PAD_SLOT_ID = -1`` precedent in
+            # ``infra.engine``).
+            full_cache_idx = np.full(B, -1, dtype=np.int32)
+            full_cache_idx[:n] = cache_idx_np
 
             bufs_input_ids.copy_(torch.from_numpy(full_ids))
             bufs_positions.copy_(torch.from_numpy(full_pos))
