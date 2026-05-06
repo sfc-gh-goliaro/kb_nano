@@ -1,6 +1,7 @@
 """Jamba's multi-head attention block (no RoPE, no QK-norm).
 
-Reference: ``transformers.models.jamba.modeling_jamba.JambaAttention``.
+Reference: ``transformers.models.jamba.modeling_jamba.JambaAttention``
+            and ``vllm.model_executor.layers.attention``.
 
 Key difference from :class:`L2.attention.LlamaAttention`: Jamba does NOT
 use rotary position embeddings.  Position information enters the network
@@ -8,14 +9,44 @@ through Mamba's selective scan (data-dependent recurrence) plus the
 ordering of attention layers; no positional embedding is applied to Q
 or K.
 
-Layout: works with HuggingFace-style batched ``[B, T, hidden]`` input,
-emits ``[B, T, hidden]`` output.  KV cache is owned by the engine and
-read from the global ``Context`` (populated via ``set_jamba_context``),
-matching the project's ``set_context`` / ``get_context()`` convention
-used by Llama / Mamba / Mamba2 / Mixtral.
+Cache layout & strategy (mirrors vLLM's Jamba forward path):
 
-L1 ops: ``Linear`` (q/k/v/o projections), ``DenseAttention`` (kernel
-launch).  No ``F.linear``/``F.scaled_dot_product_attention`` leak.
+  * **Paged KV cache** allocated by the engine and bound to
+    ``self.k_cache`` / ``self.v_cache`` (one slice per attention layer).
+    Layout depends on the auto-detected backend (TRTLLM-gen on
+    Blackwell uses HND ``[num_blocks, num_kv_heads, page_size,
+    head_dim]`` with page_size=16; FA3/FA2 elsewhere uses NHD
+    ``[num_blocks, page_size, num_kv_heads, head_dim]`` with
+    page_size=256).  This matches kb-nano's standard
+    ``LlamaEngine.allocate_kv_cache`` pattern.
+
+  * **Prefill**: paged-context attention via ``TRTLLMPrefill`` /
+    ``FlashAttnPrefill`` reading from the paged cache (the same
+    kernels vLLM uses).  Q/K/V come from the [B, T, h] left-padded
+    input; K/V are written to the paged cache via ``StoreKVCache``,
+    then attention reads them back through ``block_table`` +
+    ``cu_seqlens``.  This matches vLLM's TRTLLM prefill numerics so
+    drift vs the reference stays small.
+
+  * **Decode**: paged attention via ``FlashAttnDecode`` /
+    ``TRTLLMDecode`` reading the paged caches with ``block_table`` +
+    ``cache_seqlens`` from ``get_context()``.  Wasted-tail compute
+    (the old dense slab's masked region beyond ``cur_len``) is
+    eliminated -- attention only touches valid positions.
+
+  * **Mamba layers** in Jamba consume the standard
+    ``mamba_state`` / ``mamba_metadata`` Context fields and are not
+    affected by this module.
+
+Forward signature: ``forward(positions, hidden_states)`` where
+``hidden_states`` is ``[B, T, hidden]`` (T == 1 in decode, T == max_prompt
+in prefill) -- same convention as :class:`L2.attention.LlamaAttention`.
+
+L1 ops used (no ``torch.nn.functional`` / external lib leaks):
+  * ``Linear``                       (Q/K/V/O)
+  * ``TRTLLMDecode`` / ``FlashAttnDecode``     (paged decode)
+  * ``TRTLLMPrefill`` / ``FlashAttnPrefill``    (paged context prefill)
+  * ``StoreKVCacheHND`` / ``StoreKVCache``      (paged-cache write)
 """
 
 from __future__ import annotations
@@ -23,8 +54,7 @@ from __future__ import annotations
 import torch
 import torch.nn as nn
 
-from ....infra.context import get_context
-from ..L1.dense_attention import DenseAttention
+from ....infra.context import get_attn_backend_config, get_context
 from ..L1.linear import Linear
 
 
@@ -59,18 +89,51 @@ class JambaAttention(nn.Module):
             num_attention_heads * self.head_dim, hidden_size, bias=False,
         )
 
-        # cuDNN backend gives the best B200 perf for this layout
-        # (see CLAUDE.md: ~2.7x over cutlass FMHA).  ``DenseAttention``
-        # falls back to MATH for masks cuDNN can't handle.
-        self.attn = DenseAttention(backend="cudnn")
+        # Paged attention dispatch.  Mirrors ``L2.attention_impl.Attention``:
+        # on Blackwell (sm_100+) we use TRTLLM-gen paged kernels via
+        # FlashInfer (HND layout, ``block_size=16``); elsewhere we use
+        # FA3/FA2 paged kernels (NHD, ``block_size=256``).  Same dispatch
+        # for both prefill and decode so numerics match vLLM's choice.
+        attn_cfg = get_attn_backend_config()
+        self._use_trtllm = attn_cfg.use_trtllm
+        self._block_size = attn_cfg.block_size
 
-    @staticmethod
-    def _repeat_kv(x: torch.Tensor, n_rep: int) -> torch.Tensor:
-        """[B, H_kv, T, D] -> [B, H_kv * n_rep, T, D]. No-op if n_rep==1."""
-        if n_rep == 1:
-            return x
-        b, h, t, d = x.shape
-        return x[:, :, None, :, :].expand(b, h, n_rep, t, d).reshape(b, h * n_rep, t, d)
+        if self._use_trtllm:
+            from ..L1.flashinfer_decode import TRTLLMDecode
+            from ..L1.flashinfer_prefill import TRTLLMPrefill
+            from ..L1.store_kvcache import StoreKVCacheHND
+            self.decode_attn = TRTLLMDecode(
+                num_qo_heads=self.num_heads,
+                num_kv_heads=self.num_kv_heads,
+                head_dim=self.head_dim,
+            )
+            self.prefill_attn = TRTLLMPrefill(
+                num_qo_heads=self.num_heads,
+                num_kv_heads=self.num_kv_heads,
+                head_dim=self.head_dim,
+            )
+            self.store_kv = StoreKVCacheHND(page_size=attn_cfg.block_size)
+        else:
+            from ..L1.flash_attn_decode import FlashAttnDecode
+            from ..L1.flash_attn_prefill import FlashAttnPrefill
+            from ..L1.store_kvcache import StoreKVCache
+            self.decode_attn = FlashAttnDecode(
+                num_heads=self.num_heads,
+                num_kv_heads=self.num_kv_heads,
+                head_dim=self.head_dim,
+            )
+            self.prefill_attn = FlashAttnPrefill(
+                num_heads=self.num_heads,
+                num_kv_heads=self.num_kv_heads,
+                head_dim=self.head_dim,
+            )
+            self.store_kv = StoreKVCache()
+
+        # Per-layer paged caches; bound by the engine after KV allocation.
+        # NHD layout: [num_blocks, block_size, num_kv_heads, head_dim]
+        # HND layout: [num_blocks, num_kv_heads, block_size, head_dim]
+        self.k_cache: torch.Tensor | None = None
+        self.v_cache: torch.Tensor | None = None
 
     def forward(
         self,
@@ -78,128 +141,132 @@ class JambaAttention(nn.Module):
                                             # signature parity with Llama.
         hidden_states: torch.Tensor,        # [B, T, hidden]
     ) -> torch.Tensor:
-        """Forward.  Reads per-step KV state and attention mask from the
-        global ``Context`` populated by the engine's ``set_jamba_context``.
+        """Forward.  Reads per-step paged-KV state from the global
+        ``Context`` (populated by ``set_jamba_context``).
 
-        Two modes are dispatched off ``ctx.jamba_attn_metadata``:
+        * **Prefill** (``ctx.is_prefill == True``): batched dense
+          attention against ``ctx.prefill_attn_mask``.  After computing
+          attention, K/V are also written to the paged cache via
+          ``ctx.slot_mapping`` so decode steps can read them.
 
-          * **Static-shape decode** (CUDA-graph friendly).  ``meta.kv_slabs``
-            is a list of ``(k_buf, v_buf)`` of shape
-            ``[B, H_kv, max_total, D]``.  The new K/V are written via
-            ``index_copy_`` at ``meta.slot_pos`` and attention is
-            computed against the **full** slab; ``meta.attn_mask_4d``
-            masks out future and pad positions.
-
-          * **Eager (variable shape)** prefill / decode.  ``meta.past_kv``
-            holds per-layer ``(past_k, past_v)`` slabs that we
-            concatenate to the new tokens; ``meta.cache_writeback``
-            optionally provides a pre-allocated ``(k_buf, v_buf)`` to
-            copy the concat result into.
+        * **Decode** (``ctx.is_prefill == False``): paged attention via
+          ``FlashAttnDecode`` with ``ctx.block_tables`` /
+          ``ctx.context_lens``.  K/V for the new step are written to
+          the paged cache via ``ctx.slot_mapping`` (one slot per row)
+          before the kernel reads them.
         """
         ctx = get_context()
-        meta = ctx.jamba_attn_metadata
-        assert meta is not None, (
-            "JambaAttention.forward called without a JambaAttnMetadata "
-            "installed on the global Context (use set_jamba_context)."
+        if ctx.is_prefill:
+            return self._forward_prefill(hidden_states, ctx)
+        return self._forward_decode(hidden_states, ctx)
+
+    # ------------------------------------------------------------------
+    # Prefill: paged-context attention via TRTLLMPrefill / FlashAttnPrefill.
+    #
+    # The L4 model passes ``hidden_states`` as ``[B, T_max, h]`` (left-
+    # padded).  We flatten to varlen format ``[total_real_tokens, h]``
+    # using the per-row prompt lengths from ``ctx.cu_seqlens_q``, run
+    # paged attention with a side-write to the paged cache, then scatter
+    # the output back to ``[B, T_max, h]`` for the downstream layers.
+    #
+    # This matches vLLM's prefill kernel choice exactly (TRTLLM-gen on
+    # Blackwell, FA3 on Hopper), so per-step numerics drift vs the
+    # reference is bounded by hardware-level rounding rather than
+    # cross-kernel algorithm differences.
+    # ------------------------------------------------------------------
+    def _forward_prefill(self, hidden_states: torch.Tensor, ctx) -> torch.Tensor:
+        b, t_max, h = hidden_states.shape
+
+        # ``ctx.cu_seqlens_q`` describes the left-padded → flat-varlen
+        # remap: for row i, the real tokens occupy positions
+        # ``[t_max - prompt_lens[i], t_max)`` in the [B, T_max] grid.
+        # ``ctx.flat_to_grid`` maps each real-token slot k in the flat
+        # tensor back to the matching index in the dense [B*T_max] view
+        # so we can gather/scatter without a host sync.
+        cu_q = ctx.cu_seqlens_q
+        flat_idx = ctx.flat_to_grid
+        assert cu_q is not None and flat_idx is not None, (
+            "JambaAttention prefill requires cu_seqlens_q and "
+            "flat_to_grid on the Context.  The engine populates these "
+            "in set_jamba_context."
         )
 
+        # Project Q, K, V on the dense [B*T_max, h] layout, then
+        # gather only the real-token rows.
+        flat_dense = hidden_states.reshape(b * t_max, h)
+        flat_real = flat_dense.index_select(0, flat_idx)  # [N, h]
+
+        q = self.q_proj(flat_real).view(-1, self.num_heads, self.head_dim)
+        k = self.k_proj(flat_real).view(-1, self.num_kv_heads, self.head_dim)
+        v = self.v_proj(flat_real).view(-1, self.num_kv_heads, self.head_dim)
+
+        # Write K, V to paged cache.  ``slot_mapping`` here is the flat
+        # version (one entry per real token) -- the engine builds it
+        # from the same flat_idx + per-row block_table.
+        self.store_kv(k, v, self.k_cache, self.v_cache, ctx.slot_mapping)
+
+        # Paged-context attention.  TRTLLMPrefill / FlashAttnPrefill read
+        # K, V from the paged cache (block_table) -- the just-written
+        # K/V are visible because ``store_kv`` ran on the same stream.
+        max_seqlen = ctx.max_seqlen_q
+        out = self.prefill_attn(
+            q, self.k_cache, self.v_cache,
+            cu_seqlens_q=cu_q,
+            cu_seqlens_k=ctx.cu_seqlens_k,
+            max_seqlen_q=max_seqlen,
+            max_seqlen_k=ctx.max_seqlen_k,
+            softmax_scale=self.scaling,
+            causal=True,
+            block_table=ctx.block_tables,
+        )
+        # ``out`` is [N, num_heads, head_dim].  Project + scatter back
+        # to [B, T_max, h].  Padded slots stay 0; downstream layers'
+        # subsequent residual + RMSNorm passes operate on a tensor
+        # whose padded rows happen to be zero, which is benign for
+        # the last-token logit extraction the engine does after the
+        # forward.
+        out = out.reshape(-1, self.num_heads * self.head_dim)
+        out = self.o_proj(out)  # [N, h]
+        # Scatter back into the full [B*T_max, h] layout.
+        scattered = torch.zeros(
+            b * t_max, h, dtype=out.dtype, device=out.device,
+        )
+        scattered.index_copy_(0, flat_idx, out)
+        return scattered.reshape(b, t_max, h)
+
+    # ------------------------------------------------------------------
+    # Decode: paged attention via FlashAttnDecode + per-step KV write.
+    # ------------------------------------------------------------------
+    def _forward_decode(self, hidden_states: torch.Tensor, ctx) -> torch.Tensor:
+        # ``hidden_states`` is [B, 1, hidden] for decode; flatten to [B, hidden].
         b, t, _ = hidden_states.shape
+        assert t == 1, f"JambaAttention decode expects T=1, got T={t}"
+        h = hidden_states.view(b, -1)
 
-        # ------------------------------------------------------------------
-        # Static-shape decode path (CUDA-graph friendly).
-        # ------------------------------------------------------------------
-        if meta.kv_slabs is not None and t == 1:
-            k_slab, v_slab = meta.kv_slabs[self.layer_idx]
-            slot_pos = meta.slot_pos
-            attention_mask = meta.attn_mask_4d
+        q = self.q_proj(h).view(b, self.num_heads, self.head_dim)
+        k = self.k_proj(h).view(b, self.num_kv_heads, self.head_dim)
+        v = self.v_proj(h).view(b, self.num_kv_heads, self.head_dim)
 
-            q = self.q_proj(hidden_states).view(b, 1, self.num_heads, self.head_dim)
-            k = self.k_proj(hidden_states).view(b, 1, self.num_kv_heads, self.head_dim)
-            v = self.v_proj(hidden_states).view(b, 1, self.num_kv_heads, self.head_dim)
+        # Write the new step's K, V into the paged cache at the slots
+        # the engine has already computed for this step.
+        self.store_kv(k, v, self.k_cache, self.v_cache, ctx.slot_mapping)
 
-            # Move to [B, H_kv, 1, D] before writing into the slab.
-            k = k.transpose(1, 2)
-            v = v.transpose(1, 2)
-
-            # In-place write at slot_pos.  ``index_copy_`` accepts a 1-d
-            # index tensor, so we view the 0-d scalar as 1-d.  This is
-            # CUDA-graph safe: the index tensor's storage is fixed; the
-            # caller mutates its **value** in-place between replays.
-            slot_idx_1d = slot_pos.view(1)
-            k_slab.index_copy_(2, slot_idx_1d, k)
-            v_slab.index_copy_(2, slot_idx_1d, v)
-
-            # Attention against the full slab.  The caller-supplied mask
-            # is what enforces "ignore positions >= cur_len" and the
-            # original left-padding -- it is shape [B, 1, 1, max_total].
-            k_full = self._repeat_kv(k_slab, self.num_kv_groups)
-            v_full = self._repeat_kv(v_slab, self.num_kv_groups)
-
-            # DenseAttention wants [B, T, H, D].
-            q_ = q.contiguous()
-            k_ = k_full.transpose(1, 2).contiguous()
-            v_ = v_full.transpose(1, 2).contiguous()
-            out = self.attn(
-                q_, k_, v_,
-                softmax_scale=self.scaling, attn_mask=attention_mask,
-            )
-            out = out.contiguous().view(b, 1, self.num_heads * self.head_dim)
-            return self.o_proj(out)
-
-        # ------------------------------------------------------------------
-        # Eager (variable-shape) path -- prefill or non-graph decode.
-        # ------------------------------------------------------------------
-        past_key = past_value = None
-        if meta.past_kv is not None:
-            pkv = meta.past_kv[self.layer_idx]
-            if pkv is not None:
-                past_key, past_value = pkv
-
-        cache_writeback = None
-        if meta.cache_writeback is not None:
-            cache_writeback = meta.cache_writeback[self.layer_idx]
-
-        attention_mask = meta.attn_mask_4d
-
-        q = self.q_proj(hidden_states).view(b, t, self.num_heads, self.head_dim)
-        k = self.k_proj(hidden_states).view(b, t, self.num_kv_heads, self.head_dim)
-        v = self.v_proj(hidden_states).view(b, t, self.num_kv_heads, self.head_dim)
-
-        # Move to [B, H, T, D] for concat with the cache.
-        q = q.transpose(1, 2)
-        k = k.transpose(1, 2)
-        v = v.transpose(1, 2)
-
-        if past_key is not None and past_value is not None:
-            k = torch.cat([past_key, k], dim=2)
-            v = torch.cat([past_value, v], dim=2)
-
-        if cache_writeback is not None:
-            k_buf, v_buf = cache_writeback
-            s = k.size(2)
-            k_buf[:, :, :s, :].copy_(k)
-            v_buf[:, :, :s, :].copy_(v)
-
-        k_full = self._repeat_kv(k, self.num_kv_groups)
-        v_full = self._repeat_kv(v, self.num_kv_groups)
-
-        # ``DenseAttention`` consumes [B, T, H, D].
-        q_ = q.transpose(1, 2).contiguous()
-        k_ = k_full.transpose(1, 2).contiguous()
-        v_ = v_full.transpose(1, 2).contiguous()
-
-        # Causal masking: when no mask is given, rely on ``causal=True``
-        # ONLY for the first call (T == S+T, i.e. T_q == T_kv).  For
-        # decode (T_q=1, T_kv>1) ``causal=True`` would shift the
-        # diagonal incorrectly, so callers are expected to pass either
-        # a proper mask or rely on T_q==1 + the trivial diagonal.
-        if attention_mask is None:
-            causal = (q_.size(1) == k_.size(1))
-            out = self.attn(q_, k_, v_, softmax_scale=self.scaling, causal=causal)
-        else:
-            out = self.attn(q_, k_, v_, softmax_scale=self.scaling,
-                            attn_mask=attention_mask)
-
-        # [B, T, H, D] -> [B, T, hidden]
-        out = out.contiguous().view(b, t, self.num_heads * self.head_dim)
+        # Paged decode attention.  FlashAttnDecode wraps FA3
+        # ``flash_attn_varlen_func`` (or FA2 ``flash_attn_with_kvcache``)
+        # with the paged cache + block_table + cache_seqlens read from
+        # the Context.  The kernel only touches valid positions
+        # (``[:context_lens[i]]`` per batch row), eliminating the
+        # masked-tail compute the previous dense-slab path paid.
+        out = self.decode_attn(
+            q, self.k_cache, self.v_cache,
+            cache_seqlens=ctx.context_lens,
+            block_table=ctx.block_tables,
+            softmax_scale=self.scaling,
+            causal=True,
+            max_seq_len=ctx.max_context_len,
+        )
+        # FA returns [B, num_heads, head_dim] (FA3 path) or already
+        # squeezed (FA2 fallback in FlashAttnDecode); either way reshape
+        # to [B, 1, hidden] for o_proj.
+        out = out.contiguous().view(b, 1, self.num_heads * self.head_dim)
         return self.o_proj(out)

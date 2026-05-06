@@ -200,9 +200,9 @@ class JambaMambaMixer(nn.Module):
         Returns ``[B, T, hidden]``.
         """
         ctx = get_context()
-        meta = ctx.jamba_mamba_metadata
+        meta = ctx.mamba_metadata
         assert meta is not None, (
-            "JambaMambaMixer.forward called without a JambaMambaMetadata "
+            "JambaMambaMixer.forward called without a Mamba metadata "
             "installed on the global Context (use set_jamba_context)."
         )
 

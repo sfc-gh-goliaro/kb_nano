@@ -160,18 +160,18 @@ class Context:
     mamba_state: object = None
     mamba_metadata: object = None
 
-    # --- Jamba-specific fields (hybrid attention + Mamba + MoE).
-    # Jamba uses a dense-batched left-padded KV layout rather than the
-    # generic paged ``Attention``'s ``k_cache``/``v_cache`` slabs, so it
-    # needs its own per-step metadata.  ``jamba_attn_metadata`` is a
-    # ``JambaAttnMetadata`` dataclass (defined alongside the engine)
-    # carrying the per-batch KV slabs, slot position, attention mask,
-    # and per-layer past/writeback views read by every
-    # ``JambaAttention`` in its forward pass.  Mamba layers in Jamba
-    # consume the standard ``mamba_state`` / ``mamba_metadata`` fields
-    # above (Jamba uses a Mamba-v1-style flat-varlen mixer).
-    jamba_attn_metadata: object = None
-    jamba_mamba_metadata: object = None
+    # --- Hybrid (Jamba) prefill flat-varlen remap.  When a left-padded
+    # ``[B, T_max]`` batch enters JambaAttention, the prefill kernel
+    # (TRTLLMPrefill / FlashAttnPrefill) wants a flat-varlen layout:
+    # ``[total_real_tokens, hidden]``.  ``flat_to_grid`` maps each
+    # real-token slot k in the flat tensor back to its position in the
+    # ``[B*T_max]`` row-major dense view, so the L2 attention can do
+    # ``flat_real = dense.index_select(0, flat_to_grid)`` on entry and
+    # ``dense.index_copy_(0, flat_to_grid, out)`` on exit.  ``cu_seqlens_q``
+    # / ``cu_seqlens_k`` plus this mapping describe the same data;
+    # they're just two views the kernel needs (cu_seqlens for batching,
+    # flat_to_grid for the scatter/gather).
+    flat_to_grid: torch.Tensor | None = None
 
 
 # Global module registry populated once at model init; copied into each
@@ -238,7 +238,9 @@ def set_context(is_prefill, cu_seqlens_q=None, cu_seqlens_k=None,
                 max_seqlen_q=0, max_seqlen_k=0, slot_mapping=None,
                 context_lens=None, block_tables=None,
                 max_context_len=0, chunked_context=None,
-                req_id_per_token=None):
+                req_id_per_token=None,
+                mamba_state=None, mamba_metadata=None,
+                flat_to_grid=None):
     global _CONTEXT
     # For pure-decode batches (``is_prefill=False`` with no mixed fields),
     # mirror the generic ``context_lens`` / ``block_tables`` / ``max_context_len``
@@ -258,7 +260,10 @@ def set_context(is_prefill, cu_seqlens_q=None, cu_seqlens_k=None,
                        no_compile_layers=_STATIC_NO_COMPILE_LAYERS,
                        decode_context_lens=dc_cl,
                        decode_block_tables=dc_bt,
-                       decode_max_context_len=dc_max)
+                       decode_max_context_len=dc_max,
+                       mamba_state=mamba_state,
+                       mamba_metadata=mamba_metadata,
+                       flat_to_grid=flat_to_grid)
 
 
 def set_mixed_context(
@@ -316,25 +321,60 @@ def set_mamba_context(
 
 def set_jamba_context(
     is_prefill: bool,
-    jamba_attn_metadata,
-    jamba_mamba_metadata,
+    *,
+    # Standard paged-attention fields (for the 4 attention layers).
+    slot_mapping=None,
+    context_lens=None,
+    block_tables=None,
+    max_context_len=0,
+    cu_seqlens_q=None,
+    cu_seqlens_k=None,
+    max_seqlen_q=0,
+    max_seqlen_k=0,
+    flat_to_grid=None,
+    # Mamba state + metadata (for the 28 Mamba layers).
+    mamba_state=None,
+    mamba_metadata=None,
 ):
-    """Install per-step Jamba metadata (attention + Mamba) on the global Context.
+    """Install per-step Jamba metadata on the global Context.
 
-    Jamba is a hybrid model with a dense-batched left-padded KV layout
-    for its attention layers and a flat-varlen Mamba state for its
-    Mamba layers.  Both kinds of layers read their per-step state from
-    this Context inside their forward pass -- mirroring the
-    ``set_context`` (paged attention) / ``set_mamba_context`` (Mamba)
-    split used elsewhere, but combined into a single helper because
-    every Jamba forward runs both layer kinds.
+    Jamba is a hybrid model: 4 attention layers consume the standard
+    ``set_context`` fields (paged KV: ``slot_mapping``, ``block_tables``,
+    ``context_lens``, ``cu_seqlens``...), and 28 Mamba layers consume
+    ``mamba_state`` / ``mamba_metadata``.  This helper combines both
+    installs into a single Context so a Jamba forward can run both
+    kinds of layers off one ``get_context()``.
+
+    Both prefill and decode go through paged attention so JambaAttention
+    matches vLLM's TRTLLM/FA3 kernel choice.  Prefill uses paged-context
+    attention (``TRTLLMPrefill`` / ``FlashAttnPrefill``) on flat-varlen
+    Q/K/V; ``flat_to_grid`` carries the [B*T_max] → [N] index map the
+    L2 mixer uses to gather/scatter against the L4 model's left-padded
+    ``[B, T_max, hidden]`` view.  Decode uses paged attention via
+    ``TRTLLMDecode`` / ``FlashAttnDecode`` reading
+    ``slot_mapping`` / ``block_tables`` / ``context_lens``.
     """
     global _CONTEXT
+    dc_cl = context_lens if not is_prefill else None
+    dc_bt = block_tables if not is_prefill else None
+    dc_max = max_context_len if not is_prefill else 0
     _CONTEXT = Context(
         is_prefill=is_prefill,
+        cu_seqlens_q=cu_seqlens_q,
+        cu_seqlens_k=cu_seqlens_k,
+        max_seqlen_q=max_seqlen_q,
+        max_seqlen_k=max_seqlen_k,
+        slot_mapping=slot_mapping,
+        context_lens=context_lens,
+        block_tables=block_tables,
+        max_context_len=max_context_len,
+        decode_context_lens=dc_cl,
+        decode_block_tables=dc_bt,
+        decode_max_context_len=dc_max,
         no_compile_layers=_STATIC_NO_COMPILE_LAYERS,
-        jamba_attn_metadata=jamba_attn_metadata,
-        jamba_mamba_metadata=jamba_mamba_metadata,
+        mamba_state=mamba_state,
+        mamba_metadata=mamba_metadata,
+        flat_to_grid=flat_to_grid,
     )
 
 
