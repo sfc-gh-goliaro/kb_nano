@@ -13,6 +13,7 @@ No vLLM imports.
 from __future__ import annotations
 
 import atexit
+import json
 import os
 import pickle
 import random
@@ -44,6 +45,32 @@ from .weight_loader import load_model
 
 MAX_MODEL_LEN = 131072
 NCCL_PORT = int(os.environ.get("KB_NANO_NCCL_PORT", "29501"))
+
+
+def _load_tokenizer(model_name: str):
+    try:
+        return AutoTokenizer.from_pretrained(model_name, trust_remote_code=True)
+    except AttributeError as exc:
+        msg = str(exc)
+        if "extra_special_tokens" not in msg and "keys" not in msg:
+            raise
+        from huggingface_hub import hf_hub_download
+
+        cfg_path = hf_hub_download(model_name, "tokenizer_config.json")
+        with open(cfg_path) as f:
+            tok_cfg = json.load(f)
+        extra = tok_cfg.get("extra_special_tokens")
+        if not isinstance(extra, list):
+            raise
+        extra_map = {
+            f"extra_special_token_{i}": token
+            for i, token in enumerate(extra)
+        }
+        return AutoTokenizer.from_pretrained(
+            model_name,
+            trust_remote_code=True,
+            extra_special_tokens=extra_map,
+        )
 
 
 
@@ -275,11 +302,14 @@ class ModelRunner:
         self.max_num_batched_tokens = max_num_batched_tokens if max_num_batched_tokens is not None else _DEFAULT_MAX_NUM_BATCHED_TOKENS
 
         torch.cuda.set_device(rank)
-        dist.init_process_group(
-            "nccl", f"tcp://localhost:{NCCL_PORT}",
-            world_size=world_size, rank=rank,
-            device_id=torch.device(f"cuda:{rank}"),
-        )
+        self._dist_initialized = False
+        if world_size > 1:
+            dist.init_process_group(
+                "nccl", f"tcp://localhost:{NCCL_PORT}",
+                world_size=world_size, rank=rank,
+                device_id=torch.device(f"cuda:{rank}"),
+            )
+            self._dist_initialized = True
 
         self.custom_ar = None
         if world_size > 1:
@@ -349,6 +379,7 @@ class ModelRunner:
         self.is_mamba = model_type in ("mamba", "mamba2")
         self.model_family = "mamba" if self.is_mamba else "attention"
         self.is_gpt_oss = model_type == "gpt_oss" or "gpt-oss" in model_name.lower()
+        self.is_gemma4 = model_type == "gemma4"
         self.is_moe = hasattr(self.config, "num_local_experts") or getattr(self.config, "is_moe", False)
         self.is_qwen_vl = hasattr(self.config, "mrope_section")
         self.is_qwen3_vl = self.is_qwen_vl and hasattr(
@@ -459,7 +490,8 @@ class ModelRunner:
         if hasattr(self, "graphs"):
             del self.graphs, self.graph_pool
         torch.cuda.synchronize()
-        dist.destroy_process_group()
+        if self._dist_initialized:
+            dist.destroy_process_group()
 
     # SHM layout for spin-wait signaling:
     # byte[-1] (_SHM_FLAG_OFFSET): 0=generic, 1=attn decode_greedy,
@@ -821,6 +853,9 @@ class ModelRunner:
         if self.is_deepseek_mla:
             self._allocate_mla_kv_cache()
             return
+        if getattr(self.config, "model_type", "") == "gemma4":
+            self._allocate_variable_kv_cache()
+            return
 
         free, total = torch.cuda.mem_get_info()
         used = total - free
@@ -898,6 +933,55 @@ class ModelRunner:
             module.v_cache = self.kv_cache[1, i]
 
         if self.rank == 0:
+            cfg = ATTN_BACKEND_CONFIG
+            print(f"  Attention backend: {cfg.backend} "
+                  f"(block_size={cfg.block_size}, kv_layout={cfg.kv_layout})")
+
+        if hasattr(self, '_warmup_encoder_cache'):
+            del self._warmup_encoder_cache
+            import gc
+            gc.collect()
+            torch.cuda.empty_cache()
+
+    def _allocate_variable_kv_cache(self):
+        """Allocate per-layer KV caches for models with non-uniform KV shape."""
+        free, total = torch.cuda.mem_get_info()
+        used = total - free
+        peak = torch.cuda.memory_stats()["allocated_bytes.all.peak"]
+        current = torch.cuda.memory_stats()["allocated_bytes.all.current"]
+        elem_size = torch.finfo(torch.get_default_dtype()).bits // 8
+        available_bytes = int(
+            total * self.gpu_memory_utilization - used - peak + current
+        )
+        per_block_bytes = 0
+        for layer in self._attn_layers:
+            per_block_bytes += (
+                2 * BLOCK_SIZE * layer.num_kv_heads * layer.head_size * elem_size
+            )
+        num_blocks = available_bytes // per_block_bytes
+        assert num_blocks > 0, f"Not enough GPU memory for KV cache on rank {self.rank}"
+        self.num_blocks = num_blocks
+        self.kv_cache = []
+        for layer in self._attn_layers:
+            if ATTN_BACKEND_CONFIG.kv_layout == "HND":
+                cache = torch.empty(
+                    2, num_blocks, layer.num_kv_heads, BLOCK_SIZE,
+                    layer.head_size,
+                )
+            else:
+                cache = torch.empty(
+                    2, num_blocks, BLOCK_SIZE, layer.num_kv_heads,
+                    layer.head_size,
+                )
+            layer.k_cache = cache[0]
+            layer.v_cache = cache[1]
+            self.kv_cache.append(cache)
+
+        if self.rank == 0:
+            print(
+                f"  KV cache: {num_blocks} blocks x {BLOCK_SIZE} = "
+                f"{num_blocks * BLOCK_SIZE} token slots (per-layer shapes)",
+            )
             cfg = ATTN_BACKEND_CONFIG
             print(f"  Attention backend: {cfg.backend} "
                   f"(block_size={cfg.block_size}, kv_layout={cfg.kv_layout})")
@@ -2370,8 +2454,16 @@ class ModelRunner:
         return input_ids_t, positions_t
 
     @torch.inference_mode()
+    def _compute_logits(self, hidden_states, skip_final_softcap=False):
+        if skip_final_softcap:
+            raw_logits_fn = getattr(self.model, "compute_logits_no_softcap", None)
+            if raw_logits_fn is not None:
+                return raw_logits_fn(hidden_states)
+        return self.model.compute_logits(hidden_states)
+
     def run_model(self, input_ids, positions, is_prefill, inputs_embeds=None,
-                  deepstack_embeds=None, encoder_outputs=None):
+                  deepstack_embeds=None, encoder_outputs=None,
+                  skip_final_softcap=False):
         if is_prefill or self.enforce_eager or input_ids.size(0) > self.graph_bs_list[-1]:
             # For compiled VL models, always compute inputs_embeds outside
             # the compiled graph (matching vLLM).  The compiled inner
@@ -2389,20 +2481,30 @@ class ModelRunner:
                         hidden = inner(input_ids, positions,
                                        inputs_embeds=inputs_embeds,
                                        deepstack_embeds=deepstack_embeds)
-                        return self.model.compute_logits(hidden)
-                    return self.model.compute_logits(
-                        self.model(input_ids, positions,
-                                   inputs_embeds=inputs_embeds,
-                                   deepstack_embeds=deepstack_embeds)
+                        return self._compute_logits(
+                            hidden, skip_final_softcap=skip_final_softcap,
+                        )
+                    return self._compute_logits(
+                        self.model(
+                            input_ids, positions,
+                            inputs_embeds=inputs_embeds,
+                            deepstack_embeds=deepstack_embeds,
+                        ),
+                        skip_final_softcap=skip_final_softcap,
                     )
-                return self.model.compute_logits(
-                    self.model(input_ids, positions, inputs_embeds=inputs_embeds)
+                return self._compute_logits(
+                    self.model(input_ids, positions, inputs_embeds=inputs_embeds),
+                    skip_final_softcap=skip_final_softcap,
                 )
             if encoder_outputs is not None:
-                return self.model.compute_logits(
-                    self.model(input_ids, positions, encoder_outputs=encoder_outputs)
+                return self._compute_logits(
+                    self.model(input_ids, positions, encoder_outputs=encoder_outputs),
+                    skip_final_softcap=skip_final_softcap,
                 )
-            return self.model.compute_logits(self.model(input_ids, positions))
+            return self._compute_logits(
+                self.model(input_ids, positions),
+                skip_final_softcap=skip_final_softcap,
+            )
         # Decode path: CUDA graph replay.
         # For VL models, embed_fn is recorded inside the graph — updating
         # input_ids in graph_vars is sufficient; the graph replays embed_fn
@@ -2843,11 +2945,20 @@ class ModelRunner:
         reset_context()
         return result
 
-    def run_mixed(self, prefill_seqs, prefill_chunk_sizes, decode_seqs):
+    def run_mixed(
+        self,
+        prefill_seqs,
+        prefill_chunk_sizes,
+        decode_seqs,
+        skip_final_softcap=False,
+    ):
         input_ids, positions = self.prepare_mixed_batch(
             prefill_seqs, prefill_chunk_sizes, decode_seqs,
         )
-        result = self.run_model(input_ids, positions, True)
+        result = self.run_model(
+            input_ids, positions, True,
+            skip_final_softcap=skip_final_softcap,
+        )
         reset_context()
         return result
 
@@ -3321,7 +3432,7 @@ class ModelRunner:
         # [1, 2, 4, 8, 16, 24, ..., 256, 272, ..., max_capture].
         # vLLM normally caps captures at 512, but GPT-OSS overrides this to
         # 1024 for better high-concurrency decode throughput.
-        max_capture_limit = 1024 if self.is_gpt_oss else 512
+        max_capture_limit = 1024 if (self.is_gpt_oss or self.is_gemma4) else 512
         max_capture = min(max_bs, max_capture_limit)
         self.graph_bs_list = [i for i in [1, 2, 4] if i <= max_capture]
         if max_capture >= 8:
@@ -3389,7 +3500,7 @@ class ModelRunner:
         else:
             outputs[:largest_bs] = self.model(warmup_ids, warmup_pos)
         lm_logits[:largest_bs] = lm_head.linear_op(
-            outputs[:largest_bs], lm_head.embedding_op.emb.weight).float()
+            outputs[:largest_bs], lm_head.embedding_op.emb.weight)
         lm_max_vals[:largest_bs], lm_max_idxs[:largest_bs] = \
             lm_logits[:largest_bs].max(dim=-1)
         reset_context()
@@ -3447,7 +3558,7 @@ class ModelRunner:
                 else:
                     outputs[:bs] = self.model(ids_slice, pos_slice)
                 lm_logits[:bs] = lm_head.linear_op(
-                    outputs[:bs], lm_head.embedding_op.emb.weight).float()
+                    outputs[:bs], lm_head.embedding_op.emb.weight)
                 lm_max_vals[:bs], lm_max_idxs[:bs] = lm_logits[:bs].max(dim=-1)
 
                 with torch.cuda.graph(graph, self.graph_pool):
@@ -3460,7 +3571,7 @@ class ModelRunner:
                     else:
                         outputs[:bs] = self.model(ids_slice, pos_slice)
                     lm_logits[:bs] = lm_head.linear_op(
-                        outputs[:bs], lm_head.embedding_op.emb.weight).float()
+                        outputs[:bs], lm_head.embedding_op.emb.weight)
                     lm_max_vals[:bs], lm_max_idxs[:bs] = lm_logits[:bs].max(dim=-1)
 
                 if self.graph_pool is None:
@@ -3509,6 +3620,8 @@ class LlamaEngine:
     ):
         self.model_name = model_name
         self.seed = seed
+        if max_num_batched_tokens is None and "gemma-4" in model_name.lower():
+            max_num_batched_tokens = 2048
         self.max_num_seqs = max_num_seqs if max_num_seqs is not None else _DEFAULT_MAX_NUM_SEQS
         self.max_num_batched_tokens = max_num_batched_tokens if max_num_batched_tokens is not None else _DEFAULT_MAX_NUM_BATCHED_TOKENS
         self._set_seeds(seed)
@@ -3561,7 +3674,7 @@ class LlamaEngine:
         print(f"  Scheduling: max_num_seqs={self.max_num_seqs}, "
               f"max_num_batched_tokens={self.max_num_batched_tokens}")
 
-        self.tokenizer = AutoTokenizer.from_pretrained(model_name)
+        self.tokenizer = _load_tokenizer(model_name)
         if self.tokenizer.pad_token_id is None:
             self.tokenizer.pad_token_id = self.tokenizer.eos_token_id
 
@@ -3913,6 +4026,7 @@ class LlamaEngine:
         sp_list,
         collect_logits: bool = False,
         use_tqdm: bool = False,
+        decode_text: bool = True,
     ):
         """Scheduler for Mamba / Mamba2 models.
 
@@ -4255,8 +4369,11 @@ class LlamaEngine:
         return [
             GenerationOutput(
                 prompt=(prompts[i] if isinstance(prompts[i], str) else ""),
-                generated_text=self.tokenizer.decode(
-                    all_seqs[i].generated_ids, skip_special_tokens=True,
+                generated_text=(
+                    self.tokenizer.decode(
+                        all_seqs[i].generated_ids, skip_special_tokens=True,
+                    )
+                    if decode_text else ""
                 ),
                 token_ids=all_seqs[i].generated_ids,
                 logits_history=(
@@ -4269,7 +4386,8 @@ class LlamaEngine:
     @torch.inference_mode()
     def generate(self, prompts, sampling_params, collect_logits: bool = False,
                  images=None, videos=None, audio_features=None,
-                 use_tqdm: bool = False):
+                 use_tqdm: bool = False,
+                 decode_text: bool = True):
         """Generate completions for a batch of prompts.
 
         Uses unified chunked-prefill scheduling: every GPU step processes
@@ -4295,7 +4413,7 @@ class LlamaEngine:
         if self.is_mamba:
             return self._generate_mamba(
                 prompts, sp_list, collect_logits=collect_logits,
-                use_tqdm=use_tqdm,
+                use_tqdm=use_tqdm, decode_text=decode_text,
             )
 
         eos = self.tokenizer.eos_token_id
@@ -4485,14 +4603,85 @@ class LlamaEngine:
             _pbar_pending_in = 0
             _pbar_pending_out = 0
 
+        def _prefill_blocked_by_capacity() -> bool:
+            """Whether scheduler would be unable to add prefill work now.
+
+            This lets the pure-decode fast path keep using async D2H and
+            incremental metadata while prefill queues are blocked by the
+            same capacity checks used by the scheduler below. As soon as a
+            decode finish frees enough capacity, fast decode stops and the
+            normal scheduler admits or continues prefill work.
+            """
+            if not waiting and not prefilling:
+                return True
+            if self.is_qwen_vl or self.is_whisper:
+                return False
+
+            decode_count = min(len(running), self.max_num_seqs)
+            if decode_count == 0:
+                return False
+
+            decode_need_blocks = 0
+            total_peak = 0
+            for i, seq in enumerate(running):
+                if i < decode_count and len(seq) % block_size == 1:
+                    decode_need_blocks += 1
+                total_peak += (
+                    seq.num_prompt_tokens + seq.max_tokens + block_size - 1
+                ) // block_size
+
+            free_after_decode = len(bm.free_block_ids) - decode_need_blocks
+            if free_after_decode < 0:
+                return False
+
+            token_budget = self.max_num_batched_tokens - decode_count
+            if token_budget <= 0:
+                return True
+
+            for seq in prefilling:
+                remaining = seq.num_remaining_prefill
+                if remaining <= 0:
+                    continue
+                chunk = min(remaining, token_budget)
+                if chunk <= 0:
+                    break
+                if seq.blocks_needed_for(chunk) <= free_after_decode:
+                    return False
+
+            if not waiting:
+                return True
+
+            seq = waiting[0]
+            prompt_len = seq.num_prompt_tokens
+            chunk = min(prompt_len, token_budget)
+            blocks_needed = (chunk + block_size - 1) // block_size
+            if free_after_decode < blocks_needed + watermark_blocks:
+                return True
+
+            seq_peak = (prompt_len + seq.max_tokens + block_size - 1) // block_size
+            if total_peak + seq_peak > num_blocks:
+                return True
+
+            if decode_count + 1 > self.max_num_seqs:
+                return True
+
+            return False
+
+        def _can_enter_decode_fast_path() -> bool:
+            return (
+                running
+                and use_greedy
+                and _prefill_blocked_by_capacity()
+            )
+
         while waiting or running or prefilling:
             if pbar is not None:
                 _flush_pbar()
             # =============================================================
             # FAST PATH: pure decode (most common steady-state)
-            # No waiting/prefilling seqs, so skip the full scheduler.
+            # Skip the full scheduler when no prefill can be admitted.
             # =============================================================
-            if running and not waiting and not prefilling and use_greedy:
+            if _can_enter_decode_fast_path():
                 need_blocks = 0
                 for seq in running:
                     if len(seq) % block_size == 1:
@@ -4554,7 +4743,7 @@ class LlamaEngine:
 
                         _whisper_fast = self.is_whisper
                         use_incr = True
-                        while running and not waiting and not prefilling:
+                        while _can_enter_decode_fast_path():
                             if any_finished:
                                 decode_seqs = list(running)
                                 n_dc = len(decode_seqs)
@@ -4569,7 +4758,7 @@ class LlamaEngine:
                                     need_blocks += 1
                             if need_blocks > len(bm.free_block_ids):
                                 break
-                            if os.environ.get("KB_NANO_STEP_PROFILE") == "1":
+                            if _step_profile_active:
                                 step_profile["fast_decode"] = step_profile.get("fast_decode", 0) + 1
                                 step_profile["fast_decode_tokens"] = step_profile.get("fast_decode_tokens", 0) + n_dc
                             for seq in decode_seqs:
@@ -4897,6 +5086,7 @@ class LlamaEngine:
                 else:
                     logits = self.model_runner.call(
                         "run_mixed", prefill_seqs, prefill_chunk_sizes, [],
+                        use_greedy and not collect_logits,
                     )
                 if logits is not None:
                     self._process_prefill_logits(
@@ -4937,6 +5127,7 @@ class LlamaEngine:
                 else:
                     logits = self.model_runner.call(
                         "run_mixed", prefill_seqs, prefill_chunk_sizes, decode_seqs,
+                        use_greedy and not collect_logits,
                     )
                 if logits is not None:
                     pf_logits = logits[:n_pf]
@@ -4992,8 +5183,11 @@ class LlamaEngine:
         return [
             GenerationOutput(
                 prompt=(prompts[i] if isinstance(prompts[i], str) else ""),
-                generated_text=self.tokenizer.decode(
-                    all_seqs[i].generated_ids, skip_special_tokens=True,
+                generated_text=(
+                    self.tokenizer.decode(
+                        all_seqs[i].generated_ids, skip_special_tokens=True,
+                    )
+                    if decode_text else ""
                 ),
                 token_ids=all_seqs[i].generated_ids,
                 logits_history=(

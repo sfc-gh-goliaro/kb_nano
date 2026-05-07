@@ -194,7 +194,8 @@ def auto_register_no_compile_layers(model: "nn.Module") -> None:
     fully-qualified prefix so custom ops can find them at runtime.
 
     Recognized types (by class name to avoid circular imports):
-      - ``Qwen3MoE``, ``MixtralMoE``, ``GptOssMoE``, ``DeepSeekMoE`` (MoE blocks)
+      - ``Qwen3MoE``, ``MixtralMoE``, ``GptOssMoE``, ``DeepSeekMoE``,
+        ``Gemma4MoE``                                               (MoE blocks)
       - ``Attention``, ``MLAAttention``, ``SparseAttnIndexer``       (attention impls)
       - ``Mamba2Mixer``                                              (Mamba2 compile boundary)
 
@@ -202,7 +203,7 @@ def auto_register_no_compile_layers(model: "nn.Module") -> None:
     ``_use_custom_op`` remains ``False`` until compilation is enabled.
     """
     _TARGET_NAMES = {
-        "Qwen3MoE", "MixtralMoE", "GptOssMoE", "DeepSeekMoE",
+        "Qwen3MoE", "MixtralMoE", "GptOssMoE", "DeepSeekMoE", "Gemma4MoE",
         "Attention", "MLAAttention", "SparseAttnIndexer",
         "Mamba2Mixer",
     }

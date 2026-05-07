@@ -253,6 +253,39 @@ _DEFAULT_CONFIG_HEURISTIC = {
 }
 
 
+def _get_vllm_default_config(M: int, E: int = 0, dtype: str | None = None) -> dict:
+    """vLLM-style BF16/FP16 MoE defaults.
+
+    Gemma4's BF16 top-8 experts are much closer to vLLM's generic MoE path
+    than to the older kb-nano heuristic, especially in decode where tokens are
+    spread thinly across 128 experts.
+    """
+    if M <= 32:
+        block_m = 16
+    elif M <= 96:
+        block_m = 32
+    elif M <= 1024:
+        block_m = 64
+    else:
+        block_m = 128
+
+    block_n = 64 if M <= 64 else 128
+    block_k = 128 if dtype == "fp8_w8a8" or M <= 64 else 64
+    tokens_per_expert = M // max(E, 1)
+    group_m = 16 if tokens_per_expert > 128 else 1
+    num_warps = 4 if M <= 1024 else 8
+    num_stages = 4 if M <= 32 else 3
+
+    return {
+        "BLOCK_SIZE_M": block_m,
+        "BLOCK_SIZE_N": block_n,
+        "BLOCK_SIZE_K": block_k,
+        "GROUP_SIZE_M": group_m,
+        "num_warps": num_warps,
+        "num_stages": num_stages,
+    }
+
+
 def _get_default_config(M: int, E: int = 0, N: int = 0,
                         block_shape: list[int] | None = None) -> dict:
     if M <= 4:
@@ -264,7 +297,8 @@ def _get_default_config(M: int, E: int = 0, N: int = 0,
 
 def get_triton_config(M: int, w1_shape: tuple[int, ...], w2_shape: tuple[int, ...],
                       top_k: int, use_fp8: bool,
-                      block_shape: list[int] | None = None) -> dict:
+                      block_shape: list[int] | None = None,
+                      default_style: str = "legacy") -> dict:
     """Select best Triton kernel config, preferring JSON tuning files."""
     E, _, N = w2_shape
     dtype = "fp8_w8a8" if use_fp8 else None
@@ -276,6 +310,10 @@ def get_triton_config(M: int, w1_shape: tuple[int, ...], w2_shape: tuple[int, ..
         config = configs[min(configs.keys(), key=lambda x: abs(x - M))]
         return dict(config)
 
+    if default_style == "vllm":
+        return _get_vllm_default_config(M, E, dtype)
+    if default_style != "legacy":
+        raise ValueError(f"Unknown MoE config style: {default_style}")
     return _get_default_config(M, E, N, block_shape)
 
 

@@ -85,6 +85,23 @@ def _moe_forward_fake(
     return torch.empty_like(hidden_states)
 
 
+def _gemma4_moe_forward_impl(
+    hidden_states: torch.Tensor,
+    router_logits: torch.Tensor,
+    layer_name: str,
+) -> torch.Tensor:
+    layer = get_no_compile_layers()[layer_name]
+    return layer.forward_impl(hidden_states, router_logits)
+
+
+def _gemma4_moe_forward_fake(
+    hidden_states: torch.Tensor,
+    router_logits: torch.Tensor,
+    layer_name: str,
+) -> torch.Tensor:
+    return torch.empty_like(hidden_states)
+
+
 def _unified_attention_impl(
     query: torch.Tensor,
     key: torch.Tensor,
@@ -189,6 +206,14 @@ def ensure_custom_ops_registered() -> None:
 
     abstract_lib = torch.library.Library("kb_nano", "IMPL", "Meta")
     abstract_lib.impl("moe_forward", _moe_forward_fake)
+
+    lib.define(
+        "gemma4_moe_forward(Tensor hidden_states, Tensor router_logits, "
+        "str layer_name) -> Tensor"
+    )
+    lib.impl("gemma4_moe_forward", _gemma4_moe_forward_impl, "CUDA")
+    lib.impl("gemma4_moe_forward", _gemma4_moe_forward_impl, "CPU")
+    abstract_lib.impl("gemma4_moe_forward", _gemma4_moe_forward_fake)
 
     lib.define(
         "unified_attention(Tensor query, Tensor key, Tensor value, "
