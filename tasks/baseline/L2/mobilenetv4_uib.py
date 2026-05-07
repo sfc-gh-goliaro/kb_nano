@@ -17,6 +17,10 @@ from __future__ import annotations
 import torch
 import torch.nn as nn
 
+from ..L1.batch_norm2d import BatchNorm2d
+from ..L1.conv2d import Conv2d
+from ..L1.relu import ReLU
+
 
 def _make_divisible(v: float, divisor: int = 8) -> int:
     """Round a value to the nearest multiple of divisor."""
@@ -43,15 +47,15 @@ class ConvNormAct(nn.Module):
         apply_act: bool = True,
     ):
         super().__init__()
-        self.conv = nn.Conv2d(
+        self.conv = Conv2d(
             in_chs, out_chs, kernel_size,
             stride=stride,
             padding=kernel_size // 2,
             groups=groups,
             bias=False,
         )
-        self.bn = nn.BatchNorm2d(out_chs)
-        self.act = nn.ReLU(inplace=True) if apply_act else nn.Identity()
+        self.bn = BatchNorm2d(out_chs)
+        self.act = ReLU() if apply_act else nn.Identity()
 
     def forward(self, x: torch.Tensor) -> torch.Tensor:
         return self.act(self.bn(self.conv(x)))
