@@ -1326,6 +1326,17 @@ def load_model(
             "kb_nano.infra.tts_engine.TTSEngine, "
             "not the LLM load_model() path."
         )
+    if model_type == "jamba":
+        # Jamba is a hybrid transformer+Mamba+MoE model that does not
+        # plug into the paged-KV LlamaEngine cleanly: every batch needs
+        # both a KV slab AND per-sequence Mamba selective-scan state.
+        # ``infra.jamba_engine.JambaEngine`` owns that wiring (Pattern 2,
+        # per-pipeline weight loader documented in CLAUDE.md).
+        raise ValueError(
+            "Jamba models should be loaded via "
+            "kb_nano.infra.jamba_engine.JambaEngine, "
+            "not the LLM load_model() path."
+        )
     if model_type == "gpt_oss":
         from ..tasks.baseline.L4.gpt_oss import GptOssConfig, GptOssForCausalLM
         config = GptOssConfig.from_pretrained(model_name)

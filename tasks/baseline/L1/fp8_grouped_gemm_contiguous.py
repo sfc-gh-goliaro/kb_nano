@@ -23,7 +23,15 @@ import os
 import torch
 import torch.nn as nn
 
-import deep_gemm
+# Lazy import: DeepGEMM is only required for the FP8 path on Hopper+
+# GPUs.  Skipping it lets BF16 codepaths import this module on systems
+# (or branches) where DeepGEMM isn't installed.
+try:
+    import deep_gemm
+    _HAS_DEEP_GEMM = True
+except ImportError:  # pragma: no cover
+    deep_gemm = None  # type: ignore[assignment]
+    _HAS_DEEP_GEMM = False
 
 
 @functools.cache

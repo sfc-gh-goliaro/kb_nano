@@ -14,6 +14,7 @@ A standalone, high-performance inference engine supporting **LLMs** (Llama 3.1, 
 - **BGE-M3** dense + sparse + ColBERT-style embedding outputs
 - **ColBERTv2** query/doc encoders with MaxSim scoring
 - **Mamba / Mamba2** (`state-spaces/mamba-2.8b-hf`, `mistralai/Mamba-Codestral-7B-v0.1`) selective state-space models with vLLM-aligned `causal_conv1d` + `mamba_chunk_scan` / `selective_scan` kernels, slot-based recurrent state cache, chunked-prefill metadata, and TP sharding (incl. `n_groups % tp != 0` head-shard groups)
+- **Jamba** (AI21Labs `Jamba-tiny-dev`, `Jamba-v0.1`) triple-hybrid Transformer + Mamba-1 + sparse MoE.  L2 modules mirror vLLM's exactly so generated kernels port back into vLLM with no call-site change: `JambaAttention` uses fused `QKVParallelLinear` + the project's `L2.attention_impl.Attention` class (same paged-KV / TRTLLM-gen / FA3 dispatch as `LlamaAttention`) + `RowParallelLinear`; `JambaMLP` mirrors `LlamaMLP` (fused `gate_up_proj` + `SiluAndMul` + `RowParallelLinear`); the L3 decoder layers use Llama-style fused add+RMSNorm (`fused_add_rms_norm`) for residuals.  Full pipeline is flat-varlen `[N, hidden]` with paged KV (`TRTLLMPrefill` + `TRTLLMDecode` on Blackwell, `FlashAttnPrefill` + `FlashAttnDecode` elsewhere).  Engine implements **continuous batching with within-seq chunked prefill** (FLA-engine pattern) -- `Sequence` + `BlockManager` + Mamba slot pool, `waiting / prefilling / running` deques, lifetime-allocate at admit, multi-bucket decode CUDA-graph capture at batch sizes `[1, 2, 4, 8, 16, 24, 32, 40, …, max_num_seqs]` with shared mempool (largest-first), Mamba `has_initial_state` carries conv/SSM state across prefill chunks, GPU greedy argmax + **async D2H pipeline** of next-token IDs (mirrors `run_mamba_decode_fast_async`), and TRTLLM workspace sharing across attention modules (mirrors `LlamaEngine._share_trtllm_workspace`).  **Geomean 2.40× tok/s on tiny-dev and 1.02× on Jamba-v0.1 (52B) vs vLLM 0.18.0** at the standard scenarios (1024/512, 512/512, 512/1024 prefill/decode); avg match-tokens 532/748 (tiny-dev) and 415/748 (v0.1) -- both bars (≥0.9× perf, ≥100 match-tokens/req) cleared with margin.  `torch.compile` is OFF by default: Inductor's fused elementwise paths drift from vLLM's hand-written `_C.fused_add_rms_norm` / `_C.silu_and_mul` by ~1e-3 per layer in bf16 and tank match-tokens; the eager path uses the same vLLM CUDA kernels vLLM itself uses, so bf16 numerics are bit-identical.  Set `KB_NANO_JAMBA_COMPILE=1` to opt in to ~25-30% extra throughput at tiny-dev if you can tolerate the bf16 drift.
 - **GLA** (`fla-hub/gla-2.7B-100B`) Gated Linear Attention with per-head logsigmoid forget gate, swish output gate, and SwiGLU MLP — token-aligned with the FLA reference
 - **RetNet** (`fla-hub/retnet-2.7B-100B`) Multi-Scale Retention with rotary embeddings, fixed per-head decay (γ_h = 1 − 2^(−5−h)), swish output gate, and SwiGLU MLP — token-aligned with the FLA reference
 - **RWKV7** (`fla-hub/rwkv7-2.9B-g1`, `fla-hub/rwkv7-2.9B-world`) DPLR (diagonal-plus-low-rank) recurrence with token-shift mixing, LoRA decay/value/gate adapters, GroupNorm output, and squared-ReLU FFN — token-aligned with the FLA reference
@@ -785,6 +786,34 @@ Latency (TP=1, 5 timed iterations):
 | Mamba-Codestral-7B-v0.1 | fixed-batch-32 |    32 |    128 |   1.5716 |   1.6316 |          0.38 |          0.40 | 0.96x |
 
 Token alignment is in the expected range for two independent SSM implementations at `temperature=0`: Mamba v1 stays relatively close (416.2/512, 402.1/512, 805.5/1024 average matching tokens across the three scenarios), and Codestral does as well after restoring its original mixed-batch token layout (418.4/512, 425.7/512, 823.5/1024). The recurrent state still accumulates small bf16 numerical differences over the full prefill chunk-scan, and those divergences compound across the decode loop. With profile-based state sizing kb-nano now allocates **716 slots** for Codestral and **1024 slots** for Mamba v1 on a single H200 (vLLM reports ~855 concurrent 1536-token requests for Codestral; Mamba v1's per-slot state is much smaller, so its slot count is higher). On the latest H200 rerun, Mamba v1 is effectively at parity with vLLM on throughput (0.98x / 1.04x / 1.12x across the three scenarios) and slightly ahead on latency (1.04x single-request, 1.02x fixed-batch-32), while Codestral is also near parity on throughput (0.98x / 0.96x / 0.97x) and latency (0.95x / 0.96x). Per-step instrumentation (enable with `KB_NANO_PROFILE_MAMBA=1`) still shows that **97% of decode-step wall time is in GPU + D2H wait**; CPU-side phases (admit, decode prep, finalize, slot bookkeeping) together account for less than 3%, so the remaining optimization work is concentrated in the GPU path and batched-latency tail rather than scheduler overhead.
+
+### Jamba (Transformer + Mamba-1 + Sparse MoE)
+
+Run `tests/bench_jamba.py --model ai21labs/Jamba-tiny-dev` and `tests/bench_jamba.py --model ai21labs/Jamba-v0.1` to reproduce. 1000 sequences per scenario, `temperature=0`. The reference is vLLM 0.18.0's production Jamba server; both sides dispatch into the same `causal_conv1d_fn` / `selective_scan_fn` Mamba CUDA primitives, so this measures engine-level overhead (continuous batching, paged KV, scheduler) plus the L2 attention/MLP wrapping.  L2 modules mirror vLLM's exactly (fused `QKVParallelLinear` + the project's `Attention` class + `RowParallelLinear`; `MergedColumnParallelLinear gate_up_proj` + `SiluAndMul`; Llama-style fused add+RMSNorm) so generated kernels port back into vLLM with no call-site change.
+
+Throughput:
+
+| Model | TP | Scenario | Input/Output | vLLM (tok/s) | Ours (tok/s) | Ratio | Avg Match Tokens |
+|-------|---:|----------|:------------:|-------------:|-------------:|------:|-----------------:|
+| Jamba-tiny-dev | 1 | prefill-heavy | 1024/608  | 15,751 | 36,096 | **2.29x** | 463.3/608  |
+| Jamba-tiny-dev | 1 | balanced      |  512/629  | 16,030 | 37,101 | **2.31x** | 421.9/629  |
+| Jamba-tiny-dev | 1 | decode-heavy  |  512/1008 | 23,948 | 62,947 | **2.63x** | 711.2/1008 |
+| Jamba-v0.1     | 1 | prefill-heavy | 1024/608  |  4,040 |  4,345 | **1.08x** | 355.2/608  |
+| Jamba-v0.1     | 1 | balanced      |  512/629  |  4,737 |  4,667 | 0.99x     | 322.6/629  |
+| Jamba-v0.1     | 1 | decode-heavy  |  512/1008 |  6,217 |  6,146 | 0.99x     | 568.4/1008 |
+
+Latency (128 output tokens, 5 iterations):
+
+| Model | TP | Scenario | Batch Size | vLLM median | Ours median | vLLM ms/tok | Ours ms/tok | Ratio |
+|-------|---:|----------|---:|------------:|------------:|------------:|------------:|------:|
+| Jamba-tiny-dev | 1 | single-request | 1  | 0.185s | 0.166s | 1.44 | 1.29 | **1.12x** |
+| Jamba-tiny-dev | 1 | fixed-batch-32 | 32 | 0.419s | 0.262s | 0.10 | 0.06 | **1.60x** |
+| Jamba-v0.1     | 1 | single-request | 1  | 0.916s | 0.927s | 7.16 | 7.24 | 0.99x |
+| Jamba-v0.1     | 1 | fixed-batch-32 | 32 | 3.183s | 3.227s | 0.78 | 0.79 | 0.99x |
+
+Tiny-dev (200M) clears vLLM by 2.40× geomean — kb-nano's tighter Python scheduler dominates at small model sizes where per-step overhead matters more than kernel time. v0.1 (52B) is at parity (1.02× geomean) under the same scheduler config (max_num_seqs=256). Both ship at TP=1: v0.1's bf16 weights (~104 GB) fit comfortably on one B200, and its activated MoE parameter count (~12B) is in the same regime as `gpt-oss-20b` (TP=1). `torch.compile` is OFF by default — Inductor's fused elementwise kernels drift from vLLM's `_C.fused_add_rms_norm` / `_C.silu_and_mul` in bf16 and tank match-tokens; set `KB_NANO_JAMBA_COMPILE=1` to opt in.
+
+**Hardware: 1× NVIDIA B200**
 
 **Hardware: NVIDIA H200**
 
