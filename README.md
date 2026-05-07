@@ -1141,6 +1141,60 @@ Correctness (deterministic, all queries across all scenarios):
 
 Both engines run identical model code with the same pretrained weights and deterministic seeding, achieving bitwise reproducibility (100% correctness pass rate). The throughput advantage comes from vectorized block conversion utilities (`torch.gather`-based) in the atom attention module, replacing Python for-loops in the reference implementation.
 
+### EAGLE-3 Speculative Decoding (Llama 3.1 8B)
+
+Run `tests/bench_sglang.py` to reproduce. Target model: `meta-llama/Llama-3.1-8B-Instruct`. Draft model: `jamesliu1/sglang-EAGLE3-Llama-3.1-Instruct-8B`. Reference engine: `sglang` v2 with EAGLE-3 enabled. Sampling is greedy (temperature 0). The measured workload below uses the real WildChat-derived dataset `sfc-gh-goliaro/wildchat-kb-nano-balanced-1k`, with the target model's chat template applied before tokenization.
+
+```bash
+python tests/bench_sglang.py \
+  --sglang-python /path/to/sglang/env/bin/python \
+  --workload wildchat \
+  --scenario balanced \
+  --num-seqs 1000 \
+  --max-running-requests 4 \
+  --cuda-graph-max-bs 4 \
+  --spec-num-draft-tokens 8 \
+  --skip-latency \
+  --output-dir tests/results/H200/eagle3_wildchat_balanced_1000seqs_b4_n8
+```
+
+Rank alignment is scored by feeding `prompt + generated_tokens` back through a target-only `sglang` engine and measuring each generated token's rank under the reference target logits:
+
+```bash
+python tests/score_sglang_rank_alignment.py \
+  --sglang-python /path/to/sglang/env/bin/python \
+  --workload wildchat \
+  --scenario balanced \
+  --num-seqs 1000 \
+  --max-running-requests 4 \
+  --cuda-graph-max-bs 4 \
+  --top-k 20 \
+  --output-dir tests/results/H200/eagle3_wildchat_balanced_1000seqs_b4_n8
+```
+
+**Hardware: NVIDIA H200**
+
+Throughput (1000 real WildChat requests, average input/output length 509.5/510.6 tokens):
+
+| Scenario | Dataset | Batch | Draft tokens | sglang (tok/s) | kb-nano (tok/s) | Speedup |
+|----------|---------|------:|-------------:|---------------:|----------------:|--------:|
+| wildchat-balanced-1000seqs | `sfc-gh-goliaro/wildchat-kb-nano-balanced-1k` | 4 | 8 | 948.8 | 931.5 | **0.98x** |
+
+Greedy-output alignment vs `sglang`:
+
+| Scenario | Exact matches | Avg match tokens / request | Result |
+|----------|--------------:|---------------------------:|:-------|
+| wildchat-balanced-1000seqs | 157/1000 | 230.3/510.6 | **PASS** |
+
+Target-rank alignment (`top_k=20`, scored by target-only `sglang`):
+
+| Outputs scored | Tokens | Top-1 | Top-5 | Top-20 | MRR | Median rank | Worst rank |
+|----------------|-------:|------:|------:|-------:|----:|------------:|-----------:|
+| sglang self | 510,621 | 99.30% | 100.00% | 100.00% | 0.9965 | 1 | 4 |
+| kb-nano | 510,621 | 99.24% | 100.00% | 100.00% | 0.9961 | 1 | 4 |
+
+The current implementation uses CUDA graphs for target verify, draft-chain, and post-verify draft-extend. The tree build path fuses verification-tree construction with FA3 cascade metadata generation and writes verify metadata directly into graph-owned buffers. Greedy strings can diverge after close-logit argmax flips, so the target-rank scorer is the stricter alignment check: kb-nano's generated tokens have effectively the same target-rank distribution as `sglang`'s own generated tokens on this workload.
+
 ### Key optimizations
 
 - **Fused RMSNorm**: Uses `sgl_kernel`'s fused residual-add + RMSNorm CUDA kernel, eliminating multiple kernel launches per norm call

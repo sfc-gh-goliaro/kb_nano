@@ -36,7 +36,13 @@ def _terminate_process_group(pid: int) -> None:
         pass
 
 
-def run_worker(script: str, config: dict, label: str, timeout: int = 3600) -> dict | None:
+def run_worker(
+    script: str,
+    config: dict,
+    label: str,
+    timeout: int = 3600,
+    python_executable: str | None = None,
+) -> dict | None:
     """Run a worker script in a subprocess and return parsed JSON output.
 
     Args:
@@ -45,11 +51,23 @@ def run_worker(script: str, config: dict, label: str, timeout: int = 3600) -> di
                 An ``output_file`` key is added automatically.
         label: Human-readable label printed before/after execution.
         timeout: Maximum wall-clock seconds before the subprocess is killed.
+        python_executable: Path to the Python interpreter to invoke. Defaults
+            to ``sys.executable``. Use this to run a worker in a different
+            conda env (e.g. an isolated env where sglang is installed so its
+            torch/CUDA versions do not contaminate the parent env).
 
     Returns:
         Parsed JSON dict written by the worker to ``output_file``, or None on
         failure.
     """
+    py = python_executable or sys.executable
+    if not os.path.exists(py):
+        print(
+            f"  ERROR: {label} -- python interpreter not found: {py}\n"
+            f"         (set --sglang-python or create the env)"
+        )
+        return None
+
     with tempfile.NamedTemporaryFile(
         mode="w", suffix=".py", delete=False, dir="/tmp",
     ) as f:
@@ -69,10 +87,11 @@ def run_worker(script: str, config: dict, label: str, timeout: int = 3600) -> di
     try:
         print(f"\n{'─' * 70}")
         print(f"  {label}")
+        print(f"  python: {py}")
         print(f"{'─' * 70}", flush=True)
 
         proc = subprocess.Popen(
-            [sys.executable, "-u", script_path, config_path],
+            [py, "-u", script_path, config_path],
             start_new_session=True,
         )
         try:
