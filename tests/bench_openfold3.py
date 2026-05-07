@@ -640,6 +640,17 @@ def main():
     pkg = cfg["package_name"]
     engine_label = cfg.get("engine_label", "engine")
 
+    if cfg.get("pytorch_reference", False):
+        from kb_nano.infra.kernel_swapper import (
+            apply_candidates,
+            discover_references,
+            print_reference_summary,
+        )
+        references = discover_references()
+        if references:
+            print_reference_summary(references)
+            apply_candidates(references)
+
     seed = cfg.get("seed", 42)
     import random as _random
     _random.seed(seed)
@@ -932,6 +943,10 @@ def main():
     parser.add_argument("--seed", type=int, default=42)
     parser.add_argument("--skip-reference", action="store_true",
                         help="Skip reference openfold3 (kb-nano only)")
+    parser.add_argument(
+        "--pytorch-reference", action="store_true", default=False,
+        help="Patch semantic PyTorch references from tasks/reference/L*/ into kb-nano.",
+    )
     parser.add_argument("--skip-throughput", action="store_true")
     parser.add_argument("--skip-latency", action="store_true")
     parser.add_argument("--latency-iters", type=int, default=3)
@@ -1026,7 +1041,11 @@ def main():
     }
 
     # ---- Run kb-nano ----
-    kb_config = {**base_config, "engine_label": "kb-nano"}
+    kb_config = {
+        **base_config,
+        "engine_label": "kb-nano",
+        "pytorch_reference": args.pytorch_reference,
+    }
     kb_raw = run_worker(
         KB_NANO_OF3_WORKER, kb_config,
         "kb-nano OpenFold3 — all scenarios (real MSA data)", timeout=7200,

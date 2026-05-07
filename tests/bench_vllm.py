@@ -413,6 +413,16 @@ def main():
     sys.path.insert(0, cfg["project_root"])
     pkg = cfg["package_name"]
 
+    if cfg.get("pytorch_reference", False):
+        swapper = __import__(
+            f"{pkg}.infra.kernel_swapper",
+            fromlist=["apply_candidates", "discover_references", "print_reference_summary"],
+        )
+        references = swapper.discover_references()
+        if references:
+            swapper.print_reference_summary(references)
+            swapper.apply_candidates(references)
+
     mod = __import__(f"{pkg}.infra.engine", fromlist=["LlamaEngine", "SamplingParams"])
     LlamaEngine, SamplingParams = mod.LlamaEngine, mod.SamplingParams
 
@@ -918,6 +928,16 @@ def main():
     sys.path.insert(0, cfg["project_root"])
     pkg = cfg["package_name"]
 
+    if cfg.get("pytorch_reference", False):
+        swapper = __import__(
+            f"{pkg}.infra.kernel_swapper",
+            fromlist=["apply_candidates", "discover_references", "print_reference_summary"],
+        )
+        references = swapper.discover_references()
+        if references:
+            swapper.print_reference_summary(references)
+            swapper.apply_candidates(references)
+
     from transformers import AutoProcessor
     processor = AutoProcessor.from_pretrained(
         cfg["model"], trust_remote_code=True)
@@ -1320,6 +1340,16 @@ def main():
     sys.path.insert(0, cfg["project_root"])
     pkg = cfg["package_name"]
 
+    if cfg.get("pytorch_reference", False):
+        swapper = __import__(
+            f"{pkg}.infra.kernel_swapper",
+            fromlist=["apply_candidates", "discover_references", "print_reference_summary"],
+        )
+        references = swapper.discover_references()
+        if references:
+            swapper.print_reference_summary(references)
+            swapper.apply_candidates(references)
+
     mod = __import__(f"{pkg}.infra.engine", fromlist=["LlamaEngine", "SamplingParams"])
     LlamaEngine, SamplingParams = mod.LlamaEngine, mod.SamplingParams
 
@@ -1539,6 +1569,10 @@ def main():
         "--scenario", type=str, default=None,
         help="Run only the throughput scenario with this name (e.g. "
              "'balanced'). Default: run all scenarios for the model type.",
+    )
+    parser.add_argument(
+        "--pytorch-reference", action="store_true", default=False,
+        help="Patch semantic PyTorch references from tasks/reference/L*/ into kb-nano.",
     )
     args = parser.parse_args()
 
@@ -1842,6 +1876,7 @@ def main():
         "package_name": package_name,
         "scenarios": scenario_data,
         "latency_scenarios": latency_data,
+        "pytorch_reference": args.pytorch_reference,
     }
     short_name = args.model.split("/")[-1]
     os.environ["MASTER_ADDR"] = "127.0.0.1"
