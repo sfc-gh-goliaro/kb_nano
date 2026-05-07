@@ -1,11 +1,17 @@
-"""Conv1d parametric op wrapping F.conv1d.
+"""Conv1d parametric op with direct ``weight``/``bias`` (state_dict-compat with nn.Conv1d).
 
-Mirrors :class:`L1.conv2d.Conv2d` for the 1-D case.  Stores ``weight`` and
-``bias`` as direct ``nn.Parameter`` attributes (not nested under
-``self.conv`` like the older :class:`L1.conv1d.Conv1d` Whisper wrapper),
-so a state_dict from a reference model that uses ``nn.Conv1d`` directly
-loads with no parameter-name remapping (``block.0.weight`` /
-``block.0.bias`` etc.).
+DP3-specific. Mirrors :class:`L1.conv2d.Conv2d` for the 1-D case. Stores
+``weight`` and ``bias`` as direct ``nn.Parameter`` attributes (not nested under
+``self.conv`` like :class:`L1.conv1d.Conv1d`), so a state_dict from a reference
+model that uses ``nn.Conv1d`` directly loads with no parameter-name remapping
+(``block.0.weight`` / ``block.0.bias`` etc.).
+
+For full HF-coverage drop-in compatibility (with kwargs ``groups``,
+``dilation``, ``padding_mode``), see :class:`L1.conv1d.Conv1d` — that's the
+canonical map target for HF audit's `conv1d` op. This wrapper is NOT a
+superset; it lacks ``padding_mode``. It is the right choice for DP3's 1-D
+U-Net upsampling block where state_dict naming matters and padding_mode
+isn't needed.
 """
 
 from __future__ import annotations

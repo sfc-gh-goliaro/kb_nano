@@ -20,6 +20,7 @@ Validation pass:
 from __future__ import annotations
 
 import csv
+import re
 import sys
 from collections import Counter, defaultdict
 from pathlib import Path
@@ -179,7 +180,74 @@ def normalize_row(r: dict) -> dict:
                 l4_entry = f"{fld}_l4→{l4_path.relative_to(KB_REPO)}"
                 r["mapped_kb_nano"] = (cur_mapped + ";" + l4_entry).strip(";") if cur_mapped else l4_entry
 
+    # Persistent stale-prose cleanup for composable rows. Rewrite known stale
+    # phrases (left over from the original audit pass before v3 added L1 wrappers)
+    # into current-state language. Idempotent: applies on every regeneration.
+    if r.get("support_status") == "composable":
+        notes = r.get("notes", "") or ""
+        if notes:
+            for pat, repl in _STALE_PROSE_REWRITES:
+                notes = pat.sub(repl, notes)
+            # Drop leftover "— partial; ..." or "— partial." qualifiers (the row is now composable)
+            notes = re.sub(r"\s+—\s+partial(?:\s*;\s*|\s*\.\s*|\s*$)", " ", notes)
+            notes = re.sub(r"\(no L1[^)]*\)", "", notes)
+            notes = re.sub(r"\(no kb-nano L1[^)]*\)", "", notes)
+            # Drop common stale phrases anywhere they appear (greedy across sentence boundaries)
+            notes = re.sub(r"partial via torch\.nn fallback per (?:kb-nano convention|pilot convention[^.]*)\.?", "", notes)
+            notes = re.sub(r"\bpartial via torch\.nn fallback\b\.?", "", notes)
+            notes = re.sub(r"\bpartial per pilot convention[^.;,]*\.?", "", notes)
+            notes = re.sub(r"\bhas no L1 kernel\b\.?", "(now has L1 kernel in audit branch)", notes)
+            notes = re.sub(r"\bUNSUPPORTED on origin/experiments\b", "added in audit branch", notes)
+            # Stray "treated as" leftover after "partial via torch.nn fallback" stripped
+            notes = re.sub(r"treated as\s+\.", "", notes)
+            notes = re.sub(r"treated as\s*$", "", notes)
+            # Whitespace + dangling punctuation cleanup
+            notes = re.sub(r"\s*\(\s*\)", "", notes)
+            notes = re.sub(r"\s*;\s*\)", ")", notes)
+            notes = re.sub(r"\s+", " ", notes).strip()
+            r["notes"] = notes
+
     return r
+
+
+# Stale-prose rewrites: applied to every composable row's notes during merge.
+# Each entry is (compiled_regex, replacement_string).
+_STALE_PROSE_REWRITES = [
+    (re.compile(r"(?i)nn\.AdaptiveAvgPool2d[^.;,\n]*?(no L1 kernel|partial via torch\.nn|partial per pilot)[^.;,\n]*"),
+     "nn.AdaptiveAvgPool2d (covered by tasks/baseline/L1/adaptive_avg_pool2d.py:AdaptiveAvgPool2d)"),
+    (re.compile(r"(?i)nn\.AdaptiveAvgPool1d[^.;,\n]*?(no L1 kernel|partial via torch\.nn|partial per pilot)[^.;,\n]*"),
+     "nn.AdaptiveAvgPool1d (covered by tasks/baseline/L1/adaptive_avg_pool1d.py:AdaptiveAvgPool1d)"),
+    (re.compile(r"(?i)nn\.ConvTranspose2d[^.;,\n]*?(no L1 kernel|partial via torch\.nn|partial per pilot)[^.;,\n]*"),
+     "nn.ConvTranspose2d (covered by tasks/baseline/L1/conv_transpose2d.py:ConvTranspose2d)"),
+    (re.compile(r"(?i)nn\.ConvTranspose1d[^.;,\n]*?(no L1 kernel|partial via torch\.nn|partial per pilot)[^.;,\n]*"),
+     "nn.ConvTranspose1d (covered by tasks/baseline/L1/conv_transpose1d.py:ConvTranspose1d)"),
+    (re.compile(r"(?i)nn\.BatchNorm1d[^.;,\n]*?(no L1 kernel|partial via torch\.nn|partial per pilot)[^.;,\n]*"),
+     "nn.BatchNorm1d (composable via kb-nano BatchNorm2d, rank-agnostic)"),
+    (re.compile(r"(?i)nn\.BatchNorm3d[^.;,\n]*?(no L1 kernel|partial via torch\.nn|partial per pilot)[^.;,\n]*"),
+     "nn.BatchNorm3d (composable via kb-nano BatchNorm2d, rank-agnostic)"),
+    (re.compile(r"(?i)nn\.MaxPool1d[^.;,\n]*?(no L1 kernel|partial via torch\.nn|partial per pilot)[^.;,\n]*"),
+     "nn.MaxPool1d (covered by tasks/baseline/L1/max_pool1d.py:MaxPool1d)"),
+    (re.compile(r"(?i)nn\.AvgPool1d[^.;,\n]*?(no L1 kernel|partial via torch\.nn|partial per pilot)[^.;,\n]*"),
+     "nn.AvgPool1d (covered by tasks/baseline/L1/avg_pool1d.py:AvgPool1d)"),
+    (re.compile(r"(?i)nn\.LSTM[^.;,\n]*?(no L1|partial via torch\.nn|partial per pilot)[^.;,\n]*"),
+     "nn.LSTM (covered by tasks/baseline/L1/lstm.py:LSTM)"),
+    (re.compile(r"(?i)nn\.MultiheadAttention[^.;,\n]*?(no L1 wrapper|partial via torch\.nn|partial per pilot)[^.;,\n]*"),
+     "nn.MultiheadAttention (composable via 3xLinear + DenseAttention + Linear; per mentor: no L2 wrapper)"),
+    (re.compile(r"(?i)multihead_attention\s*\([^)]*no L1 wrapper[^)]*\)"),
+     "multihead_attention (composable via 3xLinear + DenseAttention + Linear)"),
+    (re.compile(r"(?i)chunk_gated_delta_rule\s*\(\s*no L1 wrapper[^)]*\)"),
+     "chunk_gated_delta_rule (covered by tasks/baseline/L1/chunk_gated_delta_rule.py:ChunkGatedDeltaRule)"),
+    (re.compile(r"(?i)nn\.LeakyReLU[^.;,\n]*?(no L1|partial via torch\.nn)[^.;,\n]*"),
+     "nn.LeakyReLU (covered by tasks/baseline/L1/leaky_relu.py:LeakyReLU)"),
+    (re.compile(r"(?i)nn\.ELU\b[^.;,\n]*?(no L1|partial via torch\.nn)[^.;,\n]*"),
+     "nn.ELU (covered by tasks/baseline/L1/elu.py:ELU)"),
+    (re.compile(r"(?i)nn\.Hardsigmoid[^.;,\n]*?(no L1|partial via torch\.nn)[^.;,\n]*"),
+     "nn.Hardsigmoid (covered by tasks/baseline/L1/hardsigmoid.py:Hardsigmoid)"),
+    (re.compile(r"(?i)nn\.Hardswish[^.;,\n]*?(no L1|partial via torch\.nn)[^.;,\n]*"),
+     "nn.Hardswish (covered by tasks/baseline/L1/hardswish.py:Hardswish)"),
+    (re.compile(r"(?i)F\.grid_sample[^.;,\n]*?(no L1|partial via torch\.nn)[^.;,\n]*"),
+     "F.grid_sample (covered by tasks/baseline/L1/grid_sample.py:GridSample)"),
+]
 
 
 # Ops that are supported by kb-nano. Categorized by HOW they are supported:

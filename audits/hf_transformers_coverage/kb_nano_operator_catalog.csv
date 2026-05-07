@@ -20,7 +20,7 @@ L1,tasks/baseline/L1/chunk_retention.py,ChunkRetention,nn.Module,Chunk RetNet â€
 L1,tasks/baseline/L1/chunk_rwkv7.py,ChunkRWKV7,nn.Module,Chunk RWKV7 â€” Triton-accelerated chunked prefill kernel.,Triton chunk RWKV7 kernel.
 L1,tasks/baseline/L1/compile_mode.py,,,Global flag controlling whether modules dispatch to native PyTorch,
 L1,tasks/baseline/L1/conv1d.py,Conv1d,nn.Module,Conv1d wrapper around nn.Conv1d.,
-L1,tasks/baseline/L1/conv1d_native.py,Conv1dNative,nn.Module,Conv1d parametric op wrapping F.conv1d.,Parametric 1-D convolution.  Forward dispatches to ``F.conv1d``.
+L1,tasks/baseline/L1/conv1d_native.py,Conv1dNative,nn.Module,Conv1d parametric op with direct ``weight``/``bias`` (state_dict-compat with nn.Conv1d).,Parametric 1-D convolution.  Forward dispatches to ``F.conv1d``.
 L1,tasks/baseline/L1/conv2d.py,Conv2d,nn.Module,Conv2d parametric op wrapping F.conv2d.,Parametric 2D convolution: stores weight and bias internally.
 L1,tasks/baseline/L1/conv3d.py,Conv3d,nn.Module,Conv3d wrapper around nn.Conv3d.,Conv3D wrapper matching vllm's Conv3dLayer interface.
 L1,tasks/baseline/L1/conv_transpose1d.py,ConvTranspose1d,nn.Module,ConvTranspose1d parametric op wrapping F.conv_transpose1d.,Parametric 1-D transposed convolution.  Forward dispatches to
@@ -320,7 +320,6 @@ L2,tasks/baseline/L2/mla_attention_impl.py,MLAAttention,nn.Module,MLA attention 
 L2,tasks/baseline/L2/mobilenetv4_edge_residual.py,EdgeResidual,nn.Module,EdgeResidual (FusedMBConv) block for MobileNetV4.,Edge Residual (Fused Inverted Bottleneck) block.
 L2,tasks/baseline/L2/mobilenetv4_uib.py,ConvNormAct,nn.Module,Universal Inverted Residual (UIB) block for MobileNetV4.,Conv2d + BatchNorm2d + optional activation.
 L2,tasks/baseline/L2/mobilenetv4_uib.py,UniversalInvertedResidual,nn.Module,Universal Inverted Residual (UIB) block for MobileNetV4.,Universal Inverted Residual block (UIB) for MobileNetV4.
-L2,tasks/baseline/L2/multihead_attention.py,MultiheadAttention,nn.Module,MultiheadAttention L2 wrapper.,
 L2,tasks/baseline/L2/oasis_final_layer.py,OasisFinalLayer,nn.Module,Oasis final DiT projection layer.,
 L2,tasks/baseline/L2/oasis_mlp.py,OasisMLP,nn.Module,Oasis feed-forward blocks.,
 L2,tasks/baseline/L2/oasis_patch_embed.py,OasisPatchEmbed,nn.Module,Oasis 2D patch embedding.,

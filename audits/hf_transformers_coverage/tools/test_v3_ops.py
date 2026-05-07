@@ -36,7 +36,6 @@ from tasks.baseline.L1.elu import ELU
 from tasks.baseline.L1.hardsigmoid import Hardsigmoid
 from tasks.baseline.L1.hardswish import Hardswish
 from tasks.baseline.L1.conv1d import Conv1d as Conv1dNative  # existing Conv1d, now extended
-from tasks.baseline.L2.multihead_attention import MultiheadAttention as KBMultiheadAttention
 
 
 PASSED: list[tuple[str, str, float]] = []
@@ -136,113 +135,11 @@ def test_conv1d_native_full_kwargs():
                    kb(x), ref(x), tol=5e-3 if dtype != torch.float32 else 1e-5)
 
 
-def test_mha_state_dict_compat():
-    """Verify MultiheadAttention parameter naming matches torch.nn.MultiheadAttention so
-    HF reference checkpoints load with no remapping."""
-    ref = nn.MultiheadAttention(64, 8, batch_first=True)
-    kb = KBMultiheadAttention(64, 8, batch_first=True)
-    ref_keys = set(ref.state_dict().keys())
-    kb_keys = set(kb.state_dict().keys())
-    # Both should have in_proj_weight, in_proj_bias, out_proj.weight, out_proj.bias
-    expected = {"in_proj_weight", "in_proj_bias", "out_proj.weight", "out_proj.bias"}
-    if not expected.issubset(kb_keys):
-        FAILED.append(("MHA", "state_keys", -1.0))
-        print(f"  FAIL  MHA state_dict keys missing: {expected - kb_keys}")
-    elif not expected.issubset(ref_keys):
-        # Some torch versions use bias_k/bias_v too
-        pass
-    else:
-        PASSED.append(("MHA", "state_keys", 0.0))
-        print(f"  PASS  MHA                  state_keys (subset match) = {sorted(expected)}")
 
 
-def test_mha_self_attention_no_weights():
-    """need_weights=False → SDPA fast path. Self-attention with batch_first=True
-    (the aria/idefics2 pattern)."""
-    for dtype in [torch.float32, torch.bfloat16]:
-        for E, H, B, L in [(64, 8, 2, 16), (128, 16, 1, 32), (32, 4, 4, 8)]:
-            torch.manual_seed(0)
-            ref = nn.MultiheadAttention(E, H, batch_first=True, dropout=0.0).to(dtype).eval()
-            kb = KBMultiheadAttention(E, H, batch_first=True, dropout=0.0).to(dtype).eval()
-            kb.load_state_dict(ref.state_dict())
-            x = torch.randn(B, L, E, dtype=dtype)
-            ref_out, _ = ref(x, x, x, need_weights=False)
-            kb_out, _ = kb(x, x, x, need_weights=False)
-            _check("MHA(self,no_w)", f"{dtype}/E{E}H{H}B{B}L{L}",
-                   kb_out, ref_out, tol=1e-3 if dtype != torch.float32 else 1e-5)
 
 
-def test_mha_self_attention_with_weights():
-    """need_weights=True → explicit attention map."""
-    for E, H, B, L in [(64, 8, 2, 16), (32, 4, 4, 8)]:
-        torch.manual_seed(0)
-        ref = nn.MultiheadAttention(E, H, batch_first=True, dropout=0.0).eval()
-        kb = KBMultiheadAttention(E, H, batch_first=True, dropout=0.0).eval()
-        kb.load_state_dict(ref.state_dict())
-        x = torch.randn(B, L, E)
-        ref_out, ref_w = ref(x, x, x, need_weights=True, average_attn_weights=True)
-        kb_out, kb_w = kb(x, x, x, need_weights=True, average_attn_weights=True)
-        _check("MHA(self,with_w)", f"out E{E}H{H}B{B}L{L}", kb_out, ref_out, tol=1e-5)
-        _check("MHA(self,with_w)", f"weights E{E}H{H}B{B}L{L}", kb_w, ref_w, tol=1e-5)
 
-
-def test_mha_cross_attention():
-    """Cross-attention (different q vs k=v lengths). Mask2former / oneformer pattern."""
-    for E, H, B, Lq, Lk in [(64, 8, 2, 16, 24), (128, 16, 1, 8, 32)]:
-        torch.manual_seed(0)
-        ref = nn.MultiheadAttention(E, H, batch_first=True, dropout=0.0).eval()
-        kb = KBMultiheadAttention(E, H, batch_first=True, dropout=0.0).eval()
-        kb.load_state_dict(ref.state_dict())
-        q = torch.randn(B, Lq, E)
-        k = torch.randn(B, Lk, E)
-        v = torch.randn(B, Lk, E)
-        ref_out, _ = ref(q, k, v, need_weights=False)
-        kb_out, _ = kb(q, k, v, need_weights=False)
-        _check("MHA(cross,no_w)", f"E{E}H{H}B{B}Lq{Lq}Lk{Lk}", kb_out, ref_out, tol=1e-5)
-
-
-def test_mha_with_attn_mask():
-    """attn_mask (additive float mask)."""
-    E, H, B, L = 64, 8, 2, 8
-    torch.manual_seed(0)
-    ref = nn.MultiheadAttention(E, H, batch_first=True, dropout=0.0).eval()
-    kb = KBMultiheadAttention(E, H, batch_first=True, dropout=0.0).eval()
-    kb.load_state_dict(ref.state_dict())
-    x = torch.randn(B, L, E)
-    # additive mask: lower triangular
-    causal = torch.triu(torch.full((L, L), float("-inf")), diagonal=1)
-    ref_out, _ = ref(x, x, x, attn_mask=causal, need_weights=False)
-    kb_out, _ = kb(x, x, x, attn_mask=causal, need_weights=False)
-    _check("MHA(attn_mask)", f"causal E{E}L{L}", kb_out, ref_out, tol=1e-5)
-
-
-def test_mha_with_key_padding_mask():
-    """key_padding_mask (boolean mask: True = mask out)."""
-    E, H, B, L = 64, 8, 2, 8
-    torch.manual_seed(0)
-    ref = nn.MultiheadAttention(E, H, batch_first=True, dropout=0.0).eval()
-    kb = KBMultiheadAttention(E, H, batch_first=True, dropout=0.0).eval()
-    kb.load_state_dict(ref.state_dict())
-    x = torch.randn(B, L, E)
-    # mask out last 3 of each batch
-    kpm = torch.zeros(B, L, dtype=torch.bool)
-    kpm[:, -3:] = True
-    ref_out, _ = ref(x, x, x, key_padding_mask=kpm, need_weights=False)
-    kb_out, _ = kb(x, x, x, key_padding_mask=kpm, need_weights=False)
-    _check("MHA(kpm)", f"E{E}L{L}", kb_out, ref_out, tol=1e-5)
-
-
-def test_mha_batch_first_false():
-    """batch_first=False (the bridgetower pattern: input is (L, B, E))."""
-    E, H, B, L = 64, 8, 2, 8
-    torch.manual_seed(0)
-    ref = nn.MultiheadAttention(E, H, batch_first=False, dropout=0.0).eval()
-    kb = KBMultiheadAttention(E, H, batch_first=False, dropout=0.0).eval()
-    kb.load_state_dict(ref.state_dict())
-    x = torch.randn(L, B, E)  # (L, B, E)
-    ref_out, _ = ref(x, x, x, need_weights=False)
-    kb_out, _ = kb(x, x, x, need_weights=False)
-    _check("MHA(batch_first=F)", f"E{E}L{L}", kb_out, ref_out, tol=1e-5)
 
 
 def main():
@@ -257,14 +154,6 @@ def main():
     test_activations_match_nn()
     print("\n--- Conv1dNative (full HF kwarg coverage: groups, dilation, padding_mode) ---")
     test_conv1d_native_full_kwargs()
-    print("\n--- MultiheadAttention L2 wrapper ---")
-    test_mha_state_dict_compat()
-    test_mha_self_attention_no_weights()
-    test_mha_self_attention_with_weights()
-    test_mha_cross_attention()
-    test_mha_with_attn_mask()
-    test_mha_with_key_padding_mask()
-    test_mha_batch_first_false()
 
     print()
     print("=" * 95)

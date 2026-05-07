@@ -19,14 +19,14 @@ sigmoid,tasks/baseline/L1/sigmoid.py,Sigmoid,direct
 tanh,tasks/baseline/L1/tanh.py,Tanh,direct
 quick_gelu,tasks/baseline/L1/quickgelu.py,QuickGELU,direct
 log_sigmoid,tasks/baseline/L1/log_sigmoid.py,LogSigmoid,direct
-mish,,, NOT IN L1 (used by DP3 only - dp3 branch unmerged)
+mish,tasks/baseline/L1/mish.py,Mish,direct (L1 op; came in via add-dp3-support merge)
 leaky_relu,tasks/baseline/L1/leaky_relu.py,LeakyReLU,direct (explicit L1; per audit prompt high-priority list)
 elu,tasks/baseline/L1/elu.py,ELU,direct (explicit L1)
 hardsigmoid,tasks/baseline/L1/hardsigmoid.py,Hardsigmoid,direct (explicit L1)
 hardswish,tasks/baseline/L1/hardswish.py,Hardswish,direct (explicit L1)
 batch_norm_1d,composable,,kb-nano BatchNorm2d.forward calls F.batch_norm rank-agnostically (no rank check); F.batch_norm accepts ranks 2/3/4/5 with same per-channel semantics. No new file needed; same kernel family as BatchNorm2d (no reshape penalty). Verified test_composition_equivalence.py.
 batch_norm_3d,composable,,same as batch_norm_1d (kb-nano BatchNorm2d works on [B,C,D,H,W] directly via F.batch_norm).
-multihead_attention,tasks/baseline/L2/multihead_attention.py,MultiheadAttention,direct (L2 wrapper; uses kb-nano DenseAttention/SDPA when need_weights=False; materializes attention map only when need_weights=True; state_dict-compat with nn.MultiheadAttention). Per audit prompt: explicit wrapper avoids slow attention-weight materialization that nn.MultiheadAttention always does.
+multihead_attention,composable,,nn.MultiheadAttention is composable from kb-nano Linear (3x: Q/K/V/O) + DenseAttention (SDPA). Per mentor: do not add a literal L2 wrapper — kb-nano doesn't use nn.MultiheadAttention internally so no benefit from a thin wrapper. HF callsites that use nn.MultiheadAttention (aria, bridgetower, idefics2, mask2former, oneformer, omdet_turbo, phi4_multimodal) require call-site refactor when porting; the math is fully present in kb-nano L1.
 chunk_gated_delta_rule,tasks/baseline/L1/chunk_gated_delta_rule.py,ChunkGatedDeltaRule,direct (added in audit branch; wraps fla.ops.gated_delta_rule.chunk_gated_delta_rule; same import pattern as chunk_gla.py)
 fused_recurrent_gated_delta_rule,tasks/baseline/L1/chunk_gated_delta_rule.py,FusedRecurrentGatedDeltaRule,direct (added in audit branch)
 lstm,tasks/baseline/L1/lstm.py,LSTM,direct (added in audit branch; numerically verified vs nn.LSTM)
@@ -66,7 +66,7 @@ rotary_pos_emb_hunyuan_video,tasks/baseline/L1/hunyuan_video_rope.py,HunyuanVide
 kv_cache,tasks/baseline/L1/store_kvcache.py,StoreKVCache,direct (paged KV; HND/NHD)
 kv_cache_fp8_mla,tasks/baseline/L1/store_kvcache_fp8_mla.py,StoreKVCacheFP8MLA,direct
 selective_scan,tasks/baseline/L1/?,?,Mamba ops are spread across mamba_chunked / mamba_recurrent files - need to verify
-causal_conv1d,,,Mamba causal conv - bundled with mamba ops
+causal_conv1d,tasks/baseline/L1/causal_conv1d.py,CausalConv1d,direct (L1 op; came in via add-kimi-qwen3next merge — was previously bundled inside L2/mamba_mixer.py via vllm import)
 moe_topk,tasks/baseline/L1/grouped_topk.py,GroupedTopK,direct
 moe_align,tasks/baseline/L1/moe_align.py,MoeAlign,direct
 moe_grouped_gemm,tasks/baseline/L1/moe_grouped_gemm.py,MoeGroupedGemm,direct

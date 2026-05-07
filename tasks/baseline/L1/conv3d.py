@@ -5,9 +5,11 @@ vision-encoder patch-embedding only. Extended additively to accept the full
 nn.Conv3d kwarg surface — ``padding``, ``dilation``, ``groups``, ``padding_mode``
 — that emu3's VQVAE temporal block uses (``nn.Conv3d(..., padding=0)``).
 
-Defaults match torch.nn.Conv3d (padding=0, dilation=1, groups=1, bias=False
-preserved for vllm-compat) so existing callers (Qwen2-VL, Qwen3-VL, video
-patch-embed) continue to work unchanged.
+DEVIATION FROM torch.nn.Conv3d defaults: when ``stride`` is None or omitted,
+this wrapper uses ``stride=kernel_size`` (vllm/patch-embed convention used by
+kb-nano callers ``L2/vision_patch_embed.py`` and ``L2/vjepa2_embeddings.py``).
+torch.nn.Conv3d defaults to ``stride=1``. To get torch's behavior, pass
+``stride=1`` explicitly.
 
 Internal layout: ``self.conv = nn.Conv3d(...)`` is preserved so kb-nano
 callers that access ``self.conv.weight`` keep working.
