@@ -1,6 +1,6 @@
 # kb-nano
 
-A standalone, high-performance inference engine supporting **LLMs** (Llama 3.1, Llama 4, Mixtral-8x7B, DeepSeek V3.2, GPT-OSS, Qwen2-VL, Qwen3-VL), **linear-attention LLMs** (GLA, RetNet, RWKV7), **embedding / retrieval models** (BGE-M3, ColBERTv2), **diffusion models** (FLUX.1-dev, SDXL, HunyuanVideo-1.5), **world models** (Oasis 500M), **detection models** (YOLOv10, RTDetrV2), **vision encoders** (SigLIP-2, DINOv3, SwinV2), **segmentation models** (SAM3.1), **3D point models** (PointTransformerV3), **protein structure prediction** (OpenFold3), audio models (Whisper), and **TTS models** (CosyVoice3) with tensor parallelism and FP8 quantization. No vLLM dependency at runtime — just PyTorch, Triton, and Flash Attention.
+A standalone, high-performance inference engine supporting **LLMs** (Llama 3.1, Llama 4, Mixtral-8x7B, DeepSeek V3.2, GPT-OSS, Qwen2-VL, Qwen3-VL), **linear-attention LLMs** (GLA, RetNet, RWKV7), **embedding / retrieval models** (BGE-M3, ColBERTv2), **diffusion models** (FLUX.1-dev, SDXL, HunyuanVideo-1.5), **world models** (Oasis 500M), **detection models** (YOLOv10, RTDetrV2), **vision encoders** (SigLIP-2, DINOv3, SwinV2), **segmentation models** (SAM3.1), **3D point models** (PointTransformerV3), **protein structure prediction** (OpenFold3), audio models (Whisper), **TTS models** (CosyVoice3), and **3-D visuomotor policies** (DP3 / Simple-DP3) with tensor parallelism and FP8 quantization. No vLLM dependency at runtime — just PyTorch, Triton, and Flash Attention.
 
 ## Features
 
@@ -31,6 +31,7 @@ A standalone, high-performance inference engine supporting **LLMs** (Llama 3.1, 
 - **Whisper** (large-v3) encoder-decoder speech-to-text with batched inference and paged cross-attention KV cache
 - **CosyVoice3** (Fun-CosyVoice3-0.5B-2512) text-to-speech with flow matching DiT + HiFi-GAN vocoder
 - **OpenFold3** (OpenFold/OpenFold3) protein structure prediction with MSA module, PairFormer, diffusion sampling, and atom attention
+- **DP3 / Simple-DP3** (YanjieZe/3D-Diffusion-Policy) 3-D visuomotor policy with PointNet point-cloud encoder, 1-D conditional U-Net (FiLM-modulated, Mish + GroupNorm), DDIM scheduler with `prediction_type="sample"`, and action chunking (horizon=16, n_obs_steps=2, n_action_steps=8)
 - **FP8 inference** with block-scaled FP8 quantization via DeepGEMM, UE8M0 power-of-two scales, and fused SiLU+Mul+FP8 quantization kernels
 - **Tensor parallelism** (TP) with custom IPC-based all-reduce for multi-GPU inference
 - **Paged KV cache** with Triton store kernels (LLM models); FP8 MLA KV cache for DeepSeek
@@ -50,6 +51,7 @@ A standalone, high-performance inference engine supporting **LLMs** (Llama 3.1, 
 - **PointTransformerV3 detached comparison benchmark** for 3D point cloud encoding
 - **open-oasis comparison benchmark** for autoregressive diffusion world models
 - **OpenFold/OpenFold3 comparison benchmark** for protein structure prediction
+- **3D-Diffusion-Policy comparison benchmark** for DP3 / Simple-DP3 visuomotor policies (real point clouds from `rishabhrj11/gym-xarm-pointcloud`)
 
 ## Project Structure
 
@@ -302,6 +304,62 @@ The protein structure benchmark measures:
 - **Throughput**: tokens/sec across short (100-200 residues), medium (200-400), long (400-700), and extra-long (700+) protein chains
 - **Latency**: per-structure prediction latency with median stats
 - **Correctness**: percentage of queries meeting all correctness requirements (atom position cosine similarity >= 0.95, RMSD < 0.5A, pLDDT correlation >= 0.99, PAE cosine similarity >= 0.95)
+
+### Benchmarking vs 3D-Diffusion-Policy (DP3 / Simple-DP3)
+
+```bash
+# Simple-DP3 (default): real xarm point clouds, 100 frames, kb-nano vs reference
+python tests/bench_dp3.py
+
+# Full DP3 (heavier U-Net, down_dims=[512,1024,2048])
+python tests/bench_dp3.py --variant dp3
+
+# kb-nano only (skip reference comparison)
+python tests/bench_dp3.py --skip-reference
+
+# Use a real trained DP3 checkpoint (latest.ckpt produced by reference's train.py)
+python tests/bench_dp3.py --checkpoint /path/to/latest.ckpt
+
+# Override request count or DDIM steps
+python tests/bench_dp3.py --num-requests 200 --num-steps 10
+
+# Enable torch.compile (default is eager — apples-to-apples vs reference)
+python tests/bench_dp3.py --torch-compile
+
+# Synthetic Gaussian point clouds (debug only)
+python tests/bench_dp3.py --synthetic-only
+```
+
+**Inputs.** Real 3-D point cloud + robot state + actions from `rishabhrj11/gym-xarm-pointcloud` (HF Hub, 18374 frames, 50 episodes, gym-xarm push-block). Point clouds are 512×6 XYZRGB extracted from depth cameras; we slice to XYZ for `use_pc_color=False`. Robot state is 7-D joint angles, action is 4-D end-effector control. The per-key linear normalizer (`scale`, `offset`) is fit to real xarm data (1000 frames, "limits" mode → outputs scaled to [-1, 1]) so the normalize/unnormalize math is exercised end-to-end — not bypassed via identity scale.
+
+**Weights.** DP3 publishes no pretrained checkpoints, but kernel/math equivalence is independent of weight values. The bench builds a reference DP3 with `nn.Linear` Kaiming-uniform init, saves it in the reference's `train.py` checkpoint format, and both engines load the same file. Pass `--checkpoint` to use a real trained checkpoint.
+
+**Validates:**
+- **Correctness**: per-frame action MSE + cosine similarity between kb-nano and reference (≥ 0.999 cos sim required to pass).
+- **Speed**: throughput + P50/P99 latency at single-env (B=1) and batched (B=8) scenarios.
+- *Out of scope*: real-task accuracy (would require MuJoCo + scripted-policy demo generation + multi-hour training).
+
+**Results on 1× B200 (real xarm data, 10 DDIM steps, fp32, eager — see `tests/results/B200/dp3_*/results.json`):**
+
+Simple-DP3 (13.2M params, 100 frames):
+
+| Scenario | kb-nano | reference | speedup |
+|---|---|---|---|
+| dp3-1env throughput | 23.45 req/s | 14.00 req/s | 1.67× |
+| dp3-batch throughput (bsz=8) | 178.25 req/s | 152.14 req/s | 1.17× |
+| single-step latency (P50/P99) | 42.5 / 42.6 ms | 47.6 / 49.9 ms | 1.12× |
+| batch-8 latency (P50/P99) | 41.7 / 42.7 ms | 51.5 / 63.9 ms | 1.24× |
+
+Full DP3 (255M params, 50 frames):
+
+| Scenario | kb-nano | reference | speedup |
+|---|---|---|---|
+| dp3-1env throughput | 22.78 req/s | 20.64 req/s | 1.10× |
+| dp3-batch throughput (bsz=8) | 144.58 req/s | 143.84 req/s | 1.01× |
+| single-step latency (P50/P99) | 40.0 / 48.8 ms | 47.8 / 53.3 ms | 1.19× |
+| batch-8 latency (P50/P99) | 40.1 / 45.7 ms | 45.8 / 90.0 ms | 1.14× |
+
+**Correctness:** **byte-identical** outputs across all samples in both variants — mean MSE = 0.0, mean cosine similarity = 1.000000, max abs diff = **0.000000e+00**. Both engines run identical code paths (encoder, U-Net, DDIM scheduler with `alphas_cumprod` pre-moved to GPU, normalize/unnormalize, action slice).
 
 ### Benchmarking vs vLLM (Embedding / Retrieval)
 

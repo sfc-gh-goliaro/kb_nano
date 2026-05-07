@@ -718,3 +718,75 @@ ALL_STRUCTURE_PREDICTION_WORKLOADS = {
     "throughput": STRUCTURE_PREDICTION_THROUGHPUT_WORKLOADS,
     "latency": STRUCTURE_PREDICTION_LATENCY_WORKLOADS,
 }
+
+
+# ---------------------------------------------------------------------------
+# 3-D point-cloud robotics policy workloads (DP3 / Simple-DP3)
+# ---------------------------------------------------------------------------
+
+@dataclass(frozen=True)
+class DP3ModelConfig:
+    """Hyperparameters that drive both kb-nano DP3 and the reference engine."""
+    num_inference_steps: int
+    horizon: int
+    n_obs_steps: int
+    n_action_steps: int
+    num_points: int
+    state_dim: int
+    action_dim: int
+
+
+# Defaults match the xarm push-block dataset (the public point-cloud robotics
+# benchmark closest to DP3's MetaWorld setup):
+#   - 512 points x 6 channels (XYZRGB; we slice to XYZ for use_pc_color=False)
+#   - 7-D joint-state proprioception
+#   - 4-D end-effector action (x, y, z, gripper)
+DP3_CONFIG = DP3ModelConfig(
+    num_inference_steps=10,
+    horizon=16,
+    n_obs_steps=2,
+    n_action_steps=8,
+    num_points=512,
+    state_dim=7,
+    action_dim=4,
+)
+
+
+@dataclass(frozen=True)
+class DP3ThroughputWorkload:
+    """3-D diffusion policy throughput workload (per-frame action chunk gen).
+
+    Real point clouds + robot state + actions come from a public 3-D
+    point-cloud robotics dataset (default ``rishabhrj11/gym-xarm-pointcloud``
+    — 18374 frames over 50 episodes, ``observation.environment_state`` is
+    a 512x6 XYZRGB cloud, ``observation.state`` is 7-D, ``action`` is 4-D).
+    """
+    name: str
+    num_requests: int
+    batch_size: int = 1
+    dataset_name: str = "rishabhrj11/gym-xarm-pointcloud"
+
+
+@dataclass(frozen=True)
+class DP3LatencyWorkload:
+    name: str
+    batch_size: int = 1
+    num_warmup: int = 5
+    num_iters: int = 20
+    dataset_name: str = "rishabhrj11/gym-xarm-pointcloud"
+
+
+DP3_THROUGHPUT_WORKLOADS: list[DP3ThroughputWorkload] = [
+    DP3ThroughputWorkload("dp3-1env",  num_requests=100, batch_size=1),
+    DP3ThroughputWorkload("dp3-batch", num_requests=100, batch_size=8),
+]
+
+DP3_LATENCY_WORKLOADS: list[DP3LatencyWorkload] = [
+    DP3LatencyWorkload("single-step", batch_size=1),
+    DP3LatencyWorkload("batch-8",     batch_size=8),
+]
+
+ALL_DP3_WORKLOADS = {
+    "throughput": DP3_THROUGHPUT_WORKLOADS,
+    "latency": DP3_LATENCY_WORKLOADS,
+}

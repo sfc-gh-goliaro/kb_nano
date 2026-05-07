@@ -35,6 +35,14 @@ dependencies = [
     "fastsafetensors",
     "ultralytics",
     "flash-linear-attention>=0.4.2",
+    # DP3 bench (tests/bench_dp3.py): omegaconf is required by the
+    # reference 3D-Diffusion-Policy repo for its OmegaConf-based configs;
+    # pyarrow reads the xarm-pointcloud parquet shards; dill loads the
+    # reference's dill-pickled checkpoints. ``datasets`` already pulls in
+    # pyarrow and dill transitively, but we pin them here for clarity.
+    "omegaconf",
+    "pyarrow",
+    "dill",
 ]
 
 [project.scripts]
