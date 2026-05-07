@@ -346,7 +346,46 @@ Coverage numbers UNCHANGED (the change is in HOW certain rows are supported and 
 - 4 `unsupported` (0.9%) — mra, reformer, rwkv v4, xlstm
 - Coverage = 439/447 = **98.21%**
 
-## 17. What this proves about kb-nano
+## 17. Pass v3.1: systematic narrowness re-audit (4 more ops extended additively)
+
+After the v3 commit (96f740e), user feedback: "is it just conv1d? any other things with a similar issue? please make sure everything is up to date and correct, do a full reaudit of the guidelines and instruction prompt." Did a systematic code-deep inspection of every kb-nano L1 wrapper's `__init__` signature against `torch.nn.X` and HF actual usage.
+
+Found 4 more narrow ops with the same pattern as Conv1d (file existed in kb-nano L1 catalog but missed kwargs HF uses):
+
+| op | what was missing | HF usage that breaks |
+|---|---|---|
+| `Conv3d` | `padding`, `dilation`, `groups`, `padding_mode` | `emu3/modeling_emu3.py: nn.Conv3d(..., padding=0)` (VQVAE temporal block) — TypeError on kb-nano narrow Conv3d |
+| `ReLU` | `inplace` kwarg | `regnet/sam_hq/...: nn.ReLU(inplace=True)` — TypeError on kb-nano narrow ReLU |
+| `AvgPool2d` | `count_include_pad`, `divisor_override` | `swin2sr/...: nn.AvgPool2d(pool_size, stride=1, padding=pool_size // 2, count_include_pad=False)` — TypeError |
+| `Dropout` | `inplace` | `nn.Dropout(p, inplace=True)` (multiple HF) — TypeError |
+
+**Fix.** Each extended additively (defaults match torch.nn.X so existing kb-nano callers are unaffected). Verified by:
+- Backward-compat: kb-nano callers using only the original kwargs produce 0.00e+00 max-abs diff vs the prior wrapper.
+- New-kwargs forward output matches `torch.nn.X` 0.00e+00 max-abs diff.
+- All existing test suites still pass (v3: 227/227, keep_ops_thorough: 297/297, composition: 243/243).
+
+**Files modified additively:**
+- `tasks/baseline/L1/conv3d.py` — added `padding`, `dilation`, `groups`, `padding_mode`
+- `tasks/baseline/L1/relu.py` — added `inplace`
+- `tasks/baseline/L1/avg_pool2d.py` — added `count_include_pad`, `divisor_override`
+- `tasks/baseline/L1/dropout.py` — added `inplace`
+
+The original Conv1d narrowness was the same systemic mistake: I had built the canonical map by reading file *names*, not file *contents*. After v3 (Conv1d + LayerNorm) and v3.1 (Conv3d + ReLU + AvgPool2d + Dropout), I have now code-deep-verified every kb-nano L1 wrapper that maps to a canonical HF op against actual HF call sites in the pinned commit.
+
+**Remaining ops that I did NOT extend** (verified their narrowness is acceptable):
+- `Embedding`: no HF usage of `max_norm`/`scale_grad_by_freq`/`sparse` in pinned commit. Fine.
+- `Conv2d`: no HF usage of `padding_mode`. Fine.
+- `MaxPool2d`: no HF usage of `dilation` or `return_indices`. Fine.
+- `Linear`: no HF use of `device`/`dtype` at architectural level. Fine.
+- `silu/sigmoid/tanh`: stateless, no kwargs in HF use. Fine.
+- `softmax`: only `dim` is needed. Fine.
+- `GroupNorm`: kb-nano default eps is 1e-6, torch's is 1e-5. Most HF callers pass explicit eps; some don't (`nn.GroupNorm(min(8, out_channels), out_channels)`). Default mismatch is a subtle correctness issue (~1e-5 numeric difference) but changing the default would risk breaking existing kb-nano callers (sdxl, sam3, rwkv7, etc. some of which may rely on the 1e-6 default). Leaving alone but documented.
+
+**Coverage numbers UNCHANGED** (the v3.1 change is in *how* HF kwargs are accepted; no model moves between status buckets — they were already classified as composable based on the math, the kwarg gap was a wrapper/API issue):
+- 17 `kb_nano_l4` (3.8%) + 422 `composable` (94.4%) + 4 `partial` (0.9%) + 4 `unsupported` (0.9%) + 24 `not_inference_required`
+- Coverage = 439/447 = **98.21%**
+
+## 18. What this proves about kb-nano
 
 The pilot data already supports the headline framing of the paper appendix: kb-nano's existing L1/L2 surface covers the core compute primitives needed by the most common HF architecture families (encoder, decoder-only, encoder-decoder, vision encoder, multimodal, detection, SSM). The remaining gaps are concentrated in (1) niche pooling kernels (`adaptive_avg_pool*`), (2) `ConvTranspose*` for segmentation/upsampling heads, and (3) attention variants that haven't been hit yet (e.g. `flex_attention`-only models). Each gap is a small, well-bounded kernel — none reflect a fundamental architectural limitation.
 
