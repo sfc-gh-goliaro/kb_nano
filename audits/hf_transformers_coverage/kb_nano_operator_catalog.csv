@@ -1,4 +1,5 @@
 layer,file,class_name,parents,module_doc_first_line,class_doc_first_line
+L1,tasks/baseline/L1/_flashmla_backend.py,,,"Resolve FlashMLA symbols from vLLM's vendored copy, falling back to",
 L1,tasks/baseline/L1/adaptive_avg_pool1d.py,AdaptiveAvgPool1d,nn.Module,AdaptiveAvgPool1d wrapping F.adaptive_avg_pool1d.,
 L1,tasks/baseline/L1/adaptive_avg_pool2d.py,AdaptiveAvgPool2d,nn.Module,AdaptiveAvgPool2d wrapping F.adaptive_avg_pool2d.,
 L1,tasks/baseline/L1/allreduce.py,AllReduce,nn.Module,AllReduce L1 operator with custom IPC all-reduce and NCCL fallback.,
@@ -6,50 +7,78 @@ L1,tasks/baseline/L1/allreduce.py,CustomAllreduce,,AllReduce L1 operator with cu
 L1,tasks/baseline/L1/avg_pool1d.py,AvgPool1d,nn.Module,AvgPool1d wrapping F.avg_pool1d directly.,
 L1,tasks/baseline/L1/avg_pool2d.py,AvgPool2d,nn.Module,AvgPool2d wrapping F.avg_pool2d.,
 L1,tasks/baseline/L1/batch_norm2d.py,BatchNorm2d,nn.Module,BatchNorm2d wrapping F.batch_norm with registered affine/running stats.,
+L1,tasks/baseline/L1/bitnet_int8xint2_linear.py,BitnetInt8xInt2Gemm,nn.Module,W1.58A8 GEMM: int8 activations × packed-2-bit ternary weights.,Stateless wrapper around the W1.58A8 GEMM custom op.
+L1,tasks/baseline/L1/bitnet_linear.py,BitLinear,nn.Module,BitLinear: native W1.58A8 linear layers for ``microsoft/bitnet-b1.58-2B-4T``.,W1.58A8 linear layer (single projection).
+L1,tasks/baseline/L1/bitnet_linear.py,BitLinearMerged,nn.Module,BitLinear: native W1.58A8 linear layers for ``microsoft/bitnet-b1.58-2B-4T``.,W1.58A8 linear with multiple shards fused along the output dim.
+L1,tasks/baseline/L1/bitnet_rms_norm.py,BitNetRMSNorm,nn.Module,BitNet-specific RMSNorm that is bit-for-bit identical to SOTA.,Drop-in for ``RMSNorm`` that matches SOTA's xformers kernel exactly.
 L1,tasks/baseline/L1/bmm.py,BatchMatMul,nn.Module,Batched matrix multiply (``torch.bmm``) as an L1 primitive.,"Batched matrix multiply ``(B, N, M) @ (B, M, P) -> (B, N, P)``."
+L1,tasks/baseline/L1/causal_conv1d.py,CausalConv1d,nn.Module,Depthwise causal 1D convolution (L1).,Causal depthwise 1D conv with optional SiLU activation and stateful decode.
 L1,tasks/baseline/L1/chunk_gated_delta_rule.py,ChunkGatedDeltaRule,nn.Module,Chunk Gated Delta Rule — Triton-accelerated chunked kernel from FLA.,Triton chunk gated-delta-rule kernel.
 L1,tasks/baseline/L1/chunk_gated_delta_rule.py,FusedRecurrentGatedDeltaRule,nn.Module,Chunk Gated Delta Rule — Triton-accelerated chunked kernel from FLA.,FLA fused-recurrent gated-delta-rule decode kernel.
 L1,tasks/baseline/L1/chunk_gla.py,ChunkGLA,nn.Module,Chunk GLA — Triton-accelerated chunked prefill kernel.,Triton chunk GLA kernel.
 L1,tasks/baseline/L1/chunk_retention.py,ChunkRetention,nn.Module,Chunk RetNet — Triton-accelerated chunked prefill kernel.,Triton chunk RetNet kernel.
 L1,tasks/baseline/L1/chunk_rwkv7.py,ChunkRWKV7,nn.Module,Chunk RWKV7 — Triton-accelerated chunked prefill kernel.,Triton chunk RWKV7 kernel.
+L1,tasks/baseline/L1/compile_mode.py,,,Global flag controlling whether modules dispatch to native PyTorch,
 L1,tasks/baseline/L1/conv1d.py,Conv1d,nn.Module,Conv1d wrapper around nn.Conv1d.,
+L1,tasks/baseline/L1/conv1d_native.py,Conv1dNative,nn.Module,Conv1d parametric op wrapping F.conv1d.,Parametric 1-D convolution.  Forward dispatches to ``F.conv1d``.
 L1,tasks/baseline/L1/conv2d.py,Conv2d,nn.Module,Conv2d parametric op wrapping F.conv2d.,Parametric 2D convolution: stores weight and bias internally.
 L1,tasks/baseline/L1/conv3d.py,Conv3d,nn.Module,Conv3d wrapper around nn.Conv3d.,Conv3D wrapper matching vllm's Conv3dLayer interface.
-L1,tasks/baseline/L1/conv_transpose1d.py,ConvTranspose1d,nn.Module,ConvTranspose1d parametric op wrapping F.conv_transpose1d.,Parametric 1-D transposed convolution. Forward dispatches to
+L1,tasks/baseline/L1/conv_transpose1d.py,ConvTranspose1d,nn.Module,ConvTranspose1d parametric op wrapping F.conv_transpose1d.,Parametric 1-D transposed convolution.  Forward dispatches to
 L1,tasks/baseline/L1/conv_transpose2d.py,ConvTranspose2d,nn.Module,ConvTranspose2d parametric op wrapping F.conv_transpose2d.,Parametric 2-D transposed convolution. Forward dispatches to
 L1,tasks/baseline/L1/conv_transpose3d.py,ConvTranspose3d,nn.Module,ConvTranspose3d parametric op wrapping F.conv_transpose3d.,Parametric 3-D transposed convolution. Forward dispatches to
 L1,tasks/baseline/L1/convert_indices.py,ConvertIndicesToGlobal,nn.Module,Convert request-local token indices to global paged cache slots.,Map per-request token indices to global linear cache slots.
+L1,tasks/baseline/L1/custom_ops.py,,,Register opaque kernels as torch.library custom ops for torch.compile.,
 L1,tasks/baseline/L1/dense_attention.py,DenseAttention,nn.Module,Dense (non-paged) multi-head attention.,Dense multi-head attention.
 L1,tasks/baseline/L1/diffusion_rope.py,DiffusionRoPE,nn.Module,Rotary position embedding for diffusion models (interleaved / GPT-J style).,"Apply rotary embeddings given pre-computed (cos, sin) tensors."
 L1,tasks/baseline/L1/dinov3_rope.py,DINOv3RoPE,nn.Module,DINOv3 2D rotary position embedding (L1).,DINOv3 2D rotary position embedding.
+L1,tasks/baseline/L1/dp3_sinusoidal_pos_emb.py,DP3SinusoidalPosEmb,nn.Module,Sinusoidal position embedding for DP3 diffusion timestep encoding.,Sinusoidal embedding with the standard log(10000) frequency schedule.
 L1,tasks/baseline/L1/dropout.py,Dropout,nn.Module,Dropout wrapping F.dropout.,
+L1,tasks/baseline/L1/eagle_tree_ops.py,TreeMaskMode,IntEnum,EAGLE-3 tree-construction and tree-verify CUDA ops.,
 L1,tasks/baseline/L1/elu.py,ELU,nn.Module,ELU wrapping F.elu (explicit L1 op for benchmark scaffolding).,
 L1,tasks/baseline/L1/embedding.py,Embedding,nn.Module,Embedding lookup kernel: wraps nn.Embedding.,
+L1,tasks/baseline/L1/embedding_bag.py,EmbeddingBag,nn.Module,EmbeddingBag lookup primitive for recommender models.,
 L1,tasks/baseline/L1/flash_attn_decode.py,FlashAttnDecode,nn.Module,Flash attention decode kernel (with paged KV cache).,
+L1,tasks/baseline/L1/flash_attn_dense.py,FlashAttnDense,nn.Module,Dense (non-varlen) Flash Attention forward (L1).,Dense Flash Attention.
 L1,tasks/baseline/L1/flash_attn_prefill.py,FlashAttnPrefill,nn.Module,Flash attention prefill kernel (variable-length sequences).,
 L1,tasks/baseline/L1/flash_attn_varlen.py,FlashAttnVarlen,nn.Module,Variable-length Flash Attention (no KV cache lookup).,Variable-length Flash Attention without paged KV cache lookup.
 L1,tasks/baseline/L1/flash_mla_decode.py,FlashMLADecode,nn.Module,FlashMLA decode kernels for MLA (Multi-head Latent Attention).,Wraps ``flash_mla_with_kvcache`` for paged MLA decode.
 L1,tasks/baseline/L1/flash_mla_decode.py,FlashMLADecodeFP8,nn.Module,FlashMLA decode kernels for MLA (Multi-head Latent Attention).,Dense FP8 decode wrapper matching vLLM's ``flash_mla_with_kvcache_fp8``.
 L1,tasks/baseline/L1/flash_mla_decode.py,FlashMLAGetMetadata,nn.Module,FlashMLA decode kernels for MLA (Multi-head Latent Attention).,
 L1,tasks/baseline/L1/flash_mla_decode.py,FlashMLAGetMetadataDenseFP8,nn.Module,FlashMLA decode kernels for MLA (Multi-head Latent Attention).,Wraps ``get_mla_metadata_dense_fp8`` for the FP8 dense decode kernel.
+L1,tasks/baseline/L1/flash_mla_prefill.py,FlashMLAPrefill,nn.Module,FlashMLA prefill kernel for MLA (Multi-head Latent Attention).,Wraps flash_mla.flash_attn_varlen_func for variable-length MLA prefill.
 L1,tasks/baseline/L1/flash_mla_sparse_prefill.py,FlashMLASparsePrefill,nn.Module,FlashMLA sparse prefill for DSA (DeepSeek Sparse Attention).,Wraps flash_mla.flash_mla_sparse_fwd for sparse BF16 prefill.
 L1,tasks/baseline/L1/flashinfer_decode.py,TRTLLMDecode,nn.Module,"TRTLLM-gen paged attention decode kernel (via FlashInfer, Blackwell only).",
+L1,tasks/baseline/L1/flashinfer_moe.py,FlashInferFusedMoE,nn.Module,FlashInfer native CUDA MoE kernels with GPU architecture dispatch.,Monolithic FlashInfer MoE kernel with GPU architecture dispatch.
 L1,tasks/baseline/L1/flashinfer_prefill.py,TRTLLMPrefill,nn.Module,"TRTLLM-gen paged attention prefill kernel (via FlashInfer, Blackwell only).",
 L1,tasks/baseline/L1/flux_pos_embed.py,FluxPosEmbed,nn.Module,2D rotary position embeddings for FLUX (concatenated per-axis 1D embeddings).,2D rotary position embeddings for FLUX.
+L1,tasks/baseline/L1/fp8_block_scaled_mm.py,W8A8BlockScaledMM,nn.Module,Block-scaled FP8 GEMM: DeepGEMM (preferred) with Triton fallback.,Block-scaled FP8 matrix multiplication.
 L1,tasks/baseline/L1/fp8_grouped_gemm_contiguous.py,Fp8GroupedGemmContiguous,nn.Module,DeepGEMM grouped FP8 GEMM for MoE expert execution.,"Grouped FP8 GEMM: ``(A_fp8, a_scale) @ (B_fp8, b_scale) -> C_bf16``."
 L1,tasks/baseline/L1/fp8_linear.py,PerTokenGroupQuantFp8,nn.Module,FP8 linear (block-scaled FP8 matrix multiply) with vLLM-parity dispatch.,In-place per-token-group FP8 quantization (single Triton/CUDA kernel).
 L1,tasks/baseline/L1/fp8_linear.py,_Fp8PrefillBufs,,FP8 linear (block-scaled FP8 matrix multiply) with vLLM-parity dispatch.,Shared prefill buffers for FP8 activation quantization.
 L1,tasks/baseline/L1/fp8_linear.py,Fp8Linear,nn.Module,FP8 linear (block-scaled FP8 matrix multiply) with vLLM-parity dispatch.,Block-scaled FP8 linear using deep_gemm.fp8_gemm_nt.
+L1,tasks/baseline/L1/fp8_moe_grouped_gemm.py,FP8MoeGroupedGemm,nn.Module,Triton fused MoE grouped GEMM kernel with FP8 W8A8 block-scaled quantization.,FP8 W8A8 block-scaled MoE grouped GEMM.
 L1,tasks/baseline/L1/fp8_mqa_logits.py,Fp8MQALogits,nn.Module,FP8 MQA logits for DSA indexer via DeepGEMM.,FP8 MQA logits for the DSA indexer.
 L1,tasks/baseline/L1/fp8_mqa_logits.py,Fp8PagedMQALogitsMetadata,nn.Module,FP8 MQA logits for DSA indexer via DeepGEMM.,Scheduling metadata for paged MQA logits (DeepGEMM).
+L1,tasks/baseline/L1/fp8_quant.py,PerTokenGroupQuantFP8,nn.Module,Per-token-group FP8 activation quantization.,Quantize BF16 activations to FP8 with per-token-group scaling.
 L1,tasks/baseline/L1/frozen_batch_norm2d.py,FrozenBatchNorm2d,nn.Module,Frozen BatchNorm2d for detection backbones.,
 L1,tasks/baseline/L1/fused_recurrent_gla.py,FusedRecurrentGLA,nn.Module,Fused recurrent GLA — Triton-accelerated decode kernel.,Triton fused-recurrent GLA kernel.
 L1,tasks/baseline/L1/fused_recurrent_retention.py,FusedRecurrentRetention,nn.Module,Fused recurrent RetNet — Triton-accelerated decode kernel.,Triton fused-recurrent retention kernel.
 L1,tasks/baseline/L1/fused_recurrent_rwkv7.py,FusedRecurrentRWKV7,nn.Module,Fused recurrent RWKV7 — Triton-accelerated decode kernel.,Triton fused-mul-recurrent RWKV7 kernel.
+L1,tasks/baseline/L1/fused_rmsnorm_fp8.py,FusedRMSNormFP8Quant,nn.Module,Fused RMSNorm + FP8 group quantization.,Fused residual-add + RMSNorm + FP8 group quantization.
 L1,tasks/baseline/L1/gate_linear.py,GateLinear,nn.Module,DeepSeek MoE router gate matmul (BF16 x BF16 -> FP32) with vLLM parity.,DeepSeek MoE router gate matmul with vLLM-parity three-tier dispatch.
+L1,tasks/baseline/L1/gaussian_projection.py,GaussianProjection,nn.Module,3D Gaussian projection to 2D image space.,
+L1,tasks/baseline/L1/gaussian_rasterize.py,GaussianRasterize,nn.Module,Rasterize projected 2D Gaussians to pixels.,
+L1,tasks/baseline/L1/gaussian_tile_intersection.py,GaussianTileIntersection,nn.Module,Tile intersection utilities for Gaussian splatting.,
+L1,tasks/baseline/L1/gdn_recurrence.py,GDNChunkPrefill,nn.Module,Gated Delta Net (GDN) recurrence (L1).,"FlashInfer chunked GDN prefill (Hopper, SM90+)."
+L1,tasks/baseline/L1/gdn_recurrence.py,GDNFusedRecurrent,nn.Module,Gated Delta Net (GDN) recurrence (L1).,vLLM-bundled FLA fused recurrent GDN kernel (decode path).
 L1,tasks/baseline/L1/gelu.py,GELU,nn.Module,GELU activation (via torch.nn.functional.gelu).,
+L1,tasks/baseline/L1/gelu_and_mul.py,GeluAndMul,nn.Module,GELU-and-mul activation for packed gate/up projections.,Apply GELU to the gate half and multiply by the up half.
+L1,tasks/baseline/L1/gemma4_routing.py,Gemma4Routing,nn.Module,Gemma4 MoE routing.,"Softmax over all experts, top-k select, then top-k renormalize."
+L1,tasks/baseline/L1/gemma_rms_norm.py,GemmaRMSNorm,nn.Module,GemmaRMSNorm: RMSNorm where the stored weight is an offset from 1.0.,RMSNorm with weight stored as offset from 1.0 (Gemma convention).
 L1,tasks/baseline/L1/gla_recurrence.py,NaiveRecurrentGLA,nn.Module,Naive recurrent GLA (Gated Linear Attention) kernel.,nn.Module wrapper around `naive_recurrent_gla` for L1 compliance.
+L1,tasks/baseline/L1/global_avg_pool2d.py,GlobalAvgPool2d,nn.Module,Global average pooling over spatial NCHW dimensions.,
 L1,tasks/baseline/L1/grid_sample.py,GridSample,nn.Module,GridSample wrapping F.grid_sample.,
+L1,tasks/baseline/L1/grn.py,GRN,nn.Module,Global Response Normalization for ConvNeXtV2-style channels-last activations.,
 L1,tasks/baseline/L1/group_norm.py,GroupNorm,nn.Module,GroupNorm wrapping F.group_norm with learnable affine parameters.,Group normalization with optional learnable weight and bias.
 L1,tasks/baseline/L1/grouped_topk.py,GroupedTopK,nn.Module,Grouped top-k routing for DeepSeek-style MoE.,Functional grouped top-k router.
 L1,tasks/baseline/L1/hardsigmoid.py,Hardsigmoid,nn.Module,Hardsigmoid wrapping F.hardsigmoid (explicit L1 op for benchmark scaffolding).,
@@ -57,9 +86,16 @@ L1,tasks/baseline/L1/hardswish.py,Hardswish,nn.Module,Hardswish wrapping F.hards
 L1,tasks/baseline/L1/hunyuan_video_rope.py,HunyuanVideo15RotaryPosEmbed,nn.Module,3D rotary position embedding frequency generator for HunyuanVideo-1.5.,
 L1,tasks/baseline/L1/indexer_k_cache.py,IndexerKCacheStore,nn.Module,Indexer K cache store and gather for DSA (132 bytes/token).,Quantize K to FP8 and store in indexer paged cache via CUDA kernel.
 L1,tasks/baseline/L1/indexer_k_cache.py,IndexerKCacheGather,nn.Module,Indexer K cache store and gather for DSA (132 bytes/token).,Gather K from indexer paged cache in FP8 form via CUDA kernel.
+L1,tasks/baseline/L1/instantngp_direction_encoding.py,InstantNGPDirectionEncoding,nn.Module,InstantNGP direction encoding wrapper built on tinycudann.,
+L1,tasks/baseline/L1/instantngp_fused_mlp.py,InstantNGPFullyFusedMLP,nn.Module,InstantNGP fully fused MLP wrapper built on tinycudann.,
+L1,tasks/baseline/L1/instantngp_hashgrid.py,InstantNGPHashGrid,nn.Module,InstantNGP hash-grid encoding wrapper built on tinycudann.,
 L1,tasks/baseline/L1/interpolate.py,Interpolate,nn.Module,Interpolate wrapping F.interpolate.,
+L1,tasks/baseline/L1/kda_recurrence.py,KDAGate,nn.Module,KDA (Kimi Delta Attention) recurrence (L1).,Wrap FLA's ``fused_kda_gate`` (forget-gate fusion in log space).
+L1,tasks/baseline/L1/kda_recurrence.py,KDARecurrence,nn.Module,KDA (Kimi Delta Attention) recurrence (L1).,Fused KDA Delta-Net recurrence (FLA Triton kernel).
 L1,tasks/baseline/L1/l2_norm.py,L2Norm,nn.Module,L2 normalization along a single dimension: x / ||x||_2.,
+L1,tasks/baseline/L1/l2norm_kernel.py,L2NormFwd,nn.Module,Fused L2-norm forward kernel (L1).,Fused Triton L2-norm matching vLLM's numerics.
 L1,tasks/baseline/L1/layer_norm.py,LayerNorm,nn.Module,Standard LayerNorm wrapping F.layer_norm with optional affine parameters.,
+L1,tasks/baseline/L1/layer_norm2d.py,LayerNorm2d,nn.Module,LayerNorm over channels for NCHW image tensors.,
 L1,tasks/baseline/L1/leaky_relu.py,LeakyReLU,nn.Module,LeakyReLU wrapping F.leaky_relu.,
 L1,tasks/baseline/L1/linear.py,Matmul,nn.Module,Linear (matrix multiply) kernels.,"Pure functional linear: takes input, weight, and optional bias as forward args."
 L1,tasks/baseline/L1/linear.py,BMM,nn.Module,Linear (matrix multiply) kernels.,"Batch matrix multiply: torch.matmul(a, b)."
@@ -69,34 +105,63 @@ L1,tasks/baseline/L1/lstm.py,LSTM,nn.Module,LSTM wrapping torch.nn.LSTM.,Standar
 L1,tasks/baseline/L1/max_pool1d.py,MaxPool1d,nn.Module,MaxPool1d wrapping F.max_pool1d directly.,
 L1,tasks/baseline/L1/max_pool2d.py,MaxPool2d,nn.Module,MaxPool2d wrapping F.max_pool2d.,
 L1,tasks/baseline/L1/merge_attn_states.py,MergeAttnStates,nn.Module,Online softmax merge for two attention partitions.,Online softmax merge of two attention partitions.
+L1,tasks/baseline/L1/merge_state.py,,,Softmax-LSE state merge for cascade attention.,
+L1,tasks/baseline/L1/mish.py,Mish,nn.Module,Mish activation: x * tanh(softplus(x)).,
 L1,tasks/baseline/L1/moe_align.py,MoeAlign,nn.Module,MoE token-to-expert alignment with block padding.,MoE token-to-expert alignment using sgl_kernel.
 L1,tasks/baseline/L1/moe_grouped_gemm.py,MoeGroupedGemm,nn.Module,Triton fused MoE grouped GEMM kernel with FP8 W8A8 block-scaled support.,
+L1,tasks/baseline/L1/moe_permute.py,MoePermute,nn.Module,Fused MoE permute for DeepGEMM contiguous layout.,Fused FP8 MoE permute into DeepGEMM contiguous layout.
 L1,tasks/baseline/L1/moe_sum.py,MoeSum,nn.Module,Fused MoE sum kernel: reduces top-k expert outputs into final output.,Fused top-k reduction for MoE outputs using sgl_kernel.
+L1,tasks/baseline/L1/moe_unpermute_reduce.py,MoeUnpermuteReduce,nn.Module,Fused MoE unpermute + weighted reduce via Triton.,Fused unpermute + weighted reduce for MoE expert outputs.
 L1,tasks/baseline/L1/mrope.py,MRotaryEmbedding,nn.Module,Multi-dimensional Rotary Position Embedding (M-RoPE) for Qwen VL models.,M-RoPE for Qwen2-VL / Qwen3-VL.
 L1,tasks/baseline/L1/mrope_input_positions.py,MRopeInputPositions,nn.Module,Compute M-RoPE 3D position indices for text+vision token sequences.,Stateless module that computes M-RoPE 3D positions from token layout.
 L1,tasks/baseline/L1/mxfp4_moe.py,Mxfp4MoEQuantConfig,,MXFP4-native fused MoE primitive backed by the OAI Triton kernels.,Minimal quant config carrying the per-MoE precision/bias tensors.
 L1,tasks/baseline/L1/mxfp4_moe.py,Mxfp4MoE,nn.Module,MXFP4-native fused MoE primitive backed by the OAI Triton kernels.,MXFP4-quantized fused MoE primitive (routing + matmul_ogs experts).
 L1,tasks/baseline/L1/oasis_rotary.py,OasisRotaryEmbedding,nn.Module,Rotary embedding helpers used by Oasis.,
+L1,tasks/baseline/L1/openfold3_attention.py,OF3Attention,nn.Module,Multi-head attention with bias list support for AlphaFold3.,Standard multi-head attention with gating and bias list support.
+L1,tasks/baseline/L1/openfold3_outer_product_mean.py,OuterProductMean,nn.Module,Outer product mean for AlphaFold3.,AF3 Algorithm 9: Outer product mean.
+L1,tasks/baseline/L1/openfold3_swiglu.py,SwiGLU,nn.Module,SwiGLU activation and transition for AlphaFold3.,SwiGLU activation: SiLU(Wa x) * Wb x.
+L1,tasks/baseline/L1/openfold3_swiglu.py,AdaLN,nn.Module,SwiGLU activation and transition for AlphaFold3.,Adaptive Layer Normalization matching the reference AdaLN.
+L1,tasks/baseline/L1/openfold3_swiglu.py,SwiGLUTransition,nn.Module,SwiGLU activation and transition for AlphaFold3.,AF3 Algorithm 11: SwiGLU-based transition.
+L1,tasks/baseline/L1/openfold3_swiglu.py,ConditionedTransitionBlock,nn.Module,SwiGLU activation and transition for AlphaFold3.,AF3 Algorithm 25: SwiGLU transition with AdaLN-Zero conditioning.
+L1,tasks/baseline/L1/openfold3_triangle_attention.py,TriangleAttention,nn.Module,Triangle attention for AlphaFold3.,AF3 Algorithms 14/15: Triangle attention.
+L1,tasks/baseline/L1/openfold3_triangle_attention.py,TriangleAttentionEndingNode,TriangleAttention,Triangle attention for AlphaFold3.,AF3 Algorithm 15.
+L1,tasks/baseline/L1/openfold3_triangle_multiplication.py,TriangleMultiplicativeUpdate,nn.Module,Triangle multiplicative update for AlphaFold3.,AF3 Algorithms 12/13: Triangle multiplicative update.
+L1,tasks/baseline/L1/openfold3_triangle_multiplication.py,TriangleMultiplicationOutgoing,TriangleMultiplicativeUpdate,Triangle multiplicative update for AlphaFold3.,AF3 Algorithm 12.
+L1,tasks/baseline/L1/openfold3_triangle_multiplication.py,TriangleMultiplicationIncoming,TriangleMultiplicativeUpdate,Triangle multiplicative update for AlphaFold3.,AF3 Algorithm 13.
+L1,tasks/baseline/L1/pointtransformerv3_offsets.py,Offset2Bincount,nn.Module,Offset/batch conversion helpers for point cloud batches.,
+L1,tasks/baseline/L1/pointtransformerv3_offsets.py,Offset2Batch,nn.Module,Offset/batch conversion helpers for point cloud batches.,
+L1,tasks/baseline/L1/pointtransformerv3_offsets.py,Batch2Offset,nn.Module,Offset/batch conversion helpers for point cloud batches.,
+L1,tasks/baseline/L1/pointtransformerv3_serialization.py,_KeyLUT,,PointTransformerV3 serialization helpers.,
+L1,tasks/baseline/L1/pointtransformerv3_serialization.py,PointTransformerV3Serialization,nn.Module,PointTransformerV3 serialization helpers.,
 L1,tasks/baseline/L1/quickgelu.py,QuickGELU,nn.Module,QuickGELU activation: x * sigmoid(1.702 * x).,
 L1,tasks/baseline/L1/relu.py,ReLU,nn.Module,"ReLU activation: max(0, x).",
 L1,tasks/baseline/L1/retnet_recurrence.py,NaiveRecurrentRetention,nn.Module,Naive recurrent retention kernel.,nn.Module wrapper around `naive_recurrent_retention` for L1 compliance.
 L1,tasks/baseline/L1/rms_norm.py,RMSNorm,nn.Module,RMSNorm with dual dispatch: CUDA custom op (eager) and pure-PyTorch (compiled).,
+L1,tasks/baseline/L1/rms_norm_gated.py,RMSNormGated,nn.Module,Gated RMSNorm with element-wise multiplicative gate (L1).,"Fused gated RMSNorm: ``out = activation(z) * RMSNorm(x, weight)``."
+L1,tasks/baseline/L1/rms_norm_native.py,RMSNormNative,nn.Module,"Pure-PyTorch RMSNorm L1 op (fp32-internal, autograd-friendly).",
 L1,tasks/baseline/L1/rmsnorm_quant.py,RMSNormFP8Quant,nn.Module,Fused RMSNorm + per-token-group FP8 quantization.,Fused RMSNorm + per-token-group FP8 quantization.
 L1,tasks/baseline/L1/rmsnorm_quant.py,FusedAddRMSNormFP8Quant,nn.Module,Fused RMSNorm + per-token-group FP8 quantization.,Fused residual-add + RMSNorm + per-token-group FP8 quantization.
 L1,tasks/baseline/L1/rotary_emb.py,RotaryEmbedding,nn.Module,"Rotary position embeddings (RoPE), with optional Llama 3.1-style frequency scaling.",RoPE with optional Llama 3.1-style frequency scaling.
+L1,tasks/baseline/L1/rotary_emb.py,Gemma4ProportionalRotaryEmbedding,RotaryEmbedding,"Rotary position embeddings (RoPE), with optional Llama 3.1-style frequency scaling.",Gemma4 proportional RoPE.
 L1,tasks/baseline/L1/rtdetrv2_deformable_attention.py,MultiScaleDeformableAttentionV2,nn.Module,RTDetrV2 multi-scale deformable attention primitive.,RTDetrV2 multi-scale deformable attention sampling primitive.
 L1,tasks/baseline/L1/rwkv7_recurrence.py,NaiveRecurrentRWKV7,nn.Module,Naive recurrent RWKV7 kernel (DPLR delta rule).,nn.Module wrapper around `naive_recurrent_rwkv7` for L1 compliance.
 L1,tasks/baseline/L1/sam3_position_encoding.py,Sam3PositionEncoding,nn.Module,Sinusoidal 2D position encoding for SAM3.,2D sinusoidal position encoding.
 L1,tasks/baseline/L1/sam3_rope.py,Sam3RoPE2D,nn.Module,2D Rotary Position Embedding for SAM3 ViT attention.,2-D axial rotary position embedding for SAM3 ViT.
 L1,tasks/baseline/L1/sam3_rope_attention.py,Sam3Attention,nn.Module,RoPE Attention for SAM3 tracker memory attention.,Multi-head attention with optional downsampling and separate kv_in_dim.
 L1,tasks/baseline/L1/sam3_rope_attention.py,Sam3RoPEAttention,Sam3Attention,RoPE Attention for SAM3 tracker memory attention.,Attention with 2D rotary position encoding for the tracker.
+L1,tasks/baseline/L1/sdpa.py,SDPA,nn.Module,Scaled dot-product attention primitive (L1).,Scaled dot-product attention.
+L1,tasks/baseline/L1/segment_csr.py,SegmentCSR,nn.Module,CSR segment reduction via torch.segment_reduce.,
 L1,tasks/baseline/L1/sigmoid.py,Sigmoid,nn.Module,Sigmoid activation: 1 / (1 + exp(-x)).,
 L1,tasks/baseline/L1/sigmoid_topk.py,SigmoidTopK,nn.Module,Sigmoid top-k routing for Mixture-of-Experts.,Top-k selection with sigmoid weights.
 L1,tasks/baseline/L1/silu.py,SiLU,nn.Module,SiLU (Swish) activation: x * sigmoid(x).,
 L1,tasks/baseline/L1/silu_and_mul.py,SiluAndMul,nn.Module,SiLU-and-Mul activation with dual dispatch: CUDA (eager) and pure-PyTorch (compiled).,
 L1,tasks/baseline/L1/silu_mul_quant_fp8.py,SiluMulQuantFp8,nn.Module,Fused SiLU-mul + per-token-group FP8 quantization with column-major scales.,Fused SiLU-mul + per-token-group FP8 quantization (colmajor scales).
+L1,tasks/baseline/L1/sinusoidal_embed.py,SinusoidalEmbed,nn.Module,Sinusoidal time/position embedding for flow matching models.,Sinusoidal embedding with configurable frequency range.
 L1,tasks/baseline/L1/softmax.py,Softmax,nn.Module,Softmax activation (via torch.nn.functional.softmax).,
+L1,tasks/baseline/L1/softplus.py,Softplus,nn.Module,Softplus activation (L1).,Element-wise softplus: log(1 + exp(beta * x)) / beta.
+L1,tasks/baseline/L1/sparse_mm.py,SparseMM,nn.Module,Sparse matrix multiply primitive for graph recommenders.,
 L1,tasks/baseline/L1/squared_relu.py,SquaredReLU,nn.Module,"Squared ReLU activation: max(0, x)^2.",
+L1,tasks/baseline/L1/squared_relu_and_mul.py,SquaredReluAndMul,nn.Module,SquaredReLU-and-Mul activation for BitNet b1.58's gated FFN.,Fused ``relu(gate)^2 * up`` for the BitNet gated FFN.
 L1,tasks/baseline/L1/store_kvcache.py,StoreKVCache,nn.Module,Triton kernel for storing key/value into paged KV cache.,"NHD layout store: [num_blocks, block_size, num_kv_heads, head_dim]."
 L1,tasks/baseline/L1/store_kvcache.py,StoreKVCacheHND,nn.Module,Triton kernel for storing key/value into paged KV cache.,"HND layout store: [num_blocks, num_kv_heads, block_size, head_dim]."
 L1,tasks/baseline/L1/store_kvcache_fp8_mla.py,StoreKVCacheFP8MLA,nn.Module,MLA KV cache store and gather.,Store ``kv_c_normed`` and ``k_pe`` into MLA paged cache.
@@ -109,8 +174,11 @@ L1,tasks/baseline/L1/tensor_ops.py,Pad,nn.Module,Primitive tensor manipulation o
 L1,tasks/baseline/L1/tensor_ops.py,OneHot,nn.Module,Primitive tensor manipulation ops.,Functional one-hot encoding op.
 L1,tasks/baseline/L1/top_k_per_row.py,TopKPerRow,nn.Module,Top-K per row selection for DSA indexer using vLLM's CUDA kernels.,Top-K per row selection for sparse attention indexer.
 L1,tasks/baseline/L1/topk_softmax.py,TopKSoftmax,nn.Module,Fused top-k + softmax routing for Mixture-of-Experts.,Fused top-k selection with softmax normalization.
+L1,tasks/baseline/L1/tree_attn_prefill.py,TreeAttnPrefill,nn.Module,FA3 cascade attention for the EAGLE-3 verify step.,Verify-step attention via cascade (two batched calls + LSE merge).
+L1,tasks/baseline/L1/ttt_e2e_rope.py,TTTE2ERoPE,nn.Module,TTT-E2E rotary embedding (interleaved / GPT-J style) L1 op.,Interleaved rotary embedding with a pre-computed cos/sin cache.
 L1,tasks/baseline/L1/video_processor.py,VideoProcessor,nn.Module,VAE output post-processor for images and video.,Post-processor for VAE-decoded image and video tensors.
 L1,tasks/baseline/L1/vision_rotary_emb.py,VisionRotaryEmbedding,nn.Module,Vision encoder rotary position embeddings.,
+L1,tasks/baseline/L1/vjepa2_rope.py,VJEPA2RotaryEmbedding,nn.Module,V-JEPA 2 rotary position helper.,Apply V-JEPA 2's frame/height/width rotary embedding.
 L1,tasks/baseline/L1/yarn_rotary_emb.py,YaRNRotaryEmbedding,nn.Module,Rotary position embeddings with YaRN / YARN scaling.,YaRN RoPE with precomputed cos/sin cache.
 L1,tasks/baseline/L1/yarn_rotary_emb.py,YarnRotaryEmbedding,nn.Module,Rotary position embeddings with YaRN / YARN scaling.,DeepSeek-style YARN (Yet Another RoPE extensioN) RoPE.
 L2,tasks/baseline/L2/ada_layer_norm.py,AdaLayerNormZero,nn.Module,Adaptive Layer Norm modules for diffusion transformers (L2 composite).,Norm layer adaptive layer norm zero (adaLN-Zero).
@@ -147,12 +215,17 @@ L2,tasks/baseline/L2/attention.py,LlamaAttention,nn.Module,Model-level multi-hea
 L2,tasks/baseline/L2/attention_impl.py,Attention,nn.Module,vLLM-aligned Attention layer with paged KV cache.,
 L2,tasks/baseline/L2/attention_pool.py,AttentionPoolLatent,nn.Module,Attention pooling with latent query (L2).,Attention pooling with a learnable latent query.
 L2,tasks/baseline/L2/attention_pool.py,_PoolMlp,nn.Module,Attention pooling with latent query (L2).,Simple MLP used inside AttentionPoolLatent.
+L2,tasks/baseline/L2/batch_norm_act2d.py,BatchNormAct2d,BatchNorm2d,BatchNorm2d followed by an optional activation.,
+L2,tasks/baseline/L2/bert_embeddings.py,BertEmbeddings,EncoderEmbeddingsBase,BERT embedding stack.,
+L2,tasks/baseline/L2/bitnet_attention.py,BitNetAttention,nn.Module,BitNet attention block (W1.58A8 with fused QKV projection).,W1.58A8 GQA attention with sub-norm and NeoX RoPE.
+L2,tasks/baseline/L2/bitnet_mlp.py,BitNetMLP,nn.Module,BitNet MLP: squared-ReLU gated FFN with W1.58A8 BitLinear and sub-norm.,
 L2,tasks/baseline/L2/clip_attention.py,CLIPAttention,nn.Module,CLIP self-attention (L2).,
 L2,tasks/baseline/L2/clip_mlp.py,CLIPMLP,nn.Module,CLIP MLP and text embeddings (L2).,
 L2,tasks/baseline/L2/clip_mlp.py,CLIPTextEmbeddings,nn.Module,CLIP MLP and text embeddings (L2).,
 L2,tasks/baseline/L2/colbertv2_ops.py,ColBERTv2TokenMask,nn.Module,ColBERTv2 embedding and MaxSim ops.,
 L2,tasks/baseline/L2/colbertv2_ops.py,ColBERTv2ScoreReduce,nn.Module,ColBERTv2 embedding and MaxSim ops.,
 L2,tasks/baseline/L2/colbertv2_ops.py,ColBERTv2MaxSim,nn.Module,ColBERTv2 embedding and MaxSim ops.,
+L2,tasks/baseline/L2/convnextv2_block.py,ConvNeXtV2Layer,nn.Module,ConvNeXtV2 block.,
 L2,tasks/baseline/L2/cosyvoice3_cfm.py,BASECFM,nn.Module;ABC,Conditional Flow Matching (CFM) for CosyVoice3 audio generation.,
 L2,tasks/baseline/L2/cosyvoice3_cfm.py,CausalConditionalCFM,BASECFM,Conditional Flow Matching (CFM) for CosyVoice3 audio generation.,
 L2,tasks/baseline/L2/cosyvoice3_hifigan.py,Snake,nn.Module,HiFi-GAN vocoder for CosyVoice3 mel-to-waveform conversion.,
@@ -168,6 +241,20 @@ L2,tasks/baseline/L2/cosyvoice3_hifigan.py,CausalHiFTGenerator,nn.Module,HiFi-GA
 L2,tasks/baseline/L2/cosyvoice3_pre_lookahead.py,PreLookaheadLayer,nn.Module,Pre-lookahead convolutional layer for CosyVoice3 causal processing.,
 L2,tasks/baseline/L2/deepseek_mla_attention.py,DeepSeekMLAAttention,nn.Module,DeepSeek MLA attention (model-level).,DeepSeek Multi-head Latent Attention with optional DSA indexer.
 L2,tasks/baseline/L2/deepseek_moe.py,DeepSeekMoE,nn.Module,"DeepSeek MoE with shared expert, grouped routing, and FP8 expert execution.",DeepSeek Mixture-of-Experts with shared expert and grouped routing.
+L2,tasks/baseline/L2/dlrm_interaction.py,DLRMFeatureInteraction,nn.Module,Feature interaction block for DLRM-style recommenders.,
+L2,tasks/baseline/L2/dp3_conditional_residual_block.py,_RearrangeBT1,nn.Module,DP3 conditional residual block (FiLM-conditioned).,``b t -> b t 1`` — append a length-1 horizon axis to the FiLM embed.
+L2,tasks/baseline/L2/dp3_conditional_residual_block.py,ConditionalResidualBlock1D,nn.Module,DP3 conditional residual block (FiLM-conditioned).,Two-Conv1dBlock residual with FiLM (scale+bias) conditioning.
+L2,tasks/baseline/L2/dp3_conv1d_block.py,Conv1dBlock,nn.Module,DP3 1-D conv block: Conv1d -> GroupNorm -> Mish.,"Conv1d (kernel_size, padding=ks//2) -> GroupNorm(n_groups) -> Mish."
+L2,tasks/baseline/L2/dp3_conv1d_block.py,Downsample1d,nn.Module,DP3 1-D conv block: Conv1d -> GroupNorm -> Mish.,"Conv1d(dim, dim, kernel_size=3, stride=2, padding=1)."
+L2,tasks/baseline/L2/dp3_conv1d_block.py,Upsample1d,nn.Module,DP3 1-D conv block: Conv1d -> GroupNorm -> Mish.,"ConvTranspose1d(dim, dim, kernel_size=4, stride=2, padding=1)."
+L2,tasks/baseline/L2/dp3_diffusion_step_embedding.py,,,DP3 diffusion-step embedding MLP.,
+L2,tasks/baseline/L2/dp3_pointnet_encoder.py,PointNetEncoderXYZ,nn.Module,DP3 sparse point-cloud encoder.,3-layer per-point MLP -> max-pool -> projection.
+L2,tasks/baseline/L2/dp3_pointnet_encoder.py,PointNetEncoderXYZRGB,nn.Module,DP3 sparse point-cloud encoder.,4-layer per-point MLP for XYZRGB inputs (use_pc_color=True path).
+L2,tasks/baseline/L2/dp3_state_encoder.py,,,DP3 robot-state (proprioception) MLP builder.,
+L2,tasks/baseline/L2/efficientnetv2_edge_residual.py,EdgeResidual,nn.Module,EfficientNetV2 EdgeResidual block.,
+L2,tasks/baseline/L2/efficientnetv2_inverted_residual.py,InvertedResidual,nn.Module,EfficientNetV2 inverted residual block.,
+L2,tasks/baseline/L2/efficientnetv2_squeeze_excite.py,SqueezeExcite,nn.Module,EfficientNetV2 squeeze-and-excitation block.,
+L2,tasks/baseline/L2/embedding_bag_collection.py,EmbeddingBagCollection,nn.Module,Collection of feature-wise embedding bags for recsys models.,
 L2,tasks/baseline/L2/encoder_attention.py,EncoderSelfAttention,nn.Module,Attention blocks for encoder models.,
 L2,tasks/baseline/L2/encoder_attention.py,EncoderSelfOutput,nn.Module,Attention blocks for encoder models.,
 L2,tasks/baseline/L2/encoder_attention.py,EncoderAttention,nn.Module,Attention blocks for encoder models.,
@@ -182,9 +269,18 @@ L2,tasks/baseline/L2/flux_feedforward.py,ColumnParallelApproxGELU,nn.Module,FLUX
 L2,tasks/baseline/L2/flux_feedforward.py,FeedForward,nn.Module,FLUX feed-forward network (L2 composite).,FLUX FFN: GELU(tanh) linear -> linear with TP sharding.
 L2,tasks/baseline/L2/fused_experts.py,_SharedBuf,,Fused MoE experts: two grouped GEMMs with SiLU-mul in between.,Mutable container so all FusedExperts layers share one set of scratch
 L2,tasks/baseline/L2/fused_experts.py,FusedExperts,nn.Module,Fused MoE experts: two grouped GEMMs with SiLU-mul in between.,Fused MoE experts: two grouped GEMMs with SiLU-mul in between.
+L2,tasks/baseline/L2/gaussian_splat_render.py,GaussianSplatRender,nn.Module,Render block for 3D Gaussian splatting.,
 L2,tasks/baseline/L2/geglu.py,GEGLU,nn.Module,GEGLU activation: gated linear unit with GELU gate.,GEGLU activation with a fused linear projection.
+L2,tasks/baseline/L2/gemma4_attention.py,Gemma4Attention,nn.Module,Gemma4 attention with per-layer RoPE and K==V full-attention support.,
+L2,tasks/baseline/L2/gemma4_mlp.py,Gemma4MLP,nn.Module,Gemma4 dense MLP block.,
+L2,tasks/baseline/L2/gemma4_moe.py,Gemma4GateLinear,nn.Module,Gemma4 MoE block.,Replicated router projection with vLLM's bf16->fp32 router GEMM.
+L2,tasks/baseline/L2/gemma4_moe.py,Gemma4Router,nn.Module,Gemma4 MoE block.,Gemma4 router pre-normalization and expert-logit projection.
+L2,tasks/baseline/L2/gemma4_moe.py,Gemma4MoE,nn.Module,Gemma4 MoE block.,Gemma4 routed experts with full-softmax top-k routing.
+L2,tasks/baseline/L2/gemma_dense_attention.py,GemmaRotaryEmbedding,nn.Module,Gemma dense attention with simple KV cache (L2 composite).,Precompute RoPE cos/sin cache for Gemma.
+L2,tasks/baseline/L2/gemma_dense_attention.py,GemmaDenseAttention,nn.Module,Gemma dense attention with simple KV cache (L2 composite).,Multi-head attention for Gemma with dense (non-paged) KV cache.
 L2,tasks/baseline/L2/gla_attention.py,GatedLinearAttention,nn.Module,Gated linear attention (covers both GLA and RetNet).,Unified L2 attention for GLA and RetNet.
 L2,tasks/baseline/L2/gla_mlp.py,GLAMLP,nn.Module,SwiGLU MLP for GLA / RetNet decoder layers.,
+L2,tasks/baseline/L2/gpt_oss_attention.py,GptOssAttention,nn.Module,"GPT-OSS attention: GQA with bias, YaRN RoPE, sliding window, and attention sinks.","GQA attention with bias, sliding window, and attention sinks."
 L2,tasks/baseline/L2/gpt_oss_moe.py,GptOssMoE,nn.Module,GPT-OSS MoE: MXFP4-native fused MoE composed from KB-Nano L1 ops.,MXFP4-native MoE composed from KB-Nano L1 ops.
 L2,tasks/baseline/L2/hunyuan_video_attention.py,HunyuanVideo15Attention,nn.Module,HunyuanVideo-1.5 dual-stream joint attention (L2 composite).,Dual-stream joint attention with TP optimization.
 L2,tasks/baseline/L2/hunyuan_video_conditioning.py,HunyuanVideo15ConditioningMerge,nn.Module,HunyuanVideo-1.5 multi-stream conditioning merge (L2 composite).,Merge and reorder three conditioning streams for HunyuanVideo.
@@ -196,6 +292,22 @@ L2,tasks/baseline/L2/hunyuan_video_embeddings.py,HunyuanVideo15ImageProjection,n
 L2,tasks/baseline/L2/hunyuan_video_token_refiner.py,TokenRefinerSelfAttention,nn.Module,HunyuanVideo-1.5 token refiner ops (L2 composites).,Self-attention for the token refiner.
 L2,tasks/baseline/L2/hunyuan_video_token_refiner.py,_LinearSiLU,nn.Module,HunyuanVideo-1.5 token refiner ops (L2 composites).,Linear projection followed by SiLU activation.
 L2,tasks/baseline/L2/hunyuan_video_token_refiner.py,TokenRefinerFeedForward,nn.Module,HunyuanVideo-1.5 token refiner ops (L2 composites).,SiLU feedforward for the token refiner.
+L2,tasks/baseline/L2/instantngp_field.py,InstantNGPFieldOutput,,Kernel-level InstantNGP field built from tinycudann primitives.,
+L2,tasks/baseline/L2/instantngp_field.py,InstantNGPField,nn.Module,Kernel-level InstantNGP field built from tinycudann primitives.,
+L2,tasks/baseline/L2/jamba_attention.py,JambaAttention,nn.Module,"Jamba's multi-head attention block (no RoPE, no QK-norm).","Fused-QKV multi-head attention, mirroring :class:`LlamaAttention`."
+L2,tasks/baseline/L2/jamba_mamba_mixer.py,JambaMambaMixer,nn.Module,Jamba's Mamba v1 selective-scan mixer (with per-layer dt/B/C RMSNorms).,Mamba v1 mixer with Jamba's per-layer dt/B/C RMSNorms.
+L2,tasks/baseline/L2/jamba_mlp.py,JambaMLP,nn.Module,Jamba's plain (non-MoE) FFN block: fused gate_up_proj + SiluAndMul + down_proj.,Jamba dense FFN.  Identical structure to :class:`LlamaMLP`.
+L2,tasks/baseline/L2/jamba_moe.py,JambaMoE,nn.Module,Jamba's MoE block (sparse MoE with softmax+top-k routing).,"Jamba sparse MoE FFN: router (Linear, no bias) -> softmax+top-k"
+L2,tasks/baseline/L2/kda_attention.py,KDAAttention,nn.Module,KDA (Kimi Delta Attention) layer (L2).,Kimi Delta Attention (linear attention with Delta-Net recurrence).
+L2,tasks/baseline/L2/kimi_delta_attention.py,_Conv1DWeights,nn.Module,,Sharded depthwise-conv weight holder with HF-compatible parameter names.
+L2,tasks/baseline/L2/kimi_delta_attention.py,_KDAStateView,,,
+L2,tasks/baseline/L2/kimi_delta_attention.py,KimiDeltaAttention,nn.Module,,Kimi Linear's KDA layer.
+L2,tasks/baseline/L2/kimi_mla_attention.py,KimiMLAAttention,nn.Module,,Kimi MLA path matching vLLM's latent-attention formulation.
+L2,tasks/baseline/L2/kimi_moe.py,KimiMoE,nn.Module,,
+L2,tasks/baseline/L2/lightgcn_propagation.py,LightGCNPropagation,nn.Module,Graph propagation utilities for LightGCN.,
+L2,tasks/baseline/L2/llada_attention.py,LLaDAAttention,nn.Module,LLaDA bidirectional self-attention with optional Fast-dLLM cache support.,
+L2,tasks/baseline/L2/llada_mlp.py,LLaDAMLP,nn.Module,LLaDA SwiGLU MLP.,
+L2,tasks/baseline/L2/llama4_attention.py,Llama4Attention,nn.Module,"Llama 4 attention with NoPE, QK norm, and temperature tuning.","Multi-head attention with optional NoPE, QK norm, and temperature tuning."
 L2,tasks/baseline/L2/llama4_moe.py,_SharedExpertConfig,,Llama 4 MoE: sigmoid top-1 routing with shared expert.,Minimal config object for LlamaMLP.
 L2,tasks/baseline/L2/llama4_moe.py,Llama4MoE,nn.Module,Llama 4 MoE: sigmoid top-1 routing with shared expert.,MoE with sigmoid top-1 routing and shared expert.
 L2,tasks/baseline/L2/llama_mlp.py,LlamaMLP,nn.Module,Llama SwiGLU MLP block: gate_up_proj -> SiluAndMul -> down_proj.,
@@ -203,6 +315,7 @@ L2,tasks/baseline/L2/mamba2_mixer.py,Mixer2RMSNormGated,nn.Module,"Mamba2 SSD mi
 L2,tasks/baseline/L2/mamba2_mixer.py,Mamba2Mixer,nn.Module,"Mamba2 SSD mixer (mistralai/Mamba-Codestral-7B-v0.1, etc.).",Mamba2 SSD mixer.
 L2,tasks/baseline/L2/mamba_mixer.py,MambaMixer,nn.Module,Mamba v1 mixer (selective state-space model).,Mamba v1 selective-scan mixer block.
 L2,tasks/baseline/L2/mixtral_moe.py,MixtralMoE,nn.Module,Mixtral Mixture-of-Experts block with fused Triton grouped GEMM.,Mixture-of-Experts with fused Triton grouped GEMM.
+L2,tasks/baseline/L2/mla_attention.py,MLAAttention,nn.Module,MLA (Multi-head Latent Attention) for Kimi-Linear (L2).,Multi-head Latent Attention (DeepSeek-V2 style) with paged KV.
 L2,tasks/baseline/L2/mla_attention_impl.py,MLAAttention,nn.Module,MLA attention implementation with BF16 or FP8 paged KV cache.,MLA attention with FP8 paged KV cache.
 L2,tasks/baseline/L2/mobilenetv4_edge_residual.py,EdgeResidual,nn.Module,EdgeResidual (FusedMBConv) block for MobileNetV4.,Edge Residual (Fused Inverted Bottleneck) block.
 L2,tasks/baseline/L2/mobilenetv4_uib.py,ConvNormAct,nn.Module,Universal Inverted Residual (UIB) block for MobileNetV4.,Conv2d + BatchNorm2d + optional activation.
@@ -215,6 +328,22 @@ L2,tasks/baseline/L2/oasis_spatial_axial_attention.py,OasisSpatialAxialAttention
 L2,tasks/baseline/L2/oasis_temporal_axial_attention.py,OasisTemporalAxialAttention,nn.Module,Oasis temporal axial attention.,
 L2,tasks/baseline/L2/oasis_timestep_embedder.py,OasisTimestepEmbedder,nn.Module,Oasis timestep embedding.,
 L2,tasks/baseline/L2/oasis_vae_attention.py,OasisVAEAttention,nn.Module,Oasis VAE self-attention.,
+L2,tasks/baseline/L2/openfold3_atom_attention.py,RefAtomFeatureEmbedder,nn.Module,Sequence-local atom attention for AlphaFold3.,"Embeds reference atom features (Algorithm 5, lines 1-6)."
+L2,tasks/baseline/L2/openfold3_atom_attention.py,NoisyPositionEmbedder,nn.Module,Sequence-local atom attention for AlphaFold3.,"Embeds noisy positions and trunk embeddings (Algorithm 5, lines 8-12)."
+L2,tasks/baseline/L2/openfold3_atom_attention.py,AtomAttentionEncoder,nn.Module,Sequence-local atom attention for AlphaFold3.,AF3 Algorithm 5: Atom attention encoder.
+L2,tasks/baseline/L2/openfold3_atom_attention.py,AtomAttentionDecoder,nn.Module,Sequence-local atom attention for AlphaFold3.,AF3 Algorithm 6: Atom attention decoder.
+L2,tasks/baseline/L2/openfold3_attention_pair_bias.py,AttentionPairBias,nn.Module,Attention with pair bias for AlphaFold3.,AF3 Algorithm 24: Attention with pair bias.
+L2,tasks/baseline/L2/openfold3_attention_pair_bias.py,CrossAttentionPairBias,nn.Module,Attention with pair bias for AlphaFold3.,AF3 Algorithm 24: Cross-attention with pair bias for atom attention.
+L2,tasks/baseline/L2/openfold3_diffusion_conditioning.py,FourierEmbedding,nn.Module,Diffusion conditioning for AlphaFold3.,Fourier time embedding for diffusion conditioning.
+L2,tasks/baseline/L2/openfold3_diffusion_conditioning.py,DiffusionConditioning,nn.Module,Diffusion conditioning for AlphaFold3.,Conditioning for diffusion module.
+L2,tasks/baseline/L2/openfold3_input_embedder.py,InputEmbedder,nn.Module,Input embedder for AlphaFold3.,Produces initial single and pair representations from token features.
+L2,tasks/baseline/L2/openfold3_msa_attention.py,MSARowAttentionWithPairBias,nn.Module,MSA pair-weighted averaging for AlphaFold3 (Algorithm 10).,AF3 MSA Pair-Weighted Averaging (Algorithm 10).
+L2,tasks/baseline/L2/openfold3_msa_module_embedder.py,MSAModuleEmbedder,nn.Module,"MSA module embedder for AlphaFold3 (Algorithm 8, lines 1-4).","AF3 Algorithm 8, lines 1-4: MSA feature embedding."
+L2,tasks/baseline/L2/openfold3_pair_block.py,PairBlock,nn.Module,PairBlock for AlphaFold3.,Shared pair stack block for AF3 PairFormer / MSA module / template.
+L2,tasks/baseline/L2/openfold3_template_embedder.py,TemplatePairEmbedder,nn.Module,Template embedder for AlphaFold3 (Algorithm 16).,"Embeds template pair features (Algorithm 16, lines 1-5)."
+L2,tasks/baseline/L2/openfold3_template_embedder.py,TemplatePairStackBlock,PairBlock,Template embedder for AlphaFold3 (Algorithm 16).,Single block of the template pair stack.
+L2,tasks/baseline/L2/openfold3_template_embedder.py,TemplatePairStack,nn.Module,Template embedder for AlphaFold3 (Algorithm 16).,Template pair stack.
+L2,tasks/baseline/L2/openfold3_template_embedder.py,TemplateEmbedder,nn.Module,Template embedder for AlphaFold3 (Algorithm 16).,AF3 Algorithm 16: Template embedder.
 L2,tasks/baseline/L2/parallel_embedding.py,VocabParallelEmbedding,nn.Module,TP-aware embedding and LM head (L2 operators).,
 L2,tasks/baseline/L2/parallel_embedding.py,ParallelLMHead,VocabParallelEmbedding,TP-aware embedding and LM head (L2 operators).,
 L2,tasks/baseline/L2/parallel_linear.py,ColumnParallelLinear,nn.Module,TP-aware linear layers (L2 operators).,Splits output dim across TP ranks.
@@ -222,11 +351,37 @@ L2,tasks/baseline/L2/parallel_linear.py,MergedColumnParallelLinear,nn.Module,TP-
 L2,tasks/baseline/L2/parallel_linear.py,QKVParallelLinear,nn.Module,TP-aware linear layers (L2 operators).,"Q, K, V projections merged and sharded across TP."
 L2,tasks/baseline/L2/parallel_linear.py,ReplicatedLinear,nn.Module,TP-aware linear layers (L2 operators).,"Full weight replicated on every TP rank (no sharding, no all-reduce)."
 L2,tasks/baseline/L2/parallel_linear.py,RowParallelLinear,nn.Module,TP-aware linear layers (L2 operators).,"Splits input dim across TP ranks, all-reduces output."
+L2,tasks/baseline/L2/pi0_action_embed.py,Pi0ActionTimeEmbedding,nn.Module,Pi0 action-time embedding (L2 composite).,Embed state + noisy actions + flow timestep for the Pi0 action expert.
+L2,tasks/baseline/L2/pointtransformerv3_layers.py,Point,Dict,PointTransformerV3 detached layers.,
+L2,tasks/baseline/L2/pointtransformerv3_layers.py,PointModule,nn.Module,PointTransformerV3 detached layers.,
+L2,tasks/baseline/L2/pointtransformerv3_layers.py,PointSequential,PointModule,PointTransformerV3 detached layers.,
+L2,tasks/baseline/L2/pointtransformerv3_layers.py,PDNorm,PointModule,PointTransformerV3 detached layers.,
+L2,tasks/baseline/L2/pointtransformerv3_layers.py,RPE,nn.Module,PointTransformerV3 detached layers.,
+L2,tasks/baseline/L2/pointtransformerv3_layers.py,SerializedAttention,PointModule,PointTransformerV3 detached layers.,
+L2,tasks/baseline/L2/pointtransformerv3_layers.py,MLP,nn.Module,PointTransformerV3 detached layers.,
+L2,tasks/baseline/L2/pointtransformerv3_layers.py,Block,PointModule,PointTransformerV3 detached layers.,
+L2,tasks/baseline/L2/pointtransformerv3_layers.py,SerializedPooling,PointModule,PointTransformerV3 detached layers.,
+L2,tasks/baseline/L2/pointtransformerv3_layers.py,SerializedUnpooling,PointModule,PointTransformerV3 detached layers.,
+L2,tasks/baseline/L2/pointtransformerv3_layers.py,Embedding,PointModule,PointTransformerV3 detached layers.,
 L2,tasks/baseline/L2/qwen3_moe.py,Qwen3MoE,nn.Module,Qwen3 Mixture-of-Experts block with fused Triton grouped GEMM.,Qwen3 Mixture-of-Experts with fused Triton grouped GEMM.
+L2,tasks/baseline/L2/qwen3_next_attention.py,Qwen3NextAttention,nn.Module,"Qwen3-Next full attention with per-head QK-norm, partial RoPE, output gating, KV cache (L2).","Full attention with per-head QK-norm, partial RoPE, output gating, and KV cache."
+L2,tasks/baseline/L2/qwen3_next_gdn_attention.py,_Conv1dWeight,nn.Module,Qwen3-Next Gated Delta Net (GDN) linear attention (L2).,Parameter container for the GDN causal-conv1d kernel.
+L2,tasks/baseline/L2/qwen3_next_gdn_attention.py,Qwen3NextGDNAttention,nn.Module,Qwen3-Next Gated Delta Net (GDN) linear attention (L2).,Gated Delta Net linear attention for Qwen3-Next.
+L2,tasks/baseline/L2/qwen3_next_moe.py,_ReplicatedLinear,nn.Module,Qwen3-Next MoE: softmax-gated with shared expert and sigmoid shared gate.,Linear layer replicated across TP ranks (no sharding).
+L2,tasks/baseline/L2/qwen3_next_moe.py,_SharedExpertMLP,nn.Module,Qwen3-Next MoE: softmax-gated with shared expert and sigmoid shared gate.,SiLU-gated MLP for shared expert.
+L2,tasks/baseline/L2/qwen3_next_moe.py,Qwen3NextMoE,nn.Module,Qwen3-Next MoE: softmax-gated with shared expert and sigmoid shared gate.,"MoE with softmax gating, shared expert, and sigmoid shared gate."
+L2,tasks/baseline/L2/recsys_mlp.py,RecsysMLP,nn.Module,Shared MLP for recommender models.,
+L2,tasks/baseline/L2/retnet_attention.py,MultiScaleRetention,nn.Module,RetNet Multi-Scale Retention attention layer.,
 L2,tasks/baseline/L2/rtdetrv2_conv_norm.py,RTDetrV2ConvNormLayer,nn.Module,RTDetrV2 Conv-Norm-Activation layer.,
 L2,tasks/baseline/L2/rtdetrv2_csp_rep_layer.py,RTDetrV2CSPRepLayer,nn.Module,RTDetrV2 CSP RepVGG layer.,
 L2,tasks/baseline/L2/rtdetrv2_deformable_attention.py,RTDetrV2MultiscaleDeformableAttention,nn.Module,RTDetrV2 multi-scale deformable attention composite module.,
 L2,tasks/baseline/L2/rtdetrv2_encoder_layer.py,RTDetrV2EncoderLayer,nn.Module,RTDetrV2 transformer encoder layer.,
+L2,tasks/baseline/L2/rtdetrv2_layers.py,RTDetrV2ConvNormLayer,nn.Module,RTDetrV2 shared layers.,
+L2,tasks/baseline/L2/rtdetrv2_layers.py,RTDetrV2MultiheadAttention,nn.Module,RTDetrV2 shared layers.,
+L2,tasks/baseline/L2/rtdetrv2_layers.py,RTDetrV2EncoderLayer,nn.Module,RTDetrV2 shared layers.,
+L2,tasks/baseline/L2/rtdetrv2_layers.py,RTDetrV2RepVggBlock,nn.Module,RTDetrV2 shared layers.,
+L2,tasks/baseline/L2/rtdetrv2_layers.py,RTDetrV2CSPRepLayer,nn.Module,RTDetrV2 shared layers.,
+L2,tasks/baseline/L2/rtdetrv2_layers.py,RTDetrV2MLPPredictionHead,nn.Module,RTDetrV2 shared layers.,
 L2,tasks/baseline/L2/rtdetrv2_mlp_head.py,RTDetrV2MLPPredictionHead,nn.Module,RTDetrV2 MLP prediction head.,
 L2,tasks/baseline/L2/rtdetrv2_multihead_attention.py,RTDetrV2MultiheadAttention,nn.Module,RTDetrV2 multi-head self-attention.,
 L2,tasks/baseline/L2/rtdetrv2_repvgg_block.py,RTDetrV2RepVggBlock,nn.Module,RTDetrV2 RepVGG block.,
@@ -259,6 +414,10 @@ L2,tasks/baseline/L2/sdxl_feedforward.py,FeedForward,nn.Module,FeedForward netwo
 L2,tasks/baseline/L2/sdxl_resnet.py,ResnetBlock2D,nn.Module,ResnetBlock2D for SDXL UNet.,Residual block with time-embedding injection.
 L2,tasks/baseline/L2/sdxl_time_embedding.py,TextTimeEmbedding,nn.Module,SDXL time + text_time micro-conditioning embedding (L2 composite).,Projects concatenated (time_ids_sinusoidal + pooled_text_embeds) to time_embed_dim.
 L2,tasks/baseline/L2/sdxl_upsample.py,Upsample2D,nn.Module,Upsample2D for SDXL UNet — nearest-neighbor 2x interpolation + Conv2d.,Spatial upsampling via 2x nearest interpolation + convolution.
+L2,tasks/baseline/L2/shared_expert_moe.py,_TPSwiGLUMLP,nn.Module,Mixture-of-Experts with optional shared expert (L2).,"SwiGLU MLP sharded along TP (gate_up + down projections, SiLU-and-Mul)."
+L2,tasks/baseline/L2/shared_expert_moe.py,SharedExpertMoE,nn.Module,Mixture-of-Experts with optional shared expert (L2).,Configurable MoE with optional shared expert.
+L2,tasks/baseline/L2/siglip_attention.py,SigLIPAttention,nn.Module,SigLIP vision encoder attention (L2 composite).,Multi-head attention for SigLIP vision encoder.
+L2,tasks/baseline/L2/siglip_mlp.py,SigLIPMLP,nn.Module,SigLIP vision encoder MLP (L2 composite).,
 L2,tasks/baseline/L2/sparse_attn_indexer.py,SparseAttnIndexer,nn.Module,DSA (DeepSeek Sparse Attention) indexer.,DSA sparse attention indexer.
 L2,tasks/baseline/L2/swiglu_mlp.py,SwiGLUMlp,nn.Module,SwiGLU MLP (L2).,SwiGLU MLP with separate gate and value projections.
 L2,tasks/baseline/L2/swinv2_patch_merging.py,SwinV2PatchMerging,nn.Module,SwinV2 patch merging layer (L2).,Patch merging layer for SwinV2 inter-stage downsampling.
@@ -271,6 +430,9 @@ L2,tasks/baseline/L2/timestep_embedding.py,Timesteps,nn.Module,Timestep and text
 L2,tasks/baseline/L2/timestep_embedding.py,TimestepEmbedding,nn.Module,Timestep and text projection embeddings for diffusion models (L2 composite).,Two-layer MLP that projects sinusoidal timestep encodings.
 L2,tasks/baseline/L2/timestep_embedding.py,CombinedTimestepTextProjEmbeddings,nn.Module,Timestep and text projection embeddings for diffusion models (L2 composite).,Combines sinusoidal timestep encoding with pooled text projection.
 L2,tasks/baseline/L2/timestep_embedding.py,CombinedTimestepGuidanceTextProjEmbeddings,nn.Module,Timestep and text projection embeddings for diffusion models (L2 composite).,Combines sinusoidal timestep + guidance encoding with pooled text projection.
+L2,tasks/baseline/L2/ttt_e2e_block.py,TTTE2EBlock,nn.Module,TTT-E2E transformer block (L2).,
+L2,tasks/baseline/L2/ttt_e2e_swa.py,TTTE2ESWA,nn.Module,TTT-E2E sliding-window attention (L2).,Sliding-window attention with prefix and suffix-chunked KV-cache paths.
+L2,tasks/baseline/L2/ttt_e2e_swiglu.py,TTTE2ESwiGLU,nn.Module,TTT-E2E SwiGLU MLP (L2).,
 L2,tasks/baseline/L2/vision_attention.py,VisionAttention,nn.Module,Encoder-only attention for Qwen vision transformer blocks.,Multi-head attention for vision encoder (Qwen2-VL / Qwen2.5-VL / Qwen3-VL).
 L2,tasks/baseline/L2/vision_mlp.py,VisionMLP,nn.Module,Vision MLP for Qwen vision transformer blocks.,Vision encoder MLP with configurable activation.
 L2,tasks/baseline/L2/vision_patch_embed.py,VisionPatchEmbed,nn.Module,Vision patch embedding for Qwen VL models.,
@@ -278,12 +440,30 @@ L2,tasks/baseline/L2/vision_patch_merger.py,VisionPatchMerger,nn.Module,Patch me
 L2,tasks/baseline/L2/vision_pos_embed_interpolate.py,VisionPosEmbedInterpolate,nn.Module,Bilinear interpolation of learned 2D position embeddings (Qwen3-VL).,
 L2,tasks/baseline/L2/vit_encoder_attention.py,VitEncoderAttention,nn.Module,Standard ViT multi-head self-attention (L2).,Standard multi-head self-attention with fused QKV.
 L2,tasks/baseline/L2/vit_encoder_mlp.py,VitEncoderMlp,nn.Module,Standard ViT MLP (L2).,Standard two-layer MLP.
+L2,tasks/baseline/L2/vjepa2_attention.py,VJEPA2RopeAttention,nn.Module,V-JEPA 2 attention blocks.,
+L2,tasks/baseline/L2/vjepa2_attention.py,VJEPA2PoolerSelfAttention,nn.Module,V-JEPA 2 attention blocks.,
+L2,tasks/baseline/L2/vjepa2_attention.py,VJEPA2PoolerCrossAttention,nn.Module,V-JEPA 2 attention blocks.,
+L2,tasks/baseline/L2/vjepa2_embeddings.py,VJEPA2PatchEmbeddings3D,nn.Module,V-JEPA 2 patch embeddings.,Tubelet patch embedding.
+L2,tasks/baseline/L2/vjepa2_embeddings.py,VJEPA2Embeddings,nn.Module,V-JEPA 2 patch embeddings.,Video-to-patch embedding wrapper.
+L2,tasks/baseline/L2/vjepa2_mlp.py,VJEPA2MLP,nn.Module,V-JEPA 2 MLP.,
 L2,tasks/baseline/L2/vllm_fused_experts.py,VllmFusedExperts,nn.Module,DeepSeek-only fused MoE experts mirroring vLLM's ``fused_experts_impl``.,DeepSeek-only Triton MoE that mirrors vLLM's ``fused_experts_impl``.
 L2,tasks/baseline/L2/whisper_attention.py,WhisperEncoderSelfAttention,nn.Module,"Whisper attention variants: encoder self-attention, decoder self-attention,",Bidirectional self-attention for the Whisper encoder.
 L2,tasks/baseline/L2/whisper_attention.py,WhisperDecoderSelfAttention,nn.Module,"Whisper attention variants: encoder self-attention, decoder self-attention,",Causal self-attention for the Whisper decoder with paged KV cache.
 L2,tasks/baseline/L2/whisper_attention.py,WhisperCrossAttention,nn.Module,"Whisper attention variants: encoder self-attention, decoder self-attention,",Decoder cross-attention with paged KV cache.
 L2,tasks/baseline/L2/whisper_mlp.py,WhisperMLP,nn.Module,Whisper MLP block: fc1 -> activation -> fc2.,
+L2,tasks/baseline/L2/xlm_roberta_embeddings.py,XLMRobertaEmbeddings,EncoderEmbeddingsBase,XLM-RoBERTa embedding stack.,
 L2,tasks/baseline/L2/yolov10_attention.py,YOLOAttention,nn.Module,YOLOv10 spatial attention block.,
+L2,tasks/baseline/L2/yolov10_blocks.py,YOLOConv,nn.Module,Native YOLOv10 building blocks.,
+L2,tasks/baseline/L2/yolov10_blocks.py,YOLOBottleneck,nn.Module,Native YOLOv10 building blocks.,
+L2,tasks/baseline/L2/yolov10_blocks.py,YOLOC2f,nn.Module,Native YOLOv10 building blocks.,
+L2,tasks/baseline/L2/yolov10_blocks.py,YOLOSPPF,nn.Module,Native YOLOv10 building blocks.,
+L2,tasks/baseline/L2/yolov10_blocks.py,YOLOAttention,nn.Module,Native YOLOv10 building blocks.,
+L2,tasks/baseline/L2/yolov10_blocks.py,YOLOPSA,nn.Module,Native YOLOv10 building blocks.,
+L2,tasks/baseline/L2/yolov10_blocks.py,YOLOSCDown,nn.Module,Native YOLOv10 building blocks.,
+L2,tasks/baseline/L2/yolov10_blocks.py,YOLORepVGGDW,nn.Module,Native YOLOv10 building blocks.,
+L2,tasks/baseline/L2/yolov10_blocks.py,YOLOCIB,nn.Module,Native YOLOv10 building blocks.,
+L2,tasks/baseline/L2/yolov10_blocks.py,YOLOC2fCIB,YOLOC2f,Native YOLOv10 building blocks.,
+L2,tasks/baseline/L2/yolov10_blocks.py,YOLOConcat,nn.Module,Native YOLOv10 building blocks.,
 L2,tasks/baseline/L2/yolov10_bottleneck.py,YOLOBottleneck,nn.Module,YOLOv10 bottleneck block.,
 L2,tasks/baseline/L2/yolov10_c2f.py,YOLOC2f,nn.Module,YOLOv10 C2f and C2fCIB blocks.,
 L2,tasks/baseline/L2/yolov10_c2f.py,YOLOC2fCIB,YOLOC2f,YOLOv10 C2f and C2fCIB blocks.,
@@ -291,6 +471,8 @@ L2,tasks/baseline/L2/yolov10_cib.py,YOLOCIB,nn.Module,YOLOv10 CIB (Compact Inver
 L2,tasks/baseline/L2/yolov10_concat.py,YOLOConcat,nn.Module,YOLOv10 tensor concatenation op.,
 L2,tasks/baseline/L2/yolov10_conv.py,YOLOConv,nn.Module,YOLOv10 Conv-BN-Act building block.,
 L2,tasks/baseline/L2/yolov10_dfl.py,YOLODFL,nn.Module,YOLOv10 Distribution Focal Loss layer.,
+L2,tasks/baseline/L2/yolov10_head.py,YOLODFL,nn.Module,Native YOLOv10 detection head.,
+L2,tasks/baseline/L2/yolov10_head.py,YOLOv10DetectHead,nn.Module,Native YOLOv10 detection head.,
 L2,tasks/baseline/L2/yolov10_psa.py,YOLOPSA,nn.Module,YOLOv10 PSA (Partial Self-Attention) block.,
 L2,tasks/baseline/L2/yolov10_repvggdw.py,YOLORepVGGDW,nn.Module,YOLOv10 RepVGG depthwise block.,
 L2,tasks/baseline/L2/yolov10_scdown.py,YOLOSCDown,nn.Module,YOLOv10 SCDown (spatial channel downsampling) block.,
@@ -313,7 +495,9 @@ L3,tasks/baseline/L3/alphafold3_pairformer.py,PairFormerStack,nn.Module,PairForm
 L3,tasks/baseline/L3/bert_encoder.py,BertEncoder,nn.Module,BERT encoder stack.,
 L3,tasks/baseline/L3/bert_layer.py,BertLayer,nn.Module,BERT encoder layer.,
 L3,tasks/baseline/L3/bert_model.py,BertModel,nn.Module,BERT encoder-only model.,
+L3,tasks/baseline/L3/bitnet_decoder.py,BitNetDecoderLayer,nn.Module,BitNet decoder layer: pre-norm residual with attention and MLP.,
 L3,tasks/baseline/L3/clip_encoder_layer.py,CLIPEncoderLayer,nn.Module,CLIP encoder layer: pre-norm attention + MLP with residual connections (L3).,
+L3,tasks/baseline/L3/convnextv2_stage.py,ConvNeXtV2Stage,nn.Module,ConvNeXtV2 stage with optional downsampling.,
 L3,tasks/baseline/L3/cosyvoice3_dit.py,RotaryEmbedding,nn.Module,CosyVoice3 Diffusion Transformer (DiT) backbone.,
 L3,tasks/baseline/L3/cosyvoice3_dit.py,FeedForward,nn.Module,CosyVoice3 Diffusion Transformer (DiT) backbone.,
 L3,tasks/baseline/L3/cosyvoice3_dit.py,AdaLayerNormZero,nn.Module,CosyVoice3 Diffusion Transformer (DiT) backbone.,
@@ -328,15 +512,25 @@ L3,tasks/baseline/L3/cosyvoice3_dit.py,TimestepEmbedding,nn.Module,CosyVoice3 Di
 L3,tasks/baseline/L3/cosyvoice3_dit.py,InputEmbedding,nn.Module,CosyVoice3 Diffusion Transformer (DiT) backbone.,
 L3,tasks/baseline/L3/cosyvoice3_dit.py,DiT,nn.Module,CosyVoice3 Diffusion Transformer (DiT) backbone.,Diffusion Transformer backbone for CosyVoice3 flow matching.
 L3,tasks/baseline/L3/deepseek_decoder.py,DeepSeekDecoderLayer,nn.Module,DeepSeek V3.2 decoder layer with MLA attention and MoE.,
+L3,tasks/baseline/L3/dp3_conditional_unet1d.py,ConditionalUnet1D,nn.Module,DP3 1-D conditional U-Net (denoising network).,1-D U-Net with FiLM conditioning on diffusion-step + global obs cond.
+L3,tasks/baseline/L3/efficientnetv2_stage.py,EfficientNetV2Stage,nn.Module,EfficientNetV2 stage.,
 L3,tasks/baseline/L3/eva_block.py,EvaBlock,nn.Module,EVA pre-norm transformer block with layer-scale (L3).,EVA transformer block with layer-scale and SwiGLU MLP.
 L3,tasks/baseline/L3/flux_transformer_block.py,FluxTransformerBlock,nn.Module,FLUX transformer blocks (L3 composites).,"Dual-stream DiT block: joint attention over text+image, then separate FFNs."
 L3,tasks/baseline/L3/flux_transformer_block.py,FluxSingleTransformerBlock,nn.Module,FLUX transformer blocks (L3 composites).,"Single-stream DiT block: text+image concatenated, self-attention + MLP in parallel."
+L3,tasks/baseline/L3/gemma4_decoder.py,Gemma4DecoderLayer,nn.Module,Gemma4 decoder layer.,
+L3,tasks/baseline/L3/gemma_dense_decoder_layer.py,GemmaMLP,nn.Module,Gemma decoder layer with dense attention (L3 composite).,Gemma MLP with GELUTanh activation (not SiLU like Llama).
+L3,tasks/baseline/L3/gemma_dense_decoder_layer.py,GemmaDenseDecoderLayer,nn.Module,Gemma decoder layer with dense attention (L3 composite).,Single Gemma decoder layer with dense KV cache support.
 L3,tasks/baseline/L3/gla_decoder.py,GLADecoderLayer,nn.Module,GLA / RetNet decoder layer.,
 L3,tasks/baseline/L3/gpt_oss_decoder.py,GptOssDecoderLayer,nn.Module,GPT-OSS decoder layer: attention + MoE with RMSNorm residual connections.,
 L3,tasks/baseline/L3/hunyuan_video_token_refiner_block.py,HunyuanVideo15IndividualTokenRefinerBlock,nn.Module,HunyuanVideo-1.5 token refiner blocks (L3 blocks).,
 L3,tasks/baseline/L3/hunyuan_video_token_refiner_block.py,HunyuanVideo15IndividualTokenRefiner,nn.Module,HunyuanVideo-1.5 token refiner blocks (L3 blocks).,
 L3,tasks/baseline/L3/hunyuan_video_token_refiner_block.py,HunyuanVideo15TokenRefiner,nn.Module,HunyuanVideo-1.5 token refiner blocks (L3 blocks).,
 L3,tasks/baseline/L3/hunyuan_video_transformer_block.py,HunyuanVideo15TransformerBlock,nn.Module,HunyuanVideo-1.5 transformer block (L3 composite).,
+L3,tasks/baseline/L3/instantngp_renderer.py,InstantNGPRenderer,nn.Module,Thin InstantNGP renderer wrapper over the official pyngp testbed.,
+L3,tasks/baseline/L3/jamba_decoder.py,JambaAttentionDecoderLayer,nn.Module,Jamba decoder layer wiring -- mirrors vLLM's JambaAttentionDecoderLayer,
+L3,tasks/baseline/L3/jamba_decoder.py,JambaMambaDecoderLayer,nn.Module,Jamba decoder layer wiring -- mirrors vLLM's JambaAttentionDecoderLayer,
+L3,tasks/baseline/L3/kimi_linear_decoder.py,KimiLinearDecoderLayer,nn.Module,Kimi-Linear decoder layer: hybrid KDA/MLA attention + MoE/dense MLP (L3).,
+L3,tasks/baseline/L3/llada_block.py,LLaDABlock,nn.Module,LLaDA transformer block.,
 L3,tasks/baseline/L3/llama4_decoder.py,_DenseMlpConfig,,Llama 4 decoder layer: attention + MoE/MLP with NoPE support.,Minimal config for LlamaMLP on dense (non-MoE) layers.
 L3,tasks/baseline/L3/llama4_decoder.py,Llama4DecoderLayer,nn.Module,Llama 4 decoder layer: attention + MoE/MLP with NoPE support.,
 L3,tasks/baseline/L3/llama_decoder.py,LlamaDecoderLayer,nn.Module,Decoder layer: attention + MLP with RMSNorm residual connections.,
@@ -351,7 +545,23 @@ L3,tasks/baseline/L3/oasis_block.py,SpatioTemporalDiTBlock,nn.Module,Oasis DiT b
 L3,tasks/baseline/L3/oasis_dit.py,OasisDiT,nn.Module,Oasis diffusion transformer.,
 L3,tasks/baseline/L3/oasis_rollout.py,OasisRollout,nn.Module,"Oasis latent encoding, decoding, and rollout sampling.",
 L3,tasks/baseline/L3/oasis_vae_attention_block.py,OasisVAEAttentionBlock,nn.Module,Oasis VAE attention block.,
+L3,tasks/baseline/L3/openfold3_diffusion_module.py,DiffusionModule,nn.Module,Diffusion module for AlphaFold3.,AF3 Algorithm 20: Diffusion module.
+L3,tasks/baseline/L3/openfold3_diffusion_module.py,SampleDiffusion,nn.Module,Diffusion module for AlphaFold3.,AF3 Algorithm 18: Diffusion sampling.
+L3,tasks/baseline/L3/openfold3_diffusion_transformer.py,DiffusionTransformerBlock,nn.Module,Diffusion transformer for AlphaFold3.,AF3 Algorithm 23: Diffusion transformer block.
+L3,tasks/baseline/L3/openfold3_diffusion_transformer.py,DiffusionTransformer,nn.Module,Diffusion transformer for AlphaFold3.,AF3 Algorithm 23: Diffusion transformer stack.
+L3,tasks/baseline/L3/openfold3_heads.py,DistogramHead,nn.Module,Auxiliary prediction heads for AlphaFold3.,Predicts inter-residue distance distribution.
+L3,tasks/baseline/L3/openfold3_heads.py,PLDDTHead,nn.Module,Auxiliary prediction heads for AlphaFold3.,Predicts per-atom pLDDT confidence (PerResidueLDDTAllAtom).
+L3,tasks/baseline/L3/openfold3_heads.py,PAEHead,nn.Module,Auxiliary prediction heads for AlphaFold3.,Predicts Predicted Aligned Error (PAE).
+L3,tasks/baseline/L3/openfold3_heads.py,PDEHead,nn.Module,Auxiliary prediction heads for AlphaFold3.,Predicts Predicted Distance Error (PDE).
+L3,tasks/baseline/L3/openfold3_heads.py,ExperimentallyResolvedHead,nn.Module,Auxiliary prediction heads for AlphaFold3.,Predicts per-atom experimental resolution confidence.
+L3,tasks/baseline/L3/openfold3_heads.py,PairformerEmbedding,nn.Module,Auxiliary prediction heads for AlphaFold3.,Confidence head PairformerEmbedding.
+L3,tasks/baseline/L3/openfold3_heads.py,AuxiliaryHeads,nn.Module,Auxiliary prediction heads for AlphaFold3.,All auxiliary prediction heads for AF3.
+L3,tasks/baseline/L3/openfold3_msa_module.py,MSAModuleBlock,nn.Module,MSA module for AlphaFold3.,Single block of AF3 Algorithm 8.
+L3,tasks/baseline/L3/openfold3_msa_module.py,MSAModuleStack,nn.Module,MSA module for AlphaFold3.,AF3 Algorithm 8: MSA module stack.
+L3,tasks/baseline/L3/openfold3_pairformer.py,PairFormerBlock,nn.Module,PairFormer stack for AlphaFold3.,Single block of AF3 Algorithm 17.
+L3,tasks/baseline/L3/openfold3_pairformer.py,PairFormerStack,nn.Module,PairFormer stack for AlphaFold3.,AF3 Algorithm 17: PairFormer stack.
 L3,tasks/baseline/L3/qwen3_moe_decoder.py,Qwen3MoEDecoderLayer,nn.Module,Qwen3 MoE decoder layer: QK-norm attention + MoE with RMSNorm residual connections.,
+L3,tasks/baseline/L3/qwen3_next_decoder.py,Qwen3NextDecoderLayer,nn.Module,Qwen3-Next decoder layer: hybrid GDN/full attention + MoE.,
 L3,tasks/baseline/L3/retnet_decoder.py,RetNetDecoderLayer,nn.Module,RetNet decoder layer.,
 L3,tasks/baseline/L3/rtdetrv2_backbone.py,RTDetrV2ResNetEncoder,nn.Module,Native RTDetrV2 convolutional backbone.,
 L3,tasks/baseline/L3/rtdetrv2_backbone.py,RTDetrV2ResNetBackbone,nn.Module,Native RTDetrV2 convolutional backbone.,
@@ -386,13 +596,22 @@ L3,tasks/baseline/L3/sdxl_unet_block.py,CrossAttnDownBlock2D,nn.Module,UNet down
 L3,tasks/baseline/L3/sdxl_unet_block.py,UNetMidBlock2DCrossAttn,nn.Module,UNet down/mid/up blocks for SDXL (L3).,UNet mid block: ResnetBlock2D + Transformer2DModel + ResnetBlock2D.
 L3,tasks/baseline/L3/sdxl_unet_block.py,UpBlock2D,nn.Module,UNet down/mid/up blocks for SDXL (L3).,UNet decoder block without cross-attention.
 L3,tasks/baseline/L3/sdxl_unet_block.py,CrossAttnUpBlock2D,nn.Module,UNet down/mid/up blocks for SDXL (L3).,UNet decoder block with cross-attention transformers.
+L3,tasks/baseline/L3/siglip_encoder_layer.py,SigLIPEncoderLayer,nn.Module,SigLIP vision encoder layer (L3 composite).,
 L3,tasks/baseline/L3/swinv2_block.py,SwinV2Block,nn.Module,SwinV2 transformer block with windowed attention (L3).,SwinV2 transformer block.
 L3,tasks/baseline/L3/swinv2_stage.py,SwinV2Stage,nn.Module,SwinV2 stage: optional downsample + sequence of transformer blocks (L3).,A single SwinV2 stage.
 L3,tasks/baseline/L3/t5_block.py,T5LayerSelfAttention,nn.Module,T5 encoder block: self-attention + FFN with pre-norm residuals (L3).,
 L3,tasks/baseline/L3/t5_block.py,T5LayerFF,nn.Module,T5 encoder block: self-attention + FFN with pre-norm residuals (L3).,
 L3,tasks/baseline/L3/t5_block.py,T5Block,nn.Module,T5 encoder block: self-attention + FFN with pre-norm residuals (L3).,
+L3,tasks/baseline/L3/ttt_e2e_decoder.py,TTTE2EDecoder,nn.Module,TTT-E2E transformer (L3).,
 L3,tasks/baseline/L3/vision_block.py,VisionBlock,nn.Module,Vision transformer block for Qwen VL models.,
 L3,tasks/baseline/L3/vit_encoder_block.py,VitEncoderBlock,nn.Module,Standard pre-norm ViT transformer block (L3).,Pre-norm ViT transformer block.
+L3,tasks/baseline/L3/vjepa2_layer.py,VJEPA2DropPath,nn.Module,V-JEPA 2 transformer layer.,
+L3,tasks/baseline/L3/vjepa2_layer.py,VJEPA2Layer,nn.Module,V-JEPA 2 transformer layer.,Single V-JEPA 2 transformer block.
+L3,tasks/baseline/L3/vjepa2_pooler.py,VJEPA2PoolerSelfAttentionLayer,nn.Module,V-JEPA 2 attentive pooler.,
+L3,tasks/baseline/L3/vjepa2_pooler.py,VJEPA2PoolerCrossAttentionLayer,nn.Module,V-JEPA 2 attentive pooler.,
+L3,tasks/baseline/L3/vjepa2_pooler.py,VJEPA2AttentivePooler,nn.Module,V-JEPA 2 attentive pooler.,
+L3,tasks/baseline/L3/vjepa2_predictor.py,VJEPA2PredictorEmbeddings,nn.Module,V-JEPA 2 predictor stack.,
+L3,tasks/baseline/L3/vjepa2_predictor.py,VJEPA2Predictor,nn.Module,V-JEPA 2 predictor stack.,
 L3,tasks/baseline/L3/whisper_decoder_layer.py,WhisperDecoderLayer,nn.Module,Whisper decoder layer: self-attention + cross-attention + MLP.,
 L3,tasks/baseline/L3/whisper_encoder_layer.py,WhisperEncoderLayer,nn.Module,Whisper encoder layer: self-attention + MLP with pre-norm LayerNorm.,
 L3,tasks/baseline/L3/xlm_roberta_encoder.py,XLMRobertaEncoder,nn.Module,XLM-RoBERTa encoder stack.,

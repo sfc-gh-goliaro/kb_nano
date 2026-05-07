@@ -164,6 +164,21 @@ def normalize_row(r: dict) -> dict:
                 cur_notes = r.get("notes", "") or ""
                 r["notes"] = (cur_notes + " " + note).strip()
 
+    # Auto-rule: composable -> kb_nano_l4 when an L4 file exists matching this
+    # HF folder name. Run AFTER partial→composable reclassify so rows that
+    # just-became-composable also get checked.
+    if r.get("support_status") == "composable" and fld:
+        l4_path = KB_REPO / f"tasks/baseline/L4/{fld}.py"
+        if l4_path.exists():
+            r["support_status"] = "kb_nano_l4"
+            note = f"[auto-l4-detect] {l4_path.relative_to(KB_REPO)} exists in kb-nano tree → reclassified composable→kb_nano_l4"
+            cur_notes = r.get("notes", "") or ""
+            r["notes"] = (cur_notes + " " + note).strip()
+            cur_mapped = r.get("mapped_kb_nano", "") or ""
+            if str(l4_path.relative_to(KB_REPO)) not in cur_mapped:
+                l4_entry = f"{fld}_l4→{l4_path.relative_to(KB_REPO)}"
+                r["mapped_kb_nano"] = (cur_mapped + ";" + l4_entry).strip(";") if cur_mapped else l4_entry
+
     return r
 
 
