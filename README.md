@@ -1,6 +1,6 @@
 # kb-nano
 
-A standalone, high-performance inference engine supporting **LLMs** (Llama 3.1, Llama 4, Mixtral-8x7B, DeepSeek V3.2, GPT-OSS, Qwen2-VL, Qwen3-VL), **linear-attention LLMs** (GLA, RetNet, RWKV7), **diffusion models** (FLUX.1-dev, SDXL, HunyuanVideo-1.5), **graphics models** (3D Gaussian Splatting, InstantNGP), **detection models** (YOLOv10, RTDetrV2), **vision encoders** (SigLIP-2, DINOv3, SwinV2), **segmentation models** (SAM3.1), **protein structure prediction** (OpenFold3), audio models (Whisper), and **TTS models** (CosyVoice3) with tensor parallelism and FP8 quantization. No vLLM dependency at runtime — just PyTorch, Triton, and Flash Attention.
+A standalone, high-performance inference engine supporting **LLMs** (Llama 3.1, Llama 4, Mixtral-8x7B, DeepSeek V3.2, GPT-OSS, Qwen2-VL, Qwen3-VL), **linear-attention LLMs** (GLA, RetNet, RWKV7), **diffusion models** (FLUX.1-dev, SDXL, HunyuanVideo-1.5), **detection models** (YOLOv10, RTDetrV2), **vision encoders** (SigLIP-2, DINOv3, SwinV2), **segmentation models** (SAM3.1), **3D point models** (PointTransformerV3), **protein structure prediction** (OpenFold3), audio models (Whisper), and **TTS models** (CosyVoice3) with tensor parallelism and FP8 quantization. No vLLM dependency at runtime — just PyTorch, Triton, and Flash Attention.
 
 ## Features
 
@@ -16,8 +16,6 @@ A standalone, high-performance inference engine supporting **LLMs** (Llama 3.1, 
 - **FLUX.1-dev** diffusion transformer (text-to-image) with Flash Attention
 - **SDXL** (Stable Diffusion XL) UNet-based text-to-image with dual CLIP text encoders
 - **HunyuanVideo-1.5** 3D video diffusion transformer (text-to-video) with dual-stream joint attention, M-RoPE, and Qwen2.5-VL text encoder
-- **3D Gaussian Splatting** (`Voxel51/gaussian_splatting` pretrained `train` scene) with native projection / tile intersection / rasterization path over `gsplat` CUDA primitives
-- **InstantNGP** (`fox` scene) with repo wrapper over official `pyngp` bindings plus kernel-level `HashGrid` / `FullyFusedMLP` field benchmarks on real fox training-view samples
 - **YOLOv10** (`jameslahm/yolov10n`) NMS-free object detection with rank sorting
 - **RTDetrV2** (`PekingU/rtdetr_v2_r101vd`) real-time detection transformer with deformable attention
 - **Qwen2-VL / Qwen3-VL** vision-language models with image and video support
@@ -25,6 +23,7 @@ A standalone, high-performance inference engine supporting **LLMs** (Llama 3.1, 
 - **DINOv3** (facebook/dinov3-vit7b16-pretrain-lvd1689m) Eva vision encoder with 2D RoPE, SwiGLU MLP, and register tokens
 - **SwinV2** (timm/swinv2_large_window12_192.ms_in22k) hierarchical vision transformer with shifted-window cosine attention and continuous position bias
 - **SAM3.1** (facebook/sam3.1) image/video segmentation with ViT backbone, fusion encoder, detection decoder, and segmentation head
+- **PointTransformerV3** (Pointcept/PointTransformerV3) 3D point cloud transformer with serialized pooling, sparse conv stems, and optional Flash Attention
 - **Whisper** (large-v3) encoder-decoder speech-to-text with batched inference and paged cross-attention KV cache
 - **CosyVoice3** (Fun-CosyVoice3-0.5B-2512) text-to-speech with flow matching DiT + HiFi-GAN vocoder
 - **OpenFold3** (OpenFold/OpenFold3) protein structure prediction with MSA module, PairFormer, diffusion sampling, and atom attention
@@ -38,13 +37,12 @@ A standalone, high-performance inference engine supporting **LLMs** (Llama 3.1, 
 - **Layered operator architecture** (L1 single-kernel ops through L4 full models) with clean separation of concerns
 - **Benchmarking suite** for evaluating custom CUDA/Triton/PyTorch kernels at 4 abstraction levels
 - **vllm-omni comparison benchmark** for FLUX diffusion and HunyuanVideo-1.5 video diffusion
-- **gsplat comparison benchmark** for 3D Gaussian Splatting
-- **pyngp / tinycudann comparison benchmarks** for InstantNGP
 - **vllm-omni comparison benchmark** for CosyVoice3 TTS (SEED-TTS-Eval dataset)
 - **diffusers comparison benchmark** for SDXL diffusion
 - **Detection benchmark** for YOLOv10 and RTDetrV2
 - **timm comparison benchmark** for SigLIP-2, DINOv3, and SwinV2 vision encoders (ImageNet-1K validation)
 - **facebook/sam3 comparison benchmark** for SAM3.1 segmentation
+- **PointTransformerV3 detached comparison benchmark** for 3D point cloud encoding
 - **OpenFold/OpenFold3 comparison benchmark** for protein structure prediction
 
 ## Project Structure
@@ -83,9 +81,6 @@ A standalone, high-performance inference engine supporting **LLMs** (Llama 3.1, 
     ├── bench_vllm.py           # Multi-scenario throughput + latency + alignment benchmark vs vLLM
     ├── bench_vllm_omni.py     # Diffusion (FLUX / HunyuanVideo) and TTS (CosyVoice3) benchmark: kb-nano vs vllm-omni
     ├── bench_diffusers.py     # SDXL diffusion benchmark: kb-nano vs diffusers + torch.compile
-    ├── bench_3dgs.py          # 3D Gaussian Splatting benchmark: kb-nano vs gsplat
-    ├── bench_instantngp.py    # InstantNGP render benchmark: kb-nano vs pyngp
-    ├── bench_instantngp_kernels.py  # InstantNGP field benchmark: kb-nano vs tinycudann
     ├── bench_timm.py          # Vision encoder benchmark: kb-nano vs timm (SigLIP-2, DINOv3, SwinV2)
     ├── test_sam.py            # SAM3 segmentation benchmark: kb-nano vs facebook/sam3 reference
     ├── bench_openfold3.py     # OpenFold3 protein structure benchmark: kb-nano vs OpenFold reference
@@ -260,6 +255,37 @@ python tests/test_sam.py --skip-reference
 python tests/test_sam.py --skip-latency
 ```
 
+### Benchmarking vs official PointTransformerV3 (Point Cloud)
+
+```bash
+# Clone detached PointTransformerV3 reference once
+git clone https://github.com/Pointcept/PointTransformerV3.git third_party/PointTransformerV3
+
+# PointTransformerV3: throughput + final-feature alignment vs official detached implementation
+# First run auto-downloads jxie/scanobjectnn and the default ScanNet PTv3 checkpoint
+python tests/bench_pointcloud.py --use-fp16
+
+# Heavier ScanObjectNN workload used for README numbers
+python tests/bench_pointcloud.py \
+    --use-fp16 \
+    --split nobg_test \
+    --max-samples 128 \
+    --batch-size 8 \
+    --points-per-sample 2048 \
+    --grid-size 0.01 \
+    --warmup-iters 10 \
+    --measure-iters 50
+
+# Enable Flash Attention in both ours and reference
+python tests/bench_pointcloud.py --use-fp16 --enable-flash
+
+# kb-nano only (skip reference comparison)
+python tests/bench_pointcloud.py --use-fp16 --skip-reference
+
+# Save results to a specific directory
+python tests/bench_pointcloud.py --use-fp16 --output-dir tests/results/H200/PointTransformerV3
+```
+
 ### Benchmarking detection models
 
 ```bash
@@ -301,92 +327,6 @@ The protein structure benchmark measures:
 - **Throughput**: tokens/sec across short (100-200 residues), medium (200-400), long (400-700), and extra-long (700+) protein chains
 - **Latency**: per-structure prediction latency with median stats
 - **Correctness**: percentage of queries meeting all correctness requirements (atom position cosine similarity >= 0.95, RMSD < 0.5A, pLDDT correlation >= 0.99, PAE cosine similarity >= 0.95)
-
-### Benchmarking vs gsplat (3D Gaussian Splatting)
-
-```bash
-# 3DGS pretrained train scene: throughput + latency + correctness benchmark vs gsplat
-python tests/bench_3dgs.py \
-    --scene train \
-    --num-cameras 2 \
-    --max-points 100000 \
-    --target-measure-seconds 10 \
-    --latency-iters 20
-
-# Same benchmark (flag kept for CLI parity; current low-level projection path runs in float32)
-python tests/bench_3dgs.py \
-    --scene train \
-    --num-cameras 2 \
-    --max-points 100000 \
-    --target-measure-seconds 10 \
-    --latency-iters 20 \
-    --use-fp16
-
-# kb-nano only (skip reference comparison)
-python tests/bench_3dgs.py \
-    --scene train \
-    --num-cameras 2 \
-    --max-points 100000 \
-    --target-measure-seconds 10 \
-    --latency-iters 20 \
-    --skip-reference
-
-# Save results to a specific directory
-python tests/bench_3dgs.py \
-    --scene train \
-    --num-cameras 2 \
-    --max-points 100000 \
-    --target-measure-seconds 10 \
-    --latency-iters 20 \
-    --output-dir tests/results/H200/3dgs-train
-```
-
-### Benchmarking vs pyngp (InstantNGP)
-
-```bash
-# InstantNGP fox scene: render throughput + latency + correctness benchmark vs official pyngp
-python tests/bench_instantngp.py --target-measure-seconds 10 --latency-iters 20
-
-# Faster smoke run at reduced resolution
-python tests/bench_instantngp.py \
-    --width 540 \
-    --height 960 \
-    --target-measure-seconds 10 \
-    --latency-iters 20
-
-# kb-nano only (skip reference comparison)
-python tests/bench_instantngp.py --target-measure-seconds 10 --latency-iters 20 --skip-reference
-
-# Save results to a specific directory
-python tests/bench_instantngp.py \
-    --target-measure-seconds 10 \
-    --latency-iters 20 \
-    --output-dir tests/results/H200/instantngp-fox
-```
-
-### Benchmarking kernel-level InstantNGP field vs direct tinycudann
-
-```bash
-# HashGrid + direction encoding + fully fused MLP field benchmark
-# Defaults use real fox training-view sampled field inputs
-python tests/bench_instantngp_kernels.py \
-    --num-samples 131072 \
-    --target-measure-seconds 10 \
-    --latency-iters 20
-
-# Larger kernel batch
-python tests/bench_instantngp_kernels.py \
-    --num-samples 262144 \
-    --target-measure-seconds 10 \
-    --latency-iters 20
-
-# Save results to a specific directory
-python tests/bench_instantngp_kernels.py \
-    --num-samples 131072 \
-    --target-measure-seconds 10 \
-    --latency-iters 20 \
-    --output-dir tests/results/H200/instantngp-kernels
-```
 
 The diffusion benchmark measures:
 - **Throughput**: images/sec (FLUX) or videos/sec (HunyuanVideo) at various resolutions
@@ -558,6 +498,14 @@ pip install ultralytics==8.4.35
 git clone https://github.com/THU-MIG/yolov10.git third_party/yolov10
 ```
 
+Optional benchmark baselines:
+
+```bash
+pip install addict datasets spconv-cu121==2.3.8
+```
+
+PointTransformerV3 benchmarking compares against the official detached implementation in `third_party/PointTransformerV3`. The current benchmark path uses a local `torch_scatter.segment_csr` shim backed by `torch.segment_reduce`, so `torch_scatter` is not required.
+
 ### GPU architecture and library compatibility
 
 The pre-built wheels for `torch`, `sgl-kernel`, `flash-attn`, and `vllm` must all
@@ -578,29 +526,6 @@ pip install flash-attn
 The engine auto-selects the attention backend based on GPU compute capability:
 **sm_100+** (Blackwell) uses TRTLLM-gen decode kernels via FlashInfer;
 **sm_90 and below** (Hopper, Ampere) uses Flash Attention.
-
-### Optional graphics / 3DGS dependencies
-
-```bash
-pip install gsplat
-```
-
-The 3DGS benchmark downloads the pretrained `FO_dataset/train/point_cloud/iteration_30000/point_cloud.ply` checkpoint from `Voxel51/gaussian_splatting` on first run, then renders a deterministic 100k-Gaussian subset with fixed orbit cameras. The current low-level `gsplat` projection primitive used by kb-nano runs in `float32`, so `--use-fp16` is accepted for CLI consistency but the benchmark reports `dtype=float32`.
-
-### Optional graphics / InstantNGP dependencies
-
-```bash
-git clone --recursive https://github.com/NVlabs/instant-ngp.git third_party/instant-ngp
-pip install -r third_party/instant-ngp/requirements.txt
-TCNN_CUDA_ARCHITECTURES=90 cmake third_party/instant-ngp -B third_party/instant-ngp/build -DCMAKE_BUILD_TYPE=RelWithDebInfo -DNGP_BUILD_WITH_GUI=off -DCMAKE_CUDA_COMPILER=/usr/local/cuda/bin/nvcc
-cmake --build third_party/instant-ngp/build --config RelWithDebInfo -j 8
-export PATH=/usr/local/cuda/bin:$PATH
-cd third_party/instant-ngp/dependencies/tiny-cuda-nn/bindings/torch
-TCNN_CUDA_ARCHITECTURES=90 python setup.py install
-```
-
-The InstantNGP benchmark uses the official `fox` sample scene bundled with `instant-ngp`, reuses the cached `fox_50steps.ingp` snapshot when present, trains it locally for `50` steps only if the cache is missing, and then compares kb-nano's wrapper path against direct `pyngp` rendering on the same training views.
-The kernel-level InstantNGP benchmark uses the same `tiny-cuda-nn` stack, but samples positions and directions from real `fox` training-view rays derived from the cached snapshot metadata before comparing kb-nano's `HashGrid` / direction encoding / `FullyFusedMLP` wrappers against direct `tinycudann` modules.
 
 ## Performance
 
@@ -890,81 +815,6 @@ Correctness (eager mode, decoded video frames, per-prompt cosine similarity):
 
 Correctness is measured in decoded pixel space (both engines produce PIL video frames which are compared as uint8 numpy arrays). The pixel-level cosine similarity of ~0.92 is expected for two independent bf16 implementations: numerical differences in the 30-step denoising loop are amplified by the VAE decoder. For reference, latent-space comparison between kb-nano and HF diffusers yields CosSim=0.986, confirming the transformer backbone is correctly implemented. The pixel-space divergence is dominated by VAE decode amplification and different text encoder implementations (kb-nano uses a custom Qwen2.5-VL paged-attention encoder vs vllm-omni's HuggingFace-based encoder).
 
-### 3D Gaussian Splatting (pretrained train scene)
-
-Run `tests/bench_3dgs.py` to reproduce. The benchmark uses the pretrained `FO_dataset/train/point_cloud/iteration_30000/point_cloud.ply` checkpoint from `Voxel51/gaussian_splatting`, renders a deterministic 100k-Gaussian subset with 2 fixed orbit cameras, and compares kb-nano's native low-level render path against `gsplat.rasterization`. The reported run uses `--target-measure-seconds 10 --latency-iters 20`.
-
-**Hardware: NVIDIA H200**
-
-Throughput (images/sec, float32):
-
-| Scene | Cameras | Loaded / Total Gaussians | gsplat | Ours | Ratio |
-|-------|--------:|-------------------------:|-------:|-----:|------:|
-| train | 2 | 100,000 / 1,074,761 | 556.81 | 553.08 | 0.993x |
-
-Latency (median):
-
-| Scene | gsplat | Ours |
-|-------|-------:|-----:|
-| train | 1.828 ms/image | 1.827 ms/image |
-
-Correctness:
-
-| Output | CosSim | MAE | Shape |
-|--------|-------:|----:|:-----:|
-| RGB image | 1.000000 | 0.0 | 2x1080x1920x3 |
-| Alpha map | 1.000000 | 0.0 | 2x1080x1920x1 |
-
-### InstantNGP (fox scene)
-
-Run `tests/bench_instantngp.py` to reproduce. The benchmark uses the official `instant-ngp` `fox` sample scene, reuses the cached `fox_50steps.ingp` snapshot when present, trains it locally for `50` steps only if missing, and compares kb-nano's wrapper path against direct `pyngp` rendering on the same training views. The reported run uses `--target-measure-seconds 10 --latency-iters 20`.
-
-**Hardware: NVIDIA H200**
-
-Throughput (images/sec, spp=1):
-
-| Scene | Views | Resolution | pyngp | Ours | Ratio |
-|-------|------:|-----------:|------:|-----:|------:|
-| fox | 2 | 1920x1080 | 13.55 | 13.16 | 0.971x |
-
-Latency (median):
-
-| Scene | pyngp | Ours |
-|-------|------:|-----:|
-| fox | 73.48 ms/image | 75.48 ms/image |
-
-Correctness:
-
-| Output | CosSim | MAE | Shape |
-|--------|-------:|----:|:-----:|
-| RGBA image | 1.000000 | 0.0 | 2x1920x1080x4 |
-
-### InstantNGP kernels
-
-Run `tests/bench_instantngp_kernels.py` to reproduce. This benchmark drops below the render wrapper, samples positions and directions from real `fox` training-view rays using the cached snapshot metadata, and compares kb-nano's kernel-level `HashGrid` + direction encoding + `FullyFusedMLP` field wiring against direct `tinycudann` modules with synchronized weights. The reported run uses `--target-measure-seconds 10 --latency-iters 20`.
-
-**Hardware: NVIDIA H200**
-
-Throughput (samples/sec):
-
-| Samples | tinycudann | Ours | Ratio |
-|--------:|-----------:|-----:|------:|
-| 131072 | 430,294,625 | 430,248,490 | 1.000x |
-
-Latency (median):
-
-| Samples | tinycudann | Ours |
-|--------:|-----------:|-----:|
-| 131072 | 0.326 ms/call | 0.329 ms/call |
-
-Correctness:
-
-| Output | CosSim | MAE |
-|--------|-------:|----:|
-| Sigma | 1.000000 | 0.0 |
-| Geo features | 1.000000 | 0.0 |
-| RGB | 1.000000 | 0.0 |
-
 ### CosyVoice3 (TTS)
 
 Run `tests/bench_vllm_omni.py --model FunAudioLLM/Fun-CosyVoice3-0.5B-2512` to reproduce. Dataset: SEED-TTS-Eval (110 utterances across short/medium/long scenarios). Both engines run in float32 with greedy decoding. Reference engine: vllm-omni 0.16.0.
@@ -1144,6 +994,24 @@ Correctness (100 images, per-element cosine similarity):
 
 The remaining numerical divergence is expected from SDPA vs Flash Attention numerics and bf16/fp32 precision differences accumulated through the deep pipeline (backbone + encoder + decoder + pixel decoder + mask predictor). All metrics pass their thresholds (boxes/logits: mean >= 0.95, min >= 0.90; masks: mean >= 0.90, min >= 0.85).
 
+### PointTransformerV3 (Point Cloud)
+
+Run `tests/bench_pointcloud.py` to reproduce. The benchmark uses the public `jxie/scanobjectnn` dataset from Hugging Face and auto-downloads it on first run into `data/scanobjectnn`. Inputs are deterministically voxel-deduplicated before building the sparse tensor so both the official detached implementation and kb-nano see the same valid voxel set. By default, the benchmark loads the official `Pointcept/PointTransformerV3` ScanNet checkpoint file `scannet-semseg-pt-v3m1-0-base/model/model_best.pth`, strips the `module.backbone.` prefix, and compares final backbone features. This is a real pretrained backbone throughput/alignment benchmark on ScanObjectNN inputs; it still does not report ScanObjectNN classification accuracy.
+
+**Hardware: NVIDIA H200**
+
+Throughput (points/sec):
+
+| Dataset Split | Requested Points/Sample | Avg Points After Voxelization | Batch | Official Detached | Ours | Ratio |
+|---------------|------------------------:|------------------------------:|------:|------------------:|-----:|------:|
+| ScanObjectNN `nobg_test` | 2048 | 1941.47 | 8 | 367,144 | 366,602 | 1.00x |
+
+Correctness (feature space, all alignment batches):
+
+| Dataset Split | Feature CosSim | Feature MAE | Feature Shape |
+|---------------|---------------:|------------:|:-------------:|
+| ScanObjectNN `nobg_test` | 0.979595 | 0.14804 | 15702x64 |
+
 ### YOLOv10 (Detection)
 
 Run `tests/bench_detection.py --model jameslahm/yolov10n` to reproduce. Throughput uses synthetic 640x640 image tensors; the reference baseline is the official `THU-MIG/yolov10` implementation loaded from `third_party/yolov10`.
@@ -1197,6 +1065,7 @@ Alignment:
 | Scores | Cosine | 1.000 |
 | Scores | MAE | 0.0 |
 | Labels | Match Rate | 1.000 |
+
 ### OpenFold3 (Protein Structure Prediction)
 
 Run `tests/bench_openfold3.py` to reproduce. Uses real pre-computed MSA data from [OpenProteinSet](https://registry.opendata.aws/openfold/) (74 protein chains across 4 length buckets). Model: OpenFold/OpenFold3 (368M params, `of3-p2-155k.pt` checkpoint). Both engines use identical code with 10 diffusion rollout steps and 1 recycle. Correctness is verified deterministically (identical seeds, `torch.use_deterministic_algorithms`).
