@@ -42,6 +42,7 @@ _CANDIDATE_DIR = CANDIDATE_DIR
 _REFERENCE_DIR = REFERENCE_DIR
 
 _L4_MODEL_KEYS: dict[str, str] = {
+    "bitnet": "bitnet",
     "gla": "gla",
     "gpt_oss": "gpt_oss",
     "llama": "llama31",

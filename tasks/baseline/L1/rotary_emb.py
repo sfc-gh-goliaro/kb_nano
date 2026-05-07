@@ -83,9 +83,11 @@ class RotaryEmbedding(nn.Module):
         rope_low_freq_factor: float = 1.0,
         rope_high_freq_factor: float = 1.0,
         rope_original_max_position_embeddings: int | None = None,
+        is_neox_style: bool = True,
     ):
         super().__init__()
         self.head_dim = head_dim
+        self.is_neox_style = is_neox_style
         inv_freq = 1.0 / (rope_theta ** (torch.arange(0, head_dim, 2, dtype=torch.float) / head_dim))
 
         if rope_scaling_factor != 1.0 and rope_original_max_position_embeddings is not None:
@@ -134,13 +136,41 @@ class RotaryEmbedding(nn.Module):
                          k2 * cos + k1 * sin], dim=-1).view(k_shape)
         return query, key
 
+    @staticmethod
+    def forward_native_interleaved(positions, query, key, head_dim, cos_sin_cache):
+        """Pure PyTorch GPT-J/interleaved RoPE matching CUDA IS_NEOX=false."""
+        cos_sin = cos_sin_cache[positions]
+        embed_dim = cos_sin.shape[-1] // 2
+        cos = cos_sin[..., :embed_dim].unsqueeze(1)
+        sin = cos_sin[..., embed_dim:].unsqueeze(1)
+
+        q_shape = query.shape
+        k_shape = key.shape
+        q = query.view(q_shape[0], -1, head_dim)
+        k = key.view(k_shape[0], -1, head_dim)
+
+        q_even, q_odd = q[..., 0::2], q[..., 1::2]
+        k_even, k_odd = k[..., 0::2], k[..., 1::2]
+
+        q_rot = torch.stack(
+            (q_even * cos - q_odd * sin,
+             q_odd * cos + q_even * sin),
+            dim=-1,
+        ).flatten(-2)
+        k_rot = torch.stack(
+            (k_even * cos - k_odd * sin,
+             k_odd * cos + k_even * sin),
+            dim=-1,
+        ).flatten(-2)
+        return q_rot.view(q_shape), k_rot.view(k_shape)
+
     def forward_cuda(self, positions, query, key):
         """CUDA kernel path for eager mode."""
         cache = self.cos_sin_cache
         if cache.dtype != query.dtype:
             cache = cache.to(query.dtype)
         torch.ops.kb_nano_rope.rotary_embedding(
-            positions, query, key, self.head_dim, cache, True,
+            positions, query, key, self.head_dim, cache, self.is_neox_style,
         )
         return query, key
 
@@ -149,7 +179,11 @@ class RotaryEmbedding(nn.Module):
             cache = self.cos_sin_cache
             if cache.dtype != query.dtype:
                 cache = cache.to(query.dtype)
-            return self.forward_native(
+            if self.is_neox_style:
+                return self.forward_native(
+                    positions, query, key, self.head_dim, cache,
+                )
+            return self.forward_native_interleaved(
                 positions, query, key, self.head_dim, cache,
             )
         return self.forward_cuda(positions, query, key)

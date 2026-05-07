@@ -31,6 +31,7 @@ from transformers import AutoTokenizer
 
 from .context import (
     AttnBackendConfig, CUDAGraphMode, auto_register_no_compile_layers,
+    disable_custom_ops, enable_custom_ops,
     get_attn_backend_config, get_context,
     reset_context, set_context, set_forward_context, set_mamba_context,
     set_mixed_context,
@@ -306,23 +307,36 @@ class ModelRunner:
                 )
                 cfg_dtype = getattr(_cfg, "torch_dtype", None)
                 model_type = getattr(_cfg, "model_type", "")
-            except (ValueError, KeyError):
+            except (ValueError, KeyError, OSError):
+                # BitNet b1.58 ships an ``auto_map`` pointing at
+                # ``configuration_bitnet.py`` / ``modeling_bitnet.py`` files
+                # that don't actually exist in the repo (the model_type is
+                # registered natively in transformers).  Retry without
+                # ``trust_remote_code`` so AutoConfig uses the registered
+                # class instead of the dynamic loader.
                 try:
-                    from huggingface_hub import hf_hub_download
-                    import json as _json
-                    if os.path.isdir(model_name):
-                        _cfg_path = os.path.join(model_name, "config.json")
-                    else:
-                        _cfg_path = hf_hub_download(model_name, "config.json")
-                    with open(_cfg_path) as _f:
-                        _cfg_dict = _json.load(_f)
-                    _td = _cfg_dict.get("torch_dtype", None)
-                    cfg_dtype = getattr(torch, _td) if isinstance(_td, str) else None
-                    model_type = _cfg_dict.get("model_type", "")
-                    if isinstance(cfg_dtype, torch.dtype):
-                        dtype = cfg_dtype
+                    _cfg = AutoConfig.from_pretrained(
+                        model_name, trust_remote_code=False,
+                    )
+                    cfg_dtype = getattr(_cfg, "torch_dtype", None)
+                    model_type = getattr(_cfg, "model_type", "")
                 except Exception:
-                    pass
+                    try:
+                        from huggingface_hub import hf_hub_download
+                        import json as _json
+                        if os.path.isdir(model_name):
+                            _cfg_path = os.path.join(model_name, "config.json")
+                        else:
+                            _cfg_path = hf_hub_download(model_name, "config.json")
+                        with open(_cfg_path) as _f:
+                            _cfg_dict = _json.load(_f)
+                        _td = _cfg_dict.get("torch_dtype", None)
+                        cfg_dtype = getattr(torch, _td) if isinstance(_td, str) else None
+                        model_type = _cfg_dict.get("model_type", "")
+                        if isinstance(cfg_dtype, torch.dtype):
+                            dtype = cfg_dtype
+                    except Exception:
+                        pass
             if model_type in ("mamba", "mamba2") and cfg_dtype == torch.float32:
                 # HF Mamba configs often advertise fp32, but the serving path
                 # restores only the recurrent SSM parameters to fp32 after load
@@ -349,6 +363,7 @@ class ModelRunner:
         self.is_mamba = model_type in ("mamba", "mamba2")
         self.model_family = "mamba" if self.is_mamba else "attention"
         self.is_gpt_oss = model_type == "gpt_oss" or "gpt-oss" in model_name.lower()
+        self.is_bitnet = model_type == "bitnet"
         self.is_moe = hasattr(self.config, "num_local_experts") or getattr(self.config, "is_moe", False)
         self.is_qwen_vl = hasattr(self.config, "mrope_section")
         self.is_qwen3_vl = self.is_qwen_vl and hasattr(
@@ -2373,6 +2388,13 @@ class ModelRunner:
     def run_model(self, input_ids, positions, is_prefill, inputs_embeds=None,
                   deepstack_embeds=None, encoder_outputs=None):
         if is_prefill or self.enforce_eager or input_ids.size(0) > self.graph_bs_list[-1]:
+            model = self.model
+            if is_prefill and self.is_bitnet and self._compiled:
+                # BitNet's BitLinear switches between bf16 fake-quant prefill
+                # and int2 decode by reading the runtime Context. torch.compile
+                # specializes that Python branch during decode graph capture,
+                # so compiled prefill would incorrectly use the int2 path.
+                model = getattr(self, "_eager_model", self.model)
             # For compiled VL models, always compute inputs_embeds outside
             # the compiled graph (matching vLLM).  The compiled inner
             # Qwen3Model was traced with inputs_embeds, so it must always
@@ -2390,19 +2412,19 @@ class ModelRunner:
                                        inputs_embeds=inputs_embeds,
                                        deepstack_embeds=deepstack_embeds)
                         return self.model.compute_logits(hidden)
-                    return self.model.compute_logits(
-                        self.model(input_ids, positions,
-                                   inputs_embeds=inputs_embeds,
-                                   deepstack_embeds=deepstack_embeds)
+                    return model.compute_logits(
+                        model(input_ids, positions,
+                              inputs_embeds=inputs_embeds,
+                              deepstack_embeds=deepstack_embeds)
                     )
-                return self.model.compute_logits(
-                    self.model(input_ids, positions, inputs_embeds=inputs_embeds)
+                return model.compute_logits(
+                    model(input_ids, positions, inputs_embeds=inputs_embeds)
                 )
             if encoder_outputs is not None:
-                return self.model.compute_logits(
-                    self.model(input_ids, positions, encoder_outputs=encoder_outputs)
+                return model.compute_logits(
+                    model(input_ids, positions, encoder_outputs=encoder_outputs)
                 )
-            return self.model.compute_logits(self.model(input_ids, positions))
+            return model.compute_logits(model(input_ids, positions))
         # Decode path: CUDA graph replay.
         # For VL models, embed_fn is recorded inside the graph — updating
         # input_ids in graph_vars is sufficient; the graph replays embed_fn
@@ -2543,10 +2565,18 @@ class ModelRunner:
             req_id_per_token=req_id_per_token,
         )
         self._apply_pending_cross_ctx()
-        hidden = self.model(input_ids, positions)
-        lm_head = self.model.lm_head
-        logits = lm_head.linear_op(hidden, lm_head.embedding_op.emb.weight).float()
-        max_vals, max_idxs = logits.max(dim=-1)
+        use_bitnet_eager_model = self.is_bitnet and self._compiled
+        model = getattr(self, "_eager_model", self.model) if use_bitnet_eager_model else self.model
+        if use_bitnet_eager_model:
+            disable_custom_ops()
+        try:
+            hidden = model(input_ids, positions)
+            lm_head = model.lm_head
+            logits = lm_head.linear_op(hidden, lm_head.embedding_op.emb.weight).float()
+            max_vals, max_idxs = logits.max(dim=-1)
+        finally:
+            if use_bitnet_eager_model:
+                enable_custom_ops()
         reset_context()
 
         if self.world_size > 1:
@@ -4438,6 +4468,9 @@ class LlamaEngine:
 
         use_greedy = (sp_list[0].temperature == 0.0
                       and not collect_logits)
+        is_bitnet = getattr(
+            self.model_runner.config, "model_type", "",
+        ) == "bitnet"
         block_size = BLOCK_SIZE
         bm = self.block_manager
         num_blocks = bm._num_blocks
@@ -4493,6 +4526,40 @@ class LlamaEngine:
             # No waiting/prefilling seqs, so skip the full scheduler.
             # =============================================================
             if running and not waiting and not prefilling and use_greedy:
+                if is_bitnet and len(running) == 1:
+                    seq = running[0]
+                    remaining = seq.max_tokens - len(seq.generated_ids)
+                    mr = self.model_runner
+                    # Microsoft BitNet's ladder decode kernel is fastest under
+                    # CUDA graph, but for 1024-token prefills the captured graph
+                    # diverges from the official direct decode in the first few
+                    # autoregressive steps. Seed the KV state with a tiny
+                    # uncompiled prefix, then return to graph replay.
+                    if (
+                        seq.ignore_eos
+                        and remaining > 0
+                        and seq.num_prompt_tokens >= 1024
+                        and len(seq.generated_ids) <= 4
+                        and mr.world_size == 1
+                        and not mr.enforce_eager
+                    ):
+                        if len(seq) % block_size != 1 or bm.free_block_ids:
+                            if len(seq) % block_size == 1:
+                                seq.block_table.append(
+                                    bm.free_block_ids.popleft())
+                            decode_data = mr._prepare_decode_arrays([seq])
+                            gpu_ids = mr._run_decode_greedy_eager(*decode_data)
+                            if gpu_ids is not None:
+                                tid = int(gpu_ids[:1].tolist()[0])
+                                seq.append_token(tid)
+                                done = len(seq.generated_ids) >= seq.max_tokens
+                                if not seq.ignore_eos:
+                                    done = done or tid == eos
+                                if done:
+                                    _finish_seq(seq)
+                                    running.clear()
+                                continue
+
                 need_blocks = 0
                 for seq in running:
                     if len(seq) % block_size == 1:
@@ -4662,23 +4729,36 @@ class LlamaEngine:
             # --- 1. Allocate blocks for decode seqs that need a new block ---
             decode_seqs: list[Sequence] = []
             new_running: deque[Sequence] = deque()
-            while running:
-                seq = running.popleft()
-                if len(decode_seqs) >= self.max_num_seqs:
-                    new_running.append(seq)
-                    continue
-                needs_block = (len(seq) % block_size == 1)
-                if needs_block:
-                    if not bm.free_block_ids:
-                        bm.deallocate(seq)
-                        bm.deallocate_cross(seq)
-                        seq.preempt()
-                        waiting.appendleft(seq)
+            def _schedule_decode_tokens() -> None:
+                nonlocal token_budget, running, decode_seqs, new_running
+                while running:
+                    seq = running.popleft()
+                    if len(decode_seqs) >= self.max_num_seqs:
+                        new_running.append(seq)
                         continue
-                    seq.block_table.append(bm.free_block_ids.popleft())
-                decode_seqs.append(seq)
-            running = new_running
-            token_budget -= len(decode_seqs)
+                    needs_block = (len(seq) % block_size == 1)
+                    if needs_block:
+                        if not bm.free_block_ids:
+                            bm.deallocate(seq)
+                            bm.deallocate_cross(seq)
+                            seq.preempt()
+                            waiting.appendleft(seq)
+                            continue
+                        seq.block_table.append(bm.free_block_ids.popleft())
+                    decode_seqs.append(seq)
+                running = new_running
+                token_budget -= len(decode_seqs)
+
+            if is_bitnet and (waiting or prefilling):
+                # BitNet uses bf16 fake-quant weights for prefill and int2
+                # weights for decode. Since BitLinear dispatches per forward,
+                # mixed prefill+decode batches would run decode tokens through
+                # the prefill path and break alignment. Try prefill first; if
+                # no prefill work can be scheduled this step, fall back to
+                # pure decode below to avoid scheduler empty-spin/deadlock.
+                pass
+            else:
+                _schedule_decode_tokens()
 
             # --- 2. Continue prefilling seqs already mid-prefill ---
             prefill_seqs: list[Sequence] = []
@@ -4748,7 +4828,15 @@ class LlamaEngine:
                             + block_size - 1) // block_size
                 if total_peak + seq_peak > num_blocks:
                     break
-                if len(prefill_seqs) + len(decode_seqs) >= self.max_num_seqs:
+                num_scheduled = len(prefill_seqs) + len(decode_seqs)
+                if is_bitnet:
+                    # BitNet may intentionally leave running decode seqs
+                    # unscheduled while it tries to drain pure-prefill work.
+                    # Count those active seqs against max_num_seqs so
+                    # --kb-bsz=1 really means one in-flight request, not one
+                    # prefill plus hidden running decode requests.
+                    num_scheduled += len(running) + len(prefilling)
+                if num_scheduled >= self.max_num_seqs:
                     break
                 waiting.popleft()
                 bm.allocate_n(seq, blocks_needed)
@@ -4762,6 +4850,9 @@ class LlamaEngine:
                 total_peak += seq_peak
                 if has_mm:
                     encoder_budget -= chunk
+
+            if is_bitnet and not prefill_seqs and not decode_seqs and running:
+                _schedule_decode_tokens()
 
             if not decode_seqs and not prefill_seqs:
                 continue
@@ -4824,7 +4915,21 @@ class LlamaEngine:
                 # Pure decode with CUDA graphs (fast path)
                 if self.is_whisper:
                     self.model_runner._set_cross_attn_context_decode(decode_seqs)
-                gpu_result = self.model_runner.call_decode_greedy(decode_seqs)
+                if (
+                    is_bitnet
+                    and len(decode_seqs) == 1
+                    and decode_seqs[0].ignore_eos
+                    and decode_seqs[0].num_prompt_tokens >= 1024
+                    and len(decode_seqs[0].generated_ids) <= 4
+                    and self.model_runner.world_size == 1
+                    and not self.model_runner.enforce_eager
+                ):
+                    decode_data = self.model_runner._prepare_decode_arrays(
+                        decode_seqs)
+                    gpu_result = self.model_runner._run_decode_greedy_eager(
+                        *decode_data)
+                else:
+                    gpu_result = self.model_runner.call_decode_greedy(decode_seqs)
                 if gpu_result is not None:
                     token_ids = gpu_result.tolist()
                     finished_set = set()
@@ -4987,6 +5092,19 @@ class LlamaEngine:
             print(f"  pure_mm_prefill:   {sp['pure_mm_prefill']:6d} steps, {sp['mm_prefill_tokens']:10d} tokens, {sp['mm_prefill_time']:.3f}s")
             print(f"  mixed_text:        {sp['mixed_text']:6d} steps, pf={sp['mixed_text_pf_tokens']:10d} dc={sp['mixed_text_dc_tokens']:10d}")
             print(f"  mixed_mm:          {sp['mixed_mm']:6d} steps, pf={sp['mixed_mm_pf_tokens']:10d} dc={sp['mixed_mm_dc_tokens']:10d}, {sp['mixed_mm_time']:.3f}s")
+            fp = getattr(self, "_fast_path_profile", None)
+            if fp is not None and fp["n"]:
+                print(
+                    "  fast_path_detail: "
+                    f"prep={fp['prep']:.3f}s "
+                    f"gpu_dispatch={fp['gpu']:.3f}s "
+                    f"d2h_wait={fp['tolist']:.3f}s "
+                    f"post={fp['post']:.3f}s "
+                    f"steps={fp['n']}"
+                )
+                self._fast_path_profile = {
+                    "prep": 0., "gpu": 0., "tolist": 0., "post": 0., "n": 0,
+                }
 
         # Return in original order
         return [
