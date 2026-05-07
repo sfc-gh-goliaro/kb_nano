@@ -163,7 +163,7 @@ def test_lstm_cudnn():
                dict(batch_first=True), dict(num_layers=1, bias=False)]:
         ref = nn.LSTM(8, 16, **kw).to(device)
         kb = KBLSTM(8, 16, **kw).to(device)
-        kb.load_state_dict(ref.state_dict())
+        kb.lstm.load_state_dict(ref.state_dict())
         if kw.get("batch_first"):
             x = torch.randn(2, 5, 8, device=device)
         else:

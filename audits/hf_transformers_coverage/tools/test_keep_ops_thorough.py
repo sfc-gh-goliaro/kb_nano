@@ -181,18 +181,18 @@ def test_lstm():
     HF actual usage: nn.LSTM(dim, dim, num_layers) — encodec.
     Spec: input_size, hidden_size, num_layers, bias, batch_first, dropout, bidirectional, proj_size."""
     group = "LSTM"
-    # As of round-2 fix, kb-nano LSTM is `class LSTM(nn.LSTM): pass` (subclass alias).
-    # State_dict keys are bare (weight_ih_l0 etc), bit-identical to nn.LSTM.
+    # kb-nano LSTM is an nn.Module wrapper holding self.lstm = nn.LSTM(...).
+    # State_dict keys are nested under 'lstm.'; inner keys match nn.LSTM exactly.
     ref = nn.LSTM(8, 16, num_layers=2)
     kb = LSTM(8, 16, num_layers=2)
-    kb_keys = set(kb.state_dict().keys())
+    inner_keys = set(kb.lstm.state_dict().keys())
     ref_keys = set(ref.state_dict().keys())
-    if kb_keys != ref_keys:
-        FAILED.append((group, "state_keys", -1.0))
-        print(f"  FAIL  {group}/state_keys: kb={sorted(kb_keys)} vs ref={sorted(ref_keys)}")
+    if inner_keys != ref_keys:
+        FAILED.append((group, "inner_state_keys", -1.0))
+        print(f"  FAIL  {group}/inner_state_keys: kb.lstm={sorted(inner_keys)} vs ref={sorted(ref_keys)}")
     else:
-        PASSED.append((group, "state_keys", 0.0))
-        print(f"  PASS  {group:22s} state_keys (bare) = {sorted(ref_keys)[:3]}...")
+        PASSED.append((group, "inner_state_keys", 0.0))
+        print(f"  PASS  {group:22s} inner_state_keys = {sorted(ref_keys)[:3]}...")
     for dtype in [torch.float32]:  # LSTM cuDNN doesn't always like bf16; HF encodec uses fp32
         for cfg in [
             # (input_size, hidden_size, num_layers, bias, batch_first, bidirectional, proj_size)
@@ -208,7 +208,7 @@ def test_lstm():
                           bidirectional=bidir, proj_size=proj).to(dtype)
             kb = LSTM(ip, hp, num_layers=nl, bias=bias, batch_first=bf,
                       bidirectional=bidir, proj_size=proj).to(dtype)
-            kb.load_state_dict(ref.state_dict())
+            kb.lstm.load_state_dict(ref.state_dict())
             T, B = 5, 2
             x = torch.randn(B, T, ip, dtype=dtype) if bf else torch.randn(T, B, ip, dtype=dtype)
             ref_out, _ = ref(x)

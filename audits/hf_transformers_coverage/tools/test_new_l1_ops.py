@@ -70,7 +70,7 @@ def main():
 
     ref = nn.LSTM(8, 16, 2, batch_first=True)
     kb = LSTM(8, 16, 2, batch_first=True)
-    kb.load_state_dict(ref.state_dict())
+    kb.lstm.load_state_dict(ref.state_dict())
     x = torch.randn(2, 5, 8)
     _check("LSTM", kb(x), ref(x))
 

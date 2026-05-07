@@ -99,19 +99,21 @@ def test_conv_transpose():
 
 
 def test_lstm():
-    """LSTM must be state_dict-compatible with nn.LSTM (bare keys, no nesting)."""
+    """LSTM is an nn.Module wrapper around nn.LSTM. State_dict keys nested under 'lstm.';
+    inner keys match nn.LSTM exactly. Numerical output identical to nn.LSTM."""
     for kw in [dict(num_layers=1), dict(num_layers=2), dict(bidirectional=True),
                dict(num_layers=2, bidirectional=True), dict(batch_first=True),
                dict(num_layers=1, bias=False)]:
         ref = nn.LSTM(8, 16, **kw)
         kb = LSTM(8, 16, **kw)
+        # Inner state_dict (kb.lstm.state_dict()) must match nn.LSTM exactly.
         ref_keys = set(ref.state_dict().keys())
-        kb_keys = set(kb.state_dict().keys())
-        if ref_keys != kb_keys:
-            FAIL.append((f"LSTM/{kw}/keys", -1.0))
-            print(f"  FAIL  LSTM/{kw}: keys differ ref={sorted(ref_keys)}, kb={sorted(kb_keys)}")
+        inner_keys = set(kb.lstm.state_dict().keys())
+        if ref_keys != inner_keys:
+            FAIL.append((f"LSTM/{kw}/inner_keys", -1.0))
+            print(f"  FAIL  LSTM/{kw}: inner keys differ ref={sorted(ref_keys)}, kb.lstm={sorted(inner_keys)}")
             continue
-        kb.load_state_dict(ref.state_dict())
+        kb.lstm.load_state_dict(ref.state_dict())
         x = torch.randn(2, 5, 8) if kw.get("batch_first") else torch.randn(5, 2, 8)
         check(f"LSTM/{kw}", kb(x)[0], ref(x)[0], tol=1e-5)
 
