@@ -1,6 +1,6 @@
 # kb-nano
 
-A standalone, high-performance inference engine supporting **LLMs** (Llama 3.1, Llama 4, Mixtral-8x7B, DeepSeek V3.2, GPT-OSS, Qwen2-VL, Qwen3-VL), **linear-attention LLMs** (GLA, RetNet, RWKV7), **diffusion models** (FLUX.1-dev, SDXL, HunyuanVideo-1.5), **detection models** (YOLOv10, RTDetrV2), **vision encoders** (SigLIP-2, DINOv3, SwinV2), **segmentation models** (SAM3.1), **protein structure prediction** (OpenFold3), audio models (Whisper), **TTS models** (CosyVoice3), and **robotics VLA models** (Pi0) with tensor parallelism and FP8 quantization. No vLLM dependency at runtime — just PyTorch, Triton, and Flash Attention.
+A standalone, high-performance inference engine supporting **LLMs** (Llama 3.1, Llama 4, Mixtral-8x7B, DeepSeek V3.2, GPT-OSS, Qwen2-VL, Qwen3-VL), **linear-attention LLMs** (GLA, RetNet, RWKV7), **embedding / retrieval models** (BGE-M3, ColBERTv2), **diffusion models** (FLUX.1-dev, SDXL, HunyuanVideo-1.5), **world models** (Oasis 500M), **detection models** (YOLOv10, RTDetrV2), **vision encoders** (SigLIP-2, DINOv3, SwinV2), **segmentation models** (SAM3.1), **3D point models** (PointTransformerV3), **protein structure prediction** (OpenFold3), audio models (Whisper), **TTS models** (CosyVoice3), and **3-D visuomotor policies** (DP3 / Simple-DP3) with tensor parallelism and FP8 quantization. No vLLM dependency at runtime — just PyTorch, Triton, and Flash Attention.
 
 ## Features
 
@@ -9,6 +9,8 @@ A standalone, high-performance inference engine supporting **LLMs** (Llama 3.1, 
 - **Mixtral-8x7B** with fused Triton MoE grouped-GEMM kernels
 - **DeepSeek V3.2** with MLA (Multi-head Latent Attention), 256-expert MoE via DeepGEMM FP8, DSA (DeepSeek Sparse Attention), and YARN RoPE — currently **0.78–0.90× of vLLM** throughput on 8×H200 (gap due to kernel-launch overhead, GEMM kernel selection, and AllReduce+RMSNorm fusion)
 - **GPT-OSS** (20B, 120B) MXFP4-quantized MoE with native Triton inference, YaRN RoPE, attention sinks, and sliding window
+- **BGE-M3** dense + sparse + ColBERT-style embedding outputs
+- **ColBERTv2** query/doc encoders with MaxSim scoring
 - **Mamba / Mamba2** (`state-spaces/mamba-2.8b-hf`, `mistralai/Mamba-Codestral-7B-v0.1`) selective state-space models with vLLM-aligned `causal_conv1d` + `mamba_chunk_scan` / `selective_scan` kernels, slot-based recurrent state cache, chunked-prefill metadata, and TP sharding (incl. `n_groups % tp != 0` head-shard groups)
 - **GLA** (`fla-hub/gla-2.7B-100B`) Gated Linear Attention with per-head logsigmoid forget gate, swish output gate, and SwiGLU MLP — token-aligned with the FLA reference
 - **RetNet** (`fla-hub/retnet-2.7B-100B`) Multi-Scale Retention with rotary embeddings, fixed per-head decay (γ_h = 1 − 2^(−5−h)), swish output gate, and SwiGLU MLP — token-aligned with the FLA reference
@@ -16,6 +18,7 @@ A standalone, high-performance inference engine supporting **LLMs** (Llama 3.1, 
 - **FLUX.1-dev** diffusion transformer (text-to-image) with Flash Attention
 - **SDXL** (Stable Diffusion XL) UNet-based text-to-image with dual CLIP text encoders
 - **HunyuanVideo-1.5** 3D video diffusion transformer (text-to-video) with dual-stream joint attention, M-RoPE, and Qwen2.5-VL text encoder
+- **Oasis 500M** action-conditioned autoregressive diffusion world model
 - **YOLOv10** (`jameslahm/yolov10n`) NMS-free object detection with rank sorting
 - **RTDetrV2** (`PekingU/rtdetr_v2_r101vd`) real-time detection transformer with deformable attention
 - **Qwen2-VL / Qwen3-VL** vision-language models with image and video support
@@ -23,10 +26,11 @@ A standalone, high-performance inference engine supporting **LLMs** (Llama 3.1, 
 - **DINOv3** (facebook/dinov3-vit7b16-pretrain-lvd1689m) Eva vision encoder with 2D RoPE, SwiGLU MLP, and register tokens
 - **SwinV2** (timm/swinv2_large_window12_192.ms_in22k) hierarchical vision transformer with shifted-window cosine attention and continuous position bias
 - **SAM3.1** (facebook/sam3.1) image/video segmentation with ViT backbone, fusion encoder, detection decoder, and segmentation head
+- **PointTransformerV3** (Pointcept/PointTransformerV3) 3D point cloud transformer with serialized pooling, sparse conv stems, and optional Flash Attention
 - **Whisper** (large-v3) encoder-decoder speech-to-text with batched inference and paged cross-attention KV cache
 - **CosyVoice3** (Fun-CosyVoice3-0.5B-2512) text-to-speech with flow matching DiT + HiFi-GAN vocoder
-- **Pi0** (lerobot/pi0_base) vision-language-action robotics model with SigLIP vision encoder, PaliGemma VLM backbone, Gemma 300M action expert, and flow-matching action generation (10-step Euler ODE)
 - **OpenFold3** (OpenFold/OpenFold3) protein structure prediction with MSA module, PairFormer, diffusion sampling, and atom attention
+- **DP3 / Simple-DP3** (YanjieZe/3D-Diffusion-Policy) 3-D visuomotor policy with PointNet point-cloud encoder, 1-D conditional U-Net (FiLM-modulated, Mish + GroupNorm), DDIM scheduler with `prediction_type="sample"`, and action chunking (horizon=16, n_obs_steps=2, n_action_steps=8)
 - **FP8 inference** with block-scaled FP8 quantization via DeepGEMM, UE8M0 power-of-two scales, and fused SiLU+Mul+FP8 quantization kernels
 - **Tensor parallelism** (TP) with custom IPC-based all-reduce for multi-GPU inference
 - **Paged KV cache** with Triton store kernels (LLM models); FP8 MLA KV cache for DeepSeek
@@ -42,7 +46,11 @@ A standalone, high-performance inference engine supporting **LLMs** (Llama 3.1, 
 - **Detection benchmark** for YOLOv10 and RTDetrV2
 - **timm comparison benchmark** for SigLIP-2, DINOv3, and SwinV2 vision encoders (ImageNet-1K validation)
 - **facebook/sam3 comparison benchmark** for SAM3.1 segmentation
+- **vLLM pooling/token_embed comparison benchmark** for embedding and retrieval models
+- **PointTransformerV3 detached comparison benchmark** for 3D point cloud encoding
+- **open-oasis comparison benchmark** for autoregressive diffusion world models
 - **OpenFold/OpenFold3 comparison benchmark** for protein structure prediction
+- **3D-Diffusion-Policy comparison benchmark** for DP3 / Simple-DP3 visuomotor policies (real point clouds from `rishabhrj11/gym-xarm-pointcloud`)
 
 ## Project Structure
 
@@ -80,7 +88,6 @@ A standalone, high-performance inference engine supporting **LLMs** (Llama 3.1, 
     ├── bench_vllm.py           # Multi-scenario throughput + latency + alignment benchmark vs vLLM
     ├── bench_vllm_omni.py     # Diffusion (FLUX / HunyuanVideo) and TTS (CosyVoice3) benchmark: kb-nano vs vllm-omni
     ├── bench_diffusers.py     # SDXL diffusion benchmark: kb-nano vs diffusers + torch.compile
-    ├── bench_openpi.py        # Pi0 VLA benchmark: kb-nano vs OpenPI (Policy) or HF Transformers
     ├── bench_timm.py          # Vision encoder benchmark: kb-nano vs timm (SigLIP-2, DINOv3, SwinV2)
     ├── test_sam.py            # SAM3 segmentation benchmark: kb-nano vs facebook/sam3 reference
     ├── bench_openfold3.py     # OpenFold3 protein structure benchmark: kb-nano vs OpenFold reference
@@ -202,108 +209,6 @@ python tests/bench_diffusers.py --skip-diffusers
 python tests/bench_diffusers.py --output-dir tests/results/B200/stable-diffusion-xl-base-1.0
 ```
 
-### Benchmarking vs OpenPI / HF Transformers (Pi0 Robotics VLA)
-
-Default runs use **real robot demonstration data** from three domains: ALOHA, DROID, and LIBERO. Use `--synthetic-only` only for debugging.
-
-**Like-with-like comparison:** both kb-nano and OpenPI load the **same fine-tuned Pi0 checkpoint** (converted to PyTorch). Both sides apply matching domain-specific transforms and use pre-generated shared noise for deterministic flow-matching. Correctness is measured on robot-space actions after full output post-processing.
-
-| Dataset | HF dataset | Checkpoint | action_dim | action_horizon |
-|---------|-----------|-----------|----------:|---------------:|
-| ALOHA | `physical-intelligence/aloha_pen_uncap_diverse` | `pi0_aloha_pen_uncap` | 14 | 50 |
-| DROID | `lerobot/droid_100` | `pi0_droid` | 8 | 10 |
-| LIBERO | `lerobot/libero_10_image` | `pi0_libero` | 7 | 50 |
-
-> **DROID dataset note:** `lerobot/droid_100` stores observations as MP4 videos.
-> The benchmark selects LeRobot's bundled `pyav` video backend
-> (`video_backend="pyav"`), which decodes without a system FFmpeg install.
-
-**Why a separate venv for OpenPI:** OpenPI pins `transformers==4.53.2` and requires manually overlaying `src/openpi/models_pytorch/transformers_replace/` into the transformers site-package. This conflicts with kb-nano's environment. Keep them isolated; pass `--reference-python` to point at the OpenPI interpreter.
-
-**Install OpenPI:**
-```bash
-# Clone (skip LFS checkpoints — we download separately)
-GIT_LFS_SKIP_SMUDGE=1 git clone https://github.com/physical-intelligence/openpi \
-  /raid/user_data/olu/openpi
-cd /raid/user_data/olu/openpi
-uv sync
-
-# Overlay the custom Transformers modules OpenPI requires
-cp -r src/openpi/models_pytorch/transformers_replace/* \
-  .venv/lib/python3.11/site-packages/transformers/
-```
-
-**One-time checkpoint conversion** (JAX → PyTorch safetensors). Repeat for each domain checkpoint:
-```bash
-cd /raid/user_data/olu/openpi
-
-# ALOHA
-.venv/bin/python examples/convert_jax_model_to_pytorch.py \
-  --checkpoint-dir ~/.cache/openpi/openpi-assets/checkpoints/pi0_aloha_pen_uncap \
-  --config-name pi0_aloha_pen_uncap \
-  --output-path /raid/user_data/olu/pi0_aloha_pen_uncap_pytorch
-cp -a ~/.cache/openpi/openpi-assets/checkpoints/pi0_aloha_pen_uncap/assets \
-  /raid/user_data/olu/pi0_aloha_pen_uncap_pytorch/
-
-# DROID
-.venv/bin/python examples/convert_jax_model_to_pytorch.py \
-  --checkpoint-dir ~/.cache/openpi/openpi-assets/checkpoints/pi0_droid \
-  --config-name pi0_droid \
-  --output-path /raid/user_data/olu/pi0_droid_pytorch
-cp -a ~/.cache/openpi/openpi-assets/checkpoints/pi0_droid/assets \
-  /raid/user_data/olu/pi0_droid_pytorch/
-
-# LIBERO
-.venv/bin/python examples/convert_jax_model_to_pytorch.py \
-  --checkpoint-dir ~/.cache/openpi/openpi-assets/checkpoints/pi0_libero \
-  --config-name pi0_libero \
-  --output-path /raid/user_data/olu/pi0_libero_pytorch
-cp -a ~/.cache/openpi/openpi-assets/checkpoints/pi0_libero/assets \
-  /raid/user_data/olu/pi0_libero_pytorch/
-```
-
-The **OpenPI** reference uses `create_trained_policy` + `Policy.infer` with the PyTorch backend (`--openpi-backend pytorch`). The checkpoint must contain `model.safetensors`; there is no automatic JAX fallback. Use `--openpi-backend jax` only when explicitly testing the JAX stack.
-
-On shared GPUs, set `CUDA_VISIBLE_DEVICES` to an idle GPU (`nvidia-smi`).
-
-```bash
-# All three datasets vs OpenPI PyTorch
-CUDA_VISIBLE_DEVICES=3 python tests/bench_openpi.py \
-  --reference-python /raid/user_data/olu/openpi/.venv/bin/python \
-  --model /raid/user_data/olu/pi0_aloha_pen_uncap_pytorch \
-  --droid-model /raid/user_data/olu/pi0_droid_pytorch \
-  --libero-model /raid/user_data/olu/pi0_libero_pytorch
-
-# Single dataset
-CUDA_VISIBLE_DEVICES=3 python tests/bench_openpi.py \
-  --datasets aloha \
-  --reference-python /raid/user_data/olu/openpi/.venv/bin/python \
-  --model /raid/user_data/olu/pi0_aloha_pen_uncap_pytorch
-
-# kb-nano only (no OpenPI reference)
-python tests/bench_openpi.py --skip-reference \
-  --model /raid/user_data/olu/pi0_aloha_pen_uncap_pytorch \
-  --droid-model /raid/user_data/olu/pi0_droid_pytorch \
-  --libero-model /raid/user_data/olu/pi0_libero_pytorch
-
-# Synthetic tensors (debug only — not for reported benchmarks)
-python tests/bench_openpi.py --synthetic-only --num-requests 10 --num-steps 10
-
-# Save results to a specific directory
-python tests/bench_openpi.py --output-dir tests/results/B200/pi0
-```
-
-**Results (B200, N=100, 10 flow-matching steps, bfloat16):**
-
-| Scenario | kb-nano ips | OpenPI ips | Speedup | kb-nano p50 latency | OpenPI p50 latency | CosSim | MSE |
-|---|---:|---:|---:|---:|---:|---:|---:|
-| ALOHA 3-cam | 29.35 | 8.11 | 3.62× | 33.8 ms | 121.6 ms | 0.9999995 | 2.3e-07 |
-| ALOHA 1-cam | 16.66 | 8.16 | 2.04× | 25.9 ms | 121.4 ms | 0.9999992 | 3.4e-07 |
-| DROID 2-cam | 33.76 | 8.13 | 4.15× | 29.7 ms | 122.8 ms | 0.9994678 | 5.6e-05 |
-| LIBERO 2-cam | 33.59 | 8.15 | 4.12× | 29.2 ms | 121.2 ms | 0.9994360 | 2.4e-04 |
-
-Correctness is the mean cosine similarity between kb-nano and OpenPI predicted action chunks on 100 real dataset samples, with both sides using the same shared flow-matching noise. All four scenarios clear the ≥0.99 bar.
-
 ### Benchmarking vs timm (Vision Encoders)
 
 Supported models:
@@ -399,10 +304,111 @@ The protein structure benchmark measures:
 - **Latency**: per-structure prediction latency with median stats
 - **Correctness**: percentage of queries meeting all correctness requirements (atom position cosine similarity >= 0.95, RMSD < 0.5A, pLDDT correlation >= 0.99, PAE cosine similarity >= 0.95)
 
+### Benchmarking vs 3D-Diffusion-Policy (DP3 / Simple-DP3)
+
+```bash
+# Simple-DP3 (default): real xarm point clouds, 100 frames, kb-nano vs reference
+python tests/bench_dp3.py
+
+# Full DP3 (heavier U-Net, down_dims=[512,1024,2048])
+python tests/bench_dp3.py --variant dp3
+
+# kb-nano only (skip reference comparison)
+python tests/bench_dp3.py --skip-reference
+
+# Use a real trained DP3 checkpoint (latest.ckpt produced by reference's train.py)
+python tests/bench_dp3.py --checkpoint /path/to/latest.ckpt
+
+# Override request count or DDIM steps
+python tests/bench_dp3.py --num-requests 200 --num-steps 10
+
+# Enable torch.compile (default is eager — apples-to-apples vs reference)
+python tests/bench_dp3.py --torch-compile
+
+# Synthetic Gaussian point clouds (debug only)
+python tests/bench_dp3.py --synthetic-only
+```
+
+**Inputs.** Real 3-D point cloud + robot state + actions from `rishabhrj11/gym-xarm-pointcloud` (HF Hub, 18374 frames, 50 episodes, gym-xarm push-block). Point clouds are 512×6 XYZRGB extracted from depth cameras; we slice to XYZ for `use_pc_color=False`. Robot state is 7-D joint angles, action is 4-D end-effector control. The per-key linear normalizer (`scale`, `offset`) is fit to real xarm data (1000 frames, "limits" mode → outputs scaled to [-1, 1]) so the normalize/unnormalize math is exercised end-to-end — not bypassed via identity scale.
+
+**Weights.** DP3 publishes no pretrained checkpoints, but kernel/math equivalence is independent of weight values. The bench builds a reference DP3 with `nn.Linear` Kaiming-uniform init, saves it in the reference's `train.py` checkpoint format, and both engines load the same file. Pass `--checkpoint` to use a real trained checkpoint.
+
+**Validates:**
+- **Correctness**: per-frame action MSE + cosine similarity between kb-nano and reference (≥ 0.999 cos sim required to pass).
+- **Speed**: throughput + P50/P99 latency at single-env (B=1) and batched (B=8) scenarios.
+- *Out of scope*: real-task accuracy (would require MuJoCo + scripted-policy demo generation + multi-hour training).
+
+**Results on 1× B200 (real xarm data, 10 DDIM steps, fp32, eager — see `tests/results/B200/dp3_*/results.json`):**
+
+Simple-DP3 (13.2M params, 100 frames):
+
+| Scenario | kb-nano | reference | speedup |
+|---|---|---|---|
+| dp3-1env throughput | 23.45 req/s | 14.00 req/s | 1.67× |
+| dp3-batch throughput (bsz=8) | 178.25 req/s | 152.14 req/s | 1.17× |
+| single-step latency (P50/P99) | 42.5 / 42.6 ms | 47.6 / 49.9 ms | 1.12× |
+| batch-8 latency (P50/P99) | 41.7 / 42.7 ms | 51.5 / 63.9 ms | 1.24× |
+
+Full DP3 (255M params, 50 frames):
+
+| Scenario | kb-nano | reference | speedup |
+|---|---|---|---|
+| dp3-1env throughput | 22.78 req/s | 20.64 req/s | 1.10× |
+| dp3-batch throughput (bsz=8) | 144.58 req/s | 143.84 req/s | 1.01× |
+| single-step latency (P50/P99) | 40.0 / 48.8 ms | 47.8 / 53.3 ms | 1.19× |
+| batch-8 latency (P50/P99) | 40.1 / 45.7 ms | 45.8 / 90.0 ms | 1.14× |
+
+**Correctness:** **byte-identical** outputs across all samples in both variants — mean MSE = 0.0, mean cosine similarity = 1.000000, max abs diff = **0.000000e+00**. Both engines run identical code paths (encoder, U-Net, DDIM scheduler with `alphas_cumprod` pre-moved to GPU, normalize/unnormalize, action slice).
+
+### Benchmarking vs vLLM (Embedding / Retrieval)
+
+Install the benchmark dependencies in the `kb` environment:
+
+```bash
+python -m pip install datasets==4.8.4 peft==0.18.1 GitPython==3.1.46 ujson==5.12.0 scipy==1.17.1
+```
+
+After that, run the benchmark directly from the repo root. The embedding benchmark compares kb-nano against vLLM's pooling runner in `token_embed` mode, using pre-tokenized identical requests for both engines. It reports end-to-end input tokens/sec, latency, and per-request output cosine correctness as part of the throughput run.
+
+```bash
+# BGE-M3 + ColBERTv2 token-level embedding throughput/latency/correctness vs vLLM
+python tests/bench_embedding.py
+
+# Single model
+python tests/bench_embedding.py --model bge-m3
+python tests/bench_embedding.py --model colbertv2.0
+
+# kb-nano only
+python tests/bench_embedding.py --model bge-m3 --skip-vllm
+
+# Skip latency phase
+python tests/bench_embedding.py --skip-latency
+
+# Save results to a specific directory
+python tests/bench_embedding.py --output-dir tests/results/B200/embedding/manual
+```
+
 The diffusion benchmark measures:
 - **Throughput**: images/sec (FLUX) or videos/sec (HunyuanVideo) at various resolutions
 - **Latency**: per-image/video latency with P50 percentile stats
 - **Correctness**: per-batch latent cosine similarity (FLUX) or per-prompt decoded-frame PSNR and cosine similarity (HunyuanVideo)
+
+### Benchmarking vs open-oasis (Autoregressive Diffusion)
+
+```bash
+# Oasis 500M: throughput + latency + correctness benchmark vs official open-oasis
+python tests/bench_oasis.py --model Etched/oasis-500m
+
+# Use an existing open-oasis checkout instead of auto-cloning it
+python tests/bench_oasis.py --model Etched/oasis-500m --open-oasis-src /path/to/open-oasis
+
+# Skip throughput or latency
+python tests/bench_oasis.py --model Etched/oasis-500m --skip-throughput
+python tests/bench_oasis.py --model Etched/oasis-500m --skip-latency
+
+# Save results to a specific directory
+python tests/bench_oasis.py --model Etched/oasis-500m --output-dir tests/results/H200/oasis-500m
+```
 
 ## Benchmarking
 
@@ -560,6 +566,7 @@ Each run is tagged with a `tier` (`agent`, `kernel`, `eval`, or `e2e`) indicatin
 - timm (pytorch-image-models — only needed for vision encoder comparison tests)
 - vLLM (only needed for running comparison tests)
 - matplotlib (only needed for benchmark plotting)
+- timm, einops, torchvision, av, rotary-embedding-torch (only needed for the Oasis / open-oasis comparison benchmark)
 - ultralytics (YOLOv10 baseline benchmarking)
 
 ### Optional detection benchmark dependencies
@@ -592,7 +599,7 @@ The engine auto-selects the attention backend based on GPU compute capability:
 
 ## Performance
 
-Run `tests/bench_vllm.py` to reproduce. Workload uses random token IDs with `ignore_eos=True`, both engines with full optimizations (`enforce_eager=False`).
+Run `tests/bench_vllm.py` to reproduce. LLM workloads use the WildChat-derived `sfc-gh-goliaro/wildchat-kb-nano-{prefill-heavy,balanced,decode-heavy}-1k` datasets, with each target model's chat template applied before tokenization and `ignore_eos=True`.
 
 **Hardware: 4x NVIDIA H200 (NVLink)**
 
@@ -755,6 +762,30 @@ Latency (batch size 1, 128 output tokens, 5 iterations):
 
 FP8 activation quantization uses a custom Triton kernel for single-launch per-token-group UE8M0 quantization. Pre-allocated shared prefill buffers eliminate dynamic allocation during FP8 prefill, and DeepGEMM is JIT-warmed for both decode and prefill batch sizes. The remaining throughput gap vs vLLM is primarily from vLLM's `torch.compile` + Inductor fusion passes (RMSNorm+quant, SiLU+quant).
 
+### BGE-M3 / ColBERTv2 (Embedding)
+
+Run `python tests/bench_embedding.py` to reproduce. Reference baseline: vLLM pooling runner in `token_embed` mode. Both engines receive the same pre-tokenized requests, use fp16 model weights with fp32 pooling heads, and materialize token-level embedding outputs before correctness comparison. The benchmark measures end-to-end input tokens/sec, not retrieval ranking quality.
+
+**Hardware: NVIDIA B200**
+
+Throughput (real dataset workloads, fp16, token-level embeddings):
+
+| Scenario | Requests | Input Tokens | vLLM tok/s | Ours tok/s | Ratio | Correct | Min Cos |
+|----------|---------:|-------------:|-----------:|-----------:|------:|:--------|--------:|
+| BGE-M3 MLDR documents | 1,000 | 4,569,071 | 376,516 | 398,706 | **1.06x** | PASS | 0.999012 |
+| ColBERTv2 MS MARCO passages | 60,000 | 4,627,378 | 346,735 | 1,068,509 | **3.08x** | PASS | 0.999992 |
+
+Latency (median of 5 runs, fp16):
+
+| Model | Scenario | BS | Input Tokens | vLLM median | Ours median | vLLM ms/tok | Ours ms/tok | Ratio |
+|-------|----------|---:|-------------:|------------:|------------:|------------:|------------:|------:|
+| BGE-M3 | single-request | 1 | 6,638 | 0.0197s | 0.0183s | 0.00 | 0.00 | **1.08x** |
+| BGE-M3 | fixed-batch-32 | 32 | 152,801 | 0.3411s | 0.3520s | 0.00 | 0.00 | 0.97x |
+| ColBERTv2 | single-request | 1 | 56 | 0.0042s | 0.0011s | 0.08 | 0.02 | **3.99x** |
+| ColBERTv2 | fixed-batch-32 | 32 | 2,401 | 0.0193s | 0.0022s | 0.01 | 0.00 | **8.63x** |
+
+BGE-M3 is near vLLM parity on large-document encoder work. The ColBERTv2 workload has many short passages, so the larger speedup primarily reflects lower end-to-end request/pooling/output overhead in kb-nano's packed token-embedding path rather than a claim that every ColBERT kernel is 3x faster than vLLM.
+
 ### DeepSeek V3.2 FP8 (MoE, MLA, DSA)
 
 FP8 support for `deepseek-ai/DeepSeek-V3.2` with block-scaled FP8 MoE experts via DeepGEMM, Multi-head Latent Attention (MLA) with FP8 KV cache via FlashMLA, and DeepSeek Sparse Attention (DSA) indexer.
@@ -877,6 +908,31 @@ Correctness (eager mode, decoded video frames, per-prompt cosine similarity):
 | 480p-medium |  8 | 0.923 | 0.862 | 12.92 dB | WARN |
 
 Correctness is measured in decoded pixel space (both engines produce PIL video frames which are compared as uint8 numpy arrays). The pixel-level cosine similarity of ~0.92 is expected for two independent bf16 implementations: numerical differences in the 30-step denoising loop are amplified by the VAE decoder. For reference, latent-space comparison between kb-nano and HF diffusers yields CosSim=0.986, confirming the transformer backbone is correctly implemented. The pixel-space divergence is dominated by VAE decode amplification and different text encoder implementations (kb-nano uses a custom Qwen2.5-VL paged-attention encoder vs vllm-omni's HuggingFace-based encoder).
+
+### Oasis 500M (Autoregressive Diffusion)
+
+Run `python tests/bench_oasis.py --model Etched/oasis-500m` to reproduce. Reference baseline: official `open-oasis`, which the benchmark auto-clones under `data/open_oasis_src/` unless `--open-oasis-src` is provided.
+
+Dataset: `TESS-Computer/minecraft-vla-stage1` (`train` split), using non-overlapping real Minecraft clips from distinct source videos at 360x640. The benchmark converts each dataset action string into Oasis' 25-d control vector and caches the resulting prompt/action tensors locally under `data/oasis_cache/`.
+
+**Hardware: NVIDIA B200**
+
+Throughput workload:
+
+| Scenario | Dataset | Clips | Frames | DDIM Steps | Correctness Checked |
+|----------|---------|------:|-------:|-----------:|:--------------------|
+| short-bs4-16f-4ddim | `TESS-Computer/minecraft-vla-stage1` | 4 | 16 | 4 | yes |
+| medium-bs8-24f-4ddim | `TESS-Computer/minecraft-vla-stage1` | 8 | 24 | 4 | yes |
+| long-bs8-32f-4ddim | `TESS-Computer/minecraft-vla-stage1` | 8 | 32 | 4 | yes |
+| denoise-bs4-16f-8ddim | `TESS-Computer/minecraft-vla-stage1` | 4 | 16 | 8 | yes |
+
+Latency:
+
+| Scenario | Clips | Frames | Reference p50 (ms) | Ours p50 (ms) | Ratio |
+|----------|------:|-------:|-------------------:|--------------:|------:|
+| latency-bs1-8f-4ddim | 1 | 8 | 981.28 | 758.85 | **1.29x** |
+
+Correctness is measured for every throughput workload entry, using the same prompt frames and actions as the timed run. The benchmark reports cosine similarity, pass/fail status, and mean absolute difference for prompt latents, rollout latents, and decoded video in each throughput scenario.
 
 ### CosyVoice3 (TTS)
 
@@ -1056,41 +1112,6 @@ Correctness (100 images, per-element cosine similarity):
 | Classification Logits | 0.975 | 0.924 | PASS |
 
 The remaining numerical divergence is expected from SDPA vs Flash Attention numerics and bf16/fp32 precision differences accumulated through the deep pipeline (backbone + encoder + decoder + pixel decoder + mask predictor). All metrics pass their thresholds (boxes/logits: mean >= 0.95, min >= 0.90; masks: mean >= 0.90, min >= 0.85).
-
-### Pi0 (Robotics VLA)
-
-Run `tests/bench_openpi.py` to reproduce. Both engines load the same domain-specific fine-tuned Pi0 checkpoint (converted to PyTorch safetensors). Both sides apply matching domain transforms and use pre-generated shared noise for identical flow-matching initialisation. OpenPI uses the PyTorch backend. N=100 real dataset samples per scenario, 10 denoising steps, bfloat16.
-
-**Hardware: NVIDIA B200**
-
-Throughput + latency (single inference, p50 of 10 runs):
-
-| Scenario | OpenPI (inf/s) | Ours (inf/s) | Speedup (thru) | OpenPI p50 | Ours p50 | Speedup (p50) |
-|----------|-----------:|-----------:|-----------:|----------:|--------:|-----------:|
-| aloha-3cam | 8.11 | 29.35 | **3.62x** | 121.6 ms | 33.8 ms | **3.60x** |
-| aloha-1cam | 8.16 | 16.66 | **2.04x** | 121.4 ms | 25.9 ms | **4.69x** |
-| droid-2cam | 8.13 | 33.76 | **4.15x** | 122.8 ms | 29.7 ms | **4.13x** |
-| libero-2cam | 8.15 | 33.59 | **4.12x** | 121.2 ms | 29.2 ms | **4.15x** |
-
-Correctness (mean cosine similarity of predicted action chunks vs OpenPI, shared noise):
-
-| Scenario | action_dim | action_horizon | Samples | Mean CosSim | Mean MSE | Result |
-|----------|----------:|---------------:|--------:|------------:|---------:|-------:|
-| aloha-3cam | 14 | 50 | 100 | 0.9999995 | 2.3e-07 | PASS |
-| aloha-1cam | 14 | 50 | 100 | 0.9999992 | 3.4e-07 | PASS |
-| droid-2cam | 8 | 10 | 100 | 0.9994678 | 5.6e-05 | PASS |
-| libero-2cam | 7 | 50 | 100 | 0.9994360 | 2.4e-04 | PASS |
-
-Stability across seeds (seeds 42/100/200, N=100 each, 1,200 samples total; minimum CosSim observed per scenario):
-
-| Scenario | min CosSim (any seed) |
-|----------|----------------------:|
-| aloha-3cam | 0.9999995 |
-| aloha-1cam | 0.9999989 |
-| droid-2cam | 0.9989521 |
-| libero-2cam | 0.9993237 |
-
-Both engines apply matching domain-specific transforms (joint flip + gripper encoding for ALOHA; z-score state normalization for DROID/LIBERO) and identical shared noise for flow-matching. The residual ~0.001 CosSim gap on DROID/LIBERO is bf16 accumulation drift across 18-layer Gemma × 10-step Euler loop, occasionally amplified near gripper open/close decision thresholds where small precision differences flip the action to the opposite side.
 
 ### YOLOv10 (Detection)
 
