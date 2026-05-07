@@ -14,24 +14,44 @@ import torch.nn.functional as F
 class LayerNorm(nn.Module):
     def __init__(
         self,
-        normalized_shape: int,
+        normalized_shape: int | tuple[int, ...],
         eps: float = 1e-5,
         elementwise_affine: bool = True,
+        bias: bool | None = None,
         create_scale: bool = True,
         create_offset: bool = True,
     ):
+        """LayerNorm wrapping F.layer_norm.
+
+        ``bias`` is the torch.nn.LayerNorm-compatible kwarg (HF models like
+        bark/dbrx/gemma4/modernbert/moonshine pass ``bias=False`` /
+        ``bias=config.norm_bias``). If provided, it overrides ``create_offset``
+        for compatibility. ``create_scale`` / ``create_offset`` are preserved
+        for openfold3 callers.
+        """
         super().__init__()
-        self.normalized_shape = (normalized_shape,)
+        # Accept int or tuple/list (torch.nn.LayerNorm semantics)
+        if isinstance(normalized_shape, int):
+            self.normalized_shape: tuple[int, ...] = (normalized_shape,)
+            shape_for_params = (normalized_shape,)
+        else:
+            self.normalized_shape = tuple(normalized_shape)
+            shape_for_params = tuple(normalized_shape)
         self.eps = eps
         self.elementwise_affine = elementwise_affine
 
+        # Resolve bias-related flags. torch.nn.LayerNorm's `bias` kwarg, when
+        # passed, takes precedence over our openfold3-style `create_offset`.
+        if bias is not None:
+            create_offset = bool(bias)
+
         if elementwise_affine and create_scale:
-            self.weight = nn.Parameter(torch.ones(normalized_shape))
+            self.weight = nn.Parameter(torch.ones(*shape_for_params))
         else:
             self.register_parameter("weight", None)
 
         if elementwise_affine and create_offset:
-            self.bias = nn.Parameter(torch.zeros(normalized_shape))
+            self.bias = nn.Parameter(torch.zeros(*shape_for_params))
         else:
             self.register_parameter("bias", None)
 

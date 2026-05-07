@@ -24,7 +24,10 @@ import sys
 from collections import Counter, defaultdict
 from pathlib import Path
 
-ROOT = Path("/home/olu/kb_nano/audits/hf_transformers_coverage")
+import os
+
+KB_REPO = Path(os.environ.get("KB_NANO_REPO", Path(__file__).resolve().parents[3]))
+ROOT = KB_REPO / "audits/hf_transformers_coverage"
 INVENTORY = ROOT / "hf_model_inventory.csv"
 PILOT_CSV = ROOT / "pilot/pilot_rows.csv"
 SHARDS = ["a-d", "e-i", "j-m", "n-q", "r-z"]
@@ -142,26 +145,45 @@ def normalize_row(r: dict) -> dict:
     return r
 
 
-# Ops that are supported by kb-nano. Three categories:
+# Ops that are supported by kb-nano. Categorized by HOW they are supported:
 #
-# (A) Genuinely new L1 wrappers added in this audit branch (8 files; numerically
-#     verified vs torch.nn.X / fla via test_keep_ops_thorough.py — 297 tests, 100% pass):
-#       AdaptiveAvgPool1d/2d, ConvTranspose1d/2d/3d, GridSample, LSTM,
-#       ChunkGatedDeltaRule (+ FusedRecurrentGatedDeltaRule)
+# (A) Explicit new L1 wrappers added in this audit branch — performance-faithful
+#     dedicated kernels (per mentor guidance: composition introduces reshape overhead
+#     and benchmarks the wrong kernel family). Each numerically verified vs torch.nn.X
+#     / fla across HF kwarg patterns and edge cases:
+#       L1 ops:
+#         - AdaptiveAvgPool1d / AdaptiveAvgPool2d (adaptive sizing kernel)
+#         - ConvTranspose1d / ConvTranspose2d / ConvTranspose3d (different op direction;
+#           weight-bearing; state_dict-compat with nn.ConvTransposeNd)
+#         - GridSample (fundamental sampling op; standalone uses outside deformable attn)
+#         - LSTM (recurrent state machine; cuDNN; encodec)
+#         - ChunkGatedDeltaRule + FusedRecurrentGatedDeltaRule (FLA recurrence)
+#         - MaxPool1d / AvgPool1d (DIRECT 1D dispatch; the 2D-composed workaround
+#           would benchmark a different kernel family)
+#         - LeakyReLU / ELU / Hardsigmoid / Hardswish (explicit per audit prompt
+#           high-priority list; bit-identical to torch.nn but provides per-op
+#           benchmark scaffolding consistent with existing relu/silu/gelu/sigmoid/tanh)
+#         - Conv1dNative (general Conv1d with full HF kwarg coverage:
+#           groups, dilation, padding_mode — additive to existing narrow Conv1d
+#           which is preserved unchanged for Whisper)
+#       L2 ops:
+#         - MultiheadAttention (uses DenseAttention/SDPA when need_weights=False;
+#           avoids materializing attention map; state_dict-compat with nn.MultiheadAttention)
 #
-# (B) Composable from existing kb-nano L1 ops + standard torch arithmetic — no new file needed.
-#     Verified bit-identical via test_composition_equivalence.py (243 tests, 100% pass):
-#       BatchNorm1d/3d  (kb-nano BatchNorm2d.forward is rank-agnostic via F.batch_norm)
-#       MaxPool1d / AvgPool1d  (kb-nano MaxPool2d/AvgPool2d with kernel=(1,k) + reshape)
-#       LeakyReLU / ELU / Hardsigmoid / Hardswish  (torch builtins F.x; audit passthrough)
+# (B) Composable from existing kb-nano L1 + torch arithmetic — no new file needed
+#     because the composition is in the SAME kernel family (no reshape penalty,
+#     no different benchmark target). Verified bit-identical:
+#       - BatchNorm1d / BatchNorm3d  (kb-nano BatchNorm2d.forward calls F.batch_norm
+#         which is rank-agnostic; calling kb-nano BatchNorm2d on [B,C] or [B,C,D,H,W]
+#         directly works without any reshape — same exact kernel as BatchNorm2d).
 #
 # (C) Pre-existing kb-nano support that the original audit flagged as partial:
-#       multihead_attention (nn.MultiheadAttention is a wrapper around 3xLinear+SDPA+Linear;
-#                            all primitives in kb-nano — per mentor: don't wrap the deprecated class)
-#       causal_conv1d (pre-existing in tasks/baseline/L2/mamba_mixer.py via vllm)
-#       deformable_attention_v1_normalization (kb-nano L1 method="default" is bit-identical)
+#       - causal_conv1d (pre-existing in tasks/baseline/L2/mamba_mixer.py via vllm
+#         import; same package as HF qwen3_5)
+#       - deformable_attention_v1_normalization (kb-nano L1 with method="default"
+#         is bit-identical to v1; verified by reading both kernels)
 NEWLY_SUPPORTED_OPS = {
-    # (A) genuinely new L1 wrappers added in this audit branch
+    # (A) explicit L1/L2 wrappers added in this audit branch
     "adaptive_avg_pool_1d",
     "adaptive_avg_pool_2d",
     "conv_transpose1d",
@@ -171,17 +193,20 @@ NEWLY_SUPPORTED_OPS = {
     "lstm",
     "chunk_gated_delta_rule",
     "fused_recurrent_gated_delta_rule",
-    # (B) composable from existing kb-nano + torch builtins (no new file; verified)
-    "batch_norm_1d",
-    "batch_norm_3d",
     "max_pool_1d",
     "avg_pool_1d",
     "leaky_relu",
     "elu",
     "hardsigmoid",
     "hardswish",
+    "multihead_attention",  # L2 wrapper using DenseAttention; SDPA fast path when need_weights=False
+    # Conv1dNative is now the canonical Conv1d mapping; existing narrow Conv1d preserved
+    # for Whisper. Rows already mapped to "conv1d" canonical name now resolve to the
+    # general wrapper via tools/canonical_to_kb_nano.csv.
+    # (B) composable from existing kb-nano (same kernel family, no reshape penalty)
+    "batch_norm_1d",
+    "batch_norm_3d",
     # (C) pre-existing kb-nano support
-    "multihead_attention",
     "causal_conv1d",
     "deformable_attention_v1_normalization",
 }

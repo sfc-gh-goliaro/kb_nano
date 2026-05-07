@@ -23,9 +23,14 @@ import re
 import sys
 from pathlib import Path
 
-ROOT = Path("/home/olu/kb_nano/audits/hf_transformers_coverage")
-KB_REPO = Path("/home/olu/kb_nano")
-HF_PINNED = Path("/tmp/hf_transformers_pinned/src/transformers/models")
+import os
+
+KB_REPO = Path(os.environ.get("KB_NANO_REPO", Path(__file__).resolve().parents[3]))
+ROOT = KB_REPO / "audits/hf_transformers_coverage"
+HF_PINNED = Path(os.environ.get(
+    "HF_TRANSFORMERS_PINNED",
+    "/tmp/hf_transformers_pinned",
+)) / "src/transformers/models"
 INVENTORY = ROOT / "hf_model_inventory.csv"
 CANONICAL = ROOT / "tools/canonical_to_kb_nano.csv"
 

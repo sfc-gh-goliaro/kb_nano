@@ -257,7 +257,96 @@ The 8 ops that were REMOVED (proven composable, bit-identical to a composition o
 
 The 4 remaining `partial` rows have at least one flag that is none of the above (e.g. `detectron2_backbone`, `rg_lru_scan`, `timm_dynamic_backbone`).
 
-## 16. What this proves about kb-nano
+## 16. Pass v3: explicit op support (mentor: performance-faithful) + Conv1d narrowness fix + MHA L2 wrapper
+
+A subsequent re-audit on this branch (after independent code-deep inspection per the audit prompt) found three separate issues with the previous pass:
+
+### Conv1d narrowness — false-positive `composable` rows
+
+I had marked `conv1d` → `tasks/baseline/L1/conv1d.py:Conv1d` "direct" in the canonical map without reading the wrapper code. Re-inspection showed the existing kb-nano `Conv1d` is a Whisper-specific narrow wrapper:
+
+```python
+class Conv1d(nn.Module):
+    def __init__(self, in_channels, out_channels, kernel_size,
+                 stride=1, padding=0, bias=True):
+        ...  # NO groups, NO dilation, NO padding_mode
+```
+
+But HF heavily uses `groups=` (granite_speech, vibevoice, squeezebert) and `dilation=` (dac, encodec, pe_audio, vibevoice_acoustic_tokenizer) for `nn.Conv1d`. ~10 HF rows had been over-classified as `composable` when their Conv1d use is actually narrow-uncovered.
+
+**Fix.** Added an additive general-purpose wrapper at `tasks/baseline/L1/conv1d_native.py:Conv1dNative` with full `nn.Conv1d` kwarg coverage (groups, dilation, padding_mode for zeros/reflect/replicate/circular, bias, stride, padding). State_dict-compatible with `nn.Conv1d` (direct `weight`/`bias` parameters, not nested under `self.conv`). Existing narrow Conv1d preserved unchanged for Whisper. Verified bit-identical to `nn.Conv1d` across all HF kwarg patterns and dtypes (`tools/test_v3_ops.py`, 18 Conv1dNative tests, 100% pass).
+
+### Mentor reversal on stylistic L1 ops — performance-faithfulness matters
+
+The previous pass removed `MaxPool1d`, `AvgPool1d`, `LeakyReLU`, `ELU`, `Hardsigmoid`, `Hardswish` because they were "composable from existing primitives." Mentor pushback: the composed version (e.g. `MaxPool2d((1, k))(x.unsqueeze(-2)).squeeze(-2)` for 1D pool) is *semantically* equivalent but *benchmarks the wrong kernel family* (2D pool with degenerate H=1) and adds reshape overhead. Per the audit prompt's policy: "If a composition changes the kernel family, adds unnecessary memory movement, prevents fused dispatch, materializes intermediates, or uses an awkward higher-dimensional kernel, add an explicit op."
+
+**Fix.** Re-added the 6 ops as explicit L1 wrappers (each dispatches directly to the matching `F.max_pool1d` / `F.avg_pool1d` / `F.leaky_relu` etc. — NOT through the 2D-composed workaround). Verified vs `torch.nn.X` on 100% of HF kwarg patterns + edge cases.
+
+`BatchNorm1d` / `BatchNorm3d` are NOT re-added because kb-nano `BatchNorm2d.forward` calls `F.batch_norm` rank-agnostically — the "composition" is calling kb-nano BatchNorm2d directly with whatever rank input you have, no reshape, *same kernel*. So the mentor's performance-faithfulness rule does not apply (no different benchmark target, no extra movement).
+
+### LayerNorm narrowness — `bias` kwarg missing
+
+kb-nano `LayerNorm.__init__` had `create_scale`/`create_offset` (openfold3-style) but did NOT accept the `bias` kwarg `nn.LayerNorm` exposes. 9 HF folders pass `nn.LayerNorm(..., bias=False)` or `bias=config.norm_bias` (bark, dbrx, gemma4, lasr, modernbert, modernbert_decoder, modernvbert, moonshine, moonshine_streaming) — drop-in compatibility breaks with TypeError.
+
+**Fix.** Extended `tasks/baseline/L1/layer_norm.py:LayerNorm.__init__` additively: added `bias` kwarg (when provided, takes precedence over `create_offset`) and `tuple/list normalized_shape` support (matches `nn.LayerNorm` semantics). Existing callers that pass `create_scale` / `create_offset` are unaffected. Verified vs `nn.LayerNorm` with `bias=True/False` and tuple shape (max-abs diff 0.00e+00).
+
+### MultiheadAttention — proper L2 wrapper instead of "composable via existing primitives"
+
+The previous pass declared `nn.MultiheadAttention` "composable via 3×Linear + DenseAttention + 1×Linear, no new wrapper needed." Per audit prompt: this is correct semantically, but a naive composition that *materializes the attention map* (which `nn.MultiheadAttention.forward` always does internally) defeats the SDPA fast path. Six HF folders use `nn.MultiheadAttention` directly (aria, bridgetower, idefics2, mask2former, oneformer, omdet_turbo, phi4_multimodal).
+
+**Fix.** Added `tasks/baseline/L2/multihead_attention.py:MultiheadAttention` — a proper L2 wrapper that:
+- Mirrors `torch.nn.MultiheadAttention.__init__` and `forward` signatures (so HF call sites are drop-in).
+- Stores `in_proj_weight` / `in_proj_bias` / `out_proj.weight` / `out_proj.bias` matching torch's parameter names (HF reference checkpoints load with no remap).
+- Uses `F.scaled_dot_product_attention` (= kb-nano `DenseAttention`) when `need_weights=False` (the common case — aria, idefics2 take `attention(...)[0]`, discarding weights).
+- Materializes the attention map only when `need_weights=True` (matches `nn.MultiheadAttention`'s tuple-return semantics).
+- Supports `attn_mask`, `key_padding_mask`, `batch_first`, `is_causal`, `average_attn_weights`, separate `kdim`/`vdim`.
+
+Verified bit-identical to `nn.MultiheadAttention` across self-attention (no_weights / with_weights), cross-attention (different Q vs KV lengths), `attn_mask` (causal), `key_padding_mask`, `batch_first=False/True` — 15 tests in `tools/test_v3_ops.py`.
+
+### Test coverage of v3 changes
+
+`tools/test_v3_ops.py` — 227 tests, 100% PASS:
+- 24 MaxPool1d + 18 AvgPool1d (direct 1D dispatch verified across 3 dtypes × 4 kernel/stride/padding × 4 shapes)
+- 144 elementwise activations (LeakyReLU/ELU/Hardsigmoid/Hardswish across 3 dtypes × 4 shapes × multiple slope/alpha)
+- 18 Conv1dNative across all HF kwarg patterns: depthwise (granite), strided+dilated+grouped (vibevoice), padded+dilated (dac/encodec), 1×1 grouped (squeezebert), narrow (whisper), padding_mode in {reflect, replicate, circular} — fp32 + bf16
+- 1 Conv1dNative state_dict key match
+- 15 MultiheadAttention tests covering state_dict compat, self-attn no_weights, self-attn with_weights, cross-attn, attn_mask, key_padding_mask, batch_first=False, multiple sizes/dtypes
+
+### Final spot-check audit (10 critical rows by code-deep inspection)
+
+Read each HF modeling file directly and verified the audit row's classification against the actual compute primitives used:
+
+| HF folder | status | what HF uses | kb-nano coverage |
+|---|---|---|---|
+| `llama` | kb_nano_l4 | Linear, RMSNorm, RoPE, SDPA, KV cache, SiLU | L4 pipeline at `tasks/baseline/L4/llama.py` ✓ |
+| `bert` | composable | Linear, LayerNorm, Embedding, Dropout, Tanh | all in kb-nano L1 ✓ |
+| `bark` | composable | LayerNorm with `bias=config.bias`, GELU, Dropout, Embedding, Linear, F.softmax | now covered after LayerNorm `bias` kwarg extension ✓ |
+| `dac` | composable | Conv1d with `dilation=` and `padding=` | now covered by new Conv1dNative ✓ |
+| `mask2former` | composable | GroupNorm, LayerNorm, `nn.MultiheadAttention` (line 1585), MS-deformable attn v1 | MHA covered by new L2 wrapper; deformable v1 covered by kb-nano L1 with method="default" ✓ |
+| `whisper` | kb_nano_l4 | Conv1d (stride+padding only), GELU, LayerNorm, Linear, MHA inside L2 whisper_attention | L4 pipeline exists; narrow Conv1d sufficient ✓ |
+| `regnet` | composable | Conv2d, BatchNorm2d, AdaptiveAvgPool2d, ReLU | all in kb-nano L1 (AdaptiveAvgPool2d added in v3) ✓ |
+| `mra` | unsupported | `mra_cuda_kernel.index_max` / `mm_to_sparse` / `sparse_dense_mm` from `kernels-community/mra` | confirmed: custom CUDA, no kb-nano analog ✓ |
+| `recurrent_gemma` | partial | `RecurrentGemmaRglru` with `torch.baddbmm`-based custom recurrence | confirmed: no rg_lru kernel in kb-nano (FLA family covers GLA/Retention/RWKV7 not RG-LRU) ✓ |
+| `reformer` | unsupported | `LSHSelfAttention` with `_hash_vectors` + bucketed attention | confirmed: hash-based bucketing IS the algorithm, not a kernel call ✓ |
+
+10/10 verified. No misclassifications found in this spot-check pass.
+
+### Final state after v3
+
+- **8 explicit new L1 ops** kept from prior passes (AdaptiveAvgPool1d/2d, ConvTranspose1d/2d/3d, GridSample, LSTM, ChunkGatedDeltaRule)
+- **6 explicit new L1 ops re-added** (MaxPool1d, AvgPool1d, LeakyReLU, ELU, Hardsigmoid, Hardswish)
+- **1 new L1 op** (Conv1dNative — additive to existing narrow Conv1d)
+- **1 existing L1 op extended** (LayerNorm: added `bias` kwarg + tuple-shape support, additive)
+- **1 new L2 op** (MultiheadAttention — uses DenseAttention/SDPA fast path)
+
+Coverage numbers UNCHANGED (the change is in HOW certain rows are supported and removing false positives, not in which models can run):
+- 17 `kb_nano_l4` (3.8%)
+- 422 `composable` (94.4%)
+- 4 `partial` (0.9%) — layoutlmv2 (detectron2), recurrent_gemma (RG-LRU), timm_backbone, timm_wrapper
+- 4 `unsupported` (0.9%) — mra, reformer, rwkv v4, xlstm
+- Coverage = 439/447 = **98.21%**
+
+## 17. What this proves about kb-nano
 
 The pilot data already supports the headline framing of the paper appendix: kb-nano's existing L1/L2 surface covers the core compute primitives needed by the most common HF architecture families (encoder, decoder-only, encoder-decoder, vision encoder, multimodal, detection, SSM). The remaining gaps are concentrated in (1) niche pooling kernels (`adaptive_avg_pool*`), (2) `ConvTranspose*` for segmentation/upsampling heads, and (3) attention variants that haven't been hit yet (e.g. `flex_attention`-only models). Each gap is a small, well-bounded kernel — none reflect a fundamental architectural limitation.
 

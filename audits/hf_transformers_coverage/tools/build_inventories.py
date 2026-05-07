@@ -19,8 +19,13 @@ import csv
 import sys
 from pathlib import Path
 
-REPO = Path("/home/olu/kb_nano")
-HF = Path("/tmp/hf_transformers_pinned/src/transformers/models")
+import os
+
+REPO = Path(os.environ.get("KB_NANO_REPO", Path(__file__).resolve().parents[3]))
+HF = Path(os.environ.get(
+    "HF_TRANSFORMERS_PINNED",
+    "/tmp/hf_transformers_pinned",
+)) / "src/transformers/models"
 OUT = REPO / "audits/hf_transformers_coverage"
 
 

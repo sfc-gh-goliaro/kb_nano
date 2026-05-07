@@ -20,20 +20,21 @@ tanh,tasks/baseline/L1/tanh.py,Tanh,direct
 quick_gelu,tasks/baseline/L1/quickgelu.py,QuickGELU,direct
 log_sigmoid,tasks/baseline/L1/log_sigmoid.py,LogSigmoid,direct
 mish,,, NOT IN L1 (used by DP3 only - dp3 branch unmerged)
-leaky_relu,composable,,torch builtin: F.leaky_relu — bit-identical to nn.LeakyReLU by construction (nn.LeakyReLU just wraps F.leaky_relu). Audit passthrough. Verified across fp32/bf16/fp16 and slope in {0 0.01 0.1 0.2}.
-elu,composable,,torch builtin: F.elu — bit-identical to nn.ELU. Audit passthrough. Verified across fp32/bf16/fp16 and alpha in {0.5 1.0 1.5}.
-hardsigmoid,composable,,torch builtin: F.hardsigmoid — bit-identical to nn.Hardsigmoid. Audit passthrough.
-hardswish,composable,,torch builtin: F.hardswish — bit-identical to nn.Hardswish. Audit passthrough.
-batch_norm_1d,composable,,composable via kb-nano BatchNorm2d (rank-agnostic via F.batch_norm; tested across rank-2 [B,C] groupvit/levit pattern AND rank-3 [B,C,L] hubert/fastspeech pattern). Verified test_composition_equivalence.py (eval+train, fp32/bf16/fp16).
-batch_norm_3d,composable,,composable via kb-nano BatchNorm2d (F.batch_norm is rank-agnostic; works on [B,C,D,H,W] directly). Verified test_composition_equivalence.py.
+leaky_relu,tasks/baseline/L1/leaky_relu.py,LeakyReLU,direct (explicit L1; per audit prompt high-priority list)
+elu,tasks/baseline/L1/elu.py,ELU,direct (explicit L1)
+hardsigmoid,tasks/baseline/L1/hardsigmoid.py,Hardsigmoid,direct (explicit L1)
+hardswish,tasks/baseline/L1/hardswish.py,Hardswish,direct (explicit L1)
+batch_norm_1d,composable,,kb-nano BatchNorm2d.forward calls F.batch_norm rank-agnostically (no rank check); F.batch_norm accepts ranks 2/3/4/5 with same per-channel semantics. No new file needed; same kernel family as BatchNorm2d (no reshape penalty). Verified test_composition_equivalence.py.
+batch_norm_3d,composable,,same as batch_norm_1d (kb-nano BatchNorm2d works on [B,C,D,H,W] directly via F.batch_norm).
+multihead_attention,tasks/baseline/L2/multihead_attention.py,MultiheadAttention,direct (L2 wrapper; uses kb-nano DenseAttention/SDPA when need_weights=False; materializes attention map only when need_weights=True; state_dict-compat with nn.MultiheadAttention). Per audit prompt: explicit wrapper avoids slow attention-weight materialization that nn.MultiheadAttention always does.
 chunk_gated_delta_rule,tasks/baseline/L1/chunk_gated_delta_rule.py,ChunkGatedDeltaRule,direct (added in audit branch; wraps fla.ops.gated_delta_rule.chunk_gated_delta_rule; same import pattern as chunk_gla.py)
 fused_recurrent_gated_delta_rule,tasks/baseline/L1/chunk_gated_delta_rule.py,FusedRecurrentGatedDeltaRule,direct (added in audit branch)
-multihead_attention,tasks/baseline/L1/dense_attention.py,DenseAttention,direct (legacy nn.MultiheadAttention is a wrapper around 3xLinear+SDPA+Linear; all primitives in kb-nano. Per mentor: do not add a literal wrapper for the deprecated class API)
 lstm,tasks/baseline/L1/lstm.py,LSTM,direct (added in audit branch; numerically verified vs nn.LSTM)
 squared_relu,tasks/baseline/L1/squared_relu.py,SquaredReLU,direct
 silu_and_mul,tasks/baseline/L1/silu_and_mul.py,SiluAndMul,fused SwiGLU activation
 swiglu_oai,tasks/baseline/L1/swiglu_oai.py,SwigluOai,fused GPT-OSS swiglu (clipped)
-conv1d,tasks/baseline/L1/conv1d.py,Conv1d,direct (note: this is the Whisper-style wrapper with self.conv nesting)
+conv1d,tasks/baseline/L1/conv1d_native.py,Conv1dNative,direct (full kwarg coverage: groups/dilation/padding_mode/etc; state_dict-compat with nn.Conv1d). Existing narrow tasks/baseline/L1/conv1d.py:Conv1d (Whisper-specific) is preserved unchanged.
+conv1d_whisper,tasks/baseline/L1/conv1d.py,Conv1d,Whisper-specific narrow wrapper (no groups/dilation/padding_mode); existing kb-nano L4 whisper.py uses this.
 conv2d,tasks/baseline/L1/conv2d.py,Conv2d,direct
 conv3d,tasks/baseline/L1/conv3d.py,Conv3d,direct
 conv_transpose1d,tasks/baseline/L1/conv_transpose1d.py,ConvTranspose1d,direct (added in audit branch; numerically verified vs nn.ConvTranspose1d)
@@ -43,8 +44,8 @@ max_pool_2d,tasks/baseline/L1/max_pool2d.py,MaxPool2d,direct
 avg_pool_2d,tasks/baseline/L1/avg_pool2d.py,AvgPool2d,direct
 adaptive_avg_pool_2d,tasks/baseline/L1/adaptive_avg_pool2d.py,AdaptiveAvgPool2d,direct (added in audit branch; numerically verified)
 adaptive_avg_pool_1d,tasks/baseline/L1/adaptive_avg_pool1d.py,AdaptiveAvgPool1d,direct (added in audit branch; numerically verified)
-max_pool_1d,composable,,composable via MaxPool2d with kernel=(1 k) + reshape: MaxPool2d((1,k))(x.unsqueeze(-2)).squeeze(-2). Verified bit-identical across fp32/bf16/fp16 and all HF kernel/stride/padding configs (test_composition_equivalence.py)
-avg_pool_1d,composable,,composable via AvgPool2d with kernel=(1 k) + reshape: AvgPool2d((1,k))(x.unsqueeze(-2)).squeeze(-2). Verified bit-identical (test_composition_equivalence.py)
+max_pool_1d,tasks/baseline/L1/max_pool1d.py,MaxPool1d,direct (re-added per mentor: explicit 1D wrapper benchmarks the right kernel family; the 2D-composed workaround would be inefficient/not benchmark-faithful)
+avg_pool_1d,tasks/baseline/L1/avg_pool1d.py,AvgPool1d,direct (re-added per mentor: explicit 1D wrapper)
 max_pool_3d,,, NOT FOUND (no HF model in pinned commit needs it)
 avg_pool_3d,,, NOT FOUND (no HF model in pinned commit needs it)
 interpolate,tasks/baseline/L1/interpolate.py,Interpolate,direct
