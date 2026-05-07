@@ -175,7 +175,7 @@ python audits/hf_transformers_coverage/tools/ast_extract.py --dir /tmp/hf_transf
 - "modular DSL" handling: when both `modeling_<x>.py` and `modular_<x>.py` exist, the audit reads the generated `modeling_<x>.py` (which is the runtime artifact). The 2 modular-only folders (`layoutxlm`, `pp_chart2table`) are wrappers that re-use a parent architecture and are flagged in `notes`.
 - The audit does not measure performance. A `composable` model may be slow if all of its ops fall back to torch eager.
 
-## 15. Re-audit pass — addressing inconsistencies and adding the trivially-fixable L1 wrappers
+## 14. Re-audit pass — addressing inconsistencies and adding the trivially-fixable L1 wrappers
 
 After the first audit pass landed (77.5% coverage), a deeper re-audit identified two classes of issues:
 
@@ -257,7 +257,7 @@ The 8 ops that were REMOVED (proven composable, bit-identical to a composition o
 
 The 4 remaining `partial` rows have at least one flag that is none of the above (e.g. `detectron2_backbone`, `rg_lru_scan`, `timm_dynamic_backbone`).
 
-## 16. Pass v3: explicit op support (mentor: performance-faithful) + Conv1d narrowness fix + MHA L2 wrapper
+## 15. Pass v3: explicit op support (mentor: performance-faithful) + Conv1d narrowness fix + MHA L2 wrapper
 
 A subsequent re-audit on this branch (after independent code-deep inspection per the audit prompt) found three separate issues with the previous pass:
 
@@ -346,7 +346,7 @@ Coverage numbers UNCHANGED (the change is in HOW certain rows are supported and 
 - 4 `unsupported` (0.9%) — mra, reformer, rwkv v4, xlstm
 - Coverage = 439/447 = **98.21%**
 
-## 17. Pass v3.1: systematic narrowness re-audit (4 more ops extended additively)
+## 16. Pass v3.1: systematic narrowness re-audit (4 more ops extended additively)
 
 After the v3 commit (96f740e), user feedback: "is it just conv1d? any other things with a similar issue? please make sure everything is up to date and correct, do a full reaudit of the guidelines and instruction prompt." Did a systematic code-deep inspection of every kb-nano L1 wrapper's `__init__` signature against `torch.nn.X` and HF actual usage.
 
@@ -385,7 +385,7 @@ The original Conv1d narrowness was the same systemic mistake: I had built the ca
 - 17 `kb_nano_l4` (3.8%) + 422 `composable` (94.4%) + 4 `partial` (0.9%) + 4 `unsupported` (0.9%) + 24 `not_inference_required`
 - Coverage = 439/447 = **98.21%**
 
-## 18. What this proves about kb-nano
+## 17. What this proves about kb-nano
 
 The pilot data already supports the headline framing of the paper appendix: kb-nano's existing L1/L2 surface covers the core compute primitives needed by the most common HF architecture families (encoder, decoder-only, encoder-decoder, vision encoder, multimodal, detection, SSM). The remaining gaps are concentrated in (1) niche pooling kernels (`adaptive_avg_pool*`), (2) `ConvTranspose*` for segmentation/upsampling heads, and (3) attention variants that haven't been hit yet (e.g. `flex_attention`-only models). Each gap is a small, well-bounded kernel — none reflect a fundamental architectural limitation.
 

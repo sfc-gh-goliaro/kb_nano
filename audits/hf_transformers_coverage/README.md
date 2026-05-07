@@ -11,7 +11,7 @@ This directory contains a paper-appendix-quality audit of how broadly Hugging Fa
 | [`hf_architecture_operator_coverage.csv`](hf_architecture_operator_coverage.csv) | One row per HF modeling file, with status, mapped kb-nano ops, and `file:line` evidence. The full data behind the appendix table. |
 | [`unsupported_operator_summary.csv`](unsupported_operator_summary.csv) | Frequency table of canonical ops in `partial`/`unsupported` rows — i.e., the kernels that, if added, would unlock the most architectures. |
 | [`hf_model_inventory.csv`](hf_model_inventory.csv) | The HF model surface: 465 folders, with PyTorch-modeling counts, modular DSL flags, multi-modeling flags, and no-modeling flags. |
-| [`kb_nano_operator_catalog.csv`](kb_nano_operator_catalog.csv) | The kb-nano support surface on `origin/experiments`: 386 class-level rows from L1/L2/L3. |
+| [`kb_nano_operator_catalog.csv`](kb_nano_operator_catalog.csv) | The kb-nano support surface (origin/experiments + audit-branch L1/L2 additions): 402 class-level rows from L1/L2/L3 (114 L1 + 182 L2 + 106 L3). |
 
 ## Pinning
 
