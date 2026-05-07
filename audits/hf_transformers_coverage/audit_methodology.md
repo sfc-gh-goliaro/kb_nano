@@ -207,59 +207,55 @@ The 4 remaining `partial` rows all have at least one flagged op that genuinely c
 
 The 4 `unsupported` rows are unchanged (mra/reformer/rwkv-v4/xlstm — each requires a custom non-SDPA kernel).
 
-### Honest framing of the new L1 ops vs the multihead_attention case
+### Re-re-audit: removed 8 stylistic L1 wrappers (true minimum is 8 new files, not 16)
 
-The multihead_attention case (where kb-nano did not add a wrapper because the underlying compute is already in kb-nano) raises a fair consistency question for the new L1 ops. The honest answer is that **8 of the 16 new L1 ops are mathematically equivalent to compositions of pre-existing kb-nano L1 ops + standard torch arithmetic**. They are stylistic L1 wrappers (consistent with kb-nano's existing one-file-per-torch.nn-op convention — see `silu.py`, `gelu.py`, `relu.py`, `sigmoid.py`, `tanh.py`, all of which are also one-line F.x wraps), not new compute primitives.
+Original re-audit added 16 new L1 wrappers. On code-deep re-inspection it became clear that **8 of those 16 are unnecessary** because they are either (i) torch builtins available via the audit's passthrough mechanism, or (ii) trivially composable from pre-existing kb-nano L1 ops with no precision loss. They were removed from this audit branch.
 
-The composition equivalence is proven numerically by `tools/test_composition_equivalence.py` — every test passes with max-abs diff ≤ 6e-8 (perfect for the integer-arithmetic ones; tiny floating-point noise for `ELU` (`exp` ordering) and `Hardswish` (multiplication ordering)):
+Verification of compositions (`tools/test_composition_equivalence.py`, **243 tests across all dtypes, all shape ranks, all parameter configs, eval+train modes; 100% pass**):
 
-| New L1 op | Equivalent composition | could-be-composable? |
+- **`BatchNorm1d` / `BatchNorm3d`** → use kb-nano `BatchNorm2d` directly. Code-verified by reading `tasks/baseline/L1/batch_norm2d.py:42` — its forward is `F.batch_norm(x, ...)` with no rank check. Empirically verified that `F.batch_norm` accepts ranks 2/3/4/5 with same output shape. Tested across the actually-used HF patterns: rank-2 `[B,C]` (groupvit/levit linear-projection BatchNorm1d), rank-3 `[B,C,L]` (hubert/fastspeech conformer BatchNorm1d), rank-5 `[B,C,D,H,W]` (emu3 VQVAE BatchNorm3d).
+- **`MaxPool1d` / `AvgPool1d`** → use kb-nano `MaxPool2d` / `AvgPool2d` with kernel `(1, k)` on `x.unsqueeze(-2)` then `squeeze(-2)`. Bit-identical for all kernel/stride/padding configurations HF uses.
+- **`LeakyReLU` / `ELU` / `Hardsigmoid` / `Hardswish`** → torch builtins (`F.leaky_relu`, `F.elu`, `F.hardsigmoid`, `F.hardswish`). Bit-identical to `nn.X` by construction. Audit passthrough mechanism covers them (same as `cat`, `gather`, `where`).
+
+The 8 ops that REMAIN added as L1 wrappers (genuinely new primitives, not compositions):
+
+| L1 file kept | reference impl | why genuinely new (not composable) |
 |---|---|---|
-| `BatchNorm1d` | `BatchNorm2d(x.unsqueeze(-1)).squeeze(-1)` | yes (stylistic L1) |
-| `BatchNorm3d` | `BatchNorm2d(reshape(x, [B, C, D*H*W, 1]))` reshaped back | yes (stylistic L1) |
-| `MaxPool1d` | `MaxPool2d((1, k))(x.unsqueeze(-2)).squeeze(-2)` | yes (stylistic L1) |
-| `AvgPool1d` | `AvgPool2d((1, k))(x.unsqueeze(-2)).squeeze(-2)` | yes (stylistic L1) |
-| `LeakyReLU` | `where(x > 0, x, alpha * x)` | yes (stylistic L1) |
-| `ELU` | `where(x >= 0, x, alpha * (exp(x) - 1))` | yes (stylistic L1) |
-| `Hardsigmoid` | `clamp((x + 3) / 6, 0, 1)` | yes (stylistic L1) |
-| `Hardswish` | `x * hardsigmoid(x)` | yes (stylistic L1) |
-| `AdaptiveAvgPool1d` | — | NO (adaptive sizing is non-trivial) |
-| `AdaptiveAvgPool2d` | — | NO |
-| `ConvTranspose1d` | — | NO (different op direction; cannot be composed from Conv) |
-| `ConvTranspose2d` | — | NO |
-| `ConvTranspose3d` | — | NO |
-| `GridSample` | — | NO (fundamental sampling op) |
-| `LSTM` | — | NO (recurrent state, multiple gates) |
-| `ChunkGatedDeltaRule` | — | NO (specific FLA recurrent algorithm) |
+| `tasks/baseline/L1/adaptive_avg_pool1d.py` | `F.adaptive_avg_pool1d` | adaptive output sizing computes kernel/stride dynamically — non-trivial composition |
+| `tasks/baseline/L1/adaptive_avg_pool2d.py` | `F.adaptive_avg_pool2d` | same |
+| `tasks/baseline/L1/conv_transpose1d.py` | `F.conv_transpose1d` (+ weight/bias storage matching `nn.ConvTranspose1d` state_dict) | transposed convolution is a fundamentally different op direction; cannot be composed from `Conv` |
+| `tasks/baseline/L1/conv_transpose2d.py` | `F.conv_transpose2d` (+ weight/bias storage) | same |
+| `tasks/baseline/L1/conv_transpose3d.py` | `F.conv_transpose3d` (+ weight/bias storage) | same |
+| `tasks/baseline/L1/grid_sample.py` | `F.grid_sample` | fundamental sampling op (also used standalone by `superpoint`, `videomt` outside deformable-attention contexts) |
+| `tasks/baseline/L1/lstm.py` | `nn.LSTM` (cuDNN) | recurrent state machine with multi-layer / bidirectional / proj_size — not composable from primitives |
+| `tasks/baseline/L1/chunk_gated_delta_rule.py` | `fla.ops.gated_delta_rule.{chunk,fused_recurrent}_gated_delta_rule` | specific FLA recurrent algorithm (Qwen3.5/Qwen3-Next/OLMo-Hybrid); same import pattern as kb-nano's existing `chunk_gla.py` |
 
-**Implication for the headline number.** Under a strict consistency reading (treating compositions as `composable` even without a dedicated L1 file, the same way we treat `nn.MultiheadAttention`), the 8 stylistic-wrapper ops would have been `composable` from the start. The pre-re-audit `composable` count would have been ≈ 330 + (# of partial rows whose only flagged op is a stylistic case) instead of 330. Either way, the post-re-audit count is the same: **422 composable, 4 partial, 4 unsupported**.
+The 8 ops that were REMOVED (proven composable, bit-identical to a composition of pre-existing kb-nano + torch builtins): `BatchNorm1d`, `BatchNorm3d`, `MaxPool1d`, `AvgPool1d`, `LeakyReLU`, `ELU`, `Hardsigmoid`, `Hardswish`. Their canonical map entries are now `composable` (no file path) with the composition recipe documented in `tools/canonical_to_kb_nano.csv`. The auto-reclassify logic still treats them as supported (a row whose only partial flag is one of these is correctly reclassified as `composable` — no kb-nano L1 file is needed because the existing primitives cover them).
 
-The choice to add L1 files for these 8 stylistic ops is consistent with kb-nano's existing style and gives the kernel-benchmark scaffolding a clean per-op target. Documenting the equivalence here makes the audit honest about the choice rather than implying the 8 ops are new primitives.
+**Headline numbers are unchanged** by this re-re-audit (422 composable, 4 partial, 4 unsupported) — the change is in *how* certain ops are supported (composition vs new L1), not whether they are supported.
 
-### List of new L1 wrappers added (all numerically verified vs torch.nn.X / fla; max-abs diff = 0.00e+00)
+### Final list: 8 new L1 wrappers in `tasks/baseline/L1/` (numerically verified — see `tools/test_keep_ops_thorough.py`, 297 tests, 100% pass)
 
-In `tasks/baseline/L1/`:
+| file | class | reference impl |
+|---|---|---|
+| `adaptive_avg_pool1d.py` | `AdaptiveAvgPool1d` | `F.adaptive_avg_pool1d` |
+| `adaptive_avg_pool2d.py` | `AdaptiveAvgPool2d` | `F.adaptive_avg_pool2d` |
+| `conv_transpose1d.py` | `ConvTranspose1d` | `F.conv_transpose1d` + state_dict-compat with `nn.ConvTranspose1d` |
+| `conv_transpose2d.py` | `ConvTranspose2d` | `F.conv_transpose2d` + state_dict-compat |
+| `conv_transpose3d.py` | `ConvTranspose3d` | `F.conv_transpose3d` + state_dict-compat |
+| `grid_sample.py` | `GridSample` | `F.grid_sample` |
+| `lstm.py` | `LSTM` | `torch.nn.LSTM` (cuDNN; encodec uses this) |
+| `chunk_gated_delta_rule.py` | `ChunkGatedDeltaRule`, `FusedRecurrentGatedDeltaRule` | `fla.ops.gated_delta_rule.{chunk,fused_recurrent}_gated_delta_rule` (Qwen3.5 / Qwen3-Next / OLMo-Hybrid; mirrors kb-nano's existing `chunk_gla.py` import pattern) |
 
-| file | class | wraps | rows it lifts to composable |
-|---|---|---|---:|
-| `adaptive_avg_pool1d.py` | `AdaptiveAvgPool1d` | `F.adaptive_avg_pool1d` | 5 |
-| `adaptive_avg_pool2d.py` | `AdaptiveAvgPool2d` | `F.adaptive_avg_pool2d` | 22 |
-| `avg_pool1d.py` | `AvgPool1d` | `F.avg_pool1d` | 5 |
-| `max_pool1d.py` | `MaxPool1d` | `F.max_pool1d` | 2 |
-| `conv_transpose1d.py` | `ConvTranspose1d` | `F.conv_transpose1d` (state_dict-compat) | 14 |
-| `conv_transpose2d.py` | `ConvTranspose2d` | `F.conv_transpose2d` (state_dict-compat) | 23 |
-| `conv_transpose3d.py` | `ConvTranspose3d` | `F.conv_transpose3d` (state_dict-compat) | 0 (no HF model in pinned commit needs it; added for completeness) |
-| `batch_norm1d.py` | `BatchNorm1d` | `F.batch_norm` 1d (state_dict-compat) | 15 |
-| `batch_norm3d.py` | `BatchNorm3d` | `F.batch_norm` 3d (state_dict-compat) | 1 |
-| `leaky_relu.py` | `LeakyReLU` | `F.leaky_relu` | 6 |
-| `elu.py` | `ELU` | `F.elu` | 2 |
-| `hardsigmoid.py` | `Hardsigmoid` | `F.hardsigmoid` | 2 |
-| `hardswish.py` | `Hardswish` | `F.hardswish` | 1 |
-| `grid_sample.py` | `GridSample` | `F.grid_sample` | 6 |
-| `lstm.py` | `LSTM` | `torch.nn.LSTM` (encodec) | 1 |
-| `chunk_gated_delta_rule.py` | `ChunkGatedDeltaRule`, `FusedRecurrentGatedDeltaRule` | `fla.ops.gated_delta_rule.{chunk,fused_recurrent}_gated_delta_rule` (Qwen3.5 / Qwen3-Next / OLMo-Hybrid) | 4 |
+(Plus 8 ops removed as composable; see table above.)
 
-(The "rows it lifts" column counts how many HF modeling files this single op enabled to move from `partial` → `composable`. Some rows had multiple flagged ops and only flipped once *all* of them were addressable — those are credited only to the last-needed op. Total reclassified: 92 rows by 16 new ops + 4 rows reclassified for `multihead_attention` per mentor guidance + 0 for already-supported `causal_conv1d` / `deformable_attention_v1` which were originally over-flagged.)
+**Auto-reclassification accounting.** Of the 96 originally-`partial` rows, 92 flipped to `composable` after the re-audit. Each row flipped because every flagged op falls in `tools/merge_and_summarize.py:NEWLY_SUPPORTED_OPS`, which contains:
+
+- (A) **Genuinely-new L1 wrappers** (8 ops): `adaptive_avg_pool_1d/2d`, `conv_transpose1d/2d/3d`, `grid_sample`, `lstm`, `chunk_gated_delta_rule`.
+- (B) **Composition-supported ops** (8 ops): `batch_norm_1d/3d`, `max_pool_1d`, `avg_pool_1d`, `leaky_relu`, `elu`, `hardsigmoid`, `hardswish`. No new file — uses kb-nano BatchNorm2d/MaxPool2d/AvgPool2d with reshape, or torch builtin F.x. Verified bit-identical (`tools/test_composition_equivalence.py`, 243 tests).
+- (C) **Pre-existing kb-nano support** (3 cases): `multihead_attention` (deprecated nn class; per mentor, no new wrapper), `causal_conv1d` (already in `tasks/baseline/L2/mamba_mixer.py`), `deformable_attention_v1_normalization` (kb-nano L1 with `method="default"` is bit-identical).
+
+The 4 remaining `partial` rows have at least one flag that is none of the above (e.g. `detectron2_backbone`, `rg_lru_scan`, `timm_dynamic_backbone`).
 
 ## 16. What this proves about kb-nano
 

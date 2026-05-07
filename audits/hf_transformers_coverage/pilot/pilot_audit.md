@@ -1,5 +1,10 @@
 # Pilot Audit: 12 architectures + 1 no-modeling exception
 
+> **Note:** This is the **historical** pilot analysis from the first audit pass. The classifications in this doc reflect what the coordinator concluded during the pilot, before the re-audit added 8 new L1 wrappers and reclassified previously-flagged ops. After the re-audit, several rows here that were marked `partial` (e.g. `data2vec_vision` for `conv_transpose2d` + `adaptive_avg_pool_2d`, `swin` for `adaptive_avg_pool_1d`) are now `composable` — see [`audit_methodology.md`](../audit_methodology.md) § 15 for the reclassification logic and [`hf_architecture_operator_coverage.csv`](../hf_architecture_operator_coverage.csv) for current per-row status. This pilot doc is preserved as historical record of the methodology development; the canonical numbers live in `coverage_summary.md`.
+
+---
+
+
 **HF source:** `huggingface/transformers` @ `da6c53e431f7c9ef0691239d4ce89b0f711ecad7`, in `/tmp/hf_transformers_pinned/`.
 **kb-nano support surface:** `origin/experiments` @ `11aa838`, audited from working tree on `audit/hf-transformers-coverage`.
 

@@ -3,11 +3,8 @@ L1,tasks/baseline/L1/adaptive_avg_pool1d.py,AdaptiveAvgPool1d,nn.Module,Adaptive
 L1,tasks/baseline/L1/adaptive_avg_pool2d.py,AdaptiveAvgPool2d,nn.Module,AdaptiveAvgPool2d wrapping F.adaptive_avg_pool2d.,
 L1,tasks/baseline/L1/allreduce.py,AllReduce,nn.Module,AllReduce L1 operator with custom IPC all-reduce and NCCL fallback.,
 L1,tasks/baseline/L1/allreduce.py,CustomAllreduce,,AllReduce L1 operator with custom IPC all-reduce and NCCL fallback.,
-L1,tasks/baseline/L1/avg_pool1d.py,AvgPool1d,nn.Module,AvgPool1d wrapping F.avg_pool1d.,
 L1,tasks/baseline/L1/avg_pool2d.py,AvgPool2d,nn.Module,AvgPool2d wrapping F.avg_pool2d.,
-L1,tasks/baseline/L1/batch_norm1d.py,BatchNorm1d,nn.Module,BatchNorm1d wrapping F.batch_norm with registered affine/running stats.,
 L1,tasks/baseline/L1/batch_norm2d.py,BatchNorm2d,nn.Module,BatchNorm2d wrapping F.batch_norm with registered affine/running stats.,
-L1,tasks/baseline/L1/batch_norm3d.py,BatchNorm3d,nn.Module,BatchNorm3d wrapping F.batch_norm with registered affine/running stats.,
 L1,tasks/baseline/L1/bmm.py,BatchMatMul,nn.Module,Batched matrix multiply (``torch.bmm``) as an L1 primitive.,"Batched matrix multiply ``(B, N, M) @ (B, M, P) -> (B, N, P)``."
 L1,tasks/baseline/L1/chunk_gated_delta_rule.py,ChunkGatedDeltaRule,nn.Module,Chunk Gated Delta Rule — Triton-accelerated chunked kernel from FLA.,Triton chunk gated-delta-rule kernel.
 L1,tasks/baseline/L1/chunk_gated_delta_rule.py,FusedRecurrentGatedDeltaRule,nn.Module,Chunk Gated Delta Rule — Triton-accelerated chunked kernel from FLA.,FLA fused-recurrent gated-delta-rule decode kernel.
@@ -25,7 +22,6 @@ L1,tasks/baseline/L1/dense_attention.py,DenseAttention,nn.Module,Dense (non-page
 L1,tasks/baseline/L1/diffusion_rope.py,DiffusionRoPE,nn.Module,Rotary position embedding for diffusion models (interleaved / GPT-J style).,"Apply rotary embeddings given pre-computed (cos, sin) tensors."
 L1,tasks/baseline/L1/dinov3_rope.py,DINOv3RoPE,nn.Module,DINOv3 2D rotary position embedding (L1).,DINOv3 2D rotary position embedding.
 L1,tasks/baseline/L1/dropout.py,Dropout,nn.Module,Dropout wrapping F.dropout.,
-L1,tasks/baseline/L1/elu.py,ELU,nn.Module,ELU wrapping F.elu.,
 L1,tasks/baseline/L1/embedding.py,Embedding,nn.Module,Embedding lookup kernel: wraps nn.Embedding.,
 L1,tasks/baseline/L1/flash_attn_decode.py,FlashAttnDecode,nn.Module,Flash attention decode kernel (with paged KV cache).,
 L1,tasks/baseline/L1/flash_attn_prefill.py,FlashAttnPrefill,nn.Module,Flash attention prefill kernel (variable-length sequences).,
@@ -54,21 +50,17 @@ L1,tasks/baseline/L1/gla_recurrence.py,NaiveRecurrentGLA,nn.Module,Naive recurre
 L1,tasks/baseline/L1/grid_sample.py,GridSample,nn.Module,GridSample wrapping F.grid_sample.,
 L1,tasks/baseline/L1/group_norm.py,GroupNorm,nn.Module,GroupNorm wrapping F.group_norm with learnable affine parameters.,Group normalization with optional learnable weight and bias.
 L1,tasks/baseline/L1/grouped_topk.py,GroupedTopK,nn.Module,Grouped top-k routing for DeepSeek-style MoE.,Functional grouped top-k router.
-L1,tasks/baseline/L1/hardsigmoid.py,Hardsigmoid,nn.Module,Hardsigmoid wrapping F.hardsigmoid.,
-L1,tasks/baseline/L1/hardswish.py,Hardswish,nn.Module,Hardswish wrapping F.hardswish.,
 L1,tasks/baseline/L1/hunyuan_video_rope.py,HunyuanVideo15RotaryPosEmbed,nn.Module,3D rotary position embedding frequency generator for HunyuanVideo-1.5.,
 L1,tasks/baseline/L1/indexer_k_cache.py,IndexerKCacheStore,nn.Module,Indexer K cache store and gather for DSA (132 bytes/token).,Quantize K to FP8 and store in indexer paged cache via CUDA kernel.
 L1,tasks/baseline/L1/indexer_k_cache.py,IndexerKCacheGather,nn.Module,Indexer K cache store and gather for DSA (132 bytes/token).,Gather K from indexer paged cache in FP8 form via CUDA kernel.
 L1,tasks/baseline/L1/interpolate.py,Interpolate,nn.Module,Interpolate wrapping F.interpolate.,
 L1,tasks/baseline/L1/l2_norm.py,L2Norm,nn.Module,L2 normalization along a single dimension: x / ||x||_2.,
 L1,tasks/baseline/L1/layer_norm.py,LayerNorm,nn.Module,Standard LayerNorm wrapping F.layer_norm with optional affine parameters.,
-L1,tasks/baseline/L1/leaky_relu.py,LeakyReLU,nn.Module,LeakyReLU wrapping F.leaky_relu.,
 L1,tasks/baseline/L1/linear.py,Matmul,nn.Module,Linear (matrix multiply) kernels.,"Pure functional linear: takes input, weight, and optional bias as forward args."
 L1,tasks/baseline/L1/linear.py,BMM,nn.Module,Linear (matrix multiply) kernels.,"Batch matrix multiply: torch.matmul(a, b)."
 L1,tasks/baseline/L1/linear.py,Linear,nn.Module,Linear (matrix multiply) kernels.,Parametric linear: stores weight and bias internally.
 L1,tasks/baseline/L1/log_sigmoid.py,LogSigmoid,nn.Module,Log-sigmoid activation: log(1 / (1 + exp(-x))) = -softplus(-x).,
 L1,tasks/baseline/L1/lstm.py,LSTM,nn.Module,LSTM wrapping torch.nn.LSTM.,Standard LSTM wrapping ``torch.nn.LSTM``.
-L1,tasks/baseline/L1/max_pool1d.py,MaxPool1d,nn.Module,MaxPool1d wrapping F.max_pool1d.,
 L1,tasks/baseline/L1/max_pool2d.py,MaxPool2d,nn.Module,MaxPool2d wrapping F.max_pool2d.,
 L1,tasks/baseline/L1/merge_attn_states.py,MergeAttnStates,nn.Module,Online softmax merge for two attention partitions.,Online softmax merge of two attention partitions.
 L1,tasks/baseline/L1/moe_align.py,MoeAlign,nn.Module,MoE token-to-expert alignment with block padding.,MoE token-to-expert alignment using sgl_kernel.

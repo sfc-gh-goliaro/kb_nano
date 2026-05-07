@@ -20,12 +20,12 @@ tanh,tasks/baseline/L1/tanh.py,Tanh,direct
 quick_gelu,tasks/baseline/L1/quickgelu.py,QuickGELU,direct
 log_sigmoid,tasks/baseline/L1/log_sigmoid.py,LogSigmoid,direct
 mish,,, NOT IN L1 (used by DP3 only - dp3 branch unmerged)
-leaky_relu,tasks/baseline/L1/leaky_relu.py,LeakyReLU,direct (added in audit branch; numerically verified)
-elu,tasks/baseline/L1/elu.py,ELU,direct (added in audit branch; numerically verified)
-hardsigmoid,tasks/baseline/L1/hardsigmoid.py,Hardsigmoid,direct (added in audit branch; numerically verified)
-hardswish,tasks/baseline/L1/hardswish.py,Hardswish,direct (added in audit branch; numerically verified)
-batch_norm_1d,tasks/baseline/L1/batch_norm1d.py,BatchNorm1d,direct (added in audit branch; numerically verified)
-batch_norm_3d,tasks/baseline/L1/batch_norm3d.py,BatchNorm3d,direct (added in audit branch; numerically verified)
+leaky_relu,composable,,torch builtin: F.leaky_relu — bit-identical to nn.LeakyReLU by construction (nn.LeakyReLU just wraps F.leaky_relu). Audit passthrough. Verified across fp32/bf16/fp16 and slope in {0 0.01 0.1 0.2}.
+elu,composable,,torch builtin: F.elu — bit-identical to nn.ELU. Audit passthrough. Verified across fp32/bf16/fp16 and alpha in {0.5 1.0 1.5}.
+hardsigmoid,composable,,torch builtin: F.hardsigmoid — bit-identical to nn.Hardsigmoid. Audit passthrough.
+hardswish,composable,,torch builtin: F.hardswish — bit-identical to nn.Hardswish. Audit passthrough.
+batch_norm_1d,composable,,composable via kb-nano BatchNorm2d (rank-agnostic via F.batch_norm; tested across rank-2 [B,C] groupvit/levit pattern AND rank-3 [B,C,L] hubert/fastspeech pattern). Verified test_composition_equivalence.py (eval+train, fp32/bf16/fp16).
+batch_norm_3d,composable,,composable via kb-nano BatchNorm2d (F.batch_norm is rank-agnostic; works on [B,C,D,H,W] directly). Verified test_composition_equivalence.py.
 chunk_gated_delta_rule,tasks/baseline/L1/chunk_gated_delta_rule.py,ChunkGatedDeltaRule,direct (added in audit branch; wraps fla.ops.gated_delta_rule.chunk_gated_delta_rule; same import pattern as chunk_gla.py)
 fused_recurrent_gated_delta_rule,tasks/baseline/L1/chunk_gated_delta_rule.py,FusedRecurrentGatedDeltaRule,direct (added in audit branch)
 multihead_attention,tasks/baseline/L1/dense_attention.py,DenseAttention,direct (legacy nn.MultiheadAttention is a wrapper around 3xLinear+SDPA+Linear; all primitives in kb-nano. Per mentor: do not add a literal wrapper for the deprecated class API)
@@ -43,8 +43,8 @@ max_pool_2d,tasks/baseline/L1/max_pool2d.py,MaxPool2d,direct
 avg_pool_2d,tasks/baseline/L1/avg_pool2d.py,AvgPool2d,direct
 adaptive_avg_pool_2d,tasks/baseline/L1/adaptive_avg_pool2d.py,AdaptiveAvgPool2d,direct (added in audit branch; numerically verified)
 adaptive_avg_pool_1d,tasks/baseline/L1/adaptive_avg_pool1d.py,AdaptiveAvgPool1d,direct (added in audit branch; numerically verified)
-max_pool_1d,tasks/baseline/L1/max_pool1d.py,MaxPool1d,direct (added in audit branch; numerically verified)
-avg_pool_1d,tasks/baseline/L1/avg_pool1d.py,AvgPool1d,direct (added in audit branch; numerically verified)
+max_pool_1d,composable,,composable via MaxPool2d with kernel=(1 k) + reshape: MaxPool2d((1,k))(x.unsqueeze(-2)).squeeze(-2). Verified bit-identical across fp32/bf16/fp16 and all HF kernel/stride/padding configs (test_composition_equivalence.py)
+avg_pool_1d,composable,,composable via AvgPool2d with kernel=(1 k) + reshape: AvgPool2d((1,k))(x.unsqueeze(-2)).squeeze(-2). Verified bit-identical (test_composition_equivalence.py)
 max_pool_3d,,, NOT FOUND (no HF model in pinned commit needs it)
 avg_pool_3d,,, NOT FOUND (no HF model in pinned commit needs it)
 interpolate,tasks/baseline/L1/interpolate.py,Interpolate,direct
