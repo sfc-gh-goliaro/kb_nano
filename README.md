@@ -1,16 +1,18 @@
 # kb-nano
 
-A standalone, high-performance inference engine supporting **LLMs** (Llama 3.1, Llama 4, Mixtral-8x7B, DeepSeek V3.2, GPT-OSS, Qwen2-VL, Qwen3-VL), **linear-attention LLMs** (GLA, RetNet, RWKV7), **embedding / retrieval models** (BGE-M3, ColBERTv2), **diffusion models** (FLUX.1-dev, SDXL, HunyuanVideo-1.5), **world models** (Oasis 500M), **detection models** (YOLOv10, RTDetrV2), **vision encoders** (SigLIP-2, DINOv3, SwinV2), **segmentation models** (SAM3.1), **3D point models** (PointTransformerV3), **protein structure prediction** (OpenFold3), audio models (Whisper), **TTS models** (CosyVoice3), and **3-D visuomotor policies** (DP3 / Simple-DP3) with tensor parallelism and FP8 quantization. No vLLM dependency at runtime — just PyTorch, Triton, and Flash Attention.
+A standalone, high-performance inference engine supporting **LLMs** (Llama 3.1, Llama 4, Mixtral-8x7B, DeepSeek V3.2, GPT-OSS, Qwen2-VL, Qwen3-VL), **linear-attention LLMs** (GLA, RetNet, RWKV7), **embedding / retrieval models** (BGE-M3, ColBERTv2), **recsys / graph recommendation models** (DLRMv2, LightGCN), **diffusion models** (FLUX.1-dev, SDXL, HunyuanVideo-1.5), **detection models** (YOLOv10, RTDetrV2), **vision encoders** (SigLIP-2, DINOv3, SwinV2), **segmentation models** (SAM3.1), **protein structure prediction** (OpenFold3), audio models (Whisper), and **TTS models** (CosyVoice3) with tensor parallelism and FP8 quantization. No vLLM dependency at runtime — just PyTorch, Triton, and Flash Attention.
 
 ## Features
 
 - **Llama 3.1** (8B, 70B) with frequency-scaled RoPE
 - **Llama 4** with fused MoE experts
 - **Mixtral-8x7B** with fused Triton MoE grouped-GEMM kernels
-- **DeepSeek V3.2** with MLA (Multi-head Latent Attention), 256-expert MoE via DeepGEMM FP8, DSA (DeepSeek Sparse Attention), and YARN RoPE — currently **0.78–0.90× of vLLM** throughput on 8×H200 (gap due to kernel-launch overhead, GEMM kernel selection, and AllReduce+RMSNorm fusion)
-- **GPT-OSS** (20B, 120B) MXFP4-quantized MoE with native Triton inference, YaRN RoPE, attention sinks, and sliding window
 - **BGE-M3** dense + sparse + ColBERT-style embedding outputs
 - **ColBERTv2** query/doc encoders with MaxSim scoring
+- **DLRMv2** dense + sparse feature recommendation model with packed embedding-bag inference
+- **LightGCN** graph recommendation model with CSR propagation
+- **DeepSeek V3.2** with MLA (Multi-head Latent Attention), 256-expert MoE via DeepGEMM FP8, DSA (DeepSeek Sparse Attention), and YARN RoPE — currently **0.78–0.90× of vLLM** throughput on 8×H200 (gap due to kernel-launch overhead, GEMM kernel selection, and AllReduce+RMSNorm fusion)
+- **GPT-OSS** (20B, 120B) MXFP4-quantized MoE with native Triton inference, YaRN RoPE, attention sinks, and sliding window
 - **Mamba / Mamba2** (`state-spaces/mamba-2.8b-hf`, `mistralai/Mamba-Codestral-7B-v0.1`) selective state-space models with vLLM-aligned `causal_conv1d` + `mamba_chunk_scan` / `selective_scan` kernels, slot-based recurrent state cache, chunked-prefill metadata, and TP sharding (incl. `n_groups % tp != 0` head-shard groups)
 - **GLA** (`fla-hub/gla-2.7B-100B`) Gated Linear Attention with per-head logsigmoid forget gate, swish output gate, and SwiGLU MLP — token-aligned with the FLA reference
 - **RetNet** (`fla-hub/retnet-2.7B-100B`) Multi-Scale Retention with rotary embeddings, fixed per-head decay (γ_h = 1 − 2^(−5−h)), swish output gate, and SwiGLU MLP — token-aligned with the FLA reference
@@ -18,7 +20,6 @@ A standalone, high-performance inference engine supporting **LLMs** (Llama 3.1, 
 - **FLUX.1-dev** diffusion transformer (text-to-image) with Flash Attention
 - **SDXL** (Stable Diffusion XL) UNet-based text-to-image with dual CLIP text encoders
 - **HunyuanVideo-1.5** 3D video diffusion transformer (text-to-video) with dual-stream joint attention, M-RoPE, and Qwen2.5-VL text encoder
-- **Oasis 500M** action-conditioned autoregressive diffusion world model
 - **YOLOv10** (`jameslahm/yolov10n`) NMS-free object detection with rank sorting
 - **RTDetrV2** (`PekingU/rtdetr_v2_r101vd`) real-time detection transformer with deformable attention
 - **Qwen2-VL / Qwen3-VL** vision-language models with image and video support
@@ -26,11 +27,9 @@ A standalone, high-performance inference engine supporting **LLMs** (Llama 3.1, 
 - **DINOv3** (facebook/dinov3-vit7b16-pretrain-lvd1689m) Eva vision encoder with 2D RoPE, SwiGLU MLP, and register tokens
 - **SwinV2** (timm/swinv2_large_window12_192.ms_in22k) hierarchical vision transformer with shifted-window cosine attention and continuous position bias
 - **SAM3.1** (facebook/sam3.1) image/video segmentation with ViT backbone, fusion encoder, detection decoder, and segmentation head
-- **PointTransformerV3** (Pointcept/PointTransformerV3) 3D point cloud transformer with serialized pooling, sparse conv stems, and optional Flash Attention
 - **Whisper** (large-v3) encoder-decoder speech-to-text with batched inference and paged cross-attention KV cache
 - **CosyVoice3** (Fun-CosyVoice3-0.5B-2512) text-to-speech with flow matching DiT + HiFi-GAN vocoder
 - **OpenFold3** (OpenFold/OpenFold3) protein structure prediction with MSA module, PairFormer, diffusion sampling, and atom attention
-- **DP3 / Simple-DP3** (YanjieZe/3D-Diffusion-Policy) 3-D visuomotor policy with PointNet point-cloud encoder, 1-D conditional U-Net (FiLM-modulated, Mish + GroupNorm), DDIM scheduler with `prediction_type="sample"`, and action chunking (horizon=16, n_obs_steps=2, n_action_steps=8)
 - **FP8 inference** with block-scaled FP8 quantization via DeepGEMM, UE8M0 power-of-two scales, and fused SiLU+Mul+FP8 quantization kernels
 - **Tensor parallelism** (TP) with custom IPC-based all-reduce for multi-GPU inference
 - **Paged KV cache** with Triton store kernels (LLM models); FP8 MLA KV cache for DeepSeek
@@ -46,11 +45,9 @@ A standalone, high-performance inference engine supporting **LLMs** (Llama 3.1, 
 - **Detection benchmark** for YOLOv10 and RTDetrV2
 - **timm comparison benchmark** for SigLIP-2, DINOv3, and SwinV2 vision encoders (ImageNet-1K validation)
 - **facebook/sam3 comparison benchmark** for SAM3.1 segmentation
-- **vLLM pooling/token_embed comparison benchmark** for embedding and retrieval models
-- **PointTransformerV3 detached comparison benchmark** for 3D point cloud encoding
-- **open-oasis comparison benchmark** for autoregressive diffusion world models
+- **FlagEmbedding / ColBERT comparison benchmark** for embedding and retrieval models
+- **TorchRec / PyG comparison benchmark** for recsys and graph recommendation models
 - **OpenFold/OpenFold3 comparison benchmark** for protein structure prediction
-- **3D-Diffusion-Policy comparison benchmark** for DP3 / Simple-DP3 visuomotor policies (real point clouds from `rishabhrj11/gym-xarm-pointcloud`)
 
 ## Project Structure
 
@@ -262,6 +259,67 @@ python tests/test_sam.py --skip-reference
 python tests/test_sam.py --skip-latency
 ```
 
+### Benchmarking vs Embedding Baselines
+
+Install the optional benchmark baseline packages listed in [Dependencies](#dependencies) to run reference comparisons.
+
+```bash
+# BGE-M3: throughput + latency + alignment benchmark vs FlagEmbedding
+python tests/bench_embedding.py --model BAAI/bge-m3
+
+# ColBERTv2: query/doc throughput + latency + alignment benchmark vs official ColBERT
+python tests/bench_embedding.py --model colbert-ir/colbertv2.0
+
+# kb-nano only (skip reference comparison)
+python tests/bench_embedding.py --model BAAI/bge-m3 --skip-reference
+
+# Skip latency phase
+python tests/bench_embedding.py --model BAAI/bge-m3 --skip-latency
+
+# Save results to a specific directory
+python tests/bench_embedding.py --model BAAI/bge-m3 --output-dir tests/results/H200/bge-m3_embedding
+python tests/bench_embedding.py --model colbert-ir/colbertv2.0 --output-dir tests/results/H200/colbertv2.0_embedding
+```
+
+### Benchmarking vs Recsys Baselines
+
+Install the optional benchmark baseline packages listed in [Dependencies](#dependencies) to run reference comparisons.
+
+```bash
+# DLRMv2: real-data throughput + alignment benchmark vs TorchRec DLRM
+# Uses Hugging Face scikit-learn/adult-census-income (cached under tests/data/recsys by default)
+python tests/bench_recsys.py --model dlrmv2
+
+# LightGCN: real-data throughput + alignment benchmark vs torch_geometric LightGCN
+# Uses official GroupLens MovieLens 1M ratings with implicit positives defined by rating >= 4
+python tests/bench_recsys.py --model lightgcn
+
+# Run both recsys baselines in one invocation
+python tests/bench_recsys.py --model all
+
+# Full alignment + throughput run used for the H200 numbers below
+python tests/bench_recsys.py --model all --output-dir tests/results/H200/recsys
+
+# Force regeneration of the cached trained checkpoints
+python tests/bench_recsys.py --model all --retrain-checkpoints --output-dir tests/results/H200/recsys
+
+# Override dataset cache root
+python tests/bench_recsys.py --model all --dataset-root tests/data/recsys
+
+# Skip throughput or alignment
+python tests/bench_recsys.py --model lightgcn --skip-throughput
+python tests/bench_recsys.py --model dlrmv2 --skip-alignment
+
+# Save results to a specific directory
+python tests/bench_recsys.py --model dlrmv2 --output-dir tests/results/H200/dlrmv2_recsys
+python tests/bench_recsys.py --model lightgcn --output-dir tests/results/H200/lightgcn_recsys
+```
+
+Default timing for the recsys benchmark is `100` warmup iterations and `11000` measured iterations.
+The benchmark uses real input datasets and official TorchRec / PyG model implementations as references.
+If a trained checkpoint is missing, the script trains one on the real dataset and caches it under `tests/data/recsys/checkpoints` by default.
+Both the reference implementation and kb-nano load the same trained checkpoint for alignment and throughput.
+
 ### Benchmarking detection models
 
 ```bash
@@ -304,111 +362,10 @@ The protein structure benchmark measures:
 - **Latency**: per-structure prediction latency with median stats
 - **Correctness**: percentage of queries meeting all correctness requirements (atom position cosine similarity >= 0.95, RMSD < 0.5A, pLDDT correlation >= 0.99, PAE cosine similarity >= 0.95)
 
-### Benchmarking vs 3D-Diffusion-Policy (DP3 / Simple-DP3)
-
-```bash
-# Simple-DP3 (default): real xarm point clouds, 100 frames, kb-nano vs reference
-python tests/bench_dp3.py
-
-# Full DP3 (heavier U-Net, down_dims=[512,1024,2048])
-python tests/bench_dp3.py --variant dp3
-
-# kb-nano only (skip reference comparison)
-python tests/bench_dp3.py --skip-reference
-
-# Use a real trained DP3 checkpoint (latest.ckpt produced by reference's train.py)
-python tests/bench_dp3.py --checkpoint /path/to/latest.ckpt
-
-# Override request count or DDIM steps
-python tests/bench_dp3.py --num-requests 200 --num-steps 10
-
-# Enable torch.compile (default is eager — apples-to-apples vs reference)
-python tests/bench_dp3.py --torch-compile
-
-# Synthetic Gaussian point clouds (debug only)
-python tests/bench_dp3.py --synthetic-only
-```
-
-**Inputs.** Real 3-D point cloud + robot state + actions from `rishabhrj11/gym-xarm-pointcloud` (HF Hub, 18374 frames, 50 episodes, gym-xarm push-block). Point clouds are 512×6 XYZRGB extracted from depth cameras; we slice to XYZ for `use_pc_color=False`. Robot state is 7-D joint angles, action is 4-D end-effector control. The per-key linear normalizer (`scale`, `offset`) is fit to real xarm data (1000 frames, "limits" mode → outputs scaled to [-1, 1]) so the normalize/unnormalize math is exercised end-to-end — not bypassed via identity scale.
-
-**Weights.** DP3 publishes no pretrained checkpoints, but kernel/math equivalence is independent of weight values. The bench builds a reference DP3 with `nn.Linear` Kaiming-uniform init, saves it in the reference's `train.py` checkpoint format, and both engines load the same file. Pass `--checkpoint` to use a real trained checkpoint.
-
-**Validates:**
-- **Correctness**: per-frame action MSE + cosine similarity between kb-nano and reference (≥ 0.999 cos sim required to pass).
-- **Speed**: throughput + P50/P99 latency at single-env (B=1) and batched (B=8) scenarios.
-- *Out of scope*: real-task accuracy (would require MuJoCo + scripted-policy demo generation + multi-hour training).
-
-**Results on 1× B200 (real xarm data, 10 DDIM steps, fp32, eager — see `tests/results/B200/dp3_*/results.json`):**
-
-Simple-DP3 (13.2M params, 100 frames):
-
-| Scenario | kb-nano | reference | speedup |
-|---|---|---|---|
-| dp3-1env throughput | 23.45 req/s | 14.00 req/s | 1.67× |
-| dp3-batch throughput (bsz=8) | 178.25 req/s | 152.14 req/s | 1.17× |
-| single-step latency (P50/P99) | 42.5 / 42.6 ms | 47.6 / 49.9 ms | 1.12× |
-| batch-8 latency (P50/P99) | 41.7 / 42.7 ms | 51.5 / 63.9 ms | 1.24× |
-
-Full DP3 (255M params, 50 frames):
-
-| Scenario | kb-nano | reference | speedup |
-|---|---|---|---|
-| dp3-1env throughput | 22.78 req/s | 20.64 req/s | 1.10× |
-| dp3-batch throughput (bsz=8) | 144.58 req/s | 143.84 req/s | 1.01× |
-| single-step latency (P50/P99) | 40.0 / 48.8 ms | 47.8 / 53.3 ms | 1.19× |
-| batch-8 latency (P50/P99) | 40.1 / 45.7 ms | 45.8 / 90.0 ms | 1.14× |
-
-**Correctness:** **byte-identical** outputs across all samples in both variants — mean MSE = 0.0, mean cosine similarity = 1.000000, max abs diff = **0.000000e+00**. Both engines run identical code paths (encoder, U-Net, DDIM scheduler with `alphas_cumprod` pre-moved to GPU, normalize/unnormalize, action slice).
-
-### Benchmarking vs vLLM (Embedding / Retrieval)
-
-Install the benchmark dependencies in the `kb` environment:
-
-```bash
-python -m pip install datasets==4.8.4 peft==0.18.1 GitPython==3.1.46 ujson==5.12.0 scipy==1.17.1
-```
-
-After that, run the benchmark directly from the repo root. The embedding benchmark compares kb-nano against vLLM's pooling runner in `token_embed` mode, using pre-tokenized identical requests for both engines. It reports end-to-end input tokens/sec, latency, and per-request output cosine correctness as part of the throughput run.
-
-```bash
-# BGE-M3 + ColBERTv2 token-level embedding throughput/latency/correctness vs vLLM
-python tests/bench_embedding.py
-
-# Single model
-python tests/bench_embedding.py --model bge-m3
-python tests/bench_embedding.py --model colbertv2.0
-
-# kb-nano only
-python tests/bench_embedding.py --model bge-m3 --skip-vllm
-
-# Skip latency phase
-python tests/bench_embedding.py --skip-latency
-
-# Save results to a specific directory
-python tests/bench_embedding.py --output-dir tests/results/B200/embedding/manual
-```
-
 The diffusion benchmark measures:
 - **Throughput**: images/sec (FLUX) or videos/sec (HunyuanVideo) at various resolutions
 - **Latency**: per-image/video latency with P50 percentile stats
 - **Correctness**: per-batch latent cosine similarity (FLUX) or per-prompt decoded-frame PSNR and cosine similarity (HunyuanVideo)
-
-### Benchmarking vs open-oasis (Autoregressive Diffusion)
-
-```bash
-# Oasis 500M: throughput + latency + correctness benchmark vs official open-oasis
-python tests/bench_oasis.py --model Etched/oasis-500m
-
-# Use an existing open-oasis checkout instead of auto-cloning it
-python tests/bench_oasis.py --model Etched/oasis-500m --open-oasis-src /path/to/open-oasis
-
-# Skip throughput or latency
-python tests/bench_oasis.py --model Etched/oasis-500m --skip-throughput
-python tests/bench_oasis.py --model Etched/oasis-500m --skip-latency
-
-# Save results to a specific directory
-python tests/bench_oasis.py --model Etched/oasis-500m --output-dir tests/results/H200/oasis-500m
-```
 
 ## Benchmarking
 
@@ -566,7 +523,6 @@ Each run is tagged with a `tier` (`agent`, `kernel`, `eval`, or `e2e`) indicatin
 - timm (pytorch-image-models — only needed for vision encoder comparison tests)
 - vLLM (only needed for running comparison tests)
 - matplotlib (only needed for benchmark plotting)
-- timm, einops, torchvision, av, rotary-embedding-torch (only needed for the Oasis / open-oasis comparison benchmark)
 - ultralytics (YOLOv10 baseline benchmarking)
 
 ### Optional detection benchmark dependencies
@@ -575,6 +531,23 @@ Each run is tagged with a `tier` (`agent`, `kernel`, `eval`, or `e2e`) indicatin
 pip install ultralytics==8.4.35
 git clone https://github.com/THU-MIG/yolov10.git third_party/yolov10
 ```
+
+### Optional benchmark baselines
+
+Embedding / retrieval:
+
+```bash
+pip install FlagEmbedding==1.3.5 colbert-ai==0.2.22 datasets==4.8.4 \
+    peft==0.18.1 GitPython==3.1.46 ujson==5.12.0 scipy==1.17.1
+```
+
+RecSys / graph recommendation:
+
+```bash
+pip install datasets==4.8.4 torchrec==1.4.0 fbgemm-gpu==1.5.0 torch-geometric==2.7.0
+```
+
+`torch-sparse` is optional and is not required for the current `LightGCN` benchmark path.
 
 ### GPU architecture and library compatibility
 
@@ -762,29 +735,118 @@ Latency (batch size 1, 128 output tokens, 5 iterations):
 
 FP8 activation quantization uses a custom Triton kernel for single-launch per-token-group UE8M0 quantization. Pre-allocated shared prefill buffers eliminate dynamic allocation during FP8 prefill, and DeepGEMM is JIT-warmed for both decode and prefill batch sizes. The remaining throughput gap vs vLLM is primarily from vLLM's `torch.compile` + Inductor fusion passes (RMSNorm+quant, SiLU+quant).
 
-### BGE-M3 / ColBERTv2 (Embedding)
+### BGE-M3 (Embedding)
 
-Run `python tests/bench_embedding.py` to reproduce. Reference baseline: vLLM pooling runner in `token_embed` mode. Both engines receive the same pre-tokenized requests, use fp16 model weights with fp32 pooling heads, and materialize token-level embedding outputs before correctness comparison. The benchmark measures end-to-end input tokens/sec, not retrieval ranking quality.
+Run `tests/bench_embedding.py --model BAAI/bge-m3` to reproduce. Reference baseline: FlagEmbedding / BGEM3FlagModel.
 
-**Hardware: NVIDIA B200**
+**Hardware: NVIDIA H200**
 
-Throughput (real dataset workloads, fp16, token-level embeddings):
+Throughput (8 texts, batch size 4, fp16):
 
-| Scenario | Requests | Input Tokens | vLLM tok/s | Ours tok/s | Ratio | Correct | Min Cos |
-|----------|---------:|-------------:|-----------:|-----------:|------:|:--------|--------:|
-| BGE-M3 MLDR documents | 1,000 | 4,569,071 | 376,516 | 398,706 | **1.06x** | PASS | 0.999012 |
-| ColBERTv2 MS MARCO passages | 60,000 | 4,627,378 | 346,735 | 1,068,509 | **3.08x** | PASS | 0.999992 |
+| Model | Len | FlagEmbedding (docs/s) | Ours (docs/s) | Ratio |
+|-------|----:|-----------------------:|--------------:|------:|
+| BGE-M3 | 128 | 297.82 | 369.02 | **1.24x** |
 
 Latency (median of 5 runs, fp16):
 
-| Model | Scenario | BS | Input Tokens | vLLM median | Ours median | vLLM ms/tok | Ours ms/tok | Ratio |
-|-------|----------|---:|-------------:|------------:|------------:|------------:|------------:|------:|
-| BGE-M3 | single-request | 1 | 6,638 | 0.0197s | 0.0183s | 0.00 | 0.00 | **1.08x** |
-| BGE-M3 | fixed-batch-32 | 32 | 152,801 | 0.3411s | 0.3520s | 0.00 | 0.00 | 0.97x |
-| ColBERTv2 | single-request | 1 | 56 | 0.0042s | 0.0011s | 0.08 | 0.02 | **3.99x** |
-| ColBERTv2 | fixed-batch-32 | 32 | 2,401 | 0.0193s | 0.0022s | 0.01 | 0.00 | **8.63x** |
+| Batch Size | Len | FlagEmbedding median | Ours median | Ratio |
+|-----------:|----:|---------------------:|------------:|------:|
+| 1 | 128 | 0.0176s | 0.0055s | **3.22x** |
+| 4 | 128 | 0.0079s | 0.0062s | **1.29x** |
 
-BGE-M3 is near vLLM parity on large-document encoder work. The ColBERTv2 workload has many short passages, so the larger speedup primarily reflects lower end-to-end request/pooling/output overhead in kb-nano's packed token-embedding path rather than a claim that every ColBERT kernel is 3x faster than vLLM.
+Alignment:
+
+| Output | Avg CosSim | Avg Mean Abs Diff | Notes |
+|--------|-----------:|------------------:|:------|
+| Dense | 0.99999905 | 3.33e-05 | PASS |
+| Sparse | — | 1.30e-04 | 100% exact key match |
+
+### ColBERTv2 (Retrieval)
+
+Run `tests/bench_embedding.py --model colbert-ir/colbertv2.0` to reproduce. Reference baseline: official ColBERT / HF_ColBERT.
+
+**Hardware: NVIDIA H200**
+
+Throughput (8 texts, batch size 4, fp16):
+
+| Scenario | Reference (docs/s) | Ours (docs/s) | Ratio |
+|----------|-------------------:|--------------:|------:|
+| Query len 32 | 805.19 | 987.85 | **1.23x** |
+| Doc len 128 | 333.75 | 393.80 | **1.18x** |
+
+Latency (median of 5 runs, fp16):
+
+| Scenario | Reference median | Ours median | Ratio |
+|----------|-----------------:|------------:|------:|
+| Query bs=1 len=32 | 0.0043s | 0.0035s | **1.21x** |
+| Query bs=4 len=32 | 0.0068s | 0.0037s | **1.84x** |
+| Doc bs=1 len=128 | 0.0065s | 0.0039s | **1.68x** |
+| Doc bs=4 len=128 | 0.0062s | 0.0046s | **1.36x** |
+
+Alignment:
+
+| Output | Avg CosSim | Avg Mean Abs Diff | Notes |
+|--------|-----------:|------------------:|:------|
+| Query | 0.99999928 | 8.22e-05 | PASS |
+| Doc | 0.99999940 | 7.45e-05 | PASS |
+| MaxSim score | — | 1.08e-03 | PASS |
+
+### DLRMv2 (RecSys)
+
+Default real benchmark: `python tests/bench_recsys.py --model dlrmv2`
+H200 command used for the table below: `python tests/bench_recsys.py --model all --output-dir tests/results/H200/recsys`
+
+- Dataset: `scikit-learn/adult-census-income` train split
+- Reference baseline: `torchrec.models.dlrm.DLRM`
+- Checkpoint: trained on Adult train with binary cross-entropy, `64` steps, cached at `tests/data/recsys/checkpoints/dlrmv2_adult_seed42.pt`
+- Default workload: batch size `16384`
+- Default timing: `100` warmup iterations + `11000` measured iterations
+- H200 cached-checkpoint full run wall time: `37.81s` for DLRMv2 + LightGCN
+
+**Hardware: NVIDIA H200**
+
+Throughput (real dataset default: Adult train, batch size 16384, bag size 1):
+
+| Model | TorchRec (samples/s) | Ours (samples/s) | Ratio |
+|-------|----------------------:|-----------------:|------:|
+| DLRMv2 | 38,244,364 | 40,422,675 | **1.06x** |
+
+Alignment (real dataset default):
+
+| Output | Avg CosSim | Avg Mean Abs Diff | Notes |
+|--------|-----------:|------------------:|:------|
+| Dense embedding | 1.00000000 | 0.00e+00 | PASS |
+| Sparse embeddings | 1.00000000 | 0.00e+00 | PASS |
+| Interaction | 1.00000000 | 0.00e+00 | PASS |
+| Logits | 1.00000000 | 0.00e+00 | PASS |
+
+### LightGCN (Graph Recommendation)
+
+Default real benchmark: `python tests/bench_recsys.py --model lightgcn`
+H200 command used for the table below: `python tests/bench_recsys.py --model all --output-dir tests/results/H200/recsys`
+
+- Dataset: MovieLens 1M ratings, treating `rating >= 4` as positive implicit feedback
+- Reference baseline: `torch_geometric.nn.models.LightGCN`
+- Checkpoint: trained on MovieLens 1M positives with BPR, `64` steps, cached at `tests/data/recsys/checkpoints/lightgcn_movielens-1m_min4p0_d64_l3_seed42.pt`
+- Default workload: full graph with `575281` edges, `131072` scored pairs per iteration
+- Default timing: `100` warmup iterations + `11000` measured iterations
+- H200 cached-checkpoint full run wall time: `37.81s` for DLRMv2 + LightGCN
+
+**Hardware: NVIDIA H200**
+
+Throughput (real dataset default: MovieLens 1M, 575281 edges, 131072 query pairs):
+
+| Model | torch_geometric (pairs/s) | Ours (pairs/s) | Ratio |
+|-------|---------------------------:|---------------:|------:|
+| LightGCN | 258,867,242 | 265,871,241 | **1.03x** |
+
+Alignment (real dataset default):
+
+| Output | Avg CosSim | Avg Mean Abs Diff | Notes |
+|--------|-----------:|------------------:|:------|
+| User embeddings | 1.00000000 | 2.69e-09 | PASS |
+| Item embeddings | 1.00000000 | 3.93e-09 | PASS |
+| Scores | 1.00000000 | 1.23e-07 | PASS |
 
 ### DeepSeek V3.2 FP8 (MoE, MLA, DSA)
 
@@ -908,31 +970,6 @@ Correctness (eager mode, decoded video frames, per-prompt cosine similarity):
 | 480p-medium |  8 | 0.923 | 0.862 | 12.92 dB | WARN |
 
 Correctness is measured in decoded pixel space (both engines produce PIL video frames which are compared as uint8 numpy arrays). The pixel-level cosine similarity of ~0.92 is expected for two independent bf16 implementations: numerical differences in the 30-step denoising loop are amplified by the VAE decoder. For reference, latent-space comparison between kb-nano and HF diffusers yields CosSim=0.986, confirming the transformer backbone is correctly implemented. The pixel-space divergence is dominated by VAE decode amplification and different text encoder implementations (kb-nano uses a custom Qwen2.5-VL paged-attention encoder vs vllm-omni's HuggingFace-based encoder).
-
-### Oasis 500M (Autoregressive Diffusion)
-
-Run `python tests/bench_oasis.py --model Etched/oasis-500m` to reproduce. Reference baseline: official `open-oasis`, which the benchmark auto-clones under `data/open_oasis_src/` unless `--open-oasis-src` is provided.
-
-Dataset: `TESS-Computer/minecraft-vla-stage1` (`train` split), using non-overlapping real Minecraft clips from distinct source videos at 360x640. The benchmark converts each dataset action string into Oasis' 25-d control vector and caches the resulting prompt/action tensors locally under `data/oasis_cache/`.
-
-**Hardware: NVIDIA B200**
-
-Throughput workload:
-
-| Scenario | Dataset | Clips | Frames | DDIM Steps | Correctness Checked |
-|----------|---------|------:|-------:|-----------:|:--------------------|
-| short-bs4-16f-4ddim | `TESS-Computer/minecraft-vla-stage1` | 4 | 16 | 4 | yes |
-| medium-bs8-24f-4ddim | `TESS-Computer/minecraft-vla-stage1` | 8 | 24 | 4 | yes |
-| long-bs8-32f-4ddim | `TESS-Computer/minecraft-vla-stage1` | 8 | 32 | 4 | yes |
-| denoise-bs4-16f-8ddim | `TESS-Computer/minecraft-vla-stage1` | 4 | 16 | 8 | yes |
-
-Latency:
-
-| Scenario | Clips | Frames | Reference p50 (ms) | Ours p50 (ms) | Ratio |
-|----------|------:|-------:|-------------------:|--------------:|------:|
-| latency-bs1-8f-4ddim | 1 | 8 | 981.28 | 758.85 | **1.29x** |
-
-Correctness is measured for every throughput workload entry, using the same prompt frames and actions as the timed run. The benchmark reports cosine similarity, pass/fail status, and mean absolute difference for prompt latents, rollout latents, and decoded video in each throughput scenario.
 
 ### CosyVoice3 (TTS)
 

@@ -66,6 +66,8 @@ _L4_MODEL_KEYS: dict[str, str] = {
     "colbertv2": "colbertv2",
     "oasis": "oasis",
     "pointtransformerv3": "pointtransformerv3",
+    "dlrmv2": "dlrmv2",
+    "lightgcn": "lightgcn",
     "yolov10": "yolov10",
     "rtdetrv2": "rtdetrv2",
     "openfold3": "openfold3",
