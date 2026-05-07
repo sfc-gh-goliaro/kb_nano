@@ -53,7 +53,6 @@
 | canonical op | frequency | example HF files |
 |---|---:|---|
 | `timm_dynamic_backbone` | 2 | timm_backbone/modeling_timm_backbone.py;timm_wrapper/modeling_timm_wrapper.py |
-| `adaptive_avg_pool_2d` | 1 | layoutlmv2/modeling_layoutlmv2.py |
 | `detectron2_backbone` | 1 | layoutlmv2/modeling_layoutlmv2.py |
 | `mra_sparse_kernels` | 1 | mra/modeling_mra.py |
 | `rg_lru_scan` | 1 | recurrent_gemma/modeling_recurrent_gemma.py |

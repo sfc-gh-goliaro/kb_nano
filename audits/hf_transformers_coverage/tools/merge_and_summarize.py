@@ -141,6 +141,28 @@ def normalize_row(r: dict) -> dict:
             # Move flagged ops into a separate column for traceability via notes;
             # clear partial_or_unsupported_ops (now empty since composable).
             r["partial_or_unsupported_ops"] = ""
+        else:
+            # Row STAYS partial because some op isn't in NEWLY_SUPPORTED_OPS,
+            # but flagged ops that ARE in NEWLY_SUPPORTED_OPS should be removed
+            # from `partial_or_unsupported_ops` so the field reflects only the
+            # truly-still-blocking ops. Keep the original entries in `notes`
+            # for historical traceability.
+            kept_entries = []
+            removed_ops = []
+            for entry in _split_outside_parens(flagged):
+                op = entry.split("(", 1)[0].strip().lower()
+                op = {"conv_transpose_1d": "conv_transpose1d",
+                      "conv_transpose_2d": "conv_transpose2d",
+                      "conv_transpose_3d": "conv_transpose3d"}.get(op, op)
+                if op in NEWLY_SUPPORTED_OPS:
+                    removed_ops.append(op)
+                else:
+                    kept_entries.append(entry)
+            if removed_ops and kept_entries:
+                r["partial_or_unsupported_ops"] = ";".join(kept_entries)
+                note = f"[v3.1 cleanup] Removed now-supported flags from partial_or_unsupported_ops: {sorted(set(removed_ops))} (covered by audit-branch L1/L2 additions); remaining truly-blocking ops: {sorted(set(e.split('(',1)[0].strip().lower() for e in kept_entries))}"
+                cur_notes = r.get("notes", "") or ""
+                r["notes"] = (cur_notes + " " + note).strip()
 
     return r
 

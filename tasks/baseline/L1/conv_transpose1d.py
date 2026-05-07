@@ -1,7 +1,8 @@
 """ConvTranspose1d parametric op wrapping F.conv_transpose1d.
 
-Stores ``weight`` and ``bias`` as direct ``nn.Parameter`` attributes so
-reference state_dicts (HF / torch.nn.ConvTranspose1d) load with no remapping.
+Used by DP3's 1-D U-Net upsampling block.  Stores ``weight`` and
+``bias`` as direct ``nn.Parameter`` attributes so reference state_dicts
+load with no remapping.
 """
 
 from __future__ import annotations
@@ -12,7 +13,7 @@ import torch.nn.functional as F
 
 
 class ConvTranspose1d(nn.Module):
-    """Parametric 1-D transposed convolution. Forward dispatches to
+    """Parametric 1-D transposed convolution.  Forward dispatches to
     ``F.conv_transpose1d``."""
 
     def __init__(

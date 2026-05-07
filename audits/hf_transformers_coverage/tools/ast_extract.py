@@ -75,6 +75,10 @@ _NN_LOOKUPS = {
     "Dropout3d": "dropout",
     # attention
     "MultiheadAttention": "multihead_attention",
+    # recurrent
+    "LSTM": "lstm",
+    "GRU": "gru",
+    "RNN": "rnn",
     # other
     "Identity": "identity",
     "Flatten": "flatten",
@@ -232,6 +236,8 @@ _HF_HELPERS = {
     "mamba_chunk_scan_combined": "mamba_scan",
     "causal_conv1d_fn": "causal_conv1d",
     "causal_conv1d_update": "causal_conv1d",
+    "chunk_gated_delta_rule": "chunk_gated_delta_rule",
+    "fused_recurrent_gated_delta_rule": "fused_recurrent_gated_delta_rule",
     "multi_scale_deformable_attention": "deformable_attention",
     "MultiScaleDeformableAttnFunction": "deformable_attention",
     "ms_deform_attn_core_pytorch": "deformable_attention",
