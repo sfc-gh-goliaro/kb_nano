@@ -28,7 +28,16 @@ import torch.nn as nn
 import triton
 import triton.language as tl
 
-import deep_gemm
+# DeepGEMM provides the FP8 fast path on Hopper+; on environments
+# without it the BF16 / Triton fallbacks still work.  Import lazily
+# so importing this module from a non-FP8 codepath (e.g. the BF16
+# Jamba-tiny-dev MoE) doesn't fail on machines without DeepGEMM.
+try:
+    import deep_gemm
+    _HAS_DEEP_GEMM = True
+except ImportError:  # pragma: no cover -- exercised at import time
+    deep_gemm = None  # type: ignore[assignment]
+    _HAS_DEEP_GEMM = False
 
 from .fp8_grouped_gemm_contiguous import _is_deep_gemm_e8m0_used
 
