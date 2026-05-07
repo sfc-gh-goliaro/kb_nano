@@ -11,6 +11,19 @@ Mirrors vLLM's ``CustomOp`` dispatch pattern:
     key mechanism that enables RMSNorm+FP8-quant fusion.
 
 The ``forward`` method dispatches based on ``torch.compiler.is_compiling()``.
+
+Known limitations of the CUDA kernel (forward_cuda path):
+  - Produces incorrect output for hidden sizes that aren't multiples of 32
+    (verified empirically: hidden=16 and hidden=80 give max-abs error ~1e3
+    on random unit-variance input vs the reference math; hidden=32, 64, 128
+    are correct).
+  - Has no ``torch.autograd`` backward registered, so the norm silently
+    drops gradient under ``torch.func.grad``.
+
+Use :class:`L1.rms_norm_native.RMSNormNative` instead when you need either
+of those properties — odd head_dims (e.g. TTT-E2E qk_norm at head_dim=16,
+or any model with head_dim that isn't a multiple of 32), or autograd /
+torch.func.grad support.
 """
 
 from __future__ import annotations

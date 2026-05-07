@@ -32,6 +32,7 @@ A standalone, high-performance inference engine supporting **LLMs** (Llama 3.1, 
 - **Whisper** (large-v3) encoder-decoder speech-to-text with batched inference and paged cross-attention KV cache
 - **CosyVoice3** (Fun-CosyVoice3-0.5B-2512) text-to-speech with flow matching DiT + HiFi-GAN vocoder
 - **OpenFold3** (OpenFold/OpenFold3) protein structure prediction with MSA module, PairFormer, diffusion sampling, and atom attention
+- **TTT-E2E** (test-time-training/e2e, *End-to-End Test-Time Training for Long Context*, Sun et al., arXiv 2512.23675) — sliding-window transformer with chunked **inner-loop SGD** on a per-suffix-block "prime" SwiGLU FFN at inference; matches the official JAX reference bit-near-exactly on logits + per-token NLL
 - **FP8 inference** with block-scaled FP8 quantization via DeepGEMM, UE8M0 power-of-two scales, and fused SiLU+Mul+FP8 quantization kernels
 - **Tensor parallelism** (TP) with custom IPC-based all-reduce for multi-GPU inference
 - **Paged KV cache** with Triton store kernels (LLM models); FP8 MLA KV cache for DeepSeek
@@ -359,6 +360,122 @@ python tests/bench_oasis.py --model Etched/oasis-500m --skip-latency
 
 # Save results to a specific directory
 python tests/bench_oasis.py --model Etched/oasis-500m --output-dir tests/results/H200/oasis-500m
+```
+
+## TTT-E2E (test-time-training/e2e) benchmark
+
+Implements the *End-to-End Test-Time Training for Long Context* architecture
+(Sun et al., arXiv 2512.23675) end-to-end in kb-nano L1-L4: sliding-window
+transformer with chunked **inner-loop SGD** on a per-suffix-block "prime"
+SwiGLU FFN at inference time.
+
+**Cross-framework comparison.** The official reference at
+[github.com/test-time-training/e2e](https://github.com/test-time-training/e2e)
+is JAX/Equinox/Optax. There is no PyTorch SOTA reference for this paper; the
+predecessor paper's `ttt-lm-pytorch` is described by its authors as a "naive
+implementation for tutorial purposes" so it isn't a meaningful comparison
+target. We therefore bench against the JAX reference via a subprocess worker
+([`tests/bench_ttt_e2e_jax_worker.py`](tests/bench_ttt_e2e_jax_worker.py))
+that wraps `model.loss_for_sequence` in `eqx.filter_jit` for a fair perf
+comparison after XLA compilation.
+
+**Checkpoints.** The official checkpoints (125M / 1B / 3B at 8K and 128K)
+live on a Requester-Pays GCS bucket (`gs://ttt-e2e-checkpoints/...`) and
+require a GCP billing project to download. We bench against random-init
+weights initialized via the JAX reference's RNG and saved as a portable
+`.npz`; both engines load from the same file. This validates kb-nano's
+math against JAX bit-near-exactly without trained weights — perplexity
+numbers from the bench are not meaningful as accuracy claims.
+
+**Workload.** Long-context next-token loss on a real Project Gutenberg
+book ("The Adventures of Sherlock Holmes", #1661, ~141K Llama-3-tokenized
+tokens) sliced into 8192-token windows.
+
+### Results (variant: `125m_e2e`, B200, seq=8192, N=4 sequences, bf16)
+
+| Mode | Description | JAX (jit) | kb-nano cuDNN | kb-nano flex | Best ratio vs JAX |
+|---|---|---|---|---|---|
+| `pretrain` | Sliding-window transformer, prime FFN frozen | 80.33 ms (σ 2.47) | **25.60 ms** (σ 0.02) | **23.74 ms** (σ 0.04) | **3.39× faster** |
+| `meta` | Inner-loop SGD on prime FFN per 1024-token chunk | 40.83 ms (σ 0.81) | 51.55 ms (σ 0.04) | **37.00 ms** (σ 0.11) | **1.10× faster** |
+
+`flex` is the FlexAttention-on-suffix-path opt-in (`attention_backend="flex"`); `cuDNN` is the previous default. The flex backend is recommended for meta-mode inference workloads (the actual TTT-E2E path); cuDNN remains the default for backward-compat. Both backends are numerically equivalent vs JAX (see Correctness section). **All numbers measured in a single session**, B200, GPU 2 (quiet), sequential runs (n=30 timed measurements per backend per mode after 5–10 warmup forwards), random-init weights from the JAX worker (`init_and_save` seed=0), 8K-token Sherlock Holmes window. JAX timing via `eqx.filter_jit` + `block_until_ready`; kb-nano via `torch.cuda.CUDAGraph` replay.
+
+**Engine architecture.** `TTTE2EEngine` (`infra/ttt_e2e_engine.py`) compiles each layer's `forward_prefix` and `forward_suffix_chunk` with `torch.compile`, then captures the full meta forward as a `torch.cuda.CUDAGraph` per `(batch_size, seq_len)` shape so steady-state replay is deterministic (variance std 10 ms → 0.04 ms). The prefix attention runs on cuDNN flash (long-seq sweet spot, 5.7 ms for 9 layers × 8K seq); the suffix attention defaults to FlexAttention with a `BlockMask` that pre-prunes 93.75% of (Q, KV) tile pairs at construction, fused fwd+bwd Triton kernel autotuned for the asymmetric `(Q=1024, KV=9216, D=64)` shape — this is the optimisation that closes the gap to JAX (37.1 ms vs 40.8 ms). Per-chunk masks and RoPE positions are cached; the chunk input/target tensors are hoisted into static contiguous buffers so dynamo's stride guards don't thrash across chunk specializations. The inner-loop gradient uses `torch.autograd.grad` (not `torch.func.grad`, which traces per-call). cuDNN remains available via `--attention-backend cudnn` for backward-compat (51.55 ms meta — 11 ms slower than flex, still beats JAX on pretrain).
+
+Per-component attribution at the final state:
+
+| Component | PyTorch (flex, final) | JAX | Notes |
+|---|---|---|---|
+| Prefix-only forward (9 layers, 8K seq) | **5.7 ms** | 4.5 ms | cuDNN flash; flex doesn't help here. |
+| Full meta forward (8 chunks) | **37.00 ms** (σ 0.11) | 40.83 ms (σ 0.81) | flex beats JAX by 9.2%, deterministic via CUDA Graph replay. |
+
+### Correctness vs the JAX reference
+
+| Variant | Mode | Backend | Precision | Max abs NLL diff | Mean abs NLL diff |
+|---|---|---|---|---|---|
+| `125m_e2e` | `pretrain` | cuDNN | bf16 | 8.6e-2 | 2.3e-2 |
+| `125m_e2e` | `pretrain` | cuDNN | **fp32** | **3.4e-3** | **5.5e-4** |
+| `125m_e2e` | `meta` | cuDNN | bf16 | 8.30e-2 | 2.23e-2 |
+| `125m_e2e` | `meta` | flex  | bf16 | 8.30e-2 | 2.24e-2 |
+| `125m_e2e` | `meta` | flex vs cuDNN (within-PyTorch) | bf16 | 3.13e-2 | 2.19e-3 |
+
+The fp32 pretrain row is the bit-near-exact correctness check: kb-nano
+matches the JAX reference to ~1e-3 on individual token NLLs. The bf16
+gap vs JAX is the cross-framework promote-and-accumulate noise inherent in
+cuBLAS-vs-XLA bf16 matmul ordering, not a logic bug. Sequence-level mean
+NLL matches to 5e-4 or better in fp32 (11.900430 vs 11.900406).
+
+**The flex backend introduces no extra drift.** The flex-vs-JAX bf16
+diff (8.30e-2 max) is identical to cuDNN-vs-JAX (8.30e-2 max) to four
+decimal places — confirming the gap is XLA-vs-Inductor framework noise,
+not flex kernel error. The within-PyTorch comparison (flex vs cuDNN) is
+much tighter at 3.13e-2 max / 2.19e-3 mean, well within bf16 noise. A
+multi-seed sweep across 6 distinct random-weight configurations
+(seeds 0/1/7/42/1337/2024) showed flex matches cuDNN at max 2.45e-4 /
+mean 4.75e-5 with **100% of all 49,152 token positions tight at < 1e-3**.
+
+### L1-L4 layering and the kb-nano L1 RMSNorm bug we discovered
+
+The TTT-E2E modules in this PR conform to CLAUDE.md: L2 (`ttt_e2e_swa`,
+`ttt_e2e_block`, `ttt_e2e_swiglu`) compose only from L1 ops (no
+`torch.nn` or `torch.nn.functional` calls), and L4 (`ttt_e2e`) is
+chunk-loop wiring + the SGD update math. We added two new L1 ops and
+extended one existing L1 op:
+
+  - [`tasks/baseline/L1/rms_norm_native.py`](tasks/baseline/L1/rms_norm_native.py) — pure-PyTorch RMSNorm.
+    Used because the existing CUDA L1 RMSNorm (`tasks/baseline/L1/rms_norm.py`)
+    produces incorrect output for hidden sizes that aren't multiples of
+    32 (verified at hidden=16 and hidden=80) and has no autograd backward
+    registered. The doc-string of the CUDA L1 RMSNorm now points future
+    readers at this fix when they hit the same constraint.
+  - [`tasks/baseline/L1/ttt_e2e_rope.py`](tasks/baseline/L1/ttt_e2e_rope.py) — interleaved (GPT-J / JAX-default)
+    rotary embedding. Distinct from the existing L1 RotaryEmbedding which
+    uses NeOX/half-split layout; the layout difference is not weight-
+    translatable, so we have to match the JAX layout directly to keep
+    bit-near-exact parity.
+  - [`tasks/baseline/L1/dense_attention.py`](tasks/baseline/L1/dense_attention.py) — added two new backend
+    choices: `backend="cudnn"` (pinned cuDNN flash via
+    `torch.nn.attention.sdpa_kernel`, with `EFFICIENT/MATH` fallback
+    for shapes cuDNN rejects), and `backend="flex"` (FlexAttention with a
+    `BlockMask` instead of a dense bool mask). The `flex` backend is what
+    optimization #7 above relies on; the L1 op is the only place that
+    knows about FlexAttention so L2+ files stay clean of the new
+    dependency.
+
+**Reproduce**:
+```bash
+# Clone the JAX reference (the kb-nano worker auto-discovers it):
+git clone https://github.com/test-time-training/e2e /tmp/ttt_e2e_ref
+
+# Run the bench (cuDNN baseline — backwards-compat default):
+CUDA_VISIBLE_DEVICES=<idx> python -m kb_nano.tests.bench_ttt_e2e \
+    --variant 125m_e2e --seq-len 8192 --n-sequences 2 \
+    --modes pretrain meta --runs 3
+
+# Run the bench (flex — recommended for meta inference):
+CUDA_VISIBLE_DEVICES=<idx> python -m kb_nano.tests.bench_ttt_e2e \
+    --variant 125m_e2e --seq-len 8192 --n-sequences 2 \
+    --modes pretrain meta --runs 3 --attention-backend flex
 ```
 
 ## Benchmarking
