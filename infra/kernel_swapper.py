@@ -59,6 +59,7 @@ _L4_MODEL_KEYS: dict[str, str] = {
     "flux": "flux",
     "gaussian_splatting": "3dgs",
     "instant_ngp": "instantngp",
+    "vjepa2": "vjepa2",
     "sam3": "sam3",
     "cosyvoice3": "cosyvoice3",
     "hunyuan_video": "hunyuan_video",
