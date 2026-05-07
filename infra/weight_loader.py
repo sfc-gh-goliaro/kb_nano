@@ -177,6 +177,21 @@ def _remap_qwen3_vl_name(name: str) -> str:
     return name
 
 
+def _remap_qwen2_5_omni_name(name: str) -> str | None:
+    """Map Qwen2.5-Omni Thinker weights to kb-nano module names."""
+    if name.startswith(("talker.", "token2wav.")):
+        return None
+    if name.startswith("thinker.lm_head."):
+        return "lm_head." + name[len("thinker.lm_head."):]
+    if name.startswith("thinker.model."):
+        return "model." + name[len("thinker.model."):]
+    if name.startswith("thinker.visual."):
+        return "visual." + name[len("thinker.visual."):]
+    if name.startswith("thinker.audio_tower."):
+        return "audio_tower." + name[len("thinker.audio_tower."):]
+    return None
+
+
 def _load_vision_qkv(model, param_prefix: str, loaded_weight: torch.Tensor,
                       wb: str) -> int:
     """Load merged vision QKV weight/bias into our QKVParallelLinear.
@@ -628,7 +643,8 @@ def load_weights(model, model_path: str, model_type: str = "llama") -> None:
     is_qwen2_vl = model_type == "qwen2_vl"
     is_qwen3_vl = model_type in ("qwen3_vl", "qwen3_vl_moe")
     is_qwen3_vl_moe = model_type == "qwen3_vl_moe"
-    is_qwen_vl = is_qwen2_vl or is_qwen3_vl
+    is_qwen2_5_omni = model_type == "qwen2_5_omni"
+    is_qwen_vl = is_qwen2_vl or is_qwen3_vl or is_qwen2_5_omni
     is_llama4 = model_type == "llama4"
     is_gemma4 = model_type == "gemma4"
     is_mamba = model_type in ("mamba", "mamba2")
@@ -682,6 +698,10 @@ def load_weights(model, model_path: str, model_type: str = "llama") -> None:
             mapped_name = _remap_qwen2_vl_name(weight_name)
         elif is_qwen3_vl:
             mapped_name = _remap_qwen3_vl_name(weight_name)
+        elif is_qwen2_5_omni:
+            mapped_name = _remap_qwen2_5_omni_name(weight_name)
+            if mapped_name is None:
+                continue
         else:
             mapped_name = weight_name
 
@@ -834,7 +854,7 @@ def load_weights(model, model_path: str, model_type: str = "llama") -> None:
                     continue
 
         # Handle Qwen2-VL merger: ln_q -> norm, mlp.0 -> fc1, mlp.2 -> fc2
-        if is_qwen2_vl:
+        if is_qwen2_vl or is_qwen2_5_omni:
             m_merger = _QWEN2_MERGER_RE.match(mapped_name)
             if m_merger:
                 prefix, attr, wb = m_merger.groups()
@@ -1351,28 +1371,39 @@ def load_model(
               f"top-{config.top_k_experts})...")
         model = Gemma4ForCausalLM(config)
     elif model_type == "whisper":
+        from ..tasks.baseline.L4.whisper import (
+            WhisperConfig, WhisperForConditionalGeneration,
+        )
         config = WhisperConfig.from_pretrained(model_name)
         config.dtype = dtype
         print(f"  Allocating Whisper model (enc={config.encoder_layers}L, "
               f"dec={config.decoder_layers}L, d={config.d_model})...")
         model = WhisperForConditionalGeneration(config)
     elif model_type == "llama4":
+        from ..tasks.baseline.L4.llama4 import Llama4Config, Llama4ForCausalLM
         config = Llama4Config.from_pretrained(model_name)
         config.dtype = dtype
         print(f"  Allocating Llama4 model ({config.num_local_experts} experts, "
               f"top-{config.num_experts_per_tok})...")
         model = Llama4ForCausalLM(config)
     elif model_type == "mixtral":
+        from ..tasks.baseline.L4.mixtral import MixtralConfig, MixtralForCausalLM
         config = MixtralConfig.from_pretrained(model_name)
         config.dtype = dtype
         print(f"  Allocating Mixtral model ({config.num_local_experts} experts)...")
         model = MixtralForCausalLM(config)
     elif model_type == "qwen2_vl":
+        from ..tasks.baseline.L4.qwen2_vl import (
+            Qwen2VLConfig, Qwen2VLForConditionalGeneration,
+        )
         config = Qwen2VLConfig.from_pretrained(model_name)
         config.dtype = dtype
         print("  Allocating Qwen2-VL model...")
         model = Qwen2VLForConditionalGeneration(config)
     elif model_type in ("qwen3_vl", "qwen3_vl_moe"):
+        from ..tasks.baseline.L4.qwen3_vl import (
+            Qwen3VLConfig, Qwen3VLForConditionalGeneration,
+        )
         config = Qwen3VLConfig.from_pretrained(model_name)
         config.dtype = dtype
         if config.is_moe:
@@ -1391,12 +1422,16 @@ def load_model(
             f"{sum(not config.is_linear_attn_layer(i) for i in range(config.num_hidden_layers))} MHA layers)..."
         )
         model = Qwen3NextForCausalLM(config)
+    elif model_type == "qwen2_5_omni":
+        from ..tasks.baseline.L4.qwen2_5_omni import (
+            Qwen2_5OmniConfig, Qwen2_5OmniThinkerForConditionalGeneration,
+        )
+        config = Qwen2_5OmniConfig.from_pretrained(model_name)
+        config.dtype = dtype
+        print("  Allocating Qwen2.5-Omni Thinker model...")
+        model = Qwen2_5OmniThinkerForConditionalGeneration(config)
     elif model_type == "mamba2":
         from ..tasks.baseline.L4.mamba2 import Mamba2Config, Mamba2ForCausalLM
-
-
-
-
         config = Mamba2Config.from_pretrained(model_path)
         config.dtype = dtype
         print(f"  Allocating Mamba2 model "
@@ -1406,10 +1441,6 @@ def load_model(
         model = Mamba2ForCausalLM(config)
     elif model_type == "mamba":
         from ..tasks.baseline.L4.mamba import MambaConfig, MambaForCausalLM
-
-
-
-
         config = MambaConfig.from_pretrained(model_path)
         config.dtype = dtype
         print(f"  Allocating Mamba model "
@@ -1417,11 +1448,9 @@ def load_model(
               f"intermediate={config.intermediate_size}, state={config.state_size})...")
         model = MambaForCausalLM(config)
     elif model_type == "deepseek_v3":
-        from ..tasks.baseline.L4.deepseek import DeepSeekV3Config, DeepSeekV3ForCausalLM
-
-
-
-
+        from ..tasks.baseline.L4.deepseek import (
+            DeepSeekV3Config, DeepSeekV3ForCausalLM,
+        )
         config = DeepSeekV3Config.from_pretrained(model_name)
         config.dtype = dtype
         print(f"  Allocating DeepSeek V3.2 model ({config.n_routed_experts} experts, "

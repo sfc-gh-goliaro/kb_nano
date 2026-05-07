@@ -8,7 +8,9 @@ the target model's chat template.
 
 For VLM models (Qwen2-VL, Qwen3-VL): runs three throughput scenarios
 (text-only, image, video) and two latency scenarios (single-image,
-single-video) using real multimodal datasets (VisionArena, MMVU).
+single-video) using real multimodal datasets (VisionArena, MMVU). Qwen-Omni
+extends this to text, image, video, and audio using real text/multimodal/audio
+datasets.
 
 Each engine (vLLM, kb-nano) is loaded once in a single long-lived subprocess
 that processes all scenarios sequentially, avoiding repeated model loading.
@@ -168,18 +170,35 @@ if namespace:
 _THIS_DIR = Path(__file__).resolve().parent
 _PACKAGE_DIR = _THIS_DIR.parent
 _PROJECT_ROOT = _PACKAGE_DIR.parent
+_PACKAGE_NAME = _PACKAGE_DIR.name
 
 sys.path.insert(0, str(_PROJECT_ROOT))
 
-from kb_nano.bench.utils.worker import run_worker
-from kb_nano.bench.utils.real_prompts import load_real_prompt_workload
-from kb_nano.bench.utils.workloads import (
+from importlib import import_module
+
+run_worker = import_module(f"{_PACKAGE_NAME}.bench.utils.worker").run_worker
+load_real_prompt_workload = import_module(
+    f"{_PACKAGE_NAME}.bench.utils.real_prompts",
+).load_real_prompt_workload
+_workloads = import_module(f"{_PACKAGE_NAME}.bench.utils.workloads")
+(
     ASR_LATENCY_WORKLOADS,
     ASR_THROUGHPUT_WORKLOADS,
     LATENCY_WORKLOADS,
+    QWEN_OMNI_LATENCY_WORKLOADS,
+    QWEN_OMNI_THROUGHPUT_WORKLOADS,
     THROUGHPUT_WORKLOADS,
     VLM_LATENCY_WORKLOADS,
     VLM_THROUGHPUT_WORKLOADS,
+) = (
+    _workloads.ASR_LATENCY_WORKLOADS,
+    _workloads.ASR_THROUGHPUT_WORKLOADS,
+    _workloads.LATENCY_WORKLOADS,
+    _workloads.QWEN_OMNI_LATENCY_WORKLOADS,
+    _workloads.QWEN_OMNI_THROUGHPUT_WORKLOADS,
+    _workloads.THROUGHPUT_WORKLOADS,
+    _workloads.VLM_LATENCY_WORKLOADS,
+    _workloads.VLM_THROUGHPUT_WORKLOADS,
 )
 
 _HELD_PORT_LOCKS: list[object] = []
@@ -215,6 +234,18 @@ VLM_SCENARIOS = [
     for w in VLM_THROUGHPUT_WORKLOADS
 ]
 
+QWEN_OMNI_SCENARIOS = [
+    {
+        "name": w.name,
+        "modality": w.modality,
+        "input_len": w.input_len,
+        "output_len": w.output_len,
+        "dataset": w.dataset_name,
+        "dataset_split": w.dataset_split,
+    }
+    for w in QWEN_OMNI_THROUGHPUT_WORKLOADS
+]
+
 WHISPER_SCENARIOS = [
     {
         "name": w.name,
@@ -247,6 +278,19 @@ VLM_LATENCY_SCENARIOS = [
         "dataset_split": w.dataset_split,
     }
     for w in VLM_LATENCY_WORKLOADS
+]
+
+QWEN_OMNI_LATENCY_SCENARIOS = [
+    {
+        "name": w.name,
+        "modality": w.modality,
+        "output_len": w.output_len,
+        "batch_size": w.batch_size,
+        "dataset": w.dataset_name,
+        "dataset_split": w.dataset_split,
+        "input_len": 128,
+    }
+    for w in QWEN_OMNI_LATENCY_WORKLOADS
 ]
 
 
@@ -293,6 +337,11 @@ def _needs_trust_remote_code(model_name: str) -> bool:
     return "kimi" in lower or "qwen3-next" in lower
 
 
+def _is_qwen_omni_model(model_name: str) -> bool:
+    lower = model_name.lower()
+    return "qwen" in lower and "omni" in lower
+
+
 # ---------------------------------------------------------------------------
 # Multi-scenario vLLM subprocess worker (LLM, text-only)
 # ---------------------------------------------------------------------------
@@ -337,6 +386,7 @@ def main():
     llm_kwargs = dict(
         model=cfg["model"],
         seed=cfg["seed"],
+        trust_remote_code=True,
         enforce_eager=cfg.get("enforce_eager", False),
         tensor_parallel_size=cfg["tp"],
         gpu_memory_utilization=cfg.get("gpu_memory_utilization", 0.9),
@@ -345,6 +395,12 @@ def main():
     )
     if cfg.get("trust_remote_code"):
         llm_kwargs["trust_remote_code"] = True
+    if cfg.get("is_qwen_omni", False):
+        llm_kwargs["limit_mm_per_prompt"] = {
+            "image": 0,
+            "video": 0,
+            "audio": 0,
+        }
     if cfg.get("load_format"):
         llm_kwargs["load_format"] = cfg["load_format"]
     llm = LLM(**llm_kwargs)
@@ -587,6 +643,44 @@ from io import BytesIO
 from PIL import Image
 from tqdm import tqdm
 
+
+def _decode_audio_array(audio):
+    """Decode a HF Audio item to mono float32 samples without torchcodec."""
+    if isinstance(audio, dict) and audio.get("array") is not None:
+        samples = np.asarray(audio["array"], dtype=np.float32)
+        return samples, int(audio["sampling_rate"])
+
+    import av
+
+    source = None
+    if isinstance(audio, dict):
+        if audio.get("bytes") is not None:
+            source = BytesIO(audio["bytes"])
+        elif audio.get("path") is not None:
+            source = audio["path"]
+    if source is None:
+        raise ValueError("Unsupported audio sample format")
+
+    chunks = []
+    sampling_rate = None
+    with av.open(source) as container:
+        for frame in container.decode(audio=0):
+            arr = frame.to_ndarray()
+            sampling_rate = frame.sample_rate
+            chunks.append(arr)
+    if not chunks or sampling_rate is None:
+        raise ValueError("Audio sample has no decodable frames")
+
+    samples = np.concatenate(chunks, axis=-1)
+    if np.issubdtype(samples.dtype, np.integer):
+        info = np.iinfo(samples.dtype)
+        samples = samples.astype(np.float32) / max(abs(info.min), info.max)
+    else:
+        samples = samples.astype(np.float32)
+    if samples.ndim == 2:
+        samples = samples.mean(axis=0)
+    return samples, int(sampling_rate)
+
 def _load_video_opencv(video_path, num_frames=32):
     """Load video frames with OpenCV, matching vLLM's OpenCVVideoBackend."""
     import cv2
@@ -648,18 +742,23 @@ def _load_video_opencv(video_path, num_frames=32):
 
 def _preload_mm_data(dataset_name, dataset_split, num_seqs, seed,
                      num_video_frames=32):
-    """Pre-download and load all images/videos into memory.
+    """Pre-download and load multimodal samples into memory.
 
     Returns list of dicts with keys:
       - prompt: str
       - images: list[PIL.Image] or None
       - video_frames: np.ndarray (T,H,W,3) or None
       - video_metadata: dict or None
+      - audio: np.ndarray or None
+      - audio_sampling_rate: int or None
     """
     from datasets import load_dataset
     use_streaming = "MMVU" not in dataset_name
     data = load_dataset(dataset_name, split=dataset_split,
                         streaming=use_streaming)
+    if "librispeech_asr" in dataset_name:
+        from datasets import Audio
+        data = data.cast_column("audio", Audio(decode=False))
     data = data.shuffle(seed=seed)
 
     results = []
@@ -688,6 +787,8 @@ def _preload_mm_data(dataset_name, dataset_split, num_seqs, seed,
                 "images": [img],
                 "video_frames": None,
                 "video_metadata": None,
+                "audio": None,
+                "audio_sampling_rate": None,
             })
             pbar.update(0)
         pbar.close()
@@ -711,6 +812,29 @@ def _preload_mm_data(dataset_name, dataset_split, num_seqs, seed,
                 "images": None,
                 "video_frames": frames,
                 "video_metadata": metadata,
+                "audio": None,
+                "audio_sampling_rate": None,
+            })
+            pbar.update(0)
+        pbar.close()
+    elif "librispeech_asr" in dataset_name:
+        pbar = tqdm(data, total=num_seqs, desc="Loading audio")
+        for item in pbar:
+            if len(results) >= num_seqs:
+                break
+            try:
+                samples, sampling_rate = _decode_audio_array(item["audio"])
+                if samples.ndim != 1 or samples.size == 0:
+                    continue
+            except Exception:
+                continue
+            results.append({
+                "prompt": "Transcribe this audio and answer in text.",
+                "images": None,
+                "video_frames": None,
+                "video_metadata": None,
+                "audio": samples,
+                "audio_sampling_rate": sampling_rate,
             })
             pbar.update(0)
         pbar.close()
@@ -725,6 +849,11 @@ def _filter_and_prepare(mm_data, processor, max_input_tokens):
             messages = [{"role": "user", "content": []}]
             images_for_proc = None
             videos_for_proc = None
+            audios_for_proc = None
+            if item["audio"] is not None:
+                messages[0]["content"].append(
+                    {"type": "audio", "audio": item["audio"]})
+                audios_for_proc = [item["audio"]]
             if item["images"] is not None:
                 for img in item["images"]:
                     messages[0]["content"].append(
@@ -742,13 +871,16 @@ def _filter_and_prepare(mm_data, processor, max_input_tokens):
                 {"type": "text", "text": item["prompt"]})
             text = processor.apply_chat_template(
                 messages, tokenize=False, add_generation_prompt=True)
-            inputs = processor(
+            processor_kwargs = dict(
                 text=[text],
                 images=images_for_proc,
                 videos=videos_for_proc,
                 return_tensors="pt",
                 padding=True,
             )
+            if audios_for_proc is not None:
+                processor_kwargs["audio"] = audios_for_proc
+            inputs = processor(**processor_kwargs)
             num_tokens = inputs["input_ids"].shape[1]
             if num_tokens <= max_input_tokens:
                 item["chat_text"] = text
@@ -813,11 +945,14 @@ def main():
         gpu_memory_utilization=cfg.get("gpu_memory_utilization", 0.9),
         max_model_len=cfg["max_model_len"],
         enable_prefix_caching=False,
+        trust_remote_code=True,
     )
     if cfg.get("trust_remote_code"):
         llm_kwargs["trust_remote_code"] = True
     if cfg.get("load_format"):
         llm_kwargs["load_format"] = cfg["load_format"]
+    if cfg.get("limit_mm_per_prompt"):
+        llm_kwargs["limit_mm_per_prompt"] = cfg["limit_mm_per_prompt"]
     llm = LLM(**llm_kwargs)
 
     llm.generate(
@@ -868,6 +1003,10 @@ def main():
                     mm_dict["video"] = [
                         (item["video_frames"], item["video_metadata"])
                     ]
+                if item["audio"] is not None:
+                    mm_dict["audio"] = (
+                        item["audio"], item["audio_sampling_rate"]
+                    )
                 vllm_prompts.append(dict(
                     prompt=item["chat_text"],
                     multi_modal_data=mm_dict,
@@ -931,6 +1070,10 @@ def main():
                 mm_dict["video"] = [
                     (item["video_frames"], item["video_metadata"])
                 ]
+            if item["audio"] is not None:
+                mm_dict["audio"] = (
+                    item["audio"], item["audio_sampling_rate"]
+                )
             lat_prompt = dict(prompt=item["chat_text"],
                               multi_modal_data=mm_dict)
             run_fn = lambda: llm.generate([lat_prompt], sp, use_tqdm=False)
@@ -956,6 +1099,10 @@ def main():
 
     with open(cfg["output_file"], "w") as f:
         json.dump({"throughput": all_results, "latency": latency_results}, f)
+        f.flush()
+        os.fsync(f.fileno())
+
+    os._exit(0)
 
 if __name__ == "__main__":
     main()
@@ -1044,6 +1191,7 @@ def main():
             prompts = [item["prompt"] for item in mm_data]
             batch_images = []
             batch_videos = []
+            batch_audios = []
             for item in mm_data:
                 if item["images"] is not None:
                     batch_images.append(item["images"])
@@ -1057,6 +1205,10 @@ def main():
                     batch_videos.append([frames_pil])
                 else:
                     batch_videos.append(None)
+                if item["audio"] is not None:
+                    batch_audios.append([item["audio"]])
+                else:
+                    batch_audios.append(None)
 
             sp_list = [
                 SamplingParams(temperature=temperature, top_p=top_p,
@@ -1071,6 +1223,7 @@ def main():
             outputs = engine.generate(prompts, sp_list,
                                       images=batch_images,
                                       videos=batch_videos,
+                                      audio_features=batch_audios,
                                       use_tqdm=True)
             torch.cuda.synchronize()
             elapsed = time.perf_counter() - start
@@ -1122,6 +1275,7 @@ def main():
                                 max_tokens=ls["output_len"])
             lat_images = None
             lat_videos = None
+            lat_audios = None
             if item["images"] is not None:
                 lat_images = [item["images"]]
             if item["video_frames"] is not None:
@@ -1130,13 +1284,17 @@ def main():
                     for j in range(item["video_frames"].shape[0])
                 ]
                 lat_videos = [[lat_frames_pil]]
-            def run_fn(p=item["prompt"], imgs=lat_images, vids=lat_videos):
+            if item["audio"] is not None:
+                lat_audios = [[item["audio"]]]
+            def run_fn(p=item["prompt"], imgs=lat_images, vids=lat_videos,
+                       auds=lat_audios):
                 engine.block_manager.reset()
                 torch.cuda.synchronize()
                 engine.generate(
                     [p], sp,
                     images=imgs,
                     videos=vids,
+                    audio_features=auds,
                 )
                 torch.cuda.synchronize()
 
@@ -1159,8 +1317,10 @@ def main():
 
     with open(cfg["output_file"], "w") as f:
         json.dump({"throughput": all_results, "latency": latency_results}, f)
+        f.flush()
+        os.fsync(f.fileno())
 
-    del engine
+    os._exit(0)
 
 if __name__ == "__main__":
     main()
@@ -1616,8 +1776,8 @@ def main():
     )
     parser.add_argument(
         "--modality", type=str, default="all",
-        choices=["all", "text", "image", "video"],
-        help="Run only scenarios matching this modality (VLM models only, default: all)",
+        choices=["all", "text", "image", "video", "audio"],
+        help="Run only scenarios matching this modality (multimodal models only, default: all)",
     )
     parser.add_argument(
         "--scenario", type=str, default=None,
@@ -1638,6 +1798,7 @@ def main():
 
     gpu = _detect_gpu_name()
     is_vlm = _is_vlm_model(args.model)
+    is_qwen_omni = _is_qwen_omni_model(args.model)
     is_whisper = _is_whisper_model(args.model)
 
     if args.output_dir is None:
@@ -1678,6 +1839,9 @@ def main():
     if is_whisper:
         throughput_scenarios = WHISPER_SCENARIOS
         latency_scenarios = WHISPER_LATENCY_SCENARIOS
+    elif is_qwen_omni:
+        throughput_scenarios = QWEN_OMNI_SCENARIOS
+        latency_scenarios = QWEN_OMNI_LATENCY_SCENARIOS
     elif is_vlm:
         throughput_scenarios = VLM_SCENARIOS
         latency_scenarios = VLM_LATENCY_SCENARIOS
@@ -1685,7 +1849,7 @@ def main():
         throughput_scenarios = SCENARIOS
         latency_scenarios = LATENCY_SCENARIOS
 
-    if is_vlm and not is_whisper and args.modality != "all":
+    if (is_vlm or is_qwen_omni) and not is_whisper and args.modality != "all":
         throughput_scenarios = [
             s for s in throughput_scenarios
             if s.get("modality", "text") == args.modality
@@ -1730,7 +1894,7 @@ def main():
                 })
                 continue
 
-            modality = scenario.get("modality", "text") if is_vlm else "text"
+            modality = scenario.get("modality", "text") if (is_vlm or is_qwen_omni) else "text"
             if modality == "text":
                 if scenario.get("dataset") is not None:
                     samples = load_real_prompt_workload(
@@ -1767,8 +1931,8 @@ def main():
                     "output_lens": output_lens,
                 })
             else:
-                # Image/video: dataset is loaded inside the subprocess worker.
-                # Large images can produce many vision tokens; be generous.
+                # Multimodal datasets are loaded inside the subprocess worker.
+                # Large media inputs can produce many tokens; be generous.
                 max_seq_len = 16384 + scenario["output_len"]
                 if max_seq_len > global_max_seq_len:
                     global_max_seq_len = max_seq_len
@@ -1800,7 +1964,7 @@ def main():
                 })
                 continue
 
-            modality = ls.get("modality", "text") if is_vlm else "text"
+            modality = ls.get("modality", "text") if (is_vlm or is_qwen_omni) else "text"
             if modality == "text":
                 bs = ls["batch_size"]
                 samples = load_real_prompt_workload(
@@ -1848,9 +2012,12 @@ def main():
     print("  kb-nano Baseline vs vLLM -- Multi-Scenario Benchmark")
     print("=" * 70)
     print(f"  Model          : {args.model}")
-    model_type_str = "Whisper" if is_whisper else ("VLM" if is_vlm else "LLM")
+    model_type_str = (
+        "Whisper" if is_whisper
+        else ("Qwen-Omni" if is_qwen_omni else ("VLM" if is_vlm else "LLM"))
+    )
     print(f"  Model type     : {model_type_str}")
-    if is_vlm and args.modality != "all":
+    if (is_vlm or is_qwen_omni) and args.modality != "all":
         print(f"  Modality       : {args.modality}")
     print(f"  TP             : {args.tp}")
     has_full = any(s.get("use_full_dataset") for s in throughput_scenarios) if is_whisper else False
@@ -1879,7 +2046,7 @@ def main():
     if is_whisper:
         vllm_worker = VLLM_WHISPER_WORKER
         kb_worker = KB_NANO_WHISPER_WORKER
-    elif is_vlm:
+    elif is_vlm or is_qwen_omni:
         vllm_worker = VLLM_VLM_WORKER
         kb_worker = KB_NANO_VLM_WORKER
     else:
@@ -1904,7 +2071,14 @@ def main():
             "latency_scenarios": latency_data,
             "trust_remote_code": args.trust_remote_code,
             "load_format": "fastsafetensors",
+            "is_qwen_omni": is_qwen_omni,
         }
+        if is_qwen_omni:
+            vllm_config["limit_mm_per_prompt"] = {
+                "image": 1,
+                "video": 1,
+                "audio": 1,
+            }
         os.environ["MASTER_ADDR"] = "127.0.0.1"
         os.environ["MASTER_PORT"] = str(vllm_port)
         vllm_raw = run_worker(
@@ -2019,7 +2193,7 @@ def main():
                 f"{'KB-NANO tok/s':>15} {'vLLM tok/s':>12} {'SPEEDUP':>8} "
                 f"{'AVG MATCH TOKS':>15}"
             )
-        elif is_vlm:
+        elif is_vlm or is_qwen_omni:
             header = (
                 f"  {'SCENARIO':<16} {'OUT':>5} "
                 f"{'KB-NANO tok/s':>15} {'vLLM tok/s':>12} {'SPEEDUP':>8} "
@@ -2060,7 +2234,7 @@ def main():
                     f"{kb_tps_str:>15} {v_tps_str:>12} {speedup_str:>8} "
                     f"{match_str:>15}"
                 )
-            elif is_vlm:
+            elif is_vlm or is_qwen_omni:
                 out_str = (
                     f"{r['output_len']:>5}"
                     if "output_len" in r
@@ -2157,7 +2331,10 @@ def main():
         combined = {
             "gpu": gpu,
             "model": args.model,
-            "model_type": "vlm" if is_vlm else "llm",
+            "model_type": (
+                "qwen_omni" if is_qwen_omni
+                else ("vlm" if is_vlm else "llm")
+            ),
             "tp": args.tp,
             "seed": args.seed,
             "temperature": args.temperature,

@@ -153,6 +153,9 @@ class Sequence:
         self.image_grid_thw = None  # list of [t, h, w] per image
         self.video_pixel_values = None
         self.video_grid_thw = None
+        self.video_second_per_grid = None
+        self.input_audio_features = None
+        self.audio_feature_lengths = None
         self.mrope_position_delta: int = 0
         self.mrope_positions = None  # (3, seq_len) tensor computed at prefill
         # Encoder-decoder fields (Whisper)
@@ -3767,22 +3770,22 @@ class ModelRunner:
             if inputs_embeds is not None:
                 if deepstack_embeds is not None:
                     # Multimodal prefill with actual vision features —
-                    # use the uncompiled inner model since the compiled
-                    # graph was traced without deepstack_embeds.
+                    # use the uncompiled inner model since the compiled graph
+                    # is warmed up with synthetic inputs_embeds.
                     inner = getattr(self, '_eager_inner_model', None)
                     if inner is not None:
-                        hidden = inner(input_ids, positions,
-                                       inputs_embeds=inputs_embeds,
-                                       deepstack_embeds=deepstack_embeds)
+                        kwargs = {"inputs_embeds": inputs_embeds}
+                        if deepstack_embeds is not None:
+                            kwargs["deepstack_embeds"] = deepstack_embeds
+                        hidden = inner(input_ids, positions, **kwargs)
                         return self._compute_logits(
                             hidden, skip_final_softcap=skip_final_softcap,
                         )
+                    kwargs = {"inputs_embeds": inputs_embeds}
+                    if deepstack_embeds is not None:
+                        kwargs["deepstack_embeds"] = deepstack_embeds
                     return self._compute_logits(
-                        model(
-                            input_ids, positions,
-                            inputs_embeds=inputs_embeds,
-                            deepstack_embeds=deepstack_embeds,
-                        ),
+                        model(input_ids, positions, **kwargs),
                         skip_final_softcap=skip_final_softcap,
                     )
                 return self._compute_logits(
@@ -3943,7 +3946,11 @@ class ModelRunner:
         if use_bitnet_eager_model:
             disable_custom_ops()
         try:
-            hidden = model(input_ids, positions)
+            if self.is_qwen_vl and self._compiled:
+                inputs_embeds = model.get_input_embeddings()(input_ids)
+                hidden = model(input_ids, positions, inputs_embeds=inputs_embeds)
+            else:
+                hidden = model(input_ids, positions)
             lm_head = model.lm_head
             logits = lm_head.linear_op(hidden, lm_head.embedding_op.emb.weight).float()
             max_vals, max_idxs = logits.max(dim=-1)
@@ -4276,6 +4283,8 @@ class ModelRunner:
             c.__dict__.update(s.__dict__)
             c.pixel_values = None
             c.video_pixel_values = None
+            c.input_audio_features = None
+            c.audio_feature_lengths = None
             c.encoder_features = None
             stripped.append(c)
         return stripped
@@ -4330,6 +4339,7 @@ class ModelRunner:
         merge_size = model.config.vision.spatial_merge_size
         image_token_id = self.config.image_token_id
         video_token_id = self.config.video_token_id
+        audio_token_id = getattr(self.config, "audio_token_id", None)
 
         all_inputs_embeds = []
         all_deepstack = [] if has_deepstack else None
@@ -4349,18 +4359,17 @@ class ModelRunner:
             seq_deepstack = [] if has_deepstack else None
 
             info = vis_cache_map[seq_idx] if seq_idx < len(vis_cache_map) else None
-            if os.environ.get("KB_DIAG_MM") and self.rank == 0:
-                _dc2 = getattr(self, '_diag_mm_count', 0)
-                if _dc2 < 2:
-                    print(f"  [DIAG_MM seq_idx={seq_idx}] info={info} "
-                          f"chunk_ids_len={len(chunk_ids)} "
-                          f"has_img_tokens={(chunk_ids == image_token_id).sum().item()}")
             if info is not None:
                 vis_out = self._vis_cache[info["cache_idx"]]
                 modality = info["modality"]
-                tok_id = image_token_id if modality == "image" else video_token_id
+                if modality == "image":
+                    tok_id = image_token_id
+                elif modality == "video":
+                    tok_id = video_token_id
+                else:
+                    tok_id = audio_token_id
 
-                if has_deepstack:
+                if modality != "audio" and has_deepstack:
                     all_vis_embeds = vis_out[:, :visual_dim]
                     ds_cat = vis_out[:, visual_dim:]
                     all_ds_features = list(ds_cat.split(visual_dim, dim=1))
@@ -4379,17 +4388,6 @@ class ModelRunner:
 
                 mask = chunk_ids == tok_id
                 if mask.any():
-                    if os.environ.get("KB_DIAG_MM") and self.rank == 0:
-                        _dc = getattr(self, '_diag_mm_count', 0)
-                        if _dc < 2:
-                            n_m = mask.sum().item()
-                            print(f"  [DIAG_MM seq={seq_idx}] vis_out={vis_out.shape} "
-                                  f"modality={modality} "
-                                  f"embeds={embeds.shape} mask_count={n_m} "
-                                  f"vis_norm={embeds.norm().item():.4f} "
-                                  f"text_norm_before={text_embeds.norm().item():.4f} "
-                                  f"chunk_ids_len={len(chunk_ids)} "
-                                  f"ds_features={len(ds_features)}")
                     if prefill_chunk_sizes is not None:
                         full_mask = full_ids == tok_id
                         chunk_vis_start = full_mask[:start].sum().item()
@@ -4440,32 +4438,6 @@ class ModelRunner:
 
         self._vis_cache = []
 
-        if os.environ.get("KB_DIAG_MM") and self.rank == 0:
-            _diag_count = getattr(self, '_diag_mm_count', 0)
-            if _diag_count < 2:
-                print(f"\n[DIAG_MM seq_count={len(prefill_seqs)}] "
-                      f"inputs_embeds={inputs_embeds.shape} "
-                      f"norm={inputs_embeds.norm().item():.4f} "
-                      f"positions={'x'.join(str(d) for d in positions.shape)} "
-                      f"pos_range=[{positions.min().item()},{positions.max().item()}]")
-                if deepstack_embeds:
-                    for i, ds in enumerate(deepstack_embeds):
-                        print(f"  deepstack[{i}]: shape={ds.shape} "
-                              f"norm={ds.norm().item():.4f} "
-                              f"nonzero={ds.abs().sum(dim=-1).gt(0).sum().item()}")
-                # Print per-seq position info
-                offset = 0
-                for si, seq in enumerate(prefill_seqs):
-                    sl = len(seq) if prefill_chunk_sizes is None else prefill_chunk_sizes[si]
-                    seq_pos = positions[:, offset:offset+sl]
-                    print(f"  seq[{si}] len={sl} pos_range=["
-                          f"t:{seq_pos[0].min().item()}-{seq_pos[0].max().item()}, "
-                          f"h:{seq_pos[1].min().item()}-{seq_pos[1].max().item()}, "
-                          f"w:{seq_pos[2].min().item()}-{seq_pos[2].max().item()}] "
-                          f"mrope_delta={getattr(seq, 'mrope_position_delta', 'N/A')}")
-                    offset += sl
-                self._diag_mm_count = _diag_count + 1
-
         result = self.run_model(input_ids, positions, True,
                                 inputs_embeds=inputs_embeds,
                                 deepstack_embeds=deepstack_embeds)
@@ -4491,14 +4463,41 @@ class ModelRunner:
         else:
             bpv = torch.empty(pv_shape, dtype=vis_dtype, device=device)
             bthw = torch.empty(thw_shape, dtype=torch.long, device=device)
-        dist.broadcast(bpv, src=0)
-        dist.broadcast(bthw, src=0)
+        if self.world_size > 1:
+            dist.broadcast(bpv, src=0)
+            dist.broadcast(bthw, src=0)
         vis_out = self.model.visual(bpv, grid_thw=bthw.cpu())
         del bpv
         if not hasattr(self, '_vis_cache'):
             self._vis_cache = []
         self._vis_cache.append(vis_out)
         return vis_out
+
+    def _broadcast_audio(self, feature_shape, lengths_shape):
+        """Broadcast Qwen-Omni audio features and run the audio tower."""
+        device = torch.device("cuda")
+        audio_dtype = next(self.model.audio_tower.parameters()).dtype
+        if self.rank == 0:
+            feats = self._mm_audio_features.to(device=device, dtype=audio_dtype)
+            lengths = self._mm_audio_lengths.to(device=device, dtype=torch.long)
+            self._mm_audio_features = None
+            self._mm_audio_lengths = None
+        else:
+            feats = torch.empty(feature_shape, dtype=audio_dtype, device=device)
+            lengths = torch.empty(lengths_shape, dtype=torch.long, device=device)
+        if self.world_size > 1:
+            dist.broadcast(feats, src=0)
+            dist.broadcast(lengths, src=0)
+        feat_lens, output_lens = (
+            self.model.audio_tower._get_feat_extract_output_lengths(lengths)
+        )
+        audio_out = self.model.audio_tower(
+            feats, feature_lens=lengths, aftercnn_lens=feat_lens,
+        ).last_hidden_state
+        if not hasattr(self, '_vis_cache'):
+            self._vis_cache = []
+        self._vis_cache.append(audio_out)
+        return audio_out, output_lens
 
     # ------------------------------------------------------------------
     # Whisper cross-attention context helpers
@@ -4792,15 +4791,22 @@ class ModelRunner:
         warmup_ids = input_ids[:largest_bs]
         warmup_pos = (positions[:, :largest_bs]
                       if self.is_qwen_vl else positions[:largest_bs])
+        warmup_ie = (vl_inputs_embeds[:largest_bs]
+                     if vl_inputs_embeds is not None else None)
         if self._compiled and not self._mark_dynamic_done:
             torch._dynamo.mark_dynamic(warmup_ids, 0)
             if self.is_qwen_vl:
                 torch._dynamo.mark_dynamic(warmup_pos, 1)
             else:
                 torch._dynamo.mark_dynamic(warmup_pos, 0)
+            if warmup_ie is not None:
+                torch._dynamo.mark_dynamic(warmup_ie, 0)
             self._mark_dynamic_done = True
         if self.is_qwen_vl:
-            outputs[:largest_bs] = self.model(warmup_ids, warmup_pos)
+            warmup_ie.copy_(vl_embed_fn(warmup_ids))
+            outputs[:largest_bs] = self.model(
+                warmup_ids, warmup_pos, inputs_embeds=warmup_ie,
+            )
         else:
             outputs[:largest_bs] = self.model(warmup_ids, warmup_pos)
         lm_logits[:largest_bs] = lm_head.linear_op(
@@ -4991,7 +4997,9 @@ class LlamaEngine:
         self.processor = None
         if self.is_qwen_vl:
             from transformers import AutoProcessor
-            self.processor = AutoProcessor.from_pretrained(model_name)
+            self.processor = AutoProcessor.from_pretrained(
+                model_name, trust_remote_code=True,
+            )
 
         self.encoder_cache: dict[int, tuple] = {}
 
@@ -5036,13 +5044,17 @@ class LlamaEngine:
         probs = torch.softmax(logits, -1)
         return torch.multinomial(probs, 1).squeeze(-1).tolist()
 
-    def _preprocess_multimodal(self, prompt, images=None, videos=None):
-        """Preprocess a multimodal prompt with images/videos.
+    def _preprocess_multimodal(self, prompt, images=None, videos=None, audios=None):
+        """Preprocess a multimodal prompt with image/video/audio inputs.
 
         Returns (token_ids, pixel_values, image_grid_thw, video_pixel_values,
-                 video_grid_thw) where pixel values are already processed.
+                 video_grid_thw, video_second_per_grid, input_audio_features,
+                 audio_feature_lengths).
         """
         messages = [{"role": "user", "content": []}]
+        if audios:
+            for audio in audios:
+                messages[0]["content"].append({"type": "audio", "audio": audio})
         if images:
             for img in images:
                 messages[0]["content"].append({"type": "image", "image": img})
@@ -5054,18 +5066,37 @@ class LlamaEngine:
         text = self.processor.apply_chat_template(
             messages, tokenize=False, add_generation_prompt=True,
         )
-        inputs = self.processor(
-            text=[text], images=images, videos=videos,
-            return_tensors="pt", padding=True,
+        processor_kwargs = dict(
+            text=[text],
+            images=images,
+            videos=videos,
+            return_tensors="pt",
+            padding=True,
         )
+        if audios is not None:
+            processor_kwargs["audio"] = audios
+        inputs = self.processor(**processor_kwargs)
         token_ids = inputs["input_ids"][0].tolist()
         pixel_values = inputs.get("pixel_values", None)
         image_grid_thw = inputs.get("image_grid_thw", None)
         video_pixel_values = inputs.get("pixel_values_videos", None)
         video_grid_thw = inputs.get("video_grid_thw", None)
+        video_second_per_grid = inputs.get("video_second_per_grid", None)
+        input_audio_features = inputs.get("input_audio_features", None)
+        if input_audio_features is None and inputs.get("input_features", None) is not None:
+            input_audio_features = inputs["input_features"]
+            feature_mask = inputs.get("feature_attention_mask", None)
+            if feature_mask is not None:
+                input_audio_features = input_audio_features.permute(0, 2, 1)[
+                    feature_mask.bool()
+                ].permute(1, 0)
+        audio_feature_lengths = inputs.get("audio_feature_lengths", None)
+        if audio_feature_lengths is None and inputs.get("feature_attention_mask", None) is not None:
+            audio_feature_lengths = inputs["feature_attention_mask"].sum(-1)
 
         return (token_ids, pixel_values, image_grid_thw,
-                video_pixel_values, video_grid_thw)
+                video_pixel_values, video_grid_thw, video_second_per_grid,
+                input_audio_features, audio_feature_lengths)
 
     def _dispatch_vision_encoder(self, seqs):
         """Dispatch vision encoder to all TP ranks and build vis_cache_map.
@@ -5086,60 +5117,122 @@ class LlamaEngine:
         cache_idx = 0
 
         seq_entries = []
-        img_thw_list = []
+        image_pv_list = []
+        image_thw_list = []
+        image_entries = []
+        image_embed_start = 0
         for i, seq in enumerate(seqs):
             if seq.pixel_values is not None:
-                pv = seq.pixel_values.cuda()
                 thw = seq.image_grid_thw
                 if not isinstance(thw, torch.Tensor):
                     thw = torch.tensor(thw, dtype=torch.long)
-                img_thw_list.append(thw)
-                pv_shape = list(pv.shape)
-                thw_shape = list(thw.shape)
-                mr._mm_pv = pv
-                mr._mm_thw = thw
-                mr.call("_broadcast_visual", pv_shape, thw_shape)
-                seq_entries.append((i, cache_idx, "image"))
-                cache_idx += 1
-                del pv
+                image_pv_list.append(seq.pixel_values)
+                image_thw_list.append(thw)
+                embed_count = int((thw.prod(-1) // (merge_size ** 2)).sum().item())
+                image_entries.append((i, image_embed_start, embed_count))
+                image_embed_start += embed_count
 
+        if image_pv_list:
+            batched_pv = torch.cat(image_pv_list, dim=0)
+            batched_thw = torch.cat(image_thw_list, dim=0).cpu()
+            mr._mm_pv = batched_pv
+            mr._mm_thw = batched_thw
+            mr.call(
+                "_broadcast_visual",
+                list(batched_pv.shape),
+                list(batched_thw.shape),
+            )
+            for i, embed_start, embed_count in image_entries:
+                seq_entries.append(
+                    (i, cache_idx, "image", embed_start, embed_count),
+                )
+            cache_idx += 1
+
+        video_pv_list = []
+        video_thw_list = []
+        video_entries = []
+        video_embed_start = 0
         for i, seq in enumerate(seqs):
             if seq.video_pixel_values is not None:
-                video_pv = seq.video_pixel_values.cuda()
                 grid_thw = seq.video_grid_thw
                 if not isinstance(grid_thw, torch.Tensor):
                     grid_thw = torch.tensor(grid_thw, dtype=torch.long)
-                grid_thw = grid_thw.cpu()
-                vpv_shape = list(video_pv.shape)
-                vthw_shape = list(grid_thw.shape)
-                mr._mm_pv = video_pv
-                mr._mm_thw = grid_thw
-                mr.call("_broadcast_visual", vpv_shape, vthw_shape)
-                seq_entries.append((i, cache_idx, "video"))
-                cache_idx += 1
-                del video_pv
+                video_pv_list.append(seq.video_pixel_values)
+                video_thw_list.append(grid_thw)
+                embed_count = int(
+                    (grid_thw.prod(-1) // (merge_size ** 2)).sum().item()
+                )
+                video_entries.append((i, video_embed_start, embed_count))
+                video_embed_start += embed_count
+
+        if video_pv_list:
+            batched_pv = torch.cat(video_pv_list, dim=0)
+            batched_thw = torch.cat(video_thw_list, dim=0).cpu()
+            mr._mm_pv = batched_pv
+            mr._mm_thw = batched_thw
+            mr.call(
+                "_broadcast_visual",
+                list(batched_pv.shape),
+                list(batched_thw.shape),
+            )
+            for i, embed_start, embed_count in video_entries:
+                seq_entries.append(
+                    (i, cache_idx, "video", embed_start, embed_count),
+                )
+            cache_idx += 1
+
+        audio_seqs = [
+            (i, seq) for i, seq in enumerate(seqs)
+            if getattr(seq, "input_audio_features", None) is not None
+        ]
+        audio_output_lens = None
+        if audio_seqs:
+            feats = torch.cat(
+                [seq.input_audio_features for _, seq in audio_seqs], dim=1,
+            )
+            lengths = torch.cat([
+                seq.audio_feature_lengths.to(torch.long) for _, seq in audio_seqs
+            ])
+            mr._mm_audio_features = feats
+            mr._mm_audio_lengths = lengths
+            _, output_lens = mr.call(
+                "_broadcast_audio", list(feats.shape), list(lengths.shape),
+            )
+            audio_output_lens = output_lens.detach().cpu().tolist()
+            for i, _seq in audio_seqs:
+                seq_entries.append((i, cache_idx, "audio", None, None))
+            cache_idx += 1
 
         per_seq_map = [None] * len(seqs)
-        for si, ci, modality in seq_entries:
+        audio_embed_start = 0
+        audio_idx = 0
+        for si, ci, modality, embed_start, embed_count in seq_entries:
             seq = seqs[si]
             if modality == "image":
-                thw_list = seq.image_grid_thw
-                if isinstance(thw_list, list):
-                    thw_t = torch.tensor(thw_list, dtype=torch.long)
-                else:
-                    thw_t = thw_list if isinstance(thw_list, torch.Tensor) else torch.tensor(thw_list, dtype=torch.long)
-                sizes = (thw_t.prod(-1) // (merge_size ** 2)).tolist()
                 per_seq_map[si] = {
                     "cache_idx": ci,
                     "modality": "image",
-                    "embed_start": 0,
-                    "embed_count": sum(sizes),
+                    "embed_start": embed_start,
+                    "embed_count": embed_count,
                 }
-            else:
+            elif modality == "video":
                 per_seq_map[si] = {
                     "cache_idx": ci,
                     "modality": "video",
+                    "embed_start": embed_start,
+                    "embed_count": embed_count,
                 }
+            elif modality == "audio":
+                assert audio_output_lens is not None
+                embed_count = audio_output_lens[audio_idx]
+                per_seq_map[si] = {
+                    "cache_idx": ci,
+                    "modality": "audio",
+                    "embed_start": audio_embed_start,
+                    "embed_count": embed_count,
+                }
+                audio_embed_start += embed_count
+                audio_idx += 1
 
         return per_seq_map, cache_idx
 
@@ -6030,16 +6123,27 @@ class LlamaEngine:
                 mel_T = aud.shape[-1]
                 seq.encoder_seq_len = _whisper_encoder_tokens(mel_T)
                 return seq
-            elif self.is_qwen_vl and (img is not None or vid is not None):
+            elif self.is_qwen_vl and (
+                img is not None or vid is not None or aud is not None
+            ):
                 (ids, pixel_values, image_grid_thw,
-                 video_pv, video_grid_thw) = self._preprocess_multimodal(
-                    prompt, images=img, videos=vid,
+                 video_pv, video_grid_thw, video_second_per_grid,
+                 input_audio_features, audio_feature_lengths) = (
+                    self._preprocess_multimodal(
+                        prompt, images=img, videos=vid, audios=aud,
+                    )
                 )
                 seq = Sequence(ids, max_tokens=sp.max_tokens, ignore_eos=sp.ignore_eos)
                 seq.pixel_values = pixel_values
                 seq.image_grid_thw = image_grid_thw.tolist() if image_grid_thw is not None else None
                 seq.video_pixel_values = video_pv
                 seq.video_grid_thw = video_grid_thw.tolist() if video_grid_thw is not None else None
+                seq.video_second_per_grid = (
+                    video_second_per_grid.tolist()
+                    if video_second_per_grid is not None else None
+                )
+                seq.input_audio_features = input_audio_features
+                seq.audio_feature_lengths = audio_feature_lengths
 
                 model = self.model_runner.model
                 merge_size = model.config.vision.spatial_merge_size
@@ -6087,6 +6191,8 @@ class LlamaEngine:
                     video_grid_thw=seq.video_grid_thw,
                     image_offsets=image_offsets if image_offsets else None,
                     video_offsets=video_offsets if video_offsets else None,
+                    video_second_per_grid=seq.video_second_per_grid,
+                    audio_feature_lengths=audio_feature_lengths,
                 )
                 seq.mrope_positions = mrope_positions
                 seq.mrope_position_delta = delta
@@ -6530,7 +6636,8 @@ class LlamaEngine:
 
                 has_mm = self.is_qwen_vl and (
                     getattr(seq, 'pixel_values', None) is not None
-                    or getattr(seq, 'video_pixel_values', None) is not None)
+                    or getattr(seq, 'video_pixel_values', None) is not None
+                    or getattr(seq, 'input_audio_features', None) is not None)
 
                 is_whisper_seq = (seq.encoder_features is not None)
 
@@ -6598,7 +6705,9 @@ class LlamaEngine:
                 _spt0 = time.perf_counter()
                 _sp = step_profile
                 has_mm_step = self.is_qwen_vl and any(
-                    s.pixel_values is not None or s.video_pixel_values is not None
+                    s.pixel_values is not None
+                    or s.video_pixel_values is not None
+                    or getattr(s, 'input_audio_features', None) is not None
                     for s in prefill_seqs
                 )
                 _sp_cat = None
@@ -6706,7 +6815,9 @@ class LlamaEngine:
             elif n_dc == 0:
                 # Pure prefill (no running decode seqs)
                 has_mm = self.is_qwen_vl and any(
-                    s.pixel_values is not None or s.video_pixel_values is not None
+                    s.pixel_values is not None
+                    or s.video_pixel_values is not None
+                    or getattr(s, 'input_audio_features', None) is not None
                     for s in prefill_seqs
                 )
                 if has_mm:
@@ -6745,7 +6856,9 @@ class LlamaEngine:
             else:
                 # Mixed batch: prefill + decode together
                 has_mm = self.is_qwen_vl and any(
-                    s.pixel_values is not None or s.video_pixel_values is not None
+                    s.pixel_values is not None
+                    or s.video_pixel_values is not None
+                    or getattr(s, 'input_audio_features', None) is not None
                     for s in prefill_seqs
                 )
                 if has_mm:

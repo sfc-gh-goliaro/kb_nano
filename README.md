@@ -1,6 +1,6 @@
 # kb-nano
 
-A standalone, high-performance inference engine supporting **LLMs** (Llama 3.1, Llama 4, Mixtral-8x7B, DeepSeek V3.2, GPT-OSS, Kimi Linear, Qwen3-Next, Qwen2-VL, Qwen3-VL), **linear-attention LLMs** (GLA, RetNet, RWKV7), **embedding / retrieval models** (BGE-M3, ColBERTv2), **diffusion models** (FLUX.1-dev, SDXL, HunyuanVideo-1.5), **world models** (Oasis 500M), **detection models** (YOLOv10, RTDetrV2), **vision encoders** (SigLIP-2, DINOv3, SwinV2), **segmentation models** (SAM3.1), **3D point models** (PointTransformerV3), **protein structure prediction** (OpenFold3), audio models (Whisper), and **TTS models** (CosyVoice3) with tensor parallelism and FP8 quantization. No vLLM dependency at runtime — just PyTorch, Triton, and Flash Attention.
+A standalone, high-performance inference engine supporting **LLMs** (Llama 3.1, Llama 4, Mixtral-8x7B, DeepSeek V3.2, GPT-OSS, Qwen2.5-Omni, Qwen2-VL, Qwen3-VL), **linear-attention LLMs** (GLA, RetNet, RWKV7), **embedding / retrieval models** (BGE-M3, ColBERTv2), **diffusion models** (FLUX.1-dev, SDXL, HunyuanVideo-1.5), **world models** (Oasis 500M), **detection models** (YOLOv10, RTDetrV2), **vision encoders** (SigLIP-2, DINOv3, SwinV2), **segmentation models** (SAM3.1), **3D point models** (PointTransformerV3), **protein structure prediction** (OpenFold3), audio models (Whisper), and **TTS models** (CosyVoice3) with tensor parallelism and FP8 quantization. No vLLM dependency at runtime — just PyTorch, Triton, and Flash Attention.
 
 ## Features
 
@@ -9,12 +9,10 @@ A standalone, high-performance inference engine supporting **LLMs** (Llama 3.1, 
 - **Mixtral-8x7B** with fused Triton MoE grouped-GEMM kernels
 - **DeepSeek V3.2** with MLA (Multi-head Latent Attention), 256-expert MoE via DeepGEMM FP8, DSA (DeepSeek Sparse Attention), and YARN RoPE — currently **0.78–0.90× of vLLM** throughput on 8×H200 (gap due to kernel-launch overhead, GEMM kernel selection, and AllReduce+RMSNorm fusion)
 - **GPT-OSS** (20B, 120B) MXFP4-quantized MoE with native Triton inference, YaRN RoPE, attention sinks, and sliding window
-- **Kimi Linear** (`moonshotai/Kimi-Linear-48B-A3B-Instruct`) hybrid KDA + MLA language model with 20 KDA layers, 7 MLA layers, and 256-expert MoE
-- **Qwen3-Next** (`Qwen/Qwen3-Next-80B-A3B-Instruct`) hybrid Gated DeltaNet + full-attention language model with 36 GDN layers, 12 MHA layers, and 512-expert MoE
+- **Qwen2.5-Omni** (`Qwen/Qwen2.5-Omni-3B`) Thinker path with real text, image, video, and audio inputs
 - **BGE-M3** dense + sparse + ColBERT-style embedding outputs
 - **ColBERTv2** query/doc encoders with MaxSim scoring
 - **Mamba / Mamba2** (`state-spaces/mamba-2.8b-hf`, `mistralai/Mamba-Codestral-7B-v0.1`) selective state-space models with vLLM-aligned `causal_conv1d` + `mamba_chunk_scan` / `selective_scan` kernels, slot-based recurrent state cache, chunked-prefill metadata, and TP sharding (incl. `n_groups % tp != 0` head-shard groups)
-- **Jamba** (AI21Labs `Jamba-tiny-dev`, `Jamba-v0.1`) triple-hybrid Transformer + Mamba-1 + sparse MoE.  L2 modules mirror vLLM's exactly so generated kernels port back into vLLM with no call-site change: `JambaAttention` uses fused `QKVParallelLinear` + the project's `L2.attention_impl.Attention` class (same paged-KV / TRTLLM-gen / FA3 dispatch as `LlamaAttention`) + `RowParallelLinear`; `JambaMLP` mirrors `LlamaMLP` (fused `gate_up_proj` + `SiluAndMul` + `RowParallelLinear`); the L3 decoder layers use Llama-style fused add+RMSNorm (`fused_add_rms_norm`) for residuals.  Full pipeline is flat-varlen `[N, hidden]` with paged KV (`TRTLLMPrefill` + `TRTLLMDecode` on Blackwell, `FlashAttnPrefill` + `FlashAttnDecode` elsewhere).  Engine implements **continuous batching with within-seq chunked prefill** (FLA-engine pattern) -- `Sequence` + `BlockManager` + Mamba slot pool, `waiting / prefilling / running` deques, lifetime-allocate at admit, multi-bucket decode CUDA-graph capture at batch sizes `[1, 2, 4, 8, 16, 24, 32, 40, …, max_num_seqs]` with shared mempool (largest-first), Mamba `has_initial_state` carries conv/SSM state across prefill chunks, GPU greedy argmax + **async D2H pipeline** of next-token IDs (mirrors `run_mamba_decode_fast_async`), and TRTLLM workspace sharing across attention modules (mirrors `LlamaEngine._share_trtllm_workspace`).  **Geomean 2.40× tok/s on tiny-dev and 1.02× on Jamba-v0.1 (52B) vs vLLM 0.18.0** at the standard scenarios (1024/512, 512/512, 512/1024 prefill/decode); avg match-tokens 532/748 (tiny-dev) and 415/748 (v0.1) -- both bars (≥0.9× perf, ≥100 match-tokens/req) cleared with margin.  `torch.compile` is OFF by default: Inductor's fused elementwise paths drift from vLLM's hand-written `_C.fused_add_rms_norm` / `_C.silu_and_mul` by ~1e-3 per layer in bf16 and tank match-tokens; the eager path uses the same vLLM CUDA kernels vLLM itself uses, so bf16 numerics are bit-identical.  Set `KB_NANO_JAMBA_COMPILE=1` to opt in to ~25-30% extra throughput at tiny-dev if you can tolerate the bf16 drift.
 - **GLA** (`fla-hub/gla-2.7B-100B`) Gated Linear Attention with per-head logsigmoid forget gate, swish output gate, and SwiGLU MLP — token-aligned with the FLA reference
 - **RetNet** (`fla-hub/retnet-2.7B-100B`) Multi-Scale Retention with rotary embeddings, fixed per-head decay (γ_h = 1 − 2^(−5−h)), swish output gate, and SwiGLU MLP — token-aligned with the FLA reference
 - **RWKV7** (`fla-hub/rwkv7-2.9B-g1`, `fla-hub/rwkv7-2.9B-world`) DPLR (diagonal-plus-low-rank) recurrence with token-shift mixing, LoRA decay/value/gate adapters, GroupNorm output, and squared-ReLU FFN — token-aligned with the FLA reference
@@ -33,7 +31,6 @@ A standalone, high-performance inference engine supporting **LLMs** (Llama 3.1, 
 - **Whisper** (large-v3) encoder-decoder speech-to-text with batched inference and paged cross-attention KV cache
 - **CosyVoice3** (Fun-CosyVoice3-0.5B-2512) text-to-speech with flow matching DiT + HiFi-GAN vocoder
 - **OpenFold3** (OpenFold/OpenFold3) protein structure prediction with MSA module, PairFormer, diffusion sampling, and atom attention
-- **TTT-E2E** (test-time-training/e2e, *End-to-End Test-Time Training for Long Context*, Sun et al., arXiv 2512.23675) — sliding-window transformer with chunked **inner-loop SGD** on a per-suffix-block "prime" SwiGLU FFN at inference; matches the official JAX reference bit-near-exactly on logits + per-token NLL
 - **FP8 inference** with block-scaled FP8 quantization via DeepGEMM, UE8M0 power-of-two scales, and fused SiLU+Mul+FP8 quantization kernels
 - **Tensor parallelism** (TP) with custom IPC-based all-reduce for multi-GPU inference
 - **Paged KV cache** with Triton store kernels (LLM models); FP8 MLA KV cache for DeepSeek
@@ -132,12 +129,9 @@ python tests/bench_vllm.py \
 python tests/bench_vllm.py \
     --model openai/gpt-oss-120b --tp 2
 
-# Kimi Linear and Qwen3-Next hybrid linear-attention MoE models
+# Qwen2.5-Omni Thinker path (text + image + video + audio)
 python tests/bench_vllm.py \
-    --model moonshotai/Kimi-Linear-48B-A3B-Instruct --tp 2
-
-python tests/bench_vllm.py \
-    --model Qwen/Qwen3-Next-80B-A3B-Instruct --tp 2
+    --model Qwen/Qwen2.5-Omni-3B --num-seqs 1000
 
 # Whisper speech-to-text
 python tests/bench_vllm.py --model openai/whisper-large-v3
@@ -361,122 +355,6 @@ python tests/bench_oasis.py --model Etched/oasis-500m --skip-latency
 
 # Save results to a specific directory
 python tests/bench_oasis.py --model Etched/oasis-500m --output-dir tests/results/H200/oasis-500m
-```
-
-## TTT-E2E (test-time-training/e2e) benchmark
-
-Implements the *End-to-End Test-Time Training for Long Context* architecture
-(Sun et al., arXiv 2512.23675) end-to-end in kb-nano L1-L4: sliding-window
-transformer with chunked **inner-loop SGD** on a per-suffix-block "prime"
-SwiGLU FFN at inference time.
-
-**Cross-framework comparison.** The official reference at
-[github.com/test-time-training/e2e](https://github.com/test-time-training/e2e)
-is JAX/Equinox/Optax. There is no PyTorch SOTA reference for this paper; the
-predecessor paper's `ttt-lm-pytorch` is described by its authors as a "naive
-implementation for tutorial purposes" so it isn't a meaningful comparison
-target. We therefore bench against the JAX reference via a subprocess worker
-([`tests/bench_ttt_e2e_jax_worker.py`](tests/bench_ttt_e2e_jax_worker.py))
-that wraps `model.loss_for_sequence` in `eqx.filter_jit` for a fair perf
-comparison after XLA compilation.
-
-**Checkpoints.** The official checkpoints (125M / 1B / 3B at 8K and 128K)
-live on a Requester-Pays GCS bucket (`gs://ttt-e2e-checkpoints/...`) and
-require a GCP billing project to download. We bench against random-init
-weights initialized via the JAX reference's RNG and saved as a portable
-`.npz`; both engines load from the same file. This validates kb-nano's
-math against JAX bit-near-exactly without trained weights — perplexity
-numbers from the bench are not meaningful as accuracy claims.
-
-**Workload.** Long-context next-token loss on a real Project Gutenberg
-book ("The Adventures of Sherlock Holmes", #1661, ~141K Llama-3-tokenized
-tokens) sliced into 8192-token windows.
-
-### Results (variant: `125m_e2e`, B200, seq=8192, N=4 sequences, bf16)
-
-| Mode | Description | JAX (jit) | kb-nano cuDNN | kb-nano flex | Best ratio vs JAX |
-|---|---|---|---|---|---|
-| `pretrain` | Sliding-window transformer, prime FFN frozen | 80.33 ms (σ 2.47) | **25.60 ms** (σ 0.02) | **23.74 ms** (σ 0.04) | **3.39× faster** |
-| `meta` | Inner-loop SGD on prime FFN per 1024-token chunk | 40.83 ms (σ 0.81) | 51.55 ms (σ 0.04) | **37.00 ms** (σ 0.11) | **1.10× faster** |
-
-`flex` is the FlexAttention-on-suffix-path opt-in (`attention_backend="flex"`); `cuDNN` is the previous default. The flex backend is recommended for meta-mode inference workloads (the actual TTT-E2E path); cuDNN remains the default for backward-compat. Both backends are numerically equivalent vs JAX (see Correctness section). **All numbers measured in a single session**, B200, GPU 2 (quiet), sequential runs (n=30 timed measurements per backend per mode after 5–10 warmup forwards), random-init weights from the JAX worker (`init_and_save` seed=0), 8K-token Sherlock Holmes window. JAX timing via `eqx.filter_jit` + `block_until_ready`; kb-nano via `torch.cuda.CUDAGraph` replay.
-
-**Engine architecture.** `TTTE2EEngine` (`infra/ttt_e2e_engine.py`) compiles each layer's `forward_prefix` and `forward_suffix_chunk` with `torch.compile`, then captures the full meta forward as a `torch.cuda.CUDAGraph` per `(batch_size, seq_len)` shape so steady-state replay is deterministic (variance std 10 ms → 0.04 ms). The prefix attention runs on cuDNN flash (long-seq sweet spot, 5.7 ms for 9 layers × 8K seq); the suffix attention defaults to FlexAttention with a `BlockMask` that pre-prunes 93.75% of (Q, KV) tile pairs at construction, fused fwd+bwd Triton kernel autotuned for the asymmetric `(Q=1024, KV=9216, D=64)` shape — this is the optimisation that closes the gap to JAX (37.1 ms vs 40.8 ms). Per-chunk masks and RoPE positions are cached; the chunk input/target tensors are hoisted into static contiguous buffers so dynamo's stride guards don't thrash across chunk specializations. The inner-loop gradient uses `torch.autograd.grad` (not `torch.func.grad`, which traces per-call). cuDNN remains available via `--attention-backend cudnn` for backward-compat (51.55 ms meta — 11 ms slower than flex, still beats JAX on pretrain).
-
-Per-component attribution at the final state:
-
-| Component | PyTorch (flex, final) | JAX | Notes |
-|---|---|---|---|
-| Prefix-only forward (9 layers, 8K seq) | **5.7 ms** | 4.5 ms | cuDNN flash; flex doesn't help here. |
-| Full meta forward (8 chunks) | **37.00 ms** (σ 0.11) | 40.83 ms (σ 0.81) | flex beats JAX by 9.2%, deterministic via CUDA Graph replay. |
-
-### Correctness vs the JAX reference
-
-| Variant | Mode | Backend | Precision | Max abs NLL diff | Mean abs NLL diff |
-|---|---|---|---|---|---|
-| `125m_e2e` | `pretrain` | cuDNN | bf16 | 8.6e-2 | 2.3e-2 |
-| `125m_e2e` | `pretrain` | cuDNN | **fp32** | **3.4e-3** | **5.5e-4** |
-| `125m_e2e` | `meta` | cuDNN | bf16 | 8.30e-2 | 2.23e-2 |
-| `125m_e2e` | `meta` | flex  | bf16 | 8.30e-2 | 2.24e-2 |
-| `125m_e2e` | `meta` | flex vs cuDNN (within-PyTorch) | bf16 | 3.13e-2 | 2.19e-3 |
-
-The fp32 pretrain row is the bit-near-exact correctness check: kb-nano
-matches the JAX reference to ~1e-3 on individual token NLLs. The bf16
-gap vs JAX is the cross-framework promote-and-accumulate noise inherent in
-cuBLAS-vs-XLA bf16 matmul ordering, not a logic bug. Sequence-level mean
-NLL matches to 5e-4 or better in fp32 (11.900430 vs 11.900406).
-
-**The flex backend introduces no extra drift.** The flex-vs-JAX bf16
-diff (8.30e-2 max) is identical to cuDNN-vs-JAX (8.30e-2 max) to four
-decimal places — confirming the gap is XLA-vs-Inductor framework noise,
-not flex kernel error. The within-PyTorch comparison (flex vs cuDNN) is
-much tighter at 3.13e-2 max / 2.19e-3 mean, well within bf16 noise. A
-multi-seed sweep across 6 distinct random-weight configurations
-(seeds 0/1/7/42/1337/2024) showed flex matches cuDNN at max 2.45e-4 /
-mean 4.75e-5 with **100% of all 49,152 token positions tight at < 1e-3**.
-
-### L1-L4 layering and the kb-nano L1 RMSNorm bug we discovered
-
-The TTT-E2E modules in this PR conform to CLAUDE.md: L2 (`ttt_e2e_swa`,
-`ttt_e2e_block`, `ttt_e2e_swiglu`) compose only from L1 ops (no
-`torch.nn` or `torch.nn.functional` calls), and L4 (`ttt_e2e`) is
-chunk-loop wiring + the SGD update math. We added two new L1 ops and
-extended one existing L1 op:
-
-  - [`tasks/baseline/L1/rms_norm_native.py`](tasks/baseline/L1/rms_norm_native.py) — pure-PyTorch RMSNorm.
-    Used because the existing CUDA L1 RMSNorm (`tasks/baseline/L1/rms_norm.py`)
-    produces incorrect output for hidden sizes that aren't multiples of
-    32 (verified at hidden=16 and hidden=80) and has no autograd backward
-    registered. The doc-string of the CUDA L1 RMSNorm now points future
-    readers at this fix when they hit the same constraint.
-  - [`tasks/baseline/L1/ttt_e2e_rope.py`](tasks/baseline/L1/ttt_e2e_rope.py) — interleaved (GPT-J / JAX-default)
-    rotary embedding. Distinct from the existing L1 RotaryEmbedding which
-    uses NeOX/half-split layout; the layout difference is not weight-
-    translatable, so we have to match the JAX layout directly to keep
-    bit-near-exact parity.
-  - [`tasks/baseline/L1/dense_attention.py`](tasks/baseline/L1/dense_attention.py) — added two new backend
-    choices: `backend="cudnn"` (pinned cuDNN flash via
-    `torch.nn.attention.sdpa_kernel`, with `EFFICIENT/MATH` fallback
-    for shapes cuDNN rejects), and `backend="flex"` (FlexAttention with a
-    `BlockMask` instead of a dense bool mask). The `flex` backend is what
-    optimization #7 above relies on; the L1 op is the only place that
-    knows about FlexAttention so L2+ files stay clean of the new
-    dependency.
-
-**Reproduce**:
-```bash
-# Clone the JAX reference (the kb-nano worker auto-discovers it):
-git clone https://github.com/test-time-training/e2e /tmp/ttt_e2e_ref
-
-# Run the bench (cuDNN baseline — backwards-compat default):
-CUDA_VISIBLE_DEVICES=<idx> python -m kb_nano.tests.bench_ttt_e2e \
-    --variant 125m_e2e --seq-len 8192 --n-sequences 2 \
-    --modes pretrain meta --runs 3
-
-# Run the bench (flex — recommended for meta inference):
-CUDA_VISIBLE_DEVICES=<idx> python -m kb_nano.tests.bench_ttt_e2e \
-    --variant 125m_e2e --seq-len 8192 --n-sequences 2 \
-    --modes pretrain meta --runs 3 --attention-backend flex
 ```
 
 ## Benchmarking
@@ -714,53 +592,6 @@ Latency (128 output tokens, 5 iterations):
 
 Both models are at or above vLLM throughput across all scenarios (20B: 1.00–1.04x, 120B: 1.02–1.05x). Single-request latency trails vLLM (0.83–0.93x) since vLLM benefits from `torch.compile`/Inductor fusions at small batch sizes, while batched latency is on par. The lower token match rate for the 120B model is expected: with 128 experts and top-4 routing, small numerical differences in router logits cause different expert selections, which cascade into divergent outputs. The 20B model (32 experts) shows higher match rates (~86–91%).
 
-### Kimi Linear / Qwen3-Next
-
-Run `tests/bench_vllm.py --model moonshotai/Kimi-Linear-48B-A3B-Instruct --tp 2` and `tests/bench_vllm.py --model Qwen/Qwen3-Next-80B-A3B-Instruct --tp 2` to reproduce. 1000 sequences per throughput scenario, `temperature=0`, full vLLM/kb-nano optimizations enabled.
-
-Throughput:
-
-| Model | TP | Scenario | Input/Output | vLLM (tok/s) | Ours (tok/s) | Ratio | Avg Match Tokens |
-|-------|---:|----------|:------------:|-------------:|-------------:|------:|-----------------:|
-| Kimi-Linear-48B-A3B | 2 | prefill-heavy | 1024/512  | 13,043 | 15,554 | **1.19x** | 69.1/512 |
-| Kimi-Linear-48B-A3B | 2 | balanced      |  512/512  | 16,331 | 19,450 | **1.19x** | 71.7/512 |
-| Kimi-Linear-48B-A3B | 2 | decode-heavy  |  512/1024 | 18,325 | 22,326 | **1.22x** | 42.0/1024 |
-| Qwen3-Next-80B-A3B | 2 | prefill-heavy | 1024/512  |  8,684 | 10,697 | **1.23x** | 447.5/512 |
-| Qwen3-Next-80B-A3B | 2 | balanced      |  512/512  | 10,339 | 12,679 | **1.23x** | 451.0/512 |
-| Qwen3-Next-80B-A3B | 2 | decode-heavy  |  512/1024 | 11,257 | 14,141 | **1.26x** | 563.7/1024 |
-
-Latency (128 output tokens, 5 iterations):
-
-| Model | TP | Scenario | Batch Size | vLLM median | Ours median | vLLM ms/tok | Ours ms/tok | Ratio |
-|-------|---:|----------|---:|------------:|------------:|------------:|------------:|------:|
-| Kimi-Linear-48B-A3B | 2 | single-request | 1  | 0.568s | 0.672s | 4.44 | 5.25 | 0.85x |
-| Kimi-Linear-48B-A3B | 2 | fixed-batch-32 | 32 | 1.345s | 1.248s | 0.33 | 0.30 | **1.08x** |
-| Qwen3-Next-80B-A3B | 2 | single-request | 1  | 0.709s | 1.066s | 5.54 | 8.33 | 0.67x |
-| Qwen3-Next-80B-A3B | 2 | fixed-batch-32 | 32 | 1.336s | 1.769s | 0.33 | 0.43 | 0.76x |
-
-Kimi Linear alignment:
-
-The throughput table reports strict generated-token equality against vLLM. For Kimi Linear this is intentionally conservative: small bf16 differences in recurrent/linear-attention state can change one early greedy token, and exact continuation match then counts all downstream tokens as different. The stronger check is to feed each generated continuation back into vLLM as `prompt + generated_token_ids` and measure the rank of each generated token under vLLM prefill:
-
-```bash
-python tests/analyze_prefill_token_ranks.py \
-    --model moonshotai/Kimi-Linear-48B-A3B-Instruct \
-    --bench-output-dir tmp/readme_kimi_linear_full_vs_vllm_rerun \
-    --tp 2 --max-model-len 2048 --load-format fastsafetensors \
-    --limit 512
-```
-
-This scores 512 requests per scenario per engine (`512 x 3 x 2 = 3072` requests, 2,097,152 generated tokens total) with vLLM CUDA graphs enabled. kb-nano generated tokens rank as valid vLLM continuations, with no missing tokens and median rank 1:
-
-| Scenario | Engine | Scored Tokens | Top-1 | Top-20 | Median Rank |
-|----------|--------|--------------:|------:|-------:|------------:|
-| prefill-heavy | kb-nano | 262,144 | 0.9525 | 0.9921 | 1 |
-| prefill-heavy | vLLM self | 262,144 | 0.9298 | 0.9668 | 1 |
-| balanced | kb-nano | 262,144 | 0.9525 | 0.9930 | 1 |
-| balanced | vLLM self | 262,144 | 0.9141 | 0.9543 | 1 |
-| decode-heavy | kb-nano | 524,288 | 0.9409 | 0.9914 | 1 |
-| decode-heavy | vLLM self | 524,288 | 0.6348 | 0.9347 | 1 |
-
 ### Mamba / Mamba2 (Selective State-Space)
 
 Run `tests/bench_vllm.py --model state-spaces/mamba-2.8b-hf` and `tests/bench_vllm.py --model mistralai/Mamba-Codestral-7B-v0.1` to reproduce. 1000 sequences per scenario, `temperature=0`. kb-nano reuses vLLM's `causal_conv1d_fn` / `causal_conv1d_update`, `mamba_chunk_scan_combined_varlen` / `selective_scan_fn`, and `selective_state_update` Triton kernels behind a slot-based recurrent state cache, a chunked-prefill scheduler with a `max_num_batched_tokens` budget, **decode-only CUDA graphs at bucketed batch sizes (1, 2, 4, 8, …, 256)** with `PAD_SLOT_ID = -1` padding, **GPU greedy argmax + async D2H** of next-token IDs (a Mamba mirror of the attention engine's fast greedy path), **batched per-step state slot allocation/deallocation** broadcast over SHM, and **profile-based state pool sizing** that runs a synthetic worst-case prefill before allocating slots (mirrors vLLM's `determine_available_memory` → `get_kv_cache_configs` flow) so the slot count tracks vLLM's KV cache concurrency.
@@ -787,34 +618,6 @@ Latency (TP=1, 5 timed iterations):
 
 Token alignment is in the expected range for two independent SSM implementations at `temperature=0`: Mamba v1 stays relatively close (416.2/512, 402.1/512, 805.5/1024 average matching tokens across the three scenarios), and Codestral does as well after restoring its original mixed-batch token layout (418.4/512, 425.7/512, 823.5/1024). The recurrent state still accumulates small bf16 numerical differences over the full prefill chunk-scan, and those divergences compound across the decode loop. With profile-based state sizing kb-nano now allocates **716 slots** for Codestral and **1024 slots** for Mamba v1 on a single H200 (vLLM reports ~855 concurrent 1536-token requests for Codestral; Mamba v1's per-slot state is much smaller, so its slot count is higher). On the latest H200 rerun, Mamba v1 is effectively at parity with vLLM on throughput (0.98x / 1.04x / 1.12x across the three scenarios) and slightly ahead on latency (1.04x single-request, 1.02x fixed-batch-32), while Codestral is also near parity on throughput (0.98x / 0.96x / 0.97x) and latency (0.95x / 0.96x). Per-step instrumentation (enable with `KB_NANO_PROFILE_MAMBA=1`) still shows that **97% of decode-step wall time is in GPU + D2H wait**; CPU-side phases (admit, decode prep, finalize, slot bookkeeping) together account for less than 3%, so the remaining optimization work is concentrated in the GPU path and batched-latency tail rather than scheduler overhead.
 
-### Jamba (Transformer + Mamba-1 + Sparse MoE)
-
-Run `tests/bench_jamba.py --model ai21labs/Jamba-tiny-dev` and `tests/bench_jamba.py --model ai21labs/Jamba-v0.1` to reproduce. 1000 sequences per scenario, `temperature=0`. The reference is vLLM 0.18.0's production Jamba server; both sides dispatch into the same `causal_conv1d_fn` / `selective_scan_fn` Mamba CUDA primitives, so this measures engine-level overhead (continuous batching, paged KV, scheduler) plus the L2 attention/MLP wrapping.  L2 modules mirror vLLM's exactly (fused `QKVParallelLinear` + the project's `Attention` class + `RowParallelLinear`; `MergedColumnParallelLinear gate_up_proj` + `SiluAndMul`; Llama-style fused add+RMSNorm) so generated kernels port back into vLLM with no call-site change.
-
-Throughput:
-
-| Model | TP | Scenario | Input/Output | vLLM (tok/s) | Ours (tok/s) | Ratio | Avg Match Tokens |
-|-------|---:|----------|:------------:|-------------:|-------------:|------:|-----------------:|
-| Jamba-tiny-dev | 1 | prefill-heavy | 1024/608  | 15,751 | 36,096 | **2.29x** | 463.3/608  |
-| Jamba-tiny-dev | 1 | balanced      |  512/629  | 16,030 | 37,101 | **2.31x** | 421.9/629  |
-| Jamba-tiny-dev | 1 | decode-heavy  |  512/1008 | 23,948 | 62,947 | **2.63x** | 711.2/1008 |
-| Jamba-v0.1     | 1 | prefill-heavy | 1024/608  |  4,040 |  4,345 | **1.08x** | 355.2/608  |
-| Jamba-v0.1     | 1 | balanced      |  512/629  |  4,737 |  4,667 | 0.99x     | 322.6/629  |
-| Jamba-v0.1     | 1 | decode-heavy  |  512/1008 |  6,217 |  6,146 | 0.99x     | 568.4/1008 |
-
-Latency (128 output tokens, 5 iterations):
-
-| Model | TP | Scenario | Batch Size | vLLM median | Ours median | vLLM ms/tok | Ours ms/tok | Ratio |
-|-------|---:|----------|---:|------------:|------------:|------------:|------------:|------:|
-| Jamba-tiny-dev | 1 | single-request | 1  | 0.185s | 0.166s | 1.44 | 1.29 | **1.12x** |
-| Jamba-tiny-dev | 1 | fixed-batch-32 | 32 | 0.419s | 0.262s | 0.10 | 0.06 | **1.60x** |
-| Jamba-v0.1     | 1 | single-request | 1  | 0.916s | 0.927s | 7.16 | 7.24 | 0.99x |
-| Jamba-v0.1     | 1 | fixed-batch-32 | 32 | 3.183s | 3.227s | 0.78 | 0.79 | 0.99x |
-
-Tiny-dev (200M) clears vLLM by 2.40× geomean — kb-nano's tighter Python scheduler dominates at small model sizes where per-step overhead matters more than kernel time. v0.1 (52B) is at parity (1.02× geomean) under the same scheduler config (max_num_seqs=256). Both ship at TP=1: v0.1's bf16 weights (~104 GB) fit comfortably on one B200, and its activated MoE parameter count (~12B) is in the same regime as `gpt-oss-20b` (TP=1). `torch.compile` is OFF by default — Inductor's fused elementwise kernels drift from vLLM's `_C.fused_add_rms_norm` / `_C.silu_and_mul` in bf16 and tank match-tokens; set `KB_NANO_JAMBA_COMPILE=1` to opt in.
-
-**Hardware: 1× NVIDIA B200**
-
 **Hardware: NVIDIA H200**
 
 Run `tests/bench_vllm.py` to reproduce. Three scenarios per model, 1000 sequences each, `temperature=0`.
@@ -840,6 +643,32 @@ Run `tests/bench_vllm.py` to reproduce. Three scenarios per model, 1000 sequence
 | Mixtral-8x7B | 4 | prefill-heavy | 1024/512  | 15,060 | 23,064 | **1.53x** |
 | Mixtral-8x7B | 4 | balanced      |  512/512  | 20,530 | 33,443 | **1.63x** |
 | Mixtral-8x7B | 4 | decode-heavy  |  512/1024 | 24,728 | 37,761 | **1.53x** |
+
+### Qwen2.5-Omni
+
+Run `tests/bench_vllm.py --model Qwen/Qwen2.5-Omni-3B --num-seqs 1000` to reproduce. The benchmark uses the real `Qwen/Qwen2.5-Omni-3B` checkpoint and exercises the Thinker understanding path for four modalities. The speech-generation `talker` and `token2wav` modules are intentionally outside this benchmark.
+
+Datasets and workload: text uses `sfc-gh-goliaro/wildchat-kb-nano-balanced-1k`, image uses `lmarena-ai/VisionArena-Chat`, video uses `yale-nlp/MMVU`, and audio uses `openslr/librispeech_asr` (`test.clean`). Throughput runs 1000 requests per modality (4000 total requests), with 512 output tokens for text/image/video and 256 output tokens for audio. Audio samples are decoded from the real LibriSpeech FLAC payloads to mono float32 samples before being passed to both engines.
+
+Throughput and generated-token alignment (TP=1, H200, `temperature=0`, CUDA graphs enabled):
+
+| Model | TP | Scenario | Requests | Output | vLLM (tok/s) | Ours (tok/s) | Ratio | Exact Matches | Avg Match Tokens |
+|-------|---:|----------|---------:|-------:|-------------:|-------------:|------:|--------------:|-----------------:|
+| Qwen2.5-Omni-3B | 1 | text  | 1000 | 512 | 23,495 | 27,969 | **1.19x** | 915/1000 | 515.7/526.1 |
+| Qwen2.5-Omni-3B | 1 | image | 1000 | 512 | 12,664 | 12,059 | **0.95x** | 156/1000 | 179.2/512.0 |
+| Qwen2.5-Omni-3B | 1 | video | 1000 | 512 |  2,061 |  2,121 | **1.03x** | 153/1000 | 171.3/512.0 |
+| Qwen2.5-Omni-3B | 1 | audio | 1000 | 256 |  1,769 |  8,669 | **4.90x** | 223/1000 | 131.8/256.0 |
+
+Latency (single request, 128 output tokens, 5 timed iterations):
+
+| Model | TP | Scenario | vLLM median | Ours median | vLLM ms/tok | Ours ms/tok | Ratio |
+|-------|---:|----------|------------:|------------:|------------:|------------:|------:|
+| Qwen2.5-Omni-3B | 1 | single-text  | 1.678s | 1.767s | 13.11 | 13.80 | 0.95x |
+| Qwen2.5-Omni-3B | 1 | single-image | 0.427s | 0.500s |  3.34 |  3.91 | 0.85x |
+| Qwen2.5-Omni-3B | 1 | single-video | 0.473s | 0.696s |  3.70 |  5.44 | 0.68x |
+| Qwen2.5-Omni-3B | 1 | single-audio | 0.415s | 0.543s |  3.24 |  4.24 | 0.77x |
+
+Alignment here is exact generated-token prefix matching against vLLM. Single-request eager smoke tests matched vLLM exactly for text, image, video, and audio; long multimodal greedy generations can diverge from vLLM's CUDA-graph path numerically, so the multimodal alignment rows are best interpreted as regression signals rather than a top-k logit proof.
 
 ### Qwen2-VL / Qwen3-VL (VLM)
 
