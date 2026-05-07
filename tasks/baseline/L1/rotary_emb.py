@@ -187,3 +187,41 @@ class RotaryEmbedding(nn.Module):
                 positions, query, key, self.head_dim, cache,
             )
         return self.forward_cuda(positions, query, key)
+
+
+class Gemma4ProportionalRotaryEmbedding(RotaryEmbedding):
+    """Gemma4 proportional RoPE.
+
+    Gemma4 full-attention layers use a partial rotary factor, but the
+    frequency exponents are divided by the full head dimension and the
+    non-rotated angle pairs are represented as identity rotation.  This
+    matches HF/vLLM's proportional RoPE instead of rotating a compact
+    leading slice with ``rotary_dim`` as the denominator.
+    """
+
+    def __init__(
+        self,
+        head_dim: int,
+        rotary_dim: int,
+        max_position_embeddings: int,
+        rope_theta: float,
+    ):
+        nn.Module.__init__(self)
+        self.head_dim = head_dim
+        rope_angles = rotary_dim // 2
+        nope_angles = (head_dim // 2) - rope_angles
+
+        inv_freq = 1.0 / (
+            rope_theta ** (
+                torch.arange(0, 2 * rope_angles, 2, dtype=torch.float) / head_dim
+            )
+        )
+        if nope_angles > 0:
+            inv_freq = torch.cat(
+                [inv_freq, torch.zeros(nope_angles, dtype=torch.float)],
+            )
+
+        t = torch.arange(max_position_embeddings, dtype=torch.float)
+        freqs = torch.einsum("i,j -> ij", t, inv_freq)
+        cache = torch.cat((freqs.cos(), freqs.sin()), dim=-1).float()
+        self.register_buffer("cos_sin_cache", cache, persistent=False)

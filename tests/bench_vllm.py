@@ -260,6 +260,34 @@ def _is_whisper_model(model_name: str) -> bool:
     return "whisper" in lower
 
 
+def _load_tokenizer(model_name: str):
+    try:
+        return AutoTokenizer.from_pretrained(
+            model_name, trust_remote_code=True,
+        )
+    except AttributeError as exc:
+        msg = str(exc)
+        if "extra_special_tokens" not in msg and "keys" not in msg:
+            raise
+        from huggingface_hub import hf_hub_download
+
+        cfg_path = hf_hub_download(model_name, "tokenizer_config.json")
+        with open(cfg_path) as f:
+            tok_cfg = json.load(f)
+        extra = tok_cfg.get("extra_special_tokens")
+        if not isinstance(extra, list):
+            raise
+        extra_map = {
+            f"extra_special_token_{i}": token
+            for i, token in enumerate(extra)
+        }
+        return AutoTokenizer.from_pretrained(
+            model_name,
+            trust_remote_code=True,
+            extra_special_tokens=extra_map,
+        )
+
+
 # ---------------------------------------------------------------------------
 # Multi-scenario vLLM subprocess worker (LLM, text-only)
 # ---------------------------------------------------------------------------
@@ -328,13 +356,18 @@ def main():
         temperature = cfg.get("temperature", 0.0)
 
         sp_list = [
-            SamplingParams(temperature=temperature, ignore_eos=True, max_tokens=ol)
+            SamplingParams(
+                temperature=temperature,
+                ignore_eos=True,
+                max_tokens=ol,
+                detokenize=False,
+            )
             for ol in output_lens
         ]
 
         vllm_prompts = [dict(prompt_token_ids=p) for p in prompt_token_ids]
         start = time.perf_counter()
-        outputs = llm.generate(vllm_prompts, sp_list)
+        outputs = llm.generate(vllm_prompts, sp_list, use_tqdm=False)
         elapsed = time.perf_counter() - start
 
         total_prompt_tokens = sum(
@@ -463,7 +496,12 @@ def main():
         engine.block_manager.reset()
         torch.cuda.synchronize()
         start = time.perf_counter()
-        outputs = engine.generate(prompts, sp_list, use_tqdm=True)
+        outputs = engine.generate(
+            prompts,
+            sp_list,
+            use_tqdm=False,
+            decode_text=False,
+        )
         torch.cuda.synchronize()
         elapsed = time.perf_counter() - start
 
@@ -1653,9 +1691,7 @@ def main():
     global_max_seq_len = 0
     tokenizer = None
     if not is_whisper:
-        tokenizer = AutoTokenizer.from_pretrained(
-            args.model, trust_remote_code=True,
-        )
+        tokenizer = _load_tokenizer(args.model)
     if not args.skip_throughput:
         for i, scenario in enumerate(throughput_scenarios):
             if is_whisper:
