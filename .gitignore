@@ -222,7 +222,7 @@ bench/results/
 
 # Agent-generated kernels and build cache
 agent/_cuda_build_cache/
-tasks/candidate/L*/
+#tasks/candidate/L*/
 tasks/candidate/prev-attempts/
 
 # MLflow tracking store
