@@ -38,6 +38,8 @@ from ..tasks.baseline.L4.llama4 import Llama4Config, Llama4ForCausalLM
 from ..tasks.baseline.L4.mixtral import MixtralConfig, MixtralForCausalLM
 from ..tasks.baseline.L4.qwen2_vl import Qwen2VLConfig, Qwen2VLForConditionalGeneration
 from ..tasks.baseline.L4.qwen3_vl import Qwen3VLConfig, Qwen3VLForConditionalGeneration
+from ..tasks.baseline.L4.qwen3_next import Qwen3NextConfig, Qwen3NextForCausalLM
+from ..tasks.baseline.L4.deepseek import DeepSeekV3Config, DeepSeekV3ForCausalLM
 from ..tasks.baseline.L4.flux import FluxConfig, FluxPipeline
 from ..tasks.baseline.L4.gemma4 import Gemma4Config, Gemma4ForCausalLM
 from ..tasks.baseline.L4.whisper import WhisperConfig, WhisperForConditionalGeneration
@@ -1368,6 +1370,16 @@ def load_model(
         else:
             print("  Allocating Qwen3-VL model...")
         model = Qwen3VLForConditionalGeneration(config, quant_config=quant_config)
+    elif model_type == "qwen3_next":
+        config = Qwen3NextConfig.from_pretrained(model_name)
+        config.dtype = dtype
+        print(
+            "  Allocating Qwen3-Next model "
+            f"({config.num_experts} experts, "
+            f"{sum(config.is_linear_attn_layer(i) for i in range(config.num_hidden_layers))} GDN + "
+            f"{sum(not config.is_linear_attn_layer(i) for i in range(config.num_hidden_layers))} MHA layers)..."
+        )
+        model = Qwen3NextForCausalLM(config)
     elif model_type == "mamba2":
         from ..tasks.baseline.L4.mamba2 import Mamba2Config, Mamba2ForCausalLM
 
@@ -1411,6 +1423,19 @@ def load_model(
               f"({config.num_hidden_layers}L, hidden={config.hidden_size}, "
               f"W1.58A8)...")
         model = BitNetForCausalLM(config)
+    elif model_type == "kimi_linear":
+        from ..tasks.baseline.L4.kimi_linear import (
+            KimiLinearConfig,
+            KimiLinearForCausalLM,
+        )
+        config = KimiLinearConfig.from_pretrained(model_name)
+        config.dtype = dtype
+        print(
+            "  Allocating Kimi-Linear model "
+            f"({config.num_experts} experts, "
+            f"{len(config.kda_layers)} KDA + {len(config.full_attn_layers)} MLA layers)..."
+        )
+        model = KimiLinearForCausalLM(config, quant_config=quant_config)
     else:
         config = LlamaConfig.from_pretrained(model_name)
         config.dtype = dtype
@@ -1486,7 +1511,7 @@ def load_model(
         for name, buf in model.named_buffers():
             if buf.device != device:
                 buf.data = buf.data.to(device=device)
-        if model_type == "deepseek_v3":
+        if model_type in ("deepseek_v3", "kimi_linear"):
             _compute_mla_absorbed_weights(model)
         _postprocess_fp8_weights(model)
     elif model_type != "gpt_oss":
@@ -1495,7 +1520,7 @@ def load_model(
     if model_type in ("mamba", "mamba2") and dtype != torch.float32:
         _restore_mamba_ssm_params(model, model_type, device)
 
-    if model_type == "deepseek_v3" and quant_config is None:
+    if model_type in ("deepseek_v3", "kimi_linear") and quant_config is None:
         _compute_mla_absorbed_weights(model)
 
     if model_type == "bitnet":
@@ -1812,9 +1837,11 @@ def load_eagle3_draft_model(
 def _compute_mla_absorbed_weights(model: torch.nn.Module) -> None:
     """Compute absorbed W_UV weights for MLA decode after loading."""
     from ..tasks.baseline.L2.deepseek_mla_attention import DeepSeekMLAAttention
+    from ..tasks.baseline.L2.kimi_mla_attention import KimiMLAAttention
+
     count = 0
     for module in model.modules():
-        if isinstance(module, DeepSeekMLAAttention):
+        if isinstance(module, (DeepSeekMLAAttention, KimiMLAAttention)):
             module.compute_absorbed_weights()
             count += 1
     print(f"  Computed absorbed MLA weights for {count} attention layers.")

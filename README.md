@@ -1,6 +1,6 @@
 # kb-nano
 
-A standalone, high-performance inference engine supporting **LLMs** (Llama 3.1, Llama 4, Mixtral-8x7B, DeepSeek V3.2, GPT-OSS, BitNet b1.58, Qwen2-VL, Qwen3-VL), **linear-attention LLMs** (Mamba, Mamba2, GLA, RetNet, RWKV7), **diffusion models** (FLUX.1-dev, SDXL, HunyuanVideo-1.5), **detection models** (YOLOv10, RTDetrV2), **vision encoders** (SigLIP-2, DINOv3, SwinV2), **segmentation models** (SAM3.1), **protein structure prediction** (OpenFold3), audio models (Whisper), and **TTS models** (CosyVoice3) with tensor parallelism and FP8 quantization. No vLLM dependency at runtime — just PyTorch, Triton, and Flash Attention.
+A standalone, high-performance inference engine supporting **LLMs** (Llama 3.1, Llama 4, Mixtral-8x7B, DeepSeek V3.2, GPT-OSS, Kimi Linear, Qwen3-Next, Qwen2-VL, Qwen3-VL), **linear-attention LLMs** (GLA, RetNet, RWKV7), **embedding / retrieval models** (BGE-M3, ColBERTv2), **diffusion models** (FLUX.1-dev, SDXL, HunyuanVideo-1.5), **world models** (Oasis 500M), **detection models** (YOLOv10, RTDetrV2), **vision encoders** (SigLIP-2, DINOv3, SwinV2), **segmentation models** (SAM3.1), **3D point models** (PointTransformerV3), **protein structure prediction** (OpenFold3), audio models (Whisper), and **TTS models** (CosyVoice3) with tensor parallelism and FP8 quantization. No vLLM dependency at runtime — just PyTorch, Triton, and Flash Attention.
 
 ## Features
 
@@ -9,7 +9,10 @@ A standalone, high-performance inference engine supporting **LLMs** (Llama 3.1, 
 - **Mixtral-8x7B** with fused Triton MoE grouped-GEMM kernels
 - **DeepSeek V3.2** with MLA (Multi-head Latent Attention), 256-expert MoE via DeepGEMM FP8, DSA (DeepSeek Sparse Attention), and YARN RoPE — currently **0.78–0.90× of vLLM** throughput on 8×H200 (gap due to kernel-launch overhead, GEMM kernel selection, and AllReduce+RMSNorm fusion)
 - **GPT-OSS** (20B, 120B) MXFP4-quantized MoE with native Triton inference, YaRN RoPE, attention sinks, and sliding window
-- **BitNet b1.58 2B** (`microsoft/bitnet-b1.58-2B-4T`) native **W1.58A8** inference (1.58-bit ternary weights × int8 activations) with a Triton `int8 × packed-int2` fallback plus optional Microsoft ladder decode kernel for fair `M=1` benchmarking, fused QKV / gate-up `BitLinearMerged` projections, squared-ReLU gated FFN, and `attn_sub_norm` / `ffn_sub_norm` placement matching the SOTA `vllm_repo/BitNet` architecture
+- **Kimi Linear** (`moonshotai/Kimi-Linear-48B-A3B-Instruct`) hybrid KDA + MLA language model with 20 KDA layers, 7 MLA layers, and 256-expert MoE
+- **Qwen3-Next** (`Qwen/Qwen3-Next-80B-A3B-Instruct`) hybrid Gated DeltaNet + full-attention language model with 36 GDN layers, 12 MHA layers, and 512-expert MoE
+- **BGE-M3** dense + sparse + ColBERT-style embedding outputs
+- **ColBERTv2** query/doc encoders with MaxSim scoring
 - **Mamba / Mamba2** (`state-spaces/mamba-2.8b-hf`, `mistralai/Mamba-Codestral-7B-v0.1`) selective state-space models with vLLM-aligned `causal_conv1d` + `mamba_chunk_scan` / `selective_scan` kernels, slot-based recurrent state cache, chunked-prefill metadata, and TP sharding (incl. `n_groups % tp != 0` head-shard groups)
 - **GLA** (`fla-hub/gla-2.7B-100B`) Gated Linear Attention with per-head logsigmoid forget gate, swish output gate, and SwiGLU MLP — token-aligned with the FLA reference
 - **RetNet** (`fla-hub/retnet-2.7B-100B`) Multi-Scale Retention with rotary embeddings, fixed per-head decay (γ_h = 1 − 2^(−5−h)), swish output gate, and SwiGLU MLP — token-aligned with the FLA reference
@@ -17,6 +20,7 @@ A standalone, high-performance inference engine supporting **LLMs** (Llama 3.1, 
 - **FLUX.1-dev** diffusion transformer (text-to-image) with Flash Attention
 - **SDXL** (Stable Diffusion XL) UNet-based text-to-image with dual CLIP text encoders
 - **HunyuanVideo-1.5** 3D video diffusion transformer (text-to-video) with dual-stream joint attention, M-RoPE, and Qwen2.5-VL text encoder
+- **Oasis 500M** action-conditioned autoregressive diffusion world model
 - **YOLOv10** (`jameslahm/yolov10n`) NMS-free object detection with rank sorting
 - **RTDetrV2** (`PekingU/rtdetr_v2_r101vd`) real-time detection transformer with deformable attention
 - **Qwen2-VL / Qwen3-VL** vision-language models with image and video support
@@ -24,6 +28,7 @@ A standalone, high-performance inference engine supporting **LLMs** (Llama 3.1, 
 - **DINOv3** (facebook/dinov3-vit7b16-pretrain-lvd1689m) Eva vision encoder with 2D RoPE, SwiGLU MLP, and register tokens
 - **SwinV2** (timm/swinv2_large_window12_192.ms_in22k) hierarchical vision transformer with shifted-window cosine attention and continuous position bias
 - **SAM3.1** (facebook/sam3.1) image/video segmentation with ViT backbone, fusion encoder, detection decoder, and segmentation head
+- **PointTransformerV3** (Pointcept/PointTransformerV3) 3D point cloud transformer with serialized pooling, sparse conv stems, and optional Flash Attention
 - **Whisper** (large-v3) encoder-decoder speech-to-text with batched inference and paged cross-attention KV cache
 - **CosyVoice3** (Fun-CosyVoice3-0.5B-2512) text-to-speech with flow matching DiT + HiFi-GAN vocoder
 - **OpenFold3** (OpenFold/OpenFold3) protein structure prediction with MSA module, PairFormer, diffusion sampling, and atom attention
@@ -42,6 +47,9 @@ A standalone, high-performance inference engine supporting **LLMs** (Llama 3.1, 
 - **Detection benchmark** for YOLOv10 and RTDetrV2
 - **timm comparison benchmark** for SigLIP-2, DINOv3, and SwinV2 vision encoders (ImageNet-1K validation)
 - **facebook/sam3 comparison benchmark** for SAM3.1 segmentation
+- **vLLM pooling/token_embed comparison benchmark** for embedding and retrieval models
+- **PointTransformerV3 detached comparison benchmark** for 3D point cloud encoding
+- **open-oasis comparison benchmark** for autoregressive diffusion world models
 - **OpenFold/OpenFold3 comparison benchmark** for protein structure prediction
 
 ## Project Structure
@@ -122,28 +130,15 @@ python tests/bench_vllm.py \
 python tests/bench_vllm.py \
     --model openai/gpt-oss-120b --tp 2
 
+# Kimi Linear and Qwen3-Next hybrid linear-attention MoE models
+python tests/bench_vllm.py \
+    --model moonshotai/Kimi-Linear-48B-A3B-Instruct --tp 2
+
+python tests/bench_vllm.py \
+    --model Qwen/Qwen3-Next-80B-A3B-Instruct --tp 2
+
 # Whisper speech-to-text
 python tests/bench_vllm.py --model openai/whisper-large-v3
-
-# BitNet b1.58 (W1.58A8 native int8 inference) vs Microsoft BitNet GPU lib
-# One-time SOTA setup:
-git clone https://github.com/microsoft/BitNet /path/to/microsoft/BitNet
-cd /path/to/microsoft/BitNet/gpu
-bash bitnet_kernels/compile.sh
-huggingface-cli download microsoft/bitnet-b1.58-2B-4T-bf16 \
-    --local-dir checkpoints/bitnet-b1.58-2B-4T-bf16
-python convert_safetensors.py \
-    --safetensors_file checkpoints/bitnet-b1.58-2B-4T-bf16/model.safetensors \
-    --output checkpoints/model_state.pt --model_name 2B
-python convert_checkpoint.py --input checkpoints/model_state.pt
-rm checkpoints/model_state.pt
-cd /path/to/kb_nano
-BITNET_REPO=/path/to/microsoft/BitNet \
-    python tests/bench_microsoft_bitnet.py \
-        --prompt-source real --gen-bsz 1 --kb-bsz 1 --use-kb-cudagraph
-BITNET_REPO=/path/to/microsoft/BitNet \
-    python tests/bench_microsoft_bitnet.py \
-        --prompt-source real --skip-sota --kb-bsz 1 --use-kb-cudagraph
 
 # Bench module tests (unit tests + GPU integration)
 python tests/test_bench.py
@@ -316,10 +311,55 @@ The protein structure benchmark measures:
 - **Latency**: per-structure prediction latency with median stats
 - **Correctness**: percentage of queries meeting all correctness requirements (atom position cosine similarity >= 0.95, RMSD < 0.5A, pLDDT correlation >= 0.99, PAE cosine similarity >= 0.95)
 
+### Benchmarking vs vLLM (Embedding / Retrieval)
+
+Install the benchmark dependencies in the `kb` environment:
+
+```bash
+python -m pip install datasets==4.8.4 peft==0.18.1 GitPython==3.1.46 ujson==5.12.0 scipy==1.17.1
+```
+
+After that, run the benchmark directly from the repo root. The embedding benchmark compares kb-nano against vLLM's pooling runner in `token_embed` mode, using pre-tokenized identical requests for both engines. It reports end-to-end input tokens/sec, latency, and per-request output cosine correctness as part of the throughput run.
+
+```bash
+# BGE-M3 + ColBERTv2 token-level embedding throughput/latency/correctness vs vLLM
+python tests/bench_embedding.py
+
+# Single model
+python tests/bench_embedding.py --model bge-m3
+python tests/bench_embedding.py --model colbertv2.0
+
+# kb-nano only
+python tests/bench_embedding.py --model bge-m3 --skip-vllm
+
+# Skip latency phase
+python tests/bench_embedding.py --skip-latency
+
+# Save results to a specific directory
+python tests/bench_embedding.py --output-dir tests/results/B200/embedding/manual
+```
+
 The diffusion benchmark measures:
 - **Throughput**: images/sec (FLUX) or videos/sec (HunyuanVideo) at various resolutions
 - **Latency**: per-image/video latency with P50 percentile stats
 - **Correctness**: per-batch latent cosine similarity (FLUX) or per-prompt decoded-frame PSNR and cosine similarity (HunyuanVideo)
+
+### Benchmarking vs open-oasis (Autoregressive Diffusion)
+
+```bash
+# Oasis 500M: throughput + latency + correctness benchmark vs official open-oasis
+python tests/bench_oasis.py --model Etched/oasis-500m
+
+# Use an existing open-oasis checkout instead of auto-cloning it
+python tests/bench_oasis.py --model Etched/oasis-500m --open-oasis-src /path/to/open-oasis
+
+# Skip throughput or latency
+python tests/bench_oasis.py --model Etched/oasis-500m --skip-throughput
+python tests/bench_oasis.py --model Etched/oasis-500m --skip-latency
+
+# Save results to a specific directory
+python tests/bench_oasis.py --model Etched/oasis-500m --output-dir tests/results/H200/oasis-500m
+```
 
 ## Benchmarking
 
@@ -477,6 +517,7 @@ Each run is tagged with a `tier` (`agent`, `kernel`, `eval`, or `e2e`) indicatin
 - timm (pytorch-image-models — only needed for vision encoder comparison tests)
 - vLLM (only needed for running comparison tests)
 - matplotlib (only needed for benchmark plotting)
+- timm, einops, torchvision, av, rotary-embedding-torch (only needed for the Oasis / open-oasis comparison benchmark)
 - ultralytics (YOLOv10 baseline benchmarking)
 
 ### Optional detection benchmark dependencies
@@ -555,84 +596,52 @@ Latency (128 output tokens, 5 iterations):
 
 Both models are at or above vLLM throughput across all scenarios (20B: 1.00–1.04x, 120B: 1.02–1.05x). Single-request latency trails vLLM (0.83–0.93x) since vLLM benefits from `torch.compile`/Inductor fusions at small batch sizes, while batched latency is on par. The lower token match rate for the 120B model is expected: with 128 experts and top-4 routing, small numerical differences in router logits cause different expert selections, which cascade into divergent outputs. The 20B model (32 experts) shows higher match rates (~86–91%).
 
-<<<<<<< HEAD
-### BitNet b1.58 2B (W1.58A8)
+### Kimi Linear / Qwen3-Next
 
-`microsoft/bitnet-b1.58-2B-4T` runs in its native ternary-weight × int8-activation regime. The default fallback is a custom Triton `int8 × packed-int2` GEMM kernel (`tasks/baseline/L1/bitnet_int8xint2_linear.py`); when `KB_BITNET_KERNEL_LIB` points at the official Microsoft `libbitnet.so`, decode uses the same specialized `M == 1` ladder CUDA kernel as the SOTA baseline. The HuggingFace checkpoint stores ternary weights packed 4-per-`uint8` along the output axis; we re-pack to both KN-layout (`out, in//4`) for Triton and Microsoft ladder layout for the official decode kernel at load time. QKV and gate/up projections are fused into single `BitLinearMerged` calls, the MLP uses a fused squared-ReLU + multiply L1 primitive (`SquaredReluAndMul`), and `attn_sub_norm` / `ffn_sub_norm` RMSNorms are placed inside attention/MLP blocks per the SOTA `vllm_repo/BitNet` architecture. SOTA reference is the official **Microsoft BitNet GPU library** (`vllm_repo/BitNet/gpu`, custom W2A8 CUDA kernel + CUDA-graph batched decode); HuggingFace `transformers` does *not* run this model in its native quantized format and is roughly 5× slower than either implementation, so it is not used as a reference.
+Run `tests/bench_vllm.py --model moonshotai/Kimi-Linear-48B-A3B-Instruct --tp 2` and `tests/bench_vllm.py --model Qwen/Qwen3-Next-80B-A3B-Instruct --tp 2` to reproduce. 1000 sequences per throughput scenario, `temperature=0`, full vLLM/kb-nano optimizations enabled.
 
-Run `tests/bench_microsoft_bitnet.py` to reproduce. 1000 sequences per scenario, `temperature=0`, `ignore_eos=True`. The benchmark uses the real official model/checkpoint (`microsoft/bitnet-b1.58-2B-4T-bf16` converted by Microsoft's scripts into `model_state_fp16.pt` + `model_state_int2.pt`) and the official Microsoft `libbitnet.so` decode kernel. The default workload uses real WildChat-derived natural-language datasets (`sfc-gh-goliaro/wildchat-kb-nano-prefill-heavy-1k`, `sfc-gh-goliaro/wildchat-kb-nano-balanced-1k`, `sfc-gh-goliaro/wildchat-kb-nano-decode-heavy-1k`), tokenized with the BitNet tokenizer, then normalized to the fixed adding-arch graph shapes by suffix-truncating long prompts or left-padding short prompts. Decode budgets stay fixed at 512/512/1024 because the Microsoft GPU library hard-pins (batch size, prompt length, decode length) at CUDA-graph capture time, so the SOTA worker rebuilds the engine per scenario. Its native int2 decode kernels only dispatch for `M == 1`, so the benchmark intentionally uses `--gen-bsz 1`; larger values print `required ladder gemm kernel: M ...` and produce invalid SOTA outputs. For a fair baseline comparison, kb-nano also runs with `--kb-bsz 1 --use-kb-cudagraph`. Throughput is timed against the official CUDA-graph path.
-
-Alignment is reported two ways. Exact free-running prefix is retained as a strict diagnostic, but it is brittle on real text because two close logits can pick different valid continuations and then the sequences diverge. The primary real-text alignment check is teacher-forced top-k: feed both SOTA-generated and kb-nano-generated token sequences back through the official direct-decode reference and check whether each generated token is in the reference top-k.
-
-H200 validation:
-
-```bash
-BITNET_REPO=/path/to/microsoft/BitNet \
-    python tests/bench_microsoft_bitnet.py \
-        --prompt-source real --num-prompts 2 --alignment-prompts 2 \
-        --gen-bsz 1 --kb-bsz 1 --use-kb-cudagraph
-```
-
-| Scenario | Input/Output | Microsoft BitNet GPU (tok/s) | Ours (tok/s) | Ratio |
-|----------|:------------:|-----------------------------:|-------------:|------:|
-| prefill-heavy | 1024/512  | 1,160 | 1,217 | 1.05x |
-| balanced      |  512/512  |   791 |   904 | 1.14x |
-| decode-heavy  |  512/1024 |   594 |   693 | 1.17x |
-
-| Scenario | Exact Prefix | SOTA Self Top1/Top20 | KB Under SOTA Top1/Top20 |
-|----------|-------------:|---------------------:|--------------------------:|
-| prefill-heavy | 1.5/512    | 0.9873 / 1.0000 | 0.9639 / 1.0000 |
-| balanced      | 257.5/512  | 0.9980 / 1.0000 | 0.9863 / 1.0000 |
-| decode-heavy  | 49.5/1024  | 0.9951 / 1.0000 | 0.9805 / 1.0000 |
-
-These bsz=1 numbers use a 2-request validation workload because the official direct-decode alignment reference and teacher-forced top-k scorer are slow. kb-nano's generated tokens are accepted by the Microsoft direct-decode scorer at top20=1.0000 for all three real-text scenarios, while bsz=1 throughput is above the Microsoft baseline. kb-nano's continuous scheduler is faster at larger active batches, but those numbers are not the fair baseline comparison because the official int2 decode path is limited to `M == 1`.
-=======
-### Gemma4 26B-A4B
-
-Run:
-
-```bash
-CUDA_HOME=/usr/local/cuda-12.8 \
-PATH=/usr/local/cuda-12.8/bin:$PATH \
-LD_LIBRARY_PATH=/usr/local/cuda-12.8/lib64:${LD_LIBRARY_PATH:-} \
-VLLM_GEMMA4_MINIMAL_BUILD=1 \
-python tests/bench_vllm.py \
-  --model google/gemma-4-26B-A4B-it \
-  --tp 1 \
-  --num-seqs 1000 \
-  --skip-latency
-```
-
-Then score generated tokens by feeding both vLLM and kb-nano outputs back into vLLM:
-
-```bash
-CUDA_HOME=/usr/local/cuda-12.8 \
-PATH=/usr/local/cuda-12.8/bin:$PATH \
-LD_LIBRARY_PATH=/usr/local/cuda-12.8/lib64:${LD_LIBRARY_PATH:-} \
-VLLM_GEMMA4_MINIMAL_BUILD=1 \
-python tests/debug/gemma4_rank_align_vllm.py \
-  --result-dir tests/results/H200/gemma-4-26B-A4B-it_tp1/gemma4-throughput-1000-final3 \
-  --num-requests 1000 \
-  --sample 32 \
-  --summary tmp/gemma4_rank_score_1000_sample32_final3.json
-```
-
-Throughput (1000 sequences per scenario, real prompts, real `google/gemma-4-26B-A4B-it` weights, `temperature=0`, CUDA graphs enabled). kb-nano uses a Gemma4 scheduler default of `max_num_batched_tokens=2048`; this keeps the mixed prefill/decode path out of the slow regime while preserving decode-heavy throughput:
+Throughput:
 
 | Model | TP | Scenario | Input/Output | vLLM (tok/s) | Ours (tok/s) | Ratio | Avg Match Tokens |
 |-------|---:|----------|:------------:|-------------:|-------------:|------:|-----------------:|
-| Gemma4-26B-A4B-it | 1 | prefill-heavy | var/508 | 5,356 | 5,402 | **1.01x** | 88.9/508 |
-| Gemma4-26B-A4B-it | 1 | balanced      | var/518 | 7,178 | 7,502 | **1.05x** | 99.9/518 |
-| Gemma4-26B-A4B-it | 1 | decode-heavy  | var/986 | 7,030 | 6,686 | **0.95x** | 105.0/986 |
+| Kimi-Linear-48B-A3B | 2 | prefill-heavy | 1024/512  | 13,043 | 15,554 | **1.19x** | 69.1/512 |
+| Kimi-Linear-48B-A3B | 2 | balanced      |  512/512  | 16,331 | 19,450 | **1.19x** | 71.7/512 |
+| Kimi-Linear-48B-A3B | 2 | decode-heavy  |  512/1024 | 18,325 | 22,326 | **1.22x** | 42.0/1024 |
+| Qwen3-Next-80B-A3B | 2 | prefill-heavy | 1024/512  |  8,684 | 10,697 | **1.23x** | 447.5/512 |
+| Qwen3-Next-80B-A3B | 2 | balanced      |  512/512  | 10,339 | 12,679 | **1.23x** | 451.0/512 |
+| Qwen3-Next-80B-A3B | 2 | decode-heavy  |  512/1024 | 11,257 | 14,141 | **1.26x** | 563.7/1024 |
 
-Exact greedy token matching is low because small low-margin differences cascade across long generations. Alignment was checked by feeding generated continuations back into vLLM as a prefill scorer and measuring generated-token ranks. On a 32-request-per-scenario sample from the same 1000-sequence run, kb-nano is effectively identical to vLLM self-scoring at top-k:
+Latency (128 output tokens, 5 iterations):
 
-| Scenario | Scored Tokens | vLLM self Top-1 | kb-nano Top-1 | kb-nano Top-5 | kb-nano Top-20 | Median Rank |
-|----------|--------------:|----------------:|--------------:|--------------:|---------------:|------------:|
-| prefill-heavy | 16,028 | 98.40% | 98.61% | 99.99% | 99.99% | 1 |
-| balanced      | 17,460 | 98.44% | 98.57% | 99.99% | 99.99% | 1 |
-| decode-heavy  | 31,072 | 98.39% | 98.47% | 100.00% | 100.00% | 1 |
->>>>>>> origin/add-gemma
+| Model | TP | Scenario | Batch Size | vLLM median | Ours median | vLLM ms/tok | Ours ms/tok | Ratio |
+|-------|---:|----------|---:|------------:|------------:|------------:|------------:|------:|
+| Kimi-Linear-48B-A3B | 2 | single-request | 1  | 0.568s | 0.672s | 4.44 | 5.25 | 0.85x |
+| Kimi-Linear-48B-A3B | 2 | fixed-batch-32 | 32 | 1.345s | 1.248s | 0.33 | 0.30 | **1.08x** |
+| Qwen3-Next-80B-A3B | 2 | single-request | 1  | 0.709s | 1.066s | 5.54 | 8.33 | 0.67x |
+| Qwen3-Next-80B-A3B | 2 | fixed-batch-32 | 32 | 1.336s | 1.769s | 0.33 | 0.43 | 0.76x |
+
+Kimi Linear alignment:
+
+The throughput table reports strict generated-token equality against vLLM. For Kimi Linear this is intentionally conservative: small bf16 differences in recurrent/linear-attention state can change one early greedy token, and exact continuation match then counts all downstream tokens as different. The stronger check is to feed each generated continuation back into vLLM as `prompt + generated_token_ids` and measure the rank of each generated token under vLLM prefill:
+
+```bash
+python tests/analyze_prefill_token_ranks.py \
+    --model moonshotai/Kimi-Linear-48B-A3B-Instruct \
+    --bench-output-dir tmp/readme_kimi_linear_full_vs_vllm_rerun \
+    --tp 2 --max-model-len 2048 --load-format fastsafetensors \
+    --limit 512
+```
+
+This scores 512 requests per scenario per engine (`512 x 3 x 2 = 3072` requests, 2,097,152 generated tokens total) with vLLM CUDA graphs enabled. kb-nano generated tokens rank as valid vLLM continuations, with no missing tokens and median rank 1:
+
+| Scenario | Engine | Scored Tokens | Top-1 | Top-20 | Median Rank |
+|----------|--------|--------------:|------:|-------:|------------:|
+| prefill-heavy | kb-nano | 262,144 | 0.9525 | 0.9921 | 1 |
+| prefill-heavy | vLLM self | 262,144 | 0.9298 | 0.9668 | 1 |
+| balanced | kb-nano | 262,144 | 0.9525 | 0.9930 | 1 |
+| balanced | vLLM self | 262,144 | 0.9141 | 0.9543 | 1 |
+| decode-heavy | kb-nano | 524,288 | 0.9409 | 0.9914 | 1 |
+| decode-heavy | vLLM self | 524,288 | 0.6348 | 0.9347 | 1 |
 
 ### Mamba / Mamba2 (Selective State-Space)
 
@@ -750,6 +759,30 @@ Latency (batch size 1, 128 output tokens, 5 iterations):
 | Qwen3-VL-235B-FP8 (MoE) | 4 | single-video | 1.882s | 1.768s | **1.06x** |
 
 FP8 activation quantization uses a custom Triton kernel for single-launch per-token-group UE8M0 quantization. Pre-allocated shared prefill buffers eliminate dynamic allocation during FP8 prefill, and DeepGEMM is JIT-warmed for both decode and prefill batch sizes. The remaining throughput gap vs vLLM is primarily from vLLM's `torch.compile` + Inductor fusion passes (RMSNorm+quant, SiLU+quant).
+
+### BGE-M3 / ColBERTv2 (Embedding)
+
+Run `python tests/bench_embedding.py` to reproduce. Reference baseline: vLLM pooling runner in `token_embed` mode. Both engines receive the same pre-tokenized requests, use fp16 model weights with fp32 pooling heads, and materialize token-level embedding outputs before correctness comparison. The benchmark measures end-to-end input tokens/sec, not retrieval ranking quality.
+
+**Hardware: NVIDIA B200**
+
+Throughput (real dataset workloads, fp16, token-level embeddings):
+
+| Scenario | Requests | Input Tokens | vLLM tok/s | Ours tok/s | Ratio | Correct | Min Cos |
+|----------|---------:|-------------:|-----------:|-----------:|------:|:--------|--------:|
+| BGE-M3 MLDR documents | 1,000 | 4,569,071 | 376,516 | 398,706 | **1.06x** | PASS | 0.999012 |
+| ColBERTv2 MS MARCO passages | 60,000 | 4,627,378 | 346,735 | 1,068,509 | **3.08x** | PASS | 0.999992 |
+
+Latency (median of 5 runs, fp16):
+
+| Model | Scenario | BS | Input Tokens | vLLM median | Ours median | vLLM ms/tok | Ours ms/tok | Ratio |
+|-------|----------|---:|-------------:|------------:|------------:|------------:|------------:|------:|
+| BGE-M3 | single-request | 1 | 6,638 | 0.0197s | 0.0183s | 0.00 | 0.00 | **1.08x** |
+| BGE-M3 | fixed-batch-32 | 32 | 152,801 | 0.3411s | 0.3520s | 0.00 | 0.00 | 0.97x |
+| ColBERTv2 | single-request | 1 | 56 | 0.0042s | 0.0011s | 0.08 | 0.02 | **3.99x** |
+| ColBERTv2 | fixed-batch-32 | 32 | 2,401 | 0.0193s | 0.0022s | 0.01 | 0.00 | **8.63x** |
+
+BGE-M3 is near vLLM parity on large-document encoder work. The ColBERTv2 workload has many short passages, so the larger speedup primarily reflects lower end-to-end request/pooling/output overhead in kb-nano's packed token-embedding path rather than a claim that every ColBERT kernel is 3x faster than vLLM.
 
 ### DeepSeek V3.2 FP8 (MoE, MLA, DSA)
 
@@ -873,6 +906,31 @@ Correctness (eager mode, decoded video frames, per-prompt cosine similarity):
 | 480p-medium |  8 | 0.923 | 0.862 | 12.92 dB | WARN |
 
 Correctness is measured in decoded pixel space (both engines produce PIL video frames which are compared as uint8 numpy arrays). The pixel-level cosine similarity of ~0.92 is expected for two independent bf16 implementations: numerical differences in the 30-step denoising loop are amplified by the VAE decoder. For reference, latent-space comparison between kb-nano and HF diffusers yields CosSim=0.986, confirming the transformer backbone is correctly implemented. The pixel-space divergence is dominated by VAE decode amplification and different text encoder implementations (kb-nano uses a custom Qwen2.5-VL paged-attention encoder vs vllm-omni's HuggingFace-based encoder).
+
+### Oasis 500M (Autoregressive Diffusion)
+
+Run `python tests/bench_oasis.py --model Etched/oasis-500m` to reproduce. Reference baseline: official `open-oasis`, which the benchmark auto-clones under `data/open_oasis_src/` unless `--open-oasis-src` is provided.
+
+Dataset: `TESS-Computer/minecraft-vla-stage1` (`train` split), using non-overlapping real Minecraft clips from distinct source videos at 360x640. The benchmark converts each dataset action string into Oasis' 25-d control vector and caches the resulting prompt/action tensors locally under `data/oasis_cache/`.
+
+**Hardware: NVIDIA B200**
+
+Throughput workload:
+
+| Scenario | Dataset | Clips | Frames | DDIM Steps | Correctness Checked |
+|----------|---------|------:|-------:|-----------:|:--------------------|
+| short-bs4-16f-4ddim | `TESS-Computer/minecraft-vla-stage1` | 4 | 16 | 4 | yes |
+| medium-bs8-24f-4ddim | `TESS-Computer/minecraft-vla-stage1` | 8 | 24 | 4 | yes |
+| long-bs8-32f-4ddim | `TESS-Computer/minecraft-vla-stage1` | 8 | 32 | 4 | yes |
+| denoise-bs4-16f-8ddim | `TESS-Computer/minecraft-vla-stage1` | 4 | 16 | 8 | yes |
+
+Latency:
+
+| Scenario | Clips | Frames | Reference p50 (ms) | Ours p50 (ms) | Ratio |
+|----------|------:|-------:|-------------------:|--------------:|------:|
+| latency-bs1-8f-4ddim | 1 | 8 | 981.28 | 758.85 | **1.29x** |
+
+Correctness is measured for every throughput workload entry, using the same prompt frames and actions as the timed run. The benchmark reports cosine similarity, pass/fail status, and mean absolute difference for prompt latents, rollout latents, and decoded video in each throughput scenario.
 
 ### CosyVoice3 (TTS)
 
@@ -1140,60 +1198,6 @@ Correctness (deterministic, all queries across all scenarios):
 | PAE matrix cosine similarity    | mean >= 0.95               | **100% pass** |
 
 Both engines run identical model code with the same pretrained weights and deterministic seeding, achieving bitwise reproducibility (100% correctness pass rate). The throughput advantage comes from vectorized block conversion utilities (`torch.gather`-based) in the atom attention module, replacing Python for-loops in the reference implementation.
-
-### EAGLE-3 Speculative Decoding (Llama 3.1 8B)
-
-Run `tests/bench_sglang.py` to reproduce. Target model: `meta-llama/Llama-3.1-8B-Instruct`. Draft model: `jamesliu1/sglang-EAGLE3-Llama-3.1-Instruct-8B`. Reference engine: `sglang` v2 with EAGLE-3 enabled. Sampling is greedy (temperature 0). The measured workload below uses the real WildChat-derived dataset `sfc-gh-goliaro/wildchat-kb-nano-balanced-1k`, with the target model's chat template applied before tokenization.
-
-```bash
-python tests/bench_sglang.py \
-  --sglang-python /path/to/sglang/env/bin/python \
-  --workload wildchat \
-  --scenario balanced \
-  --num-seqs 1000 \
-  --max-running-requests 4 \
-  --cuda-graph-max-bs 4 \
-  --spec-num-draft-tokens 8 \
-  --skip-latency \
-  --output-dir tests/results/H200/eagle3_wildchat_balanced_1000seqs_b4_n8
-```
-
-Rank alignment is scored by feeding `prompt + generated_tokens` back through a target-only `sglang` engine and measuring each generated token's rank under the reference target logits:
-
-```bash
-python tests/score_sglang_rank_alignment.py \
-  --sglang-python /path/to/sglang/env/bin/python \
-  --workload wildchat \
-  --scenario balanced \
-  --num-seqs 1000 \
-  --max-running-requests 4 \
-  --cuda-graph-max-bs 4 \
-  --top-k 20 \
-  --output-dir tests/results/H200/eagle3_wildchat_balanced_1000seqs_b4_n8
-```
-
-**Hardware: NVIDIA H200**
-
-Throughput (1000 real WildChat requests, average input/output length 509.5/510.6 tokens):
-
-| Scenario | Dataset | Batch | Draft tokens | sglang (tok/s) | kb-nano (tok/s) | Speedup |
-|----------|---------|------:|-------------:|---------------:|----------------:|--------:|
-| wildchat-balanced-1000seqs | `sfc-gh-goliaro/wildchat-kb-nano-balanced-1k` | 4 | 8 | 948.8 | 931.5 | **0.98x** |
-
-Greedy-output alignment vs `sglang`:
-
-| Scenario | Exact matches | Avg match tokens / request | Result |
-|----------|--------------:|---------------------------:|:-------|
-| wildchat-balanced-1000seqs | 157/1000 | 230.3/510.6 | **PASS** |
-
-Target-rank alignment (`top_k=20`, scored by target-only `sglang`):
-
-| Outputs scored | Tokens | Top-1 | Top-5 | Top-20 | MRR | Median rank | Worst rank |
-|----------------|-------:|------:|------:|-------:|----:|------------:|-----------:|
-| sglang self | 510,621 | 99.30% | 100.00% | 100.00% | 0.9965 | 1 | 4 |
-| kb-nano | 510,621 | 99.24% | 100.00% | 100.00% | 0.9961 | 1 | 4 |
-
-The current implementation uses CUDA graphs for target verify, draft-chain, and post-verify draft-extend. The tree build path fuses verification-tree construction with FA3 cascade metadata generation and writes verify metadata directly into graph-owned buffers. Greedy strings can diverge after close-logit argmax flips, so the target-rank scorer is the stricter alignment check: kb-nano's generated tokens have effectively the same target-rank distribution as `sglang`'s own generated tokens on this workload.
 
 ### Key optimizations
 
