@@ -165,6 +165,34 @@ def normalize_row(r: dict) -> dict:
                 cur_notes = r.get("notes", "") or ""
                 r["notes"] = (cur_notes + " " + note).strip()
 
+    # Cleanup: for rows that ARE kb_nano_l4 or composable, scrub ops from
+    # `partial_or_unsupported_ops` that are now in NEWLY_SUPPORTED_OPS. These
+    # are stale flags from the initial subagent classification (when the row
+    # was 'partial' before auto-reclassify or before the audit branch added
+    # the L1 wrapper). Symmetric to the partial-row cleanup above.
+    if r.get("support_status") in ("kb_nano_l4", "composable"):
+        flagged = r.get("partial_or_unsupported_ops") or ""
+        if flagged.strip():
+            kept_entries = []
+            removed_ops = []
+            for entry in _split_outside_parens(flagged):
+                op = entry.split("(", 1)[0].strip().lower()
+                op = {"conv_transpose_1d": "conv_transpose1d",
+                      "conv_transpose_2d": "conv_transpose2d",
+                      "conv_transpose_3d": "conv_transpose3d"}.get(op, op)
+                if op in NEWLY_SUPPORTED_OPS:
+                    removed_ops.append(op)
+                else:
+                    kept_entries.append(entry)
+            if removed_ops:
+                r["partial_or_unsupported_ops"] = ";".join(kept_entries)
+                if removed_ops and not kept_entries:
+                    note = f"[v3.3 cleanup] Cleared stale partial-ops for {r['support_status']} row (now-supported by audit branch L1/L2): {sorted(set(removed_ops))}"
+                else:
+                    note = f"[v3.3 cleanup] Removed now-supported flags from partial_or_unsupported_ops: {sorted(set(removed_ops))}; remaining: {sorted(set(e.split('(',1)[0].strip().lower() for e in kept_entries))}"
+                cur_notes = r.get("notes", "") or ""
+                r["notes"] = (cur_notes + " " + note).strip()
+
     # Auto-rule: composable -> kb_nano_l4 when an L4 file exists matching this
     # HF folder name. Run AFTER partial→composable reclassify so rows that
     # just-became-composable also get checked.
@@ -296,6 +324,7 @@ NEWLY_SUPPORTED_OPS = {
     "conv_transpose3d",
     "grid_sample",
     "lstm",
+    "rg_lru_scan",  # added in audit branch (tasks/baseline/L1/rg_lru.py:RGLRU)
     "chunk_gated_delta_rule",
     "fused_recurrent_gated_delta_rule",
     "max_pool_1d",
@@ -314,6 +343,9 @@ NEWLY_SUPPORTED_OPS = {
     # (C) pre-existing kb-nano support
     "causal_conv1d",
     "deformable_attention_v1_normalization",
+    # (D) documented composable from existing kb-nano primitives (canonical map)
+    "encoder_decoder_cache",  # composable from 2x kv_cache (kb-nano L1/store_kvcache)
+    "mamba_scan",             # bundled in L2/mamba_mixer.py via vllm.model_executor.layers.mamba.ops.mamba_ssm
 }
 
 
@@ -506,6 +538,30 @@ def write_summary(rows, op_counter, op_examples, missing_folders):
     n_comp = sum(1 for r in pt_rows if r["support_status"] == "composable")
     n_partial = sum(1 for r in pt_rows if r["support_status"] == "partial")
     n_unsupp = sum(1 for r in pt_rows if r["support_status"] == "unsupported")
+    n_nir = sum(1 for r in rows if r["support_status"] == "not_inference_required")
+    n_pt_files = n_modeling_files  # alias for clarity in the narrative
+    modeling_denom = n_pt_files
+    pct_remaining = 100 * (n_partial + n_unsupp) / max(n_pt_files, 1)
+    pct_can_run = 100 * (n_l4 + n_comp + n_partial) / max(n_pt_files, 1)
+    pct_unsupp = 100 * n_unsupp / max(n_pt_files, 1)
+    n_remaining = n_partial + n_unsupp
+
+    # Build dynamic remaining-partial table from the live CSV (no hard-coded row counts).
+    partial_rows = [r for r in pt_rows if r["support_status"] == "partial"]
+    unsupp_rows = [r for r in pt_rows if r["support_status"] == "unsupported"]
+    # Why-still-partial reasons keyed by hf_folder. Truly-blocking reasons only.
+    PARTIAL_REASONS = {
+        "layoutlmv2": "Visual backbone is `detectron2`'s ResNet via `META_ARCH_REGISTRY`; runtime-loaded external library, outside kb-nano scope.",
+        "timm_backbone": "Wraps a runtime-loaded `timm` model selected by name; coverage is undecidable from static analysis.",
+        "timm_wrapper": "Same as `timm_backbone` — runtime `timm` dispatch.",
+        "recurrent_gemma": "RG-LRU is a custom recurrent unit with per-head `baddbmm` gates; NOW supported in audit branch (see L1/rg_lru.py); should re-classify on next merge.",
+    }
+    UNSUPP_REASONS = {
+        "mra": "Custom CUDA kernel `mra_cuda_kernel.{index_max, mm_to_sparse, sparse_dense_mm}` loaded from `kernels-community/mra`; no kb-nano L1.",
+        "reformer": "LSH-bucketed + chunked local self-attention with `_hash_vectors` + sort + custom compute; no standard SDPA mapping.",
+        "rwkv": "RWKV v4 `wkv` CUDA kernel — kb-nano has v7 only (`chunk_rwkv7` / `fused_recurrent_rwkv7`); v4 recurrence differs.",
+        "xlstm": "mLSTM kernels: `mlstm_chunkwise_kernel`, `mlstm_recurrent_sequence`, `mlstm_recurrent_step`; no kb-nano L1.",
+    }
 
     md = ROOT / "coverage_summary.md"
     with open(md, "w") as f:
@@ -579,27 +635,27 @@ See `audit_methodology.md` for full methodology, schema, and reproducibility ins
 
 (See `unsupported_operator_summary.csv` for the full ranking.)
 
-The first audit pass had 96 `partial` rows concentrated in three buckets — generic CNN-head pooling (`adaptive_avg_pool_*`), audio/segmentation upsampling (`conv_transpose*`, `leaky_relu`), and audio 1-D ops (`batch_norm_1d`, `avg_pool_1d`, `max_pool_1d`). These were closed by adding 16 new L1 wrappers in this audit branch (see `audit_methodology.md` § 15).
+The first audit pass had 96 `partial` rows concentrated in three buckets — generic CNN-head pooling (`adaptive_avg_pool_*`), audio/segmentation upsampling (`conv_transpose*`, `leaky_relu`), and audio 1-D ops (`batch_norm_1d`, `avg_pool_1d`, `max_pool_1d`). These were closed by adding 17 new L1 wrappers in this audit branch (see `audit_methodology.md` § 15 / § 17).
 
 After the re-audit, the remaining `partial` rows are bounded by ops that genuinely cannot be wrapped with a one-line F.x call:
 
 | HF folder | flagged op(s) | why still partial |
 |---|---|---|
-| `layoutlmv2` | `detectron2_backbone` (+ `adaptive_avg_pool_2d` which is now supported) | uses `detectron2`'s ResNet-via-`META_ARCH_REGISTRY` for visual feature extraction; external library, runtime-loaded |
-| `recurrent_gemma` | `rg_lru_scan` | RG-LRU is a custom recurrent unit (per-head gates, baddbmm-based scan); kb-nano's FLA family doesn't cover this exact recurrence |
-| `timm_backbone` | `timm_dynamic_backbone` | wrapper around a runtime-loaded `timm` model; coverage is undecidable from static analysis |
-| `timm_wrapper` | `timm_dynamic_backbone` | same |
-
-The 4 `unsupported` rows are all niche legacy or research architectures, not flagship models:
+""")
+        for r in partial_rows:
+            reason = PARTIAL_REASONS.get(r["hf_folder"], "see notes")
+            f.write(f"| `{r['hf_folder']}` | `{r['partial_or_unsupported_ops']}` | {reason} |\n")
+        f.write(f"""
+The {n_unsupp} `unsupported` rows are all niche legacy or research architectures, not flagship models:
 
 | HF folder | architecture | missing primitive |
 |---|---|---|
-| `mra` | sparse attention via custom CUDA kernel | `mra_cuda_kernel.index_max` and friends (loaded from `kernels-community/mra` HF Hub) |
-| `reformer` | LSH/local self-attention | hash-bucket attention with `_hash_vectors` + sort + chunked compute |
-| `rwkv` (v4) | RWKV v4 recurrence | `wkv` CUDA kernel — kb-nano covers v7 only (different recurrence) |
-| `xlstm` | mLSTM | `mlstm_chunkwise_kernel`, `mlstm_recurrent_sequence`, `mlstm_recurrent_step` |
-
-The 8 rows in these two tables together represent **{pct_remaining:.1f}% of the {modeling_denom} modeling-file denominator** ({n_partial} partial + {n_unsupp} unsupported).
+""")
+        for r in unsupp_rows:
+            reason = UNSUPP_REASONS.get(r["hf_folder"], "see notes")
+            f.write(f"| `{r['hf_folder']}` | `{r['partial_or_unsupported_ops']}` | {reason} |\n")
+        f.write(f"""
+These {n_remaining} rows ({n_partial} partial + {n_unsupp} unsupported) together represent **{pct_remaining:.2f}% of the {modeling_denom} modeling-file denominator**.
 
 ## Validation summary
 

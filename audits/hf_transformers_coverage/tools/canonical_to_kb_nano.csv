@@ -65,7 +65,8 @@ rotary_pos_emb_flux_2d,tasks/baseline/L1/flux_pos_embed.py,FluxPosEmbed,direct
 rotary_pos_emb_hunyuan_video,tasks/baseline/L1/hunyuan_video_rope.py,HunyuanVideo15RotaryPosEmbed,direct
 kv_cache,tasks/baseline/L1/store_kvcache.py,StoreKVCache,direct (paged KV; HND/NHD)
 kv_cache_fp8_mla,tasks/baseline/L1/store_kvcache_fp8_mla.py,StoreKVCacheFP8MLA,direct
-selective_scan,tasks/baseline/L1/?,?,Mamba ops are spread across mamba_chunked / mamba_recurrent files - need to verify
+selective_scan,tasks/baseline/L2/mamba_mixer.py,MambaMixer,bundled in L2 via vllm.model_executor.layers.mamba.ops.mamba_ssm.selective_scan_fn (verified by reading mamba_mixer.py:39-40 + 277). No standalone L1 file because vllm provides the kernel; kb-nano L4/mamba.py wires it up.
+softplus,tasks/baseline/L1/softplus.py,Softplus,direct (used by qwen3_next:672 and timesfm:232 via F.softplus; L1 exists in tree)
 causal_conv1d,tasks/baseline/L1/causal_conv1d.py,CausalConv1d,direct (L1 op; came in via add-kimi-qwen3next merge — was previously bundled inside L2/mamba_mixer.py via vllm import)
 moe_topk,tasks/baseline/L1/grouped_topk.py,GroupedTopK,direct
 moe_align,tasks/baseline/L1/moe_align.py,MoeAlign,direct
@@ -133,3 +134,14 @@ cross_entropy,training_only,,
 binary_cross_entropy,training_only,,
 mse_loss,training_only,,
 attention_dispatcher,multi_path,,ALL_ATTENTION_FUNCTIONS dispatches to one of: sdpa/flash_attention_2/eager/flex - kb-nano supports sdpa (DenseAttention) and flash_attention (FlashAttn*); flex_attention is unsupported but rarely the only path
+rg_lru_scan,tasks/baseline/L1/rg_lru.py,RGLRU,"direct (added in audit branch; faithful re-implementation of HF RecurrentGemmaRglru; numerically verified against HF reference, 23/23 tests, 0.00e+00 max-abs diff)"
+upsample,tasks/baseline/L1/interpolate.py,Interpolate,direct (alias for interpolate; nn.Upsample wraps F.interpolate)
+glu,composable,,"nn.GLU is gate*sigmoid(value); composable via kb-nano Linear → split → sigmoid → multiply. Not a single L1 in kb-nano (only fused SiluAndMul / SwigluOai exist for SwiGLU variants)."
+prelu,composable,,"nn.PReLU: x if x>0 else alpha*x with learnable alpha (per-channel). Composable via kb-nano ReLU + parametric scale; no single L1. Used by ~3 HF models (legacy CNNs)."
+gru_cell,composable,,"nn.GRUCell: single GRU step. Composable from kb-nano Linear (3x for r,z,n gates). Used by ~7 HF files (small encoder heads). No fused kernel in kb-nano (cuDNN doesn't expose single-step GRU)."
+unfold,passthrough,,"F.unfold (im2col). Torch builtin; used by ~3 HF models (segmentation patch extraction)."
+dropout_2d,training_only,,"nn.Dropout2d (channel-wise dropout). Inference-time = identity; training-only."
+sync_batch_norm,composable,,"nn.SyncBatchNorm: BatchNorm with cross-rank sync. Single-rank fallback uses kb-nano BatchNorm2d directly."
+reflection_pad_2d,passthrough,,"F.pad with mode='reflect'. Torch builtin."
+constant_pad_1d,passthrough,,"F.pad with mode='constant'. Torch builtin."
+constant_pad_2d,passthrough,,"F.pad with mode='constant'. Torch builtin."

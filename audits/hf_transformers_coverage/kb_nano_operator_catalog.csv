@@ -101,7 +101,7 @@ L1,tasks/baseline/L1/linear.py,Matmul,nn.Module,Linear (matrix multiply) kernels
 L1,tasks/baseline/L1/linear.py,BMM,nn.Module,Linear (matrix multiply) kernels.,"Batch matrix multiply: torch.matmul(a, b)."
 L1,tasks/baseline/L1/linear.py,Linear,nn.Module,Linear (matrix multiply) kernels.,Parametric linear: stores weight and bias internally.
 L1,tasks/baseline/L1/log_sigmoid.py,LogSigmoid,nn.Module,Log-sigmoid activation: log(1 / (1 + exp(-x))) = -softplus(-x).,
-L1,tasks/baseline/L1/lstm.py,LSTM,nn.Module,LSTM wrapping torch.nn.LSTM.,Standard LSTM wrapping ``torch.nn.LSTM``.
+L1,tasks/baseline/L1/lstm.py,LSTM,nn.LSTM,LSTM L1 op — subclass alias of ``torch.nn.LSTM`` (no kb-nano kernel).,Subclass alias of ``torch.nn.LSTM``. No kb-nano kernel; pure cuDNN.
 L1,tasks/baseline/L1/max_pool1d.py,MaxPool1d,nn.Module,MaxPool1d wrapping F.max_pool1d directly.,
 L1,tasks/baseline/L1/max_pool2d.py,MaxPool2d,nn.Module,MaxPool2d wrapping F.max_pool2d.,
 L1,tasks/baseline/L1/merge_attn_states.py,MergeAttnStates,nn.Module,Online softmax merge for two attention partitions.,Online softmax merge of two attention partitions.
@@ -136,6 +136,8 @@ L1,tasks/baseline/L1/pointtransformerv3_serialization.py,PointTransformerV3Seria
 L1,tasks/baseline/L1/quickgelu.py,QuickGELU,nn.Module,QuickGELU activation: x * sigmoid(1.702 * x).,
 L1,tasks/baseline/L1/relu.py,ReLU,nn.Module,"ReLU activation: max(0, x).",
 L1,tasks/baseline/L1/retnet_recurrence.py,NaiveRecurrentRetention,nn.Module,Naive recurrent retention kernel.,nn.Module wrapper around `naive_recurrent_retention` for L1 compliance.
+L1,tasks/baseline/L1/rg_lru.py,_SqrtBoundDerivative,torch.autograd.Function,RG-LRU (Real-Gated Linear Recurrent Unit) L1 op.,``sqrt`` with gradient clipped at ``_MAX_SQRT_GRADIENT``.
+L1,tasks/baseline/L1/rg_lru.py,RGLRU,nn.Module,RG-LRU (Real-Gated Linear Recurrent Unit) L1 op.,Real-Gated Linear Recurrent Unit (Griffin / Hawk recurrence).
 L1,tasks/baseline/L1/rms_norm.py,RMSNorm,nn.Module,RMSNorm with dual dispatch: CUDA custom op (eager) and pure-PyTorch (compiled).,
 L1,tasks/baseline/L1/rms_norm_gated.py,RMSNormGated,nn.Module,Gated RMSNorm with element-wise multiplicative gate (L1).,"Fused gated RMSNorm: ``out = activation(z) * RMSNorm(x, weight)``."
 L1,tasks/baseline/L1/rms_norm_native.py,RMSNormNative,nn.Module,"Pure-PyTorch RMSNorm L1 op (fp32-internal, autograd-friendly).",
