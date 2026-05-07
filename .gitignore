@@ -207,6 +207,11 @@ cython_debug/
 .cursorignore
 .cursorindexingignore
 
+# Private Cursor/Claude project rules (machine paths, personal agent instructions — not committed)
+.cursor/
+.claude/
+CLAUDE.md
+
 # Marimo
 marimo/_static/
 marimo/_lsp/

@@ -1357,6 +1357,12 @@ def load_model(
             "kb_nano.infra.jamba_engine.JambaEngine, "
             "not the LLM load_model() path."
         )
+    if model_type == "pi0":
+        raise ValueError(
+            "Pi0 robotics VLA models should be loaded via "
+            "kb_nano.infra.pi0_engine.Pi0Engine, "
+            "not the LLM load_model() path."
+        )
     if model_type == "gpt_oss":
         from ..tasks.baseline.L4.gpt_oss import GptOssConfig, GptOssForCausalLM
         config = GptOssConfig.from_pretrained(model_name)

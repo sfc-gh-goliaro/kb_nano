@@ -41,6 +41,7 @@ def run_worker(
     config: dict,
     label: str,
     timeout: int = 3600,
+    *,
     python_executable: str | None = None,
 ) -> dict | None:
     """Run a worker script in a subprocess and return parsed JSON output.
@@ -53,8 +54,8 @@ def run_worker(
         timeout: Maximum wall-clock seconds before the subprocess is killed.
         python_executable: Path to the Python interpreter to invoke. Defaults
             to ``sys.executable``. Use this to run a worker in a different
-            conda env (e.g. an isolated env where sglang is installed so its
-            torch/CUDA versions do not contaminate the parent env).
+            conda env (e.g. an isolated env where sglang/OpenPI is installed
+            so its torch/CUDA versions do not contaminate the parent env).
 
     Returns:
         Parsed JSON dict written by the worker to ``output_file``, or None on
@@ -90,9 +91,14 @@ def run_worker(
         print(f"  python: {py}")
         print(f"{'─' * 70}", flush=True)
 
+        env = os.environ.copy()
+        bindir = os.path.dirname(os.path.abspath(py))
+        if bindir:
+            env["PATH"] = bindir + os.pathsep + env.get("PATH", "")
         proc = subprocess.Popen(
             [py, "-u", script_path, config_path],
             start_new_session=True,
+            env=env,
         )
         try:
             returncode = proc.wait(timeout=timeout)

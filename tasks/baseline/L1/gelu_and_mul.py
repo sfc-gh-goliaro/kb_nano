@@ -1,4 +1,9 @@
-"""GELU-and-mul activation for packed gate/up projections."""
+"""GELU-and-mul activation for packed gate/up projections.
+
+Counterpart to ``SiluAndMul`` for models using GELU (e.g. Gemma / PaliGemma /
+some Pi0 paths).  The input is a concatenation of [gate, up] along the last
+dimension; the output is ``gelu(gate) * up`` with the chosen approximation.
+"""
 
 from __future__ import annotations
 
