@@ -12,8 +12,7 @@ L1,tasks/baseline/L1/chunk_gated_delta_rule.py,FusedRecurrentGatedDeltaRule,nn.M
 L1,tasks/baseline/L1/chunk_gla.py,ChunkGLA,nn.Module,Chunk GLA — Triton-accelerated chunked prefill kernel.,Triton chunk GLA kernel.
 L1,tasks/baseline/L1/chunk_retention.py,ChunkRetention,nn.Module,Chunk RetNet — Triton-accelerated chunked prefill kernel.,Triton chunk RetNet kernel.
 L1,tasks/baseline/L1/chunk_rwkv7.py,ChunkRWKV7,nn.Module,Chunk RWKV7 — Triton-accelerated chunked prefill kernel.,Triton chunk RWKV7 kernel.
-L1,tasks/baseline/L1/conv1d.py,Conv1d,nn.Module,Conv1D wrapper for Whisper audio encoder.,
-L1,tasks/baseline/L1/conv1d_native.py,Conv1dNative,nn.Module,General-purpose Conv1d L1 wrapper with full torch.nn.Conv1d kwarg coverage.,General Conv1d. Forward dispatches to F.conv1d (or pad+F.conv1d for
+L1,tasks/baseline/L1/conv1d.py,Conv1d,nn.Module,Conv1d wrapper around nn.Conv1d.,
 L1,tasks/baseline/L1/conv2d.py,Conv2d,nn.Module,Conv2d parametric op wrapping F.conv2d.,Parametric 2D convolution: stores weight and bias internally.
 L1,tasks/baseline/L1/conv3d.py,Conv3d,nn.Module,Conv3D patch embedding for vision encoder.,Conv3D wrapper matching vllm's Conv3dLayer interface.
 L1,tasks/baseline/L1/conv_transpose1d.py,ConvTranspose1d,nn.Module,ConvTranspose1d parametric op wrapping F.conv_transpose1d.,Parametric 1-D transposed convolution. Forward dispatches to

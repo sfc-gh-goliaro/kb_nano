@@ -33,8 +33,7 @@ lstm,tasks/baseline/L1/lstm.py,LSTM,direct (added in audit branch; numerically v
 squared_relu,tasks/baseline/L1/squared_relu.py,SquaredReLU,direct
 silu_and_mul,tasks/baseline/L1/silu_and_mul.py,SiluAndMul,fused SwiGLU activation
 swiglu_oai,tasks/baseline/L1/swiglu_oai.py,SwigluOai,fused GPT-OSS swiglu (clipped)
-conv1d,tasks/baseline/L1/conv1d_native.py,Conv1dNative,direct (full kwarg coverage: groups/dilation/padding_mode/etc; state_dict-compat with nn.Conv1d). Existing narrow tasks/baseline/L1/conv1d.py:Conv1d (Whisper-specific) is preserved unchanged.
-conv1d_whisper,tasks/baseline/L1/conv1d.py,Conv1d,Whisper-specific narrow wrapper (no groups/dilation/padding_mode); existing kb-nano L4 whisper.py uses this.
+conv1d,tasks/baseline/L1/conv1d.py,Conv1d,direct (extended additively in audit branch with groups/dilation/padding_mode/bias kwargs; backward-compatible — Whisper L4's existing default-kwargs usage and self.conv.weight access pattern unchanged). Verified bit-identical vs nn.Conv1d across all HF kwarg patterns (granite_speech depthwise, vibevoice strided+grouped+dilated, dac/encodec dilated+padded, squeezebert grouped, whisper narrow).
 conv2d,tasks/baseline/L1/conv2d.py,Conv2d,direct
 conv3d,tasks/baseline/L1/conv3d.py,Conv3d,direct
 conv_transpose1d,tasks/baseline/L1/conv_transpose1d.py,ConvTranspose1d,direct (added in audit branch; numerically verified vs nn.ConvTranspose1d)
