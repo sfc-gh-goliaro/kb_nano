@@ -16,6 +16,9 @@ from typing import Any, Dict, List
 import torch
 import torch.nn as nn
 
+from ..L1.batch_norm2d import BatchNorm2d
+from ..L1.conv2d import Conv2d
+from ..L1.relu import ReLU
 from ..L2.mobilenetv4_edge_residual import EdgeResidual
 from ..L2.mobilenetv4_uib import UniversalInvertedResidual
 
@@ -29,14 +32,14 @@ class ConvBlock(nn.Module):
 
     def __init__(self, in_chs: int, out_chs: int, kernel_size: int = 1, stride: int = 1):
         super().__init__()
-        self.conv = nn.Conv2d(
+        self.conv = Conv2d(
             in_chs, out_chs, kernel_size,
             stride=stride,
             padding=kernel_size // 2,
             bias=False,
         )
-        self.bn1 = nn.BatchNorm2d(out_chs)
-        self.act = nn.ReLU(inplace=True)
+        self.bn1 = BatchNorm2d(out_chs)
+        self.act = ReLU()
 
     def forward(self, x: torch.Tensor) -> torch.Tensor:
         return self.act(self.bn1(self.conv(x)))

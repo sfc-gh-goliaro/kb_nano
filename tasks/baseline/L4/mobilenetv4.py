@@ -16,6 +16,11 @@ from typing import List
 import torch
 import torch.nn as nn
 
+from ..L1.batch_norm2d import BatchNorm2d
+from ..L1.conv2d import Conv2d
+from ..L1.global_avg_pool2d import GlobalAvgPool2d
+from ..L1.linear import Linear
+from ..L1.relu import ReLU
 from ..L3.mobilenetv4_stage import MobileNetV4Stage
 
 
@@ -92,9 +97,9 @@ class MobileNetV4Model(nn.Module):
         self.head_hidden_size = head_hidden_size
 
         # Stem: 3x3 conv + BN + ReLU
-        self.conv_stem = nn.Conv2d(3, stem_size, 3, stride=2, padding=1, bias=False)
-        self.bn1 = nn.BatchNorm2d(stem_size)
-        self.act1 = nn.ReLU(inplace=True)
+        self.conv_stem = Conv2d(3, stem_size, 3, stride=2, padding=1, bias=False)
+        self.bn1 = BatchNorm2d(stem_size)
+        self.act1 = ReLU()
 
         # Trunk: sequential stages of blocks
         self.blocks = nn.Sequential(*[
@@ -102,12 +107,12 @@ class MobileNetV4Model(nn.Module):
         ])
 
         # Efficient head (MobileNetV4 variant with head_norm)
-        self.global_pool = nn.AdaptiveAvgPool2d(1)
-        self.conv_head = nn.Conv2d(num_features, head_hidden_size, 1, bias=False)
-        self.norm_head = nn.BatchNorm2d(head_hidden_size)
-        self.act_head = nn.ReLU(inplace=True)
+        self.global_pool = GlobalAvgPool2d(keepdim=True)
+        self.conv_head = Conv2d(num_features, head_hidden_size, 1, bias=False)
+        self.norm_head = BatchNorm2d(head_hidden_size)
+        self.act_head = ReLU()
         self.flatten = nn.Flatten(1)
-        self.classifier = nn.Linear(head_hidden_size, num_classes) if num_classes > 0 else nn.Identity()
+        self.classifier = Linear(head_hidden_size, num_classes) if num_classes > 0 else nn.Identity()
 
     def forward_features(self, x: torch.Tensor) -> torch.Tensor:
         x = self.act1(self.bn1(self.conv_stem(x)))

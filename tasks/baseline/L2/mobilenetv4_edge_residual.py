@@ -13,6 +13,9 @@ from __future__ import annotations
 import torch
 import torch.nn as nn
 
+from ..L1.batch_norm2d import BatchNorm2d
+from ..L1.conv2d import Conv2d
+from ..L1.relu import ReLU
 from .mobilenetv4_uib import _make_divisible
 
 
@@ -39,17 +42,17 @@ class EdgeResidual(nn.Module):
         mid_chs = _make_divisible(in_chs * exp_ratio)
         self.has_skip = (in_chs == out_chs and stride == 1)
 
-        self.conv_exp = nn.Conv2d(
+        self.conv_exp = Conv2d(
             in_chs, mid_chs, exp_kernel_size,
             stride=stride,
             padding=exp_kernel_size // 2,
             bias=False,
         )
-        self.bn1 = nn.BatchNorm2d(mid_chs)
-        self.act1 = nn.ReLU(inplace=True)
+        self.bn1 = BatchNorm2d(mid_chs)
+        self.act1 = ReLU()
 
-        self.conv_pwl = nn.Conv2d(mid_chs, out_chs, 1, bias=False)
-        self.bn2 = nn.BatchNorm2d(out_chs)
+        self.conv_pwl = Conv2d(mid_chs, out_chs, 1, bias=False)
+        self.bn2 = BatchNorm2d(out_chs)
 
     def forward(self, x: torch.Tensor) -> torch.Tensor:
         shortcut = x

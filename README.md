@@ -1,17 +1,16 @@
 # kb-nano
 
-A standalone, high-performance inference engine supporting **LLMs** (Llama 3.1, Llama 4, Mixtral-8x7B, DeepSeek V3.2, GPT-OSS, Qwen2.5-Omni, Qwen2-VL, Qwen3-VL), **linear-attention LLMs** (GLA, RetNet, RWKV7), **embedding / retrieval models** (BGE-M3, ColBERTv2), **diffusion models** (FLUX.1-dev, SDXL, HunyuanVideo-1.5), **world models** (Oasis 500M), **detection models** (YOLOv10, RTDetrV2), **vision encoders** (SigLIP-2, DINOv3, SwinV2), **segmentation models** (SAM3.1), **3D point models** (PointTransformerV3), **protein structure prediction** (OpenFold3), audio models (Whisper), and **TTS models** (CosyVoice3) with tensor parallelism and FP8 quantization. No vLLM dependency at runtime — just PyTorch, Triton, and Flash Attention.
+A standalone, high-performance inference engine supporting **LLMs** (Llama 3.1, Llama 4, Mixtral-8x7B, DeepSeek V3.2, GPT-OSS, Qwen2-VL, Qwen3-VL), **linear-attention LLMs** (GLA, RetNet, RWKV7), **image classification models** (ConvNeXtV2, EfficientNetV2), **diffusion models** (FLUX.1-dev, SDXL, HunyuanVideo-1.5), **detection models** (YOLOv10, RTDetrV2), **vision encoders** (SigLIP-2, DINOv3, SwinV2), **segmentation models** (SAM3.1), **protein structure prediction** (OpenFold3), audio models (Whisper), and **TTS models** (CosyVoice3) with tensor parallelism and FP8 quantization. No vLLM dependency at runtime — just PyTorch, Triton, and Flash Attention.
 
 ## Features
 
 - **Llama 3.1** (8B, 70B) with frequency-scaled RoPE
 - **Llama 4** with fused MoE experts
 - **Mixtral-8x7B** with fused Triton MoE grouped-GEMM kernels
+- **ConvNeXtV2** image classification with GRN and large-kernel depthwise blocks
+- **EfficientNetV2** image classification with fused MBConv / EdgeResidual blocks
 - **DeepSeek V3.2** with MLA (Multi-head Latent Attention), 256-expert MoE via DeepGEMM FP8, DSA (DeepSeek Sparse Attention), and YARN RoPE — currently **0.78–0.90× of vLLM** throughput on 8×H200 (gap due to kernel-launch overhead, GEMM kernel selection, and AllReduce+RMSNorm fusion)
 - **GPT-OSS** (20B, 120B) MXFP4-quantized MoE with native Triton inference, YaRN RoPE, attention sinks, and sliding window
-- **Qwen2.5-Omni** (`Qwen/Qwen2.5-Omni-3B`) Thinker path with real text, image, video, and audio inputs
-- **BGE-M3** dense + sparse + ColBERT-style embedding outputs
-- **ColBERTv2** query/doc encoders with MaxSim scoring
 - **Mamba / Mamba2** (`state-spaces/mamba-2.8b-hf`, `mistralai/Mamba-Codestral-7B-v0.1`) selective state-space models with vLLM-aligned `causal_conv1d` + `mamba_chunk_scan` / `selective_scan` kernels, slot-based recurrent state cache, chunked-prefill metadata, and TP sharding (incl. `n_groups % tp != 0` head-shard groups)
 - **GLA** (`fla-hub/gla-2.7B-100B`) Gated Linear Attention with per-head logsigmoid forget gate, swish output gate, and SwiGLU MLP — token-aligned with the FLA reference
 - **RetNet** (`fla-hub/retnet-2.7B-100B`) Multi-Scale Retention with rotary embeddings, fixed per-head decay (γ_h = 1 − 2^(−5−h)), swish output gate, and SwiGLU MLP — token-aligned with the FLA reference
@@ -19,7 +18,6 @@ A standalone, high-performance inference engine supporting **LLMs** (Llama 3.1, 
 - **FLUX.1-dev** diffusion transformer (text-to-image) with Flash Attention
 - **SDXL** (Stable Diffusion XL) UNet-based text-to-image with dual CLIP text encoders
 - **HunyuanVideo-1.5** 3D video diffusion transformer (text-to-video) with dual-stream joint attention, M-RoPE, and Qwen2.5-VL text encoder
-- **Oasis 500M** action-conditioned autoregressive diffusion world model
 - **YOLOv10** (`jameslahm/yolov10n`) NMS-free object detection with rank sorting
 - **RTDetrV2** (`PekingU/rtdetr_v2_r101vd`) real-time detection transformer with deformable attention
 - **Qwen2-VL / Qwen3-VL** vision-language models with image and video support
@@ -27,7 +25,6 @@ A standalone, high-performance inference engine supporting **LLMs** (Llama 3.1, 
 - **DINOv3** (facebook/dinov3-vit7b16-pretrain-lvd1689m) Eva vision encoder with 2D RoPE, SwiGLU MLP, and register tokens
 - **SwinV2** (timm/swinv2_large_window12_192.ms_in22k) hierarchical vision transformer with shifted-window cosine attention and continuous position bias
 - **SAM3.1** (facebook/sam3.1) image/video segmentation with ViT backbone, fusion encoder, detection decoder, and segmentation head
-- **PointTransformerV3** (Pointcept/PointTransformerV3) 3D point cloud transformer with serialized pooling, sparse conv stems, and optional Flash Attention
 - **Whisper** (large-v3) encoder-decoder speech-to-text with batched inference and paged cross-attention KV cache
 - **CosyVoice3** (Fun-CosyVoice3-0.5B-2512) text-to-speech with flow matching DiT + HiFi-GAN vocoder
 - **OpenFold3** (OpenFold/OpenFold3) protein structure prediction with MSA module, PairFormer, diffusion sampling, and atom attention
@@ -46,9 +43,6 @@ A standalone, high-performance inference engine supporting **LLMs** (Llama 3.1, 
 - **Detection benchmark** for YOLOv10 and RTDetrV2
 - **timm comparison benchmark** for SigLIP-2, DINOv3, and SwinV2 vision encoders (ImageNet-1K validation)
 - **facebook/sam3 comparison benchmark** for SAM3.1 segmentation
-- **vLLM pooling/token_embed comparison benchmark** for embedding and retrieval models
-- **PointTransformerV3 detached comparison benchmark** for 3D point cloud encoding
-- **open-oasis comparison benchmark** for autoregressive diffusion world models
 - **OpenFold/OpenFold3 comparison benchmark** for protein structure prediction
 
 ## Project Structure
@@ -85,6 +79,7 @@ A standalone, high-performance inference engine supporting **LLMs** (Llama 3.1, 
 └── tests/                      # Test suite
     ├── test_bench.py           # Bench module tests (discovery, replacement, kernel and E2E integration)
     ├── bench_vllm.py           # Multi-scenario throughput + latency + alignment benchmark vs vLLM
+    ├── bench_image_cls.py     # Image classification benchmark: kb-nano vs transformers / timm
     ├── bench_vllm_omni.py     # Diffusion (FLUX / HunyuanVideo) and TTS (CosyVoice3) benchmark: kb-nano vs vllm-omni
     ├── bench_diffusers.py     # SDXL diffusion benchmark: kb-nano vs diffusers + torch.compile
     ├── bench_timm.py          # Vision encoder benchmark: kb-nano vs timm (SigLIP-2, DINOv3, SwinV2)
@@ -129,10 +124,6 @@ python tests/bench_vllm.py \
 python tests/bench_vllm.py \
     --model openai/gpt-oss-120b --tp 2
 
-# Qwen2.5-Omni Thinker path (text + image + video + audio)
-python tests/bench_vllm.py \
-    --model Qwen/Qwen2.5-Omni-3B --num-seqs 1000
-
 # Whisper speech-to-text
 python tests/bench_vllm.py --model openai/whisper-large-v3
 
@@ -141,6 +132,68 @@ python tests/test_bench.py
 
 # Bench module unit tests only (no GPU required)
 python tests/test_bench.py --unit-only
+```
+
+### Benchmarking vs transformers / timm (Image Classification)
+
+Default dataset: real `food101` validation images. ConvNeXtV2 is compared with Hugging Face Transformers, and EfficientNetV2 is compared with timm (`pytorch-image-models`). The official workload below uses batch size 8, 3072 images per measured pass, and 3 measured passes. If you have gated access to `ILSVRC/imagenet-1k`, you can override with `--dataset ILSVRC/imagenet-1k --dataset-split validation`.
+
+```bash
+# ConvNeXtV2: throughput + latency + logits alignment vs transformers
+python tests/bench_image_cls.py \
+    --model facebook/convnextv2-base-22k-384 \
+    --use-fp16 \
+    --num-images 3072 \
+    --batch-size 8 \
+    --measure-iters 3 \
+    --alignment-images 32
+
+# EfficientNetV2: throughput + latency + logits alignment vs timm
+python tests/bench_image_cls.py \
+    --model timm/efficientnetv2_rw_m.agc_in1k \
+    --use-fp16 \
+    --num-images 3072 \
+    --batch-size 8 \
+    --measure-iters 3 \
+    --alignment-images 32
+
+# kb-nano only
+python tests/bench_image_cls.py \
+    --model facebook/convnextv2-base-22k-384 \
+    --use-fp16 \
+    --num-images 3072 \
+    --batch-size 8 \
+    --measure-iters 3 \
+    --alignment-images 32 \
+    --skip-reference
+
+# Use gated ImageNet-1K validation instead
+python tests/bench_image_cls.py \
+    --model facebook/convnextv2-base-22k-384 \
+    --use-fp16 \
+    --num-images 3072 \
+    --batch-size 8 \
+    --measure-iters 3 \
+    --alignment-images 32 \
+    --dataset ILSVRC/imagenet-1k --dataset-split validation
+
+# Save results to a specific directory
+python tests/bench_image_cls.py \
+    --model facebook/convnextv2-base-22k-384 \
+    --use-fp16 \
+    --num-images 3072 \
+    --batch-size 8 \
+    --measure-iters 3 \
+    --alignment-images 32 \
+    --output-dir tests/results/H200/convnextv2-base-22k-384-heavy
+python tests/bench_image_cls.py \
+    --model timm/efficientnetv2_rw_m.agc_in1k \
+    --use-fp16 \
+    --num-images 3072 \
+    --batch-size 8 \
+    --measure-iters 3 \
+    --alignment-images 32 \
+    --output-dir tests/results/H200/efficientnetv2_rw_m.agc_in1k-heavy
 ```
 
 ### Benchmarking vs flash-linear-attention (GLA / RetNet / RWKV7)
@@ -307,55 +360,10 @@ The protein structure benchmark measures:
 - **Latency**: per-structure prediction latency with median stats
 - **Correctness**: percentage of queries meeting all correctness requirements (atom position cosine similarity >= 0.95, RMSD < 0.5A, pLDDT correlation >= 0.99, PAE cosine similarity >= 0.95)
 
-### Benchmarking vs vLLM (Embedding / Retrieval)
-
-Install the benchmark dependencies in the `kb` environment:
-
-```bash
-python -m pip install datasets==4.8.4 peft==0.18.1 GitPython==3.1.46 ujson==5.12.0 scipy==1.17.1
-```
-
-After that, run the benchmark directly from the repo root. The embedding benchmark compares kb-nano against vLLM's pooling runner in `token_embed` mode, using pre-tokenized identical requests for both engines. It reports end-to-end input tokens/sec, latency, and per-request output cosine correctness as part of the throughput run.
-
-```bash
-# BGE-M3 + ColBERTv2 token-level embedding throughput/latency/correctness vs vLLM
-python tests/bench_embedding.py
-
-# Single model
-python tests/bench_embedding.py --model bge-m3
-python tests/bench_embedding.py --model colbertv2.0
-
-# kb-nano only
-python tests/bench_embedding.py --model bge-m3 --skip-vllm
-
-# Skip latency phase
-python tests/bench_embedding.py --skip-latency
-
-# Save results to a specific directory
-python tests/bench_embedding.py --output-dir tests/results/B200/embedding/manual
-```
-
 The diffusion benchmark measures:
 - **Throughput**: images/sec (FLUX) or videos/sec (HunyuanVideo) at various resolutions
 - **Latency**: per-image/video latency with P50 percentile stats
 - **Correctness**: per-batch latent cosine similarity (FLUX) or per-prompt decoded-frame PSNR and cosine similarity (HunyuanVideo)
-
-### Benchmarking vs open-oasis (Autoregressive Diffusion)
-
-```bash
-# Oasis 500M: throughput + latency + correctness benchmark vs official open-oasis
-python tests/bench_oasis.py --model Etched/oasis-500m
-
-# Use an existing open-oasis checkout instead of auto-cloning it
-python tests/bench_oasis.py --model Etched/oasis-500m --open-oasis-src /path/to/open-oasis
-
-# Skip throughput or latency
-python tests/bench_oasis.py --model Etched/oasis-500m --skip-throughput
-python tests/bench_oasis.py --model Etched/oasis-500m --skip-latency
-
-# Save results to a specific directory
-python tests/bench_oasis.py --model Etched/oasis-500m --output-dir tests/results/H200/oasis-500m
-```
 
 ## Benchmarking
 
@@ -510,10 +518,9 @@ Each run is tagged with a `tier` (`agent`, `kernel`, `eval`, or `e2e`) indicatin
 - Hugging Face (`transformers`, `huggingface_hub`, `safetensors`)
 - aiohttp (for the LLM kernel agent)
 - MLflow (experiment tracking — gracefully skipped if not installed)
-- timm (pytorch-image-models — only needed for vision encoder comparison tests)
+- timm (pytorch-image-models — only needed for EfficientNetV2 and vision encoder comparison tests)
 - vLLM (only needed for running comparison tests)
 - matplotlib (only needed for benchmark plotting)
-- timm, einops, torchvision, av, rotary-embedding-torch (only needed for the Oasis / open-oasis comparison benchmark)
 - ultralytics (YOLOv10 baseline benchmarking)
 
 ### Optional detection benchmark dependencies
@@ -644,31 +651,28 @@ Run `tests/bench_vllm.py` to reproduce. Three scenarios per model, 1000 sequence
 | Mixtral-8x7B | 4 | balanced      |  512/512  | 20,530 | 33,443 | **1.63x** |
 | Mixtral-8x7B | 4 | decode-heavy  |  512/1024 | 24,728 | 37,761 | **1.53x** |
 
-### Qwen2.5-Omni
+### ConvNeXtV2 / EfficientNetV2 (Image Classification)
 
-Run `tests/bench_vllm.py --model Qwen/Qwen2.5-Omni-3B --num-seqs 1000` to reproduce. The benchmark uses the real `Qwen/Qwen2.5-Omni-3B` checkpoint and exercises the Thinker understanding path for four modalities. The speech-generation `talker` and `token2wav` modules are intentionally outside this benchmark.
+Run `tests/bench_image_cls.py` to reproduce. Real `food101` validation images are used by default (streamed from Hugging Face datasets), resized and center-cropped to the target resolution with model-specific normalization. ConvNeXtV2 uses Hugging Face Transformers as the reference library; EfficientNetV2 uses timm (`pytorch-image-models`). Both engines run in fp16 on H200. The reported workload uses `--num-images 3072 --batch-size 8 --measure-iters 3 --alignment-images 32`, for 9216 timed images per backend.
 
-Datasets and workload: text uses `sfc-gh-goliaro/wildchat-kb-nano-balanced-1k`, image uses `lmarena-ai/VisionArena-Chat`, video uses `yale-nlp/MMVU`, and audio uses `openslr/librispeech_asr` (`test.clean`). Throughput runs 1000 requests per modality (4000 total requests), with 512 output tokens for text/image/video and 256 output tokens for audio. Audio samples are decoded from the real LibriSpeech FLAC payloads to mono float32 samples before being passed to both engines.
+| Model | Reference | Image Size | Ref (img/s) | Ours (img/s) | Ratio | Top1 Match |
+|-------|-----------|-----------:|------------:|-------------:|------:|-----------:|
+| facebook/convnextv2-base-22k-384 | transformers | 384 | 784.28 | 780.12 | **0.99x** | 1.00 |
+| timm/efficientnetv2_rw_m.agc_in1k | timm | 320 | 651.71 | 681.34 | **1.05x** | 1.00 |
 
-Throughput and generated-token alignment (TP=1, H200, `temperature=0`, CUDA graphs enabled):
+Latency ratio (`reference median / ours median`):
 
-| Model | TP | Scenario | Requests | Output | vLLM (tok/s) | Ours (tok/s) | Ratio | Exact Matches | Avg Match Tokens |
-|-------|---:|----------|---------:|-------:|-------------:|-------------:|------:|--------------:|-----------------:|
-| Qwen2.5-Omni-3B | 1 | text  | 1000 | 512 | 23,495 | 27,969 | **1.19x** | 915/1000 | 515.7/526.1 |
-| Qwen2.5-Omni-3B | 1 | image | 1000 | 512 | 12,664 | 12,059 | **0.95x** | 156/1000 | 179.2/512.0 |
-| Qwen2.5-Omni-3B | 1 | video | 1000 | 512 |  2,061 |  2,121 | **1.03x** | 153/1000 | 171.3/512.0 |
-| Qwen2.5-Omni-3B | 1 | audio | 1000 | 256 |  1,769 |  8,669 | **4.90x** | 223/1000 | 131.8/256.0 |
+| Model | Batch 1 | Batch 8 |
+|-------|--------:|--------:|
+| ConvNeXtV2 | 0.98x | **1.00x** |
+| EfficientNetV2 | **1.09x** | **1.06x** |
 
-Latency (single request, 128 output tokens, 5 timed iterations):
+Logit alignment:
 
-| Model | TP | Scenario | vLLM median | Ours median | vLLM ms/tok | Ours ms/tok | Ratio |
-|-------|---:|----------|------------:|------------:|------------:|------------:|------:|
-| Qwen2.5-Omni-3B | 1 | single-text  | 1.678s | 1.767s | 13.11 | 13.80 | 0.95x |
-| Qwen2.5-Omni-3B | 1 | single-image | 0.427s | 0.500s |  3.34 |  3.91 | 0.85x |
-| Qwen2.5-Omni-3B | 1 | single-video | 0.473s | 0.696s |  3.70 |  5.44 | 0.68x |
-| Qwen2.5-Omni-3B | 1 | single-audio | 0.415s | 0.543s |  3.24 |  4.24 | 0.77x |
-
-Alignment here is exact generated-token prefix matching against vLLM. Single-request eager smoke tests matched vLLM exactly for text, image, video, and audio; long multimodal greedy generations can diverge from vLLM's CUDA-graph path numerically, so the multimodal alignment rows are best interpreted as regression signals rather than a top-k logit proof.
+| Model | Cosine | MAE |
+|-------|-------:|----:|
+| ConvNeXtV2 | 1.000000 | 0.0 |
+| EfficientNetV2 | 1.000000 | 0.0 |
 
 ### Qwen2-VL / Qwen3-VL (VLM)
 
@@ -734,30 +738,6 @@ Latency (batch size 1, 128 output tokens, 5 iterations):
 | Qwen3-VL-235B-FP8 (MoE) | 4 | single-video | 1.882s | 1.768s | **1.06x** |
 
 FP8 activation quantization uses a custom Triton kernel for single-launch per-token-group UE8M0 quantization. Pre-allocated shared prefill buffers eliminate dynamic allocation during FP8 prefill, and DeepGEMM is JIT-warmed for both decode and prefill batch sizes. The remaining throughput gap vs vLLM is primarily from vLLM's `torch.compile` + Inductor fusion passes (RMSNorm+quant, SiLU+quant).
-
-### BGE-M3 / ColBERTv2 (Embedding)
-
-Run `python tests/bench_embedding.py` to reproduce. Reference baseline: vLLM pooling runner in `token_embed` mode. Both engines receive the same pre-tokenized requests, use fp16 model weights with fp32 pooling heads, and materialize token-level embedding outputs before correctness comparison. The benchmark measures end-to-end input tokens/sec, not retrieval ranking quality.
-
-**Hardware: NVIDIA B200**
-
-Throughput (real dataset workloads, fp16, token-level embeddings):
-
-| Scenario | Requests | Input Tokens | vLLM tok/s | Ours tok/s | Ratio | Correct | Min Cos |
-|----------|---------:|-------------:|-----------:|-----------:|------:|:--------|--------:|
-| BGE-M3 MLDR documents | 1,000 | 4,569,071 | 376,516 | 398,706 | **1.06x** | PASS | 0.999012 |
-| ColBERTv2 MS MARCO passages | 60,000 | 4,627,378 | 346,735 | 1,068,509 | **3.08x** | PASS | 0.999992 |
-
-Latency (median of 5 runs, fp16):
-
-| Model | Scenario | BS | Input Tokens | vLLM median | Ours median | vLLM ms/tok | Ours ms/tok | Ratio |
-|-------|----------|---:|-------------:|------------:|------------:|------------:|------------:|------:|
-| BGE-M3 | single-request | 1 | 6,638 | 0.0197s | 0.0183s | 0.00 | 0.00 | **1.08x** |
-| BGE-M3 | fixed-batch-32 | 32 | 152,801 | 0.3411s | 0.3520s | 0.00 | 0.00 | 0.97x |
-| ColBERTv2 | single-request | 1 | 56 | 0.0042s | 0.0011s | 0.08 | 0.02 | **3.99x** |
-| ColBERTv2 | fixed-batch-32 | 32 | 2,401 | 0.0193s | 0.0022s | 0.01 | 0.00 | **8.63x** |
-
-BGE-M3 is near vLLM parity on large-document encoder work. The ColBERTv2 workload has many short passages, so the larger speedup primarily reflects lower end-to-end request/pooling/output overhead in kb-nano's packed token-embedding path rather than a claim that every ColBERT kernel is 3x faster than vLLM.
 
 ### DeepSeek V3.2 FP8 (MoE, MLA, DSA)
 
@@ -881,31 +861,6 @@ Correctness (eager mode, decoded video frames, per-prompt cosine similarity):
 | 480p-medium |  8 | 0.923 | 0.862 | 12.92 dB | WARN |
 
 Correctness is measured in decoded pixel space (both engines produce PIL video frames which are compared as uint8 numpy arrays). The pixel-level cosine similarity of ~0.92 is expected for two independent bf16 implementations: numerical differences in the 30-step denoising loop are amplified by the VAE decoder. For reference, latent-space comparison between kb-nano and HF diffusers yields CosSim=0.986, confirming the transformer backbone is correctly implemented. The pixel-space divergence is dominated by VAE decode amplification and different text encoder implementations (kb-nano uses a custom Qwen2.5-VL paged-attention encoder vs vllm-omni's HuggingFace-based encoder).
-
-### Oasis 500M (Autoregressive Diffusion)
-
-Run `python tests/bench_oasis.py --model Etched/oasis-500m` to reproduce. Reference baseline: official `open-oasis`, which the benchmark auto-clones under `data/open_oasis_src/` unless `--open-oasis-src` is provided.
-
-Dataset: `TESS-Computer/minecraft-vla-stage1` (`train` split), using non-overlapping real Minecraft clips from distinct source videos at 360x640. The benchmark converts each dataset action string into Oasis' 25-d control vector and caches the resulting prompt/action tensors locally under `data/oasis_cache/`.
-
-**Hardware: NVIDIA B200**
-
-Throughput workload:
-
-| Scenario | Dataset | Clips | Frames | DDIM Steps | Correctness Checked |
-|----------|---------|------:|-------:|-----------:|:--------------------|
-| short-bs4-16f-4ddim | `TESS-Computer/minecraft-vla-stage1` | 4 | 16 | 4 | yes |
-| medium-bs8-24f-4ddim | `TESS-Computer/minecraft-vla-stage1` | 8 | 24 | 4 | yes |
-| long-bs8-32f-4ddim | `TESS-Computer/minecraft-vla-stage1` | 8 | 32 | 4 | yes |
-| denoise-bs4-16f-8ddim | `TESS-Computer/minecraft-vla-stage1` | 4 | 16 | 8 | yes |
-
-Latency:
-
-| Scenario | Clips | Frames | Reference p50 (ms) | Ours p50 (ms) | Ratio |
-|----------|------:|-------:|-------------------:|--------------:|------:|
-| latency-bs1-8f-4ddim | 1 | 8 | 981.28 | 758.85 | **1.29x** |
-
-Correctness is measured for every throughput workload entry, using the same prompt frames and actions as the timed run. The benchmark reports cosine similarity, pass/fail status, and mean absolute difference for prompt latents, rollout latents, and decoded video in each throughput scenario.
 
 ### CosyVoice3 (TTS)
 
