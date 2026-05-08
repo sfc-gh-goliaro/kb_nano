@@ -14,13 +14,9 @@ several errors in the original paper version.
 | `partial`    | 171 | 38.3% |
 | `unsupported`| 12  | 2.7% |
 
-- **Strict** (L4 + composable, kb-nano kernel exists for every compute class): **264/447 = 59.1%**
-- **Loose** (+ partial / torch fallback): **435/447 = 97.3%**
-- **Unsupported** (genuinely needs custom CUDA / external lib): **12/447 = 2.7%**
-
-v12 vs v11: 6 folders demoted composable → partial for partial-rotary
-consistency (bamba, glm4v_moe, laguna, musicflamingo, recurrent_gemma,
-solar_open). See REAUDIT_NOTES.md "v12 RECONCILIATION" for the full delta.
+- **Strict** (L4 + composable, kb-nano kernel exists for every compute class): **264/447 = 59.06%**
+- **Loose** (+ partial / torch fallback): **435/447 = 97.32%**
+- **Unsupported** (genuinely needs custom CUDA / external lib): **12/447 = 2.68%**
 
 The 12 unsupported (canonical):
 `diffllama`, `dinat`, `fast_vlm`, `gemma3n`, `ibert`, `layoutlmv2`, `mra`,
@@ -28,22 +24,34 @@ The 12 unsupported (canonical):
 
 ## What you should read
 
-### Final state + critical decisions
+### One doc has everything: `CAVEATS_AND_METHODOLOGY.md`
+
+| section | content |
+|---|---|
+| §1 | Methodology: 4-status definitions, source pinning, audit pipeline, what was strict vs lenient, worked example |
+| §2 | The 4 denominators (and why we use 447) |
+| §3 | Post-v11 fixes — 11 file-mapping corrections + the 6 v12 partial-rotary demotions, with config:line evidence + the "why kb-nano L1/rotary_emb.py does not cover partial-rotary directly" deep-dive |
+| §4 | 8 known limitations (read before citing) |
+| §5–6 | Reproducibility command + trust footprint |
+| §7 | **The 27 L4 promotions** — per-folder rationale (HF folder ↔ kb-nano L4 file) + 4 calls intentionally NOT promoted (qwen2_5_vl, falcon_mamba, gemma4_assistant, sam2_video) |
+| §8 | **The 12 unsupported folders** — per-folder rationale with HF source line evidence |
+| §9 | **Cross-pattern judgment calls (the ambiguous decisions)** — every recurring partial-vs-composable / composable-vs-unsupported call, with the consistency rule applied |
+
+### Companion docs
 
 | file | purpose |
 |---|---|
-| [`REAUDIT_NOTES.md`](REAUDIT_NOTES.md) | Full reconciliation log, the 27 L4 promotions with rationale, the 12 unsupported list with rationale, and every status change across v4 → v7 → v10 → v11 → v12. **Start here.** Final state lives in the section labelled "v12 RECONCILIATION". |
-| [`CAVEATS_AND_METHODOLOGY.md`](CAVEATS_AND_METHODOLOGY.md) | Methodology + edge cases + the 11 file-mapping fixes + the 6 v12 demotions, including the "why kb-nano L1/rotary_emb.py does not cover partial-rotary directly" deep-dive. |
+| [`CAVEATS_AND_METHODOLOGY.md`](CAVEATS_AND_METHODOLOGY.md) | All critical decisions in one place. **Start here.** |
 | [`NUMBER_DRIFT_RECONCILIATION.md`](NUMBER_DRIFT_RECONCILIATION.md) | Why the denominator was 421 / 425 / 442 / 445 / 447 / 448 over time, and why **447** is canonical. |
 
 ### Data files (reproduce the numbers)
 
 | file | purpose |
 |---|---|
-| [`audit_evidence.csv`](audit_evidence.csv) | Per-folder evidence trail (447 rows × 12 columns: shard verdict, cross-verifier verdict, phase-2 verdict, HF file:line, "I personally read" flag). |
+| [`audit_evidence.csv`](audit_evidence.csv) | Per-folder evidence trail (447 rows × 12 columns: shard verdict, cross-verifier verdict, phase-2 verdict, HF file:line, "I personally read" flag, p2_rationale). |
 | [`hf_coverage_rows.tex`](hf_coverage_rows.tex) | Current paper-input LaTeX rows (447 entries, v12). |
 | [`_reaudit_final_v11.json`](_reaudit_final_v11.json) | Machine-readable {folder: status} dict (447 entries; contains v12 final state). |
-| [`_hf_coverage_rows_pre_reaudit_20260507_153746.tex`](_hf_coverage_rows_pre_reaudit_20260507_153746.tex) | Paper's original 425-row table, frozen — reproduces 409/425 = 96.24%. |
+| [`paper_archive/hf_coverage_rows_paper_v1.tex`](paper_archive/hf_coverage_rows_paper_v1.tex) | Paper's original 425-row table, frozen — reproduces 409/425 = 96.24%. |
 
 ### Renderer + canonical shards
 
@@ -51,11 +59,10 @@ The 12 unsupported (canonical):
 `hf_coverage_rows.tex`. The 17 shard markdowns are the per-folder per-class
 breakdowns that are the source of truth for the rendered tex.
 
-### Intermediate process docs (optional)
+### Optional historical / process docs
 
-[`intermediate/`](intermediate/) holds two process docs that show how
-cross-agent disagreements were resolved and how individual agent claims
-were spot-checked. Not needed if you only want the final numbers.
+- [`paper_archive/`](paper_archive/) — frozen paper-version table + a README that walks through reproducing the paper's 409/425.
+- [`intermediate/`](intermediate/) — full v4 → v12 reconciliation chain (`REAUDIT_NOTES.md`), Phase-1 cross-agent disagreement log (`CONSISTENCY_AUDIT.md`), Phase-2 hallucination spot-check (`VERIFIER_AUDIT.md`). **Not needed for current numbers**; preserved for methodology defense.
 
 ## Pinning
 
@@ -65,61 +72,41 @@ were spot-checked. Not needed if you only want the final numbers.
 - **kb-nano support surface:** branch `audit/hf-transformers-coverage` cut from
   `origin/experiments` @ commit `11aa838`.
 
-## Reproducing
+## Reproducing the numbers
+
+### Paper (409/425 = 96.24%)
 
 ```bash
-# 1. Clone HF at the pinned commit
+cd audits/hf_transformers_coverage
+grep -c '\$\\bullet\$' paper_archive/hf_coverage_rows_paper_v1.tex   # 22 L4
+grep -c '\\cmark'      paper_archive/hf_coverage_rows_paper_v1.tex   # 387 composable
+grep -c '\\textbf{P}'  paper_archive/hf_coverage_rows_paper_v1.tex   # 9 partial
+grep -c '\\xmark'      paper_archive/hf_coverage_rows_paper_v1.tex   # 7 unsupported
+# Total = 425; strict = 22 + 387 = 409 → 409/425 = 96.24%
+```
+
+### Current v12 (264/447 = 59.06%)
+
+```bash
+cd audits/hf_transformers_coverage
+grep -c '\$\\bullet\$' hf_coverage_rows.tex   # 27 L4
+grep -c '\\cmark'      hf_coverage_rows.tex   # 237 composable
+grep -c '\\textbf{P}'  hf_coverage_rows.tex   # 171 partial
+grep -c '\\xmark'      hf_coverage_rows.tex   # 12 unsupported
+# Total = 447; strict = 27 + 237 = 264 → 264/447 = 59.06%
+```
+
+### Re-render v12 from the shards
+
+```bash
+# 1. Clone HF at the pinned commit (only needed if you want to re-verify HF source refs)
 cd /tmp && rm -rf hf_transformers_pinned && mkdir hf_transformers_pinned && cd hf_transformers_pinned
 git init -q && git remote add origin https://github.com/huggingface/transformers.git
 git fetch --depth 1 origin da6c53e431f7c9ef0691239d4ce89b0f711ecad7
 git checkout -q FETCH_HEAD
 
-# 2. Re-render the paper-appendix tex from the markdown shards
+# 2. Re-render the v12 tex from the markdown shards
 cd /home/olu/kb_nano
 python audits/hf_transformers_coverage/tools/md_to_tex.py
-# -> writes hf_coverage_rows.tex
+# -> writes audits/hf_transformers_coverage/hf_coverage_rows.tex
 ```
-
-## Audit work
-
-| pass | folders touched |
-|---|---:|
-| First-pass (16 parallel subagents) | 425 |
-| Cross-verify round 1 (5 verifiers, partial/unsupported priority) | 239 |
-| Phase 2 verifiers (slices 1–6, 8 — full source-read of edge cases) | 222 |
-| Slice 7 (recovered 20 folders missed by sharding bug) | 20 |
-| v11 additions (esmfold, donut_swin) | 2 |
-| **Personally source-read by coordinator (cumulative)** | **107** |
-
-Total folder-touches across all rounds: ~1010 (with significant overlap; many
-folders were touched 2–4 times across rounds for cross-pattern consistency).
-
-## Verification gates passed (v11)
-
-- 447 audit rows = filesystem ground truth (448 modeling files − `auto/` non-model)
-- `audit_evidence.csv` rows = `_reaudit_final_v11.json` entries (0 mismatches across 447)
-- `hf_coverage_rows.tex` rows = `_reaudit_final_v11.json` entries (0 mismatches across 447)
-- Status-marker mapping in tex matches json (27 / 237 / 171 / 12)
-- Every kb-nano `L1/L2/L3/L4/<file>.py` referenced in the tex exists on disk (202 unique refs, 0 missing)
-- Every folder in slice 7 + v11 (22 additions) exists in the HF clone
-- Every L4 promotion (27) has a matching `tasks/baseline/L4/<file>.py` whose docstring header targets the corresponding HF folder
-- Every `unsupported` (12) was source-verified by the coordinator: 5 use `kernels-community` CUDA kernels, 4 use timm/detectron2/natten external libs, 3 use bespoke compute (differential attn, integer arith, mLSTM)
-
-## Status / Known limitations
-
-- **Static audit only.** This audits compute primitives by reading source. It
-  does not certify byte-correctness against HF, nor does it measure
-  performance. A `composable` model may still run slowly via torch fallback
-  until each L1/L2 op gets a tuned kernel.
-- **`partial` is "decomposable, not yet wrapped".** A partial folder can run
-  in PyTorch (the relevant op is in `torch.*`); kb-nano just doesn't have a
-  dedicated kernel for that variant yet (e.g., partial-rotary RoPE,
-  interleaved-RoPE, ALiBi slopes, Conformer rel_shift).
-- **Multi-modeling folders** (`blip`, `data2vec`, `donut`, `esm`, `maskformer`,
-  `rt_detr`) are audited per-modeling-file. Each PyTorch `modeling_*.py` gets
-  its own row. This is why 442 folders → 447 rows.
-- **Paper text vs this audit.** The submitted paper cites 421 / 96.2% / 7
-  unsupported. Those numbers are not reproducible from the table that ships
-  with the paper — see `NUMBER_DRIFT_RECONCILIATION.md` for the full story
-  and v11 corrections. The `_hf_coverage_rows_pre_reaudit_*.tex` file is
-  preserved as the original-state backup.

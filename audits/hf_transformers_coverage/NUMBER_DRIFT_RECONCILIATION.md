@@ -4,7 +4,9 @@ The paper text and various intermediate artifacts cite different denominators
 (421, 425, 442, 448, 466). This document is the canonical source-of-truth.
 
 > **Final canonical denominator: 447** (covers every PyTorch `modeling_*.py`
-> except `auto/`). See "v11 update" at the bottom for the v11 final coverage table.
+> except `auto/`). See "v12 final coverage" at the bottom for the canonical
+> coverage table. v8 / v11 sections are kept for historical context but are
+> superseded.
 > The "v8 final coverage" section earlier in this doc is **superseded**.
 
 ## Filesystem ground truth (HF commit `da6c53e4`)
@@ -147,7 +149,7 @@ After v11 reinstating both: **447 audit rows** covering all 448 distinct `modeli
 
 v12 demotes 6 folders from composable → partial for partial-rotary
 consistency (bamba, glm4v_moe, laguna, musicflamingo, recurrent_gemma,
-solar_open). See REAUDIT_NOTES.md "v12 RECONCILIATION" and
+solar_open). See `intermediate/REAUDIT_NOTES.md` "v12 RECONCILIATION" and
 CAVEATS_AND_METHODOLOGY.md §3 for details.
 
 Compared to filesystem ground truth: 448 modeling files (less `auto/__init__.py` which isn't a model = 447 effective). The audit now perfectly matches the filesystem.
