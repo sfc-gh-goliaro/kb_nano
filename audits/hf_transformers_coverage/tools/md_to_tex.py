@@ -21,7 +21,7 @@ from pathlib import Path
 
 REPO = Path('/home/olu/kb_nano')
 SHARD_DIR = REPO / 'audits/hf_transformers_coverage/tools'
-OUT_TEX = REPO / 'audits/hf_transformers_coverage/MENTOR_REVIEW_full_audit.tex'
+OUT_TEX = REPO / 'audits/hf_transformers_coverage/hf_coverage_rows.tex'
 
 STATUS_MARKER = {
     'kb_nano_l4': r'$\bullet$',
@@ -588,10 +588,6 @@ def main():
     tex = render_tex(all_folders)
     OUT_TEX.write_text(tex)
     print(f'Wrote {OUT_TEX}')
-    # Also overwrite the paper-input version
-    paper_tex = REPO / 'audits/hf_transformers_coverage/hf_coverage_rows.tex'
-    paper_tex.write_text(tex)
-    print(f'Wrote {paper_tex}')
 
 
 if __name__ == '__main__':
