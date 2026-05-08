@@ -281,3 +281,105 @@ Each entry: folder, HF read, kb-nano files opened, verdict, rationale issue (if 
 - HF: `modeling_longt5.py:494-505` LongT5LocalAttention with `local_radius`, `block_len = local_radius + 1` (local block attention + transient global path)
 - kb-nano: no local-block attention
 - Verdict: PARTIAL CORRECT.
+
+## Batch E (m-n, 23 folders)
+
+### mask2former (verified)
+- HF: `modeling_mask2former.py:26, 1402` `load_backbone` (AutoBackbone); :1554 Mask2FormerMaskedAttentionDecoderLayer
+- Verdict: PARTIAL CORRECT.
+
+### maskformer (verified-via-shard)
+- HF: maskformer uses Swin or other backbone via load_backbone; deformable cross-attn in decoder
+- Verdict: PARTIAL CORRECT.
+
+### maskformer_swin (verified)
+- HF: `modeling_maskformer_swin.py:313-358` MaskFormerSwinSelfAttention with `relative_position_bias_table` lookup (V1 RPB)
+- Verdict: PARTIAL CORRECT.
+
+### minimax (verified)
+- HF: `modeling_minimax.py:115` MiniMaxLightningAttention; :397 MiniMaxAttention
+- kb-nano: no lightning attention
+- Verdict: PARTIAL CORRECT.
+
+### mistral3 (verified)
+- HF: `modular_mistral3.py:40-114` Mistral3RMSNorm + Mistral3PatchMerger + Mistral3MultiModalProjector + LlavaCausalLMOutputWithPast (VLM)
+- Verdict: PARTIAL DEFENSIBLE (no L4 for Mistral3 VLM).
+
+### mllama (verified)
+- HF: `modeling_mllama.py:385-429` MllamaTextCrossAttention with `cross_attention_states + k_proj/v_proj on encoder states` (cross-attention path)
+- kb-nano: no cross-attn wrapper for this exact shape with QK norm
+- Verdict: PARTIAL CORRECT.
+
+### mm_grounding_dino (verified)
+- HF: `modeling_mm_grounding_dino.py:30, 63-64, 649` load_backbone + MultiScaleDeformableAttention (deformable + AutoBackbone)
+- Verdict: PARTIAL CORRECT.
+
+### modernbert (verified)
+- HF: `modeling_modernbert.py:33` `create_bidirectional_sliding_window_mask`; `:203-230` ModernBertAttention applies `apply_rotary_pos_emb` *inside* encoder attention (RoPE-in-encoder); :258 sliding_window pattern
+- kb-nano: encoder_attention does not apply RoPE; no sliding-window encoder wrapper
+- Verdict: PARTIAL CORRECT.
+
+### modernbert_decoder (verified)
+- HF: `modeling_modernbert_decoder.py:34, 91, 212` inherits ModernBert pattern (sliding_window mask + RoPE)
+- Verdict: PARTIAL CORRECT.
+
+### modernvbert (verified)
+- HF: `modeling_modernvbert.py:46-202` VisionBridge connector + ModernVBertModel inherits ModernBert (RoPE-in-encoder + sliding window)
+- Verdict: PARTIAL CORRECT.
+
+### moonshine (verified)
+- HF: `modeling_moonshine.py:140-142` partial_rotary_factor; `:253-291` MoonshineAttention with `head_dim_padding` (head_dim padded for QKV alignment)
+- Verdict: PARTIAL CORRECT.
+
+### moonshine_streaming (verified)
+- HF: `modular_moonshine_streaming.py:43-81` MoonshineStreamingProcessorKwargs + FrameCMVN; inherits Moonshine partial_rotary
+- Verdict: PARTIAL CORRECT.
+
+### moshi (verified)
+- HF: `modeling_moshi.py:211-237` MoshiFlexibleLinear (per-codebook 3D weight bank with `torch.index_select(self.weight, 0, layer_idx)` + batched matmul)
+- kb-nano: closest is moe_grouped_gemm but routing differs (layer_idx based, not topk routing)
+- Verdict: PARTIAL CORRECT.
+
+### mpt (verified)
+- HF: `modeling_mpt.py:42-61` build_mpt_alibi_tensor with `alibi_bias_max` factor (slightly different from Bloom alibi)
+- Verdict: PARTIAL CORRECT.
+
+### mt5 (verified)
+- HF: `modeling_mt5.py:25, 249-267` EncoderDecoderCache + key_value_states-based cross-attention
+- Verdict: PARTIAL CORRECT.
+
+### musicgen (verified)
+- HF: `modeling_musicgen.py:179-252` MusicgenAttention with key_value_states for cross-attn + cross_attention_cache
+- Verdict: PARTIAL CORRECT.
+
+### musicgen_melody (verified)
+- HF: `modeling_musicgen_melody.py:112` MusicgenMelodySinusoidalPositionalEmbedding (standard transformer pos enc, NOT the flow-matching timestep pattern that L1/sinusoidal_embed.py serves); :187 MusicgenMelodyAttention (BART-style with melody conditioning)
+- kb-nano: no L1 for standard transformer positional embedding (sinusoidal_embed is for timesteps); BART-style attention
+- Verdict: PARTIAL CORRECT (and rationale should be tightened — see batch 4 agent's finding that sinusoidal_embed.py was wrongly cited).
+
+### mvp (verified)
+- HF: `modeling_mvp.py:90` MvpAttention (BART-style separate q/k/v + cross-attn)
+- Verdict: PARTIAL CORRECT.
+
+### nanochat (verified)
+- HF: `modeling_nanochat.py:45-196` NanoChatRMSNorm uses pure F.normalize(p=2) without learned weight (= L2 norm); custom rotate_half. (Per shard: nano-chat-RMSNorm = Llama4TextL2Norm.) NanoChatAttention at 196.
+- kb-nano: L1/l2_norm.py exists but is RWKV7-context per docstring; no transformer-pre-norm L2-norm wrapper
+- Verdict: PARTIAL CORRECT.
+
+### nemotron (verified)
+- HF: `modeling_nemotron.py:64` NemotronLayerNorm1P (`F.layer_norm` with `weight+1` reparam); :126-128 partial_rotary_factor; :242 squared_relu activation in MLP
+- Verdict: PARTIAL CORRECT.
+
+### nemotron_h (verified)
+- HF: `modeling_nemotron_h.py:114-136` NemotronHMamba2Mixer (Mamba2 hybrid with NemotronH-specific config)
+- kb-nano: standard mamba2_mixer.py doesn't match the nemotron-h-specific mamba_num_heads/mamba_head_dim layout
+- Verdict: PARTIAL CORRECT.
+
+### nllb_moe (verified)
+- HF: `modeling_nllb_moe.py:367, 415` NllbMoeSparseMLP + NllbMoeAttention (BART-style + conditional MoE)
+- Verdict: PARTIAL CORRECT.
+
+### nystromformer (verified)
+- HF: `modeling_nystromformer.py:102-208` NystromformerSelfAttention with `iterative_inv` (Moore-Penrose pseudo-inverse via 6-step iteration on softmax kernels)
+- kb-nano: no Nystrom approximation kernel
+- Verdict: PARTIAL CORRECT.
