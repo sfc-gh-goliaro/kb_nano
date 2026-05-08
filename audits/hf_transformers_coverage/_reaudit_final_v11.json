@@ -258,7 +258,7 @@
     "ovis2": "partial",
     "owlv2": "composable",
     "owlvit": "composable",
-    "paddleocr_vl": "partial",
+    "paddleocr_vl": "composable",
     "paligemma": "composable",
     "parakeet": "partial",
     "patchtsmixer": "partial",
@@ -459,5 +459,13 @@
     "musicflamingo",
     "recurrent_gemma",
     "solar_open"
+  ],
+  "post_v12_flips": [
+    {
+      "folder": "paddleocr_vl",
+      "from": "partial",
+      "to": "composable",
+      "reason": "Audit shard tagged PaddleOCRDecoderLayer (wiring class) as [compute] with folder-level rationale, triggering partial render. All compute classes (PaddleOCRMLP\u2192llama_mlp, PaddleOCRAttention\u2192attention, PaddleOCRRotaryEmbedding\u2192mrope, PaddleOCRVisionRotaryEmbedding\u2192vision_rotary_emb, PaddleOCRMLP\u2192llama_mlp, PaddleOCRVisionMLP\u2192siglip_mlp, PaddleOCRVisionAttention\u2192vision_attention, PaddleOCRRMSNorm\u2192rms_norm, PaddleOCRProjector\u2192linear+gelu+layer_norm, PaddleOCRVisionEmbeddings\u2192conv2d+embedding) actually have kb-nano kernels. Verified personally."
+    }
   ]
 }

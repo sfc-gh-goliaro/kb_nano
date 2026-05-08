@@ -2429,10 +2429,9 @@
    &  & \texttt{\seqsplit{OwlViTClassPredictionHead}} & \texttt{L1/}\allowbreak\texttt{linear.py} \\
 \midrule
 %======================================================================
-% paddleocr_vl (partial)
+% paddleocr_vl (composable)
 %======================================================================
-  \texttt{paddleocr\_vl} & \textbf{P} & \textit{(missing)} & \textit{Missing primitive:} \texttt{PaddleOCRAttention} -- L2/attention.py, L1/rms\_norm.py, L1/mrope.py, L1/sdpa.py (Qwen2.5 Omni attention with M-RoPE; maps to LlamaAttention pattern.) \\
-   &  & \texttt{\seqsplit{PaddleOCRProjector}} & \texttt{L1/}\allowbreak\texttt{linear.py} + \texttt{L1/}\allowbreak\texttt{gelu.py} + \texttt{L1/}\allowbreak\texttt{layer\_norm.py} \\
+  \texttt{paddleocr\_vl} & \cmark & \texttt{\seqsplit{PaddleOCRProjector}} & \texttt{L1/}\allowbreak\texttt{linear.py} + \texttt{L1/}\allowbreak\texttt{gelu.py} + \texttt{L1/}\allowbreak\texttt{layer\_norm.py} \\
    &  & \texttt{\seqsplit{PaddleOCRVisionRotaryEmbedding}} & \texttt{L1/}\allowbreak\texttt{vision\_rotary\_emb.py} \\
    &  & \texttt{\seqsplit{PaddleOCRRotaryEmbedding}} & \texttt{L1/}\allowbreak\texttt{mrope.py} \\
    &  & \texttt{PaddleOCRMLP} & \texttt{L2/}\allowbreak\texttt{llama\_mlp.py} + \texttt{L1/}\allowbreak\texttt{silu\_and\_mul.py} \\

@@ -436,12 +436,15 @@ folder, grouped by primary gap, with a one-line rationale for each.
 For full per-class breakdowns see `tools/manual_audit_shard_*.md` and
 `audit_evidence.csv`.
 
-> **Caveat on rationale text accuracy.** Of the 171 entries below, ~18 have
-> been file-level re-verified by the coordinator post-v12 (HF source +
-> kb-nano kernels read in full). On those 18, the **status classifications**
-> (partial vs composable vs unsupported) were all correct, but the
-> **rationale text** carried v4-era audit shard wording that has been found
-> to:
+> **Caveat on rationale text accuracy.** Of the 171 partial entries below,
+> ~24 have been file-level re-verified by the coordinator post-v12 (HF
+> source + kb-nano kernels read in full). On those 24, **23/24 status
+> classifications were correct; 1 was wrong** (`paddleocr_vl` — flipped
+> to composable; PaddleOCRDecoderLayer was a wiring class incorrectly
+> tagged `[compute]` with the folder-level rationale text, which made
+> the renderer treat it as a "missing primitive" partial when all real
+> compute classes have kb-nano kernels). The **rationale text** carried
+> v4-era audit shard wording that was found to:
 >
 > - **understate gaps** in some cases (e.g., bloom said "supported via
 >   attn_mask" — kb-nano flash kernels have no first-class alibi parameter
@@ -456,21 +459,35 @@ For full per-class breakdowns see `tools/manual_audit_shard_*.md` and
 >   `(c_in, c_hidden, no_heads, starting, inf)` signature as kb-nano's
 >   `L2/alphafold3_triangle_attention.py:TriangleAttention`).
 >
-> Extrapolating from a 6/18 (~33%) rationale-text issue rate in the
-> verified sample, **roughly 50 of the 171 entries below may have rationale
-> text that's optimistic-leaning, missing context, or in rare cases
-> factually wrong about kb-nano kernel existence**. The status calls
-> themselves remain reliable because they came from cross-pattern
-> consistency rules (§9), not from individual rationale text. For paper
-> integrity, treat the §9 rule table as canonical and the §10 per-folder
-> rationale as best-effort summary that may need cleaning per folder.
+> Extrapolating from a 7/24 (~29%) issue rate in the personally-verified
+> sample (1 wrong status + 6 misleading rationales), **roughly 40-50 of
+> the 171 entries below may have rationale text that's optimistic-leaning,
+> missing context, or in rare cases factually wrong about kb-nano kernel
+> existence; ~5-7 may have status classifications worth re-checking**.
+> The cross-pattern status rules in §9 remain the canonical source for
+> *why* each pattern was placed in a status bucket; per-folder text in
+> §10 is best-effort summary.
 >
-> The verified 18: phi3, conditional_detr, wav2vec2_conformer, t5, dac,
-> levit, zoedepth, jetmoe, swin, mpnet, big_bird, fnet, bloom (rationale
-> noted), esmfold (rationale fixed), gpt_neox (rationale fixed), gptj
-> (rationale fixed), codegen (rationale fixed) — plus the 6 v12 demotions
-> (bamba, glm4v_moe, laguna, musicflamingo, recurrent_gemma, solar_open)
-> which were verified at v12-decision time.
+> **Personally file-verified (24)**: phi3, conditional_detr,
+> wav2vec2_conformer, t5, dac, levit, zoedepth, jetmoe, swin, mpnet,
+> big_bird, fnet, bloom (rationale noted), esmfold (rationale fixed),
+> gpt_neox (rationale fixed), gptj (rationale fixed), codegen
+> (rationale fixed), paddleocr_vl (status flipped to composable
+> post-v12), aria, deepseek_v4 (sample-checked, agent claim confirmed),
+> ernie4_5_vl_moe (sample-checked, agent claim confirmed), maskformer_swin
+> (sample-checked, status correct, agent verification was shallow), plus
+> the 6 v12 demotions (bamba, glm4v_moe, laguna, musicflamingo,
+> recurrent_gemma, solar_open) verified at v12-decision time.
+>
+> **Agent-verified (uneven quality)**: A 6-agent fan-out covering the
+> remaining ~148 folders found mixed quality — some agents (notably
+> covering paddleocr_vl, qwen3_5, sam, pixtral, phimoe, swiftformer,
+> zamba/zamba2 cohort) produced substantive findings including the one
+> status flip applied; other agents claimed "100% correct" with shallow
+> kb-nano file reads (e.g., didn't open `L2/swinv2_window_attention.py`
+> when the load-bearing claim was Swin V1 vs V2). For paper-grade
+> certainty on the remaining ~140 folders, additional coordinator-led
+> file reading is required; the current state is best-effort.
 
 ### partial-rotary RoPE (`partial_rotary_factor < 1.0`; q_rot/q_pass split) (23)
 

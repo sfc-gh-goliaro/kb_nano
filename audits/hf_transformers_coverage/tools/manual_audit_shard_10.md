@@ -274,10 +274,10 @@
 
 ## paddleocr_vl
 - **src**: modular_paddleocr_vl.py
-- **status**: partial
+- **status**: composable
 - **rationale**: OCR-focused VLM combining Ernie4.5 (Llama-style) LLM + Qwen2.5-Omni attention + Qwen2-VL RoPE + SigLIP vision MLP + VideoLlama3 vision attention. All architectural pieces map to existing kb-nano L2/L3 (encoder/llama-style attention, SwiGLU MLP, vision attention, RMSNorm).
 - **classes**:
-  - **`PaddleOCRDecoderLayer`** [compute]: OCR-focused VLM combining Ernie4.5 (Llama-style) LLM + Qwen2.5-Omni attention + Qwen2-VL RoPE + SigLIP vision MLP + VideoLlama3 vision attention. All architectural pieces map to existing kb-nano L2/L3
+  - **`PaddleOCRDecoderLayer`** [wiring]: Decoder layer wiring; compute lives on PaddleOCRAttention + PaddleOCRMLP + PaddleOCRRMSNorm.
   - **`PaddleOCRProjector`** [compute]: `L1/linear.py`, `L1/gelu.py`, `L1/layer_norm.py` (Vision -> text projector.)
   - **`PaddleOCRVisionRotaryEmbedding`** [compute]: `L1/vision_rotary_emb.py` (Qwen2-VL 2D vision RoPE.)
   - **`PaddleOCRRotaryEmbedding`** [compute]: `L1/mrope.py` (M-RoPE for Qwen2-VL.)
