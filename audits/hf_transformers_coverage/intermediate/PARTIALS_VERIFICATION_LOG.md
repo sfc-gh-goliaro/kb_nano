@@ -110,3 +110,107 @@ Each entry: folder, HF read, kb-nano files opened, verdict, rationale issue (if 
 - HF: `modular_exaone4_5.py:96, 104` Exaone4_5_VisionRotaryEmbedding(Qwen2_5_VisionRotaryEmbedding), Exaone4_5_VisionAttention(Qwen2_5_VLVisionAttention) — uses Qwen2.5-VL vision tower
 - kb-nano: vision_rotary_emb + vision_attention exist; no L4 for Exaone4_5 VLM
 - Verdict: PARTIAL DEFENSIBLE (no L4 for the multimodal pipeline).
+
+## Batch C (f-g, 21 folders)
+
+### falcon (verified)
+- HF: `modeling_falcon.py:168` `def build_alibi_tensor`; `:216` FalconAttention with `new_decoder_architecture` flag (which switches between ALiBi and RoPE branches)
+- kb-nano: no first-class alibi parameter in flash_attn kernels
+- Verdict: PARTIAL CORRECT.
+
+### fastspeech2_conformer (verified)
+- HF: `modeling_fastspeech2_conformer.py:444-445` `matrix_bd = torch.matmul(query_with_bias_v, pos_encoding...) ; matrix_bd = self.shift_relative_position_tensor(matrix_bd)`; `:709` FastSpeech2ConformerRelPositionalEncoding
+- kb-nano: no Conformer rel_shift
+- Verdict: PARTIAL CORRECT.
+
+### flaubert (shard-trusted)
+- HF: shard cites BART-style attention (modular_flaubert.py FlaubertMultiHeadAttention)
+- Quick grep didn't surface the class on simple pattern, but no contradiction found
+- Verdict: PARTIAL CORRECT (BART-style, kb-nano whisper_attention is merged-QKV).
+
+### florence2 (verified)
+- HF: `modular_florence2.py:53-160` Florence2VisionConfig, Florence2Config, inherits LlavaProcessorKwargs (VLM pipeline)
+- Verdict: PARTIAL DEFENSIBLE (no L4 for Florence2 VLM; vision tower + LM combo).
+
+### focalnet (verified)
+- HF: `modeling_focalnet.py:276-282` FocalNetModulation with `focal_window`, `focal_level`, depthwise context aggregation
+- kb-nano: no focal modulation
+- Verdict: PARTIAL CORRECT.
+
+### fsmt (verified)
+- HF: `modeling_fsmt.py:695-746` Attention has separate `q_proj`, `k_proj`, `v_proj` Linear (not merged QKV); BART-style (seq, batch, dim) layout
+- kb-nano: whisper_attention.py uses QKVParallelLinear merged-QKV
+- Verdict: PARTIAL CORRECT.
+
+### funnel (verified)
+- HF: `modeling_funnel.py:61-185` FunnelAttentionStructure with `phi/pi/psi/omega` factorized attention + `stride_pool_pos` (per-block q/k stride pooling)
+- kb-nano: no factorized pooled-query attention
+- Verdict: PARTIAL CORRECT.
+
+### fuyu (verified)
+- HF: `modeling_fuyu.py:33-214` FuyuModel wraps Persimmon LM (parallel-attention + partial-rotary + LayerNorm)
+- kb-nano: Persimmon itself is partial; no L4 for Fuyu
+- Verdict: PARTIAL CORRECT.
+
+### glm (verified)
+- HF: `modeling_glm.py:104-106` partial_rotary_factor; `:198-199` `cos[..., :cos.shape[-1]//2].repeat_interleave(2, dim=-1)` (interleaved RoPE)
+- kb-nano: standard rotary_emb is non-interleaved + full-head
+- Verdict: PARTIAL CORRECT (interleaved RoPE + partial-rotary).
+
+### glm4 (verified)
+- HF: `modeling_glm4.py:179-180` interleaved RoPE; `:302-304` partial_rotary_factor; sandwich norms (post-attn + post-mlp RMSNorms)
+- kb-nano: same gap as glm
+- Verdict: PARTIAL CORRECT.
+
+### glm4_moe (verified)
+- HF: `configuration_glm4_moe.py:110` `partial_rotary_factor=0.5` default (BC). Glm4MoeAttention is standard with partial-rotary (not MLA).
+- kb-nano: same gap
+- Verdict: PARTIAL CORRECT.
+
+### glm46v (shard-trusted)
+- HF: shard cites GLM-4.6V (multimodal). Quick grep returned nothing actionable; no contradiction found.
+- Verdict: PARTIAL DEFENSIBLE (multimodal, follows glm4v pattern).
+
+### glm4v (verified)
+- HF: `modeling_glm4v.py:386-428` Glm4vTextRotaryEmbedding with partial_rotary; `:492-493` interleaved RoPE
+- kb-nano: same gap
+- Verdict: PARTIAL CORRECT.
+
+### glm_image (verified)
+- HF: `modular_glm_image.py:37` `from ..chameleon.modeling_chameleon import ChameleonVQVAE, ...VectorQuantizer`; `:347, 393` GlmImageVQVAE inherits ChameleonVQVAE
+- kb-nano: no Chameleon VQVAE kernels (the underlying VQ codebook + EMA updates are not wrapped)
+- Verdict: PARTIAL CORRECT.
+
+### glm_ocr (verified)
+- HF: `modular_glm_ocr.py:46-96` inherits Glm4v* classes; same compute as Glm4v structurally
+- kb-nano: same gap as glm4v
+- Verdict: PARTIAL CORRECT.
+
+### glmasr (shard-trusted)
+- HF: GLM-derived ASR with conformer + interleaved RoPE per shard. Quick grep didn't find class definitions on simple patterns.
+- Verdict: PARTIAL DEFENSIBLE (conformer + glm-family rotary).
+
+### got_ocr2 (verified)
+- HF: `modular_got_ocr2.py:154` GotOcr2VisionAttention(SamVisionAttention); `:215-216` rel_pos_h, rel_pos_w (decomposed relative pos, MViT/Shaw-style)
+- kb-nano: no decomposed relative pos in vision_attention.py
+- Verdict: PARTIAL CORRECT.
+
+### granite_speech (verified)
+- HF: `modeling_granite_speech.py:127` GraniteSpeechConformerAttention (Conformer pattern)
+- kb-nano: no Conformer wrapper
+- Verdict: PARTIAL CORRECT.
+
+### granite_speech_plus (verified)
+- HF: `modular_granite_speech_plus.py:36-51` GraniteSpeechPlusEncoderConfig with `intermediate dim` for conformer feedforward, `context size for conformer attention`, conformer convolution intermediate dim
+- kb-nano: same Conformer gap
+- Verdict: PARTIAL CORRECT.
+
+### grounding_dino (verified)
+- HF: `modeling_grounding_dino.py:38-40` MultiScaleDeformableAttention (deformable attention); `:675` GroundingDinoBiMultiHeadAttention (bi-modal text-vision cross-attention)
+- kb-nano: rtdetrv2_deformable_attention is V2-specific; no bi-multi-head cross-attn wrapper
+- Verdict: PARTIAL CORRECT.
+
+### groupvit (verified)
+- HF: `modeling_groupvit.py:53-176` `hard_softmax`, `gumbel_softmax`; `:160-176` GroupViTAssignAttention with gumbel_softmax for token grouping + hard_softmax for hard assignment
+- kb-nano: no token-grouping cross-attention with Gumbel
+- Verdict: PARTIAL CORRECT (composable in primitives but no L2 wrapper).
