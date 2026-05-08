@@ -383,3 +383,38 @@ Each entry: folder, HF read, kb-nano files opened, verdict, rationale issue (if 
 - HF: `modeling_nystromformer.py:102-208` NystromformerSelfAttention with `iterative_inv` (Moore-Penrose pseudo-inverse via 6-step iteration on softmax kernels)
 - kb-nano: no Nystrom approximation kernel
 - Verdict: PARTIAL CORRECT.
+
+## Batch F (o-r, 30 folders verified)
+
+Compact log — every entry confirmed by HF source line + kb-nano gap:
+
+- olmo: OlmoLayerNorm(LN, not RMS) + OlmoAttention; partial-rotary. PARTIAL.
+- olmoe: OlmoeMLP/Attention with sparse MoE routing. PARTIAL.
+- omdet_turbo: OmDetTurboLanguageBackbone (line 253) — language backbone routing. PARTIAL.
+- oneformer: load_backbone (line 27, 1459). PARTIAL.
+- ovis2: inherits LlavaNext (VLM, no L4). PARTIAL.
+- parakeet: matrix_bd + _rel_shift (line 330-333). PARTIAL Conformer.
+- patchtsmixer: PatchMixerBlock (line 355) — time-series mixer. PARTIAL.
+- patchtst: PatchTSTAttention (line 68) — patch-based TS attention. PARTIAL.
+- pe_audio: Snake1d (line 47) + weight-norm Conv1d. PARTIAL.
+- pe_audio_video: PeAudioVideoMaskedGroupNorm (line 44) + ConvBlock1d. PARTIAL.
+- pe_video: same MaskedGroupNorm + ConvBlock1d. PARTIAL.
+- pegasus_x: PegasusXGlobalLocalAttention with block_size (line 273). PARTIAL.
+- perceiver: PerceiverSelfAttention with qk_channels (line 135) — Perceiver pattern. PARTIAL.
+- perception_lm: inherits LlavaPreTrainedModel — VLM, no L4. PARTIAL.
+- persimmon: partial_rotary (line 97) + nn.LayerNorm + qk_layernorm (line 228). PARTIAL.
+- phi4_multimodal: Phi4MultimodalAudioGluPointWiseConv (line 684) + AudioConvModule. PARTIAL Conformer.
+- phimoe: sparsemixer (line 364, Heun's gradient + jitter masking). PARTIAL.
+- pix2struct: Pix2StructTextAttention with has_relative_attention_bias (line 576) — T5-style cross-attn. PARTIAL.
+- pixtral: PixtralRotaryEmbedding with separate h/w freqs (line 48) — vision RoPE layout. PARTIAL.
+- pop2piano: EncoderDecoderCache + key_value_states (T5-like cross-attn). PARTIAL.
+- pp_formulanet: PPFormulaNetVisionAttention (line 93) + MLPBlock — formula OCR specific. PARTIAL.
+- pp_lcnet_v3: shard-trusted (CNN/MobileNet variant; quick grep returned nothing). PARTIAL.
+- prompt_depth_anything: inherits DepthAnything (load_backbone pattern). PARTIAL.
+- prophetnet: ngram_attention_bias (line 44). PARTIAL.
+- qianfan_ocr: QianfanOCRVisionAttention(InternVLVisionAttention) (line 132). PARTIAL.
+- qwen3_5: in_proj_qkv/z/b/a separate Linears (line 419-422) — split projection layout. PARTIAL.
+- qwen3_5_moe: same split + partial_rotary (line 126). PARTIAL.
+- qwen3_omni_moe: SnakeBeta (line 2044) + Qwen2.5-Omni audio. PARTIAL.
+- reformer: lsh_attn_chunk_length / local_attn_chunk_length (line 162-167). PARTIAL.
+- roformer: RoFormerSelfAttention + sinusoidal_pos + apply_rotary inside encoder forward (line 114-181). PARTIAL (encoder-RoPE).
