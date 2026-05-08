@@ -28,22 +28,34 @@ The 12 unsupported (canonical):
 
 ## What you should read
 
+### Final state + critical decisions
+
 | file | purpose |
 |---|---|
-| [`REAUDIT_NOTES.md`](REAUDIT_NOTES.md) | Full reconciliation, methodology, per-version history, and self-assessment. **Start here.** v11 final state is in the section labelled "v11 RECONCILIATION". |
+| [`REAUDIT_NOTES.md`](REAUDIT_NOTES.md) | Full reconciliation log, the 27 L4 promotions with rationale, the 12 unsupported list with rationale, and every status change across v4 → v7 → v10 → v11 → v12. **Start here.** Final state lives in the section labelled "v12 RECONCILIATION". |
+| [`CAVEATS_AND_METHODOLOGY.md`](CAVEATS_AND_METHODOLOGY.md) | Methodology + edge cases + the 11 file-mapping fixes + the 6 v12 demotions, including the "why kb-nano L1/rotary_emb.py does not cover partial-rotary directly" deep-dive. |
 | [`NUMBER_DRIFT_RECONCILIATION.md`](NUMBER_DRIFT_RECONCILIATION.md) | Why the denominator was 421 / 425 / 442 / 445 / 447 / 448 over time, and why **447** is canonical. |
-| [`VERIFIER_AUDIT.md`](VERIFIER_AUDIT.md) | Per-slice agent agreement audit + hallucination spot-checks (0/10 hallucinated file:line refs). |
-| [`CONSISTENCY_AUDIT.md`](CONSISTENCY_AUDIT.md) | Phase-1 cross-pattern consistency groups (ALiBi, partial-rotary, AutoBackbone, etc.) — how identical patterns were forced to identical statuses. |
+
+### Data files (reproduce the numbers)
+
+| file | purpose |
+|---|---|
 | [`audit_evidence.csv`](audit_evidence.csv) | Per-folder evidence trail (447 rows × 12 columns: shard verdict, cross-verifier verdict, phase-2 verdict, HF file:line, "I personally read" flag). |
-| [`hf_coverage_rows.tex`](hf_coverage_rows.tex) | Paper-input LaTeX rows (447 entries). |
-| [`MENTOR_REVIEW_full_audit.tex`](MENTOR_REVIEW_full_audit.tex) | Full standalone tex for review. |
-| [`_reaudit_final_v11.json`](_reaudit_final_v11.json) | Machine-readable {folder: status} dict (447 entries). |
+| [`hf_coverage_rows.tex`](hf_coverage_rows.tex) | Current paper-input LaTeX rows (447 entries, v12). |
+| [`_reaudit_final_v11.json`](_reaudit_final_v11.json) | Machine-readable {folder: status} dict (447 entries; contains v12 final state). |
+| [`_hf_coverage_rows_pre_reaudit_20260507_153746.tex`](_hf_coverage_rows_pre_reaudit_20260507_153746.tex) | Paper's original 425-row table, frozen — reproduces 409/425 = 96.24%. |
 
-`tools/manual_audit_shard_{01..17}.md` are the per-shard markdown audit notes
-that the renderer (`tools/md_to_tex.py`) reads to produce the tex.
+### Renderer + canonical shards
 
-`_stale_pre_reaudit/` holds the original pre-reaudit artifacts kept for
-provenance (do not use; superseded by the v11 files above).
+`tools/md_to_tex.py` parses `tools/manual_audit_shard_{01..17}.md` and writes
+`hf_coverage_rows.tex`. The 17 shard markdowns are the per-folder per-class
+breakdowns that are the source of truth for the rendered tex.
+
+### Intermediate process docs (optional)
+
+[`intermediate/`](intermediate/) holds two process docs that show how
+cross-agent disagreements were resolved and how individual agent claims
+were spot-checked. Not needed if you only want the final numbers.
 
 ## Pinning
 
