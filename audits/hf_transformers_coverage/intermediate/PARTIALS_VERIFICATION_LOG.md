@@ -214,3 +214,70 @@ Each entry: folder, HF read, kb-nano files opened, verdict, rationale issue (if 
 - HF: `modeling_groupvit.py:53-176` `hard_softmax`, `gumbel_softmax`; `:160-176` GroupViTAssignAttention with gumbel_softmax for token grouping + hard_softmax for hard assignment
 - kb-nano: no token-grouping cross-attention with Gumbel
 - Verdict: PARTIAL CORRECT (composable in primitives but no L2 wrapper).
+
+## Batch D (h-l, 13 folders)
+
+### helium (verified)
+- HF: `modeling_helium.py:212-213` `cos[..., :cos.shape[-1]//2].repeat_interleave(2, dim=-1)` — interleaved RoPE (Cohere/GLM family pattern)
+- kb-nano: standard rotary_emb is non-interleaved
+- Verdict: PARTIAL CORRECT.
+
+### hubert (verified)
+- HF: `modeling_hubert.py:58` `self.batch_norm = nn.BatchNorm1d(config.hidden_size)`; `:169` `nn.GroupNorm`
+- kb-nano: only L1/batch_norm2d.py
+- Verdict: PARTIAL CORRECT (BatchNorm1d gap).
+
+### idefics2 (verified)
+- HF: `modeling_idefics2.py:209-313` Idefics2VisionAttention uses `torch.nn.MultiheadAttention(..., batch_first=True)`; `:539-689` Idefics2PerceiverAttention/Resampler
+- kb-nano: nn.MHA black-box has no L2 wrapper; Perceiver-style cross-attn missing
+- Verdict: PARTIAL CORRECT.
+
+### informer (verified)
+- HF: `modeling_informer.py:405-525` InformerProbSparseAttention with sparsity_measurement = max - mean, top-u query selection, sparse attention only on top-u queries
+- kb-nano: no ProbSparse kernel
+- Verdict: PARTIAL CORRECT.
+
+### kyutai_speech_to_text (verified)
+- HF: `modeling_kyutai_speech_to_text.py:53` KyutaiSpeechToTextFlexibleLinear (3D weight bank); `:116-118` KyutaiSpeechToTextConv1dPaddingCache (streaming padding cache for causal conv); also weight_norm
+- kb-nano: no flexible-linear / conv-padding-cache / weight_norm wrapper
+- Verdict: PARTIAL CORRECT.
+
+### lasr (verified)
+- HF: `modeling_lasr.py:206` LasrEncoderAttention (Conformer-style ASR encoder)
+- kb-nano: no Conformer wrapper
+- Verdict: PARTIAL CORRECT.
+
+### layoutlmv3 (verified)
+- HF: `modeling_layoutlmv3.py:203-277` LayoutLMv3SelfAttention with `:224` `cogview_attention(self, attention_scores, alpha=32)` (CogView numerical-stability softmax); `:267` `attention_scores += (rel_pos + rel_2d_pos)/sqrt(d)` (additive bias)
+- kb-nano: no additive attention bias in flash kernels; no CogView softmax variant
+- Verdict: PARTIAL CORRECT.
+
+### led (verified)
+- HF: `modeling_led.py:90, 403-246` LEDEncoderSelfAttention with `_sliding_chunks_query_key_matmul` and `_sliding_chunks_matmul_attn_probs_value` (Longformer-style sliding window)
+- kb-nano: no sliding-chunks attention
+- Verdict: PARTIAL CORRECT.
+
+### lightglue (verified)
+- HF: `modeling_lightglue.py:48-262` LightGlueKeypointMatching* + LightGlueAttention + LightGlueTransformerLayer (keypoint matching graph network with depth-confidence early stopping, point-pruning, log-double-softmax assignment)
+- kb-nano: no kb-nano kernel for keypoint-matching pattern
+- Verdict: PARTIAL CORRECT.
+
+### lilt (verified)
+- HF: `modeling_lilt.py:161-178` spatial_position_embeddings + box_linear_embeddings + box_position_embeddings (dual-stream text+layout attention)
+- kb-nano: no L2 wrapper for layout-stream cross-flow with score addition
+- Verdict: PARTIAL CORRECT.
+
+### longcat_flash (verified)
+- HF: `modeling_longcat_flash.py:177-227` LongcatFlashExperts with `:186` `self.identity_expert = nn.Identity()` and `:215` `current_hidden_states = self.identity_expert(current_state)` (zero-compute identity expert path)
+- kb-nano: moe_grouped_gemm assumes weight matrices; no identity-expert pass-through
+- Verdict: PARTIAL CORRECT.
+
+### longformer (verified)
+- HF: `modeling_longformer.py:445-555` LongformerSelfAttention with `_sliding_chunks_query_key_matmul` + `_get_global_attn_indices` (sliding window + global)
+- kb-nano: same sliding-chunks gap as led
+- Verdict: PARTIAL CORRECT.
+
+### longt5 (verified)
+- HF: `modeling_longt5.py:494-505` LongT5LocalAttention with `local_radius`, `block_len = local_radius + 1` (local block attention + transient global path)
+- kb-nano: no local-block attention
+- Verdict: PARTIAL CORRECT.
