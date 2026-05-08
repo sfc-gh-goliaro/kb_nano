@@ -436,12 +436,48 @@ folder, grouped by primary gap, with a one-line rationale for each.
 For full per-class breakdowns see `tools/manual_audit_shard_*.md` and
 `audit_evidence.csv`.
 
+> **Caveat on rationale text accuracy.** Of the 171 entries below, ~18 have
+> been file-level re-verified by the coordinator post-v12 (HF source +
+> kb-nano kernels read in full). On those 18, the **status classifications**
+> (partial vs composable vs unsupported) were all correct, but the
+> **rationale text** carried v4-era audit shard wording that has been found
+> to:
+>
+> - **understate gaps** in some cases (e.g., bloom said "supported via
+>   attn_mask" — kb-nano flash kernels have no first-class alibi parameter
+>   and the partial classification stands; the workaround is fragile and
+>   version-dependent),
+> - **overstate kernel coverage** in some cases (e.g., the original gpt_neox
+>   rationale said "Maps cleanly to L2/attention + L2/llama_mlp" but
+>   GPT-NeoX uses parallel-residual + nn.LayerNorm + fc1+GELU+fc2 — none of
+>   those wrap into kb-nano's L2/attention.py-on-RMSNorm path),
+> - **occasionally claim "no kb-nano L2 wrapper" when one exists** with the
+>   same signature (e.g., esmfold's TriangleAttention has the same
+>   `(c_in, c_hidden, no_heads, starting, inf)` signature as kb-nano's
+>   `L2/alphafold3_triangle_attention.py:TriangleAttention`).
+>
+> Extrapolating from a 6/18 (~33%) rationale-text issue rate in the
+> verified sample, **roughly 50 of the 171 entries below may have rationale
+> text that's optimistic-leaning, missing context, or in rare cases
+> factually wrong about kb-nano kernel existence**. The status calls
+> themselves remain reliable because they came from cross-pattern
+> consistency rules (§9), not from individual rationale text. For paper
+> integrity, treat the §9 rule table as canonical and the §10 per-folder
+> rationale as best-effort summary that may need cleaning per folder.
+>
+> The verified 18: phi3, conditional_detr, wav2vec2_conformer, t5, dac,
+> levit, zoedepth, jetmoe, swin, mpnet, big_bird, fnet, bloom (rationale
+> noted), esmfold (rationale fixed), gpt_neox (rationale fixed), gptj
+> (rationale fixed), codegen (rationale fixed) — plus the 6 v12 demotions
+> (bamba, glm4v_moe, laguna, musicflamingo, recurrent_gemma, solar_open)
+> which were verified at v12-decision time.
+
 ### partial-rotary RoPE (`partial_rotary_factor < 1.0`; q_rot/q_pass split) (23)
 
 > kb-nano `L1/rotary_emb.RotaryEmbedding` rotates the full head_dim. Needs external slicing in user code or a Gemma4-style proportional rotary wrapper.
 
 - `bamba` — BambaConfig hardcodes `partial_rotary_factor = 0.5` (configuration_bamba.py). kb-nano L1/rotary_emb.py rotates the full head_dim; partial-rotary requires either external q_rot/q_pass slicing in user code or a Gemma4-style proportional embedding wr...
-- `codegen` — GPT-J derivative: fused QKV with mp_num=4 split, partial NeoX RoPE (rotary_dim), MHA with no GQA, fc1+gelu_new+fc2 MLP, LayerNorm. All compute primitives exist (linear, rotary_emb, gelu, layer_norm, dense_attention).
+- `codegen` — GPT-J derivative: parallel-residual `hidden = attn(ln_1(h)) + mlp(ln_1(h)) + h` (CodeGenBlock), fused QKV with mp_num=4 split, partial NeoX RoPE, fc1+gelu_new+fc2 MLP, LayerNorm. L1 primitives exist (linear, rotary_emb, gelu, layer_norm, dense_attention) but no kb-nano L2 wraps the parallel-residual + LayerNorm-decoder pattern; the partial-rotary slicing is the same gap as phi3.
 - `fuyu` — Fuyu wraps a Persimmon (parallel-attention) language model with a single Linear vision_embed_tokens projecting raw image patches to text embedding space. Persimmon is not in kb-nano, and there is no Fuyu/Persimmon L4 pipeline.
 - `glm` — GLM = Llama attention + Phi3MLP (gate_up_proj + chunk + down_proj, same SwiGLU pattern as llama_mlp) + interleaved (rotate-pairs) RoPE. The interleave-2 rotary is a variant of NeoX rotary; can be done via reshape outside rotary_emb.
 - `glm4` — GLM-4 = Glm attention + Phi3MLP + extra post-self-attn / post-mlp RMSNorms (sandwich norm). All ops map to existing kb-nano kernels.
@@ -452,8 +488,8 @@ For full per-class breakdowns see `tools/manual_audit_shard_*.md` and
 - `glm_image` — GLM-Image adds a Chameleon-style VQVAE for image generation. The VQVAE has bespoke ResNet/Conv2d blocks and a vector quantizer with EMA codebook updates — kb-nano has no Chameleon VQVAE kernels and no L4 pipeline for it.
 - `glm_ocr` — GLM-OCR = pure subclass of Glm4v vision + text components, inheritance only (no new compute). Same as Glm4v structurally.
 - `glmasr` — GLM-ASR adds an audio Conformer encoder (AudioFlamingo3 style) with depthwise Conv1d + GLU + BatchNorm1d + Shaw relative positional embeddings. kb-nano has no Conformer/audio-encoder kernels (no audio_flamingo or whisper-non-attention modules cove...
-- `gpt_neox` — GPT-NeoX = LlamaModel base with NeoX-style RoPE on first part of head_dim, separate q/k/v projections fused into qkv linear, GELU MLP. Maps cleanly to L2/attention + L2/llama_mlp + L1/rotary_emb.
-- `gptj` — GPT-J = parallel residual: attention and MLP run in parallel from same input, summed with residual. Uses GPT-J-style RoPE (rotary on first rotary_dim of head_dim, NeoX layout) without bias on q/k/v. All ops standard.
+- `gpt_neox` — Default `use_parallel_residual=True` in GPTNeoXLayer: `hidden = attn + mlp + residual` (parallel residual, line 282), with `nn.LayerNorm` (not RMSNorm) and GELU + fc1+fc2 MLP. NeoX-style RoPE on `int(head_dim * partial_rotary_factor)` (default 0.25) — the partial-rotary slicing is the same gap as phi3. kb-nano `L2/attention.py` is RMSNorm + sequential-residual; no L2 wraps the parallel-residual + LayerNorm-decoder pattern, and `L2/llama_mlp.py` is SwiGLU not fc1+GELU+fc2 (encoder_mlp shape would be closer).
+- `gptj` — GPT-J: `hidden = attn + mlp + residual` parallel residual (GPTJBlock.forward line 38: `hidden_states = attn_outputs + feed_forward_hidden_states + residual`), single ln_1 LayerNorm, GPT-J-style partial RoPE on first rotary_dim of head_dim (NeoX layout) without bias on q/k/v. fc1+gelu_new+fc2 MLP. L1 primitives all exist; no kb-nano L2 wraps the parallel-residual + LayerNorm-decoder pattern.
 - `laguna` — configuration_laguna.py sets `full_attention.partial_rotary_factor = 0.5` (sliding_attention uses 1.0). kb-nano L1/rotary_emb.py rotates the full head_dim; partial-rotary on the full-attention layers requires either Gemma4-style proportional embed...
 - `musicflamingo` — configuration_musicflamingo.py sets `partial_rotary_factor = 0.2` for the Qwen2 LM rope_parameters; standard L1/rotary_emb rotates the full head_dim, so the LM path needs external q_rot/q_pass slicing or Gemma4-style proportional rotary. Custom Mu...
 - `nemotron` — NemotronLayerNorm1P (F.layer_norm with weight+1 reparam) has no kb-nano kernel. Partial-RoPE (rotates only first int(head_dim*partial_rotary_factor) channels) not implemented in L1/rotary_emb.py which assumes full head_dim rotation. squared_relu M...
