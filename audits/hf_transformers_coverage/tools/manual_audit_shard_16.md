@@ -1,0 +1,431 @@
+## wav2vec2
+- **src**: modeling_wav2vec2.py
+- **status**: partial
+- **partial_reason**: GumbelVectorQuantizer needs gumbel_softmax + xlogy (no L1 op) and Wav2Vec2AdapterLayer uses nn.functional.glu (no L1 op); torch.nn.functional supplies these.
+- **rationale**: BART-style enc-only attention is composable, but GumbelVectorQuantizer (gumbel_softmax / xlogy / argmax-onehot) and Wav2Vec2Adapter (nn.functional.glu) have no kb-nano L1 op; kb-nano lacks GLU and Gumbel-softmax kernels.
+- **classes**:
+  - **`Wav2Vec2SamePadLayer`** [compute]: GumbelVectorQuantizer needs gumbel_softmax + xlogy (no L1 op) and Wav2Vec2AdapterLayer uses nn.functional.glu (no L1 op); torch.nn.functional supplies these.
+  - **`Wav2Vec2NoLayerNormConvLayer`** [compute]: `L1/conv1d.py`, `L1/gelu.py` (Conv1d + activation; activation depends on config (gelu / silu).)
+  - **`Wav2Vec2LayerNormConvLayer`** [compute]: `L1/conv1d.py`, `L1/layer_norm.py`, `L1/gelu.py` (Conv1d + LayerNorm + activation.)
+  - **`Wav2Vec2GroupNormConvLayer`** [compute]: `L1/conv1d.py`, `L1/group_norm.py`, `L1/gelu.py` (Conv1d + GroupNorm + activation.)
+  - **`Wav2Vec2PositionalConvEmbedding`** [compute]: `L1/conv1d.py`, `L1/gelu.py` (Weight-normed Conv1d with same-pad and activation; weight_norm is a parametrization on Conv1d weights, not a separate kernel.)
+  - **`Wav2Vec2FeatureEncoder`** [wiring]: ModuleList wiring of conv layers.
+  - **`Wav2Vec2FeatureProjection`** [compute]: `L1/layer_norm.py`, `L1/linear.py` (LayerNorm + Linear projection.)
+  - **`Wav2Vec2Attention`** [compute]: `L2/whisper_attention.py` (BART-style separate Q/K/V + out_proj attention with no relative bias; matches WhisperAttention encoder branch (full-bidir, no causal).)
+  - **`Wav2Vec2FeedForward`** [compute]: `L2/whisper_mlp.py` (fc1 -> act -> fc2 two-layer MLP; matches WhisperMLP.)
+  - **`Wav2Vec2EncoderLayer`** [wiring]: Wiring: attn + dropout + post-LN + FFN + final-LN.
+  - **`Wav2Vec2EncoderLayerStableLayerNorm`** [wiring]: Wiring with pre-norm variant.
+  - **`Wav2Vec2Encoder`** [wiring]: Stack of encoder layers + positional conv.
+  - **`Wav2Vec2EncoderStableLayerNorm`** [wiring]: Stack wiring.
+  - **`Wav2Vec2GumbelVectorQuantizer`** [wiring]: MISSING: nn.functional.gumbel_softmax, torch.xlogy and argmax-one-hot for code lookup; no L1 equivalent.
+  - **`Wav2Vec2Adapter`** [wiring]: Wiring of adapter layers.
+  - **`Wav2Vec2AdapterLayer`** [wiring]: MISSING: nn.functional.glu (no L1 GLU op).
+  - **`Wav2Vec2AttnAdapterLayer`** [compute]: `L1/layer_norm.py`, `L1/linear.py`, `L1/relu.py` (LN + Linear + ReLU + Linear bottleneck.)
+  - **`Wav2Vec2Model`** [wiring]: Top-level wiring.
+  - **`Wav2Vec2ForPreTraining`** [wiring]: Head wiring.
+  - **`Wav2Vec2ForCTC`** [wiring]: Head wiring.
+  - **`Wav2Vec2ForSequenceClassification`** [wiring]: Head wiring.
+  - **`Wav2Vec2ForAudioFrameClassification`** [wiring]: Head wiring.
+  - **`AMSoftmaxLoss`** [wiring]: Loss compute (cross_entropy + cosine sim); composes.
+  - **`TDNNLayer`** [compute]: `L1/linear.py`, `L1/relu.py` (Time-delay 1D conv expressed via unfold + Linear.)
+  - **`Wav2Vec2ForXVector`** [wiring]: Head wiring.
+
+## wav2vec2_bert
+- **src**: modeling_wav2vec2_bert.py
+- **status**: partial
+- **rationale**: Wav2Vec2BertSelfAttention is a Conformer attention with Transformer-XL relative bias (pos_bias_u/pos_bias_v) and a custom rel-shift; no kb-nano L2 attention implements relative bias attention.
+- **classes**:
+  - **`Wav2Vec2BertSelfAttention`** [compute]: Wav2Vec2BertSelfAttention is a Conformer attention with Transformer-XL relative bias (pos_bias_u/pos_bias_v) and a custom rel-shift; no kb-nano L2 attention implements relative bias attention.
+  - **`Wav2Vec2BertRotaryPositionalEmbedding`** [wiring]: Computes inv_freq lookup table; conformer-style pre-computed cos/sin not matching standard rotary_emb interface.
+  - **`Wav2Vec2BertRelPositionalEmbedding`** [wiring]: Sinusoidal relative positional embedding for Transformer-XL bias path.
+  - **`Wav2Vec2BertFeatureProjection`** [compute]: `L1/layer_norm.py`, `L1/linear.py` (LayerNorm + Linear.)
+  - **`Wav2Vec2BertFeedForward`** [compute]: `L2/whisper_mlp.py` (Reuses Wav2Vec2FeedForward (fc1 -> act -> fc2).)
+  - **`Wav2Vec2BertConvolutionModule`** [wiring]: MISSING: nn.GLU (no L1 GLU); pointwise + depthwise Conv1d + GLU + LN + activation.
+  - **`Wav2Vec2BertEncoderLayer`** [wiring]: Conformer block wiring (FFN1/2 + attn + conv module + LN).
+  - **`Wav2Vec2BertEncoder`** [wiring]: Stack wiring.
+  - **`Wav2Vec2BertAdapter`** [wiring]: Wiring.
+  - **`Wav2Vec2BertAdapterLayer`** [wiring]: Adapter with self-attention sub-block + FFN; relies on Wav2Vec2BertSelfAttention (unsupported).
+  - **`Wav2Vec2BertModel`** [wiring]: Top-level wiring.
+  - **`Wav2Vec2BertForCTC`** [wiring]: Head wiring.
+  - **`Wav2Vec2BertForSequenceClassification`** [wiring]: Head wiring.
+  - **`Wav2Vec2BertForAudioFrameClassification`** [wiring]: Head wiring.
+  - **`AMSoftmaxLoss`** [wiring]: Loss; composes.
+  - **`TDNNLayer`** [compute]: `L1/linear.py`, `L1/relu.py` (Time-delay 1D conv via unfold.)
+  - **`Wav2Vec2BertForXVector`** [wiring]: Head wiring.
+
+## wav2vec2_conformer
+- **src**: modeling_wav2vec2_conformer.py
+- **status**: partial
+- **rationale**: Wav2Vec2ConformerSelfAttention implements Transformer-XL relative bias attention (linear_pos + pos_bias_u/v + rel-shift) and the ConvolutionModule needs nn.functional.glu; no kb-nano L2 covers either compute.
+- **classes**:
+  - **`Wav2Vec2ConformerSamePadLayer`** [compute]: Wav2Vec2ConformerSelfAttention implements Transformer-XL relative bias attention (linear_pos + pos_bias_u/v + rel-shift) and the ConvolutionModule needs nn.functional.glu; no kb-nano L2 covers either 
+  - **`Wav2Vec2ConformerPositionalConvEmbedding`** [compute]: `L1/conv1d.py`, `L1/gelu.py` (Weight-normed Conv1d + activation.)
+  - **`Wav2Vec2ConformerRotaryPositionalEmbedding`** [wiring]: Conformer-specific cos/sin layout for rotary; not the standard rotary_emb interface.
+  - **`Wav2Vec2ConformerRelPositionalEmbedding`** [wiring]: Sinusoidal relative pos embedding for relative-bias path.
+  - **`Wav2Vec2ConformerNoLayerNormConvLayer`** [compute]: `L1/conv1d.py`, `L1/gelu.py` (Conv1d + activation.)
+  - **`Wav2Vec2ConformerLayerNormConvLayer`** [compute]: `L1/conv1d.py`, `L1/layer_norm.py`, `L1/gelu.py` (Conv1d + LN + activation.)
+  - **`Wav2Vec2ConformerGroupNormConvLayer`** [compute]: `L1/conv1d.py`, `L1/group_norm.py`, `L1/gelu.py` (Conv1d + GN + activation.)
+  - **`Wav2Vec2ConformerFeatureEncoder`** [wiring]: Wiring.
+  - **`Wav2Vec2ConformerFeatureProjection`** [compute]: `L1/layer_norm.py`, `L1/linear.py` (LN + Linear.)
+  - **`Wav2Vec2ConformerFeedForward`** [compute]: `L2/whisper_mlp.py` (fc1 -> act -> fc2.)
+  - **`Wav2Vec2ConformerConvolutionModule`** [wiring]: MISSING: nn.GLU (no L1) + pointwise/depthwise Conv1d + LN + activation.
+  - **`Wav2Vec2ConformerSelfAttention`** [wiring]: MISSING: Transformer-XL relative bias attention with rel-shift; no kb-nano L2 covers this.
+  - **`Wav2Vec2ConformerEncoderLayer`** [wiring]: Conformer block wiring.
+  - **`Wav2Vec2ConformerEncoder`** [wiring]: Stack wiring.
+  - **`Wav2Vec2ConformerGumbelVectorQuantizer`** [wiring]: MISSING: gumbel_softmax + xlogy.
+  - **`Wav2Vec2ConformerAdapter`** [wiring]: Wiring.
+  - **`Wav2Vec2ConformerAdapterLayer`** [wiring]: Conv1d adapter.
+  - **`Wav2Vec2ConformerModel`** [wiring]: Top-level wiring.
+  - **`Wav2Vec2ConformerForPreTraining`** [wiring]: Head wiring.
+  - **`Wav2Vec2ConformerForCTC`** [wiring]: Head wiring.
+  - **`Wav2Vec2ConformerForSequenceClassification`** [wiring]: Head wiring.
+  - **`Wav2Vec2ConformerForAudioFrameClassification`** [wiring]: Head wiring.
+  - **`AMSoftmaxLoss`** [wiring]: Loss compute; composes.
+  - **`TDNNLayer`** [compute]: `L1/linear.py`, `L1/relu.py` (Time-delay 1D conv via unfold.)
+  - **`Wav2Vec2ConformerForXVector`** [wiring]: Head wiring.
+
+## wavlm
+- **src**: modeling_wavlm.py
+- **status**: partial
+- **rationale**: WavLMAttention uses gated relative position bias (T5-style buckets gated by GRU-style projection of hidden states) and calls F.multi_head_attention_forward; no kb-nano L2 covers this gated relative bias attention.
+- **classes**:
+  - **`WavLMSamePadLayer`** [compute]: WavLMAttention uses gated relative position bias (T5-style buckets gated by GRU-style projection of hidden states) and calls F.multi_head_attention_forward; no kb-nano L2 covers this gated relative bi
+  - **`WavLMPositionalConvEmbedding`** [compute]: `L1/conv1d.py`, `L1/gelu.py` (Weight-normed Conv1d + activation.)
+  - **`WavLMFeatureProjection`** [compute]: `L1/layer_norm.py`, `L1/linear.py` (LN + Linear.)
+  - **`WavLMAttention`** [wiring]: MISSING: gated relative position bias (Q/K/V proj + bucketed rel-pos embedding modulated by GRU-style gating, dispatched through F.multi_head_attention_forward).
+  - **`WavLMFeedForward`** [compute]: `L2/whisper_mlp.py` (fc1 -> act -> fc2.)
+  - **`WavLMEncoderLayer`** [wiring]: Wiring.
+  - **`WavLMEncoderLayerStableLayerNorm`** [wiring]: Wiring (pre-norm variant).
+  - **`WavLMEncoder`** [wiring]: Stack wiring.
+  - **`WavLMEncoderStableLayerNorm`** [wiring]: Stack wiring.
+  - **`WavLMGumbelVectorQuantizer`** [wiring]: MISSING: gumbel_softmax + xlogy.
+  - **`WavLMNoLayerNormConvLayer`** [compute]: `L1/conv1d.py`, `L1/gelu.py` (Conv1d + activation.)
+  - **`WavLMLayerNormConvLayer`** [compute]: `L1/conv1d.py`, `L1/layer_norm.py`, `L1/gelu.py` (Conv1d + LN + activation.)
+  - **`WavLMGroupNormConvLayer`** [compute]: `L1/conv1d.py`, `L1/group_norm.py`, `L1/gelu.py` (Conv1d + GN + activation.)
+  - **`WavLMFeatureEncoder`** [wiring]: Wiring.
+  - **`WavLMAdapterLayer`** [compute]: `L1/conv1d.py` (Conv1d adapter.)
+  - **`WavLMAdapter`** [wiring]: Wiring.
+  - **`WavLMModel`** [wiring]: Top-level wiring.
+  - **`WavLMForCTC`** [wiring]: Head wiring.
+  - **`WavLMForSequenceClassification`** [wiring]: Head wiring.
+  - **`WavLMForAudioFrameClassification`** [wiring]: Head wiring.
+  - **`AMSoftmaxLoss`** [wiring]: Loss; composes.
+  - **`TDNNLayer`** [compute]: `L1/linear.py`, `L1/relu.py` (Time-delay 1D conv via unfold.)
+  - **`WavLMForXVector`** [wiring]: Head wiring.
+
+## whisper
+- **src**: modeling_whisper.py
+- **status**: kb_nano_l4
+- **rationale**: L4/whisper.py is a standalone Whisper encoder-decoder pipeline whose docstring states it implements WhisperForConditionalGeneration; uses L2 whisper_attention/whisper_mlp + L3 whisper_encoder_layer/whisper_decoder_layer.
+- **classes**:
+  - **`WhisperPositionalEmbedding`** [compute]: `L1/embedding.py` (Learned positional embedding via Embedding lookup.)
+  - **`WhisperAttention`** [compute]: `L2/whisper_attention.py` (Encoder self-attn / decoder self-attn / decoder cross-attn — the three sibling classes in whisper_attention.py cover all paths.)
+  - **`WhisperEncoderLayer`** [compute]: `L3/whisper_encoder_layer.py` (Pre-norm self-attn + GELU MLP.)
+  - **`WhisperDecoderLayer`** [compute]: `L3/whisper_decoder_layer.py` (Pre-norm self-attn + cross-attn + GELU MLP.)
+  - **`WhisperEncoder`** [wiring]: Conv1d feature extraction + sinusoidal pos + encoder layer stack — wired in L4/whisper.py.
+  - **`WhisperDecoder`** [wiring]: Token+pos embed + decoder layer stack — wired in L4/whisper.py.
+  - **`WhisperModel`** [wiring]: Encoder + decoder wiring.
+  - **`WhisperForConditionalGeneration`** [compute]: `L4/whisper.py` (Top-level seq2seq with LM head — implemented end-to-end in L4/whisper.py.)
+  - **`WhisperDecoderWrapper`** [wiring]: Decoder-only wrapper used by WhisperForCausalLM.
+  - **`WhisperForCausalLM`** [wiring]: Decoder-only LM head wiring.
+  - **`WhisperForAudioClassification`** [wiring]: Audio classification head wiring.
+
+## x_clip
+- **src**: modeling_x_clip.py
+- **status**: composable
+- **rationale**: X-CLIP is a CLIP variant for video: text/vision encoders are CLIP-style (LayerNorm + split-QKV attn + fc1/QuickGELU/fc2 MLP), plus extra MIT (multiframe integration transformer) and prompt-generator that compose the same primitives.
+- **classes**:
+  - **`XCLIPVisionEmbeddings`** [compute]: `L1/conv2d.py`, `L1/embedding.py` (Patch embed (Conv2d) + class token + pos Embedding.)
+  - **`XCLIPTextEmbeddings`** [compute]: `L1/embedding.py` (Token + pos embeddings.)
+  - **`XCLIPAttention`** [compute]: `L2/clip_attention.py` (Standard CLIP-style separate Q/K/V + out_proj attn.)
+  - **`XCLIPMLP`** [compute]: `L2/clip_mlp.py` (fc1 -> activation (configurable, defaults to QuickGELU for CLIP) -> fc2.)
+  - **`XCLIPEncoderLayer`** [wiring]: Wiring: LN + attn + LN + MLP.
+  - **`XCLIPDropPath`** [wiring]: Stochastic depth — identity at inference.
+  - **`XCLIPVisionEncoderLayer`** [wiring]: Wiring: cross-frame attn + message_attn + MLP.
+  - **`XCLIPEncoder`** [wiring]: Stack wiring.
+  - **`XCLIPVisionEncoder`** [wiring]: Stack wiring.
+  - **`XCLIPTextModel`** [wiring]: Wiring.
+  - **`XCLIPVisionModel`** [wiring]: Wiring.
+  - **`XCLIPMultiframeIntegrationTransformer`** [wiring]: Wiring around XCLIPEncoder + mean pool.
+  - **`XCLIPCrossAttention`** [compute]: `L2/clip_attention.py` (Same split Q/K/V multi-head attn, but with bias=False and external KV; uses CLIP attention compute pattern.)
+  - **`PromptGeneratorLayer`** [wiring]: Wiring: cross_attn + LN + (Linear+ACT+Linear).
+  - **`XCLIPPromptGenerator`** [wiring]: Wiring of prompt generator layers.
+  - **`XCLIPModel`** [wiring]: Top-level CLIP wiring + projections.
+
+## xcodec
+- **src**: modeling_xcodec.py
+- **status**: composable
+- **rationale**: Xcodec is a neural audio codec (semantic encoder + decoder + residual VQ) built from Conv1d / ConvTranspose1d / ELU and a lookup-based EuclideanCodebook; all leaf compute maps to existing kb-nano L1 ops and the AcousticEncoder/Decoder is delegated via AutoModel (audio backbone).
+- **classes**:
+  - **`XcodecResidualUnit`** [compute]: `L1/conv1d.py`, `L1/elu.py` (ELU + Conv1d + ELU + Conv1d residual.)
+  - **`XcodecSemanticEncoderBlock`** [compute]: `L1/conv1d.py` (Residual units + strided Conv1d.)
+  - **`SemanticEncoder`** [compute]: `L1/conv1d.py` (Conv1d + stack of encoder blocks.)
+  - **`SemanticDecoderBlock`** [compute]: `L1/conv1d.py`, `L1/conv_transpose1d.py` (Conv1d or ConvTranspose1d + residual units.)
+  - **`SemanticDecoder`** [compute]: `L1/conv1d.py` (Conv1d + stack of decoder blocks.)
+  - **`XcodecEuclideanCodebook`** [compute]: `L1/embedding.py` (Argmax distance lookup uses matmul + embedding lookup; no special kernel.)
+  - **`XcodecVectorQuantization`** [wiring]: Wiring around codebook.
+  - **`XcodecResidualVectorQuantization`** [wiring]: Wiring of N residual quantizers.
+  - **`XcodecModel`** [wiring]: Top-level encode/decode wiring; acoustic backbone delegated via AutoModel.
+
+## xglm
+- **src**: modeling_xglm.py
+- **status**: composable
+- **rationale**: XGLM is BART-style encoder-decoder-style decoder with sinusoidal pos embeddings + standard MultiHead attn (separate Q/K/V) + GELU MLP; matches the WhisperAttention enc-dec attention family.
+- **classes**:
+  - **`XGLMScaledWordEmbedding`** [compute]: `L1/embedding.py` (Embedding + scale.)
+  - **`XGLMSinusoidalPositionalEmbedding`** [compute]: `L1/sinusoidal_embed.py` (Sinusoidal pos table + index_select.)
+  - **`XGLMAttention`** [compute]: `L2/whisper_attention.py` (BART/Whisper-family separate Q/K/V + out_proj decoder attn with optional cross-attn; same compute as WhisperAttention.)
+  - **`XGLMDecoderLayer`** [wiring]: Wiring: self_attn + optional cross_attn + GELU FFN with pre-LN.
+  - **`XGLMModel`** [wiring]: Top-level wiring.
+  - **`XGLMForCausalLM`** [wiring]: LM head wiring.
+
+## xlm
+- **src**: modeling_xlm.py
+- **status**: composable
+- **rationale**: XLM is encoder-only transformer with vanilla MultiHeadAttention (separate Q/K/V) + ReLU/GELU FFN + sinusoidal pos embeddings; encoder attention compute matches the BART-style enc family (whisper_attention encoder branch).
+- **classes**:
+  - **`XLMPoolerStartLogits`** [compute]: `L1/linear.py` (Linear pooler.)
+  - **`XLMPoolerEndLogits`** [compute]: `L1/linear.py`, `L1/layer_norm.py` (Linear + LN.)
+  - **`XLMPoolerAnswerClass`** [compute]: `L1/linear.py` (Linear classifier.)
+  - **`XLMSQuADHead`** [wiring]: Wiring of the three poolers.
+  - **`XLMSequenceSummary`** [compute]: `L1/linear.py` (Linear summary.)
+  - **`MultiHeadAttention`** [compute]: `L2/whisper_attention.py` (Standard split Q/K/V multi-head attn with optional KV cache; compute matches WhisperAttention encoder/decoder branches.)
+  - **`TransformerFFN`** [compute]: `L2/whisper_mlp.py` (lin1 -> act (gelu/relu) -> lin2.)
+  - **`XLMModel`** [wiring]: Wiring.
+  - **`XLMPredLayer`** [compute]: `L1/linear.py` (LM head.)
+  - **`XLMWithLMHeadModel`** [wiring]: Wiring.
+  - **`XLMForSequenceClassification`** [wiring]: Head wiring.
+  - **`XLMForQuestionAnsweringSimple`** [wiring]: Head wiring.
+  - **`XLMForQuestionAnswering`** [wiring]: Head wiring.
+  - **`XLMForTokenClassification`** [wiring]: Head wiring.
+  - **`XLMForMultipleChoice`** [wiring]: Head wiring.
+
+## xlm_roberta
+- **src**: modular_xlm_roberta.py
+- **status**: composable
+- **rationale**: XLM-RoBERTa is BERT-derived in modular (RobertaPreTrainedModel/RobertaModel/RobertaForX); all classes reduce to BERT/RoBERTa primitives covered by L2/encoder_attention + L2/encoder_mlp + L2/xlm_roberta_embeddings + L3/xlm_roberta_*.
+- **classes**:
+  - **`XLMRobertaEmbeddings`** [compute]: `L2/xlm_roberta_embeddings.py` (Token + pos + token-type embeddings + LN.)
+  - **`XLMRobertaSelfAttention`** [compute]: `L2/encoder_attention.py` (BERT-style separate Q/K/V multi-head self-attn.)
+  - **`XLMRobertaCrossAttention`** [compute]: `L2/encoder_attention.py` (BERT-style cross-attn.)
+  - **`XLMRobertaSelfOutput`** [compute]: `L1/linear.py`, `L1/layer_norm.py` (Linear + LN + residual.)
+  - **`XLMRobertaAttention`** [wiring]: Sibling-class wrapper around XLMRobertaSelfAttention + SelfOutput; composes.
+  - **`XLMRobertaIntermediate`** [compute]: `L2/encoder_mlp.py` (Linear + GELU intermediate.)
+  - **`XLMRobertaOutput`** [compute]: `L2/encoder_mlp.py` (Linear + LN output.)
+  - **`XLMRobertaLayer`** [compute]: `L3/xlm_roberta_layer.py` (BERT layer wiring.)
+  - **`XLMRobertaLMHead`** [compute]: `L1/linear.py`, `L1/layer_norm.py`, `L1/gelu.py` (MLM head.)
+  - **`XLMRobertaEncoder`** [compute]: `L3/xlm_roberta_encoder.py` (Layer stack.)
+  - **`XLMRobertaPooler`** [compute]: `L1/linear.py`, `L1/tanh.py` (Linear + tanh on [CLS].)
+  - **`XLMRobertaModel`** [compute]: `L3/xlm_roberta_model.py` (Encoder model wiring.)
+  - **`XLMRobertaForCausalLM`** [wiring]: Head wiring.
+  - **`XLMRobertaForMaskedLM`** [wiring]: Head wiring.
+  - **`XLMRobertaClassificationHead`** [compute]: `L1/linear.py`, `L1/tanh.py` (Classification head.)
+  - **`XLMRobertaForSequenceClassification`** [wiring]: Head wiring.
+  - **`XLMRobertaForMultipleChoice`** [wiring]: Head wiring.
+  - **`XLMRobertaForTokenClassification`** [wiring]: Head wiring.
+  - **`XLMRobertaForQuestionAnswering`** [wiring]: Head wiring.
+
+## xlm_roberta_xl
+- **src**: modular_xlm_roberta_xl.py
+- **status**: composable
+- **rationale**: XLM-RoBERTa-XL inherits from BERT (BertSelfAttention/BertCrossAttention/BertAttention/BertLayer/BertModel) with pre-norm placement (LN inside attention/feedforward); all primitives covered by L2/encoder_attention + L2/encoder_mlp + L1/layer_norm.
+- **classes**:
+  - **`XLMRobertaXLEmbeddings`** [compute]: `L2/xlm_roberta_embeddings.py` (Token + pos + token-type embed (no final LN).)
+  - **`XLMRobertaXLSelfAttention`** [compute]: `L2/encoder_attention.py` (Inherits BertSelfAttention; same split-QKV self-attn.)
+  - **`XLMRobertaXLCrossAttention`** [compute]: `L2/encoder_attention.py` (Inherits BertCrossAttention.)
+  - **`XLMRobertaXLSelfOutput`** [compute]: `L1/linear.py` (Linear + dropout + residual (no LN — moved to attention).)
+  - **`XLMRobertaXLAttention`** [wiring]: Sibling-wrapper around XLMRobertaXLSelfAttention + XLMRobertaXLSelfOutput plus a pre-LN. Per guideline 11 the bare *Attention class is wiring; kernel lives on XLMRobertaXLSelfAttention.
+  - **`XLMRobertaXLOutput`** [compute]: `L1/linear.py` (Linear + residual (no LN).)
+  - **`XLMRobertaXLIntermediate`** [compute]: `L2/encoder_mlp.py` (Linear + GELU intermediate.)
+  - **`XLMRobertaXLLayer`** [compute]: `L3/xlm_roberta_layer.py` (BERT layer wiring with pre-norm placement.)
+  - **`XLMRobertaXLEncoder`** [compute]: `L3/xlm_roberta_encoder.py` (Stack + final LN.)
+  - **`XLMRobertaXLPooler`** [compute]: `L1/linear.py`, `L1/tanh.py` (Linear + tanh.)
+  - **`XLMRobertaXLModel`** [compute]: `L3/xlm_roberta_model.py` (Encoder wiring.)
+  - **`XLMRobertaXLLMHead`** [compute]: `L1/linear.py`, `L1/layer_norm.py`, `L1/gelu.py` (MLM head.)
+  - **`XLMRobertaXLClassificationHead`** [compute]: `L1/linear.py`, `L1/tanh.py` (Classification head.)
+  - **`XLMRobertaXLForCausalLM`** [wiring]: Head wiring.
+  - **`XLMRobertaXLForMaskedLM`** [wiring]: Head wiring.
+  - **`XLMRobertaXLForSequenceClassification`** [wiring]: Head wiring.
+  - **`XLMRobertaXLForMultipleChoice`** [wiring]: Head wiring.
+  - **`XLMRobertaXLForTokenClassification`** [wiring]: Head wiring.
+  - **`XLMRobertaXLForQuestionAnswering`** [wiring]: Head wiring.
+
+## xlnet
+- **src**: modeling_xlnet.py
+- **status**: partial
+- **rationale**: XLNetRelativeAttention is two-stream Transformer-XL relative attention with permutation-language-modeling g/h streams, segment embeddings, and a custom rel_shift; bespoke compute with no kb-nano L2 equivalent.
+- **classes**:
+  - **`XLNetRelativeAttention`** [compute]: XLNetRelativeAttention is two-stream Transformer-XL relative attention with permutation-language-modeling g/h streams, segment embeddings, and a custom rel_shift; bespoke compute with no kb-nano L2 eq
+  - **`XLNetFeedForward`** [compute]: `L2/whisper_mlp.py` (fc1 -> act -> fc2 with LN.)
+  - **`XLNetLayer`** [wiring]: Layer wiring (depends on XLNetRelativeAttention).
+  - **`XLNetPoolerStartLogits`** [compute]: `L1/linear.py` (Linear pooler.)
+  - **`XLNetPoolerEndLogits`** [compute]: `L1/linear.py`, `L1/layer_norm.py` (Linear + LN.)
+  - **`XLNetPoolerAnswerClass`** [compute]: `L1/linear.py` (Linear classifier.)
+  - **`XLNetSequenceSummary`** [compute]: `L1/linear.py` (Linear summary.)
+  - **`XLNetModel`** [wiring]: Top-level wiring.
+  - **`XLNetLMHeadModel`** [wiring]: Head wiring.
+  - **`XLNetForSequenceClassification`** [wiring]: Head wiring.
+  - **`XLNetForTokenClassification`** [wiring]: Head wiring.
+  - **`XLNetForMultipleChoice`** [wiring]: Head wiring.
+  - **`XLNetForQuestionAnsweringSimple`** [wiring]: Head wiring.
+  - **`XLNetForQuestionAnswering`** [wiring]: Head wiring.
+
+## xlstm
+- **src**: modeling_xlstm.py
+- **status**: unsupported
+- **unsupported_reason**: mLSTM (matrix LSTM) chunkwise scan kernel is required; the file gates on an external `xlstm` package's CUDA kernel, with a slow pure-PyTorch fallback. kb-nano has no mLSTM L1 op.
+- **rationale**: xLSTM (mLSTM) requires either the external `xlstm` package's mLSTMBlock kernel (when available) or in-file pure-PyTorch mLSTM chunkwise scan that has no kb-nano kernel; recurrence is a custom matrix-LSTM (mLSTM) state-space op.
+- **classes**:
+  - **`xLSTMPreTrainedModel`** [compute]: mLSTM (matrix LSTM) chunkwise scan kernel is required; the file gates on an external `xlstm` package's CUDA kernel, with a slow pure-PyTorch fallback. kb-nano has no mLSTM L1 op.
+  - **`xLSTMModel`** [wiring]: Top-level wiring; depends on mLSTMBlock (unsupported).
+  - **`xLSTMForCausalLM`** [wiring]: LM head wiring.
+
+## xmod
+- **src**: modeling_xmod.py
+- **status**: composable
+- **rationale**: Xmod is BERT/RoBERTa-style with per-language adapters (LayerNorm + Linear + activation + Linear bottleneck); all primitives covered by L2/encoder_attention + L2/encoder_mlp + L1/{linear,layer_norm,gelu}.
+- **classes**:
+  - **`XmodEmbeddings`** [compute]: `L2/xlm_roberta_embeddings.py` (RoBERTa-style token+pos+token-type embeddings.)
+  - **`XmodSelfAttention`** [compute]: `L2/encoder_attention.py` (BERT-style split-QKV self-attn.)
+  - **`XmodCrossAttention`** [compute]: `L2/encoder_attention.py` (BERT-style cross-attn.)
+  - **`XmodSelfOutput`** [compute]: `L1/linear.py` (Linear + dropout + residual.)
+  - **`XmodAttention`** [wiring]: Sibling-class wrapper around XmodSelfAttention + SelfOutput; composes.
+  - **`XmodIntermediate`** [compute]: `L2/encoder_mlp.py` (Linear + GELU intermediate.)
+  - **`XmodAdapter`** [compute]: `L1/linear.py`, `L1/gelu.py` (Linear -> activation -> Linear bottleneck (per-language).)
+  - **`XmodOutput`** [compute]: `L1/linear.py`, `L1/layer_norm.py` (Linear + LN + residual + adapter dispatch.)
+  - **`XmodLayer`** [wiring]: Wiring.
+  - **`XmodEncoder`** [wiring]: Stack wiring.
+  - **`XmodPooler`** [compute]: `L1/linear.py`, `L1/tanh.py` (Linear + tanh.)
+  - **`XmodModel`** [wiring]: Encoder wiring.
+  - **`XmodForCausalLM`** [wiring]: Head wiring.
+  - **`XmodForMaskedLM`** [wiring]: Head wiring.
+  - **`XmodLMHead`** [compute]: `L1/linear.py`, `L1/layer_norm.py`, `L1/gelu.py` (MLM head.)
+  - **`XmodForSequenceClassification`** [wiring]: Head wiring.
+  - **`XmodForMultipleChoice`** [wiring]: Head wiring.
+  - **`XmodForTokenClassification`** [wiring]: Head wiring.
+  - **`XmodClassificationHead`** [compute]: `L1/linear.py`, `L1/tanh.py` (Classification head.)
+  - **`XmodForQuestionAnswering`** [wiring]: Head wiring.
+
+## yolos
+- **src**: modeling_yolos.py
+- **status**: composable
+- **rationale**: YOLOS is a ViT detection variant: ViTSelfAttention/ViTAttention/Intermediate/Output/Layer/Encoder + patch embed + detection MLP head; all primitives covered by L2/encoder_attention + L2/encoder_mlp + L1/conv2d + L1/linear + L1/relu.
+- **classes**:
+  - **`YolosEmbeddings`** [compute]: `L1/conv2d.py` (Patch embed (Conv2d) + cls/detection tokens + interpolated pos embed.)
+  - **`InterpolateInitialPositionEmbeddings`** [compute]: `L1/interpolate.py` (Bicubic interpolation of pos embed.)
+  - **`InterpolateMidPositionEmbeddings`** [compute]: `L1/interpolate.py` (Bicubic interpolation of pos embed.)
+  - **`YolosPatchEmbeddings`** [compute]: `L1/conv2d.py` (Conv2d patch projection.)
+  - **`YolosSelfAttention`** [compute]: `L2/encoder_attention.py` (ViT-style split-QKV multi-head self-attn (no LN inside).)
+  - **`YolosSelfOutput`** [compute]: `L1/linear.py` (Linear + dropout (residual added by parent).)
+  - **`YolosAttention`** [wiring]: Sibling-class wrapper around YolosSelfAttention + SelfOutput; composes.
+  - **`YolosIntermediate`** [compute]: `L2/encoder_mlp.py` (Linear + GELU intermediate.)
+  - **`YolosOutput`** [compute]: `L2/encoder_mlp.py` (Linear + dropout + residual.)
+  - **`YolosLayer`** [wiring]: ViT layer wiring with pre-norm.
+  - **`YolosEncoder`** [wiring]: Stack wiring with mid-pos embedding injection.
+  - **`YolosModel`** [wiring]: Encoder wiring.
+  - **`YolosPooler`** [compute]: `L1/linear.py`, `L1/tanh.py` (Linear + tanh.)
+  - **`YolosMLPPredictionHead`** [compute]: `L1/linear.py`, `L1/relu.py` (Stack of Linear + ReLU layers for box/class regression.)
+  - **`YolosForObjectDetection`** [wiring]: Detection head wiring.
+
+## yoso
+- **src**: modeling_yoso.py
+- **status**: unsupported
+- **unsupported_reason**: YOSO uses custom CUDA LSH cumulation kernels (YosoCumulation, YosoLSHCumulation autograd Functions calling fast_lsh_cumulation / lsh_cumulation extensions); kb-nano has no LSH attention primitive.
+- **rationale**: YosoSelfAttention dispatches to YosoCumulation/YosoLSHCumulation autograd functions backed by custom CUDA kernels (LSH attention via local hashing); the CUDA kernel is loaded via load_cuda_kernels with bespoke ops. No kb-nano LSH attention kernel.
+- **classes**:
+  - **`YosoSelfAttention`** [compute]: YOSO uses custom CUDA LSH cumulation kernels (YosoCumulation, YosoLSHCumulation autograd Functions calling fast_lsh_cumulation / lsh_cumulation extensions); kb-nano has no LSH attention primitive.
+  - **`YosoCumulation`** [wiring]: MISSING: custom CUDA fast_lsh_cumulation kernel.
+  - **`YosoLSHCumulation`** [wiring]: MISSING: custom CUDA lsh_cumulation kernel.
+  - **`YosoEmbeddings`** [compute]: `L1/embedding.py`, `L1/layer_norm.py` (BERT-style token+pos+token-type embeddings + LN.)
+  - **`YosoSelfOutput`** [compute]: `L1/linear.py`, `L1/layer_norm.py` (Linear + LN + residual.)
+  - **`YosoAttention`** [wiring]: Sibling-class wrapper; composes.
+  - **`YosoIntermediate`** [compute]: `L2/encoder_mlp.py` (Linear + GELU.)
+  - **`YosoOutput`** [compute]: `L2/encoder_mlp.py` (Linear + LN.)
+  - **`YosoLayer`** [wiring]: Layer wiring (depends on YosoSelfAttention).
+  - **`YosoEncoder`** [wiring]: Stack wiring.
+  - **`YosoPredictionHeadTransform`** [compute]: `L1/linear.py`, `L1/layer_norm.py`, `L1/gelu.py` (Linear + activation + LN.)
+  - **`YosoLMPredictionHead`** [compute]: `L1/linear.py` (MLM head.)
+  - **`YosoOnlyMLMHead`** [wiring]: Wraps YosoLMPredictionHead.
+  - **`YosoModel`** [wiring]: Top-level wiring.
+  - **`YosoForMaskedLM`** [wiring]: Head wiring.
+  - **`YosoClassificationHead`** [compute]: `L1/linear.py`, `L1/tanh.py` (Classification head.)
+  - **`YosoForSequenceClassification`** [wiring]: Head wiring.
+  - **`YosoForMultipleChoice`** [wiring]: Head wiring.
+  - **`YosoForTokenClassification`** [wiring]: Head wiring.
+  - **`YosoForQuestionAnswering`** [wiring]: Head wiring.
+
+## youtu
+- **src**: modular_youtu.py
+- **status**: composable
+- **rationale**: Youtu inherits from DeepSeekV3 (MLA attention) + Llama (RMSNorm/RoPE/decoder layer) + Qwen3 (SwiGLU MLP); all primitives covered by L2/deepseek_mla_attention + L2/llama_mlp + L1/{rms_norm,rotary_emb,linear}.
+- **classes**:
+  - **`YoutuRMSNorm`** [compute]: `L1/rms_norm.py` (Inherits LlamaRMSNorm.)
+  - **`YoutuRotaryEmbedding`** [compute]: `L1/rotary_emb.py` (Inherits LlamaRotaryEmbedding.)
+  - **`YoutuMLP`** [compute]: `L2/llama_mlp.py` (Inherits Qwen3MLP (gate_proj/up_proj/down_proj SwiGLU); same compute as LlamaMLP.)
+  - **`YoutuAttention`** [compute]: `L2/deepseek_mla_attention.py` (Inherits DeepseekV3Attention (MLA).)
+  - **`YoutuDecoderLayer`** [wiring]: Inherits LlamaDecoderLayer; wiring.
+  - **`YoutuModel`** [wiring]: Inherits LlamaModel; wiring.
+  - **`YoutuForCausalLM`** [wiring]: Inherits LlamaForCausalLM; wiring.
+
+## zamba
+- **src**: modeling_zamba.py
+- **status**: partial
+- **partial_reason**: Multi-head Mamba mixer (per-head x_proj_weight / dt_proj_weight / dt_proj_bias / A_log / D over n_mamba_heads) is not realised by any L2 mamba mixer; kb-nano supports single-head Mamba via L2/mamba_mixer.py and L2/jamba_mamba_mixer.py but a multi-head variant would need new wiring around the existing L1 causal_conv1d + selective scan ops.
+- **rationale**: Zamba is a Mamba-attention hybrid (similar to Jamba). Llama-style attention is composable but ZambaMambaMixer is multi-head Mamba v1 (per-head x_proj/dt_proj weights with independent forward) which differs structurally from kb-nano's L2/mamba_mixer.py / L2/jamba_mamba_mixer.py (single-head); selective_scan kernel exists in kb-nano L1 (causal_conv1d + the Mamba L1 ops) but the multi-head wiring is missing.
+- **classes**:
+  - **`ZambaAttentionDecoderLayer`** [compute]: no kb-nano kernel — Multi-head Mamba mixer (per-head x_proj_weight / dt_proj_weight / dt_proj_bias / A_log / D over n_mamba_heads) is not realised by any L2 mamba mixer; kb-nano supports single-head Mamba via L2/mamba_mi
+  - **`ZambaRMSNorm`** [compute]: `L1/rms_norm.py` (Standard RMSNorm.)
+  - **`ZambaAttention`** [compute]: `L2/attention.py` (Llama-style GQA attention (no rotary), with attention_hidden_size = 2 * hidden_size and modified scaling; LlamaAttention covers split QKV + GQA path.)
+  - **`ZambaMambaMixer`** [compute]: `L1/causal_conv1d.py` (MISSING: multi-head Mamba v1 mixer (per-head x_proj/dt_proj parameters; independent per-head forward). kb-nano has single-head jamba_mamba_mixer/mamba_mixer L2 which differ structurally.)
+  - **`ZambaMLP`** [compute]: `L2/llama_mlp.py` (SwiGLU MLP (gate/up/down).)
+  - **`ZambaMambaDecoderLayer`** [wiring]: Mamba layer wiring.
+  - **`ZambaHybridLayer`** [wiring]: Wiring of attention block + N mamba layers per Zamba schedule.
+  - **`ZambaModel`** [wiring]: Top-level wiring.
+  - **`ZambaForCausalLM`** [wiring]: Head wiring.
+  - **`ZambaForSequenceClassification`** [wiring]: Head wiring.
+
+## zamba2
+- **src**: modular_zamba2.py
+- **status**: partial
+- **partial_reason**: Zamba2MambaMixer uses a custom layout (in_proj fused output with intermediate + conv_dim + num_heads, group-norm-gated activation via Zamba2RMSNormGated) that is not reproduced by kb-nano's L2/mamba2_mixer.py; kb-nano has the underlying L1 ops (causal_conv1d, selective scan/state_update via Mamba2) but the wiring is custom.
+- **rationale**: Zamba2 swaps Zamba's Mamba v1 mixer for a Mamba2 mixer; kb-nano has L2/mamba2_mixer.py but Zamba2's mixer is structurally different (uses Zamba2RMSNormGated with group_size, fused in_proj of intermediate+conv_dim+num_heads, and Zamba's shared-attention block schedule). The shared-attention path with rotary embedding is composable, but the bespoke Zamba2MambaMixer wiring around the existing L1 mamba2 ops is missing.
+- **classes**:
+  - **`Zamba2AttentionDecoderLayer`** [compute]: no kb-nano kernel — Zamba2MambaMixer uses a custom layout (in_proj fused output with intermediate + conv_dim + num_heads, group-norm-gated activation via Zamba2RMSNormGated) that is not reproduced by kb-nano's L2/mamba2_
+  - **`Zamba2RMSNormGated`** [compute]: `L1/rms_norm_gated.py` (Group-RMSNorm with SiLU gate.)
+  - **`Zamba2RMSNorm`** [compute]: `L1/rms_norm.py` (Standard RMSNorm.)
+  - **`Zamba2RotaryEmbedding`** [compute]: `L1/rotary_emb.py` (Inherits LlamaRotaryEmbedding.)
+  - **`Zamba2Attention`** [compute]: `L2/attention.py` (Inherits ZambaAttention with rotary added; LlamaAttention covers.)
+  - **`Zamba2MambaMixer`** [compute]: `L1/causal_conv1d.py` (MISSING: custom Mamba2-style mixer with fused in_proj + Zamba2RMSNormGated + n_groups != 1; kb-nano L2/mamba2_mixer.py has different wiring.)
+  - **`Zamba2MLP`** [compute]: `L2/llama_mlp.py` (SwiGLU MLP.)
+  - **`Zamba2MambaDecoderLayer`** [wiring]: Mamba2 layer wiring.
+  - **`Zamba2HybridLayer`** [wiring]: Hybrid block wiring.
+  - **`Zamba2Model`** [wiring]: Top-level wiring.
+  - **`Zamba2ForCausalLM`** [wiring]: Head wiring.
+  - **`Zamba2ForSequenceClassification`** [wiring]: Head wiring.
+
+## zoedepth
+- **src**: modeling_zoedepth.py
+- **status**: partial
+- **partial_reason**: LogBinomialSoftmax uses torch.lgamma to compute log binomial coefficients (log_binom = lgamma(n+1) - lgamma(k+1) - lgamma(n-k+1)); torch supplies lgamma but kb-nano has no L1 lgamma kernel.
+- **rationale**: ZoeDepth is a depth estimation pipeline composed of a (DPT-like) ViT backbone + reassembly/fusion + bin-based depth heads; the transformer encoder + Conv2d/BatchNorm/GELU/ReLU paths are composable, but the bin-regression heads use torch.lgamma (LogBinomialSoftmax via log_binom) which has no kb-nano L1 op.
+- **classes**:
+  - **`ZoeDepthTransformerEncoderLayer`** [compute]: LogBinomialSoftmax uses torch.lgamma to compute log binomial coefficients (log_binom = lgamma(n+1) - lgamma(k+1) - lgamma(n-k+1)); torch supplies lgamma but kb-nano has no L1 lgamma kernel.
+  - **`ZoeDepthReassembleStage`** [wiring]: Wiring of reassemble layers.
+  - **`ZoeDepthReassembleLayer`** [compute]: `L1/conv2d.py`, `L1/conv_transpose2d.py` (1x1 Conv2d + optional ConvTranspose2d/Conv2d resize.)
+  - **`ZoeDepthFeatureFusionStage`** [wiring]: Wiring of fusion layers.
+  - **`ZoeDepthPreActResidualLayer`** [compute]: `L1/conv2d.py`, `L1/relu.py`, `L1/batch_norm2d.py` (Pre-act ReLU + Conv2d residual; optional BN.)
+  - **`ZoeDepthFeatureFusionLayer`** [compute]: `L1/conv2d.py`, `L1/interpolate.py` (Residual + Conv2d + bilinear upsample.)
+  - **`ZoeDepthNeck`** [wiring]: Wiring of reassemble + fusion.
+  - **`ZoeDepthRelativeDepthEstimationHead`** [compute]: `L1/conv2d.py`, `L1/relu.py`, `L1/interpolate.py` (Conv2d + ReLU + bilinear upsample.)
+  - **`LogBinomialSoftmax`** [wiring]: MISSING: torch.lgamma for log-binomial coefficient (no L1 lgamma op).
+  - **`ZoeDepthConditionalLogBinomialSoftmax`** [compute]: `L1/conv2d.py`, `L1/gelu.py`, `L1/softplus.py` (MLP via Conv2d + LogBinomialSoftmax (depends on missing lgamma).)
+  - **`ZoeDepthSeedBinRegressor`** [compute]: `L1/conv2d.py`, `L1/relu.py`, `L1/softplus.py` (Conv2d stack + softplus to produce bin widths.)
+  - **`ZoeDepthAttractorLayer`** [compute]: `L1/conv2d.py`, `L1/relu.py` (Conv2d + activation; computes bin attractors with normalization.)
+  - **`ZoeDepthAttractorLayerUnnormed`** [compute]: `L1/conv2d.py`, `L1/relu.py` (Same as ZoeDepthAttractorLayer with unnormalized variant.)
+  - **`ZoeDepthProjector`** [compute]: `L1/conv2d.py`, `L1/relu.py` (Conv2d projector.)
+  - **`ZoeDepthMultiheadAttention`** [compute]: `L2/encoder_attention.py` (Equivalent to nn.MultiheadAttention with batch_first; split Q/K/V multi-head attn.)
+  - **`ZoeDepthPatchTransformerEncoder`** [wiring]: Stack wiring.
+  - **`ZoeDepthMLPClassifier`** [compute]: `L1/linear.py`, `L1/relu.py` (MLP classifier.)
+  - **`ZoeDepthMultipleMetricDepthEstimationHeads`** [wiring]: Wiring (depends on LogBinomialSoftmax).
+  - **`ZoeDepthMetricDepthEstimationHead`** [wiring]: Wiring (depends on LogBinomialSoftmax).
+  - **`ZoeDepthForDepthEstimation`** [wiring]: Top-level wiring.

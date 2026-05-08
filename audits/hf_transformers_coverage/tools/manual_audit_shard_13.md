@@ -1,0 +1,576 @@
+## sam2
+- **src**: modeling_sam2.py
+- **status**: composable
+- **rationale**: Hiera-style multi-scale ViT vision encoder + SAM prompt encoder + two-way transformer + mask decoder. All compute primitives (Conv2d, LayerNorm, Linear, attention, GELU/SiLU, interpolate) exist in kb-nano L1; sibling SAM3 family has L2/L3 modules that closely mirror this structure.
+- **classes**:
+  - **`Sam2PatchEmbeddings`** [compute]: `L1/conv2d.py` (single nn.Conv2d projection.)
+  - **`Sam2SinePositionEmbedding`** [compute]: `L1/sam3_position_encoding.py` (sine position encoding; sam3 PositionEncoding is the same MViT-derived sine embedding.)
+  - **`Sam2VisionNeck`** [compute]: `L1/conv2d.py`, `L1/interpolate.py` (FPN with Conv2d + bilinear interpolate.)
+  - **`Sam2MultiScaleAttention`** [compute]: `L1/linear.py`, `L1/dense_attention.py`, `L1/max_pool2d.py` (QKV projection then SDPA after spatial pooling Q/K via max_pool2d.)
+  - **`Sam2FeedForward`** [compute]: `L2/sam3_vit_mlp.py` (Two-layer MLP with activation; matches SAM3 MLP.)
+  - **`Sam2MultiScaleBlock`** [wiring]: wires norm + multi-scale attention + MLP.
+  - **`Sam2HieraDetModel`** [wiring]: Hiera vision backbone wiring (composes blocks).
+  - **`Sam2VisionModel`** [wiring]: wiring around HieraDet + neck.
+  - **`Sam2PositionalEmbedding`** [compute]: `L1/sam3_position_encoding.py` (Random fourier positional embedding (matches sam3).)
+  - **`Sam2MaskEmbedding`** [compute]: `L1/conv2d.py` (stacked Conv2d layers for mask input.)
+  - **`Sam2PromptEncoder`** [compute]: `L2/sam3_prompt_encoder.py` (point/box/mask prompt encoder; sam3 prompt encoder is the same.)
+  - **`Sam2Attention`** [compute]: `L1/linear.py`, `L1/dense_attention.py` (Standard cross/self attention with downsampled internal dim.)
+  - **`Sam2TwoWayAttentionBlock`** [wiring]: wires self-attn + cross-attn + MLP (token<->image).
+  - **`Sam2TwoWayTransformer`** [wiring]: stack of two-way blocks.
+  - **`Sam2LayerNorm`** [compute]: `L1/layer_norm2d.py` (channels-first 2D LayerNorm.)
+  - **`Sam2MaskDecoder`** [compute]: `L3/sam3_mask_decoder.py` (two-way transformer + upscaler + IoU/MLP heads; matches sam3 mask decoder.)
+  - **`Sam2Model`** [wiring]: top-level wiring of encoder + prompt + decoder.
+
+## sam2_video
+- **src**: modeling_sam2_video.py
+- **status**: composable
+- **rationale**: SAM2 image pieces + memory attention + RoPE attention + memory encoder for video tracking. All primitives (RoPE attention, conv2d, layer_norm2d, dense attention) exist; structure matches kb-nano sam3_tracker memory pipeline.
+- **classes**:
+  - **`Sam2VideoLayerNorm`** [compute]: `L1/layer_norm2d.py` (channels-first 2D LayerNorm.)
+  - **`Sam2VideoPositionEmbeddingSine`** [compute]: `L1/sam3_position_encoding.py` (sine 2D position embedding.)
+  - **`Sam2VideoAttention`** [compute]: `L1/linear.py`, `L1/dense_attention.py` (standard attention with internal downsample (same as Sam2Attention).)
+  - **`Sam2VideoTwoWayAttentionBlock`** [wiring]: wires self/cross attention + MLP.
+  - **`Sam2VideoFeedForward`** [compute]: `L2/sam3_vit_mlp.py` (two-layer MLP.)
+  - **`Sam2VideoVisionRotaryEmbedding`** [compute]: `L1/sam3_rope.py` (2D vision rotary embedding (axial RoPE), matches sam3 rope.)
+  - **`Sam2VideoRoPEAttention`** [compute]: `L1/sam3_rope_attention.py` (RoPE-applied attention; matches sam3_rope_attention.)
+  - **`Sam2VideoMemoryAttentionLayer`** [wiring]: wires self-attn + memory cross-attn + MLP (sam3_memory_attention layer).
+  - **`Sam2VideoMemoryAttention`** [compute]: `L3/sam3_memory_attention.py` (stack of memory attention layers.)
+  - **`Sam2VideoMemoryFuserCXBlock`** [compute]: `L1/conv2d.py`, `L1/layer_norm2d.py`, `L1/gelu.py` (ConvNeXt-style block (depthwise conv + LN + MLP + GELU).)
+  - **`Sam2VideoMemoryFuser`** [wiring]: stack of CXBlocks; SimpleFuser equivalent.
+  - **`Sam2VideoMaskDownSamplerLayer`** [compute]: `L1/conv2d.py`, `L1/layer_norm2d.py`, `L1/gelu.py` (Conv2d + LN + activation.)
+  - **`Sam2VideoMaskDownSampler`** [wiring]: stack of mask downsampler layers (sam3 SimpleMaskDownSampler).
+  - **`Sam2VideoMemoryEncoder`** [compute]: `L2/sam3_memory_encoder.py` (memory encoder = mask downsample + fuse + projection (same as sam3).)
+  - **`Sam2VideoPositionalEmbedding`** [compute]: `L1/sam3_position_encoding.py` (random fourier positional embedding.)
+  - **`Sam2VideoMaskEmbedding`** [compute]: `L1/conv2d.py` (stacked Conv2d for mask embedding.)
+  - **`Sam2VideoPromptEncoder`** [compute]: `L2/sam3_prompt_encoder.py` (point/box/mask prompt encoder.)
+  - **`Sam2VideoTwoWayTransformer`** [wiring]: stack of two-way attention blocks (in mask decoder).
+  - **`Sam2VideoMaskDecoder`** [compute]: `L3/sam3_mask_decoder.py` (transformer + upscaler + IoU/mask MLP heads.)
+  - **`Sam2VideoModel`** [wiring]: top-level wiring of vision + memory + prompt + decoder.
+
+## sam3
+- **src**: modeling_sam3.py
+- **status**: kb_nano_l4
+- **rationale**: Existing L4 pipeline at tasks/baseline/L4/sam3.py implements SAM3 image segmentation (VL backbone + fusion encoder + DETR decoder + geometry encoder + segmentation head); its docstring header explicitly targets sam3 image model.
+- **classes**:
+  - **`Sam3MLP`** [compute]: `L2/sam3_vit_mlp.py` (two-layer MLP with activation.)
+  - **`Sam3Attention`** [compute]: `L2/sam3_text_attention.py` (standard MHA used by text encoder/DETR.)
+  - **`Sam3ViTRotaryEmbedding`** [compute]: `L1/sam3_rope.py` (axial 2D RoPE for ViT.)
+  - **`Sam3ViTRoPEAttention`** [compute]: `L1/sam3_rope_attention.py`, `L2/sam3_vit_attention.py` (ViT attention with RoPE applied.)
+  - **`Sam3ViTPatchEmbeddings`** [compute]: `L1/conv2d.py` (Conv2d patch projection.)
+  - **`Sam3ViTEmbeddings`** [wiring]: wires patch embed + position embed.
+  - **`Sam3ViTLayerScale`** [wiring]: single learnable scalar broadcast multiply.
+  - **`Sam3ViTLayer`** [compute]: `L3/sam3_vit_block.py` (ViT block wiring (norm + attn + MLP + layer-scale).)
+  - **`Sam3ViTModel`** [compute]: `L3/sam3_vit.py` (ViT backbone.)
+  - **`Sam3SinePositionEmbedding`** [compute]: `L1/sam3_position_encoding.py` (sine position encoding.)
+  - **`Sam3FPNLayer`** [compute]: `L2/sam3_fpn_conv.py` (FPN layer with conv + group_norm.)
+  - **`Sam3VisionNeck`** [compute]: `L3/sam3_neck.py` (FPN neck stack.)
+  - **`Sam3VisionModel`** [wiring]: wires ViT + neck.
+  - **`Sam3GeometryEncoderLayer`** [wiring]: encoder layer wiring (attn + MLP).
+  - **`Sam3GeometryEncoder`** [wiring]: stack of encoder layers.
+  - **`Sam3DetrEncoderLayer`** [wiring]: DETR encoder layer wiring.
+  - **`Sam3DetrEncoder`** [wiring]: DETR encoder stack.
+  - **`Sam3DecoderMLP`** [compute]: `L1/linear.py` (small MLP for decoder.)
+  - **`Sam3DetrDecoderLayer`** [compute]: `L3/sam3_decoder_layer.py` (DETR decoder layer with self/cross attention.)
+  - **`Sam3DetrDecoder`** [wiring]: DETR decoder stack.
+  - **`Sam3DotProductScoring`** [compute]: `L1/linear.py` (dot product scoring head.)
+  - **`Sam3MaskEmbedder`** [compute]: `L1/linear.py` (embeds queries to mask predictions.)
+  - **`Sam3PixelDecoder`** [compute]: `L3/sam3_pixel_decoder.py` (pixel decoder with conv upsampling.)
+  - **`Sam3MaskDecoder`** [compute]: `L2/sam3_mask_predictor.py` (mask predictor wiring.)
+  - **`Sam3Model`** [wiring]: top-level wiring delivered by L4 pipeline.
+
+## sam3_lite_text
+- **src**: modeling_sam3_lite_text.py
+- **status**: partial
+- **partial_reason**: RepMixer/MobileOneBlock structure relies on nn.BatchNorm2d (kb-nano L1/batch_norm2d.py exists but the depthwise-conv reparameterization wrapper has no fused kb-nano kernel) and nn.functional.interpolate handled in pure torch.
+- **rationale**: MobileOne-style RepMixer text encoder + DETR encoder/decoder + geometry encoder + mask decoder. Most pieces map to standard L1 (Conv2d, BatchNorm2d, Linear, GELU); however the RepMixer's BatchNorm2d-with-skip and reparameterizable block are not in kb-nano (rely on torch.nn.BatchNorm2d defaults).
+- **classes**:
+  - **`Sam3LiteTextRepMixer`** [compute]: RepMixer/MobileOneBlock structure relies on nn.BatchNorm2d (kb-nano L1/batch_norm2d.py exists but the depthwise-conv reparameterization wrapper has no fused kb-nano kernel) and nn.functional.interpola
+  - **`Sam3LiteTextTextPositionEmbedding`** [compute]: `L1/interpolate.py` (Position embedding interpolated to seq length via F.interpolate.)
+  - **`Sam3LiteTextMobileOneBlock`** [compute]: `L1/conv2d.py`, `L1/batch_norm2d.py` (depthwise conv + BN with BN skip path.)
+  - **`Sam3LiteTextConvMLP`** [compute]: `L1/conv2d.py` (1x1 Conv2d MLP.)
+  - **`Sam3LiteTextConvolutionalFeedForward`** [compute]: `L1/conv2d.py`, `L1/batch_norm2d.py` (depthwise conv + BN + ConvMLP.)
+  - **`Sam3LiteTextLayerScaledResidual`** [wiring]: learnable scalar broadcast multiply (residual).
+  - **`Sam3LiteTextRepMixerBlock`** [wiring]: wires token mixer + ConvFFN.
+  - **`Sam3LiteTextTextAttention`** [compute]: `L2/sam3_text_attention.py` (standard MHA used in text encoder.)
+  - **`Sam3LiteTextTextMLP`** [compute]: `L2/sam3_vit_mlp.py` (two-layer MLP with activation.)
+  - **`Sam3LiteTextTextEncoderLayer`** [compute]: `L3/sam3_text_encoder_layer.py` (wires norm + attention + MLP.)
+  - **`Sam3LiteTextTextEmbeddings`** [compute]: `L1/embedding.py` (token + position embedding.)
+  - **`Sam3LiteTextTextModel`** [compute]: `L3/sam3_text_encoder.py` (text encoder wiring.)
+  - **`Sam3LiteTextMLP`** [compute]: `L2/sam3_vit_mlp.py` (two-layer MLP.)
+  - **`Sam3LiteTextAttention`** [compute]: `L2/sam3_text_attention.py` (standard MHA.)
+  - **`Sam3LiteTextSinePositionEmbedding`** [compute]: `L1/sam3_position_encoding.py` (sine 2D position embedding.)
+  - **`Sam3LiteTextGeometryEncoderLayer`** [wiring]: wires self-attn + cross-attn + MLP.
+  - **`Sam3LiteTextGeometryEncoder`** [wiring]: stack of geometry encoder layers.
+  - **`Sam3LiteTextDetrEncoderLayer`** [wiring]: DETR encoder layer wiring.
+  - **`Sam3LiteTextDetrEncoder`** [wiring]: DETR encoder stack.
+  - **`Sam3LiteTextDecoderMLP`** [compute]: `L1/linear.py` (small MLP.)
+  - **`Sam3LiteTextDetrDecoderLayer`** [wiring]: DETR decoder layer wiring.
+  - **`Sam3LiteTextDetrDecoder`** [wiring]: DETR decoder stack.
+
+## sam3_tracker
+- **src**: modeling_sam3_tracker.py
+- **status**: kb_nano_l4
+- **rationale**: Existing L4 pipeline at tasks/baseline/L4/sam3_tracker.py implements Sam3TrackerBase/Predictor with prompt encoder, mask decoder, memory attention, memory encoder.
+- **classes**:
+  - **`Sam3TrackerFeedForward`** [compute]: `L2/sam3_vit_mlp.py` (two-layer MLP.)
+  - **`Sam3TrackerPositionalEmbedding`** [compute]: `L1/sam3_position_encoding.py` (random fourier positional embedding.)
+  - **`Sam3TrackerMaskEmbedding`** [compute]: `L1/conv2d.py` (stacked Conv2d for mask embedding.)
+  - **`Sam3TrackerPromptEncoder`** [compute]: `L2/sam3_prompt_encoder.py` (point/box/mask prompt encoder.)
+  - **`Sam3TrackerAttention`** [compute]: `L1/linear.py`, `L1/dense_attention.py` (standard attention with internal downsample dim.)
+  - **`Sam3TrackerTwoWayAttentionBlock`** [wiring]: wires self-attn + cross-attn + MLP.
+  - **`Sam3TrackerTwoWayTransformer`** [wiring]: stack of two-way attention blocks.
+  - **`Sam3TrackerLayerNorm`** [compute]: `L1/layer_norm2d.py` (channels-first 2D LayerNorm.)
+  - **`Sam3TrackerMaskDecoder`** [compute]: `L3/sam3_mask_decoder.py` (mask decoder = two-way transformer + upscaler + heads.)
+  - **`Sam3TrackerModel`** [wiring]: top-level wiring delivered by L4 pipeline.
+
+## sam3_tracker_video
+- **src**: modeling_sam3_tracker_video.py
+- **status**: kb_nano_l4
+- **rationale**: Inherits from sam2_video; the kb-nano L4 sam3_tracker.py implements Sam3TrackerBase/Predictor with the same memory attention + memory encoder + RoPE attention used here, covering the video tracker workflow.
+- **classes**:
+  - **`Sam3TrackerVideoLayerNorm`** [compute]: `L1/layer_norm2d.py` (channels-first 2D LayerNorm.)
+  - **`Sam3TrackerVideoPositionEmbeddingSine`** [compute]: `L1/sam3_position_encoding.py` (sine position embedding.)
+  - **`Sam3TrackerVideoAttention`** [compute]: `L1/linear.py`, `L1/dense_attention.py` (standard attention with internal downsample (Sam2VideoAttention).)
+  - **`Sam3TrackerVideoTwoWayAttentionBlock`** [wiring]: wires self/cross attention + MLP.
+  - **`Sam3TrackerVideoFeedForward`** [compute]: `L2/sam3_vit_mlp.py` (two-layer MLP.)
+  - **`Sam3TrackerVideoVisionRotaryEmbedding`** [compute]: `L1/sam3_rope.py` (axial 2D RoPE.)
+  - **`Sam3TrackerVideoRoPEAttention`** [compute]: `L1/sam3_rope_attention.py` (RoPE attention.)
+  - **`Sam3TrackerVideoMemoryAttentionLayer`** [wiring]: wires self-attn + memory cross-attn + MLP.
+  - **`Sam3TrackerVideoMemoryAttention`** [compute]: `L3/sam3_memory_attention.py` (memory attention stack.)
+  - **`Sam3TrackerVideoMemoryFuserCXBlock`** [compute]: `L1/conv2d.py`, `L1/layer_norm2d.py`, `L1/gelu.py` (ConvNeXt-style block.)
+  - **`Sam3TrackerVideoMemoryFuser`** [wiring]: stack of CXBlocks (SimpleFuser).
+  - **`Sam3TrackerVideoMaskDownSamplerLayer`** [compute]: `L1/conv2d.py`, `L1/layer_norm2d.py` (Conv2d + LN.)
+  - **`Sam3TrackerVideoMaskDownSampler`** [wiring]: stack of mask downsampler layers.
+  - **`Sam3TrackerVideoMemoryEncoder`** [compute]: `L2/sam3_memory_encoder.py` (memory encoder = mask downsample + fuse.)
+  - **`Sam3TrackerVideoPositionalEmbedding`** [compute]: `L1/sam3_position_encoding.py` (random fourier positional embedding.)
+  - **`Sam3TrackerVideoMaskEmbedding`** [compute]: `L1/conv2d.py` (stacked Conv2d.)
+  - **`Sam3TrackerVideoPromptEncoder`** [compute]: `L2/sam3_prompt_encoder.py` (point/box/mask prompt encoder.)
+  - **`Sam3TrackerVideoTwoWayTransformer`** [wiring]: two-way transformer stack.
+  - **`Sam3TrackerVideoMaskDecoder`** [compute]: `L3/sam3_mask_decoder.py` (mask decoder.)
+  - **`Sam3TrackerVideoModel`** [wiring]: top-level wiring delivered by L4 pipeline.
+
+## sam3_video
+- **src**: modeling_sam3_video.py
+- **status**: kb_nano_l4
+- **rationale**: Existing L4 pipeline at tasks/baseline/L4/sam3_video.py implements Sam3VideoModel as detection + tracking + association orchestrator using Sam3TrackerPredictor.
+- **classes**:
+  - **`Sam3VideoInferenceCache`** [wiring]: session/inference state container; pure Python wiring (no kernel).
+  - **`Sam3VideoInferenceSession`** [wiring]: session/inference state container; pure Python wiring.
+  - **`Sam3VideoModel`** [wiring]: top-level wiring delivered by L4 pipeline (detector + tracker + association).
+
+## sam_hq
+- **src**: modeling_sam_hq.py
+- **status**: partial
+- **rationale**: SAM-HQ adds high-quality output token with Hiera-style ViT vision encoder + standard SAM prompt encoder + two-way transformer + HQ-augmented mask decoder. All compute primitives (Conv2d, LayerNorm, Linear, attention, GELU, interpolate) exist in kb-nano L1/L2.
+- **classes**:
+  - **`SamHQVisionEncoder`** [compute]: no kb-nano kernel — SAM-HQ adds high-quality output token with Hiera-style ViT vision encoder + standard SAM prompt encoder + two-way transformer + HQ-augmented mask decoder. All compute primitives (Conv2d, LayerNorm, Li
+  - **`SamHQVisionAttention`** [compute]: `L1/linear.py` (windowed eager attention with decomposed relative position embeddings.)
+  - **`SamHQMLPBlock`** [compute]: `L2/sam3_vit_mlp.py` (two-layer MLP.)
+  - **`SamHQVisionSdpaAttention`** [compute]: `L1/sdpa.py` (SDPA variant of vision attention.)
+  - **`SamHQVisionLayer`** [compute]: `L3/sam3_vit_block.py` (wires norm + windowed attn + MLP.)
+  - **`SamHQPositionalEmbedding`** [compute]: `L1/sam3_position_encoding.py` (random fourier positional embedding.)
+  - **`SamHQPatchEmbeddings`** [compute]: `L1/conv2d.py` (Conv2d patch projection.)
+  - **`SamHQVisionNeck`** [compute]: `L1/conv2d.py`, `L1/layer_norm2d.py` (Conv2d + LN neck.)
+  - **`SamHQLayerNorm`** [compute]: `L1/layer_norm2d.py` (channels-first 2D LayerNorm.)
+  - **`SamHQAttention`** [compute]: `L1/linear.py`, `L1/dense_attention.py` (standard attention with internal downsample.)
+  - **`SamHQTwoWayAttentionBlock`** [wiring]: wires self-attn + cross-attn + MLP.
+  - **`SamHQTwoWayTransformer`** [wiring]: stack of two-way attention blocks.
+  - **`SamHQFeedForward`** [compute]: `L1/linear.py` (small MLP.)
+  - **`SamHQMaskDecoder`** [compute]: `L3/sam3_mask_decoder.py` (two-way transformer + upscaler + IoU/mask MLP heads (HQ-augmented).)
+  - **`SamHQVisionModel`** [wiring]: wires vision encoder.
+  - **`SamHQMaskEmbedding`** [compute]: `L1/conv2d.py` (stacked Conv2d.)
+  - **`SamHQPromptEncoder`** [compute]: `L2/sam3_prompt_encoder.py` (point/box/mask prompt encoder.)
+  - **`SamHQModel`** [wiring]: top-level wiring of encoder + prompt + decoder.
+
+## seamless_m4t
+- **src**: modeling_seamless_m4t.py
+- **status**: partial
+- **partial_reason**: Conformer relative-position attention + GLU activation + custom rel-pos shift are torch-native (matmul/softmax/Linear) but no fused kb-nano kernel; SeamlessM4TVariancePredictor uses standard Conv1d + LN.
+- **rationale**: Conformer speech encoder uses relative-position attention (Transformer-XL style) and rotary positional embeddings; the relative-pos attention is computed manually with no kb-nano fused kernel, plus SeamlessM4TConformerConvolutionModule has kb-nano-uncovered ops (GLU, depthwise Conv1d). HifiGan vocoder uses ConvTranspose1d which exists. Text enc/dec is BART-style (covered by whisper_attention).
+- **classes**:
+  - **`SeamlessM4TConformerSamePadLayer`** [compute]: no kb-nano kernel — Conformer relative-position attention + GLU activation + custom rel-pos shift are torch-native (matmul/softmax/Linear) but no fused kb-nano kernel; SeamlessM4TVariancePredictor uses standard Conv1d + 
+  - **`SeamlessM4TConformerPositionalConvEmbedding`** [compute]: `L1/conv1d.py` (Conv1d with weight_norm + activation.)
+  - **`SeamlessM4TConformerRotaryPositionalEmbedding`** [compute]: `L1/rotary_emb.py` (rotary embedding precomputation.)
+  - **`SeamlessM4TConformerRelPositionalEmbedding`** [wiring]: Transformer-XL relative position embedding precompute (no kb-nano kernel).
+  - **`SeamlessM4TConformerFeatureProjection`** [compute]: `L1/layer_norm.py`, `L1/linear.py` (LN + Linear.)
+  - **`SeamlessM4TConformerFeedForward`** [compute]: `L1/linear.py` (two-layer MLP with activation.)
+  - **`SeamlessM4TConformerConvolutionModule`** [compute]: `L1/conv1d.py`, `L1/layer_norm.py` (pointwise Conv1d + GLU + depthwise Conv1d + BatchNorm + activation; uses torch GLU.)
+  - **`SeamlessM4TConformerSelfAttention`** [compute]: `L1/linear.py`, `L1/rotary_emb.py` (Conformer self-attn with optional rotary or relative position; relative-pos branch has no kb-nano fused kernel.)
+  - **`SeamlessM4TConformerEncoderLayer`** [wiring]: wires FFN/2 + attn + conv module + FFN/2 + LN.
+  - **`SeamlessM4TConformerEncoder`** [wiring]: stack of Conformer layers.
+  - **`SeamlessM4TConformerAdapterLayer`** [compute]: `L1/conv1d.py` (Conv1d-based adapter.)
+  - **`SeamlessM4TConformerAdapter`** [wiring]: stack of adapter layers.
+  - **`SeamlessM4TScaledWordEmbedding`** [compute]: `L1/embedding.py` (scaled token embedding.)
+  - **`SeamlessM4TSinusoidalPositionalEmbedding`** [compute]: `L1/sinusoidal_embed.py` (sinusoidal positional embedding.)
+  - **`SeamlessM4TAttention`** [compute]: `L2/whisper_attention.py` (BART-style attention shared with whisper_attention.)
+  - **`SeamlessM4TFeedForwardNetwork`** [compute]: `L2/whisper_mlp.py` (two-layer MLP.)
+  - **`SeamlessM4TEncoderLayer`** [wiring]: wires self-attn + FFN.
+  - **`SeamlessM4TDecoderLayer`** [wiring]: wires self-attn + cross-attn + FFN.
+  - **`SeamlessM4TSpeechEncoder`** [wiring]: wraps Conformer encoder.
+  - **`SeamlessM4TEncoder`** [wiring]: BART-style text encoder.
+  - **`SeamlessM4TDecoder`** [wiring]: BART-style text decoder.
+  - **`SeamlessM4TTextToUnitModel`** [wiring]: T2U enc-dec wiring.
+  - **`SeamlessM4TTextToUnitForConditionalGeneration`** [wiring]: T2U + LM head wiring.
+  - **`HifiGanResidualBlock`** [compute]: `L1/conv1d.py` (dilated Conv1d residual block.)
+  - **`SeamlessM4TVariancePredictor`** [compute]: `L1/conv1d.py`, `L1/layer_norm.py`, `L1/linear.py` (Conv1d + LN + linear.)
+  - **`SeamlessM4THifiGan`** [compute]: `L1/conv1d.py`, `L1/conv_transpose1d.py` (HiFi-GAN vocoder = conv1d + conv_transpose1d + leaky relu + tanh.)
+  - **`SeamlessM4TCodeHifiGan`** [wiring]: wraps HifiGan with code/embedding.
+  - **`SeamlessM4TForTextToText`** [wiring]: task wiring.
+  - **`SeamlessM4TForSpeechToText`** [wiring]: task wiring.
+  - **`SeamlessM4TForTextToSpeech`** [wiring]: task wiring.
+  - **`SeamlessM4TForSpeechToSpeech`** [wiring]: task wiring.
+  - **`SeamlessM4TModel`** [wiring]: top-level wiring of all heads.
+
+## seamless_m4t_v2
+- **src**: modeling_seamless_m4t_v2.py
+- **status**: partial
+- **partial_reason**: Conformer relative-position attention has no fused kb-nano kernel (same as v1); rest is torch-native and composable.
+- **rationale**: SeamlessM4Tv2 = SeamlessM4T variant with NAR text-to-unit decoder using char-level conv-pos plus duration predictor. Same Conformer/relative-pos limitation as v1; Char-level conv predictor uses standard Conv1d.
+- **classes**:
+  - **`SeamlessM4Tv2ConformerEncoderLayer`** [compute]: no kb-nano kernel — Conformer relative-position attention has no fused kb-nano kernel (same as v1); rest is torch-native and composable.
+  - **`SeamlessM4Tv2ConformerFeatureProjection`** [compute]: `L1/layer_norm.py`, `L1/linear.py` (LN + Linear.)
+  - **`SeamlessM4Tv2ConformerFeedForward`** [compute]: `L1/linear.py` (two-layer MLP.)
+  - **`SeamlessM4Tv2ConformerConvolutionModule`** [compute]: `L1/conv1d.py`, `L1/layer_norm.py` (Conformer conv module (pointwise Conv1d + GLU + depthwise Conv1d + BN + activation).)
+  - **`SeamlessM4Tv2ConformerSelfAttention`** [compute]: `L1/linear.py` (Conformer self-attention (relative-pos, no fused kb-nano kernel).)
+  - **`SeamlessM4Tv2ConformerEncoder`** [wiring]: stack of Conformer layers.
+  - **`SeamlessM4Tv2ConformerAdapterLayer`** [compute]: `L1/conv1d.py` (Conv1d adapter.)
+  - **`SeamlessM4Tv2ConformerAdapter`** [wiring]: stack of adapter layers.
+  - **`SeamlessM4Tv2ScaledWordEmbedding`** [compute]: `L1/embedding.py` (scaled embedding.)
+  - **`SeamlessM4Tv2SinusoidalPositionalEmbedding`** [compute]: `L1/sinusoidal_embed.py` (sinusoidal positional embedding.)
+  - **`SeamlessM4Tv2Attention`** [compute]: `L2/whisper_attention.py` (BART-style attention.)
+  - **`SeamlessM4Tv2FeedForwardNetwork`** [compute]: `L2/whisper_mlp.py` (two-layer MLP.)
+  - **`SeamlessM4Tv2EncoderLayer`** [wiring]: encoder layer wiring.
+  - **`SeamlessM4Tv2DecoderLayer`** [wiring]: decoder layer wiring (self+cross attn + FFN).
+  - **`SeamlessM4Tv2TextToUnitDecoderLayer`** [wiring]: NAR T2U decoder layer wiring.
+  - **`SeamlessM4Tv2SpeechEncoder`** [wiring]: Conformer encoder wrapper.
+  - **`SeamlessM4Tv2Encoder`** [wiring]: text encoder.
+  - **`SeamlessM4Tv2Decoder`** [wiring]: text decoder.
+  - **`SeamlessM4Tv2TextToUnitDecoder`** [wiring]: NAR T2U decoder.
+  - **`SeamlessM4Tv2TextToUnitModel`** [wiring]: T2U model wiring.
+  - **`SeamlessM4Tv2TextToUnitForConditionalGeneration`** [wiring]: T2U + LM head wiring.
+  - **`HifiGanResidualBlock`** [compute]: `L1/conv1d.py` (dilated Conv1d residual block.)
+  - **`SeamlessM4Tv2VariancePredictor`** [compute]: `L1/conv1d.py`, `L1/layer_norm.py`, `L1/linear.py` (Conv1d duration predictor.)
+  - **`SeamlessM4Tv2HifiGan`** [compute]: `L1/conv1d.py`, `L1/conv_transpose1d.py` (HiFi-GAN vocoder.)
+  - **`SeamlessM4Tv2CodeHifiGan`** [wiring]: HifiGan + code embeds.
+  - **`SeamlessM4Tv2ForTextToText`** [wiring]: task wiring.
+  - **`SeamlessM4Tv2ForSpeechToText`** [wiring]: task wiring.
+  - **`SeamlessM4Tv2ForTextToSpeech`** [wiring]: task wiring.
+  - **`SeamlessM4Tv2ForSpeechToSpeech`** [wiring]: task wiring.
+  - **`SeamlessM4Tv2Model`** [wiring]: top-level wiring.
+
+## seed_oss
+- **src**: modular_seed_oss.py
+- **status**: composable
+- **rationale**: Plain Llama variant with SwiGLU MLP + GQA attention + RMSNorm + RoPE + residual dropout. All compute classes map cleanly to LlamaAttention / llama_mlp / rms_norm / rotary_emb.
+- **classes**:
+  - **`SeedOssRMSNorm`** [compute]: `L1/rms_norm.py` (Llama-family RMSNorm.)
+  - **`SeedOssMLP`** [compute]: `L2/llama_mlp.py`, `L1/silu_and_mul.py` (SwiGLU gate_proj + up_proj + down_proj with SiLU activation; matches llama_mlp.)
+  - **`SeedOssAttention`** [compute]: `L2/attention.py` (GQA attention with RoPE + KV cache; matches LlamaAttention.)
+  - **`SeedOssDecoderLayer`** [compute]: `L3/llama_decoder.py` (Llama-style decoder layer (norm + attn + norm + MLP).)
+  - **`SeedOssModel`** [wiring]: wires embeddings + decoder layers + final norm.
+  - **`SeedOssForCausalLM`** [wiring]: LM head wiring.
+  - **`SeedOssForSequenceClassification`** [wiring]: classification head wiring.
+  - **`SeedOssForTokenClassification`** [wiring]: token classification head wiring.
+  - **`SeedOssForQuestionAnswering`** [wiring]: QA head wiring.
+
+## segformer
+- **src**: modeling_segformer.py
+- **status**: composable
+- **rationale**: SegFormer = MiT (Mix Transformer) backbone with overlap patch embed + efficient self-attention with sequence reduction (PvT-style) + Mix-FFN (depthwise conv inside FFN) + segmentation head. All ops (Conv2d with depthwise/groups, Linear, LayerNorm, GELU/ReLU, softmax, matmul) exist as kb-nano L1 primitives.
+- **classes**:
+  - **`SegformerDropPath`** [wiring]: stochastic depth (no compute at inference).
+  - **`SegformerOverlapPatchEmbeddings`** [compute]: `L1/conv2d.py`, `L1/layer_norm.py` (Conv2d with stride < patch_size + LayerNorm.)
+  - **`SegformerEfficientSelfAttention`** [compute]: `L1/linear.py`, `L1/conv2d.py`, `L1/layer_norm.py`, `L1/softmax.py` (PvT efficient self-attn: spatial reduction Conv2d on K/V then standard MHA via matmul + softmax.)
+  - **`SegformerSelfOutput`** [compute]: `L1/linear.py` (Linear projection.)
+  - **`SegformerAttention`** [wiring]: wires SegformerEfficientSelfAttention + SegformerSelfOutput (sibling-class wrapper).
+  - **`SegformerDWConv`** [compute]: `L1/conv2d.py` (depthwise Conv2d (groups=dim).)
+  - **`SegformerMixFFN`** [compute]: `L1/linear.py`, `L1/gelu.py` (Linear + DWConv + GELU + Linear.)
+  - **`SegformerLayer`** [wiring]: wires norm + attention + drop_path + norm + MixFFN.
+  - **`SegformerEncoder`** [wiring]: stack of multi-scale blocks with overlap patch embeds.
+  - **`SegformerModel`** [wiring]: top-level wiring of encoder.
+  - **`SegformerForImageClassification`** [wiring]: classification head wiring.
+  - **`SegformerMLP`** [compute]: `L1/linear.py` (Linear projection.)
+  - **`SegformerDecodeHead`** [compute]: `L1/linear.py`, `L1/conv2d.py`, `L1/batch_norm2d.py`, `L1/relu.py`, `L1/interpolate.py` (ALL-MLP segmentation head: per-stage Linear + bilinear upsample + concat + Conv2d + BN + ReLU + Conv2d classifier.)
+  - **`SegformerForSemanticSegmentation`** [wiring]: segmentation head wiring.
+
+## seggpt
+- **src**: modeling_seggpt.py
+- **status**: composable
+- **rationale**: SegGpt is ViT-style with windowed attention + decomposed relative position embeddings (MViTv2). All compute (Linear, Conv2d patch embed, softmax, einsum/matmul, GELU, F.interpolate) exists in kb-nano L1; rel-pos computation is straightforward torch ops.
+- **classes**:
+  - **`SegGptPatchEmbeddings`** [compute]: `L1/conv2d.py` (Conv2d patch projection.)
+  - **`SegGptEmbeddings`** [wiring]: wires patch embed + position embed + segment/type embeds.
+  - **`SegGptAttention`** [compute]: `L1/linear.py`, `L1/softmax.py`, `L1/interpolate.py` (windowed MHA with decomposed rel-pos via einsum + interpolate; standard torch ops.)
+  - **`SegGptMlp`** [compute]: `L2/sam3_vit_mlp.py` (two-layer MLP with activation.)
+  - **`SegGptDropPath`** [wiring]: stochastic depth (no compute at inference).
+  - **`SegGptLayer`** [wiring]: wires norm + attention + drop_path + norm + MLP.
+  - **`SegGptEncoder`** [wiring]: stack of layers.
+  - **`SegGptLayerNorm`** [compute]: `L1/layer_norm2d.py` (channels-first LayerNorm.)
+  - **`SegGptDecoderHead`** [compute]: `L1/conv2d.py` (Conv2d decoder head.)
+  - **`SegGptDecoder`** [wiring]: wires final norm + decoder head.
+  - **`SegGptModel`** [wiring]: top-level wiring.
+  - **`SegGptLoss`** [wiring]: training-only loss; not relevant for inference.
+  - **`SegGptForImageSegmentation`** [wiring]: segmentation head wiring.
+
+## sew
+- **src**: modular_sew.py
+- **status**: composable
+- **rationale**: SEW = Wav2Vec2-derived speech encoder with squeezed conv embedding + standard transformer encoder. Conv1d feature encoder, weight-norm Conv1d positional embedding, Wav2Vec2-style attention all map to existing kb-nano L1 (conv1d, linear, softmax) + standard whisper_attention pattern.
+- **classes**:
+  - **`SEWNoLayerNormConvLayer`** [compute]: `L1/conv1d.py`, `L1/gelu.py` (Conv1d + activation.)
+  - **`SEWLayerNormConvLayer`** [compute]: `L1/conv1d.py`, `L1/layer_norm.py`, `L1/gelu.py` (Conv1d + LayerNorm + activation.)
+  - **`SEWGroupNormConvLayer`** [compute]: `L1/conv1d.py`, `L1/group_norm.py`, `L1/gelu.py` (Conv1d + GroupNorm + activation.)
+  - **`SEWPositionalConvEmbedding`** [compute]: `L1/conv1d.py` (weight-normed grouped Conv1d with squeeze.)
+  - **`SEWSamePadLayer`** [wiring]: trivial padding crop.
+  - **`SEWUpsampling`** [compute]: `L1/linear.py` (Linear-based upsample.)
+  - **`SEWFeatureEncoder`** [wiring]: stack of conv layers.
+  - **`SEWAttention`** [compute]: `L2/whisper_attention.py` (BART-style MHA same as Wav2Vec2/Whisper.)
+  - **`SEWFeedForward`** [compute]: `L2/whisper_mlp.py` (two-layer MLP.)
+  - **`SEWEncoderLayer`** [wiring]: wires self-attn + FFN.
+  - **`SEWEncoder`** [wiring]: stack of encoder layers.
+  - **`SEWModel`** [wiring]: top-level wiring (feature encoder + transformer encoder + upsample).
+  - **`SEWForCTC`** [wiring]: CTC head wiring.
+  - **`SEWForSequenceClassification`** [wiring]: classification head wiring.
+
+## sew_d
+- **src**: modeling_sew_d.py
+- **status**: partial
+- **partial_reason**: DisentangledSelfAttention (DeBERTa-v2 style content/pos/c2p/p2c scoring) and ConvLayer relative-pos handling have no fused kb-nano kernel; rely on torch matmul/gather/softmax/Linear.
+- **rationale**: SEW-D = SEW + DeBERTa-v2 disentangled self-attention. The disentangled attention (content-to-position + position-to-content scoring with bucket-relative positions) has no kb-nano fused kernel; uses standard torch matmul + gather + softmax. Convolution feature encoder is composable.
+- **classes**:
+  - **`SEWDSamePadLayer`** [compute]: no kb-nano kernel — DisentangledSelfAttention (DeBERTa-v2 style content/pos/c2p/p2c scoring) and ConvLayer relative-pos handling have no fused kb-nano kernel; rely on torch matmul/gather/softmax/Linear.
+  - **`SEWDNoLayerNormConvLayer`** [compute]: `L1/conv1d.py`, `L1/gelu.py` (Conv1d + activation.)
+  - **`SEWDLayerNormConvLayer`** [compute]: `L1/conv1d.py`, `L1/layer_norm.py` (Conv1d + LayerNorm.)
+  - **`SEWDGroupNormConvLayer`** [compute]: `L1/conv1d.py`, `L1/group_norm.py` (Conv1d + GroupNorm.)
+  - **`SEWDPositionalConvEmbedding`** [compute]: `L1/conv1d.py` (weight-normed grouped Conv1d positional embedding.)
+  - **`SEWDUpsampling`** [compute]: `L1/linear.py` (Linear-based upsample.)
+  - **`SEWDFeatureEncoder`** [wiring]: stack of conv layers.
+  - **`ContextPooler`** [compute]: `L1/linear.py` (Linear + activation pooler.)
+  - **`StableDropout`** [compute]: `L1/dropout.py` (dropout (training-only).)
+  - **`SEWDSelfOutput`** [compute]: `L1/linear.py` (Linear projection.)
+  - **`DisentangledSelfAttention`** [compute]: `L1/linear.py` (DeBERTa-v2 disentangled MHA: content-content + content-position + position-content scoring (no fused kb-nano kernel).)
+  - **`SEWDAttention`** [wiring]: wires DisentangledSelfAttention + SEWDSelfOutput.
+  - **`SEWDIntermediate`** [compute]: `L1/linear.py`, `L1/gelu.py` (Linear + activation.)
+  - **`SEWDOutput`** [compute]: `L1/linear.py` (Linear projection.)
+  - **`SEWDLayer`** [wiring]: wires attention + intermediate + output.
+  - **`ConvLayer`** [compute]: `L1/conv1d.py` (Conv1d residual layer.)
+  - **`SEWDTransformerEncoder`** [wiring]: stack of layers + relative-position embedding management.
+  - **`SEWDEncoder`** [wiring]: wires upsample + transformer encoder.
+  - **`SEWDModel`** [wiring]: top-level wiring.
+  - **`SEWDForCTC`** [wiring]: CTC head wiring.
+  - **`SEWDForSequenceClassification`** [wiring]: classification head wiring.
+
+## siglip
+- **src**: modeling_siglip.py
+- **status**: composable
+- **rationale**: SigLIP vision/text encoder with standard non-causal MHA + GELU MLP + LayerNorm. Maps directly to siglip_attention.py + siglip_mlp.py + siglip_encoder_layer.py.
+- **classes**:
+  - **`SiglipVisionEmbeddings`** [compute]: `L1/conv2d.py`, `L1/embedding.py` (Conv2d patch embed + position embed.)
+  - **`SiglipTextEmbeddings`** [compute]: `L1/embedding.py` (token + position embedding.)
+  - **`SiglipAttention`** [compute]: `L2/siglip_attention.py` (non-causal MHA with q_proj/k_proj/v_proj/out_proj.)
+  - **`SiglipMLP`** [compute]: `L2/siglip_mlp.py` (fc1 + GELU + fc2.)
+  - **`SiglipEncoderLayer`** [compute]: `L3/siglip_encoder_layer.py` (norm + attn + norm + MLP wiring.)
+  - **`SiglipEncoder`** [wiring]: stack of encoder layers.
+  - **`SiglipTextModel`** [wiring]: wires text embeddings + encoder + final norm + pool.
+  - **`SiglipVisionModel`** [wiring]: wires vision embeddings + encoder + final norm + pool head.
+  - **`SiglipMultiheadAttentionPoolingHead`** [compute]: `L2/attention_pool.py` (MAP pooling = single learned query + MHA + LN + MLP.)
+  - **`SiglipModel`** [wiring]: wires vision + text models with logit_scale/bias.
+  - **`SiglipForImageClassification`** [wiring]: classification head wiring.
+
+## siglip2
+- **src**: modular_siglip2.py
+- **status**: kb_nano_l4
+- **rationale**: Existing L4 pipeline at tasks/baseline/L4/siglip2.py implements SigLIP-2 NaFlexVit SO400M vision encoder. Same family.
+- **classes**:
+  - **`Siglip2VisionEmbeddings`** [compute]: `L1/linear.py`, `L1/embedding.py` (patch projection + 2D position embedding (NaFlex-style).)
+  - **`Siglip2TextEmbeddings`** [compute]: `L1/embedding.py` (token + position embedding.)
+  - **`Siglip2Attention`** [compute]: `L2/siglip_attention.py` (standard non-causal MHA.)
+  - **`Siglip2MLP`** [compute]: `L2/siglip_mlp.py` (fc1 + GELU + fc2.)
+  - **`Siglip2EncoderLayer`** [compute]: `L3/siglip_encoder_layer.py` (wires norm + attn + norm + MLP.)
+  - **`Siglip2Encoder`** [wiring]: stack of encoder layers.
+  - **`Siglip2VisionModel`** [wiring]: wires vision embeddings + encoder + pool.
+  - **`Siglip2TextModel`** [wiring]: wires text embeddings + encoder.
+  - **`Siglip2MultiheadAttentionPoolingHead`** [compute]: `L2/attention_pool.py` (MAP pooling head.)
+  - **`Siglip2Model`** [wiring]: wires vision + text + scale/bias.
+  - **`Siglip2ForImageClassification`** [wiring]: classification head wiring.
+
+## slanet
+- **src**: modular_slanet.py
+- **status**: partial
+- **partial_reason**: SLANetAttentionGRUCell (and SLANetSLAHead) use nn.GRUCell — torch handles the recurrence but kb-nano has no GRU kernel (only L1/lstm.py); rest of pipeline (Conv2d, depthwise conv, hardswish, Linear) is composable.
+- **rationale**: Table-structure recognition pipeline using PP-LCNet conv backbone + CSP-PAN neck + SLA head with attention GRU decoder. nn.GRUCell has no kb-nano kernel (kb-nano L1/lstm.py exists but no GRU equivalent).
+- **classes**:
+  - **`SLANetCSPLayer`** [compute]: no kb-nano kernel — SLANetAttentionGRUCell (and SLANetSLAHead) use nn.GRUCell — torch handles the recurrence but kb-nano has no GRU kernel (only L1/lstm.py); rest of pipeline (Conv2d, depthwise conv, hardswish, Linear) i
+  - **`SLANetForTableRecognitionOutput`** [wiring]: Output dataclass — skipped per rule 12.
+  - **`SLANetAttentionGRUCell`** [compute]: `L1/linear.py` (Linear + GRUCell — GRUCell has no kb-nano kernel (uses torch directly).)
+  - **`SLANetMLP`** [compute]: `L1/linear.py`, `L1/relu.py` (Linear + ReLU + Linear.)
+  - **`SLANetSLAHead`** [wiring]: wires AttentionGRUCell decoder + structure/location heads (autoregressive).
+  - **`SLANetConvLayer`** [compute]: `L1/conv2d.py`, `L1/batch_norm2d.py`, `L1/hardswish.py` (Conv2d + BN + activation.)
+  - **`SLANetDepthwiseSeparableConvLayer`** [compute]: `L1/conv2d.py`, `L1/batch_norm2d.py`, `L1/hardswish.py` (depthwise + pointwise Conv2d (PP-LCNet style).)
+  - **`SLANetBottleneck`** [compute]: `L1/conv2d.py`, `L1/batch_norm2d.py` (1x1 + 3x3 + 1x1 Conv2d bottleneck.)
+  - **`SLANetCSPPAN`** [wiring]: CSP Path Aggregation Network neck wiring.
+  - **`SLANetBackbone`** [wiring]: wires PP-LCNet backbone + post conv + CSP-PAN.
+  - **`SLANetForTableRecognition`** [wiring]: top-level wiring of backbone + SLA head.
+
+## slanext
+- **src**: modeling_slanext.py
+- **status**: partial
+- **partial_reason**: SLANeXtAttentionGRUCell uses nn.GRUCell which has no kb-nano kernel (kb-nano only ships L1/lstm.py for RNN family).
+- **rationale**: SLANeXt = next-gen table recognition with ViT-style vision encoder + nn.GRUCell-based AttentionGRUCell SLA decoder head. nn.GRUCell has no kb-nano kernel.
+- **classes**:
+  - **`SLANeXtVisionLayer`** [compute]: SLANeXtAttentionGRUCell uses nn.GRUCell which has no kb-nano kernel (kb-nano only ships L1/lstm.py for RNN family).
+  - **`SLANeXtVisionAttention`** [compute]: `L1/linear.py`, `L1/dense_attention.py` (ViT-style MHA.)
+  - **`SLANeXtAttentionGRUCell`** [compute]: `L1/linear.py` (Linear + nn.GRUCell — no GRU kb-nano kernel.)
+  - **`SLANeXtMLP`** [compute]: `L1/linear.py` (two-layer MLP.)
+  - **`SLANeXtMLPBlock`** [compute]: `L2/sam3_vit_mlp.py` (fc1 + activation + fc2.)
+  - **`SLANeXtPatchEmbeddings`** [compute]: `L1/conv2d.py` (Conv2d patch projection.)
+  - **`SLANeXtLayerNorm`** [compute]: `L1/layer_norm2d.py` (channels-first LayerNorm.)
+  - **`SLANeXtVisionNeck`** [compute]: `L1/conv2d.py` (Conv2d-based neck.)
+  - **`SLANeXtVisionEncoder`** [wiring]: ViT backbone wiring.
+  - **`SLANeXtBackbone`** [wiring]: wires vision encoder + neck.
+  - **`SLANeXtSLAHead`** [wiring]: SLA head with AttentionGRUCell decoder (no GRU kernel).
+  - **`SLANeXtForTableRecognition`** [wiring]: top-level wiring.
+
+## smollm3
+- **src**: modular_smollm3.py
+- **status**: composable
+- **rationale**: SmolLM3 is a Llama-family decoder with NoPE-per-layer + optional sliding window attention. SmolLM3Attention overrides forward to gate RoPE per layer; everything else inherits from Llama. Maps to L2/attention.py + llama_mlp + rms_norm.
+- **classes**:
+  - **`SmolLM3RotaryEmbedding`** [compute]: `L1/rotary_emb.py` (Qwen2-style rotary embedding.)
+  - **`SmolLM3Attention`** [compute]: `L2/attention.py` (Llama GQA attention with conditional RoPE per layer + optional sliding-window.)
+  - **`SmolLM3DecoderLayer`** [compute]: `L3/llama_decoder.py` (Llama-style decoder layer wiring.)
+  - **`SmolLM3Model`** [wiring]: Qwen2-style model wiring.
+  - **`SmolLM3ForCausalLM`** [wiring]: LM head wiring.
+  - **`SmolLM3ForSequenceClassification`** [wiring]: classification head wiring.
+  - **`SmolLM3ForTokenClassification`** [wiring]: token classification head wiring.
+  - **`SmolLM3ForQuestionAnswering`** [wiring]: QA head wiring.
+
+## smolvlm
+- **src**: modular_smolvlm.py
+- **status**: composable
+- **rationale**: SmolVLM = Idefics3 derived; uses LlamaAttention/llama_mlp text decoder + SiglipVisionTransformer-derived vision encoder. All compute classes are inherited from Idefics3/Llama/Siglip and map to existing kb-nano L2.
+- **classes**:
+  - **`SmolVLMVisionTransformer`** [compute]: `L3/siglip_encoder_layer.py`, `L2/siglip_attention.py`, `L2/siglip_mlp.py` (SigLIP-style vision encoder.)
+  - **`SmolVLMModel`** [wiring]: wires vision encoder + perceiver/connector + text model (Llama).
+  - **`SmolVLMForConditionalGeneration`** [wiring]: VLM generation wiring.
+
+## solar_open
+- **src**: modular_solar_open.py
+- **status**: partial
+- **partial_reason**: configuration_solar_open.py inherits the GLM4-MoE BC default `kwargs.setdefault("partial_rotary_factor", 0.5)`. Standard L1/rotary_emb rotates the full head_dim; partial-rotary needs external slicing or Gemma4-style proportional rotary. Same gap as glm4_moe/glm4 — applied here for consistency.
+- **rationale**: SolarOpen = GLM4-MoE backbone with shared-expert MoE + Llama attention (no QK norm) + partial-rotary (factor 0.5) + SwiGLU. Maps to L2/shared_expert_moe.py + L2/attention.py + llama_mlp + rms_norm; partial-rotary path is the only gap.
+- **classes**:
+  - **`SolarOpenDecoderLayer`** [compute]: `L3/llama_decoder.py` (Llama-style decoder with SolarOpenMoE replacing MLP.)
+  - **`SolarOpenMoE`** [compute]: `L2/shared_expert_moe.py` (shared-expert MoE pattern (routed experts + shared SwiGLU expert).)
+  - **`SolarOpenAttention`** [compute]: `L2/attention.py` (Llama GQA attention with bias-free o_proj override.)
+  - **`SolarOpenRMSNorm`** [compute]: `L1/rms_norm.py` (RMSNorm.)
+  - **`SolarOpenModel`** [wiring]: GLM4-MoE-style model wiring.
+  - **`SolarOpenForCausalLM`** [wiring]: LM head wiring.
+
+## speech_encoder_decoder
+- **src**: modeling_speech_encoder_decoder.py
+- **status**: composable
+- **rationale**: Generic encoder-decoder wrapper: speech encoder (e.g. wav2vec2/whisper) + text decoder (e.g. BART/MBart). All compute is delegated to wrapped sub-models; this folder contains only wiring.
+- **classes**:
+  - **`SpeechEncoderDecoderModel`** [wiring]: wraps any speech encoder + any text decoder; pure wiring/projection.
+
+## speech_to_text
+- **src**: modeling_speech_to_text.py
+- **status**: composable
+- **rationale**: Speech2Text = MBart-style encoder-decoder with Conv1d subsampler input + sinusoidal positional embed + standard MHA. Maps to whisper_attention + whisper_mlp + L1/conv1d + L1/sinusoidal_embed.
+- **classes**:
+  - **`Conv1dSubsampler`** [compute]: `L1/conv1d.py` (stacked Conv1d with stride for input subsampling.)
+  - **`Speech2TextSinusoidalPositionalEmbedding`** [compute]: `L1/sinusoidal_embed.py` (sinusoidal positional embedding.)
+  - **`Speech2TextAttention`** [compute]: `L2/whisper_attention.py` (MBart-style MHA (self/cross/causal) with KV cache.)
+  - **`Speech2TextEncoderLayer`** [wiring]: wires self-attn + FFN.
+  - **`Speech2TextDecoderLayer`** [wiring]: wires self-attn + cross-attn + FFN.
+  - **`Speech2TextEncoder`** [wiring]: wires Conv1dSubsampler + sinusoidal pos + encoder layers.
+  - **`Speech2TextDecoder`** [wiring]: wires embed + sinusoidal pos + decoder layers.
+  - **`Speech2TextModel`** [wiring]: encoder + decoder wiring.
+  - **`Speech2TextForConditionalGeneration`** [wiring]: LM head wiring.
+
+## speecht5
+- **src**: modeling_speecht5.py
+- **status**: partial
+- **partial_reason**: SpeechT5RelativePositionalEncoding requires custom shift-relative-pos handling (no fused kb-nano kernel); SpeechT5BatchNormConvLayer uses nn.BatchNorm1d which has no kb-nano kernel (only BN2d in L1).
+- **rationale**: SpeechT5 = unified speech/text encoder-decoder + HiFi-GAN vocoder. Encoder uses relative-position attention (Transformer-XL style) which has no fused kb-nano kernel; speech prenet/postnet uses BatchNorm1d (no kb-nano L1 kernel; L1 has BN2d only).
+- **classes**:
+  - **`SpeechT5SamePadLayer`** [compute]: SpeechT5RelativePositionalEncoding requires custom shift-relative-pos handling (no fused kb-nano kernel); SpeechT5BatchNormConvLayer uses nn.BatchNorm1d which has no kb-nano kernel (only BN2d in L1).
+  - **`SpeechT5NoLayerNormConvLayer`** [compute]: `L1/conv1d.py`, `L1/gelu.py` (Conv1d + activation.)
+  - **`SpeechT5LayerNormConvLayer`** [compute]: `L1/conv1d.py`, `L1/layer_norm.py` (Conv1d + LN.)
+  - **`SpeechT5GroupNormConvLayer`** [compute]: `L1/conv1d.py`, `L1/group_norm.py` (Conv1d + GroupNorm.)
+  - **`SpeechT5SinusoidalPositionalEmbedding`** [compute]: `L1/sinusoidal_embed.py` (sinusoidal pos embedding.)
+  - **`SpeechT5PositionalConvEmbedding`** [compute]: `L1/conv1d.py` (weight-normed grouped Conv1d positional embedding.)
+  - **`SpeechT5ScaledPositionalEncoding`** [compute]: `L1/sinusoidal_embed.py` (scaled sinusoidal positional encoding.)
+  - **`SpeechT5RelativePositionalEncoding`** [compute]: `L1/embedding.py` (Relative position embedding lookup table.)
+  - **`SpeechT5FeatureEncoder`** [wiring]: stack of conv layers.
+  - **`SpeechT5FeatureProjection`** [compute]: `L1/layer_norm.py`, `L1/linear.py` (LN + Linear.)
+  - **`SpeechT5SpeechEncoderPrenet`** [wiring]: wires FeatureEncoder + FeatureProjection + PositionalConvEmbedding.
+  - **`SpeechT5SpeechDecoderPrenet`** [compute]: `L1/linear.py` (Linear stack + speaker embedding.)
+  - **`SpeechT5BatchNormConvLayer`** [compute]: `L1/conv1d.py` (Conv1d + nn.BatchNorm1d (no kb-nano BN1d kernel).)
+  - **`SpeechT5SpeechDecoderPostnet`** [compute]: `L1/linear.py` (stack of BatchNormConvLayers + linear.)
+  - **`SpeechT5TextEncoderPrenet`** [compute]: `L1/embedding.py` (embedding + scaled pos.)
+  - **`SpeechT5TextDecoderPrenet`** [compute]: `L1/embedding.py` (embedding + scaled pos.)
+  - **`SpeechT5TextDecoderPostnet`** [compute]: `L1/linear.py` (Linear LM head.)
+  - **`SpeechT5Attention`** [compute]: `L2/whisper_attention.py` (BART-style MHA with optional relative position bias addition.)
+  - **`SpeechT5FeedForward`** [compute]: `L2/whisper_mlp.py` (two-layer MLP.)
+  - **`SpeechT5EncoderLayer`** [wiring]: wires self-attn + FFN.
+  - **`SpeechT5DecoderLayer`** [wiring]: wires self-attn + cross-attn + FFN.
+  - **`SpeechT5Encoder`** [wiring]: stack of encoder layers + relative pos embed.
+  - **`SpeechT5EncoderWithSpeechPrenet`** [wiring]: wires speech prenet + encoder.
+  - **`SpeechT5EncoderWithTextPrenet`** [wiring]: wires text prenet + encoder.
+  - **`SpeechT5EncoderWithoutPrenet`** [wiring]: encoder-only wiring.
+  - **`SpeechT5Decoder`** [wiring]: stack of decoder layers.
+  - **`SpeechT5DecoderWithSpeechPrenet`** [wiring]: wires speech prenet + decoder.
+  - **`SpeechT5DecoderWithTextPrenet`** [wiring]: wires text prenet + decoder.
+  - **`SpeechT5DecoderWithoutPrenet`** [wiring]: decoder-only wiring.
+  - **`SpeechT5GuidedMultiheadAttentionLoss`** [wiring]: training-only loss.
+  - **`SpeechT5SpectrogramLoss`** [wiring]: training-only loss.
+  - **`SpeechT5Model`** [wiring]: encoder + decoder wiring.
+  - **`SpeechT5ForSpeechToText`** [wiring]: ASR head wiring.
+  - **`SpeechT5ForTextToSpeech`** [wiring]: TTS head wiring.
+  - **`SpeechT5ForSpeechToSpeech`** [wiring]: S2S head wiring.
+  - **`HifiGanResidualBlock`** [compute]: `L1/conv1d.py` (dilated Conv1d residual block.)
+  - **`SpeechT5HifiGan`** [compute]: `L1/conv1d.py`, `L1/conv_transpose1d.py` (HiFi-GAN vocoder.)
+
+## splinter
+- **src**: modeling_splinter.py
+- **status**: composable
+- **rationale**: Splinter = BERT-style encoder + Question-Aware Span Selection head. SelfAttention/SelfOutput/Intermediate/Output mirror BERT exactly; QASS head is Linear + matmul + gather. All compute maps to encoder_attention.py + encoder_mlp.py + bert_embeddings.py.
+- **classes**:
+  - **`SplinterEmbeddings`** [compute]: `L2/bert_embeddings.py` (BERT-style word + position + token-type embeddings + LN.)
+  - **`SplinterSelfAttention`** [compute]: `L2/encoder_attention.py` (BERT-style MHA via ALL_ATTENTION_FUNCTIONS dispatch.)
+  - **`SplinterSelfOutput`** [compute]: `L1/linear.py`, `L1/layer_norm.py` (Linear + LN with residual.)
+  - **`SplinterAttention`** [wiring]: wires SelfAttention + SelfOutput (sibling-class wrapper).
+  - **`SplinterIntermediate`** [compute]: `L2/encoder_mlp.py` (Linear + GELU intermediate.)
+  - **`SplinterOutput`** [compute]: `L2/encoder_mlp.py` (Linear + LN output.)
+  - **`SplinterLayer`** [compute]: `L3/bert_layer.py` (BERT-style layer wiring.)
+  - **`SplinterEncoder`** [compute]: `L3/bert_encoder.py` (stack of layers.)
+  - **`SplinterModel`** [compute]: `L3/bert_model.py` (BERT-style model wiring (encoder-only, no pooler in this folder).)
+  - **`SplinterFullyConnectedLayer`** [compute]: `L1/linear.py`, `L1/layer_norm.py`, `L1/gelu.py` (Linear + activation + LN.)
+  - **`QuestionAwareSpanSelectionHead`** [compute]: `L1/linear.py` (Linear projections + matmul + gather for QA span scoring.)
+  - **`SplinterForQuestionAnswering`** [wiring]: wires SplinterModel + QASS head.
+
+## squeezebert
+- **src**: modeling_squeezebert.py
+- **status**: composable
+- **rationale**: SqueezeBERT replaces BERT's Linear projections with grouped nn.Conv1d (NCW layout). All compute primitives (Conv1d with groups, LayerNorm, embedding, softmax, matmul, GELU) exist in kb-nano L1 (L1/conv1d.py supports groups). No fused L2 wrapper exists for the grouped-conv attention but compute is composable from primitives.
+- **classes**:
+  - **`SqueezeBertEmbeddings`** [compute]: `L2/bert_embeddings.py` (word + position + token-type embeddings + LN.)
+  - **`MatMulWrapper`** [compute]: `L1/bmm.py` (wraps torch.matmul (BMM).)
+  - **`SqueezeBertLayerNorm`** [compute]: `L1/layer_norm.py` (channels-first LayerNorm via permute + LN + permute.)
+  - **`ConvDropoutLayerNorm`** [compute]: `L1/conv1d.py`, `L1/layer_norm.py` (grouped Conv1d + dropout + LN with residual.)
+  - **`ConvActivation`** [compute]: `L1/conv1d.py`, `L1/gelu.py` (grouped Conv1d + activation.)
+  - **`SqueezeBertSelfAttention`** [compute]: `L1/conv1d.py`, `L1/softmax.py`, `L1/bmm.py` (grouped Conv1d for QKV projections (NCW layout) + softmax + BMM (no flash-attn).)
+  - **`SqueezeBertModule`** [wiring]: wires SqueezeBert SelfAttention + post-attention + intermediate + output (encoder-layer equivalent).
+  - **`SqueezeBertEncoder`** [wiring]: stack of SqueezeBert modules.
+  - **`SqueezeBertPooler`** [compute]: `L1/linear.py`, `L1/tanh.py` (first-token Linear + tanh pooler.)
+  - **`SqueezeBertPredictionHeadTransform`** [compute]: `L1/linear.py`, `L1/layer_norm.py` (Linear + activation + LN.)
+  - **`SqueezeBertLMPredictionHead`** [compute]: `L1/linear.py` (Transform + Linear LM head with bias.)
+  - **`SqueezeBertOnlyMLMHead`** [wiring]: wraps LMPredictionHead.
+  - **`SqueezeBertModel`** [wiring]: wires embeddings + encoder + pooler.
+  - **`SqueezeBertForMaskedLM`** [wiring]: MLM head wiring.
+  - **`SqueezeBertForSequenceClassification`** [wiring]: classification head wiring.
+  - **`SqueezeBertForMultipleChoice`** [wiring]: multiple choice head wiring.
+  - **`SqueezeBertForTokenClassification`** [wiring]: token classification head wiring.
+  - **`SqueezeBertForQuestionAnswering`** [wiring]: QA head wiring.

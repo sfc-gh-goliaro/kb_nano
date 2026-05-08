@@ -39,7 +39,8 @@ COVERAGE_CSV = REPO / 'audits/hf_transformers_coverage/hf_architecture_operator_
 # legitimate compute classes inherit from them (e.g. AfmoeAttention(Module),
 # BertLayer(GradientCheckpointingLayer)). They are filtered when listing the
 # "inheritance chain" notes but never cause the class itself to be skipped.
-SKIP_NAME_RE = re.compile(r'^(.*PreTrainedModel|.*Config|.*Output|.*Cache$|.*Mixin|.*Embedder|.*Tokenizer)$')
+# *Output containers can have suffixes like "WithPooling", "WithPast", etc.
+SKIP_NAME_RE = re.compile(r'(.*PreTrainedModel|.*Config|.*Output(With\w+)?|.*Cache$|.*Mixin|.*Embedder|.*Tokenizer)$')
 SKIP_BASES_ONLY = {'PreTrainedModel', 'GenerationMixin', 'BackboneMixin', 'BaseImageProcessor',
                     'ProcessorMixin', 'Cache', 'DynamicCache', 'ModelOutput', 'IntEnum'}
 # Bases that contribute no compute info but DON'T force-skip the child class
@@ -244,14 +245,19 @@ def map_class(folder, class_name, bases, hf_src_path=None):
     if re.search(r'DecoderLayer(Self|Cross)Attention$', name):
         return out
 
-    # MultiHeadAttention (flaubert, ctrl, xlm, qformer variants) — generic MHA
+    # MultiHeadAttention (flaubert, ctrl, xlm, blip2 qformer, instructblip,
+    # etc.) — HF's older naming convention is overwhelmingly encoder-style
+    # (paired with *CrossAttention or used in BERT-derived QFormers).
+    # Default to encoder_attention.py.
     if re.search(r'MultiHeadAttention$', name):
-        if folder in ('flaubert', 'ctrl', 'xlm'):
-            f = find_kb_file('L2', 'encoder_attention.py')
-            if f: out.append(kb_path('L2', f)); return out
-        # QFormer / etc. — also encoder-style
-        f = find_kb_file('L2', 'attention.py')
+        f = find_kb_file('L2', 'encoder_attention.py')
         if f: out.append(kb_path('L2', f)); return out
+        return out
+
+    # Deformable attention — kb-nano has L1/rtdetrv2_deformable_attention.py
+    if re.search(r'(MultiscaleDeformableAttention|DeformableAttention)$', name):
+        f = find_kb_file('L1', 'rtdetrv2_deformable_attention.py')
+        if f: out.append(kb_path('L1', f)); return out
         return out
 
     # RG-LRU (recurrent_gemma)
@@ -266,7 +272,14 @@ def map_class(folder, class_name, bases, hf_src_path=None):
         if 'MLA' in name or any('Deepseek' in b or 'DeepSeek' in b for b in bases) or folder.startswith('deepseek'):
             f = find_kb_file('L2', 'deepseek_mla_attention.py')
             if f: out.append(kb_path('L2', f)); return out
-        # Encoder attention (BERT-family)
+        # *SelfAttention naming convention is HF encoder-style (paired with
+        # *CrossAttention). Decoder-only models name theirs just *Attention.
+        # Route SelfAttention -> encoder_attention.py UNLESS it's a known
+        # decoder family (Bark/etc.) or has explicit Cross/RoPE markers.
+        if re.search(r'SelfAttention$', name) and 'Decoder' not in name:
+            f = find_kb_file('L2', 'encoder_attention.py')
+            if f: out.append(kb_path('L2', f)); return out
+        # Encoder attention (BERT-family text + vision encoders explicit)
         if folder in ('bert', 'roberta', 'electra', 'distilbert', 'albert', 'big_bird',
                       'bigbird_pegasus', 'data2vec', 'mobilebert', 'mpnet', 'xlnet',
                       'xlm_roberta', 'flaubert', 'camembert', 'ernie', 'ernie4_5',
@@ -303,12 +316,9 @@ def map_class(folder, class_name, bases, hf_src_path=None):
         if f:
             out.append(kb_path('L2', f)); return out
 
-    # BERT-family Intermediate/Output (the two-layer MLP split into 2 classes)
-    if re.search(r'Intermediate$', name) and folder in (
-        'bert', 'roberta', 'electra', 'distilbert', 'albert', 'mobilebert',
-        'mpnet', 'xlnet', 'xlm_roberta', 'flaubert', 'camembert', 'ernie',
-        'ernie4_5', 'bert_generation', 'roformer', 'rembert', 'big_bird',
-        'bigbird_pegasus'):
+    # *Intermediate (the two-layer MLP split into 2 classes — BERT-family text
+    # AND vision encoders like ViT/BEiT/DEiT also use this naming)
+    if re.search(r'Intermediate$', name):
         f = find_kb_file('L2', 'encoder_mlp.py')
         if f:
             out.append(kb_path('L2', f)); return out
@@ -318,17 +328,25 @@ def map_class(folder, class_name, bases, hf_src_path=None):
         # Arch-specific MLP file?
         f = find_kb_file('L2', f'{folder}_mlp.py')
         if f: out.append(kb_path('L2', f)); return out
-        # Inherited from a known MLP class?
+        # Inherited from a known SwiGLU MLP class? -> llama_mlp.py
+        SWIGLU_PARENTS = {'LlamaMLP', 'Qwen2MoeMLP', 'MistralMLP', 'GemmaMLP',
+                          'Gemma2MLP', 'Qwen2MLP', 'Qwen3MLP', 'PhiMLP',
+                          'DeepseekV2MLP', 'DeepseekV3MLP', 'BitNetMLP',
+                          'MixtralBlockSparseTop2MLP', 'Llama4TextMLP'}
+        if any(p in SWIGLU_PARENTS for p in bases):
+            f = find_kb_file('L2', 'llama_mlp.py')
+            if f: out.append(kb_path('L2', f)); return out
+        # Inherited from any kb-nano-known MLP/dense file
         for parent in bases:
             ps = to_snake(parent)
             f = find_kb_file('L2', f'{ps}.py')
             if f and ('mlp' in f or 'dense' in f):
                 out.append(kb_path('L2', f)); return out
-        # Encoder MLP (BERT-family with EncoderIntermediate/Output)
+        # Encoder MLP (BERT-family)
         if folder in ('bert', 'roberta', 'electra', 'distilbert', 'albert',
                       'mobilebert', 'mpnet', 'xlnet', 'xlm_roberta', 'flaubert',
                       'camembert', 'ernie', 'ernie4_5', 'bert_generation',
-                      'roformer', 'rembert'):
+                      'roformer', 'rembert', 'big_bird', 'bigbird_pegasus'):
             f = find_kb_file('L2', 'encoder_mlp.py')
             if f: out.append(kb_path('L2', f)); return out
         # Whisper MLP
@@ -347,13 +365,39 @@ def map_class(folder, class_name, bases, hf_src_path=None):
         if folder == 't5' or any('T5' in b for b in bases):
             f = find_kb_file('L2', 't5_dense.py')
             if f: out.append(kb_path('L2', f)); return out
-        # Default: SwiGLU (Llama-pattern)
-        f = find_kb_file('L2', 'llama_mlp.py')
-        if f: out.append(kb_path('L2', f)); return out
-        # Compose
+        # SwiGLU LLM families (decoder-only LLMs)
+        SWIGLU_LLM_FAMILIES = {
+            'llama', 'llama4', 'mistral', 'mixtral', 'gemma', 'gemma2', 'gemma3',
+            'gemma3n', 'gemma4', 'qwen2', 'qwen2_moe', 'qwen3', 'qwen3_moe',
+            'qwen3_next', 'qwen3_vl', 'qwen3_vl_moe', 'phi', 'phi3', 'phi4',
+            'phimoe', 'starcoder2', 'codegemma', 'olmo', 'olmoe', 'olmo2',
+            'falcon', 'falcon_h1', 'falcon3', 'cohere', 'cohere2',
+            'deepseek_v2', 'deepseek_v3', 'deepseek_v4',
+            'csm', 'aria', 'arcee', 'apertus', 'doge', 'glm', 'glm4', 'granite',
+            'granitemoe', 'minicpm', 'minicpm3', 'jamba', 'mamba',
+            'recurrent_gemma', 'stablelm', 'gpt_oss', 'bitnet', 'cwm',
+            'afmoe', 'aimv2', 'audioflamingo3', 'aya_vision', 'bamba',
+            'blt', 'chameleon', 'cohere_asr', 'colpali', 'colqwen2',
+            'cohere2_vision', 'cosmos', 'cwm', 'deepseek_vl',
+            'deepseek_vl_hybrid', 'diffllama', 'dia', 'dots1', 'ernie4_5_moe',
+            'ernie4_5_vl_moe', 'eurobert', 'evolla', 'exaone4', 'exaone_moe',
+            'flex_olmo', 'fuyu', 'glm46v', 'glm4_moe', 'glm4_moe_lite',
+            'glm4v', 'glm4v_moe', 'glm_image', 'glm_moe_dsa', 'glm_ocr',
+            'glmasr', 'lfm2_moe', 'mistral3', 'mistral_common', 'moshi',
+            'nemotron', 'nemotron_h', 'olmo_hybrid', 'ovis2', 'pi0',
+            'plamo', 'qwen2_audio', 'qwen2_5_omni', 'qwen2_5_vl', 'qwen2_vl',
+            'sam3', 'siglip2', 'sam3_tracker', 'sam3_tracker_video', 'sam3_video',
+            'smollm3', 'tiger', 'timm_wrapper', 'vaultgemma', 'video_llava',
+            'vibevoice', 'vibevoice_asr', 'vipllava',
+        }
+        if folder in SWIGLU_LLM_FAMILIES:
+            f = find_kb_file('L2', 'llama_mlp.py')
+            if f: out.append(kb_path('L2', f)); return out
+        # DEFAULT for unknown: compose from L1 (fc1+gelu+fc2 — the safer
+        # assumption for vision/encoder MLPs without explicit SwiGLU evidence)
         out.append(kb_path('L1', 'linear.py'))
-        if has_kb('L1', 'silu.py'):
-            out.append(kb_path('L1', 'silu.py'))
+        if has_kb('L1', 'gelu.py'):
+            out.append(kb_path('L1', 'gelu.py'))
         return out
 
     # Embeddings (multi-component composite)
@@ -411,6 +455,27 @@ def map_class(folder, class_name, bases, hf_src_path=None):
     if re.search(r'DecoderLayer$', name):
         for cand in (f'{folder}_decoder_layer.py', f'{folder}_decoder.py'):
             f = find_kb_file('L3', cand)
+            if f: out.append(kb_path('L3', f)); return out
+        # Inherited from another arch's decoder layer? E.g. MistralDecoderLayer
+        # may inherit from LlamaDecoderLayer; the structure is Llama-style.
+        for parent in bases:
+            if 'DecoderLayer' in parent or 'Block' in parent:
+                ps = to_snake(parent.replace('DecoderLayer', '').replace('Block', ''))
+                for cand in (f'{ps}_decoder.py', f'{ps}_decoder_layer.py', f'{ps}_block.py'):
+                    f = find_kb_file('L3', cand)
+                    if f: out.append(kb_path('L3', f)); return out
+        # Fallback: known SwiGLU-LLM family -> llama_decoder.py
+        SWIGLU_LLM_FAMILIES_SHARED = {
+            'mistral', 'qwen2', 'gemma', 'gemma2', 'cohere', 'cohere2',
+            'csm', 'arcee', 'apertus', 'doge', 'glm', 'glm4', 'granite',
+            'minicpm', 'minicpm3', 'starcoder2', 'olmo', 'olmo2', 'falcon3',
+            'stablelm', 'cwm', 'aimv2', 'apertus', 'audioflamingo3',
+            'aya_vision', 'blt', 'cohere_asr', 'colpali', 'colqwen2',
+            'cohere2_vision', 'diffllama', 'eurobert', 'exaone4',
+            'glm46v', 'mistral3', 'smollm3', 'tiger', 'vaultgemma',
+        }
+        if folder in SWIGLU_LLM_FAMILIES_SHARED:
+            f = find_kb_file('L3', 'llama_decoder.py')
             if f: out.append(kb_path('L3', f)); return out
         return out  # composes (wiring)
 
@@ -517,10 +582,48 @@ def reaudit_one(folder, modeling_file_rel):
     operators = []
     per_class = []
     evidence = []
+
+    # Detect sibling-class patterns for the wiring-vs-compute distinction
+    class_names = {c[0] for c in classes}
+    has_self_attention = any(c.endswith('SelfAttention') and not should_skip(c, []) for c in class_names)
+    has_cross_attention = any(c.endswith('CrossAttention') and not should_skip(c, []) for c in class_names)
+
     for cname, bases in classes:
         if should_skip(cname, bases):
             continue
         kernels = map_class(folder, cname, bases, hf_src_path=src)
+
+        # Post-process: if class is just `<arch>Attention` (the BARE wrapping
+        # class, not *DeformableAttention / *MultiHeadAttention / etc.)
+        # AND there's a sibling `*SelfAttention`, this is a wiring class.
+        # The class name should be folder_camel + "Attention" exactly.
+        fc = folder_camel(folder)
+        # Strip "V<N>", "Text", "Vision", "QFormer" prefixes that can appear
+        # between folder and "Attention" in HF naming.
+        bare_pattern = re.compile(rf'^{re.escape(fc)}\w*?Attention$')
+        is_bare_arch_attention = (
+            bare_pattern.match(cname)
+            and not cname.endswith('SelfAttention')
+            and not cname.endswith('CrossAttention')
+            and not cname.endswith('MLAAttention')
+            and not cname.endswith('PoolingAttention')
+            and not cname.endswith('PoolAttention')
+            and not cname.endswith('MultiHeadAttention')
+            and not cname.endswith('DeformableAttention')
+            and not cname.endswith('FlashAttention')
+            and not cname.endswith('SdpaAttention')
+            and not cname.endswith('EagerAttention')
+        )
+        if is_bare_arch_attention and has_self_attention:
+            kernels = []  # mark as composes (wiring around *SelfAttention)
+
+        # Post-process: *CrossAttention should map to encoder_attention
+        # (different K/V source, same kernel) when there's a *SelfAttention sibling
+        if cname.endswith('CrossAttention') and has_self_attention:
+            f_enc = find_kb_file('L2', 'encoder_attention.py')
+            if f_enc:
+                kernels = [kb_path('L2', f_enc)]
+
         operators.append(cname)
         per_class.append((cname, kernels))
         if cname in line_nums:

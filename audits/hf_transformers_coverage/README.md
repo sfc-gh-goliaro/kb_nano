@@ -1,71 +1,113 @@
 # HF Transformers × kb-nano Coverage Audit
 
-This directory contains a paper-appendix-quality audit of how broadly Hugging Face Transformers architectures can be supported by kb-nano's existing L1/L2/L3 operator surface.
+This directory contains a paper-appendix-quality audit of how broadly Hugging
+Face Transformers architectures can be supported by kb-nano's existing
+L1/L2/L3/L4 operator surface, plus the post-submission re-audit that fixes
+several errors in the original paper version.
+
+## Headline result (v12 final, 447 folders)
+
+| status | count | %     |
+|--------|------:|------:|
+| `kb_nano_l4` | 27 | 6.0% |
+| `composable` | 237 | 53.0% |
+| `partial`    | 171 | 38.3% |
+| `unsupported`| 12  | 2.7% |
+
+- **Strict** (L4 + composable, kb-nano kernel exists for every compute class): **264/447 = 59.1%**
+- **Loose** (+ partial / torch fallback): **435/447 = 97.3%**
+- **Unsupported** (genuinely needs custom CUDA / external lib): **12/447 = 2.7%**
+
+v12 vs v11: 6 folders demoted composable → partial for partial-rotary
+consistency (bamba, glm4v_moe, laguna, musicflamingo, recurrent_gemma,
+solar_open). See REAUDIT_NOTES.md "v12 RECONCILIATION" for the full delta.
+
+The 12 unsupported (canonical):
+`diffllama`, `dinat`, `fast_vlm`, `gemma3n`, `ibert`, `layoutlmv2`, `mra`,
+`rwkv`, `timm_backbone`, `timm_wrapper`, `xlstm`, `yoso`.
 
 ## What you should read
 
 | file | purpose |
 |---|---|
-| [`audit_methodology.md`](audit_methodology.md) | The full methodology, schema, denominators, conservatism rules, and reproducibility steps. **Start here.** |
-| [`coverage_summary.md`](coverage_summary.md) | The headline result: % of HF architectures covered, broken down by modality, with the top missing primitives. |
-| [`hf_architecture_operator_coverage.csv`](hf_architecture_operator_coverage.csv) | One row per HF modeling file, with status, mapped kb-nano ops, and `file:line` evidence. The full data behind the appendix table. |
-| [`unsupported_operator_summary.csv`](unsupported_operator_summary.csv) | Frequency table of canonical ops in `partial`/`unsupported` rows — i.e., the kernels that, if added, would unlock the most architectures. |
-| [`hf_model_inventory.csv`](hf_model_inventory.csv) | The HF model surface: 465 folders, with PyTorch-modeling counts, modular DSL flags, multi-modeling flags, and no-modeling flags. |
-| [`kb_nano_operator_catalog.csv`](kb_nano_operator_catalog.csv) | The kb-nano support surface (origin/experiments + audit-branch L1/L2 additions): 402 class-level rows from L1/L2/L3 (114 L1 + 182 L2 + 106 L3). |
+| [`REAUDIT_NOTES.md`](REAUDIT_NOTES.md) | Full reconciliation, methodology, per-version history, and self-assessment. **Start here.** v11 final state is in the section labelled "v11 RECONCILIATION". |
+| [`NUMBER_DRIFT_RECONCILIATION.md`](NUMBER_DRIFT_RECONCILIATION.md) | Why the denominator was 421 / 425 / 442 / 445 / 447 / 448 over time, and why **447** is canonical. |
+| [`VERIFIER_AUDIT.md`](VERIFIER_AUDIT.md) | Per-slice agent agreement audit + hallucination spot-checks (0/10 hallucinated file:line refs). |
+| [`CONSISTENCY_AUDIT.md`](CONSISTENCY_AUDIT.md) | Phase-1 cross-pattern consistency groups (ALiBi, partial-rotary, AutoBackbone, etc.) — how identical patterns were forced to identical statuses. |
+| [`audit_evidence.csv`](audit_evidence.csv) | Per-folder evidence trail (447 rows × 12 columns: shard verdict, cross-verifier verdict, phase-2 verdict, HF file:line, "I personally read" flag). |
+| [`hf_coverage_rows.tex`](hf_coverage_rows.tex) | Paper-input LaTeX rows (447 entries). |
+| [`MENTOR_REVIEW_full_audit.tex`](MENTOR_REVIEW_full_audit.tex) | Full standalone tex for review. |
+| [`_reaudit_final_v11.json`](_reaudit_final_v11.json) | Machine-readable {folder: status} dict (447 entries). |
+
+`tools/manual_audit_shard_{01..17}.md` are the per-shard markdown audit notes
+that the renderer (`tools/md_to_tex.py`) reads to produce the tex.
+
+`_stale_pre_reaudit/` holds the original pre-reaudit artifacts kept for
+provenance (do not use; superseded by the v11 files above).
 
 ## Pinning
 
-- **HF source:** `huggingface/transformers` @ commit `da6c53e431f7c9ef0691239d4ce89b0f711ecad7`. Cloned (shallow) to `/tmp/hf_transformers_pinned/` for the audit run.
-- **kb-nano support surface:** branch `audit/hf-transformers-coverage` cut from `origin/experiments` @ commit `11aa838 add manual values for missing ops`.
+- **HF source:** `huggingface/transformers` @ commit
+  `da6c53e431f7c9ef0691239d4ce89b0f711ecad7`. Cloned (shallow) to
+  `/tmp/hf_transformers_pinned/`.
+- **kb-nano support surface:** branch `audit/hf-transformers-coverage` cut from
+  `origin/experiments` @ commit `11aa838`.
 
 ## Reproducing
 
 ```bash
-# 1. Clone HF at the pinned commit (audit run did this to /tmp; pick any path you have ~150 MB free)
+# 1. Clone HF at the pinned commit
 cd /tmp && rm -rf hf_transformers_pinned && mkdir hf_transformers_pinned && cd hf_transformers_pinned
 git init -q && git remote add origin https://github.com/huggingface/transformers.git
 git fetch --depth 1 origin da6c53e431f7c9ef0691239d4ce89b0f711ecad7
 git checkout -q FETCH_HEAD
 
-# 2. Build inventories
+# 2. Re-render the paper-appendix tex from the markdown shards
 cd /home/olu/kb_nano
-python audits/hf_transformers_coverage/tools/build_inventories.py
-
-# 3. Run the AST extractor
-python audits/hf_transformers_coverage/tools/ast_extract.py \
-    --dir /tmp/hf_transformers_pinned/src/transformers/models \
-    --out audits/hf_transformers_coverage/hf_extract.jsonl
-
-# 4. Pilot rows (12 architectures + 1 exception) — already in pilot/pilot_rows.csv
-# 5. Shard rows — produced by 5 parallel subagents into shards/shard_<a-d|e-i|j-m|n-q|r-z>_raw.csv
-# 6. Merge + summarize
-python audits/hf_transformers_coverage/tools/merge_and_summarize.py
+python audits/hf_transformers_coverage/tools/md_to_tex.py
+# -> writes hf_coverage_rows.tex
 ```
 
-## Pilot examples
+## Audit work
 
-12 architectures + 1 no-modeling exception, audited end-to-end by the coordinator before any subagent fan-out. See [`pilot/pilot_audit.md`](pilot/pilot_audit.md) for the worked-through reasoning per row, including ops-that-were-almost-missed and methodology refinements. The 15 resulting CSV rows are at [`pilot/pilot_rows.csv`](pilot/pilot_rows.csv).
+| pass | folders touched |
+|---|---:|
+| First-pass (16 parallel subagents) | 425 |
+| Cross-verify round 1 (5 verifiers, partial/unsupported priority) | 239 |
+| Phase 2 verifiers (slices 1–6, 8 — full source-read of edge cases) | 222 |
+| Slice 7 (recovered 20 folders missed by sharding bug) | 20 |
+| v11 additions (esmfold, donut_swin) | 2 |
+| **Personally source-read by coordinator (cumulative)** | **107** |
 
-## Shards
+Total folder-touches across all rounds: ~1010 (with significant overlap; many
+folders were touched 2–4 times across rounds for cross-pattern consistency).
 
-The remaining 453 folders were sharded alphabetically across 5 disjoint ranges. Each shard was processed by an independent subagent using the locked methodology, canonical map, and pilot examples. Shard outputs:
+## Verification gates passed (v11)
 
-- [`shards/shard_a-d_raw.csv`](shards/shard_a-d_raw.csv) — 96 folders / ~96 rows
-- [`shards/shard_e-i_raw.csv`](shards/shard_e-i_raw.csv) — 91 folders / ~91 rows
-- [`shards/shard_j-m_raw.csv`](shards/shard_j-m_raw.csv) — 78 folders / ~78 rows
-- [`shards/shard_n-q_raw.csv`](shards/shard_n-q_raw.csv) — 74 folders / ~74 rows
-- [`shards/shard_r-z_raw.csv`](shards/shard_r-z_raw.csv) — 114 folders / ~114 rows
-
-Per-shard notes (`shards/shard_<range>_notes.md`) record ambiguities, modular-only / no-modeling cases, and any new canonical names a shard wanted to add.
-
-## Verification
-
-Per the methodology:
-- Every `partial` and `unsupported` row was manually verified by the coordinator.
-- ~10% of `composable` rows were spot-checked.
-- Cross-shard consistency: the same canonical op maps to the same kb-nano file across all shards.
-- Final spot-check: 20 random rows from the merged CSV.
+- 447 audit rows = filesystem ground truth (448 modeling files − `auto/` non-model)
+- `audit_evidence.csv` rows = `_reaudit_final_v11.json` entries (0 mismatches across 447)
+- `hf_coverage_rows.tex` rows = `_reaudit_final_v11.json` entries (0 mismatches across 447)
+- Status-marker mapping in tex matches json (27 / 237 / 171 / 12)
+- Every kb-nano `L1/L2/L3/L4/<file>.py` referenced in the tex exists on disk (202 unique refs, 0 missing)
+- Every folder in slice 7 + v11 (22 additions) exists in the HF clone
+- Every L4 promotion (27) has a matching `tasks/baseline/L4/<file>.py` whose docstring header targets the corresponding HF folder
+- Every `unsupported` (12) was source-verified by the coordinator: 5 use `kernels-community` CUDA kernels, 4 use timm/detectron2/natten external libs, 3 use bespoke compute (differential attn, integer arith, mLSTM)
 
 ## Status / Known limitations
 
-This audit is **static** — it audits compute primitives. It does not certify byte-correctness against HF, nor does it measure performance. A `composable` model may run slowly via torch fallback. See `audit_methodology.md` § 13 for the full limitations.
+- **Static audit only.** This audits compute primitives by reading source. It
+  does not certify byte-correctness against HF, nor does it measure
+  performance. A `composable` model may still run slowly via torch fallback
+  until each L1/L2 op gets a tuned kernel.
+- **`partial` is "decomposable, not yet wrapped".** A partial folder can run
+  in PyTorch (the relevant op is in `torch.*`); kb-nano just doesn't have a
+  dedicated kernel for that variant yet (e.g., partial-rotary RoPE,
+  interleaved-RoPE, ALiBi slopes, Conformer rel_shift).
+- **Multi-modeling folders** (`blip`, `data2vec`, `donut`, `esm`, `maskformer`,
+  `rt_detr`) are audited per-modeling-file. Each PyTorch `modeling_*.py` gets
+  its own row. This is why 442 folders → 447 rows.
+- **Paper text vs this audit.** The submitted paper cites 421 / 96.2% / 7
+  unsupported. Those numbers are not reproducible from the table that ships
+  with the paper — see `NUMBER_DRIFT_RECONCILIATION.md` for the full story
+  and v11 corrections. The `_hf_coverage_rows_pre_reaudit_*.tex` file is
+  preserved as the original-state backup.

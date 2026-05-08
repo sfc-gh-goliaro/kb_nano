@@ -1,0 +1,3604 @@
+{
+  "pe_video": {
+    "src_file": "modeling_pe_video.py",
+    "classes": [
+      {
+        "name": "PeVideoContrastiveHead",
+        "line": 62,
+        "bases": [
+          "nn.Module"
+        ],
+        "kb_nano_files": [],
+        "rationale": "wiring: LayerNorm + Linear projection only; composes from L1/layer_norm + L1/linear"
+      },
+      {
+        "name": "PeVideoMaskedGroupNorm",
+        "line": 76,
+        "bases": [
+          "nn.GroupNorm"
+        ],
+        "kb_nano_files": [],
+        "rationale": "masked GroupNorm with custom forward; no kb-nano equivalent (kb-nano has L1/group_norm.py but does not implement masked variant)"
+      },
+      {
+        "name": "PeVideoConvBlock1d",
+        "line": 100,
+        "bases": [
+          "nn.Module"
+        ],
+        "kb_nano_files": [],
+        "rationale": "wiring: GroupNorm + SiLU + Conv1d; composes from L1/conv1d + L1/silu"
+      },
+      {
+        "name": "PeVideoResnetBlock1d",
+        "line": 118,
+        "bases": [
+          "nn.Module"
+        ],
+        "kb_nano_files": [],
+        "rationale": "wiring: 2x ConvBlock1d with residual"
+      },
+      {
+        "name": "PeVideoEncoderPatchEmbedder",
+        "line": 147,
+        "bases": [
+          "nn.Module"
+        ],
+        "kb_nano_files": [],
+        "rationale": "wiring: prepend cls token, then ResnetBlock1d"
+      },
+      {
+        "name": "PeVideoEncoderEmbedder",
+        "line": 168,
+        "bases": [
+          "nn.Module"
+        ],
+        "kb_nano_files": [],
+        "rationale": "wiring: holds AutoModel vision backbone + 2 Linear projections"
+      },
+      {
+        "name": "PeVideoEncoderRMSNorm",
+        "line": 248,
+        "bases": [
+          "nn.Module"
+        ],
+        "kb_nano_files": [
+          "tasks/baseline/L1/rms_norm.py"
+        ],
+        "rationale": "standard Llama-style RMSNorm (T5-equivalent structure: weight*hidden/rms)"
+      },
+      {
+        "name": "PeVideoEncoderAttention",
+        "line": 269,
+        "bases": [
+          "nn.Module"
+        ],
+        "kb_nano_files": [],
+        "rationale": "non-causal vision encoder MHA with separate q/k/v Linears + per-head QK RMSNorm + RoPE; closest is encoder_attention.py but PE-Video adds RoPE+QK norm with no cache; needs custom decomposition from L1/{linear, rms_norm, vision_rotary_emb, dense_attention}; no exact L2 file"
+      },
+      {
+        "name": "PeVideoEncoderMLP",
+        "line": 339,
+        "bases": [
+          "nn.Module"
+        ],
+        "kb_nano_files": [
+          "tasks/baseline/L2/llama_mlp.py"
+        ],
+        "rationale": "config.hidden_act='silu' SwiGLU pattern (silu(gate)*up) with separate gate_proj/up_proj/down_proj; functionally identical to LlamaMLP fused-gate-up form"
+      },
+      {
+        "name": "PeVideoEncoderLayer",
+        "line": 355,
+        "bases": [
+          "GradientCheckpointingLayer"
+        ],
+        "kb_nano_files": [],
+        "rationale": "composes: input_layernorm + self_attn + post_attention_layernorm + mlp"
+      },
+      {
+        "name": "PeVideoEncoderRotaryEmbedding",
+        "line": 431,
+        "bases": [
+          "nn.Module"
+        ],
+        "kb_nano_files": [
+          "tasks/baseline/L1/vision_rotary_emb.py"
+        ],
+        "rationale": "rotary embedding for vision encoder (2D positions); kb-nano vision_rotary_emb.py is closest equivalent"
+      },
+      {
+        "name": "PeVideoEncoder",
+        "line": 501,
+        "bases": [
+          "PeVideoPreTrainedModel"
+        ],
+        "kb_nano_files": [],
+        "rationale": "wiring: stacks PeVideoEncoderLayer modules"
+      },
+      {
+        "name": "PeVideoModel",
+        "line": 560,
+        "bases": [
+          "PeVideoPreTrainedModel"
+        ],
+        "kb_nano_files": [],
+        "rationale": "wiring: top-level container"
+      }
+    ],
+    "inheritance_summary": [
+      "PeVideoEncoderPatchEmbedder(PeAudioVideoEncoderPatchEmbedder via modular)",
+      "PeVideoEncoder(PeAudioVideoEncoder)"
+    ],
+    "evidence_lines": [
+      "pe_video/modeling_pe_video.py:248",
+      "pe_video/modeling_pe_video.py:269",
+      "pe_video/modeling_pe_video.py:339",
+      "pe_video/configuration_pe_video.py:hidden_act=silu"
+    ]
+  },
+  "pegasus": {
+    "src_file": "modeling_pegasus.py",
+    "classes": [
+      {
+        "name": "PegasusSinusoidalPositionalEmbedding",
+        "line": 74,
+        "bases": [
+          "nn.Embedding"
+        ],
+        "kb_nano_files": [],
+        "rationale": "fixed sinusoidal positional embedding (no learnable params); composes around L1/embedding (no exact kb-nano file for non-learnable sinusoidal-only positional embedding; closest is L1/sinusoidal_embed.py for time embeddings)"
+      },
+      {
+        "name": "PegasusAttention",
+        "line": 138,
+        "bases": [
+          "nn.Module"
+        ],
+        "kb_nano_files": [],
+        "rationale": "BART-family multi-purpose attention (encoder self / decoder self / cross) with separate q/k/v Linears; no causal mask hard-coded (depends on caller); does not match Whisper's three-class split exactly, but a reasonable mapping is L2/whisper_attention.py (closest sibling: encoder + decoder + cross 3-class pattern). Technically Pegasus has ONE attention class doing all roles via flag; closest fit would be a generalized BART-attention which kb-nano does not provide as a single class. No direct file."
+      },
+      {
+        "name": "PegasusEncoderLayer",
+        "line": 256,
+        "bases": [
+          "GradientCheckpointingLayer"
+        ],
+        "kb_nano_files": [],
+        "rationale": "wiring: pre-norm self_attn + fc1+gelu+fc2 (config.activation_function='gelu')"
+      },
+      {
+        "name": "PegasusDecoderLayer",
+        "line": 313,
+        "bases": [
+          "GradientCheckpointingLayer"
+        ],
+        "kb_nano_files": [],
+        "rationale": "wiring: pre-norm self_attn + cross_attn + fc1+gelu+fc2"
+      },
+      {
+        "name": "PegasusEncoder",
+        "line": 425,
+        "bases": [
+          "PegasusPreTrainedModel"
+        ],
+        "kb_nano_files": [],
+        "rationale": "wiring: stacks encoder layers"
+      },
+      {
+        "name": "PegasusDecoder",
+        "line": 546,
+        "bases": [
+          "PegasusPreTrainedModel"
+        ],
+        "kb_nano_files": [],
+        "rationale": "wiring: stacks decoder layers with cross-attn"
+      },
+      {
+        "name": "PegasusModel",
+        "line": 703,
+        "bases": [
+          "PegasusPreTrainedModel"
+        ],
+        "kb_nano_files": [],
+        "rationale": "wiring: encoder + decoder"
+      },
+      {
+        "name": "PegasusForConditionalGeneration",
+        "line": 844,
+        "bases": [
+          "PegasusPreTrainedModel",
+          "GenerationMixin"
+        ],
+        "kb_nano_files": [],
+        "rationale": "wiring: PegasusModel + lm_head"
+      },
+      {
+        "name": "PegasusDecoderWrapper",
+        "line": 1001,
+        "bases": [
+          "PegasusPreTrainedModel"
+        ],
+        "kb_nano_files": [],
+        "rationale": "wiring container"
+      },
+      {
+        "name": "PegasusForCausalLM",
+        "line": 1016,
+        "bases": [
+          "PegasusPreTrainedModel",
+          "GenerationMixin"
+        ],
+        "kb_nano_files": [],
+        "rationale": "wiring: decoder-only setup"
+      }
+    ],
+    "inheritance_summary": [
+      "PegasusEncoderLayer(MBartEncoderLayer-equivalent)",
+      "PegasusDecoderLayer(MBartDecoderLayer-equivalent)"
+    ],
+    "evidence_lines": [
+      "pegasus/modeling_pegasus.py:138",
+      "pegasus/modeling_pegasus.py:269 (gelu)",
+      "pegasus/configuration_pegasus.py:activation_function='gelu'"
+    ]
+  },
+  "pegasus_x": {
+    "src_file": "modeling_pegasus_x.py",
+    "classes": [
+      {
+        "name": "PegasusXScaledWordEmbedding",
+        "line": 82,
+        "bases": [
+          "nn.Embedding"
+        ],
+        "kb_nano_files": [
+          "tasks/baseline/L1/embedding.py"
+        ],
+        "rationale": "scaled word embedding; kb-nano L1/embedding.py provides base"
+      },
+      {
+        "name": "PegasusXSinusoidalPositionalEmbedding",
+        "line": 95,
+        "bases": [
+          "nn.Module"
+        ],
+        "kb_nano_files": [],
+        "rationale": "non-learnable sinusoidal positional embedding"
+      },
+      {
+        "name": "PegasusXAttention",
+        "line": 156,
+        "bases": [
+          "nn.Module"
+        ],
+        "kb_nano_files": [],
+        "rationale": "BART-style multi-purpose MHA with separate q/k/v Linears; no exact kb-nano file (whisper_attention.py is closest pattern but split into 3 classes)"
+      },
+      {
+        "name": "PegasusXGlobalLocalAttention",
+        "line": 273,
+        "bases": [
+          "nn.Module"
+        ],
+        "kb_nano_files": [],
+        "rationale": "Pegasus-X global+local block-sparse attention (BigBird-style); novel kernel; no kb-nano equivalent"
+      },
+      {
+        "name": "PegasusXEncoderLayer",
+        "line": 504,
+        "bases": [
+          "GradientCheckpointingLayer"
+        ],
+        "kb_nano_files": [],
+        "rationale": "wiring: global+local attention + fc1+gelu+fc2 (config.activation_function='gelu')"
+      },
+      {
+        "name": "PegasusXDecoderLayer",
+        "line": 615,
+        "bases": [
+          "GradientCheckpointingLayer"
+        ],
+        "kb_nano_files": [],
+        "rationale": "wiring: self_attn + cross_attn + fc1+gelu+fc2"
+      },
+      {
+        "name": "PegasusXEncoder",
+        "line": 723,
+        "bases": [
+          "PegasusXPreTrainedModel"
+        ],
+        "kb_nano_files": [],
+        "rationale": "wiring: stacks encoder layers"
+      },
+      {
+        "name": "PegasusXDecoder",
+        "line": 904,
+        "bases": [
+          "PegasusXPreTrainedModel"
+        ],
+        "kb_nano_files": [],
+        "rationale": "wiring: stacks decoder layers"
+      },
+      {
+        "name": "PegasusXModel",
+        "line": 1076,
+        "bases": [
+          "PegasusXPreTrainedModel"
+        ],
+        "kb_nano_files": [],
+        "rationale": "wiring container"
+      },
+      {
+        "name": "PegasusXForConditionalGeneration",
+        "line": 1219,
+        "bases": [
+          "PegasusXPreTrainedModel",
+          "GenerationMixin"
+        ],
+        "kb_nano_files": [],
+        "rationale": "wiring: model + lm_head"
+      },
+      {
+        "name": "PegasusXDecoderWrapper",
+        "line": 1337,
+        "bases": [
+          "PegasusXPreTrainedModel"
+        ],
+        "kb_nano_files": [],
+        "rationale": "wiring container"
+      }
+    ],
+    "inheritance_summary": [],
+    "evidence_lines": [
+      "pegasus_x/modeling_pegasus_x.py:273 (GlobalLocalAttention)",
+      "pegasus_x/configuration_pegasus_x.py:activation_function='gelu'"
+    ]
+  },
+  "perceiver": {
+    "src_file": "modeling_perceiver.py",
+    "classes": [
+      {
+        "name": "PerceiverEmbeddings",
+        "line": 124,
+        "bases": [
+          "nn.Module"
+        ],
+        "kb_nano_files": [],
+        "rationale": "learnable latent parameters (nn.Parameter only); not a standard embedding"
+      },
+      {
+        "name": "PerceiverSelfAttention",
+        "line": 135,
+        "bases": [
+          "nn.Module"
+        ],
+        "kb_nano_files": [],
+        "rationale": "general MHA used both as self- and cross-attn (kv from optional inputs); separate q/k/v Linears with possibly distinct qk_channels and v_channels (not equal to embed_dim); LayerNorm pre-norm on Q and KV inputs; manual SDPA with softmax; closest is L2/encoder_attention.py but Perceiver allows distinct qk/v channels and supports both self+cross modes within one class. Composes from L1/{linear, layer_norm, sdpa, softmax}; no exact L2 match."
+      },
+      {
+        "name": "PerceiverSelfOutput",
+        "line": 245,
+        "bases": [
+          "nn.Module"
+        ],
+        "kb_nano_files": [
+          "tasks/baseline/L1/linear.py"
+        ],
+        "rationale": "thin output Linear projection (no LayerNorm here, unlike BERT pattern)"
+      },
+      {
+        "name": "PerceiverAttention",
+        "line": 255,
+        "bases": [
+          "nn.Module"
+        ],
+        "kb_nano_files": [],
+        "rationale": "wiring: PerceiverSelfAttention + PerceiverSelfOutput; supports use_query_residual"
+      },
+      {
+        "name": "PerceiverMLP",
+        "line": 334,
+        "bases": [
+          "nn.Module"
+        ],
+        "kb_nano_files": [
+          "tasks/baseline/L2/encoder_mlp.py"
+        ],
+        "rationale": "config.hidden_act='gelu'; fc1 + GELU + fc2; matches encoder_mlp.py EncoderIntermediate+EncoderOutput structure (no LayerNorm)"
+      },
+      {
+        "name": "PerceiverLayer",
+        "line": 353,
+        "bases": [
+          "nn.Module"
+        ],
+        "kb_nano_files": [],
+        "rationale": "wiring: PerceiverAttention + PerceiverMLP; supports cross-attention"
+      },
+      {
+        "name": "PerceiverEncoder",
+        "line": 417,
+        "bases": [
+          "nn.Module"
+        ],
+        "kb_nano_files": [],
+        "rationale": "wiring: cross-attn from inputs to latents, then self-attn stack on latents"
+      },
+      {
+        "name": "PerceiverModel",
+        "line": 575,
+        "bases": [
+          "PerceiverPreTrainedModel"
+        ],
+        "kb_nano_files": [],
+        "rationale": "wiring container"
+      },
+      {
+        "name": "PerceiverForMaskedLM",
+        "line": 817,
+        "bases": [
+          "PerceiverPreTrainedModel"
+        ],
+        "kb_nano_files": [],
+        "rationale": "wiring: model + LM head"
+      },
+      {
+        "name": "PerceiverForSequenceClassification",
+        "line": 954,
+        "bases": [
+          "PerceiverPreTrainedModel"
+        ],
+        "kb_nano_files": [],
+        "rationale": "wiring: model + classification head"
+      },
+      {
+        "name": "PerceiverForImageClassificationLearned",
+        "line": 1076,
+        "bases": [
+          "PerceiverPreTrainedModel"
+        ],
+        "kb_nano_files": [],
+        "rationale": "wiring: model + img preprocessor + classification decoder"
+      },
+      {
+        "name": "PerceiverForImageClassificationFourier",
+        "line": 1201,
+        "bases": [
+          "PerceiverPreTrainedModel"
+        ],
+        "kb_nano_files": [],
+        "rationale": "wiring with Fourier position encoding"
+      },
+      {
+        "name": "PerceiverForImageClassificationConvProcessing",
+        "line": 1324,
+        "bases": [
+          "PerceiverPreTrainedModel"
+        ],
+        "kb_nano_files": [],
+        "rationale": "wiring with conv preprocessing"
+      },
+      {
+        "name": "PerceiverForOpticalFlow",
+        "line": 1448,
+        "bases": [
+          "PerceiverPreTrainedModel"
+        ],
+        "kb_nano_files": [],
+        "rationale": "wiring for optical flow task"
+      },
+      {
+        "name": "PerceiverForMultimodalAutoencoding",
+        "line": 1590,
+        "bases": [
+          "PerceiverPreTrainedModel"
+        ],
+        "kb_nano_files": [],
+        "rationale": "wiring with multimodal preprocess/postprocess"
+      },
+      {
+        "name": "PerceiverProjectionDecoder",
+        "line": 1853,
+        "bases": [
+          "PerceiverAbstractDecoder"
+        ],
+        "kb_nano_files": [
+          "tasks/baseline/L1/linear.py"
+        ],
+        "rationale": "single Linear projection decoder"
+      },
+      {
+        "name": "PerceiverBasicDecoder",
+        "line": 1879,
+        "bases": [
+          "PerceiverAbstractDecoder"
+        ],
+        "kb_nano_files": [],
+        "rationale": "wiring: cross-attn from output query to latents + final projection"
+      },
+      {
+        "name": "PerceiverClassificationDecoder",
+        "line": 2064,
+        "bases": [
+          "PerceiverAbstractDecoder"
+        ],
+        "kb_nano_files": [],
+        "rationale": "wiring: PerceiverBasicDecoder for classification"
+      },
+      {
+        "name": "PerceiverOpticalFlowDecoder",
+        "line": 2110,
+        "bases": [
+          "PerceiverAbstractDecoder"
+        ],
+        "kb_nano_files": [],
+        "rationale": "wiring: optical flow decoder"
+      },
+      {
+        "name": "PerceiverBasicVideoAutoencodingDecoder",
+        "line": 2145,
+        "bases": [
+          "PerceiverAbstractDecoder"
+        ],
+        "kb_nano_files": [],
+        "rationale": "wiring"
+      },
+      {
+        "name": "PerceiverMultimodalDecoder",
+        "line": 2222,
+        "bases": [
+          "PerceiverAbstractDecoder"
+        ],
+        "kb_nano_files": [],
+        "rationale": "wiring with mode-specific projections"
+      },
+      {
+        "name": "Conv2dSamePadding",
+        "line": 2391,
+        "bases": [
+          "nn.Conv2d"
+        ],
+        "kb_nano_files": [
+          "tasks/baseline/L1/conv2d.py"
+        ],
+        "rationale": "Conv2d with same-padding helper; closest is L1/conv2d.py"
+      },
+      {
+        "name": "Conv2DDownsample",
+        "line": 2407,
+        "bases": [
+          "nn.Module"
+        ],
+        "kb_nano_files": [],
+        "rationale": "wiring: stack of conv2d + bn + relu + max_pool downsample blocks"
+      },
+      {
+        "name": "PerceiverTrainablePositionEncoding",
+        "line": 2537,
+        "bases": [
+          "PerceiverAbstractPositionEncoding"
+        ],
+        "kb_nano_files": [],
+        "rationale": "learnable positional parameter"
+      },
+      {
+        "name": "PerceiverFourierPositionEncoding",
+        "line": 2621,
+        "bases": [
+          "PerceiverAbstractPositionEncoding"
+        ],
+        "kb_nano_files": [],
+        "rationale": "Fourier feature positional encoding (sin/cos of frequencies); no kb-nano equivalent"
+      },
+      {
+        "name": "PerceiverTextPreprocessor",
+        "line": 2672,
+        "bases": [
+          "AbstractPreprocessor"
+        ],
+        "kb_nano_files": [],
+        "rationale": "wiring: token + position embeddings"
+      },
+      {
+        "name": "PerceiverEmbeddingDecoder",
+        "line": 2709,
+        "bases": [
+          "nn.Module"
+        ],
+        "kb_nano_files": [],
+        "rationale": "weight-tied embedding decoder"
+      },
+      {
+        "name": "PerceiverMultimodalPostprocessor",
+        "line": 2733,
+        "bases": [
+          "nn.Module"
+        ],
+        "kb_nano_files": [],
+        "rationale": "wiring"
+      },
+      {
+        "name": "PerceiverClassificationPostprocessor",
+        "line": 2767,
+        "bases": [
+          "nn.Module"
+        ],
+        "kb_nano_files": [],
+        "rationale": "wiring linear"
+      },
+      {
+        "name": "PerceiverAudioPostprocessor",
+        "line": 2787,
+        "bases": [
+          "nn.Module"
+        ],
+        "kb_nano_files": [],
+        "rationale": "wiring"
+      },
+      {
+        "name": "PerceiverProjectionPostprocessor",
+        "line": 2814,
+        "bases": [
+          "nn.Module"
+        ],
+        "kb_nano_files": [],
+        "rationale": "wiring linear"
+      },
+      {
+        "name": "PerceiverImagePreprocessor",
+        "line": 2835,
+        "bases": [
+          "AbstractPreprocessor"
+        ],
+        "kb_nano_files": [],
+        "rationale": "wiring conv preprocess"
+      },
+      {
+        "name": "PerceiverOneHotPreprocessor",
+        "line": 3073,
+        "bases": [
+          "AbstractPreprocessor"
+        ],
+        "kb_nano_files": [],
+        "rationale": "wiring"
+      },
+      {
+        "name": "PerceiverAudioPreprocessor",
+        "line": 3099,
+        "bases": [
+          "AbstractPreprocessor"
+        ],
+        "kb_nano_files": [],
+        "rationale": "wiring"
+      },
+      {
+        "name": "PerceiverMultimodalPreprocessor",
+        "line": 3202,
+        "bases": [
+          "AbstractPreprocessor"
+        ],
+        "kb_nano_files": [],
+        "rationale": "wiring"
+      }
+    ],
+    "inheritance_summary": [],
+    "evidence_lines": [
+      "perceiver/modeling_perceiver.py:135 (SelfAttention)",
+      "perceiver/modeling_perceiver.py:334 (MLP)",
+      "perceiver/configuration_perceiver.py:hidden_act='gelu'"
+    ]
+  },
+  "perception_lm": {
+    "src_file": "modeling_perception_lm.py",
+    "classes": [
+      {
+        "name": "PerceptionLMAdaptiveAvgPooling",
+        "line": 37,
+        "bases": [
+          "nn.Module"
+        ],
+        "kb_nano_files": [
+          "tasks/baseline/L1/adaptive_avg_pool2d.py"
+        ],
+        "rationale": "F.adaptive_avg_pool2d on reshaped (b,c,h,h) input"
+      },
+      {
+        "name": "PerceptionLMMultiModalProjector",
+        "line": 56,
+        "bases": [
+          "nn.Module"
+        ],
+        "kb_nano_files": [],
+        "rationale": "wiring: Linear + GELU + Linear + optional pooling; uses nn.GELU (standard, not pytorch_tanh); composes from L1/{linear, gelu, adaptive_avg_pool2d}"
+      },
+      {
+        "name": "PerceptionLMModel",
+        "line": 166,
+        "bases": [
+          "PerceptionLMPreTrainedModel"
+        ],
+        "kb_nano_files": [],
+        "rationale": "wiring: vision_tower + multi_modal_projector + language_model (Llama-derivative); inherits LlavaModel functionally"
+      },
+      {
+        "name": "PerceptionLMForConditionalGeneration",
+        "line": 303,
+        "bases": [
+          "PerceptionLMPreTrainedModel",
+          "GenerationMixin"
+        ],
+        "kb_nano_files": [],
+        "rationale": "wiring: model + lm_head"
+      }
+    ],
+    "inheritance_summary": [
+      "PerceptionLMModel(LlavaModel via modular)",
+      "PerceptionLMForConditionalGeneration(LlavaForConditionalGeneration via modular)"
+    ],
+    "evidence_lines": [
+      "perception_lm/modeling_perception_lm.py:37",
+      "perception_lm/modeling_perception_lm.py:56"
+    ]
+  },
+  "persimmon": {
+    "src_file": "modeling_persimmon.py",
+    "classes": [
+      {
+        "name": "PersimmonRotaryEmbedding",
+        "line": 57,
+        "bases": [
+          "nn.Module"
+        ],
+        "kb_nano_files": [
+          "tasks/baseline/L1/rotary_emb.py"
+        ],
+        "rationale": "standard NeoX-style RoPE with partial_rotary_factor (only first rotary_ndims dims rotated); closest is L1/rotary_emb.py"
+      },
+      {
+        "name": "PersimmonMLP",
+        "line": 160,
+        "bases": [
+          "nn.Module"
+        ],
+        "kb_nano_files": [
+          "tasks/baseline/L1/squared_relu.py",
+          "tasks/baseline/L1/linear.py"
+        ],
+        "rationale": "config.hidden_act='relu2': dense_h_to_4h -> SquaredReLU -> dense_4h_to_h. NOT a SwiGLU pattern (no gating); plain 2-layer FFN. Closest is bitnet_mlp.py's squared_relu BUT bitnet uses fused gate_up + SquaredReluAndMul, which is structurally different. Composes from L1/{linear, squared_relu}; no L2 file matches."
+      },
+      {
+        "name": "PersimmonAttention",
+        "line": 196,
+        "bases": [
+          "nn.Module"
+        ],
+        "kb_nano_files": [],
+        "rationale": "fused QKV (single 3*hidden_size Linear) + optional QK LayerNorm + partial RoPE + dense (separate o_proj). LlamaAttention-style but with fused query_key_value, LayerNorm (not RMSNorm) for QK norm, and partial RoPE. Closest is L2/attention.py:LlamaAttention but Persimmon has LayerNorm-based qk_norm vs Llama's RMSNorm. No exact L2 match; composes from L1/{linear, layer_norm, rotary_emb} + L2/attention_impl.py"
+      },
+      {
+        "name": "PersimmonDecoderLayer",
+        "line": 320,
+        "bases": [
+          "GradientCheckpointingLayer"
+        ],
+        "kb_nano_files": [],
+        "rationale": "wiring: input_layernorm + self_attn + post_attention_layernorm + mlp"
+      },
+      {
+        "name": "PersimmonModel",
+        "line": 385,
+        "bases": [
+          "PersimmonPreTrainedModel"
+        ],
+        "kb_nano_files": [],
+        "rationale": "wiring: stacks decoder layers"
+      },
+      {
+        "name": "PersimmonForCausalLM",
+        "line": 465,
+        "bases": [
+          "PersimmonPreTrainedModel",
+          "GenerationMixin"
+        ],
+        "kb_nano_files": [],
+        "rationale": "wiring: model + lm_head"
+      },
+      {
+        "name": "PersimmonForSequenceClassification",
+        "line": 541,
+        "bases": [
+          "GenericForSequenceClassification",
+          "PersimmonPreTrainedModel"
+        ],
+        "kb_nano_files": [],
+        "rationale": "wiring head"
+      },
+      {
+        "name": "PersimmonForTokenClassification",
+        "line": 544,
+        "bases": [
+          "GenericForTokenClassification",
+          "PersimmonPreTrainedModel"
+        ],
+        "kb_nano_files": [],
+        "rationale": "wiring head"
+      }
+    ],
+    "inheritance_summary": [],
+    "evidence_lines": [
+      "persimmon/modeling_persimmon.py:160 (relu2 plain MLP)",
+      "persimmon/modeling_persimmon.py:196",
+      "persimmon/configuration_persimmon.py:hidden_act='relu2'"
+    ]
+  },
+  "phi": {
+    "src_file": "modular_phi.py",
+    "classes": [
+      {
+        "name": "PhiRotaryEmbedding",
+        "line": 39,
+        "bases": [
+          "LlamaRotaryEmbedding"
+        ],
+        "kb_nano_files": [
+          "tasks/baseline/L1/rotary_emb.py"
+        ],
+        "rationale": "inherits LlamaRotaryEmbedding; partial RoPE via partial_rotary_factor; standard rotary"
+      },
+      {
+        "name": "PhiAttention",
+        "line": 73,
+        "bases": [
+          "LlamaAttention"
+        ],
+        "kb_nano_files": [],
+        "rationale": "inherits LlamaAttention but overrides forward (in modeling_phi.py:171): separate q/k/v Linears WITH bias, optional QK LayerNorm (not RMSNorm), partial RoPE, separate dense (not o_proj). LayerNorm-based QK norm differs from L2/attention.py LlamaAttention's RMSNorm-based qk_norm (Qwen3-style). No exact L2 match; closest is L2/attention.py:LlamaAttention with caveats. Composes from L1/{linear, layer_norm, rotary_emb} + L2/attention_impl.py"
+      },
+      {
+        "name": "PhiMLP",
+        "line": 150,
+        "bases": [
+          "CLIPMLP"
+        ],
+        "kb_nano_files": [
+          "tasks/baseline/L1/linear.py",
+          "tasks/baseline/L1/gelu.py"
+        ],
+        "rationale": "[v2 fix] hidden_act=gelu_new (NewGELU=GELU(approximate=tanh)). NOT QuickGELU. Composes from L1 (no exact L2 match)."
+      },
+      {
+        "name": "PhiDecoderLayer",
+        "line": 154,
+        "bases": [
+          "GradientCheckpointingLayer"
+        ],
+        "kb_nano_files": [],
+        "rationale": "wiring: parallel attn+mlp residual structure"
+      },
+      {
+        "name": "PhiModel",
+        "line": 200,
+        "bases": [
+          "LlamaModel"
+        ],
+        "kb_nano_files": [],
+        "rationale": "wiring: inherits LlamaModel"
+      },
+      {
+        "name": "PhiForCausalLM",
+        "line": 268,
+        "bases": [
+          "LlamaForCausalLM"
+        ],
+        "kb_nano_files": [],
+        "rationale": "wiring head"
+      },
+      {
+        "name": "PhiForSequenceClassification",
+        "line": 274,
+        "bases": [
+          "LlamaForSequenceClassification"
+        ],
+        "kb_nano_files": [],
+        "rationale": "wiring head"
+      },
+      {
+        "name": "PhiForTokenClassification",
+        "line": 278,
+        "bases": [
+          "LlamaForTokenClassification"
+        ],
+        "kb_nano_files": [],
+        "rationale": "wiring head"
+      }
+    ],
+    "inheritance_summary": [
+      "PhiRotaryEmbedding(LlamaRotaryEmbedding)",
+      "PhiAttention(LlamaAttention)",
+      "PhiMLP(CLIPMLP)",
+      "PhiModel(LlamaModel)"
+    ],
+    "evidence_lines": [
+      "phi/modeling_phi.py:171 (Attention)",
+      "phi/modeling_phi.py:256 (MLP)",
+      "phi/configuration_phi.py:hidden_act='gelu_new'"
+    ]
+  },
+  "phi3": {
+    "src_file": "modular_phi3.py",
+    "classes": [
+      {
+        "name": "Phi3MLP",
+        "line": 48,
+        "bases": [
+          "nn.Module"
+        ],
+        "kb_nano_files": [
+          "tasks/baseline/L2/llama_mlp.py"
+        ],
+        "rationale": "config.hidden_act='silu' SwiGLU: fused gate_up_proj (single Linear -> chunk -> silu(gate)*up) -> down_proj. Functionally equivalent to LlamaMLP (kb-nano fuses gate+up via MergedColumnParallelLinear)."
+      },
+      {
+        "name": "Phi3RotaryEmbedding",
+        "line": 66,
+        "bases": [
+          "PhiRotaryEmbedding"
+        ],
+        "kb_nano_files": [
+          "tasks/baseline/L1/rotary_emb.py"
+        ],
+        "rationale": "partial RoPE via partial_rotary_factor; supports longrope/yarn variants. For default rope, kb-nano L1/rotary_emb.py is closest; for yarn, L1/yarn_rotary_emb.py."
+      },
+      {
+        "name": "Phi3Attention",
+        "line": 100,
+        "bases": [
+          "nn.Module"
+        ],
+        "kb_nano_files": [
+          "tasks/baseline/L2/attention.py"
+        ],
+        "rationale": "fused QKV via single Linear with op_size = num_q_heads*head_dim + 2*num_kv_heads*head_dim (GQA fused), no QK norm, full RoPE (no partial), o_proj. Supports sliding_window. Matches LlamaAttention pattern; kb-nano L2/attention.py:LlamaAttention covers this with bias=False."
+      },
+      {
+        "name": "Phi3RMSNorm",
+        "line": 275,
+        "bases": [
+          "nn.Module"
+        ],
+        "kb_nano_files": [
+          "tasks/baseline/L1/rms_norm.py"
+        ],
+        "rationale": "standard Llama-style RMSNorm"
+      },
+      {
+        "name": "Phi3DecoderLayer",
+        "line": 166,
+        "bases": [
+          "MistralDecoderLayer"
+        ],
+        "kb_nano_files": [],
+        "rationale": "wiring: input_layernorm + self_attn + dropout + post_attention_layernorm + mlp + dropout (resid dropout differs from Llama)"
+      },
+      {
+        "name": "Phi3PreTrainedModel",
+        "line": 206,
+        "bases": [
+          "MistralPreTrainedModel"
+        ],
+        "kb_nano_files": [],
+        "rationale": "skip"
+      },
+      {
+        "name": "Phi3ForCausalLM",
+        "line": 210,
+        "bases": [
+          "MistralForCausalLM"
+        ],
+        "kb_nano_files": [],
+        "rationale": "wiring head"
+      },
+      {
+        "name": "Phi3ForSequenceClassification",
+        "line": 250,
+        "bases": [
+          "MistralForSequenceClassification"
+        ],
+        "kb_nano_files": [],
+        "rationale": "wiring head"
+      },
+      {
+        "name": "Phi3ForTokenClassification",
+        "line": 254,
+        "bases": [
+          "MistralForTokenClassification"
+        ],
+        "kb_nano_files": [],
+        "rationale": "wiring head"
+      }
+    ],
+    "inheritance_summary": [
+      "Phi3RotaryEmbedding(PhiRotaryEmbedding)",
+      "Phi3DecoderLayer(MistralDecoderLayer)",
+      "Phi3PreTrainedModel(MistralPreTrainedModel)",
+      "Phi3ForCausalLM(MistralForCausalLM)"
+    ],
+    "evidence_lines": [
+      "phi3/modeling_phi3.py:49 (silu fused gate_up)",
+      "phi3/modeling_phi3.py:208 (Attention fused QKV)",
+      "phi3/configuration_phi3.py:hidden_act='silu'"
+    ]
+  },
+  "phi4_multimodal": {
+    "src_file": "modeling_phi4_multimodal.py",
+    "classes": [
+      {
+        "name": "Phi4MultimodalVisionMLP",
+        "line": 53,
+        "bases": [
+          "nn.Module"
+        ],
+        "kb_nano_files": [
+          "tasks/baseline/L2/siglip_mlp.py"
+        ],
+        "rationale": "config.vision_config.hidden_act='gelu_pytorch_tanh': fc1 + GELU(tanh) + fc2; matches SigLIP MLP (siglip_mlp.py uses GELU(approximate='none') though - wait, siglip_mlp uses approximate='none', but vision config uses gelu_pytorch_tanh which is approximate='tanh'). Caveat: kb-nano siglip_mlp.py uses GELU(approximate='none'); phi4_mm vision uses gelu_pytorch_tanh; structure matches but activation differs. Composes from L1/{linear, gelu(approximate='tanh')}."
+      },
+      {
+        "name": "Phi4MultimodalVisionAttention",
+        "line": 90,
+        "bases": [
+          "nn.Module"
+        ],
+        "kb_nano_files": [
+          "tasks/baseline/L2/siglip_attention.py"
+        ],
+        "rationale": "non-causal vision MHA with separate q/k/v Linears (with bias); matches SigLIPAttention pattern (DenseAttention)"
+      },
+      {
+        "name": "Phi4MultimodalVisionEncoderLayer",
+        "line": 140,
+        "bases": [
+          "GradientCheckpointingLayer"
+        ],
+        "kb_nano_files": [],
+        "rationale": "wiring: layer_norm1 + self_attn + layer_norm2 + mlp"
+      },
+      {
+        "name": "Phi4MultimodalVisionEncoder",
+        "line": 174,
+        "bases": [
+          "nn.Module"
+        ],
+        "kb_nano_files": [],
+        "rationale": "wiring: stacks encoder layers"
+      },
+      {
+        "name": "Phi4MultimodalVisionEmbeddings",
+        "line": 267,
+        "bases": [
+          "nn.Module"
+        ],
+        "kb_nano_files": [],
+        "rationale": "wiring: patch embedding via Conv2d + position embedding interpolation"
+      },
+      {
+        "name": "Phi4MultimodalVisionMultiheadAttentionPoolingHead",
+        "line": 367,
+        "bases": [
+          "nn.Module"
+        ],
+        "kb_nano_files": [
+          "tasks/baseline/L2/attention_pool.py"
+        ],
+        "rationale": "MAP pooling: learnable probe + nn.MultiheadAttention + LayerNorm + MLP. Closest is L2/attention_pool.py:AttentionPoolLatent (latent query attends to seq) but Phi4-MM uses torch.nn.MultiheadAttention (single fused QKV). Pattern matches."
+      },
+      {
+        "name": "Phi4MultimodalVisionModel",
+        "line": 393,
+        "bases": [
+          "Phi4MultimodalVisionPreTrainedModel"
+        ],
+        "kb_nano_files": [],
+        "rationale": "wiring: embeddings + encoder + post_layernorm + head"
+      },
+      {
+        "name": "Phi4MultimodalImageEmbedding",
+        "line": 461,
+        "bases": [
+          "nn.Module"
+        ],
+        "kb_nano_files": [],
+        "rationale": "wiring: vision_model + Linear projections + ReflectionPad + AvgPool2d for image-token compression"
+      },
+      {
+        "name": "Phi4MultimodalAudioMLP",
+        "line": 597,
+        "bases": [
+          "nn.Module"
+        ],
+        "kb_nano_files": [],
+        "rationale": "config.audio_config.activation: layer_norm + fused gate_up_proj -> chunk -> up*act(gate) -> down_proj. SwiGLU-style (default activation likely silu for audio); does pre-FFN layer_norm INSIDE the MLP (unusual). Closest is L2/llama_mlp.py for the gate*act pattern but with extra layer_norm + dropouts; composes from L1/{linear, layer_norm, silu_and_mul (or matching act)}; no exact L2 match."
+      },
+      {
+        "name": "Phi4MultimodalAudioAttention",
+        "line": 618,
+        "bases": [
+          "nn.Module"
+        ],
+        "kb_nano_files": [],
+        "rationale": "MHA with separate q/k/v Linears (bias=True), no GQA, no RoPE in this class. Composes from L1/{linear} + attention impl."
+      },
+      {
+        "name": "Phi4MultimodalAudioDepthWiseSeparableConv1d",
+        "line": 665,
+        "bases": [
+          "nn.Module"
+        ],
+        "kb_nano_files": [
+          "tasks/baseline/L1/conv1d.py"
+        ],
+        "rationale": "depthwise + pointwise Conv1d sequence; composes from L1/conv1d.py"
+      },
+      {
+        "name": "Phi4MultimodalAudioGluPointWiseConv",
+        "line": 684,
+        "bases": [
+          "nn.Module"
+        ],
+        "kb_nano_files": [],
+        "rationale": "Conv1d -> split -> half + bias, half * glu_act + bias; novel; composes from L1/{conv1d, sigmoid} (typical glu_act=sigmoid)"
+      },
+      {
+        "name": "Phi4MultimodalAudioConvModule",
+        "line": 705,
+        "bases": [
+          "nn.Module"
+        ],
+        "kb_nano_files": [],
+        "rationale": "wiring: layer_norm + glu pointwise conv + dw_sep_conv + activation + ext pointwise conv + dropout"
+      },
+      {
+        "name": "Phi4MultimodalAudioConformerEncoderLayer",
+        "line": 731,
+        "bases": [
+          "nn.Module"
+        ],
+        "kb_nano_files": [],
+        "rationale": "wiring: Conformer macaron-style layer (FFN + Conv + Attention + FFN)"
+      },
+      {
+        "name": "Phi4MultimodalAudioNemoConvSubsampling",
+        "line": 759,
+        "bases": [
+          "torch.nn.Module"
+        ],
+        "kb_nano_files": [],
+        "rationale": "Conv2d-based audio subsampling stack"
+      },
+      {
+        "name": "Phi4MultimodalAudioRelativeAttentionBias",
+        "line": 804,
+        "bases": [
+          "nn.Module"
+        ],
+        "kb_nano_files": [],
+        "rationale": "T5-style relative attention bias variant for audio"
+      },
+      {
+        "name": "Phi4MultimodalAudioMeanVarianceNormLayer",
+        "line": 837,
+        "bases": [
+          "nn.Module"
+        ],
+        "kb_nano_files": [],
+        "rationale": "audio normalization (mean/var); composes elementwise"
+      },
+      {
+        "name": "Phi4MultimodalAudioModel",
+        "line": 919,
+        "bases": [
+          "Phi4MultimodalAudioPreTrainedModel"
+        ],
+        "kb_nano_files": [],
+        "rationale": "wiring: subsampling + relative_bias + Conformer encoder layers"
+      },
+      {
+        "name": "Phi4MultimodalAudioEmbedding",
+        "line": 1051,
+        "bases": [
+          "nn.Module"
+        ],
+        "kb_nano_files": [],
+        "rationale": "wiring: audio_model + projection"
+      },
+      {
+        "name": "Phi4MultimodalRMSNorm",
+        "line": 1112,
+        "bases": [
+          "nn.Module"
+        ],
+        "kb_nano_files": [
+          "tasks/baseline/L1/rms_norm.py"
+        ],
+        "rationale": "standard Llama-style RMSNorm"
+      },
+      {
+        "name": "Phi4MultimodalMLP",
+        "line": 1132,
+        "bases": [
+          "nn.Module"
+        ],
+        "kb_nano_files": [
+          "tasks/baseline/L2/llama_mlp.py"
+        ],
+        "rationale": "config.hidden_act='silu' SwiGLU with fused gate_up_proj -> chunk -> silu(gate)*up -> down_proj. Same as Phi3MLP."
+      },
+      {
+        "name": "Phi4MultimodalAttention",
+        "line": 1224,
+        "bases": [
+          "nn.Module"
+        ],
+        "kb_nano_files": [
+          "tasks/baseline/L2/attention.py"
+        ],
+        "rationale": "fused QKV via single op_size Linear + RoPE + sliding_window; matches LlamaAttention/Phi3Attention pattern"
+      },
+      {
+        "name": "Phi4MultimodalDecoderLayer",
+        "line": 1290,
+        "bases": [
+          "GradientCheckpointingLayer"
+        ],
+        "kb_nano_files": [],
+        "rationale": "wiring: input_ln + self_attn + dropout + post_attn_ln + mlp + dropout"
+      },
+      {
+        "name": "Phi4MultimodalFeatureEmbedding",
+        "line": 1333,
+        "bases": [
+          "nn.Module"
+        ],
+        "kb_nano_files": [],
+        "rationale": "wiring: routes input to image_embed and/or audio_embed"
+      },
+      {
+        "name": "Phi4MultimodalRotaryEmbedding",
+        "line": 1419,
+        "bases": [
+          "nn.Module"
+        ],
+        "kb_nano_files": [
+          "tasks/baseline/L1/rotary_emb.py"
+        ],
+        "rationale": "rope with partial_rotary_factor support; for yarn variant use L1/yarn_rotary_emb.py"
+      },
+      {
+        "name": "Phi4MultimodalModel",
+        "line": 1487,
+        "bases": [
+          "Phi4MultimodalPreTrainedModel"
+        ],
+        "kb_nano_files": [],
+        "rationale": "wiring: stacks decoder layers + feature embedding"
+      },
+      {
+        "name": "Phi4MultimodalForCausalLM",
+        "line": 1597,
+        "bases": [
+          "Phi4MultimodalPreTrainedModel",
+          "GenerationMixin"
+        ],
+        "kb_nano_files": [],
+        "rationale": "wiring: model + lm_head"
+      }
+    ],
+    "inheritance_summary": [
+      "Phi4MultimodalVisionMLP(SiglipMLP)",
+      "Phi4MultimodalVisionAttention(custom)",
+      "Phi4MultimodalRMSNorm(Phi3RMSNorm)",
+      "Phi4MultimodalDecoderLayer(Phi3DecoderLayer)",
+      "Phi4MultimodalForCausalLM(Phi3ForCausalLM)"
+    ],
+    "evidence_lines": [
+      "phi4_multimodal/modeling_phi4_multimodal.py:53 (vision MLP)",
+      "phi4_multimodal/modeling_phi4_multimodal.py:367 (MAP head)",
+      "phi4_multimodal/modeling_phi4_multimodal.py:1132 (text MLP silu)",
+      "phi4_multimodal/modeling_phi4_multimodal.py:1224 (text attn)",
+      "phi4_multimodal/configuration_phi4_multimodal.py:hidden_act='silu' (text)",
+      "configuration_phi4_multimodal.py:hidden_act='gelu_pytorch_tanh' (vision)"
+    ]
+  },
+  "phimoe": {
+    "src_file": "modular_phimoe.py",
+    "classes": [
+      {
+        "name": "PhimoeRotaryEmbedding",
+        "line": 40,
+        "bases": [
+          "MixtralRotaryEmbedding"
+        ],
+        "kb_nano_files": [
+          "tasks/baseline/L1/rotary_emb.py"
+        ],
+        "rationale": "inherits Mixtral RoPE (standard NeoX-style)"
+      },
+      {
+        "name": "PhimoeAttention",
+        "line": 85,
+        "bases": [
+          "LlamaAttention"
+        ],
+        "kb_nano_files": [
+          "tasks/baseline/L2/attention.py"
+        ],
+        "rationale": "inherits LlamaAttention; standard Llama attention with RoPE"
+      },
+      {
+        "name": "PhimoeMultiplier",
+        "line": 89,
+        "bases": [
+          "torch.autograd.Function"
+        ],
+        "kb_nano_files": [],
+        "rationale": "custom autograd Function for jitter routing; not an nn.Module"
+      },
+      {
+        "name": "PhimoeExperts",
+        "line": 274,
+        "bases": [
+          "MixtralExperts"
+        ],
+        "kb_nano_files": [
+          "tasks/baseline/L2/mixtral_moe.py"
+        ],
+        "rationale": "inherits MixtralExperts; standard fused-experts with SiLU SwiGLU per expert. config.hidden_act='silu'"
+      },
+      {
+        "name": "PhimoeTopKRouter",
+        "line": 278,
+        "bases": [
+          "nn.Linear"
+        ],
+        "kb_nano_files": [],
+        "rationale": "linear router with custom Phimoe top-k logic; composes from L1/linear + custom topk"
+      },
+      {
+        "name": "PhimoeSparseMoeBlock",
+        "line": 297,
+        "bases": [
+          "nn.Module"
+        ],
+        "kb_nano_files": [
+          "tasks/baseline/L2/mixtral_moe.py"
+        ],
+        "rationale": "wiring: PhimoeTopKRouter + PhimoeExperts; matches Mixtral MoE block pattern with custom routing"
+      },
+      {
+        "name": "PhimoeDecoderLayer",
+        "line": 333,
+        "bases": [
+          "MixtralDecoderLayer"
+        ],
+        "kb_nano_files": [],
+        "rationale": "wiring: standard Mixtral decoder layer"
+      },
+      {
+        "name": "PhimoeModel",
+        "line": 352,
+        "bases": [
+          "MixtralModel"
+        ],
+        "kb_nano_files": [],
+        "rationale": "wiring inherits MixtralModel"
+      },
+      {
+        "name": "PhimoeForCausalLM",
+        "line": 358,
+        "bases": [
+          "MixtralForCausalLM"
+        ],
+        "kb_nano_files": [],
+        "rationale": "wiring head"
+      },
+      {
+        "name": "PhimoeForSequenceClassification",
+        "line": 402,
+        "bases": [
+          "GenericForSequenceClassification",
+          "PhimoePreTrainedModel"
+        ],
+        "kb_nano_files": [],
+        "rationale": "wiring head"
+      }
+    ],
+    "inheritance_summary": [
+      "PhimoeRotaryEmbedding(MixtralRotaryEmbedding)",
+      "PhimoeAttention(LlamaAttention)",
+      "PhimoeExperts(MixtralExperts)",
+      "PhimoeDecoderLayer(MixtralDecoderLayer)",
+      "PhimoeModel(MixtralModel)"
+    ],
+    "evidence_lines": [
+      "phimoe/modular_phimoe.py:85",
+      "phimoe/modular_phimoe.py:274",
+      "phimoe/configuration_phimoe.py:hidden_act='silu'"
+    ]
+  },
+  "pi0": {
+    "src_file": "modeling_pi0.py",
+    "classes": [
+      {
+        "name": "PI0TimestepEmbeddings",
+        "line": 38,
+        "bases": [
+          "nn.Module"
+        ],
+        "kb_nano_files": [
+          "tasks/baseline/L1/sinusoidal_embed.py"
+        ],
+        "rationale": "sinusoidal time embedding: log-spaced periods -> sin/cos cat. Mirrors kb-nano L1/sinusoidal_embed.py:SinusoidalEmbed"
+      },
+      {
+        "name": "PI0ActionTimeEmbedding",
+        "line": 61,
+        "bases": [
+          "nn.Module"
+        ],
+        "kb_nano_files": [
+          "tasks/baseline/L2/pi0_action_embed.py"
+        ],
+        "rationale": "sinusoid_embeds + action_in_proj + state_proj + 2-layer MLP with SiLU; matches L2/pi0_action_embed.py:Pi0ActionTimeEmbedding exactly"
+      },
+      {
+        "name": "PI0Model",
+        "line": 104,
+        "bases": [
+          "PI0PreTrainedModel"
+        ],
+        "kb_nano_files": [
+          "tasks/baseline/L4/pi0.py"
+        ],
+        "rationale": "wiring: holds dit + vlm via AutoModel; top-level pipeline -> matches L4/pi0.py"
+      },
+      {
+        "name": "PI0ForConditionalGeneration",
+        "line": 222,
+        "bases": [
+          "PI0PreTrainedModel"
+        ],
+        "kb_nano_files": [
+          "tasks/baseline/L4/pi0.py"
+        ],
+        "rationale": "wiring: PI0Model + flow-matching action decoder"
+      }
+    ],
+    "inheritance_summary": [],
+    "evidence_lines": [
+      "pi0/modeling_pi0.py:38",
+      "pi0/modeling_pi0.py:61"
+    ]
+  },
+  "pix2struct": {
+    "src_file": "modeling_pix2struct.py",
+    "classes": [
+      {
+        "name": "Pix2StructLayerNorm",
+        "line": 51,
+        "bases": [
+          "nn.Module"
+        ],
+        "kb_nano_files": [
+          "tasks/baseline/L1/t5_layer_norm.py"
+        ],
+        "rationale": "T5-style RMSNorm (no centering, no bias); matches kb-nano L1/t5_layer_norm.py"
+      },
+      {
+        "name": "Pix2StructVisionEmbeddings",
+        "line": 76,
+        "bases": [
+          "nn.Module"
+        ],
+        "kb_nano_files": [],
+        "rationale": "wiring: patch projection Linear + row + column nn.Embedding; composes from L1/{linear, embedding}"
+      },
+      {
+        "name": "Pix2StructVisionAttention",
+        "line": 112,
+        "bases": [
+          "nn.Module"
+        ],
+        "kb_nano_files": [],
+        "rationale": "non-causal vision attention with separate q/k/v Linears (no bias), uses position_bias mask (passed in, not computed). Matmul-based SDPA + softmax. No T5 relative-bias compute here. Composes from L1/{linear, softmax, sdpa or bmm}; closest is L2/siglip_attention.py for the structure but has external position_bias."
+      },
+      {
+        "name": "Pix2StructVisionMlp",
+        "line": 203,
+        "bases": [
+          "nn.Module"
+        ],
+        "kb_nano_files": [
+          "tasks/baseline/L2/t5_dense.py"
+        ],
+        "rationale": "config.dense_act_fn='gelu_new' gated FFN: wi_0 + GELU_NEW + wi_1 multiplied. T5DenseGatedActDense pattern (gate * up); kb-nano L2/t5_dense.py:T5DenseGatedActDense supports gelu_new via NewGELUActivation. Activation matches."
+      },
+      {
+        "name": "Pix2StructVisionLayer",
+        "line": 232,
+        "bases": [
+          "GradientCheckpointingLayer"
+        ],
+        "kb_nano_files": [],
+        "rationale": "wiring: pre_attention_layer_norm + attention + pre_mlp_layer_norm + mlp"
+      },
+      {
+        "name": "Pix2StructVisionEncoder",
+        "line": 273,
+        "bases": [
+          "nn.Module"
+        ],
+        "kb_nano_files": [],
+        "rationale": "wiring: stacks vision layers"
+      },
+      {
+        "name": "Pix2StructVisionModel",
+        "line": 432,
+        "bases": [
+          "Pix2StructPreTrainedModel"
+        ],
+        "kb_nano_files": [],
+        "rationale": "wiring: embeddings + encoder + final_layer_norm"
+      },
+      {
+        "name": "Pix2StructTextDenseGatedActDense",
+        "line": 531,
+        "bases": [
+          "nn.Module"
+        ],
+        "kb_nano_files": [
+          "tasks/baseline/L2/t5_dense.py"
+        ],
+        "rationale": "T5 gated FFN with config.dense_act_fn='gelu_new'; matches L2/t5_dense.py:T5DenseGatedActDense"
+      },
+      {
+        "name": "Pix2StructTextLayerFF",
+        "line": 560,
+        "bases": [
+          "nn.Module"
+        ],
+        "kb_nano_files": [],
+        "rationale": "wiring: layer_norm + DenseReluDense + dropout"
+      },
+      {
+        "name": "Pix2StructTextAttention",
+        "line": 576,
+        "bases": [
+          "nn.Module"
+        ],
+        "kb_nano_files": [
+          "tasks/baseline/L2/t5_attention.py"
+        ],
+        "rationale": "T5-style attention with optional relative attention bias (compute_bias). Causal in decoder context. Matches L2/t5_attention.py:T5SelfAttention pattern (relative position bucket bias). Note kb-nano has no separate cross-attention class for T5; the same class handles cross via key_value_states arg."
+      },
+      {
+        "name": "Pix2StructTextLayerSelfAttention",
+        "line": 768,
+        "bases": [
+          "nn.Module"
+        ],
+        "kb_nano_files": [],
+        "rationale": "wiring: layer_norm + Pix2StructTextAttention + dropout (T5LayerSelfAttention)"
+      },
+      {
+        "name": "Pix2StructTextLayerCrossAttention",
+        "line": 802,
+        "bases": [
+          "nn.Module"
+        ],
+        "kb_nano_files": [],
+        "rationale": "wiring: layer_norm + Pix2StructTextAttention(cross) + dropout"
+      },
+      {
+        "name": "Pix2StructTextBlock",
+        "line": 833,
+        "bases": [
+          "GradientCheckpointingLayer"
+        ],
+        "kb_nano_files": [],
+        "rationale": "wiring: self-attn + cross-attn + ff"
+      },
+      {
+        "name": "Pix2StructTextModel",
+        "line": 918,
+        "bases": [
+          "Pix2StructPreTrainedModel"
+        ],
+        "kb_nano_files": [],
+        "rationale": "wiring container"
+      },
+      {
+        "name": "Pix2StructForConditionalGeneration",
+        "line": 1139,
+        "bases": [
+          "Pix2StructPreTrainedModel",
+          "GenerationMixin"
+        ],
+        "kb_nano_files": [],
+        "rationale": "wiring: vision encoder + text decoder + lm_head"
+      }
+    ],
+    "inheritance_summary": [],
+    "evidence_lines": [
+      "pix2struct/modeling_pix2struct.py:51 (T5LayerNorm)",
+      "pix2struct/modeling_pix2struct.py:203 (vision gated MLP)",
+      "pix2struct/modeling_pix2struct.py:576 (T5-style attn with bias)",
+      "pix2struct/configuration_pix2struct.py:dense_act_fn='gelu_new'"
+    ]
+  },
+  "pixio": {
+    "src_file": "modular_pixio.py",
+    "classes": [
+      {
+        "name": "PixioPatchEmbeddings",
+        "line": 77,
+        "bases": [
+          "ViTPatchEmbeddings"
+        ],
+        "kb_nano_files": [
+          "tasks/baseline/L1/conv2d.py"
+        ],
+        "rationale": "ViT-style patch embedding via Conv2d; composes from L1/conv2d.py"
+      },
+      {
+        "name": "PixioEmbeddings",
+        "line": 81,
+        "bases": [
+          "nn.Module"
+        ],
+        "kb_nano_files": [],
+        "rationale": "wiring: patch_embeddings + cls_token + position_embeddings"
+      },
+      {
+        "name": "PixioSelfAttention",
+        "line": 152,
+        "bases": [
+          "ViTSelfAttention"
+        ],
+        "kb_nano_files": [
+          "tasks/baseline/L2/encoder_attention.py"
+        ],
+        "rationale": "inherits ViTSelfAttention -> non-causal MHA with separate q/k/v Linears + bias=qkv_bias. Maps to L2/encoder_attention.py:EncoderSelfAttention (DenseAttention/varlen FlashAttn for non-causal vision)"
+      },
+      {
+        "name": "PixioSelfOutput",
+        "line": 233,
+        "bases": [
+          "nn.Module"
+        ],
+        "kb_nano_files": [
+          "tasks/baseline/L1/linear.py"
+        ],
+        "rationale": "Linear + dropout (no LayerNorm here in ViT-style; layernorm is in PixioLayer)"
+      },
+      {
+        "name": "PixioAttention",
+        "line": 156,
+        "bases": [
+          "ViTAttention"
+        ],
+        "kb_nano_files": [],
+        "rationale": "wiring class around PixioSelfAttention + PixioSelfOutput (sibling-class pattern: bare PixioAttention is composes); EncoderAttention in kb-nano follows same wrapper pattern but BERT-style includes LayerNorm in output"
+      },
+      {
+        "name": "PixioDropPath",
+        "line": 162,
+        "bases": [
+          "Dinov2DropPath"
+        ],
+        "kb_nano_files": [],
+        "rationale": "stochastic depth / drop-path; not in kb-nano"
+      },
+      {
+        "name": "PixioMLP",
+        "line": 166,
+        "bases": [
+          "Dinov2MLP"
+        ],
+        "kb_nano_files": [
+          "tasks/baseline/L2/encoder_mlp.py"
+        ],
+        "rationale": "config.hidden_act='gelu' (default; Dinov2-derived): fc1 + GELU + fc2; matches L2/encoder_mlp.py:EncoderIntermediate (without the final LayerNorm of EncoderOutput, since pixio applies layernorm before MLP, not after)"
+      },
+      {
+        "name": "PixioLayer",
+        "line": 170,
+        "bases": [
+          "GradientCheckpointingLayer"
+        ],
+        "kb_nano_files": [],
+        "rationale": "wiring: norm1 + attention + drop_path + norm2 + mlp + drop_path (ViT pre-norm)"
+      },
+      {
+        "name": "PixioEncoder",
+        "line": 202,
+        "bases": [
+          "PixioPreTrainedModel"
+        ],
+        "kb_nano_files": [],
+        "rationale": "wiring: stacks PixioLayer"
+      },
+      {
+        "name": "PixioModel",
+        "line": 219,
+        "bases": [
+          "PixioPreTrainedModel"
+        ],
+        "kb_nano_files": [],
+        "rationale": "wiring container"
+      },
+      {
+        "name": "PixioBackbone",
+        "line": 264,
+        "bases": [
+          "Dinov2Backbone"
+        ],
+        "kb_nano_files": [],
+        "rationale": "wiring: backbone interface for feature extraction"
+      }
+    ],
+    "inheritance_summary": [
+      "PixioPatchEmbeddings(ViTPatchEmbeddings)",
+      "PixioSelfAttention(ViTSelfAttention)",
+      "PixioAttention(ViTAttention)",
+      "PixioMLP(Dinov2MLP)",
+      "PixioBackbone(Dinov2Backbone)"
+    ],
+    "evidence_lines": [
+      "pixio/modeling_pixio.py:178 (SelfAttention)",
+      "pixio/modeling_pixio.py:295 (MLP gelu)",
+      "pixio/configuration_pixio.py:hidden_act='gelu'"
+    ]
+  },
+  "pixtral": {
+    "src_file": "modeling_pixtral.py",
+    "classes": [
+      {
+        "name": "PixtralRotaryEmbedding",
+        "line": 48,
+        "bases": [
+          "nn.Module"
+        ],
+        "kb_nano_files": [
+          "tasks/baseline/L1/vision_rotary_emb.py"
+        ],
+        "rationale": "2D-position-based RoPE for vision (frequencies on (h_idx, w_idx) pairs); kb-nano L1/vision_rotary_emb.py is the vision 2D RoPE variant"
+      },
+      {
+        "name": "PixtralAttention",
+        "line": 193,
+        "bases": [
+          "nn.Module"
+        ],
+        "kb_nano_files": [],
+        "rationale": "vision MHA: separate q/k/v Linears (no bias), 2D RoPE applied to q,k, non-causal attention. Closest is L2/siglip_attention.py for non-causal MHA but Pixtral adds 2D RoPE; composes from L1/{linear, vision_rotary_emb, dense_attention or sdpa}; no exact L2 match."
+      },
+      {
+        "name": "PixtralMLP",
+        "line": 260,
+        "bases": [
+          "nn.Module"
+        ],
+        "kb_nano_files": [],
+        "rationale": "config.hidden_act='gelu' (NOT silu!): gate_proj + GELU(gate) * up_proj -> down_proj. SwiGLU pattern but with GELU instead of SiLU. NOT a match for L2/llama_mlp.py (silu_and_mul). Closest fused form is L1/gelu_and_mul.py (approximate='none'), composed with parallel_linear. L2/gemma4_mlp.py uses GeluAndMul('tanh') which is also wrong. ACTIVATION DIVERGENCE: gelu (none) != silu and != gelu_pytorch_tanh. Composes from L1/{linear, gelu_and_mul} or {linear, gelu}; no exact L2 file."
+      },
+      {
+        "name": "PixtralRMSNorm",
+        "line": 277,
+        "bases": [
+          "nn.Module"
+        ],
+        "kb_nano_files": [
+          "tasks/baseline/L1/rms_norm.py"
+        ],
+        "rationale": "standard Llama-style RMSNorm"
+      },
+      {
+        "name": "PixtralAttentionLayer",
+        "line": 297,
+        "bases": [
+          "GradientCheckpointingLayer"
+        ],
+        "kb_nano_files": [],
+        "rationale": "wiring: attention_norm + attention + ffn_norm + feed_forward (pre-norm ViT-style)"
+      },
+      {
+        "name": "PixtralTransformer",
+        "line": 338,
+        "bases": [
+          "nn.Module"
+        ],
+        "kb_nano_files": [],
+        "rationale": "wiring: stacks PixtralAttentionLayer modules"
+      },
+      {
+        "name": "PixtralVisionModel",
+        "line": 413,
+        "bases": [
+          "PixtralPreTrainedModel"
+        ],
+        "kb_nano_files": [],
+        "rationale": "wiring: patch_conv + ln_pre + transformer"
+      }
+    ],
+    "inheritance_summary": [],
+    "evidence_lines": [
+      "pixtral/modeling_pixtral.py:193 (Attention with 2D RoPE)",
+      "pixtral/modeling_pixtral.py:260 (MLP gelu SwiGLU)",
+      "pixtral/configuration_pixtral.py:hidden_act='gelu'"
+    ]
+  },
+  "plbart": {
+    "src_file": "modular_plbart.py",
+    "classes": [
+      {
+        "name": "PLBartScaledWordEmbedding",
+        "line": 47,
+        "bases": [
+          "BartScaledWordEmbedding"
+        ],
+        "kb_nano_files": [
+          "tasks/baseline/L1/embedding.py"
+        ],
+        "rationale": "scaled word embedding; inherits BART base"
+      },
+      {
+        "name": "PLBartEncoder",
+        "line": 67,
+        "bases": [
+          "BartEncoder"
+        ],
+        "kb_nano_files": [],
+        "rationale": "wiring: BART-style encoder stack with LearnedPositionalEmbedding"
+      },
+      {
+        "name": "PLBartDecoder",
+        "line": 71,
+        "bases": [
+          "BartDecoder"
+        ],
+        "kb_nano_files": [],
+        "rationale": "wiring: BART-style decoder stack with cross-attn"
+      },
+      {
+        "name": "PLBartModel",
+        "line": 76,
+        "bases": [
+          "PLBartPreTrainedModel"
+        ],
+        "kb_nano_files": [],
+        "rationale": "wiring: encoder + decoder"
+      },
+      {
+        "name": "PLBartForConditionalGeneration",
+        "line": 187,
+        "bases": [
+          "PLBartPreTrainedModel",
+          "GenerationMixin"
+        ],
+        "kb_nano_files": [],
+        "rationale": "wiring head"
+      },
+      {
+        "name": "PLBartClassificationHead",
+        "line": 322,
+        "bases": [
+          "BartClassificationHead"
+        ],
+        "kb_nano_files": [],
+        "rationale": "wiring: dense + dropout + out_proj head"
+      },
+      {
+        "name": "PLBartForSequenceClassification",
+        "line": 326,
+        "bases": [
+          "BigBirdPegasusForSequenceClassification"
+        ],
+        "kb_nano_files": [],
+        "rationale": "wiring head"
+      },
+      {
+        "name": "PLBartForCausalLM",
+        "line": 356,
+        "bases": [
+          "BartForCausalLM"
+        ],
+        "kb_nano_files": [],
+        "rationale": "wiring head"
+      },
+      {
+        "name": "PLBartLearnedPositionalEmbedding",
+        "line": 90,
+        "bases": [
+          "nn.Embedding"
+        ],
+        "kb_nano_files": [
+          "tasks/baseline/L1/embedding.py"
+        ],
+        "rationale": "learned positional embedding (modeling_plbart.py:90)"
+      },
+      {
+        "name": "PLBartAttention",
+        "line": 145,
+        "bases": [
+          "nn.Module"
+        ],
+        "kb_nano_files": [],
+        "rationale": "BART-family multi-purpose MHA (encoder self / decoder self / cross) with separate q/k/v Linears; modeling_plbart.py:145; same pattern as PegasusAttention. No exact kb-nano L2 match."
+      },
+      {
+        "name": "PLBartEncoderLayer",
+        "line": 262,
+        "bases": [
+          "GradientCheckpointingLayer"
+        ],
+        "kb_nano_files": [],
+        "rationale": "wiring: self_attn + fc1+gelu+fc2 (config.activation_function='gelu')"
+      },
+      {
+        "name": "PLBartDecoderLayer",
+        "line": 402,
+        "bases": [
+          "GradientCheckpointingLayer"
+        ],
+        "kb_nano_files": [],
+        "rationale": "wiring: self_attn + cross_attn + fc1+gelu+fc2"
+      }
+    ],
+    "inheritance_summary": [
+      "PLBartScaledWordEmbedding(BartScaledWordEmbedding)",
+      "PLBartEncoder(BartEncoder)",
+      "PLBartDecoder(BartDecoder)",
+      "PLBartForCausalLM(BartForCausalLM)"
+    ],
+    "evidence_lines": [
+      "plbart/modeling_plbart.py:145",
+      "plbart/modeling_plbart.py:276 (gelu)",
+      "plbart/configuration_plbart.py:activation_function='gelu'"
+    ]
+  },
+  "poolformer": {
+    "src_file": "modeling_poolformer.py",
+    "classes": [
+      {
+        "name": "PoolFormerDropPath",
+        "line": 49,
+        "bases": [
+          "nn.Module"
+        ],
+        "kb_nano_files": [],
+        "rationale": "stochastic depth"
+      },
+      {
+        "name": "PoolFormerEmbeddings",
+        "line": 63,
+        "bases": [
+          "nn.Module"
+        ],
+        "kb_nano_files": [],
+        "rationale": "wiring: Conv2d patch projection + optional norm"
+      },
+      {
+        "name": "PoolFormerGroupNorm",
+        "line": 83,
+        "bases": [
+          "nn.GroupNorm"
+        ],
+        "kb_nano_files": [
+          "tasks/baseline/L1/group_norm.py"
+        ],
+        "rationale": "GroupNorm with single group (=LayerNorm over C); kb-nano L1/group_norm.py applies"
+      },
+      {
+        "name": "PoolFormerPooling",
+        "line": 92,
+        "bases": [
+          "nn.Module"
+        ],
+        "kb_nano_files": [
+          "tasks/baseline/L1/avg_pool2d.py"
+        ],
+        "rationale": "AvgPool2d - x (token mixer); composes from L1/avg_pool2d"
+      },
+      {
+        "name": "PoolFormerOutput",
+        "line": 101,
+        "bases": [
+          "nn.Module"
+        ],
+        "kb_nano_files": [],
+        "rationale": "config.hidden_act='gelu': Conv2d 1x1 + GELU + drop + Conv2d 1x1 + drop. NOT a Linear-based MLP (uses pointwise convs); composes from L1/{conv2d, gelu}; no L2 match (encoder_mlp.py uses Linear)"
+      },
+      {
+        "name": "PoolFormerLayer",
+        "line": 122,
+        "bases": [
+          "nn.Module"
+        ],
+        "kb_nano_files": [],
+        "rationale": "wiring: norm + pooling + drop_path + norm + output (mlp), with optional layer-scale"
+      },
+      {
+        "name": "PoolFormerEncoder",
+        "line": 173,
+        "bases": [
+          "nn.Module"
+        ],
+        "kb_nano_files": [],
+        "rationale": "wiring: hierarchical stages of patch_embeddings + PoolFormerLayer blocks"
+      },
+      {
+        "name": "PoolFormerModel",
+        "line": 258,
+        "bases": [
+          "PoolFormerPreTrainedModel"
+        ],
+        "kb_nano_files": [],
+        "rationale": "wiring container"
+      },
+      {
+        "name": "PoolFormerFinalPooler",
+        "line": 307,
+        "bases": [
+          "nn.Module"
+        ],
+        "kb_nano_files": [],
+        "rationale": "wiring: Linear + Tanh (BERT-style pooler)"
+      },
+      {
+        "name": "PoolFormerForImageClassification",
+        "line": 322,
+        "bases": [
+          "PoolFormerPreTrainedModel"
+        ],
+        "kb_nano_files": [],
+        "rationale": "wiring head"
+      }
+    ],
+    "inheritance_summary": [],
+    "evidence_lines": [
+      "poolformer/modeling_poolformer.py:92 (Pooling - novel token mixer)",
+      "poolformer/modeling_poolformer.py:101 (Output uses Conv2d MLP)",
+      "poolformer/configuration_poolformer.py:hidden_act='gelu'"
+    ]
+  },
+  "pop2piano": {
+    "src_file": "modeling_pop2piano.py",
+    "classes": [
+      {
+        "name": "Pop2PianoLayerNorm",
+        "line": 41,
+        "bases": [
+          "nn.Module"
+        ],
+        "kb_nano_files": [
+          "tasks/baseline/L1/t5_layer_norm.py"
+        ],
+        "rationale": "T5-style RMSNorm (no centering); matches L1/t5_layer_norm.py"
+      },
+      {
+        "name": "Pop2PianoDenseActDense",
+        "line": 67,
+        "bases": [
+          "nn.Module"
+        ],
+        "kb_nano_files": [
+          "tasks/baseline/L2/t5_dense.py"
+        ],
+        "rationale": "non-gated FFN with config.dense_act_fn='relu' (default). T5DenseActDense in kb-nano L2/t5_dense.py supports relu via _get_act_fn"
+      },
+      {
+        "name": "Pop2PianoDenseGatedActDense",
+        "line": 90,
+        "bases": [
+          "nn.Module"
+        ],
+        "kb_nano_files": [
+          "tasks/baseline/L2/t5_dense.py"
+        ],
+        "rationale": "gated FFN: wi_0 + relu + wi_1 multiplied. T5DenseGatedActDense in kb-nano supports relu activation."
+      },
+      {
+        "name": "Pop2PianoLayerFF",
+        "line": 120,
+        "bases": [
+          "nn.Module"
+        ],
+        "kb_nano_files": [],
+        "rationale": "wiring: layer_norm + DenseActDense or DenseGatedActDense + dropout"
+      },
+      {
+        "name": "Pop2PianoAttention",
+        "line": 139,
+        "bases": [
+          "nn.Module"
+        ],
+        "kb_nano_files": [
+          "tasks/baseline/L2/t5_attention.py"
+        ],
+        "rationale": "T5-style attention with relative position bias (compute_bias). Used as both self- and cross-attn via key_value_states. Matches L2/t5_attention.py:T5SelfAttention pattern."
+      },
+      {
+        "name": "Pop2PianoLayerSelfAttention",
+        "line": 334,
+        "bases": [
+          "nn.Module"
+        ],
+        "kb_nano_files": [],
+        "rationale": "wiring: layer_norm + Pop2PianoAttention + dropout"
+      },
+      {
+        "name": "Pop2PianoLayerCrossAttention",
+        "line": 368,
+        "bases": [
+          "nn.Module"
+        ],
+        "kb_nano_files": [],
+        "rationale": "wiring: layer_norm + Pop2PianoAttention(cross) + dropout"
+      },
+      {
+        "name": "Pop2PianoBlock",
+        "line": 400,
+        "bases": [
+          "GradientCheckpointingLayer"
+        ],
+        "kb_nano_files": [],
+        "rationale": "wiring: stack of self-attn + (optional) cross-attn + ff"
+      },
+      {
+        "name": "Pop2PianoStack",
+        "line": 564,
+        "bases": [
+          "Pop2PianoPreTrainedModel"
+        ],
+        "kb_nano_files": [],
+        "rationale": "wiring: encoder or decoder stack"
+      },
+      {
+        "name": "Pop2PianoConcatEmbeddingToMel",
+        "line": 750,
+        "bases": [
+          "nn.Module"
+        ],
+        "kb_nano_files": [],
+        "rationale": "wiring: concat embedding to mel features"
+      },
+      {
+        "name": "Pop2PianoForConditionalGeneration",
+        "line": 769,
+        "bases": [
+          "Pop2PianoPreTrainedModel",
+          "GenerationMixin"
+        ],
+        "kb_nano_files": [],
+        "rationale": "wiring: encoder + decoder + lm_head"
+      }
+    ],
+    "inheritance_summary": [],
+    "evidence_lines": [
+      "pop2piano/modeling_pop2piano.py:41",
+      "pop2piano/modeling_pop2piano.py:67",
+      "pop2piano/modeling_pop2piano.py:139",
+      "pop2piano/configuration_pop2piano.py:dense_act_fn='relu'"
+    ]
+  },
+  "pp_doclayout_v2": {
+    "src_file": "modular_pp_doclayout_v2.py",
+    "classes": [
+      {
+        "name": "PPDocLayoutV2GlobalPointer",
+        "line": 376,
+        "bases": [
+          "PPDocLayoutV3GlobalPointer"
+        ],
+        "kb_nano_files": [],
+        "rationale": "wiring: relation extraction head (Linear + RoPE-style 2D bias)"
+      },
+      {
+        "name": "PPDocLayoutV2PositionRelationEmbedding",
+        "line": 382,
+        "bases": [
+          "nn.Module"
+        ],
+        "kb_nano_files": [],
+        "rationale": "wiring: 2D bbox-based relative position embedding"
+      },
+      {
+        "name": "PPDocLayoutV2ReadingOrderSelfAttention",
+        "line": 459,
+        "bases": [
+          "LayoutLMv3SelfAttention"
+        ],
+        "kb_nano_files": [
+          "tasks/baseline/L2/encoder_attention.py"
+        ],
+        "rationale": "BERT/LayoutLMv3-style encoder self-attention with separate q/k/v Linears (bias=True); maps to L2/encoder_attention.py:EncoderSelfAttention"
+      },
+      {
+        "name": "PPDocLayoutV2ReadingOrderSelfOutput",
+        "line": 514,
+        "bases": [
+          "LayoutLMv3SelfOutput"
+        ],
+        "kb_nano_files": [
+          "tasks/baseline/L2/encoder_attention.py"
+        ],
+        "rationale": "BERT-style SelfOutput (Linear + LayerNorm); maps to L2/encoder_attention.py:EncoderSelfOutput"
+      },
+      {
+        "name": "PPDocLayoutV2ReadingOrderIntermediate",
+        "line": 527,
+        "bases": [
+          "LayoutLMv3Intermediate"
+        ],
+        "kb_nano_files": [
+          "tasks/baseline/L2/encoder_mlp.py"
+        ],
+        "rationale": "BERT-style Intermediate (Linear + GELU); maps to L2/encoder_mlp.py:EncoderIntermediate"
+      },
+      {
+        "name": "PPDocLayoutV2ReadingOrderOutput",
+        "line": 531,
+        "bases": [
+          "LayoutLMv3Output"
+        ],
+        "kb_nano_files": [
+          "tasks/baseline/L2/encoder_mlp.py"
+        ],
+        "rationale": "BERT-style Output (Linear + LayerNorm); maps to L2/encoder_mlp.py:EncoderOutput"
+      },
+      {
+        "name": "PPDocLayoutV2ReadingOrderAttention",
+        "line": 544,
+        "bases": [
+          "LayoutLMv3Attention"
+        ],
+        "kb_nano_files": [],
+        "rationale": "wiring class around SelfAttention + SelfOutput (sibling pattern)"
+      },
+      {
+        "name": "PPDocLayoutV2ReadingOrderLayer",
+        "line": 551,
+        "bases": [
+          "LayoutLMv3Layer"
+        ],
+        "kb_nano_files": [],
+        "rationale": "wiring: attention + intermediate + output"
+      },
+      {
+        "name": "PPDocLayoutV2ReadingOrderEncoder",
+        "line": 559,
+        "bases": [
+          "LayoutLMv3Encoder"
+        ],
+        "kb_nano_files": [],
+        "rationale": "wiring: stacks reading order layers"
+      },
+      {
+        "name": "PPDocLayoutV2TextEmbeddings",
+        "line": 586,
+        "bases": [
+          "LayoutLMv3TextEmbeddings"
+        ],
+        "kb_nano_files": [
+          "tasks/baseline/L2/bert_embeddings.py"
+        ],
+        "rationale": "BERT-style word + position + token-type embedding sum + LayerNorm; closest is L2/bert_embeddings.py"
+      },
+      {
+        "name": "PPDocLayoutV2ReadingOrder",
+        "line": 660,
+        "bases": [
+          "PPDocLayoutV2PreTrainedModel"
+        ],
+        "kb_nano_files": [],
+        "rationale": "wiring: encoder + global pointer head"
+      },
+      {
+        "name": "PPDocLayoutV2MLPPredictionHead",
+        "line": 815,
+        "bases": [
+          "RTDetrMLPPredictionHead"
+        ],
+        "kb_nano_files": [
+          "tasks/baseline/L2/rtdetrv2_mlp_head.py"
+        ],
+        "rationale": "RTDetr MLP prediction head; matches kb-nano L2/rtdetrv2_mlp_head.py"
+      },
+      {
+        "name": "PPDocLayoutV2Model",
+        "line": 824,
+        "bases": [
+          "RTDetrModel"
+        ],
+        "kb_nano_files": [
+          "tasks/baseline/L3/rtdetrv2_model.py"
+        ],
+        "rationale": "wiring: inherits RTDetrModel; kb-nano L3/rtdetrv2_model.py covers structure"
+      },
+      {
+        "name": "PPDocLayoutV2ForObjectDetection",
+        "line": 836,
+        "bases": [
+          "RTDetrForObjectDetection"
+        ],
+        "kb_nano_files": [],
+        "rationale": "wiring: detection head + reading order"
+      },
+      {
+        "name": "PPDocLayoutV2MultiscaleDeformableAttention",
+        "line": 625,
+        "bases": [
+          "nn.Module"
+        ],
+        "kb_nano_files": [
+          "tasks/baseline/L2/rtdetrv2_deformable_attention.py"
+        ],
+        "rationale": "multi-scale deformable attention (RTDetr-style); modeling_pp_doclayout_v2.py:625; matches L2/rtdetrv2_deformable_attention.py"
+      },
+      {
+        "name": "PPDocLayoutV2MLP",
+        "line": 1084,
+        "bases": [
+          "nn.Module"
+        ],
+        "kb_nano_files": [],
+        "rationale": "wiring: standard 2-layer Linear MLP for decoder"
+      },
+      {
+        "name": "PPDocLayoutV2FrozenBatchNorm2d",
+        "line": 1103,
+        "bases": [
+          "nn.Module"
+        ],
+        "kb_nano_files": [
+          "tasks/baseline/L1/frozen_batch_norm2d.py"
+        ],
+        "rationale": "frozen BN; matches L1/frozen_batch_norm2d.py"
+      },
+      {
+        "name": "PPDocLayoutV2SelfAttention",
+        "line": 1170,
+        "bases": [
+          "nn.Module"
+        ],
+        "kb_nano_files": [
+          "tasks/baseline/L2/rtdetrv2_multihead_attention.py"
+        ],
+        "rationale": "RTDetr-style MHA used inside hybrid encoder/decoder; matches L2/rtdetrv2_multihead_attention.py"
+      },
+      {
+        "name": "PPDocLayoutV2ConvEncoder",
+        "line": 1260,
+        "bases": [
+          "nn.Module"
+        ],
+        "kb_nano_files": [
+          "tasks/baseline/L2/rtdetrv2_resnet.py"
+        ],
+        "rationale": "ResNet backbone for RTDetr; matches L2/rtdetrv2_resnet.py"
+      },
+      {
+        "name": "PPDocLayoutV2ConvNormLayer",
+        "line": 1292,
+        "bases": [
+          "nn.Module"
+        ],
+        "kb_nano_files": [
+          "tasks/baseline/L2/rtdetrv2_conv_norm.py"
+        ],
+        "rationale": "Conv+BN+act layer; matches L2/rtdetrv2_conv_norm.py"
+      },
+      {
+        "name": "PPDocLayoutV2EncoderLayer",
+        "line": 1313,
+        "bases": [
+          "nn.Module"
+        ],
+        "kb_nano_files": [
+          "tasks/baseline/L2/rtdetrv2_encoder_layer.py"
+        ],
+        "rationale": "hybrid encoder transformer layer; matches L2/rtdetrv2_encoder_layer.py"
+      },
+      {
+        "name": "PPDocLayoutV2RepVggBlock",
+        "line": 1384,
+        "bases": [
+          "nn.Module"
+        ],
+        "kb_nano_files": [
+          "tasks/baseline/L2/rtdetrv2_repvgg_block.py"
+        ],
+        "rationale": "RepVgg block; matches L2/rtdetrv2_repvgg_block.py"
+      },
+      {
+        "name": "PPDocLayoutV2CSPRepLayer",
+        "line": 1403,
+        "bases": [
+          "nn.Module"
+        ],
+        "kb_nano_files": [
+          "tasks/baseline/L2/rtdetrv2_csp_rep_layer.py"
+        ],
+        "rationale": "CSP RepVgg layer; matches L2/rtdetrv2_csp_rep_layer.py"
+      },
+      {
+        "name": "PPDocLayoutV2DecoderLayer",
+        "line": 1432,
+        "bases": [
+          "nn.Module"
+        ],
+        "kb_nano_files": [],
+        "rationale": "wiring: self-attn + cross-attn (deformable) + ff for RTDetr decoder"
+      },
+      {
+        "name": "PPDocLayoutV2SinePositionEmbedding",
+        "line": 1533,
+        "bases": [
+          "nn.Module"
+        ],
+        "kb_nano_files": [],
+        "rationale": "2D sine position embedding for image features"
+      },
+      {
+        "name": "PPDocLayoutV2AIFILayer",
+        "line": 1572,
+        "bases": [
+          "nn.Module"
+        ],
+        "kb_nano_files": [],
+        "rationale": "wiring: AIFI feature interaction layer"
+      },
+      {
+        "name": "PPDocLayoutV2HybridEncoder",
+        "line": 1629,
+        "bases": [
+          "PPDocLayoutV2PreTrainedModel"
+        ],
+        "kb_nano_files": [
+          "tasks/baseline/L3/rtdetrv2_hybrid_encoder.py"
+        ],
+        "rationale": "RTDetr hybrid encoder; matches kb-nano L3/rtdetrv2_hybrid_encoder.py"
+      },
+      {
+        "name": "PPDocLayoutV2Decoder",
+        "line": 1750,
+        "bases": [
+          "PPDocLayoutV2PreTrainedModel"
+        ],
+        "kb_nano_files": [
+          "tasks/baseline/L3/rtdetrv2_decoder.py"
+        ],
+        "rationale": "RTDetr decoder; matches kb-nano L3/rtdetrv2_decoder.py"
+      }
+    ],
+    "inheritance_summary": [
+      "PPDocLayoutV2*ReadingOrder*(LayoutLMv3-derived)",
+      "PPDocLayoutV2Model(RTDetrModel)",
+      "PPDocLayoutV2ForObjectDetection(RTDetrForObjectDetection)",
+      "PPDocLayoutV2MultiscaleDeformableAttention(RTDetrMultiscaleDeformableAttention)"
+    ],
+    "evidence_lines": [
+      "pp_doclayout_v2/modeling_pp_doclayout_v2.py:152 (ReadingOrderSelfAttention)",
+      "pp_doclayout_v2/modular_pp_doclayout_v2.py:459 (LayoutLMv3 inheritance)"
+    ]
+  },
+  "pp_doclayout_v3": {
+    "src_file": "modular_pp_doclayout_v3.py",
+    "classes": [
+      {
+        "name": "PPDocLayoutV3GlobalPointer",
+        "line": 498,
+        "bases": [
+          "nn.Module"
+        ],
+        "kb_nano_files": [],
+        "rationale": "wiring: relation prediction head"
+      },
+      {
+        "name": "PPDocLayoutV3MultiscaleDeformableAttention",
+        "line": 518,
+        "bases": [
+          "RTDetrMultiscaleDeformableAttention"
+        ],
+        "kb_nano_files": [
+          "tasks/baseline/L2/rtdetrv2_deformable_attention.py"
+        ],
+        "rationale": "multi-scale deformable attention; matches L2/rtdetrv2_deformable_attention.py"
+      },
+      {
+        "name": "PPDocLayoutV3MLPPredictionHead",
+        "line": 697,
+        "bases": [
+          "RTDetrMLPPredictionHead"
+        ],
+        "kb_nano_files": [
+          "tasks/baseline/L2/rtdetrv2_mlp_head.py"
+        ],
+        "rationale": "MLP prediction head; matches L2/rtdetrv2_mlp_head.py"
+      },
+      {
+        "name": "PPDocLayoutV3ConvLayer",
+        "line": 701,
+        "bases": [
+          "ResNetConvLayer"
+        ],
+        "kb_nano_files": [
+          "tasks/baseline/L2/rtdetrv2_conv_norm.py"
+        ],
+        "rationale": "Conv+BN+act; matches L2/rtdetrv2_conv_norm.py"
+      },
+      {
+        "name": "PPDocLayoutV3ScaleHead",
+        "line": 705,
+        "bases": [
+          "nn.Module"
+        ],
+        "kb_nano_files": [],
+        "rationale": "wiring: per-scale conv head"
+      },
+      {
+        "name": "PPDocLayoutV3MaskFeatFPN",
+        "line": 722,
+        "bases": [
+          "nn.Module"
+        ],
+        "kb_nano_files": [],
+        "rationale": "wiring: FPN-style mask feature aggregation"
+      },
+      {
+        "name": "PPDocLayoutV3EncoderMaskOutput",
+        "line": 773,
+        "bases": [
+          "nn.Module"
+        ],
+        "kb_nano_files": [],
+        "rationale": "wiring head"
+      },
+      {
+        "name": "PPDocLayoutV3HybridEncoder",
+        "line": 785,
+        "bases": [
+          "RTDetrHybridEncoder"
+        ],
+        "kb_nano_files": [
+          "tasks/baseline/L3/rtdetrv2_hybrid_encoder.py"
+        ],
+        "rationale": "RTDetr hybrid encoder; matches L3/rtdetrv2_hybrid_encoder.py"
+      },
+      {
+        "name": "PPDocLayoutV3Decoder",
+        "line": 863,
+        "bases": [
+          "RTDetrDecoder"
+        ],
+        "kb_nano_files": [
+          "tasks/baseline/L3/rtdetrv2_decoder.py"
+        ],
+        "rationale": "RTDetr decoder; matches L3/rtdetrv2_decoder.py"
+      },
+      {
+        "name": "PPDocLayoutV3Model",
+        "line": 992,
+        "bases": [
+          "RTDetrModel"
+        ],
+        "kb_nano_files": [
+          "tasks/baseline/L3/rtdetrv2_model.py"
+        ],
+        "rationale": "RTDetr top-level model; matches L3/rtdetrv2_model.py"
+      },
+      {
+        "name": "PPDocLayoutV3ForObjectDetection",
+        "line": 1316,
+        "bases": [
+          "RTDetrForObjectDetection",
+          "PPDocLayoutV3PreTrainedModel"
+        ],
+        "kb_nano_files": [],
+        "rationale": "wiring: detection head"
+      },
+      {
+        "name": "PPDocLayoutV3MLP",
+        "line": 518,
+        "bases": [
+          "nn.Module"
+        ],
+        "kb_nano_files": [],
+        "rationale": "wiring: MLP for decoder (modeling_pp_doclayout_v3.py:518)"
+      },
+      {
+        "name": "PPDocLayoutV3SelfAttention",
+        "line": 565,
+        "bases": [
+          "nn.Module"
+        ],
+        "kb_nano_files": [
+          "tasks/baseline/L2/rtdetrv2_multihead_attention.py"
+        ],
+        "rationale": "RTDetr MHA; matches L2/rtdetrv2_multihead_attention.py (modeling_pp_doclayout_v3.py:565)"
+      },
+      {
+        "name": "PPDocLayoutV3EncoderLayer",
+        "line": 652,
+        "bases": [
+          "nn.Module"
+        ],
+        "kb_nano_files": [
+          "tasks/baseline/L2/rtdetrv2_encoder_layer.py"
+        ],
+        "rationale": "hybrid encoder transformer layer (modeling_pp_doclayout_v3.py:652)"
+      },
+      {
+        "name": "PPDocLayoutV3RepVggBlock",
+        "line": 723,
+        "bases": [
+          "nn.Module"
+        ],
+        "kb_nano_files": [
+          "tasks/baseline/L2/rtdetrv2_repvgg_block.py"
+        ],
+        "rationale": "RepVgg block (modeling_pp_doclayout_v3.py:723)"
+      },
+      {
+        "name": "PPDocLayoutV3CSPRepLayer",
+        "line": 742,
+        "bases": [
+          "nn.Module"
+        ],
+        "kb_nano_files": [
+          "tasks/baseline/L2/rtdetrv2_csp_rep_layer.py"
+        ],
+        "rationale": "CSP RepVgg layer (modeling_pp_doclayout_v3.py:742)"
+      },
+      {
+        "name": "PPDocLayoutV3DecoderLayer",
+        "line": 1000,
+        "bases": [
+          "nn.Module"
+        ],
+        "kb_nano_files": [],
+        "rationale": "wiring: self-attn + deformable cross-attn + ff (modeling_pp_doclayout_v3.py:1000)"
+      },
+      {
+        "name": "PPDocLayoutV3FrozenBatchNorm2d",
+        "line": 1251,
+        "bases": [
+          "nn.Module"
+        ],
+        "kb_nano_files": [
+          "tasks/baseline/L1/frozen_batch_norm2d.py"
+        ],
+        "rationale": "frozen BN"
+      },
+      {
+        "name": "PPDocLayoutV3ConvEncoder",
+        "line": 1314,
+        "bases": [
+          "nn.Module"
+        ],
+        "kb_nano_files": [
+          "tasks/baseline/L2/rtdetrv2_resnet.py"
+        ],
+        "rationale": "ResNet backbone"
+      },
+      {
+        "name": "PPDocLayoutV3SinePositionEmbedding",
+        "line": 771,
+        "bases": [
+          "nn.Module"
+        ],
+        "kb_nano_files": [],
+        "rationale": "2D sine position embedding (modeling_pp_doclayout_v3.py:771)"
+      },
+      {
+        "name": "PPDocLayoutV3AIFILayer",
+        "line": 810,
+        "bases": [
+          "nn.Module"
+        ],
+        "kb_nano_files": [],
+        "rationale": "AIFI feature interaction (modeling_pp_doclayout_v3.py:810)"
+      }
+    ],
+    "inheritance_summary": [
+      "PPDocLayoutV3MultiscaleDeformableAttention(RTDetrMultiscaleDeformableAttention)",
+      "PPDocLayoutV3HybridEncoder(RTDetrHybridEncoder)",
+      "PPDocLayoutV3Decoder(RTDetrDecoder)",
+      "PPDocLayoutV3Model(RTDetrModel)"
+    ],
+    "evidence_lines": [
+      "pp_doclayout_v3/modular_pp_doclayout_v3.py:518",
+      "pp_doclayout_v3/modeling_pp_doclayout_v3.py:127 (deformable attn)"
+    ]
+  },
+  "pp_formulanet": {
+    "src_file": "modular_pp_formulanet.py",
+    "classes": [
+      {
+        "name": "PPFormulaNetVisionAttention",
+        "line": 296,
+        "bases": [
+          "SLANeXtVisionAttention"
+        ],
+        "kb_nano_files": [],
+        "rationale": "windowed MHA with decomposed relative position embeddings (MViTv2-style); fused QKV Linear + softmax SDPA + optional rel_pos. Composes from L1/{linear, softmax, sdpa, interpolate}; no exact L2 match."
+      },
+      {
+        "name": "PPFormulaNetMultiModalProjector",
+        "line": 300,
+        "bases": [
+          "nn.Module"
+        ],
+        "kb_nano_files": [],
+        "rationale": "wiring: 2 Conv2d + 2 Linear (vision-to-text projection)"
+      },
+      {
+        "name": "PPFormulaNetMLPBlock",
+        "line": 252,
+        "bases": [
+          "nn.Module"
+        ],
+        "kb_nano_files": [],
+        "rationale": "config.hidden_act='gelu' (default vision_config): lin1 + GELU + lin2; matches encoder_mlp.py pattern but without LayerNorm wrapper. Composes from L1/{linear, gelu}. Caveat: pp_formulanet config does not show explicit hidden_act value; structure is fc1+act+fc2."
+      },
+      {
+        "name": "PPFormulaNetVisionLayer",
+        "line": 266,
+        "bases": [
+          "GradientCheckpointingLayer"
+        ],
+        "kb_nano_files": [],
+        "rationale": "wiring: ln1 + (windowed) attn + ln2 + mlp + window partition/unpartition"
+      },
+      {
+        "name": "PPFormulaNetPatchEmbeddings",
+        "line": 350,
+        "bases": [
+          "nn.Module"
+        ],
+        "kb_nano_files": [
+          "tasks/baseline/L1/conv2d.py"
+        ],
+        "rationale": "patch embedding via Conv2d"
+      },
+      {
+        "name": "PPFormulaNetLayerNorm",
+        "line": 385,
+        "bases": [
+          "nn.LayerNorm"
+        ],
+        "kb_nano_files": [
+          "tasks/baseline/L1/layer_norm.py"
+        ],
+        "rationale": "standard LayerNorm subclass"
+      },
+      {
+        "name": "PPFormulaNetVisionNeck",
+        "line": 411,
+        "bases": [
+          "nn.Module"
+        ],
+        "kb_nano_files": [],
+        "rationale": "wiring: post-encoder feature neck (Linear/Conv adapter)"
+      },
+      {
+        "name": "PPFormulaNetVisionEncoder",
+        "line": 326,
+        "bases": [
+          "SLANeXtVisionEncoder"
+        ],
+        "kb_nano_files": [],
+        "rationale": "wiring: stacks vision layers"
+      },
+      {
+        "name": "PPFormulaNetVisionModel",
+        "line": 326,
+        "bases": [
+          "nn.Module"
+        ],
+        "kb_nano_files": [],
+        "rationale": "wiring: patch_embed + encoder + neck"
+      },
+      {
+        "name": "PPFormulaNetTextModel",
+        "line": 354,
+        "bases": [
+          "MBartDecoder"
+        ],
+        "kb_nano_files": [],
+        "rationale": "wiring: MBart-style decoder"
+      },
+      {
+        "name": "PPFormulaNetAttention",
+        "line": 560,
+        "bases": [
+          "nn.Module"
+        ],
+        "kb_nano_files": [],
+        "rationale": "MBart-style multi-purpose attention (encoder/decoder/cross); modeling_pp_formulanet.py:560; same pattern as PegasusAttention. No exact kb-nano L2."
+      },
+      {
+        "name": "PPFormulaNetDecoderLayer",
+        "line": 677,
+        "bases": [
+          "GradientCheckpointingLayer"
+        ],
+        "kb_nano_files": [],
+        "rationale": "wiring: MBart decoder layer (modeling_pp_formulanet.py:677)"
+      },
+      {
+        "name": "PPFormulaNetLearnedPositionalEmbedding",
+        "line": 492,
+        "bases": [
+          "nn.Embedding"
+        ],
+        "kb_nano_files": [
+          "tasks/baseline/L1/embedding.py"
+        ],
+        "rationale": "BART-style learned positional embedding"
+      },
+      {
+        "name": "PPFormulaNetScaledWordEmbedding",
+        "line": 519,
+        "bases": [
+          "nn.Embedding"
+        ],
+        "kb_nano_files": [
+          "tasks/baseline/L1/embedding.py"
+        ],
+        "rationale": "scaled word embedding"
+      },
+      {
+        "name": "PPFormulaNetModel",
+        "line": 358,
+        "bases": [
+          "PPFormulaNetPreTrainedModel"
+        ],
+        "kb_nano_files": [],
+        "rationale": "wiring: vision_encoder + text_decoder + projector"
+      },
+      {
+        "name": "PPFormulaNetForConditionalGeneration",
+        "line": 427,
+        "bases": [
+          "Florence2ForConditionalGeneration"
+        ],
+        "kb_nano_files": [],
+        "rationale": "wiring head; inherits Florence2"
+      }
+    ],
+    "inheritance_summary": [
+      "PPFormulaNetVisionAttention(SLANeXtVisionAttention)",
+      "PPFormulaNetVisionEncoder(SLANeXtVisionEncoder)",
+      "PPFormulaNetTextModel(MBartDecoder)",
+      "PPFormulaNetForConditionalGeneration(Florence2ForConditionalGeneration)"
+    ],
+    "evidence_lines": [
+      "pp_formulanet/modeling_pp_formulanet.py:93 (windowed VisionAttention with rel_pos)",
+      "pp_formulanet/modeling_pp_formulanet.py:560 (MBart text attention)",
+      "pp_formulanet/configuration_pp_formulanet.py:hidden_act='gelu', activation_function='gelu'"
+    ]
+  },
+  "pp_lcnet": {
+    "src_file": "modular_pp_lcnet.py",
+    "classes": [
+      {
+        "name": "PPLCNetConvLayer",
+        "line": 225,
+        "bases": [
+          "ResNetConvLayer"
+        ],
+        "kb_nano_files": [],
+        "rationale": "config.hidden_act='hardswish': Conv2d + BN + Hardswish; closest L1 ops are L1/{conv2d, batch_norm2d, hardswish}; no exact L2 file (rtdetrv2_conv_norm.py uses different activation set)"
+      },
+      {
+        "name": "PPLCNetDepthwiseSeparableConvLayer",
+        "line": 247,
+        "bases": [
+          "GradientCheckpointingLayer"
+        ],
+        "kb_nano_files": [],
+        "rationale": "wiring: depthwise conv + (optional SE) + pointwise conv"
+      },
+      {
+        "name": "PPLCNetSqueezeExcitationModule",
+        "line": 291,
+        "bases": [
+          "nn.Module"
+        ],
+        "kb_nano_files": [],
+        "rationale": "wiring: AdaptiveAvgPool2d + Conv1x1 + ReLU + Conv1x1 + Hardsigmoid; SE-style. Composes from L1/{adaptive_avg_pool2d, conv2d, relu, hardsigmoid}; closest is L2/efficientnetv2_squeeze_excite.py (similar SE pattern)"
+      },
+      {
+        "name": "PPLCNetBlock",
+        "line": 328,
+        "bases": [
+          "nn.Module"
+        ],
+        "kb_nano_files": [],
+        "rationale": "wiring: stacks depthwise-separable blocks per stage"
+      },
+      {
+        "name": "PPLCNetEncoder",
+        "line": 375,
+        "bases": [
+          "PPLCNetPreTrainedModel"
+        ],
+        "kb_nano_files": [],
+        "rationale": "wiring: stem conv + stages of PPLCNetBlock"
+      },
+      {
+        "name": "PPLCNetBackbone",
+        "line": 411,
+        "bases": [
+          "BackboneMixin",
+          "PPLCNetPreTrainedModel"
+        ],
+        "kb_nano_files": [],
+        "rationale": "wiring: backbone interface returning multi-scale feature maps"
+      },
+      {
+        "name": "PPLCNetForImageClassification",
+        "line": 465,
+        "bases": [
+          "PPLCNetPreTrainedModel"
+        ],
+        "kb_nano_files": [],
+        "rationale": "wiring: encoder + final conv + adaptive avg pool + Linear head"
+      }
+    ],
+    "inheritance_summary": [
+      "PPLCNetConvLayer(ResNetConvLayer)"
+    ],
+    "evidence_lines": [
+      "pp_lcnet/modeling_pp_lcnet.py:38 (ConvLayer)",
+      "pp_lcnet/configuration_pp_lcnet.py:hidden_act='hardswish'"
+    ]
+  },
+  "pp_lcnet_v3": {
+    "src_file": "modular_pp_lcnet_v3.py",
+    "classes": [
+      {
+        "name": "PPLCNetV3ConvLayer",
+        "line": 104,
+        "bases": [
+          "PPLCNetConvLayer"
+        ],
+        "kb_nano_files": [],
+        "rationale": "config.hidden_act='hardswish'; ConvLayer + LearnableAffineBlock-wrapped activation"
+      },
+      {
+        "name": "PPLCNetV3LearnableAffineBlock",
+        "line": 108,
+        "bases": [
+          "HGNetV2LearnableAffineBlock"
+        ],
+        "kb_nano_files": [],
+        "rationale": "learnable affine (gamma * x + beta); novel; composes elementwise"
+      },
+      {
+        "name": "PPLCNetV3ActLearnableAffineBlock",
+        "line": 112,
+        "bases": [
+          "nn.Module"
+        ],
+        "kb_nano_files": [],
+        "rationale": "wiring: activation + learnable affine"
+      },
+      {
+        "name": "PPLCNetV3LearnableRepLayer",
+        "line": 126,
+        "bases": [
+          "nn.Module"
+        ],
+        "kb_nano_files": [],
+        "rationale": "wiring: re-parameterizable conv block (RepConv) with learnable affine"
+      },
+      {
+        "name": "PPLCNetV3DepthwiseSeparableConvLayer",
+        "line": 199,
+        "bases": [
+          "PPLCNetDepthwiseSeparableConvLayer"
+        ],
+        "kb_nano_files": [],
+        "rationale": "wiring: depthwise separable conv with v3 RepLayer"
+      },
+      {
+        "name": "PPLCNetV3Backbone",
+        "line": 244,
+        "bases": [
+          "PPLCNetBackbone"
+        ],
+        "kb_nano_files": [],
+        "rationale": "wiring: v3 backbone"
+      },
+      {
+        "name": "PPLCNetV3Encoder",
+        "line": 248,
+        "bases": [
+          "PPLCNetEncoder"
+        ],
+        "kb_nano_files": [],
+        "rationale": "wiring: v3 encoder"
+      },
+      {
+        "name": "PPLCNetV3SqueezeExcitationModule",
+        "line": 166,
+        "bases": [
+          "nn.Module"
+        ],
+        "kb_nano_files": [],
+        "rationale": "wiring: SE module variant (modeling_pp_lcnet_v3.py:166); same pattern as v1 SE"
+      }
+    ],
+    "inheritance_summary": [
+      "PPLCNetV3ConvLayer(PPLCNetConvLayer)",
+      "PPLCNetV3LearnableAffineBlock(HGNetV2LearnableAffineBlock)",
+      "PPLCNetV3DepthwiseSeparableConvLayer(PPLCNetDepthwiseSeparableConvLayer)",
+      "PPLCNetV3Backbone(PPLCNetBackbone)",
+      "PPLCNetV3Encoder(PPLCNetEncoder)"
+    ],
+    "evidence_lines": [
+      "pp_lcnet_v3/modular_pp_lcnet_v3.py:108",
+      "pp_lcnet_v3/configuration_pp_lcnet_v3.py:hidden_act='hardswish'"
+    ]
+  },
+  "pp_ocrv5_mobile_det": {
+    "src_file": "modular_pp_ocrv5_mobile_det.py",
+    "classes": [
+      {
+        "name": "PPOCRV5MobileDetSqueezeExcitationModule",
+        "line": 95,
+        "bases": [
+          "nn.Module"
+        ],
+        "kb_nano_files": [],
+        "rationale": "wiring: SE module (similar to PPLCNet's); composes from L1/{adaptive_avg_pool2d, conv2d, relu, hardsigmoid}"
+      },
+      {
+        "name": "PPOCRV5MobileDetResidualSqueezeExcitationLayer",
+        "line": 129,
+        "bases": [
+          "nn.Module"
+        ],
+        "kb_nano_files": [],
+        "rationale": "wiring: residual block + SE"
+      },
+      {
+        "name": "PPOCRV5MobileDetNeck",
+        "line": 153,
+        "bases": [
+          "nn.Module"
+        ],
+        "kb_nano_files": [],
+        "rationale": "wiring: FPN-style neck for detection (DBNet)"
+      },
+      {
+        "name": "PPOCRV5MobileDetHead",
+        "line": 207,
+        "bases": [
+          "PPOCRV5ServerDetSegmentationHead"
+        ],
+        "kb_nano_files": [],
+        "rationale": "wiring: DBNet segmentation head"
+      },
+      {
+        "name": "PPOCRV5MobileDetModel",
+        "line": 223,
+        "bases": [
+          "PPOCRV5MobileDetPreTrainedModel"
+        ],
+        "kb_nano_files": [],
+        "rationale": "wiring: backbone + neck"
+      },
+      {
+        "name": "PPOCRV5MobileDetForObjectDetection",
+        "line": 261,
+        "bases": [
+          "PPOCRV5ServerDetForObjectDetection"
+        ],
+        "kb_nano_files": [],
+        "rationale": "wiring: model + DB head"
+      }
+    ],
+    "inheritance_summary": [
+      "PPOCRV5MobileDetHead(PPOCRV5ServerDetSegmentationHead)",
+      "PPOCRV5MobileDetForObjectDetection(PPOCRV5ServerDetForObjectDetection)"
+    ],
+    "evidence_lines": [
+      "pp_ocrv5_mobile_det/modeling_pp_ocrv5_mobile_det.py:51 (SE)",
+      "pp_ocrv5_mobile_det/configuration_pp_ocrv5_mobile_det.py:hidden_act not explicitly listed (relu by default)"
+    ]
+  },
+  "pp_ocrv5_mobile_rec": {
+    "src_file": "modular_pp_ocrv5_mobile_rec.py",
+    "classes": [
+      {
+        "name": "PPOCRV5MobileRecEncoderWithSVTR",
+        "line": 55,
+        "bases": [
+          "PPOCRV5ServerRecEncoderWithSVTR"
+        ],
+        "kb_nano_files": [],
+        "rationale": "wiring: SVTR encoder (conv_block + svtr transformer blocks)"
+      },
+      {
+        "name": "PPOCRV5MobileRecModel",
+        "line": 68,
+        "bases": [
+          "PPOCRV5ServerRecModel"
+        ],
+        "kb_nano_files": [],
+        "rationale": "wiring: backbone + encoder + head"
+      },
+      {
+        "name": "PPOCRV5MobileRecForTextRecognition",
+        "line": 73,
+        "bases": [
+          "PPOCRV5ServerRecForTextRecognition"
+        ],
+        "kb_nano_files": [],
+        "rationale": "wiring: model + recognition head"
+      },
+      {
+        "name": "PPOCRV5MobileRecAttention",
+        "line": 42,
+        "bases": [
+          "nn.Module"
+        ],
+        "kb_nano_files": [],
+        "rationale": "BLIP-style fused QKV MHA (modeling_pp_ocrv5_mobile_rec.py:42); same as ServerRecAttention"
+      },
+      {
+        "name": "PPOCRV5MobileRecMLP",
+        "line": 117,
+        "bases": [
+          "nn.Module"
+        ],
+        "kb_nano_files": [],
+        "rationale": "config.hidden_act='silu' (mobile rec): fc1 + SiLU + fc2 (NOT SwiGLU). Plain 2-layer FFN with SiLU. Composes from L1/{linear, silu}. NOT a llama_mlp match. (modeling_pp_ocrv5_mobile_rec.py:117)"
+      },
+      {
+        "name": "PPOCRV5MobileRecBlock",
+        "line": 136,
+        "bases": [
+          "GradientCheckpointingLayer"
+        ],
+        "kb_nano_files": [],
+        "rationale": "wiring: ln1 + attn + ln2 + mlp"
+      },
+      {
+        "name": "PPOCRV5MobileRecConvLayer",
+        "line": 197,
+        "bases": [
+          "nn.Module"
+        ],
+        "kb_nano_files": [],
+        "rationale": "Conv2d + BN + activation"
+      },
+      {
+        "name": "PPOCRV5MobileRecHead",
+        "line": 348,
+        "bases": [
+          "nn.Module"
+        ],
+        "kb_nano_files": [],
+        "rationale": "wiring: encoder + Linear classifier (CTC head)"
+      }
+    ],
+    "inheritance_summary": [
+      "PPOCRV5MobileRecEncoderWithSVTR(PPOCRV5ServerRecEncoderWithSVTR)",
+      "PPOCRV5MobileRecModel(PPOCRV5ServerRecModel)",
+      "PPOCRV5MobileRecForTextRecognition(PPOCRV5ServerRecForTextRecognition)"
+    ],
+    "evidence_lines": [
+      "pp_ocrv5_mobile_rec/modeling_pp_ocrv5_mobile_rec.py:117 (silu plain MLP)",
+      "pp_ocrv5_mobile_rec/configuration_pp_ocrv5_mobile_rec.py:hidden_act='silu'"
+    ]
+  },
+  "pp_ocrv5_server_det": {
+    "src_file": "modular_pp_ocrv5_server_det.py",
+    "classes": [
+      {
+        "name": "PPOCRV5ServerDetIntraclassBlock",
+        "line": 489,
+        "bases": [
+          "nn.Module"
+        ],
+        "kb_nano_files": [],
+        "rationale": "wiring: feature aggregation block (modeling_pp_ocrv5_server_det.py:34)"
+      },
+      {
+        "name": "PPOCRV5ServerDetNeck",
+        "line": 572,
+        "bases": [
+          "nn.Module"
+        ],
+        "kb_nano_files": [],
+        "rationale": "wiring: DBNet FPN neck"
+      },
+      {
+        "name": "PPOCRV5ServerDetConvBatchnormLayer",
+        "line": 688,
+        "bases": [
+          "nn.Module"
+        ],
+        "kb_nano_files": [],
+        "rationale": "Conv2d + BN + activation; composes from L1/{conv2d, batch_norm2d}"
+      },
+      {
+        "name": "PPOCRV5ServerDetSegmentationHead",
+        "line": 734,
+        "bases": [
+          "nn.Module"
+        ],
+        "kb_nano_files": [],
+        "rationale": "DBNet segmentation head (probability + threshold map)"
+      },
+      {
+        "name": "PPOCRV5ServerDetLocalModule",
+        "line": 778,
+        "bases": [
+          "nn.Module"
+        ],
+        "kb_nano_files": [],
+        "rationale": "wiring: local refinement block"
+      },
+      {
+        "name": "PPOCRV5ServerDetHead",
+        "line": 810,
+        "bases": [
+          "nn.Module"
+        ],
+        "kb_nano_files": [],
+        "rationale": "wiring: detection head"
+      },
+      {
+        "name": "PPOCRV5ServerDetModel",
+        "line": 849,
+        "bases": [
+          "PPOCRV5ServerDetPreTrainedModel"
+        ],
+        "kb_nano_files": [],
+        "rationale": "wiring: backbone + neck"
+      },
+      {
+        "name": "PPOCRV5ServerDetForObjectDetection",
+        "line": 879,
+        "bases": [
+          "PPOCRV5ServerDetPreTrainedModel"
+        ],
+        "kb_nano_files": [],
+        "rationale": "wiring: model + det head"
+      }
+    ],
+    "inheritance_summary": [],
+    "evidence_lines": [
+      "pp_ocrv5_server_det/modeling_pp_ocrv5_server_det.py:233 (ConvBatchnormLayer)",
+      "pp_ocrv5_server_det/configuration_pp_ocrv5_server_det.py:hidden_act='relu'"
+    ]
+  },
+  "pp_ocrv5_server_rec": {
+    "src_file": "modular_pp_ocrv5_server_rec.py",
+    "classes": [
+      {
+        "name": "PPOCRV5ServerRecBlock",
+        "line": 257,
+        "bases": [
+          "CLIPEncoderLayer"
+        ],
+        "kb_nano_files": [],
+        "rationale": "wiring: ln1 + attn + ln2 + mlp (pre-norm); inherits CLIPEncoderLayer"
+      },
+      {
+        "name": "PPOCRV5ServerRecAttention",
+        "line": 275,
+        "bases": [
+          "Blip2Attention"
+        ],
+        "kb_nano_files": [],
+        "rationale": "BLIP2-style fused QKV MHA (single Linear of 3*embed_dim, no bias on QKV but optional q_bias+v_bias parameters concatenated); modeling_pp_ocrv5_server_rec.py:102. Non-causal vision attention. Closest is L2/clip_attention.py (separate q/k/v) but here QKV is fused; composes from L1/{linear, sdpa, softmax}; no exact L2 match."
+      },
+      {
+        "name": "PPOCRV5ServerRecConvLayer",
+        "line": 285,
+        "bases": [
+          "ResNetConvLayer"
+        ],
+        "kb_nano_files": [],
+        "rationale": "Conv2d + BN + SiLU (default activation='silu'); composes from L1/{conv2d, batch_norm2d, silu}"
+      },
+      {
+        "name": "PPOCRV5ServerRecHead",
+        "line": 317,
+        "bases": [
+          "nn.Module"
+        ],
+        "kb_nano_files": [],
+        "rationale": "wiring: encoder + Linear + softmax (CTC head)"
+      },
+      {
+        "name": "PPOCRV5ServerRecMLP",
+        "line": 332,
+        "bases": [
+          "FocalNetMlp"
+        ],
+        "kb_nano_files": [],
+        "rationale": "config.hidden_act='gelu': fc1 + GELU + fc2 (FocalNet style, plain 2-layer FFN); maps to L2/encoder_mlp.py-like pattern but without LayerNorm. Composes from L1/{linear, gelu, dropout}."
+      },
+      {
+        "name": "PPOCRV5ServerRecEncoderWithSVTR",
+        "line": 336,
+        "bases": [
+          "PPOCRV5ServerRecPreTrainedModel"
+        ],
+        "kb_nano_files": [],
+        "rationale": "wiring: conv_block stack + svtr transformer blocks + final norm (modeling_pp_ocrv5_server_rec.py:259)"
+      },
+      {
+        "name": "PPOCRV5ServerRecModel",
+        "line": 398,
+        "bases": [
+          "PPOCRV5ServerRecPreTrainedModel"
+        ],
+        "kb_nano_files": [],
+        "rationale": "wiring: backbone + encoder + head"
+      },
+      {
+        "name": "PPOCRV5ServerRecForTextRecognition",
+        "line": 435,
+        "bases": [
+          "PPOCRV5ServerRecPreTrainedModel"
+        ],
+        "kb_nano_files": [],
+        "rationale": "wiring: model + classification head"
+      }
+    ],
+    "inheritance_summary": [
+      "PPOCRV5ServerRecBlock(CLIPEncoderLayer)",
+      "PPOCRV5ServerRecAttention(Blip2Attention)",
+      "PPOCRV5ServerRecConvLayer(ResNetConvLayer)",
+      "PPOCRV5ServerRecMLP(FocalNetMlp)"
+    ],
+    "evidence_lines": [
+      "pp_ocrv5_server_rec/modeling_pp_ocrv5_server_rec.py:102 (Attention fused QKV)",
+      "pp_ocrv5_server_rec/modeling_pp_ocrv5_server_rec.py:240 (MLP gelu plain)",
+      "pp_ocrv5_server_rec/configuration_pp_ocrv5_server_rec.py:hidden_act='gelu'"
+    ]
+  },
+  "prompt_depth_anything": {
+    "src_file": "modular_prompt_depth_anything.py",
+    "classes": [
+      {
+        "name": "PromptDepthAnythingLayer",
+        "line": 38,
+        "bases": [
+          "nn.Module"
+        ],
+        "kb_nano_files": [],
+        "rationale": "wiring: 3 Conv2d 3x3 + 2 ReLU; composes from L1/{conv2d, relu}"
+      },
+      {
+        "name": "PromptDepthAnythingPreActResidualLayer",
+        "line": 74,
+        "bases": [
+          "nn.Module"
+        ],
+        "kb_nano_files": [],
+        "rationale": "wiring: pre-act residual block (ReLU + Conv + ReLU + Conv + residual) (modeling_prompt_depth_anything.py:74)"
+      },
+      {
+        "name": "PromptDepthAnythingFeatureFusionLayer",
+        "line": 79,
+        "bases": [
+          "DepthAnythingFeatureFusionLayer"
+        ],
+        "kb_nano_files": [],
+        "rationale": "wiring: feature fusion across DPT layers"
+      },
+      {
+        "name": "PromptDepthAnythingFeatureFusionStage",
+        "line": 114,
+        "bases": [
+          "DepthAnythingFeatureFusionStage"
+        ],
+        "kb_nano_files": [],
+        "rationale": "wiring: stages of fusion layers"
+      },
+      {
+        "name": "PromptDepthAnythingDepthEstimationHead",
+        "line": 136,
+        "bases": [
+          "DepthAnythingDepthEstimationHead"
+        ],
+        "kb_nano_files": [],
+        "rationale": "wiring: 3 Conv2d + ReLU/Sigmoid for depth estimation"
+      },
+      {
+        "name": "PromptDepthAnythingReassembleLayer",
+        "line": 169,
+        "bases": [
+          "nn.Module"
+        ],
+        "kb_nano_files": [],
+        "rationale": "wiring: DPT reassemble layer (Linear projection + reshape + Conv2d resize)"
+      },
+      {
+        "name": "PromptDepthAnythingReassembleStage",
+        "line": 191,
+        "bases": [
+          "DepthAnythingReassembleStage"
+        ],
+        "kb_nano_files": [],
+        "rationale": "wiring: stages of reassemble layers"
+      },
+      {
+        "name": "PromptDepthAnythingNeck",
+        "line": 195,
+        "bases": [
+          "DepthAnythingNeck"
+        ],
+        "kb_nano_files": [],
+        "rationale": "wiring: DPT neck (reassemble + conv blocks)"
+      },
+      {
+        "name": "PromptDepthAnythingForDepthEstimation",
+        "line": 230,
+        "bases": [
+          "DepthAnythingForDepthEstimation"
+        ],
+        "kb_nano_files": [],
+        "rationale": "wiring: backbone + neck + head"
+      }
+    ],
+    "inheritance_summary": [
+      "PromptDepthAnythingFeatureFusionLayer(DepthAnythingFeatureFusionLayer)",
+      "PromptDepthAnythingFeatureFusionStage(DepthAnythingFeatureFusionStage)",
+      "PromptDepthAnythingDepthEstimationHead(DepthAnythingDepthEstimationHead)",
+      "PromptDepthAnythingReassembleStage(DepthAnythingReassembleStage)",
+      "PromptDepthAnythingNeck(DepthAnythingNeck)",
+      "PromptDepthAnythingForDepthEstimation(DepthAnythingForDepthEstimation)"
+    ],
+    "evidence_lines": [
+      "prompt_depth_anything/modeling_prompt_depth_anything.py:33",
+      "prompt_depth_anything/modeling_prompt_depth_anything.py:74"
+    ]
+  },
+  "prophetnet": {
+    "src_file": "modeling_prophetnet.py",
+    "classes": [
+      {
+        "name": "ProphetNetPositionalEmbeddings",
+        "line": 337,
+        "bases": [
+          "nn.Embedding"
+        ],
+        "kb_nano_files": [
+          "tasks/baseline/L1/embedding.py"
+        ],
+        "rationale": "BART-style learned positional embedding"
+      },
+      {
+        "name": "ProphetNetAttention",
+        "line": 380,
+        "bases": [
+          "nn.Module"
+        ],
+        "kb_nano_files": [],
+        "rationale": "BART-family multi-purpose MHA (encoder self / decoder self / cross-attn) with separate q/k/v Linears (with bias). Same pattern as PegasusAttention. No exact kb-nano L2 match."
+      },
+      {
+        "name": "ProphetNetFeedForward",
+        "line": 498,
+        "bases": [
+          "nn.Module"
+        ],
+        "kb_nano_files": [
+          "tasks/baseline/L2/encoder_mlp.py"
+        ],
+        "rationale": "config.activation_function='gelu': intermediate (Linear) + GELU + dropout + output (Linear) + dropout. Plain 2-layer FFN with GELU; matches L2/encoder_mlp.py structure (without final LayerNorm; ProphetNet applies LayerNorm in the layer)."
+      },
+      {
+        "name": "ProphetNetNgramSelfAttention",
+        "line": 521,
+        "bases": [
+          "nn.Module"
+        ],
+        "kb_nano_files": [],
+        "rationale": "ProphetNet-specific n-gram self-attention with main + n-gram heads and absolute relative position bias. Novel; no kb-nano equivalent."
+      },
+      {
+        "name": "ProphetNetEncoderLayer",
+        "line": 826,
+        "bases": [
+          "GradientCheckpointingLayer"
+        ],
+        "kb_nano_files": [],
+        "rationale": "wiring: self_attn + LayerNorm + feed_forward + LayerNorm"
+      },
+      {
+        "name": "ProphetNetDecoderLayer",
+        "line": 867,
+        "bases": [
+          "GradientCheckpointingLayer"
+        ],
+        "kb_nano_files": [],
+        "rationale": "wiring: ngram_self_attn + cross_attn + feed_forward"
+      },
+      {
+        "name": "ProphetNetEncoder",
+        "line": 943,
+        "bases": [
+          "ProphetNetPreTrainedModel"
+        ],
+        "kb_nano_files": [],
+        "rationale": "wiring: stacks encoder layers"
+      },
+      {
+        "name": "ProphetNetDecoder",
+        "line": 1050,
+        "bases": [
+          "ProphetNetPreTrainedModel"
+        ],
+        "kb_nano_files": [],
+        "rationale": "wiring: stacks decoder layers"
+      },
+      {
+        "name": "ProphetNetModel",
+        "line": 1350,
+        "bases": [
+          "ProphetNetPreTrainedModel"
+        ],
+        "kb_nano_files": [],
+        "rationale": "wiring: encoder + decoder"
+      },
+      {
+        "name": "ProphetNetForConditionalGeneration",
+        "line": 1482,
+        "bases": [
+          "ProphetNetPreTrainedModel",
+          "GenerationMixin"
+        ],
+        "kb_nano_files": [],
+        "rationale": "wiring: model + lm_head"
+      },
+      {
+        "name": "ProphetNetForCausalLM",
+        "line": 1656,
+        "bases": [
+          "ProphetNetPreTrainedModel",
+          "GenerationMixin"
+        ],
+        "kb_nano_files": [],
+        "rationale": "wiring: decoder + lm_head"
+      },
+      {
+        "name": "ProphetNetDecoderWrapper",
+        "line": 1816,
+        "bases": [
+          "ProphetNetPreTrainedModel"
+        ],
+        "kb_nano_files": [],
+        "rationale": "wiring container"
+      }
+    ],
+    "inheritance_summary": [],
+    "evidence_lines": [
+      "prophetnet/modeling_prophetnet.py:380 (Attention)",
+      "prophetnet/modeling_prophetnet.py:498 (FeedForward gelu)",
+      "prophetnet/modeling_prophetnet.py:521 (NgramSelfAttention novel)",
+      "prophetnet/configuration_prophetnet.py:activation_function='gelu'"
+    ]
+  }
+}

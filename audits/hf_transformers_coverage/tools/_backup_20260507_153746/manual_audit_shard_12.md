@@ -1,0 +1,641 @@
+# Manual audit shard 12 (qwen3 → sam3_tracker)
+
+## qwen3
+- **src**: modeling_qwen3.py, modular_qwen3.py
+- **hidden_act**: silu
+- **status**: composable
+- **classes**:
+  - **`Qwen3RMSNorm`** [compute, inherits `Qwen2RMSNorm`]: `L1/rms_norm.py`
+  - **`Qwen3MLP`** [compute, inherits `GemmaMLP`]: `L2/llama_mlp.py` (gate_proj * silu * up_proj → down_proj SwiGLU)
+  - **`Qwen3RotaryEmbedding`** [compute, inherits `Qwen2RotaryEmbedding`]: `L1/rotary_emb.py`
+  - **`Qwen3Attention`** [compute, inherits `LlamaAttention`]: `L2/attention.py` (qkv_proj + per-head q_norm/k_norm + RoPE + KV cache + sliding_window for sliding layers)
+  - **`Qwen3DecoderLayer`** [wiring, inherits `GradientCheckpointingLayer`]: wires `Qwen3Attention`, `Qwen3MLP`, `Qwen3RMSNorm` (×2: input_layernorm + post_attention_layernorm)
+  - **`Qwen3Model`** [wiring, inherits `Qwen3PreTrainedModel`]: wires `Qwen3DecoderLayer`, `Qwen3RMSNorm` (final norm), `Qwen3RotaryEmbedding`; direct `L1/embedding.py` (embed_tokens)
+  - **`Qwen3ForCausalLM`** [wiring, inherits `Qwen2ForCausalLM`]: wires `Qwen3Model`; direct `L1/linear.py` (lm_head)
+- **task heads (3)**: ForSequenceClassification, ForTokenClassification, ForQuestionAnswering — base + linear (per-task)
+
+## qwen3_5
+- **src**: modeling_qwen3_5.py, modular_qwen3_5.py
+- **hidden_act**: silu (text), gelu_pytorch_tanh (vision)
+- **status**: composable
+- **classes**:
+  - **`Qwen3_5VisionRotaryEmbedding`** [compute, inherits `Qwen3VLVisionRotaryEmbedding`]: `L1/vision_rotary_emb.py` (1D vision rotary, freq table)
+  - **`Qwen3_5TextRotaryEmbedding`** [compute, inherits `Qwen3VLTextRotaryEmbedding`]: `L1/rotary_emb.py` (with M-RoPE-style 3D position id expansion: `L1/mrope.py`)
+  - **`Qwen3_5RMSNormGated`** [compute]: `L1/rms_norm_gated.py`
+  - **`Qwen3_5GatedDeltaNet`** [compute, inherits `Qwen3NextGatedDeltaNet`]: `L2/qwen3_next_gdn_attention.py` (gated delta net linear attention)
+  - **`Qwen3_5Attention`** [compute, inherits `Qwen3NextAttention`]: `L2/qwen3_next_attention.py` (full attention with Q-gating)
+  - **`Qwen3_5MLP`** [compute, inherits `Qwen3NextMLP`]: `L2/llama_mlp.py` (SwiGLU)
+  - **`Qwen3_5RMSNorm`** [compute, inherits `Qwen3NextRMSNorm`]: `L1/gemma_rms_norm.py` (Gemma3-style w/ +1 weight cast; matches qwen3_next)
+  - **`Qwen3_5DecoderLayer`** [wiring, inherits `GradientCheckpointingLayer`]: wires `Qwen3_5Attention` or `Qwen3_5GatedDeltaNet` (per `layer_type`), `Qwen3_5MLP` or `Qwen3_5MoeSparseMoeBlock`, `Qwen3_5RMSNorm` (×2)
+  - **`Qwen3_5VisionMLP`** [compute]: `L1/linear.py + L1/gelu.py + L1/linear.py` (linear_fc1 → gelu_pytorch_tanh → linear_fc2) — same shape as `L2/sam3_vit_mlp.py` minus model-specific bits; closest L2 = `L2/vision_mlp.py`
+  - **`Qwen3_5VisionPatchEmbed`** [compute]: `L1/conv3d.py` (Conv3d patch embed)
+  - **`Qwen3_5VisionPatchMerger`** [compute]: `L1/layer_norm.py + L1/linear.py + L1/gelu.py + L1/linear.py`
+  - **`Qwen3_5VisionAttention`** [compute, inherits `Qwen3VLVisionAttention`]: `L1/linear.py + L1/dense_attention.py + L1/linear.py` (qkv → vision rotary → SDPA non-causal → proj); no exact L2 match
+  - **`Qwen3_5VisionBlock`** [wiring, inherits `GradientCheckpointingLayer`]: wires `Qwen3_5VisionAttention`, `Qwen3_5VisionMLP`, two `nn.LayerNorm` (`L1/layer_norm.py`)
+  - **`Qwen3_5VisionModel`** [wiring, inherits `Qwen3VLVisionModel`]: wires `Qwen3_5VisionPatchEmbed`, `Qwen3_5VisionBlock`(×depth), `Qwen3_5VisionPatchMerger`, deepstack mergers; direct `L1/embedding.py` (pos_embed), `Qwen3_5VisionRotaryEmbedding`
+  - **`Qwen3_5TextModel`** [wiring, inherits `Qwen3NextModel`]: wires `Qwen3_5DecoderLayer`(×N), `Qwen3_5RMSNorm` final, `Qwen3_5TextRotaryEmbedding`; direct `L1/embedding.py` (embed_tokens)
+  - **`Qwen3_5Model`** [wiring, inherits `Qwen3VLModel`]: wires `Qwen3_5VisionModel`, `Qwen3_5TextModel`
+  - **`Qwen3_5ForCausalLM`** [wiring, inherits `Qwen3ForCausalLM`]: wires text-only `Qwen3_5TextModel`; direct `L1/linear.py` (lm_head)
+  - **`Qwen3_5ForConditionalGeneration`** [wiring, inherits `Qwen3VLForConditionalGeneration`]: wires `Qwen3_5Model`; direct `L1/linear.py` (lm_head)
+- **task heads (1)**: ForSequenceClassification — base + linear (per-task)
+
+## qwen3_5_moe
+- **src**: modeling_qwen3_5_moe.py, modular_qwen3_5_moe.py
+- **hidden_act**: silu (text), gelu_pytorch_tanh (vision)
+- **status**: composable
+- **classes**:
+  - **`Qwen3_5MoeVisionRotaryEmbedding`** [compute]: `L1/vision_rotary_emb.py`
+  - **`Qwen3_5MoeTextRotaryEmbedding`** [compute]: `L1/rotary_emb.py` + `L1/mrope.py` (M-RoPE)
+  - **`Qwen3_5MoeRMSNormGated`** [compute]: `L1/rms_norm_gated.py`
+  - **`Qwen3_5MoeGatedDeltaNet`** [compute]: `L2/qwen3_next_gdn_attention.py`
+  - **`Qwen3_5MoeAttention`** [compute]: `L2/qwen3_next_attention.py`
+  - **`Qwen3_5MoeMLP`** [compute]: `L2/llama_mlp.py`
+  - **`Qwen3_5MoeExperts`** [compute]: `L1/moe_grouped_gemm.py` (fused experts)
+  - **`Qwen3_5MoeTopKRouter`** [compute]: `L1/linear.py + L1/topk_softmax.py`
+  - **`Qwen3_5MoeSparseMoeBlock`** [wiring]: wires `Qwen3_5MoeTopKRouter`, `Qwen3_5MoeExperts`; mapped collectively to `L2/qwen3_moe.py` (fused MoE, no shared expert)
+  - **`Qwen3_5MoeRMSNorm`** [compute]: `L1/gemma_rms_norm.py`
+  - **`Qwen3_5MoeDecoderLayer`** [wiring]: wires `Qwen3_5MoeAttention` or `Qwen3_5MoeGatedDeltaNet` (per `layer_type`), `Qwen3_5MoeSparseMoeBlock` or `Qwen3_5MoeMLP`, `Qwen3_5MoeRMSNorm` (×2)
+  - **`Qwen3_5MoeVisionMLP`** [compute]: `L1/linear.py + L1/gelu.py + L1/linear.py`
+  - **`Qwen3_5MoeVisionPatchEmbed`** [compute]: `L1/conv3d.py`
+  - **`Qwen3_5MoeVisionPatchMerger`** [compute]: `L1/layer_norm.py + L1/linear.py + L1/gelu.py + L1/linear.py`
+  - **`Qwen3_5MoeVisionAttention`** [compute]: `L1/linear.py + L1/dense_attention.py + L1/linear.py` (qkv + vision rotary + SDPA + proj)
+  - **`Qwen3_5MoeVisionBlock`** [wiring]: wires `Qwen3_5MoeVisionAttention`, `Qwen3_5MoeVisionMLP`, `nn.LayerNorm`(×2)
+  - **`Qwen3_5MoeVisionModel`** [wiring]: wires `Qwen3_5MoeVisionPatchEmbed`, `Qwen3_5MoeVisionBlock`(×depth), `Qwen3_5MoeVisionPatchMerger`, deepstack mergers
+  - **`Qwen3_5MoeTextModel`** [wiring]: wires `Qwen3_5MoeDecoderLayer`(×N), `Qwen3_5MoeRMSNorm`, `Qwen3_5MoeTextRotaryEmbedding`; direct `L1/embedding.py`
+  - **`Qwen3_5MoeModel`** [wiring]: wires `Qwen3_5MoeVisionModel`, `Qwen3_5MoeTextModel`
+  - **`Qwen3_5MoeForCausalLM`** [wiring]: wires `Qwen3_5MoeTextModel`; direct `L1/linear.py` (lm_head)
+  - **`Qwen3_5MoeForConditionalGeneration`** [wiring]: wires `Qwen3_5MoeModel`; direct `L1/linear.py` (lm_head)
+- **task heads (0)**: none
+
+## qwen3_moe
+- **src**: modeling_qwen3_moe.py, modular_qwen3_moe.py
+- **hidden_act**: silu
+- **status**: composable
+- **classes**:
+  - **`Qwen3MoeAttention`** [compute, inherits `Qwen3Attention`]: `L2/attention.py` (per-head qk_norm, RoPE, sliding window optional)
+  - **`Qwen3MoeMLP`** [compute, inherits `Qwen2MoeMLP`]: `L2/llama_mlp.py`
+  - **`Qwen3MoeExperts`** [compute, inherits `Qwen2MoeExperts`]: `L1/moe_grouped_gemm.py` (fused-experts SwiGLU)
+  - **`Qwen3MoeTopKRouter`** [compute, inherits `Qwen2MoeTopKRouter`]: `L1/linear.py + L1/topk_softmax.py`
+  - **`Qwen3MoeSparseMoeBlock`** [wiring]: wires `Qwen3MoeTopKRouter`, `Qwen3MoeExperts`; mapped to `L2/qwen3_moe.py`
+  - **`Qwen3MoeRMSNorm`** [compute, inherits `LlamaRMSNorm`]: `L1/rms_norm.py`
+  - **`Qwen3MoeDecoderLayer`** [wiring, inherits `Qwen2MoeDecoderLayer`]: wires `Qwen3MoeAttention`, `Qwen3MoeSparseMoeBlock`, `Qwen3MoeRMSNorm`(×2)
+  - **`Qwen3MoeRotaryEmbedding`** [compute]: `L1/rotary_emb.py`
+  - **`Qwen3MoeModel`** [wiring, inherits `MixtralModel`]: wires `Qwen3MoeDecoderLayer`(×N), `Qwen3MoeRMSNorm`, `Qwen3MoeRotaryEmbedding`; direct `L1/embedding.py`
+  - **`Qwen3MoeForCausalLM`** [wiring, inherits `MixtralForCausalLM`]: wires `Qwen3MoeModel`; direct `L1/linear.py` (lm_head)
+- **task heads (3)**: ForSequenceClassification, ForTokenClassification, ForQuestionAnswering — base + linear (per-task)
+
+## qwen3_next
+- **src**: modeling_qwen3_next.py, modular_qwen3_next.py
+- **hidden_act**: silu
+- **status**: kb_nano_l4 (full pipeline at `L4/qwen3_next.py`)
+- **classes**:
+  - **`Qwen3NextRMSNormGated`** [compute]: `L1/rms_norm_gated.py`
+  - **`Qwen3NextRotaryEmbedding`** [compute, inherits `Gemma2RotaryEmbedding`]: `L1/rotary_emb.py` (partial RoPE)
+  - **`Qwen3NextRMSNorm`** [compute, inherits `Gemma3RMSNorm`]: `L1/gemma_rms_norm.py`
+  - **`Qwen3NextAttention`** [compute, inherits `Qwen3MoeAttention`]: `L2/qwen3_next_attention.py` (full attention + Q-gating, partial RoPE)
+  - **`Qwen3NextGatedDeltaNet`** [compute]: `L2/qwen3_next_gdn_attention.py`
+  - **`Qwen3NextMLP`** [compute, inherits `Qwen3MoeMLP`]: `L2/llama_mlp.py`
+  - **`Qwen3NextExperts`** [compute, inherits `Qwen2MoeExperts`]: `L1/moe_grouped_gemm.py`
+  - **`Qwen3NextTopKRouter`** [compute, inherits `Qwen2MoeTopKRouter`]: `L1/linear.py + L1/topk_softmax.py`
+  - **`Qwen3NextSparseMoeBlock`** [wiring, inherits `Qwen2MoeSparseMoeBlock`]: wires `Qwen3NextTopKRouter`, `Qwen3NextExperts`, shared expert; mapped to `L2/qwen3_next_moe.py` (shared-expert MoE w/ sigmoid shared gate)
+  - **`Qwen3NextDecoderLayer`** [wiring, inherits `Qwen3MoeDecoderLayer`]: wires `Qwen3NextAttention` or `Qwen3NextGatedDeltaNet` (per `layer_type`), `Qwen3NextSparseMoeBlock` or `Qwen3NextMLP`, `Qwen3NextRMSNorm`(×2); see `L3/qwen3_next_decoder.py`
+  - **`Qwen3NextModel`** [wiring]: wires `Qwen3NextDecoderLayer`(×N), `Qwen3NextRMSNorm` final, `Qwen3NextRotaryEmbedding`; direct `L1/embedding.py`; see `L4/qwen3_next.py`
+  - **`Qwen3NextForCausalLM`** [wiring, inherits `MixtralForCausalLM`]: wires `Qwen3NextModel`; direct `L1/linear.py` (lm_head)
+- **task heads (3)**: ForSequenceClassification, ForTokenClassification, ForQuestionAnswering — base + linear (per-task)
+
+## qwen3_omni_moe
+- **src**: modeling_qwen3_omni_moe.py, modular_qwen3_omni_moe.py
+- **hidden_act**: gelu_pytorch_tanh (audio/vision), silu (text/talker/code2wav)
+- **status**: partial (text thinker/talker map onto qwen3 family; audio/code2wav components are unique)
+- **classes**:
+  - **`SinusoidsPositionEmbedding`** [compute]: `L1/sinusoidal_embed.py`
+  - **`Qwen3OmniMoeAudioAttention`** [compute]: `L1/linear.py + L1/dense_attention.py + L1/linear.py` (q/k/v + non-causal varlen attention + out_proj); no exact L2 match, closest = `L2/whisper_attention.py` (encoder variant) but uses cu_seqlens packing
+  - **`Qwen3OmniMoeAudioEncoderLayer`** [wiring]: wires `Qwen3OmniMoeAudioAttention`, `nn.LayerNorm`(×2 = `L1/layer_norm.py`); direct `L1/linear.py + L1/gelu.py + L1/linear.py` (fc1/fc2 with gelu_pytorch_tanh)
+  - **`Qwen3OmniMoeAudioEncoder`** [wiring]: wires `Qwen3OmniMoeAudioEncoderLayer`(×N), `SinusoidsPositionEmbedding`, `nn.LayerNorm` (ln_post), three `nn.Conv2d` downsamplers (`L1/conv2d.py`), `nn.Linear` projection layers; uses gelu_pytorch_tanh
+  - **`Qwen3OmniMoeVisionAttention`** [compute]: `L1/linear.py + L1/dense_attention.py + L1/linear.py` (qkv + vision rotary + non-causal SDPA + proj)
+  - **`Qwen3OmniMoeVisionPatchMerger`** [compute]: `L1/layer_norm.py + L1/linear.py + L1/gelu.py + L1/linear.py`
+  - **`Qwen3OmniMoeVisionRotaryEmbedding`** [compute]: `L1/vision_rotary_emb.py`
+  - **`Qwen3OmniMoeTextTopKRouter`** [compute]: `L1/linear.py + L1/topk_softmax.py`
+  - **`Qwen3OmniMoeVisionMLP`** [compute]: `L1/linear.py + L1/gelu.py + L1/linear.py` (linear_fc1 → gelu_pytorch_tanh → linear_fc2)
+  - **`Qwen3OmniMoeVisionBlock`** [wiring]: wires `Qwen3OmniMoeVisionAttention`, `Qwen3OmniMoeVisionMLP`, `nn.LayerNorm`(×2)
+  - **`Qwen3OmniMoeVisionPatchEmbed`** [compute]: `L1/conv3d.py`
+  - **`Qwen3OmniMoeVisionEncoder`** [wiring]: wires `Qwen3OmniMoeVisionPatchEmbed`, `Qwen3OmniMoeVisionBlock`(×depth), `Qwen3OmniMoeVisionPatchMerger`, `Qwen3OmniMoeVisionRotaryEmbedding`
+  - **`Qwen3OmniMoeThinkerTextRotaryEmbedding`** [compute]: `L1/rotary_emb.py` + `L1/mrope.py` (M-RoPE 3D)
+  - **`Qwen3OmniMoeThinkerTextExperts`** [compute]: `L1/moe_grouped_gemm.py`
+  - **`Qwen3OmniMoeThinkerTextTopKRouter`** [compute]: `L1/linear.py + L1/topk_softmax.py`
+  - **`Qwen3OmniMoeThinkerTextSparseMoeBlock`** [wiring]: wires `Qwen3OmniMoeThinkerTextTopKRouter`, `Qwen3OmniMoeThinkerTextExperts`; mapped to `L2/qwen3_moe.py`
+  - **`Qwen3OmniMoeThinkerTextRMSNorm`** [compute]: `L1/rms_norm.py`
+  - **`Qwen3OmniMoeThinkerTextAttention`** [compute]: `L2/attention.py` (q/k/v + per-head qk_norm + RoPE + KV cache)
+  - **`Qwen3OmniMoeThinkerTextMLP`** [compute]: `L2/llama_mlp.py`
+  - **`Qwen3OmniMoeThinkerTextDecoderLayer`** [wiring]: wires `Qwen3OmniMoeThinkerTextAttention`, `Qwen3OmniMoeThinkerTextSparseMoeBlock` or `Qwen3OmniMoeThinkerTextMLP` (per layer_idx), `Qwen3OmniMoeThinkerTextRMSNorm`(×2)
+  - **`Qwen3OmniMoeTextRMSNorm`** [compute]: `L1/rms_norm.py`
+  - **`Qwen3OmniMoeThinkerTextModel`** [wiring]: wires `Qwen3OmniMoeThinkerTextDecoderLayer`(×N), `Qwen3OmniMoeTextRMSNorm`, `Qwen3OmniMoeThinkerTextRotaryEmbedding`; direct `L1/embedding.py`
+  - **`Qwen3OmniMoeThinkerForConditionalGeneration`** [wiring]: wires `Qwen3OmniMoeAudioEncoder`, `Qwen3OmniMoeVisionEncoder`, `Qwen3OmniMoeThinkerTextModel`; direct `L1/linear.py` (lm_head)
+  - **`Qwen3OmniMoeTalkerResizeMLP`** [compute]: `L1/linear.py + L1/silu.py + L1/linear.py` (2-layer with silu)
+  - **`Qwen3OmniMoeRMSNorm`** [compute]: `L1/rms_norm.py`
+  - **`Qwen3OmniMoeTalkerCodePredictorAttention`** [compute]: `L2/attention.py` (per-head qk_norm + RoPE)
+  - **`Qwen3OmniMoeMLP`** [compute]: `L2/llama_mlp.py`
+  - **`Qwen3OmniMoeTalkerCodePredictorDecoderLayer`** [wiring]: wires `Qwen3OmniMoeTalkerCodePredictorAttention`, `Qwen3OmniMoeMLP`, `Qwen3OmniMoeRMSNorm`(×2)
+  - **`Qwen3OmniMoeRotaryEmbedding`** [compute]: `L1/rotary_emb.py`
+  - **`Qwen3OmniMoeTalkerCodePredictorModel`** [wiring]: wires `Qwen3OmniMoeTalkerCodePredictorDecoderLayer`(×N), `Qwen3OmniMoeRMSNorm`, `Qwen3OmniMoeRotaryEmbedding`
+  - **`Qwen3OmniMoeTalkerCodePredictorModelForConditionalGeneration`** [wiring]: wires `Qwen3OmniMoeTalkerCodePredictorModel`; direct `L1/linear.py`
+  - **`Qwen3OmniMoeTalkerRotaryEmbedding`** [compute, inherits `Qwen3OmniMoeThinkerTextRotaryEmbedding`]: `L1/rotary_emb.py + L1/mrope.py`
+  - **`Qwen3OmniMoeTalkerTextMLP`** [compute]: `L2/llama_mlp.py`
+  - **`Qwen3OmniMoeTalkerTextTopKRouter`** [compute]: `L1/linear.py + L1/topk_softmax.py`
+  - **`Qwen3OmniMoeTalkerTextExperts`** [compute]: `L1/moe_grouped_gemm.py`
+  - **`Qwen3OmniMoeTalkerTextSparseMoeBlock`** [wiring]: wires router + experts; mapped to `L2/qwen3_moe.py`
+  - **`Qwen3OmniMoeTalkerDecoderLayer`** [wiring]: wires `Qwen3OmniMoeThinkerTextAttention` (reused), `Qwen3OmniMoeTalkerTextSparseMoeBlock` or `Qwen3OmniMoeTalkerTextMLP`, `Qwen3OmniMoeRMSNorm`(×2)
+  - **`Qwen3OmniMoeTalkerModel`** [wiring]: wires `Qwen3OmniMoeTalkerDecoderLayer`(×N), `Qwen3OmniMoeRMSNorm`, `Qwen3OmniMoeTalkerRotaryEmbedding`
+  - **`Qwen3OmniMoeTalkerForConditionalGeneration`** [wiring]: wires `Qwen3OmniMoeTalkerModel`, `Qwen3OmniMoeTalkerCodePredictorModelForConditionalGeneration`, `Qwen3OmniMoeTalkerResizeMLP`; direct `L1/linear.py` (lm_head)
+  - **`Qwen3OmniMoeCausalConvNet`** [compute]: `L1/conv1d.py` (causal padded Conv1d)
+  - **`Qwen3OmniMoeCausalTransConvNet`** [compute]: `L1/conv_transpose1d.py`
+  - **`Qwen3OmniMoeConvNeXtBlock`** [compute]: `L1/conv1d.py + L1/layer_norm.py + L1/linear.py + L1/gelu.py + L1/linear.py` (depthwise conv + LN + 2-layer MLP + scale + residual); no exact L2 match
+  - **`Qwen3OmniMoeCode2WavAttention`** [compute]: `L2/attention.py` (no qk_norm — Identity, RoPE + KV cache + sliding window)
+  - **`Qwen3OmniMoeCode2WavMlp`** [compute]: `L2/llama_mlp.py` (silu SwiGLU)
+  - **`Qwen3OmniMoeCode2WavRMSNorm`** [compute]: `L1/rms_norm.py`
+  - **`Qwen3OmniMoeCode2WavLayerScale`** [compute]: tensor-only (`L1/tensor_ops.py` — multiply by learned scale)
+  - **`Qwen3OmniMoeCode2WavTransformerLayer`** [wiring]: wires `Qwen3OmniMoeCode2WavAttention`, `Qwen3OmniMoeCode2WavMlp`, `Qwen3OmniMoeCode2WavRMSNorm`(×2), `Qwen3OmniMoeCode2WavLayerScale`(×2)
+  - **`Qwen3OmniMoeCode2WavTransformerModel`** [wiring]: wires `Qwen3OmniMoeCode2WavTransformerLayer`(×N), `Qwen3OmniMoeRMSNorm`, `Qwen3OmniMoeRotaryEmbedding`
+  - **`SnakeBeta`** [compute]: no kb-nano kernel (custom `x + sin²(αx)/β` activation); decompose to `L1/tensor_ops.py` ops
+  - **`Qwen3OmniMoeCode2WavDecoderResidualUnit`** [wiring]: wires `SnakeBeta`(×2), `Qwen3OmniMoeCausalConvNet`(×2)
+  - **`Qwen3OmniMoeCode2WavDecoderBlock`** [wiring]: wires `SnakeBeta`, `Qwen3OmniMoeCausalTransConvNet`, `Qwen3OmniMoeCode2WavDecoderResidualUnit`(×3)
+  - **`Qwen3OmniMoeCode2Wav`** [wiring]: wires `Qwen3OmniMoeCode2WavTransformerModel`, `Qwen3OmniMoeConvNeXtBlock`(×N), `Qwen3OmniMoeCausalConvNet`/`Qwen3OmniMoeCausalTransConvNet`, `Qwen3OmniMoeCode2WavDecoderBlock`(×N), `SnakeBeta`; direct `L1/embedding.py` (code_embedding)
+  - **`Qwen3OmniMoeForConditionalGeneration`** [wiring]: wires `Qwen3OmniMoeThinkerForConditionalGeneration`, `Qwen3OmniMoeTalkerForConditionalGeneration`, `Qwen3OmniMoeCode2Wav`
+- **task heads (0)**: none beyond ForConditionalGeneration variants
+
+## qwen3_vl
+- **src**: modeling_qwen3_vl.py, modular_qwen3_vl.py
+- **hidden_act**: silu (text), gelu_pytorch_tanh (vision)
+- **status**: kb_nano_l4 (full pipeline at `L4/qwen3_vl.py`)
+- **classes**:
+  - **`Qwen3VLVisionMLP`** [compute]: `L1/linear.py + L1/gelu.py + L1/linear.py` (linear_fc1 → gelu_pytorch_tanh → linear_fc2; `L2/vision_mlp.py` shape but with bias=True)
+  - **`Qwen3VLVisionPatchEmbed`** [compute, inherits `PatchEmbed`]: `L1/conv3d.py` (Conv3d patch embed; matches `L2/vision_patch_embed.py`)
+  - **`Qwen3VLVisionRotaryEmbedding`** [compute, inherits `VisionRotaryEmbedding`]: `L1/vision_rotary_emb.py`
+  - **`Qwen3VLVisionPatchMerger`** [compute]: `L1/layer_norm.py + L1/linear.py + L1/gelu.py + L1/linear.py` (`L2/vision_patch_merger.py`)
+  - **`Qwen3VLVisionAttention`** [compute, inherits `VisionAttention`]: `L2/vision_attention.py` (qkv + vision rotary + non-causal SDPA + proj)
+  - **`Qwen3VLVisionBlock`** [wiring, inherits `Qwen2_5_VLVisionBlock`]: wires `Qwen3VLVisionAttention`, `Qwen3VLVisionMLP`, `nn.LayerNorm`(×2 = `L1/layer_norm.py`); see `L3/vision_block.py`
+  - **`Qwen3VLTextRotaryEmbedding`** [compute, inherits `LlamaRotaryEmbedding`]: `L1/rotary_emb.py + L1/mrope.py` (M-RoPE 3D with mrope_section)
+  - **`Qwen3VLTextRMSNorm`** [compute]: `L1/rms_norm.py`
+  - **`Qwen3VLTextAttention`** [compute, inherits `Qwen3Attention`]: `L2/attention.py` (per-head qk_norm + RoPE + KV cache; no sliding_window)
+  - **`Qwen3VLTextMLP`** [compute]: `L2/llama_mlp.py` (SwiGLU silu)
+  - **`Qwen3VLTextDecoderLayer`** [wiring, inherits `Qwen3DecoderLayer`]: wires `Qwen3VLTextAttention`, `Qwen3VLTextMLP`, `Qwen3VLTextRMSNorm`(×2)
+  - **`Qwen3VLVisionModel`** [wiring]: wires `Qwen3VLVisionPatchEmbed`, `Qwen3VLVisionBlock`(×depth), `Qwen3VLVisionPatchMerger` (final merger + deepstack mergers), `Qwen3VLVisionRotaryEmbedding`; direct `L1/embedding.py` (pos_embed)
+  - **`Qwen3VLTextModel`** [wiring, inherits `Qwen3VLPreTrainedModel`, `Qwen3Model`]: wires `Qwen3VLTextDecoderLayer`(×N), `Qwen3VLTextRMSNorm`, `Qwen3VLTextRotaryEmbedding`; direct `L1/embedding.py`
+  - **`Qwen3VLModel`** [wiring]: wires `Qwen3VLVisionModel`, `Qwen3VLTextModel`; see `L4/qwen3_vl.py`
+  - **`Qwen3VLForConditionalGeneration`** [wiring, inherits `Qwen2_5_VLForConditionalGeneration`]: wires `Qwen3VLModel`; direct `L1/linear.py` (lm_head)
+- **task heads (0)**: none
+
+## qwen3_vl_moe
+- **src**: modeling_qwen3_vl_moe.py, modular_qwen3_vl_moe.py
+- **hidden_act**: silu (text), gelu_pytorch_tanh (vision)
+- **status**: kb_nano_l4 (full pipeline at `L4/qwen3_vl_moe.py`)
+- **classes**:
+  - **`Qwen3VLMoeTextRMSNorm`** [compute]: `L1/rms_norm.py`
+  - **`Qwen3VLMoeTextExperts`** [compute]: `L1/moe_grouped_gemm.py` (fused experts)
+  - **`Qwen3VLMoeTextTopKRouter`** [compute]: `L1/linear.py + L1/topk_softmax.py`
+  - **`Qwen3VLMoeTextSparseMoeBlock`** [wiring]: wires `Qwen3VLMoeTextTopKRouter`, `Qwen3VLMoeTextExperts`; mapped to `L2/qwen3_moe.py` (no shared expert)
+  - **`Qwen3VLMoeTextAttention`** [compute]: `L2/attention.py` (per-head qk_norm + RoPE + KV cache)
+  - **`Qwen3VLMoeTextMLP`** [compute]: `L2/llama_mlp.py`
+  - **`Qwen3VLMoeTextDecoderLayer`** [wiring]: wires `Qwen3VLMoeTextAttention`, `Qwen3VLMoeTextSparseMoeBlock`, `Qwen3VLMoeTextRMSNorm`(×2)
+  - **`Qwen3VLMoeVisionRotaryEmbedding`** [compute]: `L1/vision_rotary_emb.py`
+  - **`Qwen3VLMoeVisionAttention`** [compute]: `L2/vision_attention.py` (qkv + vision rotary + non-causal SDPA + proj)
+  - **`Qwen3VLMoeVisionMLP`** [compute]: `L1/linear.py + L1/gelu.py + L1/linear.py` (gelu_pytorch_tanh)
+  - **`Qwen3VLMoeVisionBlock`** [wiring]: wires `Qwen3VLMoeVisionAttention`, `Qwen3VLMoeVisionMLP`, `nn.LayerNorm`(×2)
+  - **`Qwen3VLMoeVisionPatchEmbed`** [compute]: `L1/conv3d.py`
+  - **`Qwen3VLMoeVisionPatchMerger`** [compute]: `L1/layer_norm.py + L1/linear.py + L1/gelu.py + L1/linear.py`
+  - **`Qwen3VLMoeVisionModel`** [wiring]: wires `Qwen3VLMoeVisionPatchEmbed`, `Qwen3VLMoeVisionBlock`(×depth), `Qwen3VLMoeVisionPatchMerger`, deepstack mergers, `Qwen3VLMoeVisionRotaryEmbedding`; direct `L1/embedding.py` (pos_embed)
+  - **`Qwen3VLMoeTextRotaryEmbedding`** [compute]: `L1/rotary_emb.py + L1/mrope.py`
+  - **`Qwen3VLMoeTextModel`** [wiring]: wires `Qwen3VLMoeTextDecoderLayer`(×N), `Qwen3VLMoeTextRMSNorm`, `Qwen3VLMoeTextRotaryEmbedding`; direct `L1/embedding.py`
+  - **`Qwen3VLMoeModel`** [wiring]: wires `Qwen3VLMoeVisionModel`, `Qwen3VLMoeTextModel`; see `L4/qwen3_vl_moe.py`
+  - **`Qwen3VLMoeForConditionalGeneration`** [wiring]: wires `Qwen3VLMoeModel`; direct `L1/linear.py` (lm_head)
+- **task heads (0)**: none
+
+## rag
+- **src**: modeling_rag.py
+- **hidden_act**: n/a (RAG is a wiring framework over a question_encoder + generator + retriever)
+- **status**: partial (depends on which sub-models are wrapped)
+- **classes**:
+  - **`RagModel`** [wiring]: wires user-supplied `question_encoder` (BERT-family) and `generator` (BART/T5-family) plus a retriever; no kb-nano kernel of its own — composability depends on the wrapped models
+  - **`RagSequenceForGeneration`** [wiring]: wires `RagModel`; loss/marginalization arithmetic only
+  - **`RagTokenForGeneration`** [wiring, inherits `GenerationMixin`]: wires `RagModel`; token-level marginalization arithmetic only
+- **task heads (0)**: none
+
+## recurrent_gemma
+- **src**: modeling_recurrent_gemma.py
+- **hidden_act**: gelu_pytorch_tanh (`hidden_activation`)
+- **status**: composable (RG-LRU at `L1/rg_lru.py`)
+- **classes**:
+  - **`RecurrentGemmaRMSNorm`** [compute]: `L1/gemma_rms_norm.py` (Gemma-style: `(x * (1 + w)).type_as(x)` after fp32 RMS)
+  - **`RecurrentGemmaRotaryEmbedding`** [compute]: `L1/rotary_emb.py` (with partial-rotary; `apply_rotary_pos_emb` applied to chunked Q/K)
+  - **`RecurrentGemmaSdpaAttention`** [compute]: `L1/linear.py + L1/rotary_emb.py + L1/dense_attention.py + L1/linear.py` (q/k/v + partial-rotary + SDPA + o_proj); closest L2 = `L2/attention.py` but signature/cache differs (uses Cache.update + dense SDPA w/ explicit attn_mask)
+  - **`RecurrentGemmaRglru`** [compute]: `L1/rg_lru.py` (Real-Gated Linear Recurrent Unit + scan)
+  - **`RecurrentGemmaRecurrentBlock`** [wiring, inherits `nn.Module`]: wires `RecurrentGemmaRglru`; direct `L1/linear.py` (linear_x/linear_y/linear_out), `L1/conv1d.py` (depthwise causal conv), `L1/gelu.py` (gelu_pytorch_tanh)
+  - **`RecurrentGemmaMlp`** [compute]: `L2/llama_mlp.py` (gate * gelu * up → down — note hidden_activation=gelu_pytorch_tanh, intermediate_size halved)
+  - **`RecurrentGemmaDecoderLayer`** [wiring, inherits `GradientCheckpointingLayer`]: wires `RecurrentGemmaSdpaAttention` or `RecurrentGemmaRecurrentBlock` (per `layers_block_type`), `RecurrentGemmaMlp`, `RecurrentGemmaRMSNorm`(×2)
+  - **`RecurrentGemmaModel`** [wiring]: wires `RecurrentGemmaDecoderLayer`(×N), `RecurrentGemmaRMSNorm` final; direct `L1/embedding.py` (embed_tokens)
+  - **`RecurrentGemmaForCausalLM`** [wiring, inherits `GenerationMixin`]: wires `RecurrentGemmaModel`; direct `L1/linear.py` (lm_head)
+- **task heads (0)**: none
+
+## reformer
+- **src**: modeling_reformer.py
+- **hidden_act**: relu
+- **status**: unsupported (LSH and Local self-attention are bespoke chunked attention algorithms with hashing/bucketing not present in kb-nano)
+- **classes**:
+  - **`AxialPositionEmbeddings`** [compute]: parameter list reshape only (`L1/tensor_ops.py`); no exact kb-nano kernel
+  - **`PositionEmbeddings`** [compute]: `L1/embedding.py + L1/dropout.py`
+  - **`ReformerEmbeddings`** [wiring]: wires `AxialPositionEmbeddings` or `PositionEmbeddings`; direct `L1/embedding.py` (word_embeddings)
+  - **`LSHSelfAttention`** [compute]: bespoke LSH attention — no kb-nano kernel
+  - **`LocalSelfAttention`** [compute]: bespoke chunked-local attention — no kb-nano kernel
+  - **`ReformerSelfOutput`** [compute]: `L1/linear.py + L1/dropout.py`
+  - **`ReformerAttention`** [wiring]: wires `LSHSelfAttention`/`LocalSelfAttention`, `ReformerSelfOutput`, `nn.LayerNorm` (`L1/layer_norm.py`)
+  - **`ReformerFeedForwardDense`** [compute]: `L1/linear.py + L1/relu.py + L1/dropout.py`
+  - **`ReformerFeedForwardOutput`** [compute]: `L1/linear.py + L1/dropout.py`
+  - **`ChunkReformerFeedForward`** [wiring]: wires `ReformerFeedForwardDense`, `ReformerFeedForwardOutput`, `nn.LayerNorm`
+  - **`ReformerLayer`** [wiring, inherits `nn.Module`]: wires `ReformerAttention`, `ChunkReformerFeedForward` (reversible-residual style)
+  - **`ReformerEncoder`** [wiring]: wires `ReformerLayer`(×N), `nn.LayerNorm`
+  - **`ReformerOnlyLMHead`** [wiring]: direct `L1/linear.py + L1/dense_attention.py` (chunk linear)
+  - **`ReformerModel`** [wiring]: wires `ReformerEmbeddings`, `ReformerEncoder`
+  - **`ReformerModelWithLMHead`** [wiring]: wires `ReformerModel`, `ReformerOnlyLMHead`
+  - **`ReformerClassificationHead`** [compute]: `L1/linear.py + L1/tanh.py + L1/linear.py`
+- **task heads (3)**: ForMaskedLM, ForSequenceClassification, ForQuestionAnswering — base + linear (per-task)
+
+## regnet
+- **src**: modeling_regnet.py
+- **hidden_act**: relu
+- **status**: composable
+- **classes**:
+  - **`RegNetConvLayer`** [compute]: `L1/conv2d.py + L1/batch_norm2d.py + L1/relu.py` (Conv2d + BN + ACT)
+  - **`RegNetEmbeddings`** [wiring]: wires `RegNetConvLayer`
+  - **`RegNetShortCut`** [compute]: `L1/conv2d.py + L1/batch_norm2d.py`
+  - **`RegNetSELayer`** [compute]: `L1/adaptive_avg_pool2d.py + L1/conv2d.py + L1/relu.py + L1/conv2d.py + L1/sigmoid.py` (squeeze-excite)
+  - **`RegNetXLayer`** [wiring]: wires `RegNetConvLayer`(×3), `RegNetShortCut`; ACT2FN `L1/relu.py`
+  - **`RegNetYLayer`** [wiring]: wires `RegNetConvLayer`(×3), `RegNetSELayer`, `RegNetShortCut`; ACT2FN `L1/relu.py`
+  - **`RegNetStage`** [wiring]: wires `RegNetXLayer` or `RegNetYLayer`(×depth)
+  - **`RegNetEncoder`** [wiring]: wires `RegNetStage`(×N)
+  - **`RegNetModel`** [wiring]: wires `RegNetEmbeddings`, `RegNetEncoder`; direct `L1/adaptive_avg_pool2d.py` (pooler)
+- **task heads (1)**: ForImageClassification — base + linear (per-task)
+
+## rembert
+- **src**: modeling_rembert.py
+- **hidden_act**: gelu
+- **status**: composable
+- **classes**:
+  - **`RemBertEmbeddings`** [compute]: `L2/encoder_embeddings.py` (word + position + token_type + LayerNorm + Dropout) — note input_embedding_size differs from hidden_size
+  - **`RemBertPooler`** [compute]: `L1/linear.py + L1/tanh.py`
+  - **`RemBertSelfAttention`** [compute]: `L2/encoder_attention.py` (q/k/v + dispatch via ALL_ATTENTION_FUNCTIONS)
+  - **`RemBertSelfOutput`** [compute]: `L2/encoder_attention.py` (dense + LayerNorm + residual)
+  - **`RemBertAttention`** [wiring]: wires `RemBertSelfAttention`, `RemBertSelfOutput` (`L2/encoder_attention.py` wrapper)
+  - **`RemBertIntermediate`** [compute]: `L1/linear.py + L1/gelu.py`
+  - **`RemBertOutput`** [compute]: `L1/linear.py + L1/layer_norm.py` (dense + LayerNorm + residual)
+  - **`RemBertLayer`** [wiring, inherits `GradientCheckpointingLayer`]: wires `RemBertAttention`, `RemBertIntermediate`, `RemBertOutput`, optional `RemBertAttention` (cross-attention)
+  - **`RemBertEncoder`** [wiring]: wires `RemBertLayer`(×N); direct `L1/linear.py` (embedding_hidden_mapping_in)
+  - **`RemBertPredictionHeadTransform`** [compute]: `L1/linear.py + L1/gelu.py + L1/layer_norm.py`
+  - **`RemBertLMPredictionHead`** [wiring]: direct `L1/linear.py + L1/gelu.py + L1/layer_norm.py + L1/linear.py` (custom layout w/ output_embedding_size)
+  - **`RemBertOnlyMLMHead`** [wiring]: wires `RemBertLMPredictionHead`
+  - **`RemBertModel`** [wiring]: wires `RemBertEmbeddings`, `RemBertEncoder`, `RemBertPooler`
+  - **`RemBertForMaskedLM`** [wiring]: wires `RemBertModel`, `RemBertOnlyMLMHead`
+  - **`RemBertForCausalLM`** [wiring, inherits `GenerationMixin`]: wires `RemBertModel`, `RemBertOnlyMLMHead`
+- **task heads (4)**: ForSequenceClassification, ForMultipleChoice, ForTokenClassification, ForQuestionAnswering — base + linear (per-task)
+
+## resnet
+- **src**: modeling_resnet.py
+- **hidden_act**: relu
+- **status**: composable
+- **classes**:
+  - **`ResNetConvLayer`** [compute]: `L1/conv2d.py + L1/batch_norm2d.py + L1/relu.py` (Conv2d + BN + ACT, with optional Identity ACT)
+  - **`ResNetEmbeddings`** [wiring]: wires `ResNetConvLayer`; direct `L1/max_pool2d.py` (pooler)
+  - **`ResNetShortCut`** [compute]: `L1/conv2d.py + L1/batch_norm2d.py`
+  - **`ResNetBasicLayer`** [wiring]: wires `ResNetConvLayer`(×2), `ResNetShortCut`; direct `L1/relu.py`
+  - **`ResNetBottleNeckLayer`** [wiring]: wires `ResNetConvLayer`(×3), `ResNetShortCut`; direct `L1/relu.py`
+  - **`ResNetStage`** [wiring]: wires `ResNetBasicLayer` or `ResNetBottleNeckLayer`(×depth)
+  - **`ResNetEncoder`** [wiring]: wires `ResNetStage`(×N)
+  - **`ResNetModel`** [wiring]: wires `ResNetEmbeddings`, `ResNetEncoder`; direct `L1/adaptive_avg_pool2d.py` (pooler)
+  - **`ResNetBackbone`** [wiring, inherits `BackboneMixin`]: wires `ResNetEmbeddings`, `ResNetEncoder`
+- **task heads (1)**: ForImageClassification — base + linear (per-task)
+
+## roberta
+- **src**: modeling_roberta.py
+- **hidden_act**: gelu
+- **status**: composable
+- **classes**:
+  - **`RobertaEmbeddings`** [compute]: `L2/encoder_embeddings.py` (word + position + token_type + LayerNorm + Dropout; padding-aware position offset)
+  - **`RobertaSelfAttention`** [compute]: `L2/encoder_attention.py` (q/k/v + dispatch)
+  - **`RobertaCrossAttention`** [compute]: `L2/encoder_attention.py` (cross-attn variant: q from hidden, k/v from encoder_hidden_states)
+  - **`RobertaSelfOutput`** [compute]: `L2/encoder_attention.py` (dense + LayerNorm + residual)
+  - **`RobertaAttention`** [wiring]: wires `RobertaSelfAttention`, `RobertaSelfOutput` (`L2/encoder_attention.py` wrapper)
+  - **`RobertaIntermediate`** [compute]: `L1/linear.py + L1/gelu.py`
+  - **`RobertaOutput`** [compute]: `L1/linear.py + L1/layer_norm.py` (dense + LayerNorm + residual)
+  - **`RobertaLayer`** [wiring, inherits `GradientCheckpointingLayer`]: wires `RobertaAttention`, `RobertaIntermediate`, `RobertaOutput`, optional `RobertaCrossAttention`
+  - **`RobertaEncoder`** [wiring]: wires `RobertaLayer`(×N)
+  - **`RobertaPooler`** [compute]: `L1/linear.py + L1/tanh.py`
+  - **`RobertaModel`** [wiring]: wires `RobertaEmbeddings`, `RobertaEncoder`, optional `RobertaPooler`
+  - **`RobertaForCausalLM`** [wiring, inherits `GenerationMixin`]: wires `RobertaModel`, `RobertaLMHead`
+  - **`RobertaForMaskedLM`** [wiring]: wires `RobertaModel`, `RobertaLMHead`
+  - **`RobertaLMHead`** [compute]: `L1/linear.py + L1/gelu.py + L1/layer_norm.py + L1/linear.py`
+  - **`RobertaClassificationHead`** [compute]: `L1/linear.py + L1/tanh.py + L1/linear.py`
+- **task heads (4)**: ForSequenceClassification, ForMultipleChoice, ForTokenClassification, ForQuestionAnswering — base + linear (per-task)
+
+## roberta_prelayernorm
+- **src**: modeling_roberta_prelayernorm.py
+- **hidden_act**: gelu
+- **status**: composable
+- **classes**:
+  - **`RobertaPreLayerNormEmbeddings`** [compute]: `L2/encoder_embeddings.py` (same as roberta but uses pre-LN topology downstream)
+  - **`RobertaPreLayerNormSelfAttention`** [compute]: `L2/encoder_attention.py` (q/k/v + dispatch; pre-LN variant applies LN before q/k/v projection)
+  - **`RobertaPreLayerNormCrossAttention`** [compute]: `L2/encoder_attention.py` (cross-attn variant)
+  - **`RobertaPreLayerNormSelfOutput`** [compute]: `L1/linear.py` (dense + residual; LayerNorm moved out into the layer)
+  - **`RobertaPreLayerNormAttention`** [wiring]: wires `RobertaPreLayerNormSelfAttention`, `RobertaPreLayerNormSelfOutput`, `nn.LayerNorm` (pre-attn)
+  - **`RobertaPreLayerNormIntermediate`** [compute]: `L1/layer_norm.py + L1/linear.py + L1/gelu.py` (LN before fc1)
+  - **`RobertaPreLayerNormOutput`** [compute]: `L1/linear.py` (dense + residual; LN already applied)
+  - **`RobertaPreLayerNormLayer`** [wiring, inherits `GradientCheckpointingLayer`]: wires `RobertaPreLayerNormAttention`, `RobertaPreLayerNormIntermediate`, `RobertaPreLayerNormOutput`, optional cross-attn
+  - **`RobertaPreLayerNormEncoder`** [wiring]: wires `RobertaPreLayerNormLayer`(×N), final `nn.LayerNorm`
+  - **`RobertaPreLayerNormPooler`** [compute]: `L1/linear.py + L1/tanh.py`
+  - **`RobertaPreLayerNormModel`** [wiring]: wires `RobertaPreLayerNormEmbeddings`, `RobertaPreLayerNormEncoder`, optional `RobertaPreLayerNormPooler`
+  - **`RobertaPreLayerNormForCausalLM`** [wiring, inherits `GenerationMixin`]: wires `RobertaPreLayerNormModel`, `RobertaPreLayerNormLMHead`
+  - **`RobertaPreLayerNormForMaskedLM`** [wiring]: wires `RobertaPreLayerNormModel`, `RobertaPreLayerNormLMHead`
+  - **`RobertaPreLayerNormLMHead`** [compute]: `L1/linear.py + L1/gelu.py + L1/layer_norm.py + L1/linear.py`
+  - **`RobertaPreLayerNormClassificationHead`** [compute]: `L1/linear.py + L1/tanh.py + L1/linear.py`
+- **task heads (4)**: ForSequenceClassification, ForMultipleChoice, ForTokenClassification, ForQuestionAnswering — base + linear (per-task)
+
+## roc_bert
+- **src**: modeling_roc_bert.py
+- **hidden_act**: gelu
+- **status**: composable
+- **classes**:
+  - **`RoCBertEmbeddings`** [compute]: `L2/encoder_embeddings.py` (word + position + token_type + pronunciation + shape embeddings + LayerNorm + Dropout) — extra modalities (pronunciation/shape) not in `L2/encoder_embeddings.py`; decomposes to `L1/embedding.py`(×4) + `L1/linear.py` + `L1/layer_norm.py`
+  - **`RoCBertSelfAttention`** [compute]: `L2/encoder_attention.py`
+  - **`RoCBertCrossAttention`** [compute]: `L2/encoder_attention.py` (cross variant)
+  - **`RoCBertSelfOutput`** [compute]: `L2/encoder_attention.py` (dense + LayerNorm + residual)
+  - **`RoCBertAttention`** [wiring]: wires `RoCBertSelfAttention`, `RoCBertSelfOutput`
+  - **`RoCBertIntermediate`** [compute]: `L1/linear.py + L1/gelu.py`
+  - **`RoCBertOutput`** [compute]: `L1/linear.py + L1/layer_norm.py`
+  - **`RoCBertLayer`** [wiring, inherits `GradientCheckpointingLayer`]: wires `RoCBertAttention`, `RoCBertIntermediate`, `RoCBertOutput`, optional `RoCBertCrossAttention`
+  - **`RoCBertEncoder`** [wiring]: wires `RoCBertLayer`(×N)
+  - **`RoCBertPooler`** [compute]: `L1/linear.py + L1/tanh.py`
+  - **`RoCBertPredictionHeadTransform`** [compute]: `L1/linear.py + L1/gelu.py + L1/layer_norm.py`
+  - **`RoCBertLMPredictionHead`** [wiring]: wires `RoCBertPredictionHeadTransform`; direct `L1/linear.py`
+  - **`RoCBertOnlyMLMHead`** [wiring]: wires `RoCBertLMPredictionHead`
+  - **`RoCBertModel`** [wiring]: wires `RoCBertEmbeddings`, `RoCBertEncoder`, `RoCBertPooler`
+  - **`RoCBertForPreTraining`** [wiring]: wires `RoCBertModel`, `RoCBertOnlyMLMHead`
+  - **`RoCBertForMaskedLM`** [wiring]: wires `RoCBertModel`, `RoCBertOnlyMLMHead`
+  - **`RoCBertForCausalLM`** [wiring, inherits `GenerationMixin`]: wires `RoCBertModel`, `RoCBertOnlyMLMHead`
+- **task heads (4)**: ForSequenceClassification, ForMultipleChoice, ForTokenClassification, ForQuestionAnswering — base + linear (per-task)
+
+## roformer
+- **src**: modeling_roformer.py
+- **hidden_act**: gelu
+- **status**: composable
+- **classes**:
+  - **`RoFormerSinusoidalPositionalEmbedding`** [compute, inherits `nn.Embedding`]: `L1/sinusoidal_embed.py` (precomputed sin/cos, then index lookup)
+  - **`RoFormerEmbeddings`** [compute]: `L1/embedding.py + L1/embedding.py + L1/layer_norm.py + L1/dropout.py` (word + token_type + LayerNorm; sinusoidal positional encoding is added later inside attention as RoPE-style)
+  - **`RoFormerSelfAttention`** [compute]: `L1/linear.py + L1/rotary_emb.py + L1/dense_attention.py` (q/k/v + sinusoidal RoPE applied to q/k + softmax attention); closest L2 = `L2/encoder_attention.py` but with RoPE; no exact match
+  - **`RoFormerSelfOutput`** [compute]: `L2/encoder_attention.py` (dense + LayerNorm + residual)
+  - **`RoFormerAttention`** [wiring]: wires `RoFormerSelfAttention`, `RoFormerSelfOutput`
+  - **`RoFormerIntermediate`** [compute]: `L1/linear.py + L1/gelu.py`
+  - **`RoFormerOutput`** [compute]: `L1/linear.py + L1/layer_norm.py`
+  - **`RoFormerLayer`** [wiring, inherits `GradientCheckpointingLayer`]: wires `RoFormerAttention`, `RoFormerIntermediate`, `RoFormerOutput`, optional cross-attn
+  - **`RoFormerEncoder`** [wiring]: wires `RoFormerSinusoidalPositionalEmbedding`, `RoFormerLayer`(×N)
+  - **`RoFormerSequenceSummary`** [compute]: `L1/linear.py + L1/tanh.py + L1/dropout.py + L1/linear.py`
+  - **`RoFormerPredictionHeadTransform`** [compute]: `L1/linear.py + L1/gelu.py + L1/layer_norm.py`
+  - **`RoFormerLMPredictionHead`** [wiring]: wires `RoFormerPredictionHeadTransform`; direct `L1/linear.py`
+  - **`RoFormerOnlyMLMHead`** [wiring]: wires `RoFormerLMPredictionHead`
+  - **`RoFormerModel`** [wiring]: wires `RoFormerEmbeddings`, `RoFormerEncoder`
+  - **`RoFormerForMaskedLM`** [wiring]: wires `RoFormerModel`, `RoFormerOnlyMLMHead`
+  - **`RoFormerForCausalLM`** [wiring, inherits `GenerationMixin`]: wires `RoFormerModel`, `RoFormerOnlyMLMHead`
+  - **`RoFormerClassificationHead`** [compute]: `L1/linear.py + L1/tanh.py + L1/linear.py`
+- **task heads (4)**: ForSequenceClassification, ForMultipleChoice, ForTokenClassification, ForQuestionAnswering — base + linear (per-task)
+
+## rt_detr/rt_detr
+- **src**: modeling_rt_detr.py, modular_rt_detr.py
+- **hidden_act**: encoder_activation_function=gelu, decoder_activation_function=relu, activation_function=silu (CSP/RepVGG)
+- **status**: composable (note: deformable attention exists in `L1/rtdetrv2_deformable_attention.py`)
+- **classes**:
+  - **`RTDetrMLP`** [compute]: `L1/linear.py + L1/gelu.py + L1/dropout.py + L1/linear.py + L1/dropout.py` (2-layer FFN with configurable activation)
+  - **`RTDetrFrozenBatchNorm2d`** [compute]: `L1/frozen_batch_norm2d.py`
+  - **`RTDetrSelfAttention`** [compute]: `L1/linear.py + L1/dense_attention.py + L1/linear.py` (q/k/v + position embeddings added to q,k only + non-causal SDPA + o_proj); closest L2 = `L2/encoder_attention.py` but adds pos to q,k pre-projection — no exact L2 match
+  - **`RTDetrConvEncoder`** [wiring]: wires backbone (e.g. `RTDetrResNet`); replaces BN with FrozenBN
+  - **`RTDetrConvNormLayer`** [compute]: `L1/conv2d.py + L1/batch_norm2d.py` + ACT2CLS (configurable)
+  - **`RTDetrEncoderLayer`** [wiring]: wires `RTDetrSelfAttention`, `RTDetrMLP`, `nn.LayerNorm`(×2 = `L1/layer_norm.py`); see `L3/rtdetrv2_encoder_layer.py` (for v2 variant)
+  - **`RTDetrRepVggBlock`** [wiring]: wires `RTDetrConvNormLayer`(×2); ACT2CLS; see `L2/rtdetrv2_repvgg_block.py`
+  - **`RTDetrCSPRepLayer`** [wiring]: wires `RTDetrConvNormLayer`(×2 or 3), `RTDetrRepVggBlock`(×3); see `L2/rtdetrv2_csp_rep_layer.py`
+  - **`MultiScaleDeformableAttention`** [compute]: `L1/rtdetrv2_deformable_attention.py` (no params, just grid_sample-based deformable attention)
+  - **`RTDetrMultiscaleDeformableAttention`** [wiring]: wires `MultiScaleDeformableAttention`; direct `L1/linear.py` (sampling_offsets, attention_weights, value_proj, output_proj); see `L2/rtdetrv2_deformable_attention.py`
+  - **`RTDetrDecoderLayer`** [wiring]: wires `RTDetrSelfAttention`, `RTDetrMultiscaleDeformableAttention`, `RTDetrMLP`, `nn.LayerNorm`(×3); see `L3/rtdetrv2_decoder.py` block
+  - **`RTDetrSinePositionEmbedding`** [compute]: `L1/sinusoidal_embed.py` (2D sin-cos position grid)
+  - **`RTDetrAIFILayer`** [wiring]: wires `RTDetrSinePositionEmbedding`, `RTDetrEncoderLayer`(×N)
+  - **`RTDetrMLPPredictionHead`** [compute]: stacked `L1/linear.py + L1/relu.py` (×n_layers); see `L2/rtdetrv2_mlp_head.py`
+  - **`RTDetrHybridEncoder`** [wiring]: wires `RTDetrConvNormLayer`(×N: lateral_convs/fpn_blocks/downsample_convs), `RTDetrCSPRepLayer`(×N), `RTDetrAIFILayer`; see `L3/rtdetrv2_hybrid_encoder.py`
+  - **`RTDetrDecoder`** [wiring]: wires `RTDetrDecoderLayer`(×N), `RTDetrMLPPredictionHead`; see `L3/rtdetrv2_decoder.py`
+  - **`RTDetrModel`** [wiring]: wires `RTDetrConvEncoder`, `RTDetrHybridEncoder`, `RTDetrDecoder`, `RTDetrSinePositionEmbedding`; see `L4/rtdetrv2.py` (closest related L4)
+- **task heads (1)**: ForObjectDetection — base + linear (per-task)
+
+## rt_detr/rt_detr_resnet
+- **src**: modeling_rt_detr_resnet.py
+- **hidden_act**: relu (resnet backbone)
+- **status**: composable
+- **classes**:
+  - **`RTDetrResNetConvLayer`** [compute]: `L1/conv2d.py + L1/batch_norm2d.py + L1/relu.py`
+  - **`RTDetrResNetEmbeddings`** [wiring]: wires `RTDetrResNetConvLayer`(×3); direct `L1/max_pool2d.py`
+  - **`RTDetrResNetShortCut`** [compute]: `L1/conv2d.py + L1/batch_norm2d.py`
+  - **`RTDetrResNetBasicLayer`** [wiring]: wires `RTDetrResNetConvLayer`(×2), `RTDetrResNetShortCut`; direct `L1/relu.py`
+  - **`RTDetrResNetBottleNeckLayer`** [wiring]: wires `RTDetrResNetConvLayer`(×3), `RTDetrResNetShortCut`; direct `L1/relu.py`
+  - **`RTDetrResNetStage`** [wiring]: wires `RTDetrResNetBasicLayer` or `RTDetrResNetBottleNeckLayer`(×depth)
+  - **`RTDetrResNetEncoder`** [wiring]: wires `RTDetrResNetStage`(×N); see `L3/rtdetrv2_backbone.py`
+  - **`RTDetrResNetBackbone`** [wiring, inherits `BackboneMixin`]: wires `RTDetrResNetEmbeddings`, `RTDetrResNetEncoder`; see `L3/rtdetrv2_backbone.py`
+- **task heads (0)**: none (Backbone-only)
+
+## rt_detr_v2
+- **src**: modeling_rt_detr_v2.py
+- **hidden_act**: encoder_activation_function=gelu, decoder_activation_function=relu, activation_function=silu
+- **status**: kb_nano_l4 (full pipeline at `L4/rtdetrv2.py`)
+- **classes**:
+  - **`RTDetrV2MultiscaleDeformableAttention`** [compute]: `L1/rtdetrv2_deformable_attention.py` (V2 variant with discrete sampling); see `L2/rtdetrv2_deformable_attention.py`
+  - **`RTDetrV2MLP`** [compute]: `L2/rtdetrv2_mlp_head.py` (stacked Linear+ReLU)
+  - **`RTDetrV2SelfAttention`** [compute]: `L2/rtdetrv2_multihead_attention.py` (q/k/v + pos to q,k + SDPA); same as v1
+  - **`RTDetrV2DecoderLayer`** [wiring]: wires `RTDetrV2SelfAttention`, `RTDetrV2MultiscaleDeformableAttention`, `RTDetrV2MLP`, `nn.LayerNorm`(×3); see `L3/rtdetrv2_decoder.py`
+  - **`RTDetrV2Decoder`** [wiring]: wires `RTDetrV2DecoderLayer`(×N), `RTDetrV2MLP` predictor heads; see `L3/rtdetrv2_decoder.py`
+  - **`RTDetrV2FrozenBatchNorm2d`** [compute]: `L1/frozen_batch_norm2d.py`
+  - **`RTDetrV2ConvEncoder`** [wiring]: wires backbone
+  - **`RTDetrV2ConvNormLayer`** [compute]: `L2/rtdetrv2_conv_norm.py`
+  - **`RTDetrV2EncoderLayer`** [wiring]: wires `RTDetrV2SelfAttention`, `RTDetrV2MLP`, `nn.LayerNorm`(×2); see `L3/rtdetrv2_encoder_layer.py`
+  - **`RTDetrV2RepVggBlock`** [wiring]: wires `RTDetrV2ConvNormLayer`(×2); see `L2/rtdetrv2_repvgg_block.py`
+  - **`RTDetrV2CSPRepLayer`** [wiring]: wires `RTDetrV2ConvNormLayer`(×2-3), `RTDetrV2RepVggBlock`(×3); see `L2/rtdetrv2_csp_rep_layer.py`
+  - **`RTDetrV2SinePositionEmbedding`** [compute]: `L1/sinusoidal_embed.py`
+  - **`RTDetrV2AIFILayer`** [wiring]: wires `RTDetrV2SinePositionEmbedding`, `RTDetrV2EncoderLayer`(×N)
+  - **`RTDetrV2HybridEncoder`** [wiring]: wires `RTDetrV2ConvNormLayer`(×N), `RTDetrV2CSPRepLayer`(×N), `RTDetrV2AIFILayer`; see `L3/rtdetrv2_hybrid_encoder.py`
+  - **`RTDetrV2Model`** [wiring]: wires `RTDetrV2ConvEncoder`, `RTDetrV2HybridEncoder`, `RTDetrV2Decoder`, `RTDetrV2SinePositionEmbedding`; see `L3/rtdetrv2_model.py` and `L4/rtdetrv2.py`
+  - **`RTDetrV2MLPPredictionHead`** [compute]: `L2/rtdetrv2_mlp_head.py`
+- **task heads (1)**: ForObjectDetection — base + linear (per-task)
+
+## rwkv
+- **src**: modeling_rwkv.py
+- **hidden_act**: n/a (RWKV uses sigmoid + relu² internally)
+- **status**: partial (kb-nano has `L4/rwkv7.py` and `L1/chunk_rwkv7.py`/`L1/fused_recurrent_rwkv7.py`/`L1/rwkv7_recurrence.py` for RWKV-7; this folder is RWKV-1/4 with different time-mix/channel-mix)
+- **classes**:
+  - **`RwkvLinearAttention`** [compute, `torch.autograd.Function`]: bespoke linear-attention scan with `wkv_cuda` extension; closest kb-nano = `L1/rwkv7_recurrence.py` (RWKV-7 generation, not directly compatible)
+  - **`RwkvSelfAttention`** [compute]: time-mix block: `L1/linear.py` (key, value, receptance, output) + sigmoid + token-shift + `RwkvLinearAttention` recurrence; no exact L2 match
+  - **`RwkvFeedForward`** [compute]: channel-mix block: `L1/linear.py + L1/squared_relu.py + L1/sigmoid.py + L1/linear.py` (token-shift + key→relu²→value, gated by sigmoid(receptance))
+  - **`RwkvBlock`** [wiring, inherits `GradientCheckpointingLayer`]: wires `RwkvSelfAttention`, `RwkvFeedForward`, `nn.LayerNorm`(×2 = `L1/layer_norm.py`); optional pre-LN at layer 0
+  - **`RwkvModel`** [wiring]: wires `RwkvBlock`(×N), `nn.LayerNorm`; direct `L1/embedding.py` (embeddings)
+  - **`RwkvForCausalLM`** [wiring, inherits `GenerationMixin`]: wires `RwkvModel`; direct `L1/linear.py` (head)
+- **task heads (0)**: none
+
+## sam
+- **src**: modeling_sam.py
+- **hidden_act**: gelu (default)
+- **status**: composable (kb-nano has SAM-3 specific components in `L2/sam3_*` and `L3/sam3_*`; SAM v1 components are similar but distinct)
+- **classes**:
+  - **`SamPatchEmbeddings`** [compute]: `L1/conv2d.py` (Conv2d patch embed)
+  - **`SamMLPBlock`** [compute]: `L1/linear.py + L1/gelu.py + L1/linear.py` (lin1 → gelu → lin2)
+  - **`SamLayerNorm`** [compute, inherits `nn.LayerNorm`]: `L1/layer_norm.py` or `L1/layer_norm2d.py` (channels-first variant)
+  - **`SamAttention`** [compute]: `L1/linear.py + L1/dense_attention.py + L1/linear.py` (q/k/v with optional downsample rate, non-causal SDPA, output proj); closest L2 = `L2/sam3_cross_attention.py`
+  - **`SamTwoWayAttentionBlock`** [wiring]: wires `SamAttention`(×4: self, cross→tokens, MLP, cross→image), `SamMLPBlock`, `SamLayerNorm`(×4)
+  - **`SamTwoWayTransformer`** [wiring]: wires `SamTwoWayAttentionBlock`(×N), final `SamAttention` cross-attn + LayerNorm
+  - **`SamFeedForward`** [compute]: stacked `L1/linear.py + L1/relu.py` + final `L1/linear.py` (3-layer MLP, optional sigmoid)
+  - **`SamMaskDecoder`** [wiring]: wires `SamTwoWayTransformer`, `SamFeedForward`(×N); direct `L1/conv_transpose2d.py` upscale convs, `L1/embedding.py` (iou/mask tokens), `SamLayerNorm`; see `L2/sam3_mask_predictor.py` (closest analog)
+  - **`SamPositionalEmbedding`** [compute]: random Fourier features projection (`L1/sam3_position_encoding.py` or `L1/gaussian_projection.py`)
+  - **`SamMaskEmbedding`** [wiring]: `L1/conv2d.py`(×3) + `SamLayerNorm`(×2) + `L1/gelu.py`
+  - **`SamPromptEncoder`** [wiring]: wires `SamPositionalEmbedding`, `SamMaskEmbedding`; direct `L1/embedding.py` (point/not-a-point/box embeds); see `L2/sam3_prompt_encoder.py`
+  - **`SamVisionAttention`** [compute]: `L1/linear.py + L1/dense_attention.py + L1/linear.py` (qkv + relative positional embeddings + softmax attention); window-attention variant; no exact L2 match (closest = `L2/sam3_vit_attention.py`)
+  - **`SamVisionSdpaAttention`** [compute, inherits `SamVisionAttention`]: same as `SamVisionAttention` but uses SDPA (`L1/dense_attention.py`)
+  - **`SamVisionLayer`** [wiring, inherits `GradientCheckpointingLayer`]: wires `SamVisionAttention`/`SamVisionSdpaAttention`, `SamMLPBlock`, `nn.LayerNorm`(×2); see `L3/sam3_vit_block.py` analog
+  - **`SamVisionNeck`** [compute]: `L1/conv2d.py + L1/layer_norm2d.py + L1/conv2d.py + L1/layer_norm2d.py`; see `L3/sam3_neck.py`
+  - **`SamVisionEncoder`** [wiring]: wires `SamPatchEmbeddings`, `SamVisionLayer`(×N), `SamVisionNeck`; direct `nn.Parameter` (pos_embed); see `L3/sam3_vit.py`
+  - **`SamVisionModel`** [wiring]: wires `SamVisionEncoder`
+  - **`SamModel`** [wiring]: wires `SamVisionEncoder`, `SamPromptEncoder`, `SamMaskDecoder`; see `L4/sam3.py` (closest analog)
+- **task heads (0)**: none beyond ForMaskGeneration which is the main forward path (kept; not a multi-task head)
+
+## sam2
+- **src**: modeling_sam2.py
+- **hidden_act**: gelu
+- **status**: composable
+- **classes**:
+  - **`Sam2PatchEmbeddings`** [compute]: `L1/conv2d.py` (Conv2d patch embed with stride/padding)
+  - **`Sam2SinePositionEmbedding`** [compute]: `L1/sinusoidal_embed.py` (2D sin-cos positional encoding); see `L1/sam3_position_encoding.py`
+  - **`Sam2VisionNeck`** [wiring]: wires `Sam2SinePositionEmbedding`; direct `L1/conv2d.py`(×N) FPN convs, `L1/interpolate.py` (top-down upsample); see `L3/sam3_neck.py`
+  - **`Sam2MultiScaleAttention`** [compute]: `L1/linear.py + L1/dense_attention.py + L1/max_pool2d.py + L1/linear.py` (qkv → optional Q-pooling → softmax attn → proj); no exact L2 match
+  - **`Sam2FeedForward`** [compute]: stacked `L1/linear.py + L1/relu.py` (×n_layers, optional sigmoid); see `L2/sam3_vit_mlp.py` analog
+  - **`Sam2MultiScaleBlock`** [wiring, inherits `GradientCheckpointingLayer`]: wires `Sam2MultiScaleAttention`, `Sam2FeedForward`, `nn.LayerNorm`(×2); window-partition utility; see `L3/sam3_vit_block.py`
+  - **`Sam2HieraDetModel`** [wiring]: wires `Sam2PatchEmbeddings`, `Sam2MultiScaleBlock`(×N); direct positional embed `nn.Parameter`
+  - **`Sam2VisionModel`** [wiring]: wires `Sam2HieraDetModel`, `Sam2VisionNeck`; see `L3/sam3_vit.py`
+  - **`Sam2PositionalEmbedding`** [compute]: random Fourier projection (`L1/gaussian_projection.py`)
+  - **`Sam2MaskEmbedding`** [compute]: `L1/conv2d.py + L1/layer_norm2d.py + L1/gelu.py + L1/conv2d.py + L1/layer_norm2d.py + L1/gelu.py + L1/conv2d.py`
+  - **`Sam2PromptEncoder`** [wiring]: wires `Sam2PositionalEmbedding`, `Sam2MaskEmbedding`; direct `L1/embedding.py`(×N: point embeds, not-a-point embed, no-mask embed); see `L2/sam3_prompt_encoder.py`
+  - **`Sam2Attention`** [compute]: `L1/linear.py + L1/dense_attention.py + L1/linear.py` (q/k/v + non-causal SDPA + proj, with optional downsample)
+  - **`Sam2TwoWayAttentionBlock`** [wiring, inherits `GradientCheckpointingLayer`]: wires `Sam2Attention`(×3), `Sam2FeedForward`, `nn.LayerNorm`(×4)
+  - **`Sam2TwoWayTransformer`** [wiring]: wires `Sam2TwoWayAttentionBlock`(×N), final `Sam2Attention` + `nn.LayerNorm`
+  - **`Sam2LayerNorm`** [compute, inherits `nn.LayerNorm`]: `L1/layer_norm2d.py` (channels-first variant)
+  - **`Sam2MaskDecoder`** [wiring]: wires `Sam2TwoWayTransformer`, `Sam2FeedForward`(×N), `Sam2LayerNorm`(×N); direct `L1/conv_transpose2d.py` upscale convs, `L1/embedding.py` (iou/mask/object-score tokens), `L1/gelu.py`; see `L2/sam3_mask_predictor.py` and `L3/sam3_mask_decoder.py`
+  - **`Sam2Model`** [wiring]: wires `Sam2VisionModel`, `Sam2PromptEncoder`, `Sam2MaskDecoder`; see `L4/sam3.py`
+- **task heads (0)**: none beyond ForMaskGeneration
+
+## sam2_video
+- **src**: modeling_sam2_video.py
+- **hidden_act**: gelu (default), relu (memory-attention FFN)
+- **status**: kb_nano_l4 (closely related to `L4/sam3_video.py`)
+- **classes**:
+  - **`Sam2VideoLayerNorm`** [compute, inherits `nn.LayerNorm`]: `L1/layer_norm2d.py`
+  - **`Sam2VideoPositionEmbeddingSine`** [compute]: `L1/sinusoidal_embed.py` (2D sin-cos)
+  - **`Sam2VideoAttention`** [compute]: `L1/linear.py + L1/dense_attention.py + L1/linear.py` (q/k/v + non-causal SDPA + proj)
+  - **`Sam2VideoTwoWayAttentionBlock`** [wiring, inherits `GradientCheckpointingLayer`]: wires `Sam2VideoAttention`(×3), `Sam2VideoFeedForward`, `nn.LayerNorm`(×4)
+  - **`Sam2VideoFeedForward`** [compute]: stacked `L1/linear.py + L1/relu.py` + final `L1/linear.py`
+  - **`Sam2VideoVisionRotaryEmbedding`** [compute]: `L1/sam3_rope.py` (or `L1/vision_rotary_emb.py`)
+  - **`Sam2VideoRoPEAttention`** [compute]: `L1/sam3_rope_attention.py` (RoPE-based attention with k-rotation around object pointer); closest L2 = `L2/sam3_text_attention.py` analog
+  - **`Sam2VideoMemoryAttentionLayer`** [wiring]: wires `Sam2VideoAttention` (self), `Sam2VideoRoPEAttention` (cross with mem), `Sam2VideoFeedForward`, `nn.LayerNorm`(×3); see `L3/sam3_memory_attention.py`
+  - **`Sam2VideoMemoryAttention`** [wiring]: wires `Sam2VideoMemoryAttentionLayer`(×N), `nn.LayerNorm`; see `L3/sam3_memory_attention.py`
+  - **`Sam2VideoMemoryFuserCXBlock`** [wiring, inherits `GradientCheckpointingLayer`]: ConvNeXt-style fuser block: `L1/conv2d.py` (depthwise) + `L1/layer_norm2d.py` + `L1/linear.py + L1/gelu.py + L1/linear.py` + scale; see `L2/sam3_memory_encoder.py`
+  - **`Sam2VideoMemoryFuser`** [wiring]: wires `Sam2VideoMemoryFuserCXBlock`(×N); see `L2/sam3_memory_encoder.py`
+  - **`Sam2VideoMaskDownSamplerLayer`** [compute]: `L1/conv2d.py + L1/layer_norm2d.py + L1/gelu.py`
+  - **`Sam2VideoMaskDownSampler`** [wiring]: wires `Sam2VideoMaskDownSamplerLayer`(×N); direct `L1/conv2d.py`
+  - **`Sam2VideoMemoryEncoder`** [wiring]: wires `Sam2VideoMaskDownSampler`, `Sam2VideoMemoryFuser`; direct `L1/conv2d.py` (mask_downsampler + pix_feat_proj); see `L2/sam3_memory_encoder.py`
+  - **`Sam2VideoPositionalEmbedding`** [compute]: `L1/gaussian_projection.py`
+  - **`Sam2VideoMaskEmbedding`** [compute]: `L1/conv2d.py + L1/layer_norm2d.py + L1/gelu.py` (×N)
+  - **`Sam2VideoPromptEncoder`** [wiring]: wires `Sam2VideoPositionalEmbedding`, `Sam2VideoMaskEmbedding`; direct `L1/embedding.py`(×N); see `L2/sam3_prompt_encoder.py`
+  - **`Sam2VideoTwoWayTransformer`** [wiring]: wires `Sam2VideoTwoWayAttentionBlock`(×N), final `Sam2VideoAttention` + `nn.LayerNorm`
+  - **`Sam2VideoMaskDecoder`** [wiring]: wires `Sam2VideoTwoWayTransformer`, `Sam2VideoFeedForward`(×N), `Sam2VideoLayerNorm`(×N); direct `L1/conv_transpose2d.py` (upscaling), `L1/embedding.py` (iou/mask/object-score tokens), `L1/gelu.py`; see `L3/sam3_mask_decoder.py`
+  - **`Sam2VideoModel`** [wiring]: wires `Sam2HieraDetModel`-like vision (reused), `Sam2VideoPromptEncoder`, `Sam2VideoMemoryAttention`, `Sam2VideoMemoryEncoder`, `Sam2VideoMaskDecoder`; see `L4/sam3_video.py`
+- **task heads (0)**: none beyond ForMaskGeneration
+
+## sam3
+- **src**: modeling_sam3.py
+- **hidden_act**: gelu (vision/decoder), relu (geometry/mask)
+- **status**: kb_nano_l4 (full pipeline at `L4/sam3.py`)
+- **classes**:
+  - **`Sam3MLP`** [compute]: `L2/sam3_vit_mlp.py` (linear → gelu → linear) or stacked Linear+ReLU per `L4/sam3.py:Sam3MLP`
+  - **`Sam3Attention`** [compute]: `L2/sam3_cross_attention.py` (q/k/v + scaled dot product, non-causal); see also `L2/sam3_text_attention.py`
+  - **`Sam3ViTRotaryEmbedding`** [compute]: `L1/sam3_rope.py`
+  - **`Sam3ViTRoPEAttention`** [compute]: `L1/sam3_rope_attention.py` + `L2/sam3_vit_attention.py` wrapper
+  - **`Sam3ViTPatchEmbeddings`** [compute]: `L1/conv2d.py` (Conv2d patch embed)
+  - **`Sam3ViTEmbeddings`** [wiring]: wires `Sam3ViTPatchEmbeddings`; direct `nn.Parameter` (pos_embed)
+  - **`Sam3ViTLayerScale`** [compute]: `L1/tensor_ops.py` (learned scale multiplication)
+  - **`Sam3ViTLayer`** [wiring, inherits `GradientCheckpointingLayer`]: wires `Sam3ViTRoPEAttention`, `Sam3MLP`, `Sam3ViTLayerScale`(×2), `nn.LayerNorm`(×2); see `L3/sam3_vit_block.py`
+  - **`Sam3ViTModel`** [wiring]: wires `Sam3ViTEmbeddings`, `Sam3ViTLayer`(×N); see `L3/sam3_vit.py`
+  - **`Sam3SinePositionEmbedding`** [compute]: `L1/sinusoidal_embed.py`; see `L1/sam3_position_encoding.py`
+  - **`Sam3FPNLayer`** [compute]: `L1/conv2d.py + L1/layer_norm2d.py + L1/gelu.py`; see `L2/sam3_fpn_conv.py`
+  - **`Sam3VisionNeck`** [wiring]: wires `Sam3FPNLayer`(×N), `Sam3SinePositionEmbedding`; see `L3/sam3_neck.py`
+  - **`Sam3VisionModel`** [wiring]: wires `Sam3ViTModel`, `Sam3VisionNeck`
+  - **`Sam3GeometryEncoderLayer`** [wiring]: wires `Sam3Attention` (self + cross), `Sam3MLP`, `nn.LayerNorm`(×N); ACT relu
+  - **`Sam3GeometryEncoder`** [wiring]: wires `Sam3GeometryEncoderLayer`(×N); see `L4/sam3.py:Sam3GeometryEncoder`
+  - **`Sam3DetrEncoderLayer`** [wiring]: wires `Sam3Attention` (self), `Sam3MLP`, `nn.LayerNorm`(×2); see `L3/sam3_encoder_layer.py`
+  - **`Sam3DetrEncoder`** [wiring]: wires `Sam3DetrEncoderLayer`(×N), `Sam3SinePositionEmbedding`; see `L3/sam3_encoder_layer.py` framework
+  - **`Sam3DecoderMLP`** [compute]: stacked `L1/linear.py + L1/relu.py`
+  - **`Sam3DetrDecoderLayer`** [wiring]: wires `Sam3Attention` (self + cross), `Sam3MLP`, `nn.LayerNorm`(×3); see `L3/sam3_decoder_layer.py`
+  - **`Sam3DetrDecoder`** [wiring]: wires `Sam3DetrDecoderLayer`(×N), `Sam3DecoderMLP`; see `L4/sam3.py:Sam3Decoder`
+  - **`Sam3DotProductScoring`** [compute]: `L1/linear.py + L1/tensor_ops.py` (matmul-based scoring); see `L4/sam3.py:Sam3DotProductScoring`
+  - **`Sam3MaskEmbedder`** [compute]: `L1/conv2d.py + L1/layer_norm2d.py + L1/relu.py`(×N)
+  - **`Sam3PixelDecoder`** [wiring]: wires `Sam3MaskEmbedder`; direct `L1/conv2d.py`, `L1/conv_transpose2d.py`; see `L3/sam3_pixel_decoder.py`
+  - **`Sam3MaskDecoder`** [wiring]: wires `Sam3PixelDecoder`, `Sam3DotProductScoring`; see `L3/sam3_mask_decoder.py`
+  - **`Sam3Model`** [wiring]: wires `Sam3VisionModel`, `Sam3GeometryEncoder`, `Sam3DetrEncoder`, `Sam3DetrDecoder`, `Sam3MaskDecoder`; see `L4/sam3.py:Sam3Model`
+- **task heads (0)**: none beyond image-segmentation forward
+
+## sam3_lite_text
+- **src**: modeling_sam3_lite_text.py
+- **hidden_act**: relu (multiple text blocks), gelu (mask/decoder)
+- **status**: composable (uses sam3 components plus a lightweight text encoder)
+- **classes**:
+  - **`Sam3LiteTextTextPositionEmbedding`** [compute]: `L1/embedding.py` (or sinusoidal via `L1/sinusoidal_embed.py`)
+  - **`Sam3LiteTextMobileOneBlock`** [compute]: reparameterizable `L1/conv2d.py + L1/batch_norm2d.py + L1/relu.py` (mobile-one block)
+  - **`Sam3LiteTextConvMLP`** [compute]: `L1/conv2d.py + L1/relu.py + L1/conv2d.py`
+  - **`Sam3LiteTextConvolutionalFeedForward`** [wiring]: wires `Sam3LiteTextConvMLP`; direct `L1/conv2d.py`, `L1/batch_norm2d.py`
+  - **`Sam3LiteTextLayerScaledResidual`** [compute]: `L1/tensor_ops.py` (learned scale + residual)
+  - **`Sam3LiteTextRepMixer`** [compute, inherits `Sam3LiteTextLayerScaledResidual`]: token mixing via reparameterizable conv
+  - **`Sam3LiteTextRepMixerBlock`** [wiring, inherits `Sam3LiteTextLayerScaledResidual`]: wires `Sam3LiteTextRepMixer`, `Sam3LiteTextConvolutionalFeedForward`
+  - **`Sam3LiteTextTextAttention`** [compute]: `L2/sam3_text_attention.py` (text-side self-attention)
+  - **`Sam3LiteTextTextMLP`** [compute]: `L1/linear.py + L1/relu.py + L1/linear.py`
+  - **`Sam3LiteTextTextEncoderLayer`** [wiring, inherits `GradientCheckpointingLayer`]: wires `Sam3LiteTextTextAttention`, `Sam3LiteTextTextMLP`, `nn.LayerNorm`(×2); see `L3/sam3_text_encoder_layer.py`
+  - **`Sam3LiteTextTextEmbeddings`** [compute]: `L1/embedding.py + L1/embedding.py + L1/layer_norm.py + L1/dropout.py`
+  - **`Sam3LiteTextTextModel`** [wiring]: wires `Sam3LiteTextTextEmbeddings`, `Sam3LiteTextTextEncoderLayer`(×N), `nn.LayerNorm`; see `L3/sam3_text_encoder.py`
+  - **`Sam3LiteTextMLP`** [compute]: stacked `L1/linear.py + L1/gelu.py + L1/linear.py`
+  - **`Sam3LiteTextAttention`** [compute]: `L2/sam3_cross_attention.py`
+  - **`Sam3LiteTextSinePositionEmbedding`** [compute]: `L1/sinusoidal_embed.py`
+  - **`Sam3LiteTextGeometryEncoderLayer`** [wiring]: wires `Sam3LiteTextAttention`, `Sam3LiteTextMLP`, `nn.LayerNorm`(×N)
+  - **`Sam3LiteTextGeometryEncoder`** [wiring]: wires `Sam3LiteTextGeometryEncoderLayer`(×N)
+  - **`Sam3LiteTextDetrEncoderLayer`** [wiring]: wires `Sam3LiteTextAttention`, `Sam3LiteTextMLP`, `nn.LayerNorm`(×2); see `L3/sam3_encoder_layer.py`
+  - **`Sam3LiteTextDetrEncoder`** [wiring]: wires `Sam3LiteTextDetrEncoderLayer`(×N)
+  - **`Sam3LiteTextDecoderMLP`** [compute]: stacked `L1/linear.py + L1/relu.py`
+  - **`Sam3LiteTextDetrDecoderLayer`** [wiring]: wires `Sam3LiteTextAttention` (self+cross), `Sam3LiteTextMLP`, `nn.LayerNorm`(×3); see `L3/sam3_decoder_layer.py`
+  - **`Sam3LiteTextDetrDecoder`** [wiring]: wires `Sam3LiteTextDetrDecoderLayer`(×N), `Sam3LiteTextDecoderMLP`
+  - **`Sam3LiteTextDotProductScoring`** [compute]: `L1/linear.py + L1/tensor_ops.py`
+  - **`Sam3LiteTextMaskEmbedder`** [compute]: `L1/conv2d.py + L1/layer_norm2d.py + L1/relu.py`(×N)
+  - **`Sam3LiteTextPixelDecoder`** [wiring]: wires `Sam3LiteTextMaskEmbedder`; direct `L1/conv2d.py`, `L1/conv_transpose2d.py`; see `L3/sam3_pixel_decoder.py`
+  - **`Sam3LiteTextMaskDecoder`** [wiring]: wires `Sam3LiteTextPixelDecoder`, `Sam3LiteTextDotProductScoring`; see `L3/sam3_mask_decoder.py`
+  - **`Sam3LiteTextModel`** [wiring]: wires `Sam3LiteTextTextModel` (text encoder), `Sam3LiteTextRepMixerBlock`(×N) (lite vision backbone), `Sam3LiteTextGeometryEncoder`, `Sam3LiteTextDetrEncoder`, `Sam3LiteTextDetrDecoder`, `Sam3LiteTextMaskDecoder`
+- **task heads (0)**: none
+
+## sam3_tracker
+- **src**: modeling_sam3_tracker.py
+- **hidden_act**: gelu
+- **status**: kb_nano_l4 (full pipeline at `L4/sam3_tracker.py`)
+- **classes**:
+  - **`Sam3TrackerFeedForward`** [compute]: stacked `L1/linear.py + L1/relu.py` + final `L1/linear.py` (3-layer MLP)
+  - **`Sam3TrackerPositionalEmbedding`** [compute]: `L1/gaussian_projection.py` (random Fourier features)
+  - **`Sam3TrackerMaskEmbedding`** [compute]: `L1/conv2d.py + L1/layer_norm2d.py + L1/gelu.py`(×N)
+  - **`Sam3TrackerPromptEncoder`** [wiring]: wires `Sam3TrackerPositionalEmbedding`, `Sam3TrackerMaskEmbedding`; direct `L1/embedding.py`(×N: point/box/no-mask embeds); see `L2/sam3_prompt_encoder.py`
+  - **`Sam3TrackerAttention`** [compute]: `L1/linear.py + L1/dense_attention.py + L1/linear.py` (q/k/v + non-causal SDPA + proj, with optional downsample); see `L2/sam3_cross_attention.py`
+  - **`Sam3TrackerTwoWayAttentionBlock`** [wiring, inherits `GradientCheckpointingLayer`]: wires `Sam3TrackerAttention`(×3), `Sam3TrackerFeedForward`, `nn.LayerNorm`(×4)
+  - **`Sam3TrackerTwoWayTransformer`** [wiring]: wires `Sam3TrackerTwoWayAttentionBlock`(×N), final `Sam3TrackerAttention` + `nn.LayerNorm`
+  - **`Sam3TrackerLayerNorm`** [compute, inherits `nn.LayerNorm`]: `L1/layer_norm2d.py` (channels-first)
+  - **`Sam3TrackerMaskDecoder`** [wiring]: wires `Sam3TrackerTwoWayTransformer`, `Sam3TrackerFeedForward`(×N), `Sam3TrackerLayerNorm`(×N); direct `L1/conv_transpose2d.py` upscale, `L1/embedding.py` (iou/mask/object-score tokens), `L1/gelu.py`; see `L3/sam3_mask_decoder.py`
+  - **`Sam3TrackerModel`** [wiring]: wires (vision backbone shared with sam3), `Sam3TrackerPromptEncoder`, `Sam3TrackerMaskDecoder`; see `L4/sam3_tracker.py`
+- **task heads (0)**: none beyond ForMaskGeneration
+

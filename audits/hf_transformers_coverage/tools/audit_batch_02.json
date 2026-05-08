@@ -1,0 +1,3834 @@
+{
+  "blt": {
+    "src_file": "modeling_blt.py",
+    "classes": [
+      {
+        "name": "BltMLP",
+        "line": 53,
+        "bases": [
+          "nn.Module"
+        ],
+        "kb_nano_files": [
+          "tasks/baseline/L2/llama_mlp.py"
+        ],
+        "rationale": "SwiGLU MLP (gate_proj, up_proj, down_proj with silu/ACT2FN); maps to llama_mlp.py which uses MergedColumnParallelLinear + SiluAndMul + RowParallelLinear"
+      },
+      {
+        "name": "BltRMSNorm",
+        "line": 70,
+        "bases": [
+          "nn.Module"
+        ],
+        "kb_nano_files": [
+          "tasks/baseline/L1/rms_norm.py"
+        ],
+        "rationale": "Standard RMSNorm (pow(2).mean.rsqrt) despite the comment claiming T5LayerNorm equivalence; matches L1/rms_norm.py forward_native"
+      },
+      {
+        "name": "BltRotaryEmbedding",
+        "line": 90,
+        "bases": [
+          "nn.Module"
+        ],
+        "kb_nano_files": [
+          "tasks/baseline/L1/rotary_emb.py"
+        ],
+        "rationale": "Computes cos/sin tables; uses interleaved (repeat_interleave dim=-1) cos/sin and stack-based rotate_half (non-Neox); rotary_emb.py supports is_neox=False (interleaved RoPE)"
+      },
+      {
+        "name": "BltTransformerLayer",
+        "line": 156,
+        "bases": [
+          "GradientCheckpointingLayer"
+        ],
+        "kb_nano_files": [],
+        "rationale": "Wiring class: input_layernorm -> self_attn -> residual -> post_attention_layernorm -> mlp -> residual; composes BltSelfAttention, BltMLP, BltRMSNorm"
+      },
+      {
+        "name": "BltSelfAttention",
+        "line": 294,
+        "bases": [
+          "nn.Module"
+        ],
+        "kb_nano_files": [
+          "tasks/baseline/L2/attention.py",
+          "tasks/baseline/L2/attention_impl.py"
+        ],
+        "rationale": "Llama-style decoder self-attention with separate Q/K/V projections, GQA, RoPE (interleaved), causal mask, KV cache; maps to LlamaAttention top-level wrapper"
+      },
+      {
+        "name": "BltCrossAttention",
+        "line": 359,
+        "bases": [
+          "nn.Module"
+        ],
+        "kb_nano_files": [
+          "tasks/baseline/L1/linear.py",
+          "tasks/baseline/L1/dense_attention.py",
+          "tasks/baseline/L1/rms_norm.py"
+        ],
+        "rationale": "Cross-attention: q_norm/k_norm RMSNorm, separate Q/K/V projections, no RoPE, no KV cache (uses cross_attention_states); decomposes to L1/linear + L1/dense_attention + L1/rms_norm"
+      },
+      {
+        "name": "BltLocalEncoder",
+        "line": 596,
+        "bases": [
+          "BltPreTrainedModel"
+        ],
+        "kb_nano_files": [],
+        "rationale": "Wiring: stacks BltTransformerLayer + BltCrossAttention + embeddings; pure composition"
+      },
+      {
+        "name": "BltLocalDecoder",
+        "line": 709,
+        "bases": [
+          "BltPreTrainedModel"
+        ],
+        "kb_nano_files": [],
+        "rationale": "Wiring class composing transformer layers and cross-attention"
+      },
+      {
+        "name": "BltGlobalTransformer",
+        "line": 785,
+        "bases": [
+          "BltPreTrainedModel"
+        ],
+        "kb_nano_files": [],
+        "rationale": "Wiring: stacks BltTransformerLayer for global hidden states"
+      },
+      {
+        "name": "BltPatcher",
+        "line": 881,
+        "bases": [
+          "BltPreTrainedModel"
+        ],
+        "kb_nano_files": [],
+        "rationale": "Wiring: stacks BltTransformerLayer + linear head for entropy patching"
+      },
+      {
+        "name": "BltModel",
+        "line": 1177,
+        "bases": [
+          "BltPreTrainedModel"
+        ],
+        "kb_nano_files": [],
+        "rationale": "Top-level wiring composing patcher + local encoder + global transformer + local decoder"
+      },
+      {
+        "name": "BltForCausalLM",
+        "line": 1357,
+        "bases": [
+          "BltPreTrainedModel",
+          "GenerationMixin"
+        ],
+        "kb_nano_files": [],
+        "rationale": "Wiring: BltModel + lm_head Linear"
+      }
+    ],
+    "inheritance_summary": [
+      "BltMLP(MllamaTextMLP)",
+      "BltRMSNorm(MllamaTextRMSNorm)",
+      "BltRotaryEmbedding(LlamaRotaryEmbedding) - overrides forward to use interleaved RoPE",
+      "BltTransformerLayer(MllamaSelfAttentionDecoderLayer)",
+      "BltSelfAttention(MllamaTextSelfAttention)",
+      "BltCrossAttention(MllamaTextCrossAttention) - is_causal=False, adds q_norm/k_norm"
+    ],
+    "evidence_lines": [
+      "blt/modeling_blt.py:53",
+      "blt/modeling_blt.py:70",
+      "blt/modeling_blt.py:90",
+      "blt/modeling_blt.py:156",
+      "blt/modeling_blt.py:294",
+      "blt/modeling_blt.py:359",
+      "blt/modular_blt.py:265-312"
+    ]
+  },
+  "bridgetower": {
+    "src_file": "modeling_bridgetower.py",
+    "classes": [
+      {
+        "name": "BridgeTowerResidualAttention",
+        "line": 106,
+        "bases": [
+          "nn.Module"
+        ],
+        "kb_nano_files": [
+          "tasks/baseline/L2/clip_attention.py",
+          "tasks/baseline/L2/clip_mlp.py"
+        ],
+        "rationale": "CLIP-style residual block: nn.MultiheadAttention + LayerNorm + (Linear+QuickGELU+Linear) MLP; CLIP-pattern (QuickGELU is the CLIPMLP activation, but this uses nn.MultiheadAttention with custom attn_mask)"
+      },
+      {
+        "name": "BridgeTowerTransformer",
+        "line": 150,
+        "bases": [
+          "nn.Module"
+        ],
+        "kb_nano_files": [],
+        "rationale": "Wiring: stacks BridgeTowerResidualAttention blocks"
+      },
+      {
+        "name": "BridgeTowerVisionEmbeddings",
+        "line": 177,
+        "bases": [
+          "nn.Module"
+        ],
+        "kb_nano_files": [
+          "tasks/baseline/L1/conv2d.py",
+          "tasks/baseline/L1/embedding.py"
+        ],
+        "rationale": "Patch embedding: Conv2d + class_embedding + position_embedding (CLIP-style vision embedding); decomposes from L1"
+      },
+      {
+        "name": "BridgeTowerVisionTransformer",
+        "line": 260,
+        "bases": [
+          "nn.Module"
+        ],
+        "kb_nano_files": [],
+        "rationale": "Wiring: embeddings + ln_pre + transformer + ln_post"
+      },
+      {
+        "name": "BridgeTowerLinkTower",
+        "line": 318,
+        "bases": [
+          "nn.Module"
+        ],
+        "kb_nano_files": [
+          "tasks/baseline/L1/layer_norm.py"
+        ],
+        "rationale": "Cross-modal link with weighted sum + LayerNorm"
+      },
+      {
+        "name": "BridgeTowerSelfOutput",
+        "line": 344,
+        "bases": [
+          "nn.Module"
+        ],
+        "kb_nano_files": [
+          "tasks/baseline/L1/linear.py",
+          "tasks/baseline/L1/layer_norm.py"
+        ],
+        "rationale": "BERT-style self-output: dense + dropout + LayerNorm; matches EncoderSelfOutput in encoder_attention.py"
+      },
+      {
+        "name": "BridgeTowerIntermediate",
+        "line": 359,
+        "bases": [
+          "nn.Module"
+        ],
+        "kb_nano_files": [
+          "tasks/baseline/L2/encoder_mlp.py"
+        ],
+        "rationale": "BERT-style intermediate: Linear + GELU/ACT2FN; matches EncoderIntermediate"
+      },
+      {
+        "name": "BridgeTowerOutput",
+        "line": 375,
+        "bases": [
+          "nn.Module"
+        ],
+        "kb_nano_files": [
+          "tasks/baseline/L2/encoder_mlp.py"
+        ],
+        "rationale": "BERT-style output: Linear + dropout + LayerNorm; matches EncoderOutput"
+      },
+      {
+        "name": "BridgeTowerPooler",
+        "line": 390,
+        "bases": [
+          "nn.Module"
+        ],
+        "kb_nano_files": [
+          "tasks/baseline/L1/linear.py",
+          "tasks/baseline/L1/tanh.py"
+        ],
+        "rationale": "BERT pooler: take first token, dense + tanh"
+      },
+      {
+        "name": "BridgeTowerSelfAttention",
+        "line": 435,
+        "bases": [
+          "nn.Module"
+        ],
+        "kb_nano_files": [
+          "tasks/baseline/L2/encoder_attention.py"
+        ],
+        "rationale": "Roberta-derived self-attention: separate Q/K/V Linear projections, dense_attention with mask; matches EncoderSelfAttention"
+      },
+      {
+        "name": "BridgeTowerCrossAttention",
+        "line": 503,
+        "bases": [
+          "nn.Module"
+        ],
+        "kb_nano_files": [
+          "tasks/baseline/L1/linear.py",
+          "tasks/baseline/L1/dense_attention.py"
+        ],
+        "rationale": "Cross-attention with separate Q/K/V projections (no RoPE, no causal); decomposes to L1/linear + L1/dense_attention; same family as encoder_attention but cross"
+      },
+      {
+        "name": "BridgeTowerAttention",
+        "line": 580,
+        "bases": [
+          "nn.Module"
+        ],
+        "kb_nano_files": [],
+        "rationale": "Wiring class around BridgeTowerSelfAttention or BridgeTowerCrossAttention + BridgeTowerSelfOutput"
+      },
+      {
+        "name": "BridgeTowerBertCrossLayer",
+        "line": 609,
+        "bases": [
+          "nn.Module"
+        ],
+        "kb_nano_files": [],
+        "rationale": "Wiring: self-attn + cross-attn + intermediate + output"
+      },
+      {
+        "name": "BridgeTowerTextLayer",
+        "line": 668,
+        "bases": [
+          "GradientCheckpointingLayer"
+        ],
+        "kb_nano_files": [],
+        "rationale": "Wiring: BertLayer-style attention + intermediate + output"
+      },
+      {
+        "name": "BridgeTowerTextEncoder",
+        "line": 735,
+        "bases": [
+          "nn.Module"
+        ],
+        "kb_nano_files": [],
+        "rationale": "Wiring: stacks BridgeTowerTextLayer"
+      },
+      {
+        "name": "BridgeTowerTextEmbeddings",
+        "line": 770,
+        "bases": [
+          "nn.Module"
+        ],
+        "kb_nano_files": [
+          "tasks/baseline/L2/encoder_embeddings.py"
+        ],
+        "rationale": "Roberta-style embeddings: word + position + token_type + LayerNorm; matches XLMRobertaEmbeddings (uses padding-aware position ids)"
+      },
+      {
+        "name": "BridgeTowerVisionModel",
+        "line": 923,
+        "bases": [
+          "BridgeTowerPreTrainedModel"
+        ],
+        "kb_nano_files": [],
+        "rationale": "Wiring: BridgeTowerVisionTransformer wrapper"
+      },
+      {
+        "name": "BridgeTowerTextModel",
+        "line": 954,
+        "bases": [
+          "BridgeTowerPreTrainedModel"
+        ],
+        "kb_nano_files": [],
+        "rationale": "Wiring: embeddings + encoder + pooler"
+      },
+      {
+        "name": "BridgeTowerModel",
+        "line": 1085,
+        "bases": [
+          "BridgeTowerPreTrainedModel"
+        ],
+        "kb_nano_files": [],
+        "rationale": "Wiring: vision + text + cross-modal layers"
+      },
+      {
+        "name": "BridgeTowerPredictionHeadTransform",
+        "line": 1370,
+        "bases": [
+          "nn.Module"
+        ],
+        "kb_nano_files": [
+          "tasks/baseline/L1/linear.py",
+          "tasks/baseline/L1/layer_norm.py",
+          "tasks/baseline/L1/gelu.py"
+        ],
+        "rationale": "Linear + activation + LayerNorm head"
+      },
+      {
+        "name": "BridgeTowerMLMHead",
+        "line": 1387,
+        "bases": [
+          "nn.Module"
+        ],
+        "kb_nano_files": [],
+        "rationale": "Wiring: PredictionHeadTransform + decoder Linear"
+      },
+      {
+        "name": "BridgeTowerITMHead",
+        "line": 1403,
+        "bases": [
+          "nn.Module"
+        ],
+        "kb_nano_files": [
+          "tasks/baseline/L1/linear.py"
+        ],
+        "rationale": "Linear classifier head"
+      },
+      {
+        "name": "BridgeTowerForMaskedLM",
+        "line": 1418,
+        "bases": [
+          "BridgeTowerPreTrainedModel"
+        ],
+        "kb_nano_files": [],
+        "rationale": "Wiring: model + MLM head"
+      },
+      {
+        "name": "BridgeTowerForImageAndTextRetrieval",
+        "line": 1519,
+        "bases": [
+          "BridgeTowerPreTrainedModel"
+        ],
+        "kb_nano_files": [],
+        "rationale": "Wiring: model + ITM head"
+      },
+      {
+        "name": "BridgeTowerContrastiveHead",
+        "line": 1606,
+        "bases": [
+          "nn.Module"
+        ],
+        "kb_nano_files": [
+          "tasks/baseline/L1/linear.py"
+        ],
+        "rationale": "Linear projection head for contrastive learning"
+      },
+      {
+        "name": "BridgeTowerForContrastiveLearning",
+        "line": 1621,
+        "bases": [
+          "BridgeTowerPreTrainedModel"
+        ],
+        "kb_nano_files": [],
+        "rationale": "Wiring: model + contrastive heads"
+      }
+    ],
+    "inheritance_summary": [
+      "BridgeTowerSelfAttention copied from RobertaSelfAttention",
+      "BridgeTowerCrossAttention copied from RobertaCrossAttention",
+      "BridgeTowerIntermediate/Output/SelfOutput/Pooler copied from BERT",
+      "BridgeTowerVisionEmbeddings copied from CLIPVisionEmbeddings",
+      "BridgeTowerResidualAttention is CLIP-pretrained vision residual block"
+    ],
+    "evidence_lines": [
+      "bridgetower/modeling_bridgetower.py:106",
+      "bridgetower/modeling_bridgetower.py:435",
+      "bridgetower/modeling_bridgetower.py:503",
+      "bridgetower/modeling_bridgetower.py:770"
+    ]
+  },
+  "bros": {
+    "src_file": "modeling_bros.py",
+    "classes": [
+      {
+        "name": "BrosPositionalEmbedding1D",
+        "line": 66,
+        "bases": [
+          "nn.Module"
+        ],
+        "kb_nano_files": [
+          "tasks/baseline/L1/sinusoidal_embed.py"
+        ],
+        "rationale": "1D sinusoidal positional embedding for bbox coordinates"
+      },
+      {
+        "name": "BrosPositionalEmbedding2D",
+        "line": 87,
+        "bases": [
+          "nn.Module"
+        ],
+        "kb_nano_files": [],
+        "rationale": "Wiring: combines two BrosPositionalEmbedding1D for 2D bbox"
+      },
+      {
+        "name": "BrosBboxEmbeddings",
+        "line": 106,
+        "bases": [
+          "nn.Module"
+        ],
+        "kb_nano_files": [],
+        "rationale": "Wiring: BrosPositionalEmbedding2D + Linear projection of bbox positions"
+      },
+      {
+        "name": "BrosTextEmbeddings",
+        "line": 121,
+        "bases": [
+          "nn.Module"
+        ],
+        "kb_nano_files": [
+          "tasks/baseline/L2/encoder_embeddings.py"
+        ],
+        "rationale": "BERT-style word + position + token_type embeddings + LayerNorm; matches BertEmbeddings"
+      },
+      {
+        "name": "BrosSelfAttention",
+        "line": 183,
+        "bases": [
+          "nn.Module"
+        ],
+        "kb_nano_files": [
+          "tasks/baseline/L2/encoder_attention.py"
+        ],
+        "rationale": "BERT-style self-attention with optional bbox_pos_emb additive bias to keys; structurally EncoderSelfAttention with extra position bias"
+      },
+      {
+        "name": "BrosSelfOutput",
+        "line": 261,
+        "bases": [
+          "nn.Module"
+        ],
+        "kb_nano_files": [
+          "tasks/baseline/L1/linear.py",
+          "tasks/baseline/L1/layer_norm.py"
+        ],
+        "rationale": "BERT-style self-output: dense + dropout + LayerNorm; matches EncoderSelfOutput"
+      },
+      {
+        "name": "BrosAttention",
+        "line": 275,
+        "bases": [
+          "nn.Module"
+        ],
+        "kb_nano_files": [],
+        "rationale": "Wiring: BrosSelfAttention + BrosSelfOutput"
+      },
+      {
+        "name": "BrosIntermediate",
+        "line": 302,
+        "bases": [
+          "nn.Module"
+        ],
+        "kb_nano_files": [
+          "tasks/baseline/L2/encoder_mlp.py"
+        ],
+        "rationale": "BERT-style: Linear + ACT2FN; matches EncoderIntermediate"
+      },
+      {
+        "name": "BrosOutput",
+        "line": 317,
+        "bases": [
+          "nn.Module"
+        ],
+        "kb_nano_files": [
+          "tasks/baseline/L2/encoder_mlp.py"
+        ],
+        "rationale": "BERT-style: Linear + dropout + LayerNorm; matches EncoderOutput"
+      },
+      {
+        "name": "BrosLayer",
+        "line": 331,
+        "bases": [
+          "GradientCheckpointingLayer"
+        ],
+        "kb_nano_files": [],
+        "rationale": "Wiring: BrosAttention + BrosIntermediate + BrosOutput"
+      },
+      {
+        "name": "BrosPooler",
+        "line": 391,
+        "bases": [
+          "nn.Module"
+        ],
+        "kb_nano_files": [
+          "tasks/baseline/L1/linear.py",
+          "tasks/baseline/L1/tanh.py"
+        ],
+        "rationale": "BERT pooler: dense + tanh on first token"
+      },
+      {
+        "name": "BrosRelationExtractor",
+        "line": 406,
+        "bases": [
+          "nn.Module"
+        ],
+        "kb_nano_files": [
+          "tasks/baseline/L1/linear.py"
+        ],
+        "rationale": "Linear projection layers for relation extraction"
+      },
+      {
+        "name": "BrosEncoder",
+        "line": 467,
+        "bases": [
+          "BrosPreTrainedModel"
+        ],
+        "kb_nano_files": [],
+        "rationale": "Wiring: stacks BrosLayer"
+      },
+      {
+        "name": "BrosModel",
+        "line": 500,
+        "bases": [
+          "BrosPreTrainedModel"
+        ],
+        "kb_nano_files": [],
+        "rationale": "Wiring: BrosTextEmbeddings + BrosBboxEmbeddings + BrosEncoder + BrosPooler"
+      },
+      {
+        "name": "BrosForTokenClassification",
+        "line": 621,
+        "bases": [
+          "BrosPreTrainedModel"
+        ],
+        "kb_nano_files": [],
+        "rationale": "Wiring: model + classifier head"
+      },
+      {
+        "name": "BrosSpadeEEForTokenClassification",
+        "line": 721,
+        "bases": [
+          "BrosPreTrainedModel"
+        ],
+        "kb_nano_files": [],
+        "rationale": "Wiring with relation extractor"
+      },
+      {
+        "name": "BrosSpadeELForTokenClassification",
+        "line": 862,
+        "bases": [
+          "BrosPreTrainedModel"
+        ],
+        "kb_nano_files": [],
+        "rationale": "Wiring with relation extractor"
+      }
+    ],
+    "inheritance_summary": [
+      "BrosSelfAttention copied from BertSelfAttention with bbox positional bias added",
+      "BrosSelfOutput/Intermediate/Output/Pooler copied from BERT"
+    ],
+    "evidence_lines": [
+      "bros/modeling_bros.py:121",
+      "bros/modeling_bros.py:183",
+      "bros/modeling_bros.py:261",
+      "bros/modeling_bros.py:302"
+    ]
+  },
+  "camembert": {
+    "src_file": "modeling_camembert.py",
+    "classes": [
+      {
+        "name": "CamembertEmbeddings",
+        "line": 56,
+        "bases": [
+          "nn.Module"
+        ],
+        "kb_nano_files": [
+          "tasks/baseline/L2/encoder_embeddings.py"
+        ],
+        "rationale": "Roberta-derived embeddings (padding-aware position ids); matches XLMRobertaEmbeddings"
+      },
+      {
+        "name": "CamembertSelfAttention",
+        "line": 190,
+        "bases": [
+          "nn.Module"
+        ],
+        "kb_nano_files": [
+          "tasks/baseline/L2/encoder_attention.py"
+        ],
+        "rationale": "Roberta-style self-attention with separate Q/K/V; structurally EncoderSelfAttention"
+      },
+      {
+        "name": "CamembertCrossAttention",
+        "line": 257,
+        "bases": [
+          "nn.Module"
+        ],
+        "kb_nano_files": [
+          "tasks/baseline/L1/linear.py",
+          "tasks/baseline/L1/dense_attention.py"
+        ],
+        "rationale": "Cross-attention sibling of CamembertSelfAttention; decomposes to L1/linear + L1/dense_attention"
+      },
+      {
+        "name": "CamembertSelfOutput",
+        "line": 333,
+        "bases": [
+          "nn.Module"
+        ],
+        "kb_nano_files": [
+          "tasks/baseline/L1/linear.py",
+          "tasks/baseline/L1/layer_norm.py"
+        ],
+        "rationale": "BERT-style: dense + dropout + LayerNorm; matches EncoderSelfOutput"
+      },
+      {
+        "name": "CamembertAttention",
+        "line": 347,
+        "bases": [
+          "nn.Module"
+        ],
+        "kb_nano_files": [],
+        "rationale": "Wiring: SelfAttention + SelfOutput, optionally CrossAttention"
+      },
+      {
+        "name": "CamembertIntermediate",
+        "line": 376,
+        "bases": [
+          "nn.Module"
+        ],
+        "kb_nano_files": [
+          "tasks/baseline/L2/encoder_mlp.py"
+        ],
+        "rationale": "BERT-style: Linear + ACT2FN; matches EncoderIntermediate"
+      },
+      {
+        "name": "CamembertOutput",
+        "line": 391,
+        "bases": [
+          "nn.Module"
+        ],
+        "kb_nano_files": [
+          "tasks/baseline/L2/encoder_mlp.py"
+        ],
+        "rationale": "BERT-style: Linear + dropout + LayerNorm; matches EncoderOutput"
+      },
+      {
+        "name": "CamembertLayer",
+        "line": 405,
+        "bases": [
+          "GradientCheckpointingLayer"
+        ],
+        "kb_nano_files": [],
+        "rationale": "Wiring: Attention + Intermediate + Output"
+      },
+      {
+        "name": "CamembertLMHead",
+        "line": 470,
+        "bases": [
+          "nn.Module"
+        ],
+        "kb_nano_files": [
+          "tasks/baseline/L1/linear.py",
+          "tasks/baseline/L1/gelu.py",
+          "tasks/baseline/L1/layer_norm.py"
+        ],
+        "rationale": "MLM head: Linear + GELU + LayerNorm + Linear decoder"
+      },
+      {
+        "name": "CamembertEncoder",
+        "line": 518,
+        "bases": [
+          "nn.Module"
+        ],
+        "kb_nano_files": [],
+        "rationale": "Wiring: stacks CamembertLayer"
+      },
+      {
+        "name": "CamembertPooler",
+        "line": 550,
+        "bases": [
+          "nn.Module"
+        ],
+        "kb_nano_files": [
+          "tasks/baseline/L1/linear.py",
+          "tasks/baseline/L1/tanh.py"
+        ],
+        "rationale": "BERT pooler"
+      },
+      {
+        "name": "CamembertModel",
+        "line": 577,
+        "bases": [
+          "CamembertPreTrainedModel"
+        ],
+        "kb_nano_files": [],
+        "rationale": "Wiring: embeddings + encoder + pooler"
+      },
+      {
+        "name": "CamembertForMaskedLM",
+        "line": 705,
+        "bases": [
+          "CamembertPreTrainedModel"
+        ],
+        "kb_nano_files": [],
+        "rationale": "Wiring: model + LMHead"
+      },
+      {
+        "name": "CamembertClassificationHead",
+        "line": 790,
+        "bases": [
+          "nn.Module"
+        ],
+        "kb_nano_files": [
+          "tasks/baseline/L1/linear.py",
+          "tasks/baseline/L1/tanh.py"
+        ],
+        "rationale": "Linear + tanh + Linear classifier"
+      },
+      {
+        "name": "CamembertForSequenceClassification",
+        "line": 818,
+        "bases": [
+          "CamembertPreTrainedModel"
+        ],
+        "kb_nano_files": [],
+        "rationale": "Wiring"
+      },
+      {
+        "name": "CamembertForMultipleChoice",
+        "line": 903,
+        "bases": [
+          "CamembertPreTrainedModel"
+        ],
+        "kb_nano_files": [],
+        "rationale": "Wiring"
+      },
+      {
+        "name": "CamembertForTokenClassification",
+        "line": 1000,
+        "bases": [
+          "CamembertPreTrainedModel"
+        ],
+        "kb_nano_files": [],
+        "rationale": "Wiring"
+      },
+      {
+        "name": "CamembertForQuestionAnswering",
+        "line": 1071,
+        "bases": [
+          "CamembertPreTrainedModel"
+        ],
+        "kb_nano_files": [],
+        "rationale": "Wiring"
+      },
+      {
+        "name": "CamembertForCausalLM",
+        "line": 1154,
+        "bases": [
+          "CamembertPreTrainedModel",
+          "GenerationMixin"
+        ],
+        "kb_nano_files": [],
+        "rationale": "Wiring: model + LM head"
+      }
+    ],
+    "inheritance_summary": [
+      "CamembertModel(RobertaModel) - all components derived from Roberta which is structurally BERT with padding-aware position ids"
+    ],
+    "evidence_lines": [
+      "camembert/modeling_camembert.py:56",
+      "camembert/modeling_camembert.py:190",
+      "camembert/modular_camembert.py:48"
+    ]
+  },
+  "canine": {
+    "src_file": "modeling_canine.py",
+    "classes": [
+      {
+        "name": "CanineEmbeddings",
+        "line": 85,
+        "bases": [
+          "nn.Module"
+        ],
+        "kb_nano_files": [
+          "tasks/baseline/L1/embedding.py",
+          "tasks/baseline/L1/layer_norm.py"
+        ],
+        "rationale": "Hash-bucket character embeddings (multiple Embedding shards) + position + token_type + LayerNorm; not BERT-style word embeddings (uses hashing)"
+      },
+      {
+        "name": "CharactersToMolecules",
+        "line": 182,
+        "bases": [
+          "nn.Module"
+        ],
+        "kb_nano_files": [
+          "tasks/baseline/L1/conv1d.py",
+          "tasks/baseline/L1/layer_norm.py"
+        ],
+        "rationale": "Strided Conv1d downsampling + activation + LayerNorm"
+      },
+      {
+        "name": "ConvProjection",
+        "line": 226,
+        "bases": [
+          "nn.Module"
+        ],
+        "kb_nano_files": [
+          "tasks/baseline/L1/conv1d.py",
+          "tasks/baseline/L1/layer_norm.py"
+        ],
+        "rationale": "Conv1d (k=upsampling_kernel_size) + activation + LayerNorm + dropout"
+      },
+      {
+        "name": "CanineSelfAttention",
+        "line": 282,
+        "bases": [
+          "nn.Module"
+        ],
+        "kb_nano_files": [
+          "tasks/baseline/L2/encoder_attention.py"
+        ],
+        "rationale": "BERT-style self-attention (from_tensor/to_tensor; supports both self and cross modes); separate Q/K/V Linear; matches EncoderSelfAttention"
+      },
+      {
+        "name": "CanineSelfOutput",
+        "line": 363,
+        "bases": [
+          "nn.Module"
+        ],
+        "kb_nano_files": [
+          "tasks/baseline/L1/linear.py",
+          "tasks/baseline/L1/layer_norm.py"
+        ],
+        "rationale": "BERT-style: dense + dropout + LayerNorm; matches EncoderSelfOutput"
+      },
+      {
+        "name": "CanineAttention",
+        "line": 379,
+        "bases": [
+          "nn.Module"
+        ],
+        "kb_nano_files": [],
+        "rationale": "Wiring: CanineSelfAttention + CanineSelfOutput; supports local chunk-attention loop"
+      },
+      {
+        "name": "CanineIntermediate",
+        "line": 502,
+        "bases": [
+          "nn.Module"
+        ],
+        "kb_nano_files": [
+          "tasks/baseline/L2/encoder_mlp.py"
+        ],
+        "rationale": "BERT-style intermediate; matches EncoderIntermediate"
+      },
+      {
+        "name": "CanineOutput",
+        "line": 517,
+        "bases": [
+          "nn.Module"
+        ],
+        "kb_nano_files": [
+          "tasks/baseline/L2/encoder_mlp.py"
+        ],
+        "rationale": "BERT-style output; matches EncoderOutput"
+      },
+      {
+        "name": "CanineLayer",
+        "line": 531,
+        "bases": [
+          "GradientCheckpointingLayer"
+        ],
+        "kb_nano_files": [],
+        "rationale": "Wiring: CanineAttention + CanineIntermediate + CanineOutput"
+      },
+      {
+        "name": "CanineEncoder",
+        "line": 587,
+        "bases": [
+          "nn.Module"
+        ],
+        "kb_nano_files": [],
+        "rationale": "Wiring: stacks CanineLayer"
+      },
+      {
+        "name": "CaninePooler",
+        "line": 651,
+        "bases": [
+          "nn.Module"
+        ],
+        "kb_nano_files": [
+          "tasks/baseline/L1/linear.py",
+          "tasks/baseline/L1/tanh.py"
+        ],
+        "rationale": "BERT pooler"
+      },
+      {
+        "name": "CaninePredictionHeadTransform",
+        "line": 666,
+        "bases": [
+          "nn.Module"
+        ],
+        "kb_nano_files": [
+          "tasks/baseline/L1/linear.py",
+          "tasks/baseline/L1/layer_norm.py"
+        ],
+        "rationale": "Linear + activation + LayerNorm"
+      },
+      {
+        "name": "CanineLMPredictionHead",
+        "line": 683,
+        "bases": [
+          "nn.Module"
+        ],
+        "kb_nano_files": [],
+        "rationale": "Wiring: PredictionHeadTransform + decoder Linear"
+      },
+      {
+        "name": "CanineOnlyMLMHead",
+        "line": 702,
+        "bases": [
+          "nn.Module"
+        ],
+        "kb_nano_files": [],
+        "rationale": "Wiring"
+      },
+      {
+        "name": "CanineModel",
+        "line": 728,
+        "bases": [
+          "CaninePreTrainedModel"
+        ],
+        "kb_nano_files": [],
+        "rationale": "Wiring: embeddings + chars-to-molecules + initial+deep+final encoders + ConvProjection"
+      },
+      {
+        "name": "CanineForSequenceClassification",
+        "line": 990,
+        "bases": [
+          "CaninePreTrainedModel"
+        ],
+        "kb_nano_files": [],
+        "rationale": "Wiring"
+      },
+      {
+        "name": "CanineForMultipleChoice",
+        "line": 1075,
+        "bases": [
+          "CaninePreTrainedModel"
+        ],
+        "kb_nano_files": [],
+        "rationale": "Wiring"
+      },
+      {
+        "name": "CanineForTokenClassification",
+        "line": 1178,
+        "bases": [
+          "CaninePreTrainedModel"
+        ],
+        "kb_nano_files": [],
+        "rationale": "Wiring"
+      },
+      {
+        "name": "CanineForQuestionAnswering",
+        "line": 1274,
+        "bases": [
+          "CaninePreTrainedModel"
+        ],
+        "kb_nano_files": [],
+        "rationale": "Wiring"
+      }
+    ],
+    "inheritance_summary": [
+      "Canine attention/MLP modeled after BERT but with character hash embeddings and 1D conv downsampling/upsampling between encoder stacks; supports local chunked attention but kernel is the same BERT-style SDPA"
+    ],
+    "evidence_lines": [
+      "canine/modeling_canine.py:85",
+      "canine/modeling_canine.py:282",
+      "canine/modeling_canine.py:531"
+    ]
+  },
+  "chameleon": {
+    "src_file": "modeling_chameleon.py",
+    "classes": [
+      {
+        "name": "ChameleonRMSNorm",
+        "line": 68,
+        "bases": [
+          "nn.Module"
+        ],
+        "kb_nano_files": [
+          "tasks/baseline/L1/rms_norm.py"
+        ],
+        "rationale": "Standard Llama-style RMSNorm (pow.mean.rsqrt); matches L1/rms_norm.py"
+      },
+      {
+        "name": "ChameleonRotaryEmbedding",
+        "line": 89,
+        "bases": [
+          "nn.Module"
+        ],
+        "kb_nano_files": [
+          "tasks/baseline/L1/rotary_emb.py"
+        ],
+        "rationale": "Standard Neox-style RoPE (cat freqs); matches L1/rotary_emb.py with is_neox=True"
+      },
+      {
+        "name": "ChameleonMLP",
+        "line": 189,
+        "bases": [
+          "nn.Module"
+        ],
+        "kb_nano_files": [
+          "tasks/baseline/L2/llama_mlp.py"
+        ],
+        "rationale": "SwiGLU MLP (gate_proj/up_proj/down_proj with silu); matches LlamaMLP"
+      },
+      {
+        "name": "ChameleonLayerNorm",
+        "line": 206,
+        "bases": [
+          "nn.LayerNorm"
+        ],
+        "kb_nano_files": [
+          "tasks/baseline/L1/layer_norm.py"
+        ],
+        "rationale": "Custom LayerNorm with gamma/beta applied per-head; F.layer_norm without affine then manual scale; uses L1/layer_norm with custom application"
+      },
+      {
+        "name": "ChameleonAttention",
+        "line": 263,
+        "bases": [
+          "nn.Module"
+        ],
+        "kb_nano_files": [
+          "tasks/baseline/L2/attention.py",
+          "tasks/baseline/L2/attention_impl.py"
+        ],
+        "rationale": "Llama-style attention with q_norm/k_norm (ChameleonLayerNorm per-head); maps to LlamaAttention with qk_norm enabled (non-RMS variant)"
+      },
+      {
+        "name": "ChameleonDecoderLayer",
+        "line": 357,
+        "bases": [
+          "GradientCheckpointingLayer"
+        ],
+        "kb_nano_files": [],
+        "rationale": "Wiring: input_layernorm + self_attn + post_attention_layernorm + mlp"
+      },
+      {
+        "name": "ChameleonSwinDecoderLayer",
+        "line": 427,
+        "bases": [
+          "GradientCheckpointingLayer"
+        ],
+        "kb_nano_files": [],
+        "rationale": "Wiring: Swin-style residual ordering (norms after attn/mlp instead of before)"
+      },
+      {
+        "name": "ChameleonVQVAEVectorQuantizer",
+        "line": 495,
+        "bases": [
+          "nn.Module"
+        ],
+        "kb_nano_files": [
+          "tasks/baseline/L1/embedding.py"
+        ],
+        "rationale": "Codebook embedding lookup with nearest-neighbor quantization"
+      },
+      {
+        "name": "ChameleonVQVAEEncoderConvDownsample",
+        "line": 542,
+        "bases": [
+          "nn.Module"
+        ],
+        "kb_nano_files": [
+          "tasks/baseline/L1/conv2d.py"
+        ],
+        "rationale": "Conv2d 3x3 stride=2 with manual asymmetric padding"
+      },
+      {
+        "name": "ChameleonVQVAEEncoderResnetBlock",
+        "line": 554,
+        "bases": [
+          "nn.Module"
+        ],
+        "kb_nano_files": [
+          "tasks/baseline/L1/conv2d.py",
+          "tasks/baseline/L1/group_norm.py",
+          "tasks/baseline/L1/silu.py"
+        ],
+        "rationale": "GroupNorm + silu + Conv2d + GroupNorm + silu + Conv2d residual block (silu computed via x*sigmoid(x))"
+      },
+      {
+        "name": "ChameleonVQVAEEncoderAttnBlock",
+        "line": 598,
+        "bases": [
+          "nn.Module"
+        ],
+        "kb_nano_files": [
+          "tasks/baseline/L1/conv2d.py",
+          "tasks/baseline/L1/group_norm.py",
+          "tasks/baseline/L1/bmm.py",
+          "tasks/baseline/L1/softmax.py"
+        ],
+        "rationale": "VQVAE 2D self-attention via 1x1 convs + bmm + softmax"
+      },
+      {
+        "name": "ChameleonVQVAEEncoder",
+        "line": 633,
+        "bases": [
+          "nn.Module"
+        ],
+        "kb_nano_files": [],
+        "rationale": "Wiring: stacks ResnetBlock + AttnBlock + ConvDownsample"
+      },
+      {
+        "name": "ChameleonVQVAE",
+        "line": 805,
+        "bases": [
+          "ChameleonPreTrainedModel"
+        ],
+        "kb_nano_files": [],
+        "rationale": "Wiring: encoder + quantizer"
+      },
+      {
+        "name": "ChameleonModel",
+        "line": 844,
+        "bases": [
+          "ChameleonPreTrainedModel"
+        ],
+        "kb_nano_files": [],
+        "rationale": "Wiring: embeddings + decoder layers + VQVAE"
+      },
+      {
+        "name": "ChameleonForConditionalGeneration",
+        "line": 996,
+        "bases": [
+          "ChameleonPreTrainedModel",
+          "GenerationMixin"
+        ],
+        "kb_nano_files": [],
+        "rationale": "Wiring: model + LM head"
+      }
+    ],
+    "inheritance_summary": [
+      "ChameleonRMSNorm/RotaryEmbedding/MLP copied from Llama",
+      "ChameleonAttention extends with q_norm/k_norm (ChameleonLayerNorm, not RMS) per-head",
+      "VQVAE uses GroupNorm + Conv2d + 2D self-attention"
+    ],
+    "evidence_lines": [
+      "chameleon/modeling_chameleon.py:68",
+      "chameleon/modeling_chameleon.py:189",
+      "chameleon/modeling_chameleon.py:263",
+      "chameleon/modeling_chameleon.py:598"
+    ]
+  },
+  "chinese_clip": {
+    "src_file": "modular_chinese_clip.py",
+    "classes": [
+      {
+        "name": "ChineseCLIPTextEmbeddings",
+        "line": 145,
+        "bases": [
+          "AlignTextEmbeddings"
+        ],
+        "kb_nano_files": [
+          "tasks/baseline/L2/encoder_embeddings.py"
+        ],
+        "rationale": "BERT-style embeddings (word + position + token_type + LayerNorm); matches BertEmbeddings"
+      },
+      {
+        "name": "ChineseCLIPVisionEmbeddings",
+        "line": 149,
+        "bases": [
+          "CLIPVisionEmbeddings"
+        ],
+        "kb_nano_files": [
+          "tasks/baseline/L1/conv2d.py",
+          "tasks/baseline/L1/embedding.py"
+        ],
+        "rationale": "Patch Conv2d + class_embedding + position_embedding (CLIP-style vision embeddings)"
+      },
+      {
+        "name": "ChineseCLIPTextSelfAttention",
+        "line": 153,
+        "bases": [
+          "AlignTextSelfAttention"
+        ],
+        "kb_nano_files": [
+          "tasks/baseline/L2/encoder_attention.py"
+        ],
+        "rationale": "BERT-style attention; matches EncoderSelfAttention"
+      },
+      {
+        "name": "ChineseCLIPTextSelfOutput",
+        "line": 159,
+        "bases": [
+          "BertSelfOutput"
+        ],
+        "kb_nano_files": [
+          "tasks/baseline/L1/linear.py",
+          "tasks/baseline/L1/layer_norm.py"
+        ],
+        "rationale": "BERT-style self-output; matches EncoderSelfOutput"
+      },
+      {
+        "name": "ChineseCLIPTextAttention",
+        "line": 163,
+        "bases": [
+          "AlignTextAttention"
+        ],
+        "kb_nano_files": [],
+        "rationale": "Wiring: SelfAttention + SelfOutput"
+      },
+      {
+        "name": "ChineseCLIPVisionAttention",
+        "line": 167,
+        "bases": [
+          "CLIPAttention"
+        ],
+        "kb_nano_files": [
+          "tasks/baseline/L2/clip_attention.py"
+        ],
+        "rationale": "Standard CLIP attention with separate Q/K/V/O Linear projections"
+      },
+      {
+        "name": "ChineseCLIPTextIntermediate",
+        "line": 171,
+        "bases": [
+          "BertIntermediate"
+        ],
+        "kb_nano_files": [
+          "tasks/baseline/L2/encoder_mlp.py"
+        ],
+        "rationale": "BERT intermediate"
+      },
+      {
+        "name": "ChineseCLIPTextOutput",
+        "line": 175,
+        "bases": [
+          "BertOutput"
+        ],
+        "kb_nano_files": [
+          "tasks/baseline/L2/encoder_mlp.py"
+        ],
+        "rationale": "BERT output"
+      },
+      {
+        "name": "ChineseCLIPVisionMLP",
+        "line": 179,
+        "bases": [
+          "CLIPMLP"
+        ],
+        "kb_nano_files": [
+          "tasks/baseline/L2/clip_mlp.py"
+        ],
+        "rationale": "CLIP MLP: Linear + QuickGELU + Linear; matches L2/clip_mlp.py:CLIPMLP"
+      },
+      {
+        "name": "ChineseCLIPTextLayer",
+        "line": 183,
+        "bases": [
+          "AlignTextLayer"
+        ],
+        "kb_nano_files": [],
+        "rationale": "Wiring: Attention + Intermediate + Output"
+      },
+      {
+        "name": "ChineseCLIPVisionLayer",
+        "line": 187,
+        "bases": [
+          "CLIPEncoderLayer"
+        ],
+        "kb_nano_files": [],
+        "rationale": "Wiring: ln1 + self_attn + residual + ln2 + mlp + residual"
+      },
+      {
+        "name": "ChineseCLIPTextPooler",
+        "line": 194,
+        "bases": [
+          "BertPooler"
+        ],
+        "kb_nano_files": [
+          "tasks/baseline/L1/linear.py",
+          "tasks/baseline/L1/tanh.py"
+        ],
+        "rationale": "BERT pooler"
+      },
+      {
+        "name": "ChineseCLIPTextEncoder",
+        "line": 255,
+        "bases": [
+          "AlignTextEncoder"
+        ],
+        "kb_nano_files": [],
+        "rationale": "Wiring: stacks TextLayer"
+      },
+      {
+        "name": "ChineseCLIPVisionEncoder",
+        "line": 259,
+        "bases": [
+          "CLIPEncoder"
+        ],
+        "kb_nano_files": [],
+        "rationale": "Wiring: stacks VisionLayer"
+      },
+      {
+        "name": "ChineseCLIPVisionModel",
+        "line": 278,
+        "bases": [
+          "CLIPVisionModel"
+        ],
+        "kb_nano_files": [],
+        "rationale": "Wiring"
+      },
+      {
+        "name": "ChineseCLIPTextModel",
+        "line": 315,
+        "bases": [
+          "ChineseCLIPPreTrainedModel"
+        ],
+        "kb_nano_files": [],
+        "rationale": "Wiring: text embeddings + encoder + pooler"
+      },
+      {
+        "name": "ChineseCLIPModel",
+        "line": 396,
+        "bases": [
+          "CLIPModel"
+        ],
+        "kb_nano_files": [],
+        "rationale": "Wiring: vision_model + text_model + projection layers"
+      }
+    ],
+    "inheritance_summary": [
+      "Text path = BERT (via Align) - text uses BERT not CLIP text",
+      "Vision path = CLIP (CLIPAttention with QuickGELU MLP)"
+    ],
+    "evidence_lines": [
+      "chinese_clip/modular_chinese_clip.py:153",
+      "chinese_clip/modular_chinese_clip.py:167",
+      "chinese_clip/modular_chinese_clip.py:179"
+    ]
+  },
+  "chmv2": {
+    "src_file": "modeling_chmv2.py",
+    "classes": [
+      {
+        "name": "CHMv2ReassembleLayer",
+        "line": 41,
+        "bases": [
+          "nn.Module"
+        ],
+        "kb_nano_files": [
+          "tasks/baseline/L1/conv2d.py",
+          "tasks/baseline/L1/conv_transpose2d.py"
+        ],
+        "rationale": "Conv2d 1x1 + ConvTranspose2d (upsample) or Conv2d 3x3 (downsample); depth-anything reassemble layer"
+      },
+      {
+        "name": "CHMv2ReassembleStage",
+        "line": 63,
+        "bases": [
+          "nn.Module"
+        ],
+        "kb_nano_files": [],
+        "rationale": "Wiring: stacks ReassembleLayer; readout projection via Linear+GELU"
+      },
+      {
+        "name": "CHMv2PreActResidualLayer",
+        "line": 119,
+        "bases": [
+          "nn.Module"
+        ],
+        "kb_nano_files": [
+          "tasks/baseline/L1/conv2d.py",
+          "tasks/baseline/L1/relu.py"
+        ],
+        "rationale": "ReLU + Conv2d 3x3 + ReLU + Conv2d 3x3 residual block"
+      },
+      {
+        "name": "CHMv2FeatureFusionLayer",
+        "line": 161,
+        "bases": [
+          "nn.Module"
+        ],
+        "kb_nano_files": [
+          "tasks/baseline/L1/conv2d.py",
+          "tasks/baseline/L1/interpolate.py"
+        ],
+        "rationale": "PreActResidual + bilinear interpolate + Conv2d 1x1 projection"
+      },
+      {
+        "name": "CHMv2UpsampleConvHead",
+        "line": 198,
+        "bases": [
+          "nn.Module"
+        ],
+        "kb_nano_files": [
+          "tasks/baseline/L1/conv2d.py",
+          "tasks/baseline/L1/relu.py",
+          "tasks/baseline/L1/interpolate.py"
+        ],
+        "rationale": "Conv 3x3 + 2x bilinear upsample + Conv 3x3 + ReLU + Conv 1x1"
+      },
+      {
+        "name": "CHMv2Head",
+        "line": 223,
+        "bases": [
+          "nn.Module"
+        ],
+        "kb_nano_files": [],
+        "rationale": "Wiring: Reassemble + projection convs + FeatureFusion stack + UpsampleConvHead"
+      },
+      {
+        "name": "CHMv2FeaturesToDepth",
+        "line": 268,
+        "bases": [
+          "nn.Module"
+        ],
+        "kb_nano_files": [],
+        "rationale": "Pure tensor math (relu/clamp/log/linspace) for depth-bin softmax expectation; no parameterized kernels beyond elementwise"
+      },
+      {
+        "name": "CHMv2ForDepthEstimation",
+        "line": 384,
+        "bases": [
+          "CHMv2PreTrainedModel"
+        ],
+        "kb_nano_files": [],
+        "rationale": "Wiring: backbone + Head + FeaturesToDepth"
+      }
+    ],
+    "inheritance_summary": [
+      "CHMv2ReassembleLayer(DPTReassembleLayer); CHMv2PreActResidualLayer(DepthAnythingPreActResidualLayer); pure DPT-style depth head with no transformer compute (uses external backbone like DINOv2)"
+    ],
+    "evidence_lines": [
+      "chmv2/modeling_chmv2.py:41",
+      "chmv2/modeling_chmv2.py:119",
+      "chmv2/modeling_chmv2.py:161",
+      "chmv2/modeling_chmv2.py:198"
+    ]
+  },
+  "clap": {
+    "src_file": "modeling_clap.py",
+    "classes": [
+      {
+        "name": "ClapDropPath",
+        "line": 183,
+        "bases": [
+          "nn.Module"
+        ],
+        "kb_nano_files": [],
+        "rationale": "Stochastic depth (training-only); identity at inference"
+      },
+      {
+        "name": "ClapAudioAFFBlock",
+        "line": 208,
+        "bases": [
+          "nn.Module"
+        ],
+        "kb_nano_files": [
+          "tasks/baseline/L1/conv2d.py",
+          "tasks/baseline/L1/relu.py",
+          "tasks/baseline/L1/sigmoid.py"
+        ],
+        "rationale": "Attentional Feature Fusion: Conv2d + ReLU + sigmoid gating"
+      },
+      {
+        "name": "ClapAudioPatchEmbed",
+        "line": 248,
+        "bases": [
+          "nn.Module"
+        ],
+        "kb_nano_files": [
+          "tasks/baseline/L1/conv2d.py",
+          "tasks/baseline/L1/layer_norm.py"
+        ],
+        "rationale": "Conv2d patch embedding + LayerNorm + AFFBlock"
+      },
+      {
+        "name": "ClapAudioSelfAttention",
+        "line": 347,
+        "bases": [
+          "nn.Module"
+        ],
+        "kb_nano_files": [
+          "tasks/baseline/L1/linear.py",
+          "tasks/baseline/L1/softmax.py",
+          "tasks/baseline/L1/bmm.py"
+        ],
+        "rationale": "Swin window self-attention with relative-position bias; structurally distinct from standard encoder attention (window-based, has relative position bias table); decomposes from L1 (no Swin-specific kb-nano file)"
+      },
+      {
+        "name": "ClapAudioSelfOutput",
+        "line": 441,
+        "bases": [
+          "nn.Module"
+        ],
+        "kb_nano_files": [
+          "tasks/baseline/L1/linear.py"
+        ],
+        "rationale": "Swin self-output: Linear + dropout (no LayerNorm, residual elsewhere)"
+      },
+      {
+        "name": "ClapAudioAttention",
+        "line": 455,
+        "bases": [
+          "nn.Module"
+        ],
+        "kb_nano_files": [],
+        "rationale": "Wiring: SelfAttention + SelfOutput"
+      },
+      {
+        "name": "ClapAudioIntermediate",
+        "line": 474,
+        "bases": [
+          "nn.Module"
+        ],
+        "kb_nano_files": [
+          "tasks/baseline/L1/linear.py",
+          "tasks/baseline/L1/gelu.py"
+        ],
+        "rationale": "Linear + GELU/ACT2FN"
+      },
+      {
+        "name": "ClapAudioOutput",
+        "line": 490,
+        "bases": [
+          "nn.Module"
+        ],
+        "kb_nano_files": [
+          "tasks/baseline/L1/linear.py"
+        ],
+        "rationale": "Linear + dropout"
+      },
+      {
+        "name": "ClapAudioLayer",
+        "line": 503,
+        "bases": [
+          "nn.Module"
+        ],
+        "kb_nano_files": [],
+        "rationale": "Wiring: ln + window-attention + drop_path + ln + intermediate + output"
+      },
+      {
+        "name": "ClapAudioStage",
+        "line": 626,
+        "bases": [
+          "GradientCheckpointingLayer"
+        ],
+        "kb_nano_files": [],
+        "rationale": "Wiring: stacks ClapAudioLayer + downsample"
+      },
+      {
+        "name": "ClapAudioPatchMerging",
+        "line": 682,
+        "bases": [
+          "nn.Module"
+        ],
+        "kb_nano_files": [
+          "tasks/baseline/L1/linear.py",
+          "tasks/baseline/L1/layer_norm.py"
+        ],
+        "rationale": "Swin patch merging: 4x stack + LayerNorm + Linear (4C -> 2C)"
+      },
+      {
+        "name": "ClapAudioEncoder",
+        "line": 736,
+        "bases": [
+          "nn.Module"
+        ],
+        "kb_nano_files": [],
+        "rationale": "Wiring: stacks Stage"
+      },
+      {
+        "name": "ClapProjectionLayer",
+        "line": 921,
+        "bases": [
+          "nn.Module"
+        ],
+        "kb_nano_files": [
+          "tasks/baseline/L1/linear.py",
+          "tasks/baseline/L1/relu.py"
+        ],
+        "rationale": "Linear + ReLU + Linear projection head"
+      },
+      {
+        "name": "ClapTextEmbeddings",
+        "line": 940,
+        "bases": [
+          "nn.Module"
+        ],
+        "kb_nano_files": [
+          "tasks/baseline/L2/encoder_embeddings.py"
+        ],
+        "rationale": "Roberta-derived padding-aware embeddings; matches XLMRobertaEmbeddings"
+      },
+      {
+        "name": "ClapTextSelfAttention",
+        "line": 1070,
+        "bases": [
+          "nn.Module"
+        ],
+        "kb_nano_files": [
+          "tasks/baseline/L2/encoder_attention.py"
+        ],
+        "rationale": "Roberta/BERT-style self-attention; matches EncoderSelfAttention"
+      },
+      {
+        "name": "ClapTextSelfOutput",
+        "line": 1125,
+        "bases": [
+          "nn.Module"
+        ],
+        "kb_nano_files": [
+          "tasks/baseline/L1/linear.py",
+          "tasks/baseline/L1/layer_norm.py"
+        ],
+        "rationale": "BERT-style: dense + dropout + LayerNorm"
+      },
+      {
+        "name": "ClapTextAttention",
+        "line": 1140,
+        "bases": [
+          "nn.Module"
+        ],
+        "kb_nano_files": [],
+        "rationale": "Wiring: SelfAttention + SelfOutput"
+      },
+      {
+        "name": "ClapTextIntermediate",
+        "line": 1163,
+        "bases": [
+          "nn.Module"
+        ],
+        "kb_nano_files": [
+          "tasks/baseline/L2/encoder_mlp.py"
+        ],
+        "rationale": "BERT-style intermediate"
+      },
+      {
+        "name": "ClapTextOutput",
+        "line": 1179,
+        "bases": [
+          "nn.Module"
+        ],
+        "kb_nano_files": [
+          "tasks/baseline/L2/encoder_mlp.py"
+        ],
+        "rationale": "BERT-style output"
+      },
+      {
+        "name": "ClapTextLayer",
+        "line": 1194,
+        "bases": [
+          "GradientCheckpointingLayer"
+        ],
+        "kb_nano_files": [],
+        "rationale": "Wiring"
+      },
+      {
+        "name": "ClapTextEncoder",
+        "line": 1228,
+        "bases": [
+          "nn.Module"
+        ],
+        "kb_nano_files": [],
+        "rationale": "Wiring: stacks ClapTextLayer"
+      },
+      {
+        "name": "ClapTextPooler",
+        "line": 1254,
+        "bases": [
+          "nn.Module"
+        ],
+        "kb_nano_files": [
+          "tasks/baseline/L1/linear.py",
+          "tasks/baseline/L1/tanh.py"
+        ],
+        "rationale": "BERT pooler"
+      },
+      {
+        "name": "ClapAudioModel",
+        "line": 1308,
+        "bases": [
+          "ClapPreTrainedModel"
+        ],
+        "kb_nano_files": [],
+        "rationale": "Wiring: PatchEmbed + AudioEncoder"
+      },
+      {
+        "name": "ClapTextModel",
+        "line": 1372,
+        "bases": [
+          "ClapPreTrainedModel"
+        ],
+        "kb_nano_files": [],
+        "rationale": "Wiring: text embeddings + encoder + pooler"
+      },
+      {
+        "name": "ClapModel",
+        "line": 1455,
+        "bases": [
+          "ClapPreTrainedModel"
+        ],
+        "kb_nano_files": [],
+        "rationale": "Wiring: audio + text + projections"
+      },
+      {
+        "name": "ClapTextModelWithProjection",
+        "line": 1646,
+        "bases": [
+          "ClapPreTrainedModel"
+        ],
+        "kb_nano_files": [],
+        "rationale": "Wiring"
+      },
+      {
+        "name": "ClapAudioModelWithProjection",
+        "line": 1708,
+        "bases": [
+          "ClapPreTrainedModel"
+        ],
+        "kb_nano_files": [],
+        "rationale": "Wiring"
+      }
+    ],
+    "inheritance_summary": [
+      "Audio path: Swin-style hierarchical encoder with window attention, relative position bias, patch merging - structurally similar to Swin (no Swin-specific kb-nano file in this batch's scope; decomposes from L1)",
+      "Text path: Roberta-style BERT encoder; uses encoder_attention.py + encoder_mlp.py + encoder_embeddings.py"
+    ],
+    "evidence_lines": [
+      "clap/modeling_clap.py:347",
+      "clap/modeling_clap.py:1070",
+      "clap/modeling_clap.py:940"
+    ]
+  },
+  "clip": {
+    "src_file": "modeling_clip.py",
+    "classes": [
+      {
+        "name": "CLIPVisionEmbeddings",
+        "line": 138,
+        "bases": [
+          "nn.Module"
+        ],
+        "kb_nano_files": [
+          "tasks/baseline/L1/conv2d.py",
+          "tasks/baseline/L1/embedding.py"
+        ],
+        "rationale": "Conv2d patch embedding + class_embedding + position_embedding (no fused kb-nano vision-embedding file used here)"
+      },
+      {
+        "name": "CLIPTextEmbeddings",
+        "line": 221,
+        "bases": [
+          "nn.Module"
+        ],
+        "kb_nano_files": [
+          "tasks/baseline/L1/embedding.py",
+          "tasks/baseline/L1/layer_norm.py"
+        ],
+        "rationale": "[v2 fix] token + position embeddings (CLIP-style); composes from L1/embedding.py + L1/layer_norm.py."
+      },
+      {
+        "name": "CLIPAttention",
+        "line": 282,
+        "bases": [
+          "nn.Module"
+        ],
+        "kb_nano_files": [
+          "tasks/baseline/L2/clip_attention.py"
+        ],
+        "rationale": "Standard CLIP self-attention with separate Q/K/V/O projections (bias=True), no causal by default; matches L2/clip_attention.py:CLIPAttention"
+      },
+      {
+        "name": "CLIPMLP",
+        "line": 340,
+        "bases": [
+          "nn.Module"
+        ],
+        "kb_nano_files": [
+          "tasks/baseline/L2/clip_mlp.py"
+        ],
+        "rationale": "fc1 + activation (default QuickGELU) + fc2; matches L2/clip_mlp.py:CLIPMLP"
+      },
+      {
+        "name": "CLIPEncoderLayer",
+        "line": 355,
+        "bases": [
+          "GradientCheckpointingLayer"
+        ],
+        "kb_nano_files": [],
+        "rationale": "Wiring: ln1 + attn + ln2 + mlp"
+      },
+      {
+        "name": "CLIPEncoder",
+        "line": 462,
+        "bases": [
+          "nn.Module"
+        ],
+        "kb_nano_files": [],
+        "rationale": "Wiring: stacks CLIPEncoderLayer"
+      },
+      {
+        "name": "CLIPTextModel",
+        "line": 501,
+        "bases": [
+          "CLIPPreTrainedModel"
+        ],
+        "kb_nano_files": [
+          "tasks/baseline/L4/clip_text_model.py"
+        ],
+        "rationale": "Top-level text encoder; kb-nano L4/clip_text_model.py is the pipeline wiring"
+      },
+      {
+        "name": "CLIPVisionModel",
+        "line": 601,
+        "bases": [
+          "CLIPPreTrainedModel"
+        ],
+        "kb_nano_files": [],
+        "rationale": "Wiring"
+      },
+      {
+        "name": "CLIPModel",
+        "line": 667,
+        "bases": [
+          "CLIPPreTrainedModel"
+        ],
+        "kb_nano_files": [],
+        "rationale": "Wiring: text + vision + projection"
+      },
+      {
+        "name": "CLIPTextModelWithProjection",
+        "line": 842,
+        "bases": [
+          "CLIPPreTrainedModel"
+        ],
+        "kb_nano_files": [],
+        "rationale": "Wiring"
+      },
+      {
+        "name": "CLIPVisionModelWithProjection",
+        "line": 905,
+        "bases": [
+          "CLIPPreTrainedModel"
+        ],
+        "kb_nano_files": [],
+        "rationale": "Wiring"
+      },
+      {
+        "name": "CLIPForImageClassification",
+        "line": 973,
+        "bases": [
+          "CLIPPreTrainedModel"
+        ],
+        "kb_nano_files": [],
+        "rationale": "Wiring"
+      }
+    ],
+    "inheritance_summary": [
+      "CLIPAttention: separate Q/K/V/O Linear with bias=True; CLIPMLP: fc1 + QuickGELU + fc2 (per ACT2FN[hidden_act]); kb-nano has dedicated L2/clip_attention.py and L2/clip_mlp.py and L4/clip_text_model.py"
+    ],
+    "evidence_lines": [
+      "clip/modeling_clip.py:282",
+      "clip/modeling_clip.py:340",
+      "clip/modeling_clip.py:221"
+    ]
+  },
+  "clipseg": {
+    "src_file": "modular_clipseg.py",
+    "classes": [
+      {
+        "name": "CLIPSegVisionEmbeddings",
+        "line": 191,
+        "bases": [
+          "CLIPVisionEmbeddings"
+        ],
+        "kb_nano_files": [
+          "tasks/baseline/L1/conv2d.py",
+          "tasks/baseline/L1/embedding.py"
+        ],
+        "rationale": "Inherits CLIPVisionEmbeddings unchanged"
+      },
+      {
+        "name": "CLIPSegTextEmbeddings",
+        "line": 197,
+        "bases": [
+          "CLIPTextEmbeddings"
+        ],
+        "kb_nano_files": [
+          "tasks/baseline/L1/embedding.py",
+          "tasks/baseline/L1/layer_norm.py"
+        ],
+        "rationale": "[v2 fix] token + position embeddings (CLIP-style); composes from L1/embedding.py + L1/layer_norm.py."
+      },
+      {
+        "name": "CLIPSegAttention",
+        "line": 201,
+        "bases": [
+          "CLIPAttention"
+        ],
+        "kb_nano_files": [
+          "tasks/baseline/L2/clip_attention.py"
+        ],
+        "rationale": "Inherits CLIPAttention unchanged"
+      },
+      {
+        "name": "CLIPSegMLP",
+        "line": 205,
+        "bases": [
+          "CLIPMLP"
+        ],
+        "kb_nano_files": [
+          "tasks/baseline/L2/clip_mlp.py"
+        ],
+        "rationale": "Inherits CLIPMLP unchanged"
+      },
+      {
+        "name": "CLIPSegEncoderLayer",
+        "line": 209,
+        "bases": [
+          "CLIPEncoderLayer"
+        ],
+        "kb_nano_files": [],
+        "rationale": "Wiring inherited from CLIPEncoderLayer"
+      },
+      {
+        "name": "CLIPSegDecoderLayer",
+        "line": 213,
+        "bases": [
+          "CLIPEncoderLayer"
+        ],
+        "kb_nano_files": [],
+        "rationale": "Wiring: same shape as encoder layer (post-norm vs pre-norm difference)"
+      },
+      {
+        "name": "CLIPSegEncoder",
+        "line": 293,
+        "bases": [
+          "CLIPEncoder"
+        ],
+        "kb_nano_files": [],
+        "rationale": "Wiring: stacks encoder layers"
+      },
+      {
+        "name": "CLIPSegDecoder",
+        "line": 297,
+        "bases": [
+          "CLIPSegPreTrainedModel"
+        ],
+        "kb_nano_files": [],
+        "rationale": "Wiring: dense reduces + decoder layers + upsample/transposed conv head"
+      },
+      {
+        "name": "CLIPSegTextModel",
+        "line": 385,
+        "bases": [
+          "CLIPTextModel"
+        ],
+        "kb_nano_files": [],
+        "rationale": "Wiring"
+      },
+      {
+        "name": "CLIPSegVisionModel",
+        "line": 405,
+        "bases": [
+          "CLIPVisionModel"
+        ],
+        "kb_nano_files": [],
+        "rationale": "Wiring"
+      },
+      {
+        "name": "CLIPSegModel",
+        "line": 437,
+        "bases": [
+          "CLIPModel"
+        ],
+        "kb_nano_files": [],
+        "rationale": "Wiring"
+      },
+      {
+        "name": "CLIPSegForImageSegmentation",
+        "line": 517,
+        "bases": [
+          "CLIPSegPreTrainedModel"
+        ],
+        "kb_nano_files": [],
+        "rationale": "Wiring: clip + segmentation decoder + upsampling head"
+      }
+    ],
+    "inheritance_summary": [
+      "All compute modules inherit unchanged from CLIP (CLIPAttention, CLIPMLP, CLIPVisionEmbeddings, CLIPTextEmbeddings); ClipSeg adds a transformer decoder + transposed-conv head on top"
+    ],
+    "evidence_lines": [
+      "clipseg/modular_clipseg.py:191",
+      "clipseg/modular_clipseg.py:201",
+      "clipseg/modular_clipseg.py:205",
+      "clipseg/modular_clipseg.py:213"
+    ]
+  },
+  "clvp": {
+    "src_file": "modeling_clvp.py",
+    "classes": [
+      {
+        "name": "ClvpRMSNorm",
+        "line": 220,
+        "bases": [
+          "nn.Module"
+        ],
+        "kb_nano_files": [
+          "tasks/baseline/L1/rms_norm.py"
+        ],
+        "rationale": "Standard Llama-style RMSNorm (pow.mean.rsqrt); matches L1/rms_norm.py despite docstring claiming T5LayerNorm"
+      },
+      {
+        "name": "ClvpRotaryPositionalEmbedding",
+        "line": 240,
+        "bases": [
+          "nn.Module"
+        ],
+        "kb_nano_files": [
+          "tasks/baseline/L1/rotary_emb.py"
+        ],
+        "rationale": "Rotary embedding with cos/sin tables (cat freqs, Neox-style); maps to L1/rotary_emb.py"
+      },
+      {
+        "name": "ClvpSelfAttention",
+        "line": 270,
+        "bases": [
+          "nn.Module"
+        ],
+        "kb_nano_files": [
+          "tasks/baseline/L1/linear.py",
+          "tasks/baseline/L1/dense_attention.py",
+          "tasks/baseline/L1/rotary_emb.py"
+        ],
+        "rationale": "Self-attention with partial RoPE (rotary_emb_dim < head_dim) and optional KV cache; not pure encoder, decomposes from L1"
+      },
+      {
+        "name": "ClvpGatedLinearUnit",
+        "line": 384,
+        "bases": [
+          "nn.Module"
+        ],
+        "kb_nano_files": [
+          "tasks/baseline/L1/linear.py",
+          "tasks/baseline/L1/gelu.py"
+        ],
+        "rationale": "Gated linear unit: chunk(2) + multiply by activation(gate) (typically GELU); kb-nano has L1/gelu_and_mul.py for fused GELU+mul (only matches if hidden_act='gelu')"
+      },
+      {
+        "name": "ClvpEncoderMLP",
+        "line": 400,
+        "bases": [
+          "nn.Module"
+        ],
+        "kb_nano_files": [],
+        "rationale": "Wiring: ClvpGatedLinearUnit + Linear; uses fused GLU pattern"
+      },
+      {
+        "name": "ClvpEncoderLayer",
+        "line": 420,
+        "bases": [
+          "nn.Module"
+        ],
+        "kb_nano_files": [],
+        "rationale": "Wiring: input_rmsnorm + self_attn + post_attention_rmsnorm + mlp"
+      },
+      {
+        "name": "ClvpSequenceSummary",
+        "line": 462,
+        "bases": [
+          "nn.Module"
+        ],
+        "kb_nano_files": [
+          "tasks/baseline/L1/linear.py",
+          "tasks/baseline/L1/tanh.py"
+        ],
+        "rationale": "Pooling: last/first/mean/cls_index reduction + Linear + activation"
+      },
+      {
+        "name": "ClvpDecoderMLP",
+        "line": 562,
+        "bases": [
+          "nn.Module"
+        ],
+        "kb_nano_files": [
+          "tasks/baseline/L1/linear.py",
+          "tasks/baseline/L1/gelu.py"
+        ],
+        "rationale": "GPT-2 style MLP: Conv1D (Linear) + ACT2FN + Conv1D"
+      },
+      {
+        "name": "ClvpDecoderLayer",
+        "line": 579,
+        "bases": [
+          "nn.Module"
+        ],
+        "kb_nano_files": [],
+        "rationale": "Wiring: input_layernorm (LayerNorm) + attn + post_attention_layernorm + decoder MLP"
+      },
+      {
+        "name": "ClvpConditioningEncoder",
+        "line": 622,
+        "bases": [
+          "nn.Module"
+        ],
+        "kb_nano_files": [
+          "tasks/baseline/L1/conv1d.py",
+          "tasks/baseline/L1/group_norm.py",
+          "tasks/baseline/L1/embedding.py"
+        ],
+        "rationale": "Conv1d (mel) + GroupNorm + ClvpSelfAttention stack + Embedding"
+      },
+      {
+        "name": "ClvpEncoder",
+        "line": 818,
+        "bases": [
+          "ClvpPreTrainedModel"
+        ],
+        "kb_nano_files": [],
+        "rationale": "Wiring: stacks ClvpEncoderLayer + final RMSNorm + summary"
+      },
+      {
+        "name": "ClvpDecoder",
+        "line": 908,
+        "bases": [
+          "ClvpPreTrainedModel"
+        ],
+        "kb_nano_files": [],
+        "rationale": "Wiring: stacks ClvpDecoderLayer"
+      },
+      {
+        "name": "ClvpModel",
+        "line": 1016,
+        "bases": [
+          "ClvpPreTrainedModel"
+        ],
+        "kb_nano_files": [],
+        "rationale": "Wiring"
+      },
+      {
+        "name": "ClvpForCausalLM",
+        "line": 1072,
+        "bases": [
+          "ClvpPreTrainedModel",
+          "GenerationMixin"
+        ],
+        "kb_nano_files": [],
+        "rationale": "Wiring"
+      },
+      {
+        "name": "ClvpModelForConditionalGeneration",
+        "line": 1250,
+        "bases": [
+          "ClvpPreTrainedModel",
+          "GenerationMixin"
+        ],
+        "kb_nano_files": [],
+        "rationale": "Wiring: encoder + speech encoder + decoder (TTS)"
+      }
+    ],
+    "inheritance_summary": [
+      "Speech encoder uses RMSNorm + RoPE-based attention + GLU (gate*activation) MLP",
+      "Decoder is GPT-2 style with LayerNorm + Conv1D MLP + same ClvpSelfAttention class (RoPE optional via rotary_pos_emb arg)"
+    ],
+    "evidence_lines": [
+      "clvp/modeling_clvp.py:220",
+      "clvp/modeling_clvp.py:270",
+      "clvp/modeling_clvp.py:384",
+      "clvp/modeling_clvp.py:562"
+    ]
+  },
+  "codegen": {
+    "src_file": "modeling_codegen.py",
+    "classes": [
+      {
+        "name": "CodeGenAttention",
+        "line": 61,
+        "bases": [
+          "nn.Module"
+        ],
+        "kb_nano_files": [
+          "tasks/baseline/L1/linear.py",
+          "tasks/baseline/L1/softmax.py",
+          "tasks/baseline/L1/sinusoidal_embed.py"
+        ],
+        "rationale": "GPT-J-style fused QKV (qkv_proj => embed_dim*3) split with mp_num=4 layout, partial rotary (rotary_dim) using sinusoidal cos/sin precomputed table; structurally distinct from Llama (no L2 wrapper); decomposes from L1"
+      },
+      {
+        "name": "CodeGenMLP",
+        "line": 205,
+        "bases": [
+          "nn.Module"
+        ],
+        "kb_nano_files": [
+          "tasks/baseline/L1/linear.py",
+          "tasks/baseline/L1/gelu.py"
+        ],
+        "rationale": "GPT-J-style MLP: fc_in + ACT2FN (default new_gelu) + fc_out + dropout (no SwiGLU); decomposes from L1"
+      },
+      {
+        "name": "CodeGenBlock",
+        "line": 225,
+        "bases": [
+          "GradientCheckpointingLayer"
+        ],
+        "kb_nano_files": [],
+        "rationale": "Wiring: ln_1 + parallel attn+mlp residual (GPT-J pattern: attn_out + mlp_out + residual)"
+      },
+      {
+        "name": "CodeGenModel",
+        "line": 276,
+        "bases": [
+          "CodeGenPreTrainedModel"
+        ],
+        "kb_nano_files": [],
+        "rationale": "Wiring: wte + drop + stacked CodeGenBlock + ln_f"
+      },
+      {
+        "name": "CodeGenForCausalLM",
+        "line": 411,
+        "bases": [
+          "CodeGenPreTrainedModel",
+          "GenerationMixin"
+        ],
+        "kb_nano_files": [],
+        "rationale": "Wiring: CodeGenModel + lm_head"
+      }
+    ],
+    "inheritance_summary": [
+      "CodeGen is GPT-J derived: fused QKV with TPU-style mp_num=4 split, partial rotary using fixed sinusoidal table (not Llama-style rope_init_fn), GELU MLP (no gate/up/down)"
+    ],
+    "evidence_lines": [
+      "codegen/modeling_codegen.py:61",
+      "codegen/modeling_codegen.py:205",
+      "codegen/modeling_codegen.py:225"
+    ]
+  },
+  "cohere": {
+    "src_file": "modular_cohere.py",
+    "classes": [
+      {
+        "name": "CohereLayerNorm",
+        "line": 52,
+        "bases": [
+          "nn.Module"
+        ],
+        "kb_nano_files": [
+          "tasks/baseline/L1/layer_norm.py"
+        ],
+        "rationale": "TRUE LayerNorm with mean centering (NOT RMSNorm): subtracts mean, divides by sqrt(var+eps), applies weight; structurally a LayerNorm without bias; no gemma_rms_norm match; closest is L1/layer_norm.py"
+      },
+      {
+        "name": "CohereRotaryEmbedding",
+        "line": 69,
+        "bases": [
+          "LlamaRotaryEmbedding"
+        ],
+        "kb_nano_files": [
+          "tasks/baseline/L1/rotary_emb.py"
+        ],
+        "rationale": "Interleaved RoPE (repeat_interleave + stack/flatten rotate_half); supports L1/rotary_emb.py with is_neox=False"
+      },
+      {
+        "name": "CohereMLP",
+        "line": 122,
+        "bases": [
+          "LlamaMLP"
+        ],
+        "kb_nano_files": [
+          "tasks/baseline/L2/llama_mlp.py"
+        ],
+        "rationale": "Standard LlamaMLP (gate/up/down with silu); inherits unchanged"
+      },
+      {
+        "name": "CohereAttention",
+        "line": 130,
+        "bases": [
+          "LlamaAttention"
+        ],
+        "kb_nano_files": [
+          "tasks/baseline/L2/attention.py",
+          "tasks/baseline/L2/attention_impl.py"
+        ],
+        "rationale": "LlamaAttention with optional CohereLayerNorm-based qk_norm (NOT RMSNorm); matches LlamaAttention but qk_norm uses LayerNorm not RMSNorm \u2014 partial match"
+      },
+      {
+        "name": "CohereDecoderLayer",
+        "line": 194,
+        "bases": [
+          "GradientCheckpointingLayer"
+        ],
+        "kb_nano_files": [],
+        "rationale": "Wiring: input_layernorm + parallel attn+mlp residual (single-norm Cohere pattern)"
+      },
+      {
+        "name": "CohereModel",
+        "line": 247,
+        "bases": [
+          "LlamaModel"
+        ],
+        "kb_nano_files": [],
+        "rationale": "Wiring: stacks CohereDecoderLayer"
+      },
+      {
+        "name": "CohereForCausalLM",
+        "line": 256,
+        "bases": [
+          "LlamaForCausalLM"
+        ],
+        "kb_nano_files": [],
+        "rationale": "Wiring"
+      }
+    ],
+    "inheritance_summary": [
+      "CohereLayerNorm is true LayerNorm (mean-centered) with weight only - distinct from RMSNorm/T5LayerNorm; CohereAttention extends LlamaAttention with optional QK-Norm using CohereLayerNorm; Cohere uses interleaved RoPE; parallel attn+mlp pattern (single layernorm before both branches)"
+    ],
+    "evidence_lines": [
+      "cohere/modular_cohere.py:52",
+      "cohere/modular_cohere.py:69",
+      "cohere/modular_cohere.py:130",
+      "cohere/modular_cohere.py:194"
+    ]
+  },
+  "cohere2": {
+    "src_file": "modular_cohere2.py",
+    "classes": [
+      {
+        "name": "Cohere2RotaryEmbedding",
+        "line": 128,
+        "bases": [
+          "CohereRotaryEmbedding"
+        ],
+        "kb_nano_files": [
+          "tasks/baseline/L1/rotary_emb.py"
+        ],
+        "rationale": "Inherits CohereRotaryEmbedding (interleaved RoPE)"
+      },
+      {
+        "name": "Cohere2LayerNorm",
+        "line": 145,
+        "bases": [
+          "CohereLayerNorm"
+        ],
+        "kb_nano_files": [
+          "tasks/baseline/L1/layer_norm.py"
+        ],
+        "rationale": "Inherits CohereLayerNorm (mean-centered, true LayerNorm)"
+      },
+      {
+        "name": "Cohere2Attention",
+        "line": 149,
+        "bases": [
+          "CohereAttention"
+        ],
+        "kb_nano_files": [
+          "tasks/baseline/L2/attention.py",
+          "tasks/baseline/L2/attention_impl.py"
+        ],
+        "rationale": "Cohere attention with sliding window (alternating sliding/full layers); same kernel as LlamaAttention with sliding_window param"
+      },
+      {
+        "name": "Cohere2DecoderLayer",
+        "line": 220,
+        "bases": [
+          "CohereDecoderLayer"
+        ],
+        "kb_nano_files": [],
+        "rationale": "Wiring: same parallel attn+mlp pattern as CohereDecoderLayer with sliding window switch"
+      },
+      {
+        "name": "Cohere2Model",
+        "line": 257,
+        "bases": [
+          "Gemma2Model"
+        ],
+        "kb_nano_files": [],
+        "rationale": "Wiring: gemma2-style sliding-window-aware model"
+      },
+      {
+        "name": "Cohere2ForCausalLM",
+        "line": 321,
+        "bases": [
+          "CohereForCausalLM"
+        ],
+        "kb_nano_files": [],
+        "rationale": "Wiring"
+      }
+    ],
+    "inheritance_summary": [
+      "Cohere2 = Cohere + sliding window alternation (Gemma2-style); same LayerNorm + interleaved RoPE + parallel attn+mlp"
+    ],
+    "evidence_lines": [
+      "cohere2/modular_cohere2.py:128",
+      "cohere2/modular_cohere2.py:149",
+      "cohere2/modular_cohere2.py:220"
+    ]
+  },
+  "cohere2_vision": {
+    "src_file": "modeling_cohere2_vision.py",
+    "classes": [
+      {
+        "name": "Cohere2VisionMultiModalProjector",
+        "line": 36,
+        "bases": [
+          "nn.Module"
+        ],
+        "kb_nano_files": [
+          "tasks/baseline/L1/linear.py",
+          "tasks/baseline/L1/layer_norm.py",
+          "tasks/baseline/L1/silu.py"
+        ],
+        "rationale": "Pixel-shuffle + LayerNorm + Linear + silu projection (Aya-Vision style)"
+      },
+      {
+        "name": "Cohere2VisionModel",
+        "line": 146,
+        "bases": [
+          "Cohere2VisionPreTrainedModel"
+        ],
+        "kb_nano_files": [],
+        "rationale": "Wiring: vision_tower (SigLIP) + projector + Cohere2 LM"
+      },
+      {
+        "name": "Cohere2VisionForConditionalGeneration",
+        "line": 248,
+        "bases": [
+          "Cohere2VisionPreTrainedModel",
+          "GenerationMixin"
+        ],
+        "kb_nano_files": [],
+        "rationale": "Wiring: model + lm_head"
+      }
+    ],
+    "inheritance_summary": [
+      "Cohere2VisionModel(AyaVisionModel) - composition of SigLIP vision tower + Cohere2 text decoder + multimodal projector"
+    ],
+    "evidence_lines": [
+      "cohere2_vision/modeling_cohere2_vision.py:36",
+      "cohere2_vision/modeling_cohere2_vision.py:146"
+    ]
+  },
+  "cohere_asr": {
+    "src_file": "modular_cohere_asr.py",
+    "classes": [
+      {
+        "name": "CohereAsrDecoderMLP",
+        "line": 48,
+        "bases": [
+          "CLIPMLP"
+        ],
+        "kb_nano_files": [
+          "tasks/baseline/L2/clip_mlp.py"
+        ],
+        "rationale": "Inherits CLIPMLP: Linear + activation + Linear; CLIP-MLP pattern"
+      },
+      {
+        "name": "CohereAsrSelfAttention",
+        "line": 53,
+        "bases": [
+          "nn.Module"
+        ],
+        "kb_nano_files": [
+          "tasks/baseline/L2/attention.py",
+          "tasks/baseline/L2/attention_impl.py"
+        ],
+        "rationale": "Decoder self-attention (Moonshine-derived) with RoPE and KV cache; structurally LlamaAttention-like but Moonshine variant"
+      },
+      {
+        "name": "CohereAsrCrossAttention",
+        "line": 120,
+        "bases": [
+          "nn.Module"
+        ],
+        "kb_nano_files": [
+          "tasks/baseline/L2/whisper_attention.py"
+        ],
+        "rationale": "Decoder cross-attention to encoder K/V (audio); matches WhisperCrossAttention pattern (encoder K/V projected once, used across decode steps)"
+      },
+      {
+        "name": "CohereAsrDecoderLayer",
+        "line": 198,
+        "bases": [
+          "GradientCheckpointingLayer"
+        ],
+        "kb_nano_files": [],
+        "rationale": "Wiring: norm + self-attn + norm + cross-attn + norm + MLP"
+      },
+      {
+        "name": "CohereAsrDecoder",
+        "line": 255,
+        "bases": [
+          "MoonshineDecoder"
+        ],
+        "kb_nano_files": [],
+        "rationale": "Wiring: stacks CohereAsrDecoderLayer"
+      },
+      {
+        "name": "CohereAsrModel",
+        "line": 347,
+        "bases": [
+          "MoonshineModel"
+        ],
+        "kb_nano_files": [],
+        "rationale": "Wiring: encoder + decoder"
+      },
+      {
+        "name": "CohereAsrForConditionalGeneration",
+        "line": 425,
+        "bases": [
+          "MoonshineForConditionalGeneration"
+        ],
+        "kb_nano_files": [],
+        "rationale": "Wiring"
+      }
+    ],
+    "inheritance_summary": [
+      "CohereAsr is Moonshine-derived ASR: encoder-decoder with audio encoder + decoder (self-attn + cross-attn + MLP); MLP is CLIP-style (Linear+act+Linear); cross-attention uses Whisper-style K/V-prefilled cache"
+    ],
+    "evidence_lines": [
+      "cohere_asr/modular_cohere_asr.py:48",
+      "cohere_asr/modular_cohere_asr.py:53",
+      "cohere_asr/modular_cohere_asr.py:120"
+    ]
+  },
+  "colmodernvbert": {
+    "src_file": "modeling_colmodernvbert.py",
+    "classes": [
+      {
+        "name": "ColModernVBertForRetrieval",
+        "line": 106,
+        "bases": [
+          "ColModernVBertPreTrainedModel"
+        ],
+        "kb_nano_files": [
+          "tasks/baseline/L1/linear.py"
+        ],
+        "rationale": "Wraps ModernVBert vision-language model with retrieval projection Linear head; pure wiring"
+      }
+    ],
+    "inheritance_summary": [
+      "ColModernVBertForRetrieval(ColPaliForRetrieval) - thin retrieval wrapper around ModernVBert (out of this batch's compute scope)"
+    ],
+    "evidence_lines": [
+      "colmodernvbert/modeling_colmodernvbert.py:106",
+      "colmodernvbert/modular_colmodernvbert.py:376"
+    ]
+  },
+  "colpali": {
+    "src_file": "modeling_colpali.py",
+    "classes": [
+      {
+        "name": "ColPaliForRetrieval",
+        "line": 104,
+        "bases": [
+          "ColPaliPreTrainedModel"
+        ],
+        "kb_nano_files": [
+          "tasks/baseline/L1/linear.py"
+        ],
+        "rationale": "Wraps PaliGemma vision-language model with retrieval projection Linear head; pure wiring"
+      }
+    ],
+    "inheritance_summary": [
+      "ColPaliForRetrieval - retrieval wrapper around PaliGemma backbone"
+    ],
+    "evidence_lines": [
+      "colpali/modeling_colpali.py:104"
+    ]
+  },
+  "colqwen2": {
+    "src_file": "modeling_colqwen2.py",
+    "classes": [
+      {
+        "name": "ColQwen2ForRetrieval",
+        "line": 107,
+        "bases": [
+          "ColQwen2PreTrainedModel"
+        ],
+        "kb_nano_files": [
+          "tasks/baseline/L1/linear.py"
+        ],
+        "rationale": "Wraps Qwen2-VL with retrieval projection Linear head; pure wiring"
+      }
+    ],
+    "inheritance_summary": [
+      "ColQwen2ForRetrieval(ColPaliForRetrieval) - retrieval wrapper around Qwen2-VL"
+    ],
+    "evidence_lines": [
+      "colqwen2/modeling_colqwen2.py:107",
+      "colqwen2/modular_colqwen2.py:259"
+    ]
+  },
+  "conditional_detr": {
+    "src_file": "modeling_conditional_detr.py",
+    "classes": [
+      {
+        "name": "ConditionalDetrFrozenBatchNorm2d",
+        "line": 185,
+        "bases": [
+          "nn.Module"
+        ],
+        "kb_nano_files": [
+          "tasks/baseline/L1/frozen_batch_norm2d.py"
+        ],
+        "rationale": "Frozen BN2d with fixed running stats; matches L1/frozen_batch_norm2d.py"
+      },
+      {
+        "name": "ConditionalDetrConvEncoder",
+        "line": 248,
+        "bases": [
+          "nn.Module"
+        ],
+        "kb_nano_files": [],
+        "rationale": "Wiring: external CNN backbone (e.g. ResNet-50) with FrozenBN replacement"
+      },
+      {
+        "name": "ConditionalDetrSinePositionEmbedding",
+        "line": 300,
+        "bases": [
+          "nn.Module"
+        ],
+        "kb_nano_files": [
+          "tasks/baseline/L1/sinusoidal_embed.py"
+        ],
+        "rationale": "2D sinusoidal position embedding for image features"
+      },
+      {
+        "name": "ConditionalDetrLearnedPositionEmbedding",
+        "line": 352,
+        "bases": [
+          "nn.Module"
+        ],
+        "kb_nano_files": [
+          "tasks/baseline/L1/embedding.py"
+        ],
+        "rationale": "Learnable 2D position embeddings (row+col) via Embedding"
+      },
+      {
+        "name": "ConditionalDetrSelfAttention",
+        "line": 413,
+        "bases": [
+          "nn.Module"
+        ],
+        "kb_nano_files": [
+          "tasks/baseline/L1/linear.py",
+          "tasks/baseline/L1/dense_attention.py"
+        ],
+        "rationale": "Encoder self-attention with separate Q/K/V; position embeddings ADDED to Q/K (not V) before projection - matches DETR encoder pattern; decomposes from L1"
+      },
+      {
+        "name": "ConditionalDetrDecoderSelfAttention",
+        "line": 479,
+        "bases": [
+          "nn.Module"
+        ],
+        "kb_nano_files": [
+          "tasks/baseline/L1/linear.py",
+          "tasks/baseline/L1/dense_attention.py"
+        ],
+        "rationale": "Decoder self-attention with separate content+position projections (q_content+q_pos, k_content+k_pos, v); decomposes from L1 (no DETR-specific kb-nano file)"
+      },
+      {
+        "name": "ConditionalDetrDecoderCrossAttention",
+        "line": 562,
+        "bases": [
+          "nn.Module"
+        ],
+        "kb_nano_files": [
+          "tasks/baseline/L1/linear.py",
+          "tasks/baseline/L1/dense_attention.py"
+        ],
+        "rationale": "Cross-attention with content/pos concatenation (head_dim doubled); decomposes from L1 with concat-style q/k construction"
+      },
+      {
+        "name": "ConditionalDetrMLP",
+        "line": 685,
+        "bases": [
+          "nn.Module"
+        ],
+        "kb_nano_files": [
+          "tasks/baseline/L1/linear.py",
+          "tasks/baseline/L1/relu.py"
+        ],
+        "rationale": "fc1 + ACT2FN (default ReLU) + fc2; decomposes from L1"
+      },
+      {
+        "name": "ConditionalDetrEncoderLayer",
+        "line": 702,
+        "bases": [
+          "GradientCheckpointingLayer"
+        ],
+        "kb_nano_files": [],
+        "rationale": "Wiring: self_attn + ln + mlp + ln"
+      },
+      {
+        "name": "ConditionalDetrDecoderLayer",
+        "line": 759,
+        "bases": [
+          "GradientCheckpointingLayer"
+        ],
+        "kb_nano_files": [],
+        "rationale": "Wiring: decoder self-attn + ln + cross-attn + ln + mlp + ln"
+      },
+      {
+        "name": "ConditionalDetrMLPPredictionHead",
+        "line": 854,
+        "bases": [
+          "nn.Module"
+        ],
+        "kb_nano_files": [
+          "tasks/baseline/L1/linear.py",
+          "tasks/baseline/L1/relu.py"
+        ],
+        "rationale": "Multi-layer Linear+ReLU head"
+      },
+      {
+        "name": "ConditionalDetrConvBlock",
+        "line": 873,
+        "bases": [
+          "nn.Module"
+        ],
+        "kb_nano_files": [
+          "tasks/baseline/L1/conv2d.py"
+        ],
+        "rationale": "Conv2d 3x3 + BN + ReLU"
+      },
+      {
+        "name": "ConditionalDetrFPNFusionStage",
+        "line": 886,
+        "bases": [
+          "nn.Module"
+        ],
+        "kb_nano_files": [],
+        "rationale": "Wiring: ConvBlocks for FPN fusion"
+      },
+      {
+        "name": "ConditionalDetrMaskHeadSmallConv",
+        "line": 908,
+        "bases": [
+          "nn.Module"
+        ],
+        "kb_nano_files": [
+          "tasks/baseline/L1/conv2d.py",
+          "tasks/baseline/L1/group_norm.py",
+          "tasks/baseline/L1/relu.py",
+          "tasks/baseline/L1/interpolate.py"
+        ],
+        "rationale": "Mask head: stacked Conv2d + GroupNorm + ReLU + bilinear upsample"
+      },
+      {
+        "name": "ConditionalDetrMHAttentionMap",
+        "line": 981,
+        "bases": [
+          "nn.Module"
+        ],
+        "kb_nano_files": [
+          "tasks/baseline/L1/linear.py",
+          "tasks/baseline/L1/conv2d.py",
+          "tasks/baseline/L1/softmax.py"
+        ],
+        "rationale": "Returns spatial attention map only (no value mul); Q via Linear, K via Conv2d 1x1; softmax over flattened H*W"
+      },
+      {
+        "name": "ConditionalDetrEncoder",
+        "line": 1082,
+        "bases": [
+          "ConditionalDetrPreTrainedModel"
+        ],
+        "kb_nano_files": [],
+        "rationale": "Wiring: stacks EncoderLayer"
+      },
+      {
+        "name": "ConditionalDetrDecoder",
+        "line": 1159,
+        "bases": [
+          "ConditionalDetrPreTrainedModel"
+        ],
+        "kb_nano_files": [],
+        "rationale": "Wiring: stacks DecoderLayer + iterative box refinement"
+      },
+      {
+        "name": "ConditionalDetrModel",
+        "line": 1311,
+        "bases": [
+          "ConditionalDetrPreTrainedModel"
+        ],
+        "kb_nano_files": [],
+        "rationale": "Wiring: backbone + projection + encoder + decoder"
+      },
+      {
+        "name": "ConditionalDetrForObjectDetection",
+        "line": 1479,
+        "bases": [
+          "ConditionalDetrPreTrainedModel"
+        ],
+        "kb_nano_files": [],
+        "rationale": "Wiring: model + class/bbox heads"
+      },
+      {
+        "name": "ConditionalDetrForSegmentation",
+        "line": 1623,
+        "bases": [
+          "ConditionalDetrPreTrainedModel"
+        ],
+        "kb_nano_files": [],
+        "rationale": "Wiring: detection model + MaskHeadSmallConv + MHAttentionMap"
+      }
+    ],
+    "inheritance_summary": [
+      "ConditionalDetr inherits much from DETR: ConvEncoder + frozen BN, sinusoidal/learned 2D pos embeddings; ConditionalDetrSelfAttention=DetrSelfAttention; the decoder self/cross-attention are DETR-conditional-specific (separate content+position projections)"
+    ],
+    "evidence_lines": [
+      "conditional_detr/modeling_conditional_detr.py:413",
+      "conditional_detr/modeling_conditional_detr.py:479",
+      "conditional_detr/modeling_conditional_detr.py:562",
+      "conditional_detr/modeling_conditional_detr.py:759"
+    ]
+  },
+  "convbert": {
+    "src_file": "modeling_convbert.py",
+    "classes": [
+      {
+        "name": "ConvBertEmbeddings",
+        "line": 51,
+        "bases": [
+          "nn.Module"
+        ],
+        "kb_nano_files": [
+          "tasks/baseline/L2/encoder_embeddings.py"
+        ],
+        "rationale": "BERT-style word + position + token_type embeddings + LayerNorm"
+      },
+      {
+        "name": "SeparableConv1D",
+        "line": 109,
+        "bases": [
+          "nn.Module"
+        ],
+        "kb_nano_files": [
+          "tasks/baseline/L1/conv1d.py"
+        ],
+        "rationale": "Depthwise Conv1d + pointwise Conv1d 1x1 + bias"
+      },
+      {
+        "name": "ConvBertSelfAttention",
+        "line": 135,
+        "bases": [
+          "nn.Module"
+        ],
+        "kb_nano_files": [
+          "tasks/baseline/L1/linear.py",
+          "tasks/baseline/L1/conv1d.py",
+          "tasks/baseline/L1/softmax.py"
+        ],
+        "rationale": "Hybrid: standard self-attention + span-based dynamic conv (SeparableConv1D + conv_kernel_layer + unfold); decomposes from L1; not a vanilla BERT attention"
+      },
+      {
+        "name": "ConvBertSelfOutput",
+        "line": 257,
+        "bases": [
+          "nn.Module"
+        ],
+        "kb_nano_files": [
+          "tasks/baseline/L1/linear.py",
+          "tasks/baseline/L1/layer_norm.py"
+        ],
+        "rationale": "BERT-style: dense + dropout (no LayerNorm in self-output here per the code); matches partial EncoderSelfOutput"
+      },
+      {
+        "name": "ConvBertAttention",
+        "line": 271,
+        "bases": [
+          "nn.Module"
+        ],
+        "kb_nano_files": [],
+        "rationale": "Wiring: SelfAttention + SelfOutput"
+      },
+      {
+        "name": "GroupedLinearLayer",
+        "line": 294,
+        "bases": [
+          "nn.Module"
+        ],
+        "kb_nano_files": [
+          "tasks/baseline/L1/linear.py"
+        ],
+        "rationale": "Block-diagonal Linear (split into num_groups, applies separate linear per group); reshapes input/output"
+      },
+      {
+        "name": "ConvBertIntermediate",
+        "line": 316,
+        "bases": [
+          "nn.Module"
+        ],
+        "kb_nano_files": [
+          "tasks/baseline/L2/encoder_mlp.py"
+        ],
+        "rationale": "BERT-style intermediate (uses GroupedLinearLayer when num_groups>1, else Linear)"
+      },
+      {
+        "name": "ConvBertOutput",
+        "line": 336,
+        "bases": [
+          "nn.Module"
+        ],
+        "kb_nano_files": [
+          "tasks/baseline/L2/encoder_mlp.py"
+        ],
+        "rationale": "BERT-style output"
+      },
+      {
+        "name": "ConvBertLayer",
+        "line": 355,
+        "bases": [
+          "GradientCheckpointingLayer"
+        ],
+        "kb_nano_files": [],
+        "rationale": "Wiring: Attention + Intermediate + Output"
+      },
+      {
+        "name": "ConvBertEncoder",
+        "line": 432,
+        "bases": [
+          "nn.Module"
+        ],
+        "kb_nano_files": [],
+        "rationale": "Wiring: stacks ConvBertLayer"
+      },
+      {
+        "name": "ConvBertPredictionHeadTransform",
+        "line": 461,
+        "bases": [
+          "nn.Module"
+        ],
+        "kb_nano_files": [
+          "tasks/baseline/L1/linear.py",
+          "tasks/baseline/L1/layer_norm.py"
+        ],
+        "rationale": "Linear + activation + LayerNorm"
+      },
+      {
+        "name": "ConvBertSequenceSummary",
+        "line": 479,
+        "bases": [
+          "nn.Module"
+        ],
+        "kb_nano_files": [
+          "tasks/baseline/L1/linear.py"
+        ],
+        "rationale": "Reduce sequence to single vector with Linear + activation"
+      },
+      {
+        "name": "ConvBertModel",
+        "line": 579,
+        "bases": [
+          "ConvBertPreTrainedModel"
+        ],
+        "kb_nano_files": [],
+        "rationale": "Wiring"
+      },
+      {
+        "name": "ConvBertGeneratorPredictions",
+        "line": 651,
+        "bases": [
+          "nn.Module"
+        ],
+        "kb_nano_files": [
+          "tasks/baseline/L1/linear.py",
+          "tasks/baseline/L1/layer_norm.py",
+          "tasks/baseline/L1/gelu.py"
+        ],
+        "rationale": "Linear + GELU + LayerNorm"
+      },
+      {
+        "name": "ConvBertForMaskedLM",
+        "line": 670,
+        "bases": [
+          "ConvBertPreTrainedModel"
+        ],
+        "kb_nano_files": [],
+        "rationale": "Wiring"
+      },
+      {
+        "name": "ConvBertClassificationHead",
+        "line": 734,
+        "bases": [
+          "nn.Module"
+        ],
+        "kb_nano_files": [
+          "tasks/baseline/L1/linear.py"
+        ],
+        "rationale": "Classifier head: Linear + tanh + Linear"
+      },
+      {
+        "name": "ConvBertForSequenceClassification",
+        "line": 764,
+        "bases": [
+          "ConvBertPreTrainedModel"
+        ],
+        "kb_nano_files": [],
+        "rationale": "Wiring"
+      },
+      {
+        "name": "ConvBertForMultipleChoice",
+        "line": 837,
+        "bases": [
+          "ConvBertPreTrainedModel"
+        ],
+        "kb_nano_files": [],
+        "rationale": "Wiring"
+      },
+      {
+        "name": "ConvBertForTokenClassification",
+        "line": 932,
+        "bases": [
+          "ConvBertPreTrainedModel"
+        ],
+        "kb_nano_files": [],
+        "rationale": "Wiring"
+      },
+      {
+        "name": "ConvBertForQuestionAnswering",
+        "line": 991,
+        "bases": [
+          "ConvBertPreTrainedModel"
+        ],
+        "kb_nano_files": [],
+        "rationale": "Wiring"
+      }
+    ],
+    "inheritance_summary": [
+      "ConvBert mixes standard BERT self-attention with a span-based dynamic conv head (SeparableConv1D + unfold + softmax over kernel positions); MLP can be 'grouped' linear (block-diagonal); not a pure encoder-attention match - decomposes from L1"
+    ],
+    "evidence_lines": [
+      "convbert/modeling_convbert.py:51",
+      "convbert/modeling_convbert.py:109",
+      "convbert/modeling_convbert.py:135",
+      "convbert/modeling_convbert.py:294"
+    ]
+  },
+  "convnext": {
+    "src_file": "modeling_convnext.py",
+    "classes": [
+      {
+        "name": "ConvNextDropPath",
+        "line": 56,
+        "bases": [
+          "nn.Module"
+        ],
+        "kb_nano_files": [],
+        "rationale": "Stochastic depth (training only)"
+      },
+      {
+        "name": "ConvNextLayerNorm",
+        "line": 70,
+        "bases": [
+          "nn.LayerNorm"
+        ],
+        "kb_nano_files": [
+          "tasks/baseline/L1/layer_norm.py",
+          "tasks/baseline/L1/layer_norm2d.py"
+        ],
+        "rationale": "LayerNorm with channels-first/channels-last format support"
+      },
+      {
+        "name": "ConvNextEmbeddings",
+        "line": 96,
+        "bases": [
+          "nn.Module"
+        ],
+        "kb_nano_files": [
+          "tasks/baseline/L1/conv2d.py",
+          "tasks/baseline/L1/layer_norm.py"
+        ],
+        "rationale": "Patch embedding: Conv2d 4x4 stride=4 + LayerNorm"
+      },
+      {
+        "name": "ConvNextLayer",
+        "line": 120,
+        "bases": [
+          "nn.Module"
+        ],
+        "kb_nano_files": [
+          "tasks/baseline/L1/conv2d.py",
+          "tasks/baseline/L1/layer_norm.py",
+          "tasks/baseline/L1/linear.py",
+          "tasks/baseline/L1/gelu.py"
+        ],
+        "rationale": "Depthwise Conv2d 7x7 + LayerNorm + Linear (pointwise) + GELU + Linear (pointwise) + layer-scale residual; ConvNeXt block (no GRN, that's V2)"
+      },
+      {
+        "name": "ConvNextStage",
+        "line": 163,
+        "bases": [
+          "nn.Module"
+        ],
+        "kb_nano_files": [],
+        "rationale": "Wiring: downsample (Conv2d 2x2 stride=2) + stacks ConvNextLayer"
+      },
+      {
+        "name": "ConvNextEncoder",
+        "line": 216,
+        "bases": [
+          "ConvNextPreTrainedModel"
+        ],
+        "kb_nano_files": [],
+        "rationale": "Wiring: stacks ConvNextStage"
+      },
+      {
+        "name": "ConvNextModel",
+        "line": 257,
+        "bases": [
+          "ConvNextPreTrainedModel"
+        ],
+        "kb_nano_files": [],
+        "rationale": "Wiring: embeddings + encoder + final LayerNorm"
+      },
+      {
+        "name": "ConvNextForImageClassification",
+        "line": 299,
+        "bases": [
+          "ConvNextPreTrainedModel"
+        ],
+        "kb_nano_files": [],
+        "rationale": "Wiring"
+      },
+      {
+        "name": "ConvNextBackbone",
+        "line": 348,
+        "bases": [
+          "BackboneMixin",
+          "ConvNextPreTrainedModel"
+        ],
+        "kb_nano_files": [],
+        "rationale": "Wiring: extract intermediate stage outputs"
+      }
+    ],
+    "inheritance_summary": [
+      "ConvNext (v1) block: dwconv 7x7 + LN + pwconv (Linear) + GELU + pwconv (Linear) + layer-scale + DropPath; no GRN (that's v2)"
+    ],
+    "evidence_lines": [
+      "convnext/modeling_convnext.py:96",
+      "convnext/modeling_convnext.py:120",
+      "convnext/modeling_convnext.py:163"
+    ]
+  },
+  "convnextv2": {
+    "src_file": "modeling_convnextv2.py",
+    "classes": [
+      {
+        "name": "ConvNextV2DropPath",
+        "line": 56,
+        "bases": [
+          "nn.Module"
+        ],
+        "kb_nano_files": [],
+        "rationale": "Stochastic depth (training only)"
+      },
+      {
+        "name": "ConvNextV2GRN",
+        "line": 70,
+        "bases": [
+          "nn.Module"
+        ],
+        "kb_nano_files": [
+          "tasks/baseline/L1/grn.py"
+        ],
+        "rationale": "Global Response Normalization; matches L1/grn.py used inside L2/convnextv2_block.py"
+      },
+      {
+        "name": "ConvNextV2LayerNorm",
+        "line": 88,
+        "bases": [
+          "nn.LayerNorm"
+        ],
+        "kb_nano_files": [
+          "tasks/baseline/L1/layer_norm.py",
+          "tasks/baseline/L1/layer_norm2d.py"
+        ],
+        "rationale": "LayerNorm with channels-first/channels-last format support"
+      },
+      {
+        "name": "ConvNextV2Embeddings",
+        "line": 115,
+        "bases": [
+          "nn.Module"
+        ],
+        "kb_nano_files": [
+          "tasks/baseline/L1/conv2d.py",
+          "tasks/baseline/L1/layer_norm.py"
+        ],
+        "rationale": "Patch embedding: Conv2d + LayerNorm"
+      },
+      {
+        "name": "ConvNextV2Layer",
+        "line": 139,
+        "bases": [
+          "nn.Module"
+        ],
+        "kb_nano_files": [
+          "tasks/baseline/L2/convnextv2_block.py"
+        ],
+        "rationale": "ConvNeXtV2 block: dwconv7x7 + LN + Linear + GELU + GRN + Linear + DropPath; matches L2/convnextv2_block.py:ConvNeXtV2Layer (verified: imports conv2d, layer_norm, linear, gelu, grn)"
+      },
+      {
+        "name": "ConvNextV2Stage",
+        "line": 183,
+        "bases": [
+          "nn.Module"
+        ],
+        "kb_nano_files": [
+          "tasks/baseline/L3/convnextv2_stage.py"
+        ],
+        "rationale": "Wiring: downsample + stacks ConvNeXtV2Layer; kb-nano L3/convnextv2_stage.py"
+      },
+      {
+        "name": "ConvNextV2Encoder",
+        "line": 237,
+        "bases": [
+          "ConvNextV2PreTrainedModel"
+        ],
+        "kb_nano_files": [
+          "tasks/baseline/L4/convnextv2.py"
+        ],
+        "rationale": "Wiring: stacks Stage; kb-nano L4/convnextv2.py is the pipeline"
+      },
+      {
+        "name": "ConvNextV2Model",
+        "line": 279,
+        "bases": [
+          "ConvNextV2PreTrainedModel"
+        ],
+        "kb_nano_files": [],
+        "rationale": "Wiring: embeddings + encoder + final LayerNorm"
+      },
+      {
+        "name": "ConvNextV2ForImageClassification",
+        "line": 322,
+        "bases": [
+          "ConvNextV2PreTrainedModel"
+        ],
+        "kb_nano_files": [],
+        "rationale": "Wiring"
+      },
+      {
+        "name": "ConvNextV2Backbone",
+        "line": 372,
+        "bases": [
+          "BackboneMixin",
+          "ConvNextV2PreTrainedModel"
+        ],
+        "kb_nano_files": [],
+        "rationale": "Wiring"
+      }
+    ],
+    "inheritance_summary": [
+      "ConvNextV2 = ConvNext + GRN (Global Response Normalization) replacing layer-scale; kb-nano has dedicated L1/grn.py + L2/convnextv2_block.py + L3/convnextv2_stage.py + L4/convnextv2.py for this architecture"
+    ],
+    "evidence_lines": [
+      "convnextv2/modeling_convnextv2.py:70",
+      "convnextv2/modeling_convnextv2.py:139",
+      "convnextv2/modeling_convnextv2.py:183"
+    ]
+  },
+  "cpmant": {
+    "src_file": "modeling_cpmant.py",
+    "classes": [
+      {
+        "name": "CpmAntLayerNorm",
+        "line": 36,
+        "bases": [
+          "nn.Module"
+        ],
+        "kb_nano_files": [
+          "tasks/baseline/L1/rms_norm.py"
+        ],
+        "rationale": "RMSNorm (variance.rsqrt with weight only); standard Llama-style RMSNorm despite name"
+      },
+      {
+        "name": "CpmAntAttention",
+        "line": 61,
+        "bases": [
+          "nn.Module"
+        ],
+        "kb_nano_files": [
+          "tasks/baseline/L1/linear.py",
+          "tasks/baseline/L1/softmax.py"
+        ],
+        "rationale": "Self/cross-attention with separate Q/K/V Linear (no bias), additive position_bias (T5-like relative bias passed externally), KV cache; decomposes from L1"
+      },
+      {
+        "name": "CpmAntSelfAttentionBlock",
+        "line": 162,
+        "bases": [
+          "nn.Module"
+        ],
+        "kb_nano_files": [],
+        "rationale": "Wiring: layernorm + self-attention + dropout + residual"
+      },
+      {
+        "name": "CpmAntDenseGatedACT",
+        "line": 216,
+        "bases": [
+          "nn.Module"
+        ],
+        "kb_nano_files": [
+          "tasks/baseline/L1/linear.py",
+          "tasks/baseline/L1/gelu.py"
+        ],
+        "rationale": "Gated GELU MLP: Linear + GELU + multiply by Linear (gated activation, similar to GeGLU)"
+      },
+      {
+        "name": "CpmAntFeedForward",
+        "line": 236,
+        "bases": [
+          "nn.Module"
+        ],
+        "kb_nano_files": [],
+        "rationale": "Wiring: DenseGatedACT + Linear out"
+      },
+      {
+        "name": "CpmAntFFNBlock",
+        "line": 262,
+        "bases": [
+          "nn.Module"
+        ],
+        "kb_nano_files": [],
+        "rationale": "Wiring: layernorm + ffn + residual"
+      },
+      {
+        "name": "CpmAntTransformerBlock",
+        "line": 289,
+        "bases": [
+          "nn.Module"
+        ],
+        "kb_nano_files": [],
+        "rationale": "Wiring: SelfAttentionBlock + FFNBlock"
+      },
+      {
+        "name": "CpmAntEncoder",
+        "line": 334,
+        "bases": [
+          "nn.Module"
+        ],
+        "kb_nano_files": [],
+        "rationale": "Wiring: stacks TransformerBlock + final layernorm"
+      },
+      {
+        "name": "CpmAntIntermediate",
+        "line": 398,
+        "bases": [
+          "nn.Module"
+        ],
+        "kb_nano_files": [
+          "tasks/baseline/L1/linear.py"
+        ],
+        "rationale": "Linear + activation (used inside CpmAntSegmentPositionEmbedding)"
+      },
+      {
+        "name": "CpmAntSegmentPositionEmbedding",
+        "line": 413,
+        "bases": [
+          "nn.Module"
+        ],
+        "kb_nano_files": [
+          "tasks/baseline/L1/embedding.py"
+        ],
+        "rationale": "T5-style relative position bias with segment-aware bucketing"
+      },
+      {
+        "name": "CpmAntOutput",
+        "line": 506,
+        "bases": [
+          "nn.Module"
+        ],
+        "kb_nano_files": [
+          "tasks/baseline/L1/linear.py"
+        ],
+        "rationale": "Linear projection layer"
+      },
+      {
+        "name": "CpmAntModel",
+        "line": 536,
+        "bases": [
+          "CpmAntPreTrainedModel"
+        ],
+        "kb_nano_files": [],
+        "rationale": "Wiring: embeddings + encoder + segment_position_embedding"
+      },
+      {
+        "name": "CpmAntForCausalLM",
+        "line": 686,
+        "bases": [
+          "CpmAntPreTrainedModel",
+          "GenerationMixin"
+        ],
+        "kb_nano_files": [],
+        "rationale": "Wiring: model + lm_head"
+      }
+    ],
+    "inheritance_summary": [
+      "CpmAnt = Chinese GPT-3 derivative: RMSNorm + Q/K/V attention with T5-style segment-aware relative position bias + GeGLU-like gated MLP (GELU gate); no kb-nano L2 wrapper for this exact pattern (decomposes from L1)"
+    ],
+    "evidence_lines": [
+      "cpmant/modeling_cpmant.py:36",
+      "cpmant/modeling_cpmant.py:61",
+      "cpmant/modeling_cpmant.py:216",
+      "cpmant/modeling_cpmant.py:413"
+    ]
+  },
+  "csm": {
+    "src_file": "modeling_csm.py",
+    "classes": [
+      {
+        "name": "CsmRMSNorm",
+        "line": 100,
+        "bases": [
+          "nn.Module"
+        ],
+        "kb_nano_files": [
+          "tasks/baseline/L1/rms_norm.py"
+        ],
+        "rationale": "Standard Llama-style RMSNorm; matches L1/rms_norm.py"
+      },
+      {
+        "name": "CsmRotaryEmbedding",
+        "line": 120,
+        "bases": [
+          "nn.Module"
+        ],
+        "kb_nano_files": [
+          "tasks/baseline/L1/rotary_emb.py"
+        ],
+        "rationale": "Standard Llama RoPE (cat freqs, Neox-style)"
+      },
+      {
+        "name": "CsmMLP",
+        "line": 185,
+        "bases": [
+          "nn.Module"
+        ],
+        "kb_nano_files": [
+          "tasks/baseline/L2/llama_mlp.py"
+        ],
+        "rationale": "SwiGLU MLP (gate/up/down + ACT2FN typically silu); matches LlamaMLP"
+      },
+      {
+        "name": "CsmAttention",
+        "line": 272,
+        "bases": [
+          "nn.Module"
+        ],
+        "kb_nano_files": [
+          "tasks/baseline/L2/attention.py",
+          "tasks/baseline/L2/attention_impl.py"
+        ],
+        "rationale": "Standard Llama-style decoder attention with RoPE + KV cache + GQA; matches LlamaAttention"
+      },
+      {
+        "name": "CsmDecoderLayer",
+        "line": 339,
+        "bases": [
+          "GradientCheckpointingLayer"
+        ],
+        "kb_nano_files": [],
+        "rationale": "Wiring: input_layernorm + self_attn + post_attention_layernorm + mlp"
+      },
+      {
+        "name": "CsmDepthDecoderModel",
+        "line": 419,
+        "bases": [
+          "CsmPreTrainedModel"
+        ],
+        "kb_nano_files": [],
+        "rationale": "Wiring: codebook embeddings + decoder layers"
+      },
+      {
+        "name": "CsmCodebooksHead",
+        "line": 522,
+        "bases": [
+          "nn.Module"
+        ],
+        "kb_nano_files": [
+          "tasks/baseline/L1/linear.py"
+        ],
+        "rationale": "Linear LM head per codebook"
+      },
+      {
+        "name": "CsmDepthDecoderForCausalLM",
+        "line": 549,
+        "bases": [
+          "CsmPreTrainedModel",
+          "GenerationMixin"
+        ],
+        "kb_nano_files": [],
+        "rationale": "Wiring: depth decoder model + codebooks head"
+      },
+      {
+        "name": "CsmBackboneModelEmbeddings",
+        "line": 655,
+        "bases": [
+          "nn.Module"
+        ],
+        "kb_nano_files": [
+          "tasks/baseline/L1/embedding.py"
+        ],
+        "rationale": "Sums Embedding for text + per-codebook embeddings"
+      },
+      {
+        "name": "CsmBackboneModel",
+        "line": 670,
+        "bases": [
+          "CsmPreTrainedModel"
+        ],
+        "kb_nano_files": [],
+        "rationale": "Wiring: backbone embeddings + Llama-like decoder"
+      },
+      {
+        "name": "CsmForConditionalGeneration",
+        "line": 759,
+        "bases": [
+          "CsmPreTrainedModel",
+          "CsmGenerationMixin"
+        ],
+        "kb_nano_files": [],
+        "rationale": "Wiring: backbone + depth decoder + codebooks"
+      }
+    ],
+    "inheritance_summary": [
+      "Csm = Conversational Speech Model: dual decoder (backbone Llama + depth decoder Llama) for codebook prediction; both decoders are pure Llama (RMSNorm + RoPE + LlamaMLP + LlamaAttention)"
+    ],
+    "evidence_lines": [
+      "csm/modeling_csm.py:100",
+      "csm/modeling_csm.py:185",
+      "csm/modeling_csm.py:272",
+      "csm/modular_csm.py:98-114"
+    ]
+  },
+  "ctrl": {
+    "src_file": "modeling_ctrl.py",
+    "classes": [
+      {
+        "name": "MultiHeadAttention",
+        "line": 79,
+        "bases": [
+          "nn.Module"
+        ],
+        "kb_nano_files": [
+          "tasks/baseline/L1/linear.py",
+          "tasks/baseline/L1/sdpa.py"
+        ],
+        "rationale": "Standard MHA: separate Wq/Wk/Wv Linear + scaled_dot_product_attention + dense out projection; KV cache supported; decomposes from L1 (no rotary, simple causal mask)"
+      },
+      {
+        "name": "EncoderLayer",
+        "line": 135,
+        "bases": [
+          "nn.Module"
+        ],
+        "kb_nano_files": [],
+        "rationale": "Wiring: ln1 + MHA + dropout + residual + ln2 + ffn (Sequential[Linear+ReLU+Linear]) + dropout + residual"
+      },
+      {
+        "name": "CTRLModel",
+        "line": 196,
+        "bases": [
+          "CTRLPreTrainedModel"
+        ],
+        "kb_nano_files": [],
+        "rationale": "Wiring: token embedding + sinusoidal position encoding + stacked EncoderLayer + final LayerNorm"
+      },
+      {
+        "name": "CTRLLMHeadModel",
+        "line": 375,
+        "bases": [
+          "CTRLPreTrainedModel",
+          "GenerationMixin"
+        ],
+        "kb_nano_files": [],
+        "rationale": "Wiring: model + lm_head"
+      },
+      {
+        "name": "CTRLForSequenceClassification",
+        "line": 505,
+        "bases": [
+          "CTRLPreTrainedModel"
+        ],
+        "kb_nano_files": [],
+        "rationale": "Wiring"
+      }
+    ],
+    "inheritance_summary": [
+      "CTRL is original transformer-XL style: MHA with separate Q/K/V (no GQA/RoPE), causal mask, sinusoidal absolute position encoding (added pre-input), Sequential ReLU MLP; decomposes from L1"
+    ],
+    "evidence_lines": [
+      "ctrl/modeling_ctrl.py:79",
+      "ctrl/modeling_ctrl.py:131-132",
+      "ctrl/modeling_ctrl.py:135"
+    ]
+  },
+  "cvt": {
+    "src_file": "modeling_cvt.py",
+    "classes": [
+      {
+        "name": "CvtDropPath",
+        "line": 67,
+        "bases": [
+          "nn.Module"
+        ],
+        "kb_nano_files": [],
+        "rationale": "Stochastic depth"
+      },
+      {
+        "name": "CvtEmbeddings",
+        "line": 81,
+        "bases": [
+          "nn.Module"
+        ],
+        "kb_nano_files": [],
+        "rationale": "Wiring: CvtConvEmbeddings + dropout"
+      },
+      {
+        "name": "CvtConvEmbeddings",
+        "line": 99,
+        "bases": [
+          "nn.Module"
+        ],
+        "kb_nano_files": [
+          "tasks/baseline/L1/conv2d.py",
+          "tasks/baseline/L1/layer_norm.py"
+        ],
+        "rationale": "Conv2d patch embedding + LayerNorm"
+      },
+      {
+        "name": "CvtSelfAttentionConvProjection",
+        "line": 124,
+        "bases": [
+          "nn.Module"
+        ],
+        "kb_nano_files": [
+          "tasks/baseline/L1/conv2d.py",
+          "tasks/baseline/L1/batch_norm2d.py"
+        ],
+        "rationale": "Depthwise Conv2d + BatchNorm2d (used to produce Q/K/V in CvT)"
+      },
+      {
+        "name": "CvtSelfAttentionLinearProjection",
+        "line": 144,
+        "bases": [
+          "nn.Module"
+        ],
+        "kb_nano_files": [],
+        "rationale": "Reshape b c h w -> b (h w) c"
+      },
+      {
+        "name": "CvtSelfAttentionProjection",
+        "line": 153,
+        "bases": [
+          "nn.Module"
+        ],
+        "kb_nano_files": [],
+        "rationale": "Wiring: ConvProjection + LinearProjection"
+      },
+      {
+        "name": "CvtSelfAttention",
+        "line": 166,
+        "bases": [
+          "nn.Module"
+        ],
+        "kb_nano_files": [
+          "tasks/baseline/L1/linear.py",
+          "tasks/baseline/L1/conv2d.py",
+          "tasks/baseline/L1/batch_norm2d.py",
+          "tasks/baseline/L1/softmax.py"
+        ],
+        "rationale": "CvT self-attention: depthwise Conv2d + BN projects Q/K/V (with stride for K/V), then Linear, then einsum-based attention with cls token; decomposes from L1 (no kb-nano CvT-specific file)"
+      },
+      {
+        "name": "CvtSelfOutput",
+        "line": 247,
+        "bases": [
+          "nn.Module"
+        ],
+        "kb_nano_files": [
+          "tasks/baseline/L1/linear.py"
+        ],
+        "rationale": "Dense + dropout (no LayerNorm here, layernorm is outside in CvtLayer)"
+      },
+      {
+        "name": "CvtAttention",
+        "line": 264,
+        "bases": [
+          "nn.Module"
+        ],
+        "kb_nano_files": [],
+        "rationale": "Wiring: SelfAttention + SelfOutput"
+      },
+      {
+        "name": "CvtIntermediate",
+        "line": 302,
+        "bases": [
+          "nn.Module"
+        ],
+        "kb_nano_files": [
+          "tasks/baseline/L1/linear.py",
+          "tasks/baseline/L1/gelu.py"
+        ],
+        "rationale": "Linear + GELU"
+      },
+      {
+        "name": "CvtOutput",
+        "line": 314,
+        "bases": [
+          "nn.Module"
+        ],
+        "kb_nano_files": [
+          "tasks/baseline/L1/linear.py"
+        ],
+        "rationale": "Linear + dropout + residual"
+      },
+      {
+        "name": "CvtLayer",
+        "line": 327,
+        "bases": [
+          "nn.Module"
+        ],
+        "kb_nano_files": [],
+        "rationale": "Wiring: ln + attn + drop_path + residual + ln + intermediate + output + drop_path"
+      },
+      {
+        "name": "CvtStage",
+        "line": 393,
+        "bases": [
+          "nn.Module"
+        ],
+        "kb_nano_files": [],
+        "rationale": "Wiring: optional cls_token + Embedding + stacked CvtLayer"
+      },
+      {
+        "name": "CvtEncoder",
+        "line": 456,
+        "bases": [
+          "nn.Module"
+        ],
+        "kb_nano_files": [],
+        "rationale": "Wiring: stacks CvtStage"
+      },
+      {
+        "name": "CvtModel",
+        "line": 511,
+        "bases": [
+          "CvtPreTrainedModel"
+        ],
+        "kb_nano_files": [],
+        "rationale": "Wiring"
+      },
+      {
+        "name": "CvtForImageClassification",
+        "line": 561,
+        "bases": [
+          "CvtPreTrainedModel"
+        ],
+        "kb_nano_files": [],
+        "rationale": "Wiring"
+      }
+    ],
+    "inheritance_summary": [
+      "CvT = Convolutional Vision Transformer: hybrid where Q/K/V are produced by depthwise Conv2d + BN (instead of Linear) before the standard MHA; cls token is preserved across stages; no kb-nano CvT-specific kernel - decomposes from L1"
+    ],
+    "evidence_lines": [
+      "cvt/modeling_cvt.py:124",
+      "cvt/modeling_cvt.py:166",
+      "cvt/modeling_cvt.py:327"
+    ]
+  }
+}

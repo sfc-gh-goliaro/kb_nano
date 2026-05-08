@@ -1,0 +1,3732 @@
+{
+  "musicgen_melody": {
+    "src_file": "modeling_musicgen_melody.py",
+    "classes": [
+      {
+        "name": "MusicgenMelodySinusoidalPositionalEmbedding",
+        "line": 112,
+        "bases": [
+          "nn.Module"
+        ],
+        "kb_nano_files": [
+          "tasks/baseline/L1/sinusoidal_embed.py"
+        ],
+        "rationale": "fixed (non-learned) sinusoidal positional embedding lookup; matches L1/sinusoidal_embed.py compute"
+      },
+      {
+        "name": "MusicgenMelodyAttention",
+        "line": 187,
+        "bases": [
+          "nn.Module"
+        ],
+        "kb_nano_files": [],
+        "rationale": "BART-style multi-head attention with separate q/k/v Linear+bias and out_proj; supports cross-attention via key_value_states; no kb-nano file matches the BART-decoder cross/self combo (closest is L2/whisper_attention.py but BART pattern uses dynamic dispatch via ALL_ATTENTION_FUNCTIONS, not paged KV); composes from L1/linear + L1/softmax (or L1/sdpa) + cross-attn variants"
+      },
+      {
+        "name": "MusicgenMelodyDecoderLayer",
+        "line": 299,
+        "bases": [
+          "GradientCheckpointingLayer"
+        ],
+        "kb_nano_files": [],
+        "rationale": "wiring: LayerNorm + self_attn + dropout + LayerNorm + fc1 + activation + fc2 (causal decoder, no cross-attn \u2014 text+audio is concatenated upstream)"
+      },
+      {
+        "name": "MusicgenMelodyDecoder",
+        "line": 395,
+        "bases": [
+          "MusicgenMelodyPreTrainedModel"
+        ],
+        "kb_nano_files": [],
+        "rationale": "wiring: per-codebook embeddings + sinusoidal pos + decoder layers + final LayerNorm"
+      },
+      {
+        "name": "MusicgenMelodyModel",
+        "line": 551,
+        "bases": [
+          "MusicgenMelodyPreTrainedModel"
+        ],
+        "kb_nano_files": [],
+        "rationale": "wiring class"
+      },
+      {
+        "name": "MusicgenMelodyForCausalLM",
+        "line": 635,
+        "bases": [
+          "MusicgenMelodyPreTrainedModel",
+          "GenerationMixin"
+        ],
+        "kb_nano_files": [],
+        "rationale": "wiring + per-codebook lm_heads"
+      },
+      {
+        "name": "MusicgenMelodyForConditionalGeneration",
+        "line": 1102,
+        "bases": [
+          "PreTrainedModel",
+          "GenerationMixin"
+        ],
+        "kb_nano_files": [],
+        "rationale": "wiring: text encoder + audio encoder + decoder pipeline"
+      }
+    ],
+    "inheritance_summary": [],
+    "evidence_lines": [
+      "musicgen_melody/modeling_musicgen_melody.py:187",
+      "musicgen_melody/modeling_musicgen_melody.py:299",
+      "musicgen_melody/modeling_musicgen_melody.py:395"
+    ]
+  },
+  "mvp": {
+    "src_file": "modeling_mvp.py",
+    "classes": [
+      {
+        "name": "MvpLearnedPositionalEmbedding",
+        "line": 63,
+        "bases": [
+          "nn.Embedding"
+        ],
+        "kb_nano_files": [
+          "tasks/baseline/L1/embedding.py"
+        ],
+        "rationale": "learned positional embedding with offset=2 (BART convention); maps to L1/embedding.py with bias offset"
+      },
+      {
+        "name": "MvpAttention",
+        "line": 90,
+        "bases": [
+          "nn.Module"
+        ],
+        "kb_nano_files": [],
+        "rationale": "BART-style multi-head attention with separate q/k/v Linear+bias, cross-attention support, attn_prompt support (MVP-specific prompt-tuning prefixes); composes from L1/linear + L1/softmax + L1/bmm; no direct kb-nano file (whisper_attention.py is closest but MVP eager forward uses bmm not paged-KV)"
+      },
+      {
+        "name": "MvpEncoderLayer",
+        "line": 237,
+        "bases": [
+          "GradientCheckpointingLayer"
+        ],
+        "kb_nano_files": [],
+        "rationale": "wiring: self_attn + LayerNorm + fc1+act+fc2 + LayerNorm (BART encoder layer)"
+      },
+      {
+        "name": "MvpDecoderLayer",
+        "line": 298,
+        "bases": [
+          "GradientCheckpointingLayer"
+        ],
+        "kb_nano_files": [],
+        "rationale": "wiring: self_attn + LayerNorm + cross_attn (encoder_attn) + LayerNorm + fc1+act+fc2 + LayerNorm (BART decoder layer)"
+      },
+      {
+        "name": "MvpClassificationHead",
+        "line": 407,
+        "bases": [
+          "nn.Module"
+        ],
+        "kb_nano_files": [],
+        "rationale": "Linear+tanh+Linear classification head; composes from L1/linear + L1/tanh"
+      },
+      {
+        "name": "MvpPrompt",
+        "line": 431,
+        "bases": [
+          "nn.Module"
+        ],
+        "kb_nano_files": [],
+        "rationale": "MVP-specific prompt tuning: Embedding + Linear+GELU+Linear sequential; composes from L1/embedding + L1/linear + L1/gelu"
+      },
+      {
+        "name": "MvpEncoder",
+        "line": 478,
+        "bases": [
+          "MvpPreTrainedModel"
+        ],
+        "kb_nano_files": [],
+        "rationale": "wiring: token+pos embed + LayerNorm + encoder layers"
+      },
+      {
+        "name": "MvpDecoder",
+        "line": 641,
+        "bases": [
+          "MvpPreTrainedModel"
+        ],
+        "kb_nano_files": [],
+        "rationale": "wiring: token+pos embed + LayerNorm + decoder layers"
+      },
+      {
+        "name": "MvpModel",
+        "line": 870,
+        "bases": [
+          "MvpPreTrainedModel"
+        ],
+        "kb_nano_files": [],
+        "rationale": "wiring: encoder + decoder + shared embeddings"
+      },
+      {
+        "name": "MvpForConditionalGeneration",
+        "line": 1018,
+        "bases": [
+          "MvpPreTrainedModel",
+          "GenerationMixin"
+        ],
+        "kb_nano_files": [],
+        "rationale": "wiring + lm_head"
+      },
+      {
+        "name": "MvpForSequenceClassification",
+        "line": 1183,
+        "bases": [
+          "MvpPreTrainedModel"
+        ],
+        "kb_nano_files": [],
+        "rationale": "wiring class"
+      },
+      {
+        "name": "MvpForQuestionAnswering",
+        "line": 1345,
+        "bases": [
+          "MvpPreTrainedModel"
+        ],
+        "kb_nano_files": [],
+        "rationale": "wiring class"
+      },
+      {
+        "name": "MvpDecoderWrapper",
+        "line": 1501,
+        "bases": [
+          "MvpPreTrainedModel"
+        ],
+        "kb_nano_files": [],
+        "rationale": "wiring class"
+      },
+      {
+        "name": "MvpForCausalLM",
+        "line": 1516,
+        "bases": [
+          "MvpPreTrainedModel",
+          "GenerationMixin"
+        ],
+        "kb_nano_files": [],
+        "rationale": "wiring + lm_head"
+      }
+    ],
+    "inheritance_summary": [],
+    "evidence_lines": [
+      "mvp/modeling_mvp.py:90",
+      "mvp/modeling_mvp.py:237",
+      "mvp/modeling_mvp.py:298"
+    ]
+  },
+  "nanochat": {
+    "src_file": "modular_nanochat.py",
+    "classes": [
+      {
+        "name": "NanoChatRMSNorm",
+        "line": 43,
+        "bases": [
+          "Llama4TextL2Norm"
+        ],
+        "kb_nano_files": [
+          "tasks/baseline/L1/l2_norm.py"
+        ],
+        "rationale": "Llama4TextL2Norm is L2-normalisation along last dim (no learnable weights); matches L1/l2_norm.py F.normalize(p=2)"
+      },
+      {
+        "name": "NanoChatRotaryEmbedding",
+        "line": 47,
+        "bases": [
+          "LlamaRotaryEmbedding"
+        ],
+        "kb_nano_files": [
+          "tasks/baseline/L1/rotary_emb.py"
+        ],
+        "rationale": "empty subclass of LlamaRotaryEmbedding; standard NeoX-style RoPE"
+      },
+      {
+        "name": "NanoChatAttention",
+        "line": 58,
+        "bases": [
+          "Qwen3Attention"
+        ],
+        "kb_nano_files": [
+          "tasks/baseline/L2/attention.py",
+          "tasks/baseline/L1/l2_norm.py"
+        ],
+        "rationale": "inherits Qwen3Attention but reorders: q/k/v_proj -> RoPE -> q_norm/k_norm (RoPE-then-Norm, instead of standard Norm-then-RoPE); the L1/l2_norm-based qk_norm differs from kb-nano L2/attention.py qk_norm (RMSNorm) and from its ordering, so this is partial fit \u2014 composes attention.py with L2-norm post-RoPE"
+      },
+      {
+        "name": "NanoChatMLP",
+        "line": 112,
+        "bases": [
+          "CLIPMLP"
+        ],
+        "kb_nano_files": [],
+        "rationale": "two-layer fc1+act+fc2 (CLIPMLP shape) but bias=False and activation is configurable (config.hidden_act, default likely gelu/relu); not SwiGLU. CLIPMLP uses QuickGELU+bias=True so kb-nano L2/clip_mlp.py mismatches; composes from L1/linear + activation"
+      },
+      {
+        "name": "NanoChatDecoderLayer",
+        "line": 119,
+        "bases": [
+          "LlamaDecoderLayer"
+        ],
+        "kb_nano_files": [],
+        "rationale": "wiring: input_layernorm (L2Norm) + attn + post_attention_layernorm (L2Norm) + mlp"
+      },
+      {
+        "name": "NanoChatModel",
+        "line": 140,
+        "bases": [
+          "LlamaModel"
+        ],
+        "kb_nano_files": [],
+        "rationale": "wiring: embeddings + extra L2Norm before layers + decoder layers + final L2Norm"
+      },
+      {
+        "name": "NanoChatForCausalLM",
+        "line": 200,
+        "bases": [
+          "Gemma2ForCausalLM"
+        ],
+        "kb_nano_files": [],
+        "rationale": "wiring + lm_head"
+      }
+    ],
+    "inheritance_summary": [
+      "NanoChatRMSNorm(Llama4TextL2Norm)",
+      "NanoChatRotaryEmbedding(LlamaRotaryEmbedding)",
+      "NanoChatAttention(Qwen3Attention)",
+      "NanoChatMLP(CLIPMLP)",
+      "NanoChatDecoderLayer(LlamaDecoderLayer)",
+      "NanoChatModel(LlamaModel)",
+      "NanoChatForCausalLM(Gemma2ForCausalLM)"
+    ],
+    "evidence_lines": [
+      "nanochat/modular_nanochat.py:43",
+      "nanochat/modular_nanochat.py:58",
+      "nanochat/modular_nanochat.py:112"
+    ]
+  },
+  "nemotron": {
+    "src_file": "modeling_nemotron.py",
+    "classes": [
+      {
+        "name": "NemotronLayerNorm1P",
+        "line": 64,
+        "bases": [
+          "nn.LayerNorm"
+        ],
+        "kb_nano_files": [
+          "tasks/baseline/L1/layer_norm.py"
+        ],
+        "rationale": "LayerNorm with weight+1 trick (Nemotron 1+gamma); composes from L1/layer_norm.py (no specialized kernel for the +1)"
+      },
+      {
+        "name": "NemotronRotaryEmbedding",
+        "line": 86,
+        "bases": [
+          "nn.Module"
+        ],
+        "kb_nano_files": [
+          "tasks/baseline/L1/rotary_emb.py"
+        ],
+        "rationale": "standard NeoX RoPE with optional partial_rotary_factor; computed from inv_freq + position_ids; matches L1/rotary_emb.py"
+      },
+      {
+        "name": "NemotronMLP",
+        "line": 193,
+        "bases": [
+          "nn.Module"
+        ],
+        "kb_nano_files": [],
+        "rationale": "two-linear MLP up_proj -> act_fn(squared-relu) -> down_proj; NOT SwiGLU (no gate_proj); kb-nano has L1/squared_relu.py but no L2 file for ungated squared-relu MLP \u2014 composes from L1/linear + L1/squared_relu"
+      },
+      {
+        "name": "NemotronAttention",
+        "line": 220,
+        "bases": [
+          "nn.Module"
+        ],
+        "kb_nano_files": [
+          "tasks/baseline/L2/attention.py",
+          "tasks/baseline/L1/rotary_emb.py"
+        ],
+        "rationale": "GQA attention with separate q/k/v_proj (no fused), partial RoPE (rope_dim=head_dim*partial_rotary_factor), no qk_norm; matches L2/attention.py (LlamaAttention) which supports GQA + RoPE; bias=config.attention_bias"
+      },
+      {
+        "name": "NemotronFlashAttention2",
+        "line": 302,
+        "bases": [
+          "NemotronAttention"
+        ],
+        "kb_nano_files": [
+          "tasks/baseline/L2/attention.py"
+        ],
+        "rationale": "FA2 backend variant of NemotronAttention (same parameters, different forward path); same kb-nano mapping"
+      },
+      {
+        "name": "NemotronSdpaAttention",
+        "line": 409,
+        "bases": [
+          "NemotronAttention"
+        ],
+        "kb_nano_files": [
+          "tasks/baseline/L2/attention.py"
+        ],
+        "rationale": "SDPA backend variant; same mapping"
+      },
+      {
+        "name": "NemotronDecoderLayer",
+        "line": 485,
+        "bases": [
+          "GradientCheckpointingLayer"
+        ],
+        "kb_nano_files": [],
+        "rationale": "wiring: LayerNorm1P + self_attn + LayerNorm1P + mlp"
+      },
+      {
+        "name": "NemotronModel",
+        "line": 557,
+        "bases": [
+          "NemotronPreTrainedModel"
+        ],
+        "kb_nano_files": [],
+        "rationale": "wiring class"
+      },
+      {
+        "name": "NemotronForCausalLM",
+        "line": 639,
+        "bases": [
+          "NemotronPreTrainedModel",
+          "GenerationMixin"
+        ],
+        "kb_nano_files": [],
+        "rationale": "wiring + lm_head"
+      },
+      {
+        "name": "NemotronForSequenceClassification",
+        "line": 714,
+        "bases": [
+          "GenericForSequenceClassification",
+          "NemotronPreTrainedModel"
+        ],
+        "kb_nano_files": [],
+        "rationale": "wiring class"
+      },
+      {
+        "name": "NemotronForQuestionAnswering",
+        "line": 717,
+        "bases": [
+          "GenericForQuestionAnswering",
+          "NemotronPreTrainedModel"
+        ],
+        "kb_nano_files": [],
+        "rationale": "wiring class"
+      },
+      {
+        "name": "NemotronForTokenClassification",
+        "line": 721,
+        "bases": [
+          "GenericForTokenClassification",
+          "NemotronPreTrainedModel"
+        ],
+        "kb_nano_files": [],
+        "rationale": "wiring class"
+      }
+    ],
+    "inheritance_summary": [
+      "NemotronFlashAttention2(NemotronAttention)",
+      "NemotronSdpaAttention(NemotronAttention)"
+    ],
+    "evidence_lines": [
+      "nemotron/modeling_nemotron.py:64",
+      "nemotron/modeling_nemotron.py:193",
+      "nemotron/modeling_nemotron.py:220"
+    ]
+  },
+  "nemotron_h": {
+    "src_file": "modular_nemotron_h.py",
+    "classes": [
+      {
+        "name": "NemotronHMamba2Mixer",
+        "line": 49,
+        "bases": [
+          "Zamba2MambaMixer"
+        ],
+        "kb_nano_files": [
+          "tasks/baseline/L2/mamba2_mixer.py"
+        ],
+        "rationale": "Zamba2-derived Mamba2 SSD mixer with in_proj + conv1d + Zamba2RMSNormGated + out_proj; matches L2/mamba2_mixer.py which uses vLLM's causal_conv1d/mamba_chunk_scan_combined_varlen + selective_state_update + rms_norm_gated"
+      },
+      {
+        "name": "NemotronHRMSNorm",
+        "line": 105,
+        "bases": [
+          "LlamaRMSNorm"
+        ],
+        "kb_nano_files": [
+          "tasks/baseline/L1/rms_norm.py"
+        ],
+        "rationale": "empty subclass of LlamaRMSNorm; standard RMSNorm"
+      },
+      {
+        "name": "NemotronHMLP",
+        "line": 109,
+        "bases": [
+          "NemotronMLP",
+          "nn.Module"
+        ],
+        "kb_nano_files": [],
+        "rationale": "two-linear MLP up_proj -> act_fn -> down_proj (relu2 by default); no gating (NOT SwiGLU); composes from L1/linear + L1/squared_relu (or relu)"
+      },
+      {
+        "name": "NemotronHExperts",
+        "line": 121,
+        "bases": [
+          "nn.Module"
+        ],
+        "kb_nano_files": [],
+        "rationale": "non-gated MoE experts: up_proj 3D-tensor -> act_fn -> down_proj 3D-tensor (no gate_proj/up_proj fused). Differs from kb-nano L1/moe_grouped_gemm.py which assumes SwiGLU [gate_up, down]; composes by decomposing per-expert"
+      },
+      {
+        "name": "NemotronHMoE",
+        "line": 182,
+        "bases": [
+          "DeepseekV3MoE"
+        ],
+        "kb_nano_files": [],
+        "rationale": "non-gated MoE with optional latent projection + shared expert (NemotronHMLP), differs from kb-nano L2/shared_expert_moe.py which assumes gated experts; composes"
+      },
+      {
+        "name": "NemotronHTopkRouter",
+        "line": 226,
+        "bases": [
+          "DeepseekV3TopkRouter"
+        ],
+        "kb_nano_files": [],
+        "rationale": "top-k router with sigmoid + correction bias (DeepSeek V3 style); routing pattern embedded inside L2/shared_expert_moe.py for SwiGLU experts but here used with non-gated experts"
+      },
+      {
+        "name": "NemotronHAttention",
+        "line": 230,
+        "bases": [
+          "JambaAttention"
+        ],
+        "kb_nano_files": [
+          "tasks/baseline/L2/attention.py"
+        ],
+        "rationale": "JambaAttention is GQA self-attention with separate q/k/v + RoPE (Jamba uses rotary on subset of heads); maps to L2/attention.py (LlamaAttention) with appropriate config"
+      },
+      {
+        "name": "NemotronHBlock",
+        "line": 249,
+        "bases": [
+          "GradientCheckpointingLayer"
+        ],
+        "kb_nano_files": [],
+        "rationale": "wiring: norm + mixer (mamba/attention/mlp/moe) dispatch + residual"
+      },
+      {
+        "name": "NemotronHModel",
+        "line": 387,
+        "bases": [
+          "NemotronHPreTrainedModel"
+        ],
+        "kb_nano_files": [],
+        "rationale": "wiring class"
+      },
+      {
+        "name": "NemotronHForCausalLM",
+        "line": 482,
+        "bases": [
+          "ZambaForCausalLM"
+        ],
+        "kb_nano_files": [],
+        "rationale": "wiring + lm_head"
+      }
+    ],
+    "inheritance_summary": [
+      "NemotronHMamba2Mixer(Zamba2MambaMixer)",
+      "NemotronHRMSNorm(LlamaRMSNorm)",
+      "NemotronHMLP(NemotronMLP)",
+      "NemotronHMoE(DeepseekV3MoE)",
+      "NemotronHTopkRouter(DeepseekV3TopkRouter)",
+      "NemotronHAttention(JambaAttention)",
+      "NemotronHForCausalLM(ZambaForCausalLM)"
+    ],
+    "evidence_lines": [
+      "nemotron_h/modular_nemotron_h.py:49",
+      "nemotron_h/modular_nemotron_h.py:121",
+      "nemotron_h/modular_nemotron_h.py:230"
+    ]
+  },
+  "nllb_moe": {
+    "src_file": "modeling_nllb_moe.py",
+    "classes": [
+      {
+        "name": "NllbMoeScaledWordEmbedding",
+        "line": 49,
+        "bases": [
+          "nn.Embedding"
+        ],
+        "kb_nano_files": [
+          "tasks/baseline/L1/embedding.py"
+        ],
+        "rationale": "Embedding with output scaled by sqrt(hidden); composes from L1/embedding.py + scalar mul"
+      },
+      {
+        "name": "NllbMoeSinusoidalPositionalEmbedding",
+        "line": 63,
+        "bases": [
+          "nn.Module"
+        ],
+        "kb_nano_files": [
+          "tasks/baseline/L1/sinusoidal_embed.py"
+        ],
+        "rationale": "fixed sinusoidal positional embedding (BART-style with offset=2); matches L1/sinusoidal_embed.py"
+      },
+      {
+        "name": "NllbMoeTop2Router",
+        "line": 165,
+        "bases": [
+          "nn.Module"
+        ],
+        "kb_nano_files": [],
+        "rationale": "Top-2 router with capacity-based expert assignment; routing logic does not match kb-nano's TopKSoftmax which is simple top-k; composes from L1/linear + L1/softmax"
+      },
+      {
+        "name": "NllbMoeDenseActDense",
+        "line": 318,
+        "bases": [
+          "nn.Module"
+        ],
+        "kb_nano_files": [],
+        "rationale": "single FFN expert: fc1 -> act -> fc2 (BART-style, NOT SwiGLU); composes from L1/linear + activation"
+      },
+      {
+        "name": "NllbMoeExperts",
+        "line": 340,
+        "bases": [
+          "nn.ModuleDict"
+        ],
+        "kb_nano_files": [],
+        "rationale": "ModuleDict of NllbMoeDenseActDense experts iterated per-expert; does not match kb-nano fused-experts grouped GEMM (which assumes gated SwiGLU); composes"
+      },
+      {
+        "name": "NllbMoeSparseMLP",
+        "line": 367,
+        "bases": [
+          "nn.Module"
+        ],
+        "kb_nano_files": [],
+        "rationale": "wiring: router + experts (top-2 capacity-based); does not match L2/mixtral_moe.py (top-k softmax + grouped gemm SwiGLU)"
+      },
+      {
+        "name": "NllbMoeAttention",
+        "line": 415,
+        "bases": [
+          "nn.Module"
+        ],
+        "kb_nano_files": [],
+        "rationale": "BART-style multi-head attention with separate q/k/v Linear+bias supporting cross-attention; composes from L1/linear + L1/sdpa or L1/softmax"
+      },
+      {
+        "name": "NllbMoeEncoderLayer",
+        "line": 513,
+        "bases": [
+          "GradientCheckpointingLayer"
+        ],
+        "kb_nano_files": [],
+        "rationale": "wiring: self_attn + LayerNorm + dense FFN or sparse MLP (alternating)"
+      },
+      {
+        "name": "NllbMoeDecoderLayer",
+        "line": 557,
+        "bases": [
+          "GradientCheckpointingLayer"
+        ],
+        "kb_nano_files": [],
+        "rationale": "wiring: self_attn + cross_attn + dense FFN or sparse MLP"
+      },
+      {
+        "name": "NllbMoeEncoder",
+        "line": 667,
+        "bases": [
+          "NllbMoePreTrainedModel"
+        ],
+        "kb_nano_files": [],
+        "rationale": "wiring class"
+      },
+      {
+        "name": "NllbMoeDecoder",
+        "line": 741,
+        "bases": [
+          "NllbMoePreTrainedModel"
+        ],
+        "kb_nano_files": [],
+        "rationale": "wiring class"
+      },
+      {
+        "name": "NllbMoeModel",
+        "line": 860,
+        "bases": [
+          "NllbMoePreTrainedModel"
+        ],
+        "kb_nano_files": [],
+        "rationale": "wiring: shared embed + encoder + decoder"
+      },
+      {
+        "name": "NllbMoeForConditionalGeneration",
+        "line": 1039,
+        "bases": [
+          "NllbMoePreTrainedModel",
+          "GenerationMixin"
+        ],
+        "kb_nano_files": [],
+        "rationale": "wiring + lm_head"
+      }
+    ],
+    "inheritance_summary": [],
+    "evidence_lines": [
+      "nllb_moe/modeling_nllb_moe.py:165",
+      "nllb_moe/modeling_nllb_moe.py:340",
+      "nllb_moe/modeling_nllb_moe.py:415"
+    ]
+  },
+  "nomic_bert": {
+    "src_file": "modular_nomic_bert.py",
+    "classes": [
+      {
+        "name": "NomicBertEmbeddings",
+        "line": 103,
+        "bases": [
+          "JinaEmbeddingsV3Embeddings"
+        ],
+        "kb_nano_files": [],
+        "rationale": "JinaEmbeddingsV3Embeddings is word + token_type + LayerNorm (NO position embedding \u2014 RoPE is applied at attention layer); doesn't match EncoderEmbeddingsBase which adds position embeddings; composes from L1/embedding + L1/layer_norm"
+      },
+      {
+        "name": "NomicBertRotaryEmbedding",
+        "line": 107,
+        "bases": [
+          "LlamaRotaryEmbedding"
+        ],
+        "kb_nano_files": [
+          "tasks/baseline/L1/rotary_emb.py"
+        ],
+        "rationale": "empty subclass; standard NeoX RoPE"
+      },
+      {
+        "name": "NomicBertAttention",
+        "line": 111,
+        "bases": [
+          "JinaEmbeddingsV3Attention"
+        ],
+        "kb_nano_files": [],
+        "rationale": "BERT-encoder-style bi-directional attention with RoPE applied at attention layer; separate q/k/v Linear (bias=False here, vs True in parent); kb-nano L2/encoder_attention.py has no RoPE support, L2/attention.py is causal/decoder; composes from L1/linear + L1/rotary_emb + L1/sdpa (non-causal)"
+      },
+      {
+        "name": "NomicBertMLP",
+        "line": 120,
+        "bases": [
+          "GemmaMLP"
+        ],
+        "kb_nano_files": [
+          "tasks/baseline/L2/llama_mlp.py"
+        ],
+        "rationale": "GemmaMLP is SwiGLU (gate_proj/up_proj/down_proj + SiLU); matches L2/llama_mlp.py"
+      },
+      {
+        "name": "NomicBertLayer",
+        "line": 124,
+        "bases": [
+          "JinaEmbeddingsV3Layer"
+        ],
+        "kb_nano_files": [],
+        "rationale": "wiring: post-norm pattern with attn + LayerNorm, mlp + LayerNorm"
+      },
+      {
+        "name": "NomicBertModel",
+        "line": 142,
+        "bases": [
+          "JinaEmbeddingsV3Model"
+        ],
+        "kb_nano_files": [],
+        "rationale": "wiring: embeddings + rotary_emb + encoder layers + (optional) pooler"
+      },
+      {
+        "name": "NomicBertPredictionHeadTransform",
+        "line": 209,
+        "bases": [
+          "BertPredictionHeadTransform"
+        ],
+        "kb_nano_files": [],
+        "rationale": "Linear + activation + LayerNorm; composes"
+      },
+      {
+        "name": "NomicBertOnlyMLMHead",
+        "line": 223,
+        "bases": [
+          "BertOnlyMLMHead"
+        ],
+        "kb_nano_files": [],
+        "rationale": "wiring: transform + decoder linear"
+      },
+      {
+        "name": "NomicBertForMaskedLM",
+        "line": 228,
+        "bases": [
+          "BertForMaskedLM"
+        ],
+        "kb_nano_files": [],
+        "rationale": "wiring class"
+      },
+      {
+        "name": "NomicBertForSequenceClassification",
+        "line": 282,
+        "bases": [
+          "BertForSequenceClassification"
+        ],
+        "kb_nano_files": [],
+        "rationale": "wiring class"
+      },
+      {
+        "name": "NomicBertForTokenClassification",
+        "line": 288,
+        "bases": [
+          "BertForTokenClassification"
+        ],
+        "kb_nano_files": [],
+        "rationale": "wiring class"
+      }
+    ],
+    "inheritance_summary": [
+      "NomicBertEmbeddings(JinaEmbeddingsV3Embeddings)",
+      "NomicBertRotaryEmbedding(LlamaRotaryEmbedding)",
+      "NomicBertAttention(JinaEmbeddingsV3Attention)",
+      "NomicBertMLP(GemmaMLP)",
+      "NomicBertLayer(JinaEmbeddingsV3Layer)",
+      "NomicBertModel(JinaEmbeddingsV3Model)"
+    ],
+    "evidence_lines": [
+      "nomic_bert/modular_nomic_bert.py:103",
+      "nomic_bert/modular_nomic_bert.py:111",
+      "nomic_bert/modular_nomic_bert.py:120"
+    ]
+  },
+  "nystromformer": {
+    "src_file": "modeling_nystromformer.py",
+    "classes": [
+      {
+        "name": "NystromformerEmbeddings",
+        "line": 45,
+        "bases": [
+          "nn.Module"
+        ],
+        "kb_nano_files": [
+          "tasks/baseline/L2/encoder_embeddings.py"
+        ],
+        "rationale": "BERT-style word+pos+token_type embeddings + LayerNorm; matches EncoderEmbeddingsBase pattern (with offset=2 on position_ids per Nystromformer init)"
+      },
+      {
+        "name": "NystromformerSelfAttention",
+        "line": 102,
+        "bases": [
+          "nn.Module"
+        ],
+        "kb_nano_files": [],
+        "rationale": "Nystrom-approximation attention: Moore-Penrose pseudo-inverse via iterative Z_0 method + 3 softmax kernels + optional depthwise Conv2d skip; this is a non-standard sparse attention pattern with no kb-nano analog; composes from L1/linear + L1/softmax + L1/conv2d"
+      },
+      {
+        "name": "NystromformerSelfOutput",
+        "line": 225,
+        "bases": [
+          "nn.Module"
+        ],
+        "kb_nano_files": [
+          "tasks/baseline/L2/encoder_attention.py"
+        ],
+        "rationale": "BERT-style self-output (Linear + dropout + LayerNorm + residual); matches EncoderSelfOutput"
+      },
+      {
+        "name": "NystromformerAttention",
+        "line": 239,
+        "bases": [
+          "nn.Module"
+        ],
+        "kb_nano_files": [],
+        "rationale": "wiring class around NystromformerSelfAttention + NystromformerSelfOutput (rule 11 \u2014 bare *Attention with sibling *SelfAttention)"
+      },
+      {
+        "name": "NystromformerIntermediate",
+        "line": 253,
+        "bases": [
+          "nn.Module"
+        ],
+        "kb_nano_files": [
+          "tasks/baseline/L2/encoder_mlp.py"
+        ],
+        "rationale": "BERT-style Linear + activation; matches EncoderIntermediate"
+      },
+      {
+        "name": "NystromformerOutput",
+        "line": 269,
+        "bases": [
+          "nn.Module"
+        ],
+        "kb_nano_files": [
+          "tasks/baseline/L2/encoder_mlp.py"
+        ],
+        "rationale": "BERT-style Linear + LayerNorm + residual; matches EncoderOutput"
+      },
+      {
+        "name": "NystromformerLayer",
+        "line": 283,
+        "bases": [
+          "GradientCheckpointingLayer"
+        ],
+        "kb_nano_files": [],
+        "rationale": "wiring: attention + intermediate + output"
+      },
+      {
+        "name": "NystromformerEncoder",
+        "line": 312,
+        "bases": [
+          "nn.Module"
+        ],
+        "kb_nano_files": [],
+        "rationale": "wiring: stack of layers"
+      },
+      {
+        "name": "NystromformerPredictionHeadTransform",
+        "line": 353,
+        "bases": [
+          "nn.Module"
+        ],
+        "kb_nano_files": [],
+        "rationale": "Linear + activation + LayerNorm; composes"
+      },
+      {
+        "name": "NystromformerLMPredictionHead",
+        "line": 371,
+        "bases": [
+          "nn.Module"
+        ],
+        "kb_nano_files": [],
+        "rationale": "transform + decoder linear; composes"
+      },
+      {
+        "name": "NystromformerOnlyMLMHead",
+        "line": 388,
+        "bases": [
+          "nn.Module"
+        ],
+        "kb_nano_files": [],
+        "rationale": "wiring class"
+      },
+      {
+        "name": "NystromformerModel",
+        "line": 412,
+        "bases": [
+          "NystromformerPreTrainedModel"
+        ],
+        "kb_nano_files": [],
+        "rationale": "wiring class"
+      },
+      {
+        "name": "NystromformerForMaskedLM",
+        "line": 503,
+        "bases": [
+          "NystromformerPreTrainedModel"
+        ],
+        "kb_nano_files": [],
+        "rationale": "wiring class"
+      },
+      {
+        "name": "NystromformerClassificationHead",
+        "line": 578,
+        "bases": [
+          "nn.Module"
+        ],
+        "kb_nano_files": [],
+        "rationale": "Linear + tanh + Linear classification head; composes"
+      },
+      {
+        "name": "NystromformerForSequenceClassification",
+        "line": 605,
+        "bases": [
+          "NystromformerPreTrainedModel"
+        ],
+        "kb_nano_files": [],
+        "rationale": "wiring class"
+      },
+      {
+        "name": "NystromformerForMultipleChoice",
+        "line": 686,
+        "bases": [
+          "NystromformerPreTrainedModel"
+        ],
+        "kb_nano_files": [],
+        "rationale": "wiring class"
+      },
+      {
+        "name": "NystromformerForTokenClassification",
+        "line": 791,
+        "bases": [
+          "NystromformerPreTrainedModel"
+        ],
+        "kb_nano_files": [],
+        "rationale": "wiring class"
+      },
+      {
+        "name": "NystromformerForQuestionAnswering",
+        "line": 857,
+        "bases": [
+          "NystromformerPreTrainedModel"
+        ],
+        "kb_nano_files": [],
+        "rationale": "wiring class"
+      }
+    ],
+    "inheritance_summary": [],
+    "evidence_lines": [
+      "nystromformer/modeling_nystromformer.py:102",
+      "nystromformer/modeling_nystromformer.py:239",
+      "nystromformer/modeling_nystromformer.py:283"
+    ]
+  },
+  "olmo": {
+    "src_file": "modular_olmo.py",
+    "classes": [
+      {
+        "name": "OlmoLayerNorm",
+        "line": 48,
+        "bases": [
+          "nn.Module"
+        ],
+        "kb_nano_files": [
+          "tasks/baseline/L1/layer_norm.py"
+        ],
+        "rationale": "non-parametric LayerNorm (no weight, no bias, fp32 internally); composes from L1/layer_norm.py with elementwise_affine=False"
+      },
+      {
+        "name": "OlmoMLP",
+        "line": 62,
+        "bases": [
+          "LlamaMLP"
+        ],
+        "kb_nano_files": [
+          "tasks/baseline/L2/llama_mlp.py"
+        ],
+        "rationale": "inherits LlamaMLP; SwiGLU gate_proj/up_proj/down_proj + SiLU; matches L2/llama_mlp.py"
+      },
+      {
+        "name": "OlmoRotaryEmbedding",
+        "line": 72,
+        "bases": [
+          "LlamaRotaryEmbedding"
+        ],
+        "kb_nano_files": [
+          "tasks/baseline/L1/rotary_emb.py"
+        ],
+        "rationale": "LlamaRotaryEmbedding with cos/sin returned as float32 (instead of input dtype); same compute as L1/rotary_emb.py"
+      },
+      {
+        "name": "OlmoAttention",
+        "line": 114,
+        "bases": [
+          "LlamaAttention"
+        ],
+        "kb_nano_files": [
+          "tasks/baseline/L2/attention.py"
+        ],
+        "rationale": "LlamaAttention with optional clip_qkv (clamp q/k/v to +/-clip_qkv); kb-nano L2/attention.py supports the basic GQA + RoPE pattern; clip_qkv pre-projection clamp is not part of kb-nano L2/attention.py \u2014 partial fit, composes attention.py with extra clamp"
+      },
+      {
+        "name": "OlmoDecoderLayer",
+        "line": 165,
+        "bases": [
+          "LlamaDecoderLayer"
+        ],
+        "kb_nano_files": [],
+        "rationale": "wiring: OlmoLayerNorm + attn + OlmoLayerNorm + mlp"
+      },
+      {
+        "name": "OlmoModel",
+        "line": 173,
+        "bases": [
+          "LlamaModel"
+        ],
+        "kb_nano_files": [],
+        "rationale": "wiring class"
+      },
+      {
+        "name": "OlmoForCausalLM",
+        "line": 182,
+        "bases": [
+          "LlamaForCausalLM"
+        ],
+        "kb_nano_files": [],
+        "rationale": "wiring + lm_head"
+      },
+      {
+        "name": "OlmoForSequenceClassification",
+        "line": 186,
+        "bases": [
+          "LlamaForSequenceClassification"
+        ],
+        "kb_nano_files": [],
+        "rationale": "wiring class"
+      }
+    ],
+    "inheritance_summary": [
+      "OlmoMLP(LlamaMLP)",
+      "OlmoRotaryEmbedding(LlamaRotaryEmbedding)",
+      "OlmoAttention(LlamaAttention)",
+      "OlmoDecoderLayer(LlamaDecoderLayer)",
+      "OlmoModel(LlamaModel)",
+      "OlmoForCausalLM(LlamaForCausalLM)",
+      "OlmoForSequenceClassification(LlamaForSequenceClassification)"
+    ],
+    "evidence_lines": [
+      "olmo/modular_olmo.py:48",
+      "olmo/modular_olmo.py:62",
+      "olmo/modular_olmo.py:114"
+    ]
+  },
+  "olmo2": {
+    "src_file": "modular_olmo2.py",
+    "classes": [
+      {
+        "name": "Olmo2RMSNorm",
+        "line": 90,
+        "bases": [
+          "LlamaRMSNorm"
+        ],
+        "kb_nano_files": [
+          "tasks/baseline/L1/rms_norm.py"
+        ],
+        "rationale": "RMSNorm with multiplication-before-cast ordering; standard L1/rms_norm.py compute"
+      },
+      {
+        "name": "Olmo2RotaryEmbedding",
+        "line": 99,
+        "bases": [
+          "OlmoRotaryEmbedding"
+        ],
+        "kb_nano_files": [
+          "tasks/baseline/L1/rotary_emb.py"
+        ],
+        "rationale": "empty subclass; standard NeoX RoPE"
+      },
+      {
+        "name": "Olmo2Attention",
+        "line": 113,
+        "bases": [
+          "OlmoAttention"
+        ],
+        "kb_nano_files": [
+          "tasks/baseline/L2/attention.py",
+          "tasks/baseline/L1/rms_norm.py"
+        ],
+        "rationale": "OlmoAttention with q_norm/k_norm RMSNorm applied to full (heads*head_dim) projections (NOT per-head); kb-nano L2/attention.py:LlamaAttention supports qk_norm but per-head head_dim \u2014 Olmo2's full-tensor norm is a slight numerical variant; composes attention.py"
+      },
+      {
+        "name": "Olmo2DecoderLayer",
+        "line": 167,
+        "bases": [
+          "OlmoDecoderLayer"
+        ],
+        "kb_nano_files": [],
+        "rationale": "wiring: post-norm pattern (attn + post_attention_layernorm + residual, mlp + post_feedforward_layernorm + residual)"
+      },
+      {
+        "name": "Olmo2Model",
+        "line": 212,
+        "bases": [
+          "OlmoModel"
+        ],
+        "kb_nano_files": [],
+        "rationale": "wiring class"
+      },
+      {
+        "name": "Olmo2ForCausalLM",
+        "line": 222,
+        "bases": [
+          "OlmoForCausalLM"
+        ],
+        "kb_nano_files": [],
+        "rationale": "wiring + lm_head"
+      },
+      {
+        "name": "Olmo2ForSequenceClassification",
+        "line": 226,
+        "bases": [
+          "OlmoForSequenceClassification"
+        ],
+        "kb_nano_files": [],
+        "rationale": "wiring class"
+      }
+    ],
+    "inheritance_summary": [
+      "Olmo2RMSNorm(LlamaRMSNorm)",
+      "Olmo2RotaryEmbedding(OlmoRotaryEmbedding)",
+      "Olmo2Attention(OlmoAttention)",
+      "Olmo2DecoderLayer(OlmoDecoderLayer)",
+      "Olmo2Model(OlmoModel)",
+      "Olmo2ForCausalLM(OlmoForCausalLM)"
+    ],
+    "evidence_lines": [
+      "olmo2/modular_olmo2.py:90",
+      "olmo2/modular_olmo2.py:113",
+      "olmo2/modular_olmo2.py:167"
+    ]
+  },
+  "olmo3": {
+    "src_file": "modular_olmo3.py",
+    "classes": [
+      {
+        "name": "Olmo3RMSNorm",
+        "line": 95,
+        "bases": [
+          "Olmo2RMSNorm"
+        ],
+        "kb_nano_files": [
+          "tasks/baseline/L1/rms_norm.py"
+        ],
+        "rationale": "empty subclass; standard RMSNorm"
+      },
+      {
+        "name": "Olmo3Attention",
+        "line": 101,
+        "bases": [
+          "Olmo2Attention"
+        ],
+        "kb_nano_files": [
+          "tasks/baseline/L2/attention.py",
+          "tasks/baseline/L1/rms_norm.py"
+        ],
+        "rationale": "Olmo2Attention with sliding window for 3-of-4 layers; kb-nano L2/attention.py supports sliding_window per-layer (GPT-OSS-style)"
+      },
+      {
+        "name": "Olmo3DecoderLayer",
+        "line": 153,
+        "bases": [
+          "Olmo2DecoderLayer"
+        ],
+        "kb_nano_files": [],
+        "rationale": "empty subclass; same wiring as Olmo2"
+      },
+      {
+        "name": "Olmo3RotaryEmbedding",
+        "line": 157,
+        "bases": [
+          "Gemma2RotaryEmbedding"
+        ],
+        "kb_nano_files": [
+          "tasks/baseline/L1/rotary_emb.py"
+        ],
+        "rationale": "Gemma2RotaryEmbedding is standard NeoX RoPE; matches L1/rotary_emb.py"
+      },
+      {
+        "name": "Olmo3Model",
+        "line": 168,
+        "bases": [
+          "Olmo2Model"
+        ],
+        "kb_nano_files": [],
+        "rationale": "wiring class with sliding+full attn mask routing per-layer"
+      },
+      {
+        "name": "Olmo3ForCausalLM",
+        "line": 237,
+        "bases": [
+          "Olmo2ForCausalLM"
+        ],
+        "kb_nano_files": [],
+        "rationale": "wiring + lm_head"
+      },
+      {
+        "name": "Olmo3ForSequenceClassification",
+        "line": 241,
+        "bases": [
+          "Olmo2ForSequenceClassification"
+        ],
+        "kb_nano_files": [],
+        "rationale": "wiring class"
+      }
+    ],
+    "inheritance_summary": [
+      "Olmo3RMSNorm(Olmo2RMSNorm)",
+      "Olmo3Attention(Olmo2Attention)",
+      "Olmo3DecoderLayer(Olmo2DecoderLayer)",
+      "Olmo3RotaryEmbedding(Gemma2RotaryEmbedding)",
+      "Olmo3Model(Olmo2Model)",
+      "Olmo3ForCausalLM(Olmo2ForCausalLM)"
+    ],
+    "evidence_lines": [
+      "olmo3/modular_olmo3.py:95",
+      "olmo3/modular_olmo3.py:101",
+      "olmo3/modular_olmo3.py:168"
+    ]
+  },
+  "olmo_hybrid": {
+    "src_file": "modular_olmo_hybrid.py",
+    "classes": [
+      {
+        "name": "OlmoHybridRMSNormGated",
+        "line": 294,
+        "bases": [
+          "Qwen3NextRMSNormGated"
+        ],
+        "kb_nano_files": [
+          "tasks/baseline/L1/rms_norm_gated.py"
+        ],
+        "rationale": "RMSNorm fused with gating (silu(gate)*norm(x)); matches L1/rms_norm_gated.py used by GatedDeltaNet"
+      },
+      {
+        "name": "OlmoHybridRMSNorm",
+        "line": 298,
+        "bases": [
+          "Olmo3RMSNorm"
+        ],
+        "kb_nano_files": [
+          "tasks/baseline/L1/rms_norm.py"
+        ],
+        "rationale": "empty subclass; standard RMSNorm"
+      },
+      {
+        "name": "OlmoHybridShortConvolution",
+        "line": 302,
+        "bases": [
+          "nn.Conv1d"
+        ],
+        "kb_nano_files": [
+          "tasks/baseline/L1/causal_conv1d.py"
+        ],
+        "rationale": "depthwise causal Conv1d with cached state for streaming; matches L1/causal_conv1d.py (causal_conv1d_fn / causal_conv1d_update used in Mamba mixers)"
+      },
+      {
+        "name": "OlmoHybridAttention",
+        "line": 362,
+        "bases": [
+          "Olmo3Attention"
+        ],
+        "kb_nano_files": [
+          "tasks/baseline/L2/attention.py",
+          "tasks/baseline/L1/rms_norm.py"
+        ],
+        "rationale": "Olmo3Attention with optional NoPE mode (skip RoPE when position_embeddings is None); kb-nano L2/attention.py supports both nope=True/False"
+      },
+      {
+        "name": "OlmoHybridRotaryEmbedding",
+        "line": 425,
+        "bases": [
+          "Olmo3RotaryEmbedding"
+        ],
+        "kb_nano_files": [
+          "tasks/baseline/L1/rotary_emb.py"
+        ],
+        "rationale": "RoPE returning float32 cos/sin; matches L1/rotary_emb.py"
+      },
+      {
+        "name": "OlmoHybridGatedDeltaNet",
+        "line": 447,
+        "bases": [
+          "nn.Module"
+        ],
+        "kb_nano_files": [
+          "tasks/baseline/L1/chunk_gated_delta_rule.py",
+          "tasks/baseline/L1/causal_conv1d.py",
+          "tasks/baseline/L1/rms_norm_gated.py"
+        ],
+        "rationale": "GatedDeltaNet linear attention with q/k/v conv1d + chunk_gated_delta_rule (or fused_recurrent_gated_delta_rule for decode) + RMSNormGated output; uses kb-nano L1/chunk_gated_delta_rule.py + L1/causal_conv1d.py for the conv path + L1/rms_norm_gated.py \u2014 composes (no L2 wrapper exists for this exact variant; closest is L2/qwen3_next_gdn_attention.py)"
+      },
+      {
+        "name": "OlmoHybridMLP",
+        "line": 632,
+        "bases": [
+          "Olmo3MLP"
+        ],
+        "kb_nano_files": [
+          "tasks/baseline/L2/llama_mlp.py"
+        ],
+        "rationale": "Olmo3MLP is SwiGLU; matches L2/llama_mlp.py"
+      },
+      {
+        "name": "OlmoHybridAttentionDecoderLayer",
+        "line": 636,
+        "bases": [
+          "Olmo3DecoderLayer"
+        ],
+        "kb_nano_files": [],
+        "rationale": "wiring: full-attention layer (post-norm)"
+      },
+      {
+        "name": "OlmoHybridLinearAttentionDecoderLayer",
+        "line": 643,
+        "bases": [
+          "LlamaDecoderLayer"
+        ],
+        "kb_nano_files": [],
+        "rationale": "wiring: pre-norm + linear_attn (GatedDeltaNet) + post_attention_layernorm + mlp"
+      },
+      {
+        "name": "OlmoHybridModel",
+        "line": 708,
+        "bases": [
+          "Qwen3NextModel"
+        ],
+        "kb_nano_files": [],
+        "rationale": "wiring: hybrid stack with linear_attention or full_attention layers"
+      },
+      {
+        "name": "OlmoHybridForCausalLM",
+        "line": 788,
+        "bases": [
+          "Olmo3ForCausalLM"
+        ],
+        "kb_nano_files": [],
+        "rationale": "wiring + lm_head"
+      }
+    ],
+    "inheritance_summary": [
+      "OlmoHybridRMSNormGated(Qwen3NextRMSNormGated)",
+      "OlmoHybridRMSNorm(Olmo3RMSNorm)",
+      "OlmoHybridAttention(Olmo3Attention)",
+      "OlmoHybridRotaryEmbedding(Olmo3RotaryEmbedding)",
+      "OlmoHybridMLP(Olmo3MLP)",
+      "OlmoHybridAttentionDecoderLayer(Olmo3DecoderLayer)",
+      "OlmoHybridLinearAttentionDecoderLayer(LlamaDecoderLayer)",
+      "OlmoHybridModel(Qwen3NextModel)",
+      "OlmoHybridForCausalLM(Olmo3ForCausalLM)"
+    ],
+    "evidence_lines": [
+      "olmo_hybrid/modular_olmo_hybrid.py:294",
+      "olmo_hybrid/modular_olmo_hybrid.py:362",
+      "olmo_hybrid/modular_olmo_hybrid.py:447"
+    ]
+  },
+  "olmoe": {
+    "src_file": "modular_olmoe.py",
+    "classes": [
+      {
+        "name": "OlmoeRMSNorm",
+        "line": 45,
+        "bases": [
+          "LlamaRMSNorm"
+        ],
+        "kb_nano_files": [
+          "tasks/baseline/L1/rms_norm.py"
+        ],
+        "rationale": "empty subclass of LlamaRMSNorm; standard RMSNorm"
+      },
+      {
+        "name": "OlmoeRotaryEmbedding",
+        "line": 50,
+        "bases": [
+          "LlamaRotaryEmbedding"
+        ],
+        "kb_nano_files": [
+          "tasks/baseline/L1/rotary_emb.py"
+        ],
+        "rationale": "empty subclass; standard NeoX RoPE"
+      },
+      {
+        "name": "OlmoeMLP",
+        "line": 54,
+        "bases": [
+          "GemmaMLP"
+        ],
+        "kb_nano_files": [
+          "tasks/baseline/L2/llama_mlp.py"
+        ],
+        "rationale": "GemmaMLP is SwiGLU; matches L2/llama_mlp.py"
+      },
+      {
+        "name": "OlmoeAttention",
+        "line": 58,
+        "bases": [
+          "LlamaAttention"
+        ],
+        "kb_nano_files": [
+          "tasks/baseline/L2/attention.py",
+          "tasks/baseline/L1/rms_norm.py"
+        ],
+        "rationale": "LlamaAttention with qk_norm RMSNorm applied to full hidden_size projections (q_norm: hidden_size, k_norm: num_kv_heads*head_dim) and optional clip_qkv + sliding_window; matches L2/attention.py with qk_norm and sliding_window options"
+      },
+      {
+        "name": "OlmoeExperts",
+        "line": 116,
+        "bases": [
+          "MixtralExperts"
+        ],
+        "kb_nano_files": [
+          "tasks/baseline/L1/moe_grouped_gemm.py"
+        ],
+        "rationale": "MixtralExperts is grouped-GEMM SwiGLU experts; matches L1/moe_grouped_gemm.py"
+      },
+      {
+        "name": "OlmoeTopKRouter",
+        "line": 120,
+        "bases": [
+          "Qwen2MoeTopKRouter"
+        ],
+        "kb_nano_files": [],
+        "rationale": "Qwen2MoeTopKRouter is softmax top-k router; routing pattern embedded inside L2/mixtral_moe.py via L1/topk_softmax.py"
+      },
+      {
+        "name": "OlmoeSparseMoeBlock",
+        "line": 124,
+        "bases": [
+          "nn.Module"
+        ],
+        "kb_nano_files": [
+          "tasks/baseline/L2/mixtral_moe.py"
+        ],
+        "rationale": "softmax top-k routing + grouped-GEMM SwiGLU experts (no shared expert); matches MixtralMoE pattern"
+      },
+      {
+        "name": "OlmoeDecoderLayer",
+        "line": 140,
+        "bases": [
+          "LlamaDecoderLayer"
+        ],
+        "kb_nano_files": [],
+        "rationale": "wiring: pre-norm + attn + pre-norm + sparse_moe_block"
+      },
+      {
+        "name": "OlmoeModel",
+        "line": 178,
+        "bases": [
+          "MixtralModel"
+        ],
+        "kb_nano_files": [],
+        "rationale": "wiring class"
+      },
+      {
+        "name": "OlmoeForCausalLM",
+        "line": 244,
+        "bases": [
+          "MixtralForCausalLM",
+          "GenerationMixin"
+        ],
+        "kb_nano_files": [],
+        "rationale": "wiring + lm_head"
+      }
+    ],
+    "inheritance_summary": [
+      "OlmoeRMSNorm(LlamaRMSNorm)",
+      "OlmoeRotaryEmbedding(LlamaRotaryEmbedding)",
+      "OlmoeMLP(GemmaMLP)",
+      "OlmoeAttention(LlamaAttention)",
+      "OlmoeExperts(MixtralExperts)",
+      "OlmoeTopKRouter(Qwen2MoeTopKRouter)",
+      "OlmoeDecoderLayer(LlamaDecoderLayer)",
+      "OlmoeModel(MixtralModel)",
+      "OlmoeForCausalLM(MixtralForCausalLM)"
+    ],
+    "evidence_lines": [
+      "olmoe/modular_olmoe.py:54",
+      "olmoe/modular_olmoe.py:58",
+      "olmoe/modular_olmoe.py:124"
+    ]
+  },
+  "omdet_turbo": {
+    "src_file": "modeling_omdet_turbo.py",
+    "classes": [
+      {
+        "name": "MultiScaleDeformableAttention",
+        "line": 164,
+        "bases": [
+          "nn.Module"
+        ],
+        "kb_nano_files": [
+          "tasks/baseline/L1/rtdetrv2_deformable_attention.py"
+        ],
+        "rationale": "deformable-DETR multi-scale sampling kernel; matches L1/rtdetrv2_deformable_attention.py"
+      },
+      {
+        "name": "OmDetTurboLanguageBackbone",
+        "line": 253,
+        "bases": [
+          "nn.Module"
+        ],
+        "kb_nano_files": [],
+        "rationale": "wiring around CLIPTextModel-derived language encoder"
+      },
+      {
+        "name": "OmDetTurboVisionBackbone",
+        "line": 277,
+        "bases": [
+          "nn.Module"
+        ],
+        "kb_nano_files": [],
+        "rationale": "wiring around vision backbone (Swin)"
+      },
+      {
+        "name": "OmDetTurboMultiscaleDeformableAttention",
+        "line": 298,
+        "bases": [
+          "nn.Module"
+        ],
+        "kb_nano_files": [
+          "tasks/baseline/L2/rtdetrv2_deformable_attention.py",
+          "tasks/baseline/L1/rtdetrv2_deformable_attention.py"
+        ],
+        "rationale": "wraps MultiScaleDeformableAttention with sampling_offsets/attention_weights/value_proj/output_proj projections; matches L2/rtdetrv2_deformable_attention.py:RTDetrV2DeformableAttention pattern"
+      },
+      {
+        "name": "OmDetTurboConvNormLayer",
+        "line": 407,
+        "bases": [
+          "nn.Module"
+        ],
+        "kb_nano_files": [
+          "tasks/baseline/L2/rtdetrv2_conv_norm.py"
+        ],
+        "rationale": "Conv2d + BatchNorm2d + activation; matches L2/rtdetrv2_conv_norm.py (RT-DETR copy)"
+      },
+      {
+        "name": "OmDetTurboRepVggBlock",
+        "line": 429,
+        "bases": [
+          "nn.Module"
+        ],
+        "kb_nano_files": [
+          "tasks/baseline/L2/rtdetrv2_repvgg_block.py"
+        ],
+        "rationale": "RepVGG block (3x3 + 1x1 conv merge); matches L2/rtdetrv2_repvgg_block.py"
+      },
+      {
+        "name": "OmDetTurboCSPRepLayer",
+        "line": 449,
+        "bases": [
+          "nn.Module"
+        ],
+        "kb_nano_files": [
+          "tasks/baseline/L2/rtdetrv2_csp_rep_layer.py"
+        ],
+        "rationale": "CSP layer with RepVGG bottlenecks; matches L2/rtdetrv2_csp_rep_layer.py"
+      },
+      {
+        "name": "OmDetTurboMultiheadAttention",
+        "line": 478,
+        "bases": [
+          "nn.Module"
+        ],
+        "kb_nano_files": [
+          "tasks/baseline/L2/rtdetrv2_multihead_attention.py"
+        ],
+        "rationale": "vanilla Q/K/V Linear + softmax + dropout MHA (DETR-style with manual q/k/v projections); matches L2/rtdetrv2_multihead_attention.py"
+      },
+      {
+        "name": "OmDetTurboEncoderLayer",
+        "line": 545,
+        "bases": [
+          "nn.Module"
+        ],
+        "kb_nano_files": [
+          "tasks/baseline/L2/rtdetrv2_encoder_layer.py"
+        ],
+        "rationale": "self_attn + LayerNorm + fc1+act+fc2 + LayerNorm; matches L2/rtdetrv2_encoder_layer.py"
+      },
+      {
+        "name": "OmDetTurboEncoder",
+        "line": 617,
+        "bases": [
+          "nn.Module"
+        ],
+        "kb_nano_files": [],
+        "rationale": "wiring: stack of encoder layers"
+      },
+      {
+        "name": "OmDetTurboHybridEncoder",
+        "line": 642,
+        "bases": [
+          "nn.Module"
+        ],
+        "kb_nano_files": [],
+        "rationale": "wiring: hybrid (CNN+Transformer) feature pyramid encoder"
+      },
+      {
+        "name": "OmDetTurboMLPWithDropout",
+        "line": 818,
+        "bases": [
+          "nn.Module"
+        ],
+        "kb_nano_files": [],
+        "rationale": "Linear + activation + dropout + Linear; composes from L1"
+      },
+      {
+        "name": "OmDetTurboMLP",
+        "line": 830,
+        "bases": [
+          "nn.Module"
+        ],
+        "kb_nano_files": [
+          "tasks/baseline/L2/rtdetrv2_mlp_head.py"
+        ],
+        "rationale": "stacked Linear+activation MLP head (DETR-style); matches L2/rtdetrv2_mlp_head.py"
+      },
+      {
+        "name": "OmDetTurboResidualLayer",
+        "line": 848,
+        "bases": [
+          "nn.Module"
+        ],
+        "kb_nano_files": [],
+        "rationale": "Linear + LayerNorm + residual; composes"
+      },
+      {
+        "name": "OmDetTurboTaskEncoder",
+        "line": 862,
+        "bases": [
+          "nn.Module"
+        ],
+        "kb_nano_files": [],
+        "rationale": "wiring: task-specific MLPs"
+      },
+      {
+        "name": "OmDetTurboDeformableTransformerDecoderLayer",
+        "line": 874,
+        "bases": [
+          "GradientCheckpointingLayer"
+        ],
+        "kb_nano_files": [],
+        "rationale": "wiring: self_attn + cross_attn (deformable) + linear+act+linear FFN with LayerNorms"
+      },
+      {
+        "name": "OmDetTurboDecoder",
+        "line": 1159,
+        "bases": [
+          "OmDetTurboPreTrainedModel"
+        ],
+        "kb_nano_files": [],
+        "rationale": "wiring: stack of deformable decoder layers"
+      },
+      {
+        "name": "OmDetTurboForObjectDetection",
+        "line": 1473,
+        "bases": [
+          "OmDetTurboPreTrainedModel"
+        ],
+        "kb_nano_files": [],
+        "rationale": "wiring: vision backbone + language backbone + hybrid encoder + decoder + task encoder"
+      }
+    ],
+    "inheritance_summary": [],
+    "evidence_lines": [
+      "omdet_turbo/modeling_omdet_turbo.py:164",
+      "omdet_turbo/modeling_omdet_turbo.py:298",
+      "omdet_turbo/modeling_omdet_turbo.py:478"
+    ]
+  },
+  "oneformer": {
+    "src_file": "modeling_oneformer.py",
+    "classes": [
+      {
+        "name": "OneFormerHungarianMatcher",
+        "line": 238,
+        "bases": [
+          "nn.Module"
+        ],
+        "kb_nano_files": [],
+        "rationale": "loss-only Hungarian matching; not a kernel"
+      },
+      {
+        "name": "OneFormerLoss",
+        "line": 347,
+        "bases": [
+          "nn.Module"
+        ],
+        "kb_nano_files": [],
+        "rationale": "loss function; not a forward kernel"
+      },
+      {
+        "name": "OneFormerPixelDecoderEncoderMultiscaleDeformableAttention",
+        "line": 938,
+        "bases": [
+          "nn.Module"
+        ],
+        "kb_nano_files": [
+          "tasks/baseline/L1/rtdetrv2_deformable_attention.py"
+        ],
+        "rationale": "deformable DETR multi-scale attention (sampling_offsets+attention_weights+value_proj+output_proj); same op as L1/rtdetrv2_deformable_attention.py"
+      },
+      {
+        "name": "OneFormerPixelDecoderEncoderLayer",
+        "line": 1031,
+        "bases": [
+          "nn.Module"
+        ],
+        "kb_nano_files": [],
+        "rationale": "wiring: deformable self_attn + linear+act+linear FFN + LayerNorms"
+      },
+      {
+        "name": "OneFormerPixelDecoderEncoderOnly",
+        "line": 1123,
+        "bases": [
+          "nn.Module"
+        ],
+        "kb_nano_files": [],
+        "rationale": "wiring: stack of encoder layers"
+      },
+      {
+        "name": "OneFormerPixelDecoder",
+        "line": 1247,
+        "bases": [
+          "nn.Module"
+        ],
+        "kb_nano_files": [],
+        "rationale": "wiring class for FPN-style pixel decoder"
+      },
+      {
+        "name": "OneFormerPixelLevelModule",
+        "line": 1447,
+        "bases": [
+          "nn.Module"
+        ],
+        "kb_nano_files": [],
+        "rationale": "wiring: vision encoder + pixel decoder"
+      },
+      {
+        "name": "OneFormerAttention",
+        "line": 1473,
+        "bases": [
+          "nn.Module"
+        ],
+        "kb_nano_files": [],
+        "rationale": "DETR-style MHA with positional embeddings added to q/k pre-projection; separate q/k/v Linear + bmm + softmax; composes from L1/linear + L1/softmax + L1/bmm"
+      },
+      {
+        "name": "OneFormerTransformerDecoderSelfAttentionLayer",
+        "line": 1609,
+        "bases": [
+          "nn.Module"
+        ],
+        "kb_nano_files": [],
+        "rationale": "wiring: OneFormerAttention + LayerNorm + dropout"
+      },
+      {
+        "name": "OneFormerTransformerDecoderCrossAttentionLayer",
+        "line": 1667,
+        "bases": [
+          "nn.Module"
+        ],
+        "kb_nano_files": [],
+        "rationale": "wiring: OneFormerAttention (cross) + LayerNorm + dropout"
+      },
+      {
+        "name": "OneFormerTransformerDecoderFFNLayer",
+        "line": 1739,
+        "bases": [
+          "nn.Module"
+        ],
+        "kb_nano_files": [],
+        "rationale": "wiring: Linear + activation + Linear + LayerNorm"
+      },
+      {
+        "name": "OneFormerMLPPredictionHead",
+        "line": 1781,
+        "bases": [
+          "nn.Module"
+        ],
+        "kb_nano_files": [],
+        "rationale": "stacked Linear MLP head; composes"
+      },
+      {
+        "name": "OneFormerTransformerDecoderLayer",
+        "line": 1813,
+        "bases": [
+          "nn.Module"
+        ],
+        "kb_nano_files": [],
+        "rationale": "wiring: cross_attn + self_attn + ffn"
+      },
+      {
+        "name": "OneFormerTransformerDecoderQueryTransformerDecoder",
+        "line": 1900,
+        "bases": [
+          "nn.Module"
+        ],
+        "kb_nano_files": [],
+        "rationale": "wiring: stack of query-transformer decoder layers"
+      },
+      {
+        "name": "OneFormerTransformerDecoderQueryTransformerDecoderLayer",
+        "line": 1947,
+        "bases": [
+          "nn.Module"
+        ],
+        "kb_nano_files": [],
+        "rationale": "wiring: self/cross attn + LayerNorms + linear+act+linear"
+      },
+      {
+        "name": "OneFormerTransformerDecoderQueryTransformer",
+        "line": 2075,
+        "bases": [
+          "nn.Module"
+        ],
+        "kb_nano_files": [],
+        "rationale": "wiring class"
+      },
+      {
+        "name": "OneFormerTransformerDecoder",
+        "line": 2121,
+        "bases": [
+          "nn.Module"
+        ],
+        "kb_nano_files": [],
+        "rationale": "wiring: stack of transformer decoder layers"
+      },
+      {
+        "name": "OneFormerTransformerModule",
+        "line": 2277,
+        "bases": [
+          "nn.Module"
+        ],
+        "kb_nano_files": [],
+        "rationale": "wiring: query embeddings + transformer decoder"
+      },
+      {
+        "name": "OneFormerSinePositionEmbedding",
+        "line": 2353,
+        "bases": [
+          "nn.Module"
+        ],
+        "kb_nano_files": [
+          "tasks/baseline/L1/sinusoidal_embed.py"
+        ],
+        "rationale": "DETR-style 2D sin/cos positional embedding; closest to L1/sinusoidal_embed.py compute"
+      },
+      {
+        "name": "PredictionBlock",
+        "line": 2400,
+        "bases": [
+          "nn.Module"
+        ],
+        "kb_nano_files": [],
+        "rationale": "Linear + activation; composes"
+      },
+      {
+        "name": "OneFormerTextMapperAttention",
+        "line": 2415,
+        "bases": [
+          "nn.Module"
+        ],
+        "kb_nano_files": [],
+        "rationale": "Q/K/V Linear (qkv-fused) + softmax MHA for text-mapper; composes from L1/linear + L1/softmax"
+      },
+      {
+        "name": "OneFormerTextTransformerDecoderLayer",
+        "line": 2451,
+        "bases": [
+          "nn.Module"
+        ],
+        "kb_nano_files": [],
+        "rationale": "wiring: text-mapper attn + LayerNorms + FFN"
+      },
+      {
+        "name": "OneFormerTextContextDecoder",
+        "line": 2481,
+        "bases": [
+          "nn.Module"
+        ],
+        "kb_nano_files": [],
+        "rationale": "wiring: stack of text-context decoder layers"
+      },
+      {
+        "name": "OneFormerTextMLP",
+        "line": 2526,
+        "bases": [
+          "nn.Module"
+        ],
+        "kb_nano_files": [
+          "tasks/baseline/L2/clip_mlp.py"
+        ],
+        "rationale": "fc1 + QuickGELU + fc2; matches L2/clip_mlp.py:CLIPMLP"
+      },
+      {
+        "name": "OneFormerTextTransformerLayer",
+        "line": 2545,
+        "bases": [
+          "GradientCheckpointingLayer"
+        ],
+        "kb_nano_files": [],
+        "rationale": "wiring: nn.MultiheadAttention + LayerNorm + OneFormerTextMLP + LayerNorm (CLIP-text-style with MultiheadAttention; the actual MHA is via torch's nn.MultiheadAttention which decomposes to L1/linear + L1/softmax)"
+      },
+      {
+        "name": "OneFormerTextTransformer",
+        "line": 2579,
+        "bases": [
+          "nn.Module"
+        ],
+        "kb_nano_files": [],
+        "rationale": "wiring: stack of text-transformer layers"
+      },
+      {
+        "name": "OneFormerTextEncoder",
+        "line": 2603,
+        "bases": [
+          "nn.Module"
+        ],
+        "kb_nano_files": [],
+        "rationale": "wiring: token embed + position param + transformer + ln_final"
+      },
+      {
+        "name": "OneFormerTextMapper",
+        "line": 2650,
+        "bases": [
+          "nn.Module"
+        ],
+        "kb_nano_files": [],
+        "rationale": "wiring: text encoder + context decoder + projection heads"
+      },
+      {
+        "name": "OneFormerTaskModel",
+        "line": 2711,
+        "bases": [
+          "nn.Module"
+        ],
+        "kb_nano_files": [],
+        "rationale": "wiring: prediction blocks for task encoding"
+      },
+      {
+        "name": "OneFormerModel",
+        "line": 2818,
+        "bases": [
+          "OneFormerPreTrainedModel"
+        ],
+        "kb_nano_files": [],
+        "rationale": "wiring: pixel + transformer + text-mapper"
+      },
+      {
+        "name": "OneFormerForUniversalSegmentation",
+        "line": 2954,
+        "bases": [
+          "OneFormerPreTrainedModel"
+        ],
+        "kb_nano_files": [],
+        "rationale": "wiring + class/mask heads"
+      }
+    ],
+    "inheritance_summary": [],
+    "evidence_lines": [
+      "oneformer/modeling_oneformer.py:938",
+      "oneformer/modeling_oneformer.py:1473",
+      "oneformer/modeling_oneformer.py:2526"
+    ]
+  },
+  "openai": {
+    "src_file": "modeling_openai.py",
+    "classes": [
+      {
+        "name": "Attention",
+        "line": 46,
+        "bases": [
+          "nn.Module"
+        ],
+        "kb_nano_files": [],
+        "rationale": "GPT-1 attention with Conv1D (=fused qkv linear that splits into Q/K/V) + manual scaled dot-prod with absolute upper-triangular mask buffer + softmax + attn-dropout + Conv1D out_proj; composes from L1/linear (Conv1D is just nn.Linear with transposed weight) + L1/softmax + L1/bmm"
+      },
+      {
+        "name": "MLP",
+        "line": 118,
+        "bases": [
+          "nn.Module"
+        ],
+        "kb_nano_files": [],
+        "rationale": "Conv1D fc + activation (GELU) + Conv1D proj + dropout; two-linear MLP, NOT SwiGLU; composes from L1/linear + L1/gelu"
+      },
+      {
+        "name": "Block",
+        "line": 133,
+        "bases": [
+          "nn.Module"
+        ],
+        "kb_nano_files": [],
+        "rationale": "wiring: attn + LayerNorm + mlp + LayerNorm (GPT-1 post-norm)"
+      },
+      {
+        "name": "OpenAIGPTSequenceSummary",
+        "line": 159,
+        "bases": [
+          "nn.Module"
+        ],
+        "kb_nano_files": [],
+        "rationale": "linear + activation pooling head; composes"
+      },
+      {
+        "name": "OpenAIGPTModel",
+        "line": 301,
+        "bases": [
+          "OpenAIGPTPreTrainedModel"
+        ],
+        "kb_nano_files": [],
+        "rationale": "wiring: tokens + position embed + dropout + Block stack"
+      },
+      {
+        "name": "OpenAIGPTLMHeadModel",
+        "line": 416,
+        "bases": [
+          "OpenAIGPTPreTrainedModel",
+          "GenerationMixin"
+        ],
+        "kb_nano_files": [],
+        "rationale": "wiring + lm_head"
+      },
+      {
+        "name": "OpenAIGPTDoubleHeadsModel",
+        "line": 501,
+        "bases": [
+          "OpenAIGPTPreTrainedModel"
+        ],
+        "kb_nano_files": [],
+        "rationale": "wiring + dual heads"
+      },
+      {
+        "name": "OpenAIGPTForSequenceClassification",
+        "line": 618,
+        "bases": [
+          "OpenAIGPTPreTrainedModel"
+        ],
+        "kb_nano_files": [],
+        "rationale": "wiring class"
+      }
+    ],
+    "inheritance_summary": [],
+    "evidence_lines": [
+      "openai/modeling_openai.py:46",
+      "openai/modeling_openai.py:118",
+      "openai/modeling_openai.py:133"
+    ]
+  },
+  "openai_privacy_filter": {
+    "src_file": "modular_openai_privacy_filter.py",
+    "classes": [
+      {
+        "name": "OpenAIPrivacyFilterRMSNorm",
+        "line": 114,
+        "bases": [
+          "GptOssRMSNorm"
+        ],
+        "kb_nano_files": [
+          "tasks/baseline/L1/rms_norm.py"
+        ],
+        "rationale": "empty subclass of GptOssRMSNorm; standard RMSNorm"
+      },
+      {
+        "name": "OpenAIPrivacyFilterRotaryEmbedding",
+        "line": 118,
+        "bases": [
+          "GptOssRotaryEmbedding"
+        ],
+        "kb_nano_files": [
+          "tasks/baseline/L1/yarn_rotary_emb.py"
+        ],
+        "rationale": "GptOssRotaryEmbedding is YaRN-NeoX RoPE (config.rope_parameters['rope_type']='yarn'); matches L1/yarn_rotary_emb.py"
+      },
+      {
+        "name": "OpenAIPrivacyFilterAttention",
+        "line": 165,
+        "bases": [
+          "GptOssAttention"
+        ],
+        "kb_nano_files": [
+          "tasks/baseline/L2/gpt_oss_attention.py"
+        ],
+        "rationale": "GptOss-style attention with attention sinks + sliding window + bidirectional (is_causal=False); per-Q,K scaling applied separately (head_dim**-0.25 each side); kb-nano L2/gpt_oss_attention.py is the dedicated GPT-OSS attention with sinks (note: bidirectional vs causal differs slightly, but kernel ops match)"
+      },
+      {
+        "name": "OpenAIPrivacyFilterExperts",
+        "line": 218,
+        "bases": [
+          "GptOssExperts"
+        ],
+        "kb_nano_files": [
+          "tasks/baseline/L1/mxfp4_moe.py"
+        ],
+        "rationale": "GptOssExperts is MXFP4-quantized expert bank with gate_up + down + per-expert bias; OpenAIPrivacyFilter overrides _apply_gate to use chunked layout; same kernel family as L1/mxfp4_moe.py (or non-quantized fp32 fallback path; depends on checkpoint)"
+      },
+      {
+        "name": "OpenAIPrivacyFilterTopKRouter",
+        "line": 263,
+        "bases": [
+          "GptOssTopKRouter"
+        ],
+        "kb_nano_files": [],
+        "rationale": "linear gate (fp32) + topk + softmax + scaling; routing pattern embedded inside L2/gpt_oss_moe.py"
+      },
+      {
+        "name": "OpenAIPrivacyFilterMLP",
+        "line": 276,
+        "bases": [
+          "nn.Module"
+        ],
+        "kb_nano_files": [
+          "tasks/baseline/L2/gpt_oss_moe.py"
+        ],
+        "rationale": "router + experts wiring (no shared expert); matches L2/gpt_oss_moe.py:GPTOssMoE pattern (with extra num_experts scaling)"
+      },
+      {
+        "name": "OpenAIPrivacyFilterEncoderLayer",
+        "line": 296,
+        "bases": [
+          "GptOssDecoderLayer"
+        ],
+        "kb_nano_files": [],
+        "rationale": "wiring: pre-norm + attn + pre-norm + moe-mlp"
+      },
+      {
+        "name": "OpenAIPrivacyFilterModel",
+        "line": 348,
+        "bases": [
+          "GptOssModel"
+        ],
+        "kb_nano_files": [],
+        "rationale": "wiring: bidirectional sliding-window encoder stack"
+      },
+      {
+        "name": "OpenAIPrivacyFilterForTokenClassification",
+        "line": 396,
+        "bases": [
+          "GenericForTokenClassification",
+          "OpenAIPrivacyFilterPreTrainedModel"
+        ],
+        "kb_nano_files": [],
+        "rationale": "wiring class"
+      }
+    ],
+    "inheritance_summary": [
+      "OpenAIPrivacyFilterRMSNorm(GptOssRMSNorm)",
+      "OpenAIPrivacyFilterRotaryEmbedding(GptOssRotaryEmbedding)",
+      "OpenAIPrivacyFilterAttention(GptOssAttention)",
+      "OpenAIPrivacyFilterExperts(GptOssExperts)",
+      "OpenAIPrivacyFilterTopKRouter(GptOssTopKRouter)",
+      "OpenAIPrivacyFilterEncoderLayer(GptOssDecoderLayer)",
+      "OpenAIPrivacyFilterModel(GptOssModel)"
+    ],
+    "evidence_lines": [
+      "openai_privacy_filter/modular_openai_privacy_filter.py:165",
+      "openai_privacy_filter/modular_openai_privacy_filter.py:218",
+      "openai_privacy_filter/modular_openai_privacy_filter.py:276"
+    ]
+  },
+  "opt": {
+    "src_file": "modeling_opt.py",
+    "classes": [
+      {
+        "name": "OPTLearnedPositionalEmbedding",
+        "line": 45,
+        "bases": [
+          "nn.Embedding"
+        ],
+        "kb_nano_files": [
+          "tasks/baseline/L1/embedding.py"
+        ],
+        "rationale": "learned positional embedding with offset=2 (BART-style); maps to L1/embedding.py"
+      },
+      {
+        "name": "OPTAttention",
+        "line": 97,
+        "bases": [
+          "nn.Module"
+        ],
+        "kb_nano_files": [],
+        "rationale": "BART-decoder-style causal self-attention with separate q/k/v Linear (config.enable_bias) + LayerNorm-pre-attn (in layer); no RoPE, no GQA; kb-nano L2/attention.py assumes RoPE+GQA \u2014 OPT uses absolute pos via OPTLearnedPositionalEmbedding instead of RoPE; partial fit, composes from L1/linear + L1/softmax + L1/sdpa (causal)"
+      },
+      {
+        "name": "OPTDecoderLayer",
+        "line": 184,
+        "bases": [
+          "GradientCheckpointingLayer"
+        ],
+        "kb_nano_files": [],
+        "rationale": "wiring: optional pre/post attn LayerNorm + self_attn + (configurable do_layer_norm_before) + fc1 + activation (relu) + fc2 + LayerNorm"
+      },
+      {
+        "name": "OPTDecoder",
+        "line": 273,
+        "bases": [
+          "OPTPreTrainedModel"
+        ],
+        "kb_nano_files": [],
+        "rationale": "wiring: token embed + learned position embed + optional project_in/out + decoder layers + (optional) final LayerNorm"
+      },
+      {
+        "name": "OPTModel",
+        "line": 400,
+        "bases": [
+          "OPTPreTrainedModel"
+        ],
+        "kb_nano_files": [],
+        "rationale": "wiring class around decoder"
+      },
+      {
+        "name": "OPTForCausalLM",
+        "line": 443,
+        "bases": [
+          "OPTPreTrainedModel",
+          "GenerationMixin"
+        ],
+        "kb_nano_files": [],
+        "rationale": "wiring + lm_head"
+      },
+      {
+        "name": "OPTForSequenceClassification",
+        "line": 541,
+        "bases": [
+          "OPTPreTrainedModel"
+        ],
+        "kb_nano_files": [],
+        "rationale": "wiring class"
+      },
+      {
+        "name": "OPTForQuestionAnswering",
+        "line": 644,
+        "bases": [
+          "OPTPreTrainedModel"
+        ],
+        "kb_nano_files": [],
+        "rationale": "wiring class"
+      }
+    ],
+    "inheritance_summary": [],
+    "evidence_lines": [
+      "opt/modeling_opt.py:45",
+      "opt/modeling_opt.py:97",
+      "opt/modeling_opt.py:184"
+    ]
+  },
+  "ovis2": {
+    "src_file": "modular_ovis2.py",
+    "classes": [
+      {
+        "name": "Ovis2RMSNorm",
+        "line": 68,
+        "bases": [
+          "LlamaRMSNorm"
+        ],
+        "kb_nano_files": [
+          "tasks/baseline/L1/rms_norm.py"
+        ],
+        "rationale": "empty subclass; standard RMSNorm"
+      },
+      {
+        "name": "Ovis2VisionMLP",
+        "line": 72,
+        "bases": [
+          "LlamaMLP"
+        ],
+        "kb_nano_files": [
+          "tasks/baseline/L2/llama_mlp.py"
+        ],
+        "rationale": "empty subclass of LlamaMLP; SwiGLU"
+      },
+      {
+        "name": "Ovis2VisionEmbeddings",
+        "line": 76,
+        "bases": [
+          "SiglipVisionEmbeddings"
+        ],
+        "kb_nano_files": [
+          "tasks/baseline/L1/conv2d.py",
+          "tasks/baseline/L1/embedding.py",
+          "tasks/baseline/L1/rms_norm.py"
+        ],
+        "rationale": "Conv2d patch embed + RMSNorm + position embedding (no class token); composes from L1/conv2d + L1/embedding + L1/rms_norm"
+      },
+      {
+        "name": "Ovis2VisionAttention",
+        "line": 95,
+        "bases": [
+          "Aimv2Attention"
+        ],
+        "kb_nano_files": [
+          "tasks/baseline/L2/siglip_attention.py"
+        ],
+        "rationale": "Aimv2Attention inherits SiglipAttention (separate q/k/v + dense attention, non-causal); matches L2/siglip_attention.py:SigLIPAttention"
+      },
+      {
+        "name": "Ovis2VisionEncoderLayer",
+        "line": 99,
+        "bases": [
+          "Aimv2EncoderLayer"
+        ],
+        "kb_nano_files": [],
+        "rationale": "wiring: rms_norm1 -> attention -> rms_norm2 -> ffn (Aimv2-style)"
+      },
+      {
+        "name": "Ovis2VisionEncoder",
+        "line": 105,
+        "bases": [
+          "SiglipEncoder"
+        ],
+        "kb_nano_files": [],
+        "rationale": "wiring: stack of encoder layers"
+      },
+      {
+        "name": "Ovis2VisionTransformer",
+        "line": 125,
+        "bases": [
+          "nn.Module"
+        ],
+        "kb_nano_files": [],
+        "rationale": "wiring: embeddings + encoder + final RMSNorm"
+      },
+      {
+        "name": "Ovis2VisualEmbeddingTable",
+        "line": 155,
+        "bases": [
+          "nn.Embedding"
+        ],
+        "kb_nano_files": [
+          "tasks/baseline/L1/embedding.py"
+        ],
+        "rationale": "Embedding that supports both integer (lookup) and float (matmul) inputs; composes from L1/embedding + L1/linear (matmul)"
+      },
+      {
+        "name": "Ovis2VisionModel",
+        "line": 183,
+        "bases": [
+          "Ovis2PreTrainedModel"
+        ],
+        "kb_nano_files": [],
+        "rationale": "wiring: vision transformer + head_linear + head_norm + tokenize_function (gumbel/argmax/softmax)"
+      },
+      {
+        "name": "Ovis2Model",
+        "line": 248,
+        "bases": [
+          "LlavaModel"
+        ],
+        "kb_nano_files": [],
+        "rationale": "wiring: vision_tower + visual_embeddings_table + language_model"
+      },
+      {
+        "name": "Ovis2ForConditionalGeneration",
+        "line": 361,
+        "bases": [
+          "LlavaForConditionalGeneration",
+          "GenerationMixin"
+        ],
+        "kb_nano_files": [],
+        "rationale": "wiring + lm_head"
+      }
+    ],
+    "inheritance_summary": [
+      "Ovis2RMSNorm(LlamaRMSNorm)",
+      "Ovis2VisionMLP(LlamaMLP)",
+      "Ovis2VisionEmbeddings(SiglipVisionEmbeddings)",
+      "Ovis2VisionAttention(Aimv2Attention)",
+      "Ovis2VisionEncoderLayer(Aimv2EncoderLayer)",
+      "Ovis2VisionEncoder(SiglipEncoder)",
+      "Ovis2Model(LlavaModel)",
+      "Ovis2ForConditionalGeneration(LlavaForConditionalGeneration)"
+    ],
+    "evidence_lines": [
+      "ovis2/modular_ovis2.py:72",
+      "ovis2/modular_ovis2.py:95",
+      "ovis2/modular_ovis2.py:125"
+    ]
+  },
+  "owlv2": {
+    "src_file": "modeling_owlv2.py",
+    "classes": [
+      {
+        "name": "Owlv2VisionEmbeddings",
+        "line": 280,
+        "bases": [
+          "nn.Module"
+        ],
+        "kb_nano_files": [
+          "tasks/baseline/L1/conv2d.py",
+          "tasks/baseline/L1/embedding.py"
+        ],
+        "rationale": "Conv2d patch embed + class token + learned position embedding; composes from L1/conv2d + L1/embedding"
+      },
+      {
+        "name": "Owlv2TextEmbeddings",
+        "line": 358,
+        "bases": [
+          "nn.Module"
+        ],
+        "kb_nano_files": [
+          "tasks/baseline/L1/embedding.py",
+          "tasks/baseline/L1/layer_norm.py"
+        ],
+        "rationale": "[v2 fix] token + position embeddings (CLIP-style); composes from L1/embedding.py + L1/layer_norm.py."
+      },
+      {
+        "name": "Owlv2Attention",
+        "line": 419,
+        "bases": [
+          "nn.Module"
+        ],
+        "kb_nano_files": [
+          "tasks/baseline/L2/clip_attention.py"
+        ],
+        "rationale": "CLIP-style separate q/k/v Linear + manual scaled dot-prod softmax (non-causal for vision; causal for text); matches L2/clip_attention.py:CLIPAttention"
+      },
+      {
+        "name": "Owlv2MLP",
+        "line": 477,
+        "bases": [
+          "nn.Module"
+        ],
+        "kb_nano_files": [
+          "tasks/baseline/L2/clip_mlp.py"
+        ],
+        "rationale": "fc1 + activation (QuickGELU per CLIP convention) + fc2; matches L2/clip_mlp.py:CLIPMLP"
+      },
+      {
+        "name": "Owlv2EncoderLayer",
+        "line": 493,
+        "bases": [
+          "GradientCheckpointingLayer"
+        ],
+        "kb_nano_files": [],
+        "rationale": "wiring: ln + attn + ln + mlp (CLIP encoder pattern)"
+      },
+      {
+        "name": "Owlv2Encoder",
+        "line": 590,
+        "bases": [
+          "nn.Module"
+        ],
+        "kb_nano_files": [],
+        "rationale": "wiring: stack of encoder layers"
+      },
+      {
+        "name": "Owlv2TextTransformer",
+        "line": 625,
+        "bases": [
+          "Owlv2PreTrainedModel"
+        ],
+        "kb_nano_files": [],
+        "rationale": "wiring: text embeddings + encoder + final LayerNorm"
+      },
+      {
+        "name": "Owlv2TextModel",
+        "line": 689,
+        "bases": [
+          "Owlv2PreTrainedModel"
+        ],
+        "kb_nano_files": [],
+        "rationale": "wiring class"
+      },
+      {
+        "name": "Owlv2VisionTransformer",
+        "line": 740,
+        "bases": [
+          "Owlv2PreTrainedModel"
+        ],
+        "kb_nano_files": [],
+        "rationale": "wiring: vision embeddings + pre-LayerNorm + encoder + post-LayerNorm"
+      },
+      {
+        "name": "Owlv2VisionModel",
+        "line": 784,
+        "bases": [
+          "Owlv2PreTrainedModel"
+        ],
+        "kb_nano_files": [],
+        "rationale": "wiring class"
+      },
+      {
+        "name": "Owlv2Model",
+        "line": 835,
+        "bases": [
+          "Owlv2PreTrainedModel"
+        ],
+        "kb_nano_files": [],
+        "rationale": "wiring: text + vision + projection heads"
+      },
+      {
+        "name": "Owlv2BoxPredictionHead",
+        "line": 1010,
+        "bases": [
+          "nn.Module"
+        ],
+        "kb_nano_files": [],
+        "rationale": "stacked Linear+activation MLP head; composes"
+      },
+      {
+        "name": "Owlv2ClassPredictionHead",
+        "line": 1030,
+        "bases": [
+          "nn.Module"
+        ],
+        "kb_nano_files": [],
+        "rationale": "Linear projection head; composes"
+      },
+      {
+        "name": "Owlv2ForObjectDetection",
+        "line": 1078,
+        "bases": [
+          "Owlv2PreTrainedModel"
+        ],
+        "kb_nano_files": [],
+        "rationale": "wiring: model + box/class heads"
+      }
+    ],
+    "inheritance_summary": [],
+    "evidence_lines": [
+      "owlv2/modeling_owlv2.py:419",
+      "owlv2/modeling_owlv2.py:477",
+      "owlv2/modeling_owlv2.py:493"
+    ]
+  },
+  "owlvit": {
+    "src_file": "modeling_owlvit.py",
+    "classes": [
+      {
+        "name": "OwlViTVisionEmbeddings",
+        "line": 274,
+        "bases": [
+          "nn.Module"
+        ],
+        "kb_nano_files": [
+          "tasks/baseline/L1/conv2d.py",
+          "tasks/baseline/L1/embedding.py"
+        ],
+        "rationale": "Conv2d patch embed + class token + learned position embedding; composes from L1/conv2d + L1/embedding"
+      },
+      {
+        "name": "OwlViTTextEmbeddings",
+        "line": 347,
+        "bases": [
+          "nn.Module"
+        ],
+        "kb_nano_files": [
+          "tasks/baseline/L1/embedding.py",
+          "tasks/baseline/L1/layer_norm.py"
+        ],
+        "rationale": "[v2 fix] token + position embeddings (CLIP-style); composes from L1/embedding.py + L1/layer_norm.py."
+      },
+      {
+        "name": "OwlViTAttention",
+        "line": 407,
+        "bases": [
+          "nn.Module"
+        ],
+        "kb_nano_files": [
+          "tasks/baseline/L2/clip_attention.py"
+        ],
+        "rationale": "CLIP-style separate q/k/v Linear + manual scaled dot-prod softmax; matches L2/clip_attention.py"
+      },
+      {
+        "name": "OwlViTMLP",
+        "line": 465,
+        "bases": [
+          "nn.Module"
+        ],
+        "kb_nano_files": [
+          "tasks/baseline/L2/clip_mlp.py"
+        ],
+        "rationale": "fc1 + activation + fc2 (CLIP MLP); matches L2/clip_mlp.py"
+      },
+      {
+        "name": "OwlViTEncoderLayer",
+        "line": 481,
+        "bases": [
+          "GradientCheckpointingLayer"
+        ],
+        "kb_nano_files": [],
+        "rationale": "wiring: ln + attn + ln + mlp"
+      },
+      {
+        "name": "OwlViTEncoder",
+        "line": 577,
+        "bases": [
+          "nn.Module"
+        ],
+        "kb_nano_files": [],
+        "rationale": "wiring: stack of encoder layers"
+      },
+      {
+        "name": "OwlViTTextTransformer",
+        "line": 611,
+        "bases": [
+          "OwlViTPreTrainedModel"
+        ],
+        "kb_nano_files": [],
+        "rationale": "wiring: text embeddings + encoder + final LayerNorm"
+      },
+      {
+        "name": "OwlViTTextModel",
+        "line": 674,
+        "bases": [
+          "OwlViTPreTrainedModel"
+        ],
+        "kb_nano_files": [],
+        "rationale": "wiring class"
+      },
+      {
+        "name": "OwlViTVisionTransformer",
+        "line": 724,
+        "bases": [
+          "OwlViTPreTrainedModel"
+        ],
+        "kb_nano_files": [],
+        "rationale": "wiring: vision embeddings + pre-LayerNorm + encoder + post-LayerNorm"
+      },
+      {
+        "name": "OwlViTVisionModel",
+        "line": 767,
+        "bases": [
+          "OwlViTPreTrainedModel"
+        ],
+        "kb_nano_files": [],
+        "rationale": "wiring class"
+      },
+      {
+        "name": "OwlViTModel",
+        "line": 817,
+        "bases": [
+          "OwlViTPreTrainedModel"
+        ],
+        "kb_nano_files": [],
+        "rationale": "wiring: text + vision + projection"
+      },
+      {
+        "name": "OwlViTBoxPredictionHead",
+        "line": 991,
+        "bases": [
+          "nn.Module"
+        ],
+        "kb_nano_files": [],
+        "rationale": "Linear MLP head; composes"
+      },
+      {
+        "name": "OwlViTClassPredictionHead",
+        "line": 1010,
+        "bases": [
+          "nn.Module"
+        ],
+        "kb_nano_files": [],
+        "rationale": "Linear head; composes"
+      },
+      {
+        "name": "OwlViTForObjectDetection",
+        "line": 1058,
+        "bases": [
+          "OwlViTPreTrainedModel"
+        ],
+        "kb_nano_files": [],
+        "rationale": "wiring: model + heads"
+      }
+    ],
+    "inheritance_summary": [],
+    "evidence_lines": [
+      "owlvit/modeling_owlvit.py:407",
+      "owlvit/modeling_owlvit.py:465",
+      "owlvit/modeling_owlvit.py:481"
+    ]
+  },
+  "paddleocr_vl": {
+    "src_file": "modular_paddleocr_vl.py",
+    "classes": [
+      {
+        "name": "PaddleOCRProjector",
+        "line": 532,
+        "bases": [
+          "nn.Module"
+        ],
+        "kb_nano_files": [],
+        "rationale": "vision-to-text projector: pre-norm + linear + GELU + linear (with spatial merge); composes from L1/layer_norm + L1/linear + L1/gelu"
+      },
+      {
+        "name": "PaddleOCRVisionRotaryEmbedding",
+        "line": 568,
+        "bases": [
+          "VisionRotaryEmbedding"
+        ],
+        "kb_nano_files": [
+          "tasks/baseline/L1/vision_rotary_emb.py"
+        ],
+        "rationale": "VisionRotaryEmbedding is 2D vision RoPE (Qwen2VL style); matches L1/vision_rotary_emb.py"
+      },
+      {
+        "name": "PaddleOCRRotaryEmbedding",
+        "line": 572,
+        "bases": [
+          "Qwen2VLRotaryEmbedding"
+        ],
+        "kb_nano_files": [
+          "tasks/baseline/L1/mrope.py"
+        ],
+        "rationale": "Qwen2VLRotaryEmbedding is M-RoPE (multimodal RoPE for Qwen-VL); matches L1/mrope.py"
+      },
+      {
+        "name": "PaddleOCRMLP",
+        "line": 576,
+        "bases": [
+          "Ernie4_5MLP"
+        ],
+        "kb_nano_files": [
+          "tasks/baseline/L2/llama_mlp.py"
+        ],
+        "rationale": "Ernie4_5MLP is SwiGLU (gate+up+down + SiLU); matches L2/llama_mlp.py"
+      },
+      {
+        "name": "PaddleOCRAttention",
+        "line": 581,
+        "bases": [
+          "Qwen2_5OmniAttention"
+        ],
+        "kb_nano_files": [
+          "tasks/baseline/L2/attention.py",
+          "tasks/baseline/L1/mrope.py"
+        ],
+        "rationale": "Qwen2_5OmniAttention with separate q/k/v_proj + M-RoPE (multimodal); maps to L2/attention.py with mrope-aware rotary_emb"
+      },
+      {
+        "name": "PaddleOCRRMSNorm",
+        "line": 592,
+        "bases": [
+          "Ernie4_5RMSNorm"
+        ],
+        "kb_nano_files": [
+          "tasks/baseline/L1/rms_norm.py"
+        ],
+        "rationale": "empty subclass; standard RMSNorm"
+      },
+      {
+        "name": "PaddleOCRDecoderLayer",
+        "line": 596,
+        "bases": [
+          "Ernie4_5DecoderLayer"
+        ],
+        "kb_nano_files": [],
+        "rationale": "wiring: pre-norm + attn + pre-norm + mlp"
+      },
+      {
+        "name": "PaddleOCRTextModel",
+        "line": 629,
+        "bases": [
+          "PaddleOCRVLPreTrainedModel",
+          "Ernie4_5Model"
+        ],
+        "kb_nano_files": [],
+        "rationale": "wiring class"
+      },
+      {
+        "name": "PaddleOCRVisionEmbeddings",
+        "line": 697,
+        "bases": [
+          "SiglipVisionEmbeddings"
+        ],
+        "kb_nano_files": [
+          "tasks/baseline/L1/conv2d.py",
+          "tasks/baseline/L2/vision_pos_embed_interpolate.py"
+        ],
+        "rationale": "Conv2d patch embed + interpolated learned position embeddings (per-image grid); composes"
+      },
+      {
+        "name": "PaddleOCRVisionAttention",
+        "line": 757,
+        "bases": [
+          "VideoLlama3VisionAttention"
+        ],
+        "kb_nano_files": [
+          "tasks/baseline/L2/vision_attention.py"
+        ],
+        "rationale": "VideoLlama3VisionAttention is varlen vision attention with cu_seqlens (Qwen2VL family); matches L2/vision_attention.py"
+      },
+      {
+        "name": "PaddleOCRVisionMLP",
+        "line": 762,
+        "bases": [
+          "SiglipMLP"
+        ],
+        "kb_nano_files": [
+          "tasks/baseline/L2/vision_mlp.py"
+        ],
+        "rationale": "SiglipMLP is fc1+GELU+fc2; the SigLIP-style MLP for vision encoders; matches L2/vision_mlp.py"
+      },
+      {
+        "name": "PaddleOCRVisionEncoderLayer",
+        "line": 767,
+        "bases": [
+          "VideoLlama3VisionEncoderLayer"
+        ],
+        "kb_nano_files": [],
+        "rationale": "wiring: ln + attn + ln + mlp"
+      },
+      {
+        "name": "PaddleOCRVisionEncoder",
+        "line": 772,
+        "bases": [
+          "VideoLlama3VisionEncoder"
+        ],
+        "kb_nano_files": [],
+        "rationale": "wiring: stack of encoder layers + 2D RoPE"
+      },
+      {
+        "name": "PaddleOCRVisionTransformer",
+        "line": 838,
+        "bases": [
+          "PaddleOCRVLPreTrainedModel"
+        ],
+        "kb_nano_files": [],
+        "rationale": "wiring class"
+      },
+      {
+        "name": "PaddleOCRVisionModel",
+        "line": 898,
+        "bases": [
+          "PaddleOCRVLPreTrainedModel"
+        ],
+        "kb_nano_files": [],
+        "rationale": "wiring class"
+      },
+      {
+        "name": "PaddleOCRVLModel",
+        "line": 943,
+        "bases": [
+          "Qwen2VLModel"
+        ],
+        "kb_nano_files": [],
+        "rationale": "wiring: vision + projector + language model"
+      },
+      {
+        "name": "PaddleOCRVLForConditionalGeneration",
+        "line": 1086,
+        "bases": [
+          "Qwen2VLForConditionalGeneration"
+        ],
+        "kb_nano_files": [],
+        "rationale": "wiring + lm_head"
+      }
+    ],
+    "inheritance_summary": [
+      "PaddleOCRVisionRotaryEmbedding(VisionRotaryEmbedding)",
+      "PaddleOCRRotaryEmbedding(Qwen2VLRotaryEmbedding)",
+      "PaddleOCRMLP(Ernie4_5MLP)",
+      "PaddleOCRAttention(Qwen2_5OmniAttention)",
+      "PaddleOCRRMSNorm(Ernie4_5RMSNorm)",
+      "PaddleOCRDecoderLayer(Ernie4_5DecoderLayer)",
+      "PaddleOCRVisionEmbeddings(SiglipVisionEmbeddings)",
+      "PaddleOCRVisionAttention(VideoLlama3VisionAttention)",
+      "PaddleOCRVisionMLP(SiglipMLP)",
+      "PaddleOCRVisionEncoderLayer(VideoLlama3VisionEncoderLayer)",
+      "PaddleOCRVisionEncoder(VideoLlama3VisionEncoder)",
+      "PaddleOCRTextModel(Ernie4_5Model)",
+      "PaddleOCRVLModel(Qwen2VLModel)",
+      "PaddleOCRVLForConditionalGeneration(Qwen2VLForConditionalGeneration)"
+    ],
+    "evidence_lines": [
+      "paddleocr_vl/modular_paddleocr_vl.py:532",
+      "paddleocr_vl/modular_paddleocr_vl.py:576",
+      "paddleocr_vl/modular_paddleocr_vl.py:581",
+      "paddleocr_vl/modular_paddleocr_vl.py:757"
+    ]
+  },
+  "paligemma": {
+    "src_file": "modeling_paligemma.py",
+    "classes": [
+      {
+        "name": "PaliGemmaMultiModalProjector",
+        "line": 91,
+        "bases": [
+          "nn.Module"
+        ],
+        "kb_nano_files": [],
+        "rationale": "single Linear projection from vision_hidden -> projection_dim; composes from L1/linear"
+      },
+      {
+        "name": "PaliGemmaModel",
+        "line": 122,
+        "bases": [
+          "PaliGemmaPreTrainedModel"
+        ],
+        "kb_nano_files": [],
+        "rationale": "wiring: vision_tower (SigLIP) + projector + language_model (Gemma2)"
+      },
+      {
+        "name": "PaliGemmaForConditionalGeneration",
+        "line": 302,
+        "bases": [
+          "PaliGemmaPreTrainedModel",
+          "GenerationMixin"
+        ],
+        "kb_nano_files": [],
+        "rationale": "wiring + lm_head"
+      }
+    ],
+    "inheritance_summary": [],
+    "evidence_lines": [
+      "paligemma/modeling_paligemma.py:91",
+      "paligemma/modeling_paligemma.py:122"
+    ]
+  },
+  "parakeet": {
+    "src_file": "modular_parakeet.py",
+    "classes": [
+      {
+        "name": "ParakeetEncoderRelPositionalEncoding",
+        "line": 56,
+        "bases": [
+          "nn.Module"
+        ],
+        "kb_nano_files": [
+          "tasks/baseline/L1/sinusoidal_embed.py"
+        ],
+        "rationale": "Transformer-XL-style relative positional encoding with interleaved sin/cos and reverse position_ids; sinusoidal-derived; closest to L1/sinusoidal_embed.py compute"
+      },
+      {
+        "name": "ParakeetEncoderFeedForward",
+        "line": 106,
+        "bases": [
+          "nn.Module"
+        ],
+        "kb_nano_files": [],
+        "rationale": "Conformer FFN: linear1 + activation + dropout + linear2 (no gating); composes from L1/linear + activation"
+      },
+      {
+        "name": "ParakeetEncoderConvolutionModule",
+        "line": 121,
+        "bases": [
+          "FastSpeech2ConformerConvolutionModule"
+        ],
+        "kb_nano_files": [
+          "tasks/baseline/L1/conv1d.py"
+        ],
+        "rationale": "Conformer convolution module: pointwise conv + GLU + depthwise conv + BatchNorm + activation + pointwise conv; composes from L1/conv1d + L1/batch_norm (no L2 wrapper for conformer conv)"
+      },
+      {
+        "name": "ParakeetEncoderAttention",
+        "line": 126,
+        "bases": [
+          "LlamaAttention"
+        ],
+        "kb_nano_files": [],
+        "rationale": "Transformer-XL relative-position attention: separate q/k/v + relative_k_proj + bias_u/bias_v parameters + _rel_shift trick; not standard RoPE attention; kb-nano L2/attention.py only handles RoPE; composes from L1/linear + L1/sdpa with custom relative-bias term"
+      },
+      {
+        "name": "ParakeetEncoderSubsamplingConv2D",
+        "line": 205,
+        "bases": [
+          "nn.Module"
+        ],
+        "kb_nano_files": [
+          "tasks/baseline/L1/conv2d.py",
+          "tasks/baseline/L1/relu.py"
+        ],
+        "rationale": "stacked Conv2d + ReLU + Conv2d + Linear subsampling stem; composes from L1/conv2d + L1/relu + L1/linear"
+      },
+      {
+        "name": "ParakeetEncoderBlock",
+        "line": 274,
+        "bases": [
+          "GradientCheckpointingLayer"
+        ],
+        "kb_nano_files": [],
+        "rationale": "wiring: ff1 + self_attn + conv + ff2 + LayerNorms (Conformer block)"
+      },
+      {
+        "name": "ParakeetEncoder",
+        "line": 397,
+        "bases": [
+          "ParakeetPreTrainedModel"
+        ],
+        "kb_nano_files": [],
+        "rationale": "wiring: subsampling + rel-pos + encoder layers"
+      },
+      {
+        "name": "ParakeetForCTC",
+        "line": 524,
+        "bases": [
+          "ParakeetPreTrainedModel"
+        ],
+        "kb_nano_files": [],
+        "rationale": "wiring + Conv1d CTC head"
+      }
+    ],
+    "inheritance_summary": [
+      "ParakeetEncoderConvolutionModule(FastSpeech2ConformerConvolutionModule)",
+      "ParakeetEncoderAttention(LlamaAttention)"
+    ],
+    "evidence_lines": [
+      "parakeet/modular_parakeet.py:56",
+      "parakeet/modular_parakeet.py:106",
+      "parakeet/modular_parakeet.py:126"
+    ]
+  },
+  "patchtsmixer": {
+    "src_file": "modeling_patchtsmixer.py",
+    "classes": [
+      {
+        "name": "PatchTSMixerGatedAttention",
+        "line": 38,
+        "bases": [
+          "nn.Module"
+        ],
+        "kb_nano_files": [],
+        "rationale": "Linear + softmax gate * input (channel/feature gating, not multi-head attn); composes from L1/linear + L1/softmax"
+      },
+      {
+        "name": "PatchTSMixerBatchNorm",
+        "line": 59,
+        "bases": [
+          "nn.Module"
+        ],
+        "kb_nano_files": [
+          "tasks/baseline/L1/batch_norm2d.py"
+        ],
+        "rationale": "BatchNorm1d wrapper (along time dim); closest match L1/batch_norm2d.py family (1D variant)"
+      },
+      {
+        "name": "PatchTSMixerPositionalEncoding",
+        "line": 81,
+        "bases": [
+          "nn.Module"
+        ],
+        "kb_nano_files": [
+          "tasks/baseline/L1/sinusoidal_embed.py",
+          "tasks/baseline/L1/embedding.py"
+        ],
+        "rationale": "either learned (Parameter) or sinusoidal positional encoding; composes"
+      },
+      {
+        "name": "PatchTSMixerNormLayer",
+        "line": 120,
+        "bases": [
+          "nn.Module"
+        ],
+        "kb_nano_files": [
+          "tasks/baseline/L1/layer_norm.py"
+        ],
+        "rationale": "LayerNorm or BatchNorm wrapper; composes"
+      },
+      {
+        "name": "PatchTSMixerMLP",
+        "line": 169,
+        "bases": [
+          "nn.Module"
+        ],
+        "kb_nano_files": [],
+        "rationale": "Linear + activation + dropout + Linear; composes from L1/linear"
+      },
+      {
+        "name": "PatchTSMixerChannelFeatureMixerBlock",
+        "line": 192,
+        "bases": [
+          "nn.Module"
+        ],
+        "kb_nano_files": [],
+        "rationale": "TSMixer channel-mixing block: norm + transpose + MLP + transpose; composes"
+      },
+      {
+        "name": "PatchTSMixerAttention",
+        "line": 270,
+        "bases": [
+          "nn.Module"
+        ],
+        "kb_nano_files": [],
+        "rationale": "BART-style attention with separate q/k/v + bias; composes from L1/linear + L1/softmax"
+      },
+      {
+        "name": "PatchMixerBlock",
+        "line": 355,
+        "bases": [
+          "nn.Module"
+        ],
+        "kb_nano_files": [],
+        "rationale": "patch-dim mixing block: norm + MLP (+ optional gated_attn / self_attn); wiring"
+      },
+      {
+        "name": "FeatureMixerBlock",
+        "line": 425,
+        "bases": [
+          "nn.Module"
+        ],
+        "kb_nano_files": [],
+        "rationale": "feature-dim mixing block: norm + MLP (+ optional gated_attn); wiring"
+      },
+      {
+        "name": "PatchTSMixerLayer",
+        "line": 470,
+        "bases": [
+          "nn.Module"
+        ],
+        "kb_nano_files": [],
+        "rationale": "wiring: PatchMixer + FeatureMixer + ChannelFeatureMixer (mode-dependent)"
+      },
+      {
+        "name": "PatchTSMixerBlock",
+        "line": 508,
+        "bases": [
+          "nn.Module"
+        ],
+        "kb_nano_files": [],
+        "rationale": "wiring: stack of PatchTSMixerLayer"
+      },
+      {
+        "name": "PatchTSMixerForPredictionHead",
+        "line": 549,
+        "bases": [
+          "nn.Module"
+        ],
+        "kb_nano_files": [],
+        "rationale": "Linear prediction head; composes"
+      },
+      {
+        "name": "PatchTSMixerLinearHead",
+        "line": 605,
+        "bases": [
+          "nn.Module"
+        ],
+        "kb_nano_files": [],
+        "rationale": "Linear classification/regression head; composes"
+      },
+      {
+        "name": "PatchTSMixerPretrainHead",
+        "line": 708,
+        "bases": [
+          "nn.Module"
+        ],
+        "kb_nano_files": [],
+        "rationale": "Linear pretrain head; composes"
+      },
+      {
+        "name": "PatchTSMixerPatchify",
+        "line": 867,
+        "bases": [
+          "nn.Module"
+        ],
+        "kb_nano_files": [],
+        "rationale": "patchifies time series into windows; reshape op only"
+      },
+      {
+        "name": "PatchTSMixerMasking",
+        "line": 916,
+        "bases": [
+          "nn.Module"
+        ],
+        "kb_nano_files": [],
+        "rationale": "random masking; non-kernel"
+      },
+      {
+        "name": "PatchTSMixerStdScaler",
+        "line": 977,
+        "bases": [
+          "nn.Module"
+        ],
+        "kb_nano_files": [],
+        "rationale": "z-score scaler; non-kernel"
+      },
+      {
+        "name": "PatchTSMixerMeanScaler",
+        "line": 1013,
+        "bases": [
+          "nn.Module"
+        ],
+        "kb_nano_files": [],
+        "rationale": "mean scaler; non-kernel"
+      },
+      {
+        "name": "PatchTSMixerNOPScaler",
+        "line": 1068,
+        "bases": [
+          "nn.Module"
+        ],
+        "kb_nano_files": [],
+        "rationale": "no-op scaler; non-kernel"
+      },
+      {
+        "name": "PatchTSMixerEncoder",
+        "line": 1113,
+        "bases": [
+          "PatchTSMixerPreTrainedModel"
+        ],
+        "kb_nano_files": [],
+        "rationale": "wiring: input projection + positional encoding + mixer block"
+      },
+      {
+        "name": "PatchTSMixerModel",
+        "line": 1219,
+        "bases": [
+          "PatchTSMixerPreTrainedModel"
+        ],
+        "kb_nano_files": [],
+        "rationale": "wiring: scaler + patchify + (optional masking) + encoder"
+      },
+      {
+        "name": "PatchTSMixerForPretraining",
+        "line": 1345,
+        "bases": [
+          "PatchTSMixerPreTrainedModel"
+        ],
+        "kb_nano_files": [],
+        "rationale": "wiring + pretrain head"
+      },
+      {
+        "name": "PatchTSMixerForPrediction",
+        "line": 1524,
+        "bases": [
+          "PatchTSMixerPreTrainedModel"
+        ],
+        "kb_nano_files": [],
+        "rationale": "wiring + prediction head"
+      },
+      {
+        "name": "PatchTSMixerForTimeSeriesClassification",
+        "line": 1763,
+        "bases": [
+          "PatchTSMixerPreTrainedModel"
+        ],
+        "kb_nano_files": [],
+        "rationale": "wiring + classification head"
+      },
+      {
+        "name": "InjectScalerStatistics4D",
+        "line": 1897,
+        "bases": [
+          "nn.Module"
+        ],
+        "kb_nano_files": [],
+        "rationale": "Linear post-processing for scaler stats; composes"
+      },
+      {
+        "name": "PatchTSMixerForRegression",
+        "line": 1942,
+        "bases": [
+          "PatchTSMixerPreTrainedModel"
+        ],
+        "kb_nano_files": [],
+        "rationale": "wiring + regression head"
+      }
+    ],
+    "inheritance_summary": [],
+    "evidence_lines": [
+      "patchtsmixer/modeling_patchtsmixer.py:270",
+      "patchtsmixer/modeling_patchtsmixer.py:355",
+      "patchtsmixer/modeling_patchtsmixer.py:1113"
+    ]
+  },
+  "patchtst": {
+    "src_file": "modeling_patchtst.py",
+    "classes": [
+      {
+        "name": "PatchTSTAttention",
+        "line": 68,
+        "bases": [
+          "nn.Module"
+        ],
+        "kb_nano_files": [],
+        "rationale": "BART-style multi-head attention (separate q/k/v Linear+bias) with cross-attention support; composes from L1/linear + L1/softmax"
+      },
+      {
+        "name": "PatchTSTBatchNorm",
+        "line": 153,
+        "bases": [
+          "nn.Module"
+        ],
+        "kb_nano_files": [
+          "tasks/baseline/L1/batch_norm2d.py"
+        ],
+        "rationale": "BatchNorm1d on transposed input; closest L1/batch_norm2d.py family (1D variant)"
+      },
+      {
+        "name": "PatchTSTPatchify",
+        "line": 301,
+        "bases": [
+          "nn.Module"
+        ],
+        "kb_nano_files": [],
+        "rationale": "patchifies time series; reshape op only"
+      },
+      {
+        "name": "PatchTSTMasking",
+        "line": 349,
+        "bases": [
+          "nn.Module"
+        ],
+        "kb_nano_files": [],
+        "rationale": "random masking; non-kernel"
+      },
+      {
+        "name": "PatchTSTEncoderLayer",
+        "line": 409,
+        "bases": [
+          "nn.Module"
+        ],
+        "kb_nano_files": [],
+        "rationale": "wiring: norm + attn + norm + ffn"
+      },
+      {
+        "name": "PatchTSTEmbedding",
+        "line": 600,
+        "bases": [
+          "nn.Module"
+        ],
+        "kb_nano_files": [],
+        "rationale": "Linear projection from patch_size -> d_model; composes"
+      },
+      {
+        "name": "PatchTSTPositionalEncoding",
+        "line": 636,
+        "bases": [
+          "nn.Module"
+        ],
+        "kb_nano_files": [],
+        "rationale": "learned or sinusoidal positional encoding; composes"
+      },
+      {
+        "name": "PatchTSTEncoder",
+        "line": 692,
+        "bases": [
+          "PatchTSTPreTrainedModel"
+        ],
+        "kb_nano_files": [],
+        "rationale": "wiring: stack of encoder layers"
+      },
+      {
+        "name": "PatchTSTStdScaler",
+        "line": 931,
+        "bases": [
+          "nn.Module"
+        ],
+        "kb_nano_files": [],
+        "rationale": "z-score scaler; non-kernel"
+      },
+      {
+        "name": "PatchTSTMeanScaler",
+        "line": 967,
+        "bases": [
+          "nn.Module"
+        ],
+        "kb_nano_files": [],
+        "rationale": "mean scaler; non-kernel"
+      },
+      {
+        "name": "PatchTSTNOPScaler",
+        "line": 1022,
+        "bases": [
+          "nn.Module"
+        ],
+        "kb_nano_files": [],
+        "rationale": "no-op scaler; non-kernel"
+      },
+      {
+        "name": "PatchTSTScaler",
+        "line": 1049,
+        "bases": [
+          "nn.Module"
+        ],
+        "kb_nano_files": [],
+        "rationale": "scaler wrapper; non-kernel"
+      },
+      {
+        "name": "PatchTSTModel",
+        "line": 1078,
+        "bases": [
+          "PatchTSTPreTrainedModel"
+        ],
+        "kb_nano_files": [],
+        "rationale": "wiring: scaler + patchify + masking + embedding + encoder"
+      },
+      {
+        "name": "PatchTSTMaskPretrainHead",
+        "line": 1191,
+        "bases": [
+          "nn.Module"
+        ],
+        "kb_nano_files": [],
+        "rationale": "Linear pretrain head; composes"
+      },
+      {
+        "name": "PatchTSTForPretraining",
+        "line": 1224,
+        "bases": [
+          "PatchTSTPreTrainedModel"
+        ],
+        "kb_nano_files": [],
+        "rationale": "wiring + pretrain head"
+      },
+      {
+        "name": "PatchTSTClassificationHead",
+        "line": 1336,
+        "bases": [
+          "nn.Module"
+        ],
+        "kb_nano_files": [],
+        "rationale": "Linear + dropout classification head; composes"
+      },
+      {
+        "name": "PatchTSTForClassification",
+        "line": 1378,
+        "bases": [
+          "PatchTSTPreTrainedModel"
+        ],
+        "kb_nano_files": [],
+        "rationale": "wiring + cls head"
+      },
+      {
+        "name": "PatchTSTPredictionHead",
+        "line": 1471,
+        "bases": [
+          "nn.Module"
+        ],
+        "kb_nano_files": [],
+        "rationale": "Linear prediction head; composes"
+      },
+      {
+        "name": "PatchTSTForPrediction",
+        "line": 1572,
+        "bases": [
+          "PatchTSTPreTrainedModel"
+        ],
+        "kb_nano_files": [],
+        "rationale": "wiring + prediction head"
+      },
+      {
+        "name": "PatchTSTRegressionHead",
+        "line": 1761,
+        "bases": [
+          "nn.Module"
+        ],
+        "kb_nano_files": [],
+        "rationale": "Linear regression head; composes"
+      },
+      {
+        "name": "PatchTSTForRegression",
+        "line": 1821,
+        "bases": [
+          "PatchTSTPreTrainedModel"
+        ],
+        "kb_nano_files": [],
+        "rationale": "wiring + regression head"
+      }
+    ],
+    "inheritance_summary": [],
+    "evidence_lines": [
+      "patchtst/modeling_patchtst.py:68",
+      "patchtst/modeling_patchtst.py:153",
+      "patchtst/modeling_patchtst.py:409"
+    ]
+  },
+  "pe_audio": {
+    "src_file": "modular_pe_audio.py",
+    "classes": [
+      {
+        "name": "PeAudioDacEncoderBlock",
+        "line": 38,
+        "bases": [
+          "DacEncoderBlock"
+        ],
+        "kb_nano_files": [
+          "tasks/baseline/L1/conv1d.py"
+        ],
+        "rationale": "DAC encoder block: conv1d + Snake activation + residual; closest match is L1/conv1d.py + custom Snake1d (no kb-nano file for Snake)"
+      },
+      {
+        "name": "PeAudioDacEncoder",
+        "line": 43,
+        "bases": [
+          "DacEncoder"
+        ],
+        "kb_nano_files": [],
+        "rationale": "wiring: stack of DAC encoder blocks"
+      },
+      {
+        "name": "PeAudioEncoderEmbedder",
+        "line": 48,
+        "bases": [
+          "nn.Module"
+        ],
+        "kb_nano_files": [],
+        "rationale": "wiring: DAC encoder + bottleneck Conv1d + data Linear projection"
+      },
+      {
+        "name": "PeAudioContrastiveHead",
+        "line": 74,
+        "bases": [
+          "PeAudioVideoContrastiveHead"
+        ],
+        "kb_nano_files": [],
+        "rationale": "wiring: LayerNorm + Linear; composes"
+      },
+      {
+        "name": "PeAudioEncoder",
+        "line": 121,
+        "bases": [
+          "PeAudioVideoEncoder"
+        ],
+        "kb_nano_files": [],
+        "rationale": "wiring: embedder + patch_embedder + encoder layers + RoPE + final norm + output (CLS-token pooling)"
+      },
+      {
+        "name": "PeAudioModel",
+        "line": 182,
+        "bases": [
+          "PeAudioPreTrainedModel"
+        ],
+        "kb_nano_files": [],
+        "rationale": "wiring: text + audio encoders + contrastive heads"
+      },
+      {
+        "name": "PeAudioFrameLevelModel",
+        "line": 261,
+        "bases": [
+          "PeAudioModel"
+        ],
+        "kb_nano_files": [],
+        "rationale": "wiring + frame-level audio embeds"
+      }
+    ],
+    "inheritance_summary": [
+      "PeAudioDacEncoderBlock(DacEncoderBlock)",
+      "PeAudioDacEncoder(DacEncoder)",
+      "PeAudioContrastiveHead(PeAudioVideoContrastiveHead)",
+      "PeAudioPreTrainedModel(PeAudioVideoPreTrainedModel)",
+      "PeAudioEncoder(PeAudioVideoEncoder)",
+      "PeAudioFrameLevelModel(PeAudioModel)"
+    ],
+    "evidence_lines": [
+      "pe_audio/modular_pe_audio.py:38",
+      "pe_audio/modular_pe_audio.py:48",
+      "pe_audio/modular_pe_audio.py:121"
+    ]
+  },
+  "pe_audio_video": {
+    "src_file": "modular_pe_audio_video.py",
+    "classes": [
+      {
+        "name": "PeAudioVideoMaskedGroupNorm",
+        "line": 34,
+        "bases": [
+          "nn.GroupNorm"
+        ],
+        "kb_nano_files": [
+          "tasks/baseline/L1/group_norm.py"
+        ],
+        "rationale": "GroupNorm with optional padding mask (skip masked positions in mean/var); closest L1/group_norm.py + masking layer"
+      },
+      {
+        "name": "PeAudioVideoConvBlock1d",
+        "line": 58,
+        "bases": [
+          "nn.Module"
+        ],
+        "kb_nano_files": [
+          "tasks/baseline/L1/conv1d.py",
+          "tasks/baseline/L1/group_norm.py",
+          "tasks/baseline/L1/silu.py"
+        ],
+        "rationale": "MaskedGroupNorm + SiLU + Conv1d (kernel=3); composes"
+      },
+      {
+        "name": "PeAudioVideoResnetBlock1d",
+        "line": 76,
+        "bases": [
+          "nn.Module"
+        ],
+        "kb_nano_files": [],
+        "rationale": "wiring: 2x ConvBlock1d + residual"
+      },
+      {
+        "name": "PeAudioVideoEncoderPatchEmbedder",
+        "line": 105,
+        "bases": [
+          "nn.Module"
+        ],
+        "kb_nano_files": [],
+        "rationale": "wiring: prepend class token + ResnetBlock1d"
+      },
+      {
+        "name": "PeAudioVideoContrastiveHead",
+        "line": 126,
+        "bases": [
+          "nn.Module"
+        ],
+        "kb_nano_files": [],
+        "rationale": "LayerNorm + Linear; composes from L1/layer_norm + L1/linear"
+      },
+      {
+        "name": "PeAudioVideoEncoderEmbedder",
+        "line": 140,
+        "bases": [
+          "nn.Module"
+        ],
+        "kb_nano_files": [],
+        "rationale": "wiring: audio + video encoders + cross-modality projection"
+      },
+      {
+        "name": "PeAudioVideoEncoderAttention",
+        "line": 237,
+        "bases": [
+          "Qwen3Attention"
+        ],
+        "kb_nano_files": [
+          "tasks/baseline/L2/attention.py",
+          "tasks/baseline/L1/rms_norm.py"
+        ],
+        "rationale": "Qwen3Attention with bidirectional (is_causal=False) + qk_norm + custom rotary application (stack_freqs); kb-nano L2/attention.py supports qk_norm but the custom rotary layout differs; partial fit composing attention.py"
+      },
+      {
+        "name": "PeAudioVideoEncoderLayer",
+        "line": 280,
+        "bases": [
+          "Qwen3DecoderLayer"
+        ],
+        "kb_nano_files": [],
+        "rationale": "wiring: pre-norm + attn + pre-norm + mlp"
+      },
+      {
+        "name": "PeAudioVideoEncoderRMSNorm",
+        "line": 286,
+        "bases": [
+          "Qwen3RMSNorm"
+        ],
+        "kb_nano_files": [
+          "tasks/baseline/L1/rms_norm.py"
+        ],
+        "rationale": "empty subclass; standard RMSNorm"
+      },
+      {
+        "name": "PeAudioVideoEncoderRotaryEmbedding",
+        "line": 305,
+        "bases": [
+          "Qwen3RotaryEmbedding"
+        ],
+        "kb_nano_files": [
+          "tasks/baseline/L1/rotary_emb.py"
+        ],
+        "rationale": "empty subclass; standard NeoX RoPE (used with custom apply_rotary_pos_emb that interleaves cos/sin)"
+      },
+      {
+        "name": "PeAudioVideoEncoder",
+        "line": 365,
+        "bases": [
+          "PeAudioVideoPreTrainedModel"
+        ],
+        "kb_nano_files": [],
+        "rationale": "wiring: embedder + patch_embedder + RoPE + encoder layers + final norm + output projection"
+      },
+      {
+        "name": "PeAudioVideoModel",
+        "line": 537,
+        "bases": [
+          "PeAudioVideoPreTrainedModel"
+        ],
+        "kb_nano_files": [],
+        "rationale": "wiring: text encoder + AV encoder + contrastive heads"
+      }
+    ],
+    "inheritance_summary": [
+      "PeAudioVideoEncoderAttention(Qwen3Attention)",
+      "PeAudioVideoEncoderLayer(Qwen3DecoderLayer)",
+      "PeAudioVideoEncoderRMSNorm(Qwen3RMSNorm)",
+      "PeAudioVideoEncoderRotaryEmbedding(Qwen3RotaryEmbedding)"
+    ],
+    "evidence_lines": [
+      "pe_audio_video/modular_pe_audio_video.py:34",
+      "pe_audio_video/modular_pe_audio_video.py:140",
+      "pe_audio_video/modular_pe_audio_video.py:237"
+    ]
+  }
+}

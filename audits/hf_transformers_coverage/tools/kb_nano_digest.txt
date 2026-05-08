@@ -1,0 +1,462 @@
+L1/_flashmla_backend.py: Resolve FlashMLA symbols from vLLM's vendored copy, falling back to
+L1/adaptive_avg_pool1d.py: AdaptiveAvgPool1d wrapping F.adaptive_avg_pool1d.
+L1/adaptive_avg_pool2d.py: AdaptiveAvgPool2d wrapping F.adaptive_avg_pool2d.
+L1/allreduce.py: AllReduce L1 operator with custom IPC all-reduce and NCCL fallback.
+L1/avg_pool1d.py: AvgPool1d wrapping F.avg_pool1d directly.
+L1/avg_pool2d.py: AvgPool2d wrapping F.avg_pool2d.
+L1/batch_norm2d.py: BatchNorm2d wrapping F.batch_norm with registered affine/running stats.
+L1/bitnet_int8xint2_linear.py: W1.58A8 GEMM: int8 activations × packed-2-bit ternary weights.
+L1/bitnet_linear.py: BitLinear: native W1.58A8 linear layers for ``microsoft/bitnet-b1.58-2B-4T``.
+L1/bitnet_rms_norm.py: BitNet-specific RMSNorm that is bit-for-bit identical to SOTA.
+L1/bmm.py: Batched matrix multiply (``torch.bmm``) as an L1 primitive.
+L1/causal_conv1d.py: Depthwise causal 1D convolution (L1).
+L1/chunk_gated_delta_rule.py: Chunk Gated Delta Rule — Triton-accelerated chunked kernel from FLA.
+L1/chunk_gla.py: Chunk GLA — Triton-accelerated chunked prefill kernel.
+L1/chunk_retention.py: Chunk RetNet — Triton-accelerated chunked prefill kernel.
+L1/chunk_rwkv7.py: Chunk RWKV7 — Triton-accelerated chunked prefill kernel.
+L1/compile_mode.py: Global flag controlling whether modules dispatch to native PyTorch
+L1/conv1d.py: Conv1d wrapper around nn.Conv1d.
+L1/conv1d_native.py: Conv1d parametric op with direct ``weight``/``bias`` (state_dict-compat with nn.Conv1d).
+L1/conv2d.py: Conv2d parametric op wrapping F.conv2d.
+L1/conv3d.py: Conv3d wrapper around nn.Conv3d.
+L1/conv_transpose1d.py: ConvTranspose1d parametric op wrapping F.conv_transpose1d.
+L1/conv_transpose2d.py: ConvTranspose2d parametric op wrapping F.conv_transpose2d.
+L1/conv_transpose3d.py: ConvTranspose3d parametric op wrapping F.conv_transpose3d.
+L1/convert_indices.py: Convert request-local token indices to global paged cache slots.
+L1/custom_ops.py: Register opaque kernels as torch.library custom ops for torch.compile.
+L1/dense_attention.py: Dense (non-paged) multi-head attention.
+L1/diffusion_rope.py: Rotary position embedding for diffusion models (interleaved / GPT-J style).
+L1/dinov3_rope.py: DINOv3 2D rotary position embedding (L1).
+L1/dp3_sinusoidal_pos_emb.py: Sinusoidal position embedding for DP3 diffusion timestep encoding.
+L1/dropout.py: Dropout wrapping F.dropout.
+L1/eagle_tree_ops.py: EAGLE-3 tree-construction and tree-verify CUDA ops.
+L1/elu.py: ELU wrapping F.elu (explicit L1 op for benchmark scaffolding).
+L1/embedding.py: Embedding lookup kernel: wraps nn.Embedding.
+L1/embedding_bag.py: EmbeddingBag lookup primitive for recommender models.
+L1/flash_attn_decode.py: Flash attention decode kernel (with paged KV cache).
+L1/flash_attn_dense.py: Dense (non-varlen) Flash Attention forward (L1).
+L1/flash_attn_prefill.py: Flash attention prefill kernel (variable-length sequences).
+L1/flash_attn_varlen.py: Variable-length Flash Attention (no KV cache lookup).
+L1/flash_mla_decode.py: FlashMLA decode kernels for MLA (Multi-head Latent Attention).
+L1/flash_mla_prefill.py: FlashMLA prefill kernel for MLA (Multi-head Latent Attention).
+L1/flash_mla_sparse_prefill.py: FlashMLA sparse prefill for DSA (DeepSeek Sparse Attention).
+L1/flashinfer_decode.py: TRTLLM-gen paged attention decode kernel (via FlashInfer, Blackwell only).
+L1/flashinfer_moe.py: FlashInfer native CUDA MoE kernels with GPU architecture dispatch.
+L1/flashinfer_prefill.py: TRTLLM-gen paged attention prefill kernel (via FlashInfer, Blackwell only).
+L1/flux_pos_embed.py: 2D rotary position embeddings for FLUX (concatenated per-axis 1D embeddings).
+L1/fp8_block_scaled_mm.py: Block-scaled FP8 GEMM: DeepGEMM (preferred) with Triton fallback.
+L1/fp8_grouped_gemm_contiguous.py: DeepGEMM grouped FP8 GEMM for MoE expert execution.
+L1/fp8_linear.py: FP8 linear (block-scaled FP8 matrix multiply) with vLLM-parity dispatch.
+L1/fp8_moe_grouped_gemm.py: Triton fused MoE grouped GEMM kernel with FP8 W8A8 block-scaled quantization.
+L1/fp8_mqa_logits.py: FP8 MQA logits for DSA indexer via DeepGEMM.
+L1/fp8_quant.py: Per-token-group FP8 activation quantization.
+L1/frozen_batch_norm2d.py: Frozen BatchNorm2d for detection backbones.
+L1/fused_recurrent_gla.py: Fused recurrent GLA — Triton-accelerated decode kernel.
+L1/fused_recurrent_retention.py: Fused recurrent RetNet — Triton-accelerated decode kernel.
+L1/fused_recurrent_rwkv7.py: Fused recurrent RWKV7 — Triton-accelerated decode kernel.
+L1/fused_rmsnorm_fp8.py: Fused RMSNorm + FP8 group quantization.
+L1/gate_linear.py: DeepSeek MoE router gate matmul (BF16 x BF16 -> FP32) with vLLM parity.
+L1/gaussian_projection.py: 3D Gaussian projection to 2D image space.
+L1/gaussian_rasterize.py: Rasterize projected 2D Gaussians to pixels.
+L1/gaussian_tile_intersection.py: Tile intersection utilities for Gaussian splatting.
+L1/gdn_recurrence.py: Gated Delta Net (GDN) recurrence (L1).
+L1/gelu.py: GELU activation (via torch.nn.functional.gelu).
+L1/gelu_and_mul.py: GELU-and-mul activation for packed gate/up projections.
+L1/gemma4_routing.py: Gemma4 MoE routing.
+L1/gemma_rms_norm.py: GemmaRMSNorm: RMSNorm where the stored weight is an offset from 1.0.
+L1/gla_recurrence.py: Naive recurrent GLA (Gated Linear Attention) kernel.
+L1/global_avg_pool2d.py: Global average pooling over spatial NCHW dimensions.
+L1/grid_sample.py: GridSample wrapping F.grid_sample.
+L1/grn.py: Global Response Normalization for ConvNeXtV2-style channels-last activations.
+L1/group_norm.py: GroupNorm wrapping F.group_norm with learnable affine parameters.
+L1/grouped_topk.py: Grouped top-k routing for DeepSeek-style MoE.
+L1/hardsigmoid.py: Hardsigmoid wrapping F.hardsigmoid (explicit L1 op for benchmark scaffolding).
+L1/hardswish.py: Hardswish wrapping F.hardswish (explicit L1 op for benchmark scaffolding).
+L1/hunyuan_video_rope.py: 3D rotary position embedding frequency generator for HunyuanVideo-1.5.
+L1/indexer_k_cache.py: Indexer K cache store and gather for DSA (132 bytes/token).
+L1/instantngp_direction_encoding.py: InstantNGP direction encoding wrapper built on tinycudann.
+L1/instantngp_fused_mlp.py: InstantNGP fully fused MLP wrapper built on tinycudann.
+L1/instantngp_hashgrid.py: InstantNGP hash-grid encoding wrapper built on tinycudann.
+L1/interpolate.py: Interpolate wrapping F.interpolate.
+L1/kda_recurrence.py: KDA (Kimi Delta Attention) recurrence (L1).
+L1/l2_norm.py: L2 normalization along a single dimension: x / ||x||_2.
+L1/l2norm_kernel.py: Fused L2-norm forward kernel (L1).
+L1/layer_norm.py: Standard LayerNorm wrapping F.layer_norm with optional affine parameters.
+L1/layer_norm2d.py: LayerNorm over channels for NCHW image tensors.
+L1/leaky_relu.py: LeakyReLU wrapping F.leaky_relu.
+L1/linear.py: Linear (matrix multiply) kernels.
+L1/log_sigmoid.py: Log-sigmoid activation: log(1 / (1 + exp(-x))) = -softplus(-x).
+L1/lstm.py: LSTM L1 op — minimal nn.Module wrapping ``torch.nn.LSTM`` (no kb-nano kernel).
+L1/max_pool1d.py: MaxPool1d wrapping F.max_pool1d directly.
+L1/max_pool2d.py: MaxPool2d wrapping F.max_pool2d.
+L1/merge_attn_states.py: Online softmax merge for two attention partitions.
+L1/merge_state.py: Softmax-LSE state merge for cascade attention.
+L1/mish.py: Mish activation: x * tanh(softplus(x)).
+L1/moe_align.py: MoE token-to-expert alignment with block padding.
+L1/moe_grouped_gemm.py: Triton fused MoE grouped GEMM kernel with FP8 W8A8 block-scaled support.
+L1/moe_permute.py: Fused MoE permute for DeepGEMM contiguous layout.
+L1/moe_sum.py: Fused MoE sum kernel: reduces top-k expert outputs into final output.
+L1/moe_unpermute_reduce.py: Fused MoE unpermute + weighted reduce via Triton.
+L1/mrope.py: Multi-dimensional Rotary Position Embedding (M-RoPE) for Qwen VL models.
+L1/mrope_input_positions.py: Compute M-RoPE 3D position indices for text+vision token sequences.
+L1/mxfp4_moe.py: MXFP4-native fused MoE primitive backed by the OAI Triton kernels.
+L1/oasis_rotary.py: Rotary embedding helpers used by Oasis.
+L1/openfold3_attention.py: Multi-head attention with bias list support for AlphaFold3.
+L1/openfold3_outer_product_mean.py: Outer product mean for AlphaFold3.
+L1/openfold3_swiglu.py: SwiGLU activation and transition for AlphaFold3.
+L1/openfold3_triangle_attention.py: Triangle attention for AlphaFold3.
+L1/openfold3_triangle_multiplication.py: Triangle multiplicative update for AlphaFold3.
+L1/pointtransformerv3_offsets.py: Offset/batch conversion helpers for point cloud batches.
+L1/pointtransformerv3_serialization.py: PointTransformerV3 serialization helpers.
+L1/quickgelu.py: QuickGELU activation: x * sigmoid(1.702 * x).
+L1/relu.py: ReLU activation: max(0, x).
+L1/retnet_recurrence.py: Naive recurrent retention kernel.
+L1/rg_lru.py: RG-LRU (Real-Gated Linear Recurrent Unit) L1 op.
+L1/rms_norm.py: RMSNorm with dual dispatch: CUDA custom op (eager) and pure-PyTorch (compiled).
+L1/rms_norm_gated.py: Gated RMSNorm with element-wise multiplicative gate (L1).
+L1/rms_norm_native.py: Pure-PyTorch RMSNorm L1 op (fp32-internal, autograd-friendly).
+L1/rmsnorm_quant.py: Fused RMSNorm + per-token-group FP8 quantization.
+L1/rotary_emb.py: Rotary position embeddings (RoPE), with optional Llama 3.1-style frequency scaling.
+L1/rtdetrv2_deformable_attention.py: RTDetrV2 multi-scale deformable attention primitive.
+L1/rwkv7_recurrence.py: Naive recurrent RWKV7 kernel (DPLR delta rule).
+L1/sam3_position_encoding.py: Sinusoidal 2D position encoding for SAM3.
+L1/sam3_rope.py: 2D Rotary Position Embedding for SAM3 ViT attention.
+L1/sam3_rope_attention.py: RoPE Attention for SAM3 tracker memory attention.
+L1/sdpa.py: Scaled dot-product attention primitive (L1).
+L1/segment_csr.py: CSR segment reduction via torch.segment_reduce.
+L1/sigmoid.py: Sigmoid activation: 1 / (1 + exp(-x)).
+L1/sigmoid_topk.py: Sigmoid top-k routing for Mixture-of-Experts.
+L1/silu.py: SiLU (Swish) activation: x * sigmoid(x).
+L1/silu_and_mul.py: SiLU-and-Mul activation with dual dispatch: CUDA (eager) and pure-PyTorch (compiled).
+L1/silu_mul_quant_fp8.py: Fused SiLU-mul + per-token-group FP8 quantization with column-major scales.
+L1/sinusoidal_embed.py: Sinusoidal time/position embedding for flow matching models.
+L1/softmax.py: Softmax activation (via torch.nn.functional.softmax).
+L1/softplus.py: Softplus activation (L1).
+L1/sparse_mm.py: Sparse matrix multiply primitive for graph recommenders.
+L1/squared_relu.py: Squared ReLU activation: max(0, x)^2.
+L1/squared_relu_and_mul.py: SquaredReLU-and-Mul activation for BitNet b1.58's gated FFN.
+L1/store_kvcache.py: Triton kernel for storing key/value into paged KV cache.
+L1/store_kvcache_fp8_mla.py: MLA KV cache store and gather.
+L1/swiglu_oai.py: OAI SwiGLU activation: (up + 1) * gate * sigmoid(alpha * gate) with clamping.
+L1/t5_layer_norm.py: T5-style RMSNorm with fp32 variance computation.
+L1/tanh.py: Tanh activation: (e^x - e^-x) / (e^x + e^-x).
+L1/tensor_ops.py: Primitive tensor manipulation ops.
+L1/top_k_per_row.py: Top-K per row selection for DSA indexer using vLLM's CUDA kernels.
+L1/topk_softmax.py: Fused top-k + softmax routing for Mixture-of-Experts.
+L1/tree_attn_prefill.py: FA3 cascade attention for the EAGLE-3 verify step.
+L1/ttt_e2e_rope.py: TTT-E2E rotary embedding (interleaved / GPT-J style) L1 op.
+L1/video_processor.py: VAE output post-processor for images and video.
+L1/vision_rotary_emb.py: Vision encoder rotary position embeddings.
+L1/vjepa2_rope.py: V-JEPA 2 rotary position helper.
+L1/yarn_rotary_emb.py: Rotary position embeddings with YaRN / YARN scaling.
+L2/ada_layer_norm.py: Adaptive Layer Norm modules for diffusion transformers (L2 composite).
+L2/ada_layer_norm_continuous.py: Adaptive continuous layer norm for diffusion transformers (L2 composite).
+L2/alphafold3_atom_attention.py: Sequence-local atom attention for AlphaFold3.
+L2/alphafold3_attention_pair_bias.py: Attention with pair bias for AlphaFold3.
+L2/alphafold3_diffusion_conditioning.py: Diffusion conditioning for AlphaFold3.
+L2/alphafold3_input_embedder.py: Input embedder for AlphaFold3.
+L2/alphafold3_msa_attention.py: MSA pair-weighted averaging for AlphaFold3 (Algorithm 10).
+L2/alphafold3_msa_module_embedder.py: MSA module embedder for AlphaFold3 (Algorithm 8, lines 1-4).
+L2/alphafold3_of3_attention.py: Multi-head attention with bias list support for AlphaFold3 (L2).
+L2/alphafold3_outer_product_mean.py: Outer product mean for AlphaFold3 (L2).
+L2/alphafold3_pair_block.py: PairBlock for AlphaFold3.
+L2/alphafold3_swiglu.py: SwiGLU activation and AdaLN for AlphaFold3 (L2 composites).
+L2/alphafold3_swiglu_transition.py: SwiGLU transition composites for AlphaFold3 (L2).
+L2/alphafold3_template_embedder.py: Template embedder for AlphaFold3 (Algorithm 16).
+L2/alphafold3_triangle_attention.py: Triangle attention for AlphaFold3 (L2).
+L2/alphafold3_triangle_multiplication.py: Triangle multiplicative update for AlphaFold3 (L2).
+L2/attention.py: Model-level multi-head attention (thin wrapper).
+L2/attention_impl.py: vLLM-aligned Attention layer with paged KV cache.
+L2/attention_pool.py: Attention pooling with latent query (L2).
+L2/batch_norm_act2d.py: BatchNorm2d followed by an optional activation.
+L2/bert_embeddings.py: BERT embedding stack.
+L2/bitnet_attention.py: BitNet attention block (W1.58A8 with fused QKV projection).
+L2/bitnet_mlp.py: BitNet MLP: squared-ReLU gated FFN with W1.58A8 BitLinear and sub-norm.
+L2/clip_attention.py: CLIP self-attention (L2).
+L2/clip_mlp.py: CLIP MLP and text embeddings (L2).
+L2/colbertv2_ops.py: ColBERTv2 embedding and MaxSim ops.
+L2/convnextv2_block.py: ConvNeXtV2 block.
+L2/cosyvoice3_cfm.py: Conditional Flow Matching (CFM) for CosyVoice3 audio generation.
+L2/cosyvoice3_hifigan.py: HiFi-GAN vocoder for CosyVoice3 mel-to-waveform conversion.
+L2/cosyvoice3_pre_lookahead.py: Pre-lookahead convolutional layer for CosyVoice3 causal processing.
+L2/deepseek_mla_attention.py: DeepSeek MLA attention (model-level).
+L2/deepseek_moe.py: DeepSeek MoE with shared expert, grouped routing, and FP8 expert execution.
+L2/dlrm_interaction.py: Feature interaction block for DLRM-style recommenders.
+L2/dp3_conditional_residual_block.py: DP3 conditional residual block (FiLM-conditioned).
+L2/dp3_conv1d_block.py: DP3 1-D conv block: Conv1d -> GroupNorm -> Mish.
+L2/dp3_diffusion_step_embedding.py: DP3 diffusion-step embedding MLP.
+L2/dp3_pointnet_encoder.py: DP3 sparse point-cloud encoder.
+L2/dp3_state_encoder.py: DP3 robot-state (proprioception) MLP builder.
+L2/efficientnetv2_edge_residual.py: EfficientNetV2 EdgeResidual block.
+L2/efficientnetv2_inverted_residual.py: EfficientNetV2 inverted residual block.
+L2/efficientnetv2_squeeze_excite.py: EfficientNetV2 squeeze-and-excitation block.
+L2/embedding_bag_collection.py: Collection of feature-wise embedding bags for recsys models.
+L2/encoder_attention.py: Attention blocks for encoder models.
+L2/encoder_embeddings.py: Shared token/position/type embedding wiring for encoder models.
+L2/encoder_mlp.py: Feed-forward blocks for encoder models.
+L2/eva_attention.py: EVA-style attention with RoPE (L2).
+L2/flux_attention.py: FLUX attention module (L2 composite).
+L2/flux_feedforward.py: FLUX feed-forward network (L2 composite).
+L2/fused_experts.py: Fused MoE experts: two grouped GEMMs with SiLU-mul in between.
+L2/gaussian_splat_render.py: Render block for 3D Gaussian splatting.
+L2/geglu.py: GEGLU activation: gated linear unit with GELU gate.
+L2/gemma4_attention.py: Gemma4 attention with per-layer RoPE and K==V full-attention support.
+L2/gemma4_mlp.py: Gemma4 dense MLP block.
+L2/gemma4_moe.py: Gemma4 MoE block.
+L2/gemma_dense_attention.py: Gemma dense attention with simple KV cache (L2 composite).
+L2/gla_attention.py: Gated linear attention (covers both GLA and RetNet).
+L2/gla_mlp.py: SwiGLU MLP for GLA / RetNet decoder layers.
+L2/gpt_oss_attention.py: GPT-OSS attention: GQA with bias, YaRN RoPE, sliding window, and attention sinks.
+L2/gpt_oss_moe.py: GPT-OSS MoE: MXFP4-native fused MoE composed from KB-Nano L1 ops.
+L2/hunyuan_video_attention.py: HunyuanVideo-1.5 dual-stream joint attention (L2 composite).
+L2/hunyuan_video_conditioning.py: HunyuanVideo-1.5 multi-stream conditioning merge (L2 composite).
+L2/hunyuan_video_embeddings.py: HunyuanVideo-1.5 embedding and projection modules (L2 composites).
+L2/hunyuan_video_token_refiner.py: HunyuanVideo-1.5 token refiner ops (L2 composites).
+L2/instantngp_field.py: Kernel-level InstantNGP field built from tinycudann primitives.
+L2/jamba_attention.py: Jamba's multi-head attention block (no RoPE, no QK-norm).
+L2/jamba_mamba_mixer.py: Jamba's Mamba v1 selective-scan mixer (with per-layer dt/B/C RMSNorms).
+L2/jamba_mlp.py: Jamba's plain (non-MoE) FFN block: fused gate_up_proj + SiluAndMul + down_proj.
+L2/jamba_moe.py: Jamba's MoE block (sparse MoE with softmax+top-k routing).
+L2/kda_attention.py: KDA (Kimi Delta Attention) layer (L2).
+L2/kimi_delta_attention.py: Sharded depthwise-conv weight holder with HF-compatible parameter names.
+L2/kimi_mla_attention.py: Kimi MLA path matching vLLM's latent-attention formulation.
+L2/kimi_moe.py: 
+L2/lightgcn_propagation.py: Graph propagation utilities for LightGCN.
+L2/llada_attention.py: LLaDA bidirectional self-attention with optional Fast-dLLM cache support.
+L2/llada_mlp.py: LLaDA SwiGLU MLP.
+L2/llama4_attention.py: Llama 4 attention with NoPE, QK norm, and temperature tuning.
+L2/llama4_moe.py: Llama 4 MoE: sigmoid top-1 routing with shared expert.
+L2/llama_mlp.py: Llama SwiGLU MLP block: gate_up_proj -> SiluAndMul -> down_proj.
+L2/mamba2_mixer.py: Mamba2 SSD mixer (mistralai/Mamba-Codestral-7B-v0.1, etc.).
+L2/mamba_mixer.py: Mamba v1 mixer (selective state-space model).
+L2/mixtral_moe.py: Mixtral Mixture-of-Experts block with fused Triton grouped GEMM.
+L2/mla_attention.py: MLA (Multi-head Latent Attention) for Kimi-Linear (L2).
+L2/mla_attention_impl.py: MLA attention implementation with BF16 or FP8 paged KV cache.
+L2/mobilenetv4_edge_residual.py: EdgeResidual (FusedMBConv) block for MobileNetV4.
+L2/mobilenetv4_uib.py: Universal Inverted Residual (UIB) block for MobileNetV4.
+L2/oasis_final_layer.py: Oasis final DiT projection layer.
+L2/oasis_mlp.py: Oasis feed-forward blocks.
+L2/oasis_patch_embed.py: Oasis 2D patch embedding.
+L2/oasis_spatial_axial_attention.py: Oasis spatial axial attention.
+L2/oasis_temporal_axial_attention.py: Oasis temporal axial attention.
+L2/oasis_timestep_embedder.py: Oasis timestep embedding.
+L2/oasis_vae_attention.py: Oasis VAE self-attention.
+L2/openfold3_atom_attention.py: Sequence-local atom attention for AlphaFold3.
+L2/openfold3_attention_pair_bias.py: Attention with pair bias for AlphaFold3.
+L2/openfold3_diffusion_conditioning.py: Diffusion conditioning for AlphaFold3.
+L2/openfold3_input_embedder.py: Input embedder for AlphaFold3.
+L2/openfold3_msa_attention.py: MSA pair-weighted averaging for AlphaFold3 (Algorithm 10).
+L2/openfold3_msa_module_embedder.py: MSA module embedder for AlphaFold3 (Algorithm 8, lines 1-4).
+L2/openfold3_pair_block.py: PairBlock for AlphaFold3.
+L2/openfold3_template_embedder.py: Template embedder for AlphaFold3 (Algorithm 16).
+L2/parallel_embedding.py: TP-aware embedding and LM head (L2 operators).
+L2/parallel_linear.py: TP-aware linear layers (L2 operators).
+L2/pi0_action_embed.py: Pi0 action-time embedding (L2 composite).
+L2/pointtransformerv3_layers.py: PointTransformerV3 detached layers.
+L2/qwen3_moe.py: Qwen3 Mixture-of-Experts block with fused Triton grouped GEMM.
+L2/qwen3_next_attention.py: Qwen3-Next full attention with per-head QK-norm, partial RoPE, output gating, KV cache (L2).
+L2/qwen3_next_gdn_attention.py: Qwen3-Next Gated Delta Net (GDN) linear attention (L2).
+L2/qwen3_next_moe.py: Qwen3-Next MoE: softmax-gated with shared expert and sigmoid shared gate.
+L2/recsys_mlp.py: Shared MLP for recommender models.
+L2/retnet_attention.py: RetNet Multi-Scale Retention attention layer.
+L2/rtdetrv2_conv_norm.py: RTDetrV2 Conv-Norm-Activation layer.
+L2/rtdetrv2_csp_rep_layer.py: RTDetrV2 CSP RepVGG layer.
+L2/rtdetrv2_deformable_attention.py: RTDetrV2 multi-scale deformable attention composite module.
+L2/rtdetrv2_encoder_layer.py: RTDetrV2 transformer encoder layer.
+L2/rtdetrv2_layers.py: RTDetrV2 shared layers.
+L2/rtdetrv2_mlp_head.py: RTDetrV2 MLP prediction head.
+L2/rtdetrv2_multihead_attention.py: RTDetrV2 multi-head self-attention.
+L2/rtdetrv2_repvgg_block.py: RTDetrV2 RepVGG block.
+L2/rtdetrv2_resnet.py: RTDetrV2 ResNet backbone layers.
+L2/rwkv7_attention.py: RWKV7 attention layer.
+L2/rwkv7_ffn.py: RWKV7 feed-forward network: token-shift + key -> sqrelu -> value.
+L2/sam3_cross_attention.py: Cross-attention module for SAM3 encoder and decoder layers.
+L2/sam3_fpn_conv.py: FPN convolution stage for SAM3 neck.
+L2/sam3_mask_predictor.py: Mask prediction MLP for SAM3 segmentation head.
+L2/sam3_memory_encoder.py: Memory encoder for SAM3 tracker.
+L2/sam3_prompt_encoder.py: SAM Prompt Encoder for SAM3 tracker.
+L2/sam3_text_attention.py: Text encoder residual attention block for SAM3.
+L2/sam3_vit_attention.py: ViT-Det windowed/global multi-head attention for SAM3.
+L2/sam3_vit_mlp.py: ViT MLP block for SAM3.
+L2/sdxl_attention.py: Multi-head attention for SDXL UNet spatial transformers.
+L2/sdxl_downsample.py: Downsample2D for SDXL UNet — stride-2 Conv2d spatial downsampling.
+L2/sdxl_feedforward.py: FeedForward network with GEGLU activation for SDXL.
+L2/sdxl_resnet.py: ResnetBlock2D for SDXL UNet.
+L2/sdxl_time_embedding.py: SDXL time + text_time micro-conditioning embedding (L2 composite).
+L2/sdxl_upsample.py: Upsample2D for SDXL UNet — nearest-neighbor 2x interpolation + Conv2d.
+L2/shared_expert_moe.py: Mixture-of-Experts with optional shared expert (L2).
+L2/siglip_attention.py: SigLIP vision encoder attention (L2 composite).
+L2/siglip_mlp.py: SigLIP vision encoder MLP (L2 composite).
+L2/sparse_attn_indexer.py: DSA (DeepSeek Sparse Attention) indexer.
+L2/swiglu_mlp.py: SwiGLU MLP (L2).
+L2/swinv2_patch_merging.py: SwinV2 patch merging layer (L2).
+L2/swinv2_window_attention.py: SwinV2 window-based multi-head self-attention with cosine attention
+L2/t5_attention.py: T5 self-attention with TP-aware QKV projection and relative position bias (L2).
+L2/t5_dense.py: T5 feed-forward dense layers with TP sharding (L2).
+L2/timestep_embedding.py: Timestep and text projection embeddings for diffusion models (L2 composite).
+L2/ttt_e2e_block.py: TTT-E2E transformer block (L2).
+L2/ttt_e2e_swa.py: TTT-E2E sliding-window attention (L2).
+L2/ttt_e2e_swiglu.py: TTT-E2E SwiGLU MLP (L2).
+L2/vision_attention.py: Encoder-only attention for Qwen vision transformer blocks.
+L2/vision_mlp.py: Vision MLP for Qwen vision transformer blocks.
+L2/vision_patch_embed.py: Vision patch embedding for Qwen VL models.
+L2/vision_patch_merger.py: Patch merger for Qwen vision encoders.
+L2/vision_pos_embed_interpolate.py: Bilinear interpolation of learned 2D position embeddings (Qwen3-VL).
+L2/vit_encoder_attention.py: Standard ViT multi-head self-attention (L2).
+L2/vit_encoder_mlp.py: Standard ViT MLP (L2).
+L2/vjepa2_attention.py: V-JEPA 2 attention blocks.
+L2/vjepa2_embeddings.py: V-JEPA 2 patch embeddings.
+L2/vjepa2_mlp.py: V-JEPA 2 MLP.
+L2/vllm_fused_experts.py: DeepSeek-only fused MoE experts mirroring vLLM's ``fused_experts_impl``.
+L2/whisper_attention.py: Whisper attention variants: encoder self-attention, decoder self-attention,
+L2/whisper_mlp.py: Whisper MLP block: fc1 -> activation -> fc2.
+L2/xlm_roberta_embeddings.py: XLM-RoBERTa embedding stack.
+L2/yolov10_attention.py: YOLOv10 spatial attention block.
+L2/yolov10_blocks.py: Native YOLOv10 building blocks.
+L2/yolov10_bottleneck.py: YOLOv10 bottleneck block.
+L2/yolov10_c2f.py: YOLOv10 C2f and C2fCIB blocks.
+L2/yolov10_cib.py: YOLOv10 CIB (Compact Inverted Block).
+L2/yolov10_concat.py: YOLOv10 tensor concatenation op.
+L2/yolov10_conv.py: YOLOv10 Conv-BN-Act building block.
+L2/yolov10_dfl.py: YOLOv10 Distribution Focal Loss layer.
+L2/yolov10_head.py: Native YOLOv10 detection head.
+L2/yolov10_psa.py: YOLOv10 PSA (Partial Self-Attention) block.
+L2/yolov10_repvggdw.py: YOLOv10 RepVGG depthwise block.
+L2/yolov10_scdown.py: YOLOv10 SCDown (spatial channel downsampling) block.
+L2/yolov10_sppf.py: YOLOv10 Spatial Pyramid Pooling - Fast.
+L3/alphafold3_diffusion_module.py: Diffusion module for AlphaFold3.
+L3/alphafold3_diffusion_transformer.py: Diffusion transformer for AlphaFold3.
+L3/alphafold3_heads.py: Auxiliary prediction heads for AlphaFold3.
+L3/alphafold3_msa_module.py: MSA module for AlphaFold3.
+L3/alphafold3_pairformer.py: PairFormer stack for AlphaFold3.
+L3/bert_encoder.py: BERT encoder stack.
+L3/bert_layer.py: BERT encoder layer.
+L3/bert_model.py: BERT encoder-only model.
+L3/bitnet_decoder.py: BitNet decoder layer: pre-norm residual with attention and MLP.
+L3/clip_encoder_layer.py: CLIP encoder layer: pre-norm attention + MLP with residual connections (L3).
+L3/convnextv2_stage.py: ConvNeXtV2 stage with optional downsampling.
+L3/cosyvoice3_dit.py: CosyVoice3 Diffusion Transformer (DiT) backbone.
+L3/deepseek_decoder.py: DeepSeek V3.2 decoder layer with MLA attention and MoE.
+L3/dp3_conditional_unet1d.py: DP3 1-D conditional U-Net (denoising network).
+L3/efficientnetv2_stage.py: EfficientNetV2 stage.
+L3/eva_block.py: EVA pre-norm transformer block with layer-scale (L3).
+L3/flux_transformer_block.py: FLUX transformer blocks (L3 composites).
+L3/gemma4_decoder.py: Gemma4 decoder layer.
+L3/gemma_dense_decoder_layer.py: Gemma decoder layer with dense attention (L3 composite).
+L3/gla_decoder.py: GLA / RetNet decoder layer.
+L3/gpt_oss_decoder.py: GPT-OSS decoder layer: attention + MoE with RMSNorm residual connections.
+L3/hunyuan_video_token_refiner_block.py: HunyuanVideo-1.5 token refiner blocks (L3 blocks).
+L3/hunyuan_video_transformer_block.py: HunyuanVideo-1.5 transformer block (L3 composite).
+L3/instantngp_renderer.py: Thin InstantNGP renderer wrapper over the official pyngp testbed.
+L3/jamba_decoder.py: Jamba decoder layer wiring -- mirrors vLLM's JambaAttentionDecoderLayer
+L3/kimi_linear_decoder.py: Kimi-Linear decoder layer: hybrid KDA/MLA attention + MoE/dense MLP (L3).
+L3/llada_block.py: LLaDA transformer block.
+L3/llama4_decoder.py: Llama 4 decoder layer: attention + MoE/MLP with NoPE support.
+L3/llama_decoder.py: Decoder layer: attention + MLP with RMSNorm residual connections.
+L3/mamba2_decoder.py: Mamba2 decoder layer: RMSNorm + Mamba2Mixer with vLLM-style residual.
+L3/mamba_decoder.py: Mamba v1 decoder layer: RMSNorm + MambaMixer with vLLM-style residual.
+L3/mixtral_decoder.py: Mixtral decoder layer: attention + MoE with RMSNorm residual connections.
+L3/mobilenetv4_stage.py: MobileNetV4 stage: sequential container for UIB / EdgeResidual / Conv blocks.
+L3/oasis_autoencoder_kl.py: Oasis VAE autoencoder.
+L3/oasis_block.py: Oasis DiT blocks.
+L3/oasis_dit.py: Oasis diffusion transformer.
+L3/oasis_rollout.py: Oasis latent encoding, decoding, and rollout sampling.
+L3/oasis_vae_attention_block.py: Oasis VAE attention block.
+L3/openfold3_diffusion_module.py: Diffusion module for AlphaFold3.
+L3/openfold3_diffusion_transformer.py: Diffusion transformer for AlphaFold3.
+L3/openfold3_heads.py: Auxiliary prediction heads for AlphaFold3.
+L3/openfold3_msa_module.py: MSA module for AlphaFold3.
+L3/openfold3_pairformer.py: PairFormer stack for AlphaFold3.
+L3/qwen3_moe_decoder.py: Qwen3 MoE decoder layer: QK-norm attention + MoE with RMSNorm residual connections.
+L3/qwen3_next_decoder.py: Qwen3-Next decoder layer: hybrid GDN/full attention + MoE.
+L3/retnet_decoder.py: RetNet decoder layer.
+L3/rtdetrv2_backbone.py: Native RTDetrV2 convolutional backbone.
+L3/rtdetrv2_decoder.py: RTDetrV2 decoder stack.
+L3/rtdetrv2_hybrid_encoder.py: RTDetrV2 hybrid encoder.
+L3/rtdetrv2_model.py: RTDetrV2 model (L3 composite).
+L3/rwkv7_decoder.py: RWKV7 decoder block.
+L3/sam3_decoder_layer.py: Detection decoder layer for SAM3.
+L3/sam3_encoder_layer.py: Fusion encoder layer for SAM3.
+L3/sam3_mask_decoder.py: SAM Mask Decoder for SAM3 tracker.
+L3/sam3_memory_attention.py: Memory attention transformer for SAM3 tracker.
+L3/sam3_neck.py: FPN neck for SAM3.
+L3/sam3_pixel_decoder.py: Pixel decoder for SAM3 segmentation head.
+L3/sam3_text_encoder.py: Text encoder for SAM3.
+L3/sam3_text_encoder_layer.py: Text transformer layer for SAM3 text encoder.
+L3/sam3_vit.py: ViT-Det backbone for SAM3.
+L3/sam3_vit_block.py: ViT-Det transformer block for SAM3.
+L3/sdxl_spatial_transformer.py: Transformer2DModel for SDXL UNet (L3).
+L3/sdxl_transformer_block.py: BasicTransformerBlock for SDXL UNet spatial transformers (L3).
+L3/sdxl_unet_block.py: UNet down/mid/up blocks for SDXL (L3).
+L3/siglip_encoder_layer.py: SigLIP vision encoder layer (L3 composite).
+L3/swinv2_block.py: SwinV2 transformer block with windowed attention (L3).
+L3/swinv2_stage.py: SwinV2 stage: optional downsample + sequence of transformer blocks (L3).
+L3/t5_block.py: T5 encoder block: self-attention + FFN with pre-norm residuals (L3).
+L3/ttt_e2e_decoder.py: TTT-E2E transformer (L3).
+L3/vision_block.py: Vision transformer block for Qwen VL models.
+L3/vit_encoder_block.py: Standard pre-norm ViT transformer block (L3).
+L3/vjepa2_layer.py: V-JEPA 2 transformer layer.
+L3/vjepa2_pooler.py: V-JEPA 2 attentive pooler.
+L3/vjepa2_predictor.py: V-JEPA 2 predictor stack.
+L3/whisper_decoder_layer.py: Whisper decoder layer: self-attention + cross-attention + MLP.
+L3/whisper_encoder_layer.py: Whisper encoder layer: self-attention + MLP with pre-norm LayerNorm.
+L3/xlm_roberta_encoder.py: XLM-RoBERTa encoder stack.
+L3/xlm_roberta_layer.py: XLM-RoBERTa encoder layer.
+L3/xlm_roberta_model.py: XLM-RoBERTa encoder-only model.
+L3/yolov10_backbone.py: YOLOv10 native backbone.
+L3/yolov10_head.py: YOLOv10 detection head (L3 composite).
+L3/yolov10_neck.py: YOLOv10 native neck.
+L4/bge_m3.py: BGE-M3 vLLM-compatible embedding model wiring.
+L4/bitnet.py: Standalone BitNet b1.58 model implementation.
+L4/clip_text_model.py: CLIP text encoder for diffusion pipelines (L4).
+L4/colbertv2.py: ColBERT vLLM-compatible embedding model wiring.
+L4/convnextv2.py: ConvNeXtV2 image classification model.
+L4/cosyvoice3.py: CosyVoice3 TTS model for text-to-speech synthesis.
+L4/deepseek.py: Standalone DeepSeek V3.2 model implementation.
+L4/dinov3.py: DINOv3 7B/16 Eva vision encoder (L4).
+L4/dlrmv2.py: DLRMv2-style recommendation model.
+L4/dp3.py: DP3 (3D Diffusion Policy) — L4 pipeline.
+L4/efficientnetv2.py: EfficientNetV2 image classification model.
+L4/flux.py: FLUX.1-dev diffusion pipeline (L4 pipeline).
+L4/gaussian_splatting.py: Minimal 3D Gaussian Splatting renderer.
+L4/gemma4.py: Gemma4 text-only causal LM.
+L4/gla.py: Standalone GLA (Gated Linear Attention) model implementation.
+L4/gpt_oss.py: Standalone GPT-OSS model implementation.
+L4/hunyuan_video.py: HunyuanVideo-1.5 diffusion pipeline (L4 pipeline).
+L4/instant_ngp.py: Thin InstantNGP model wrapper over the L3 pyngp renderer.
+L4/jamba.py: Standalone Jamba model implementation (L4 pipeline wiring).
+L4/kimi_linear.py: Standalone Kimi-Linear model implementation.
+L4/lightgcn.py: LightGCN recommendation model.
+L4/llada.py: Standalone LLaDA masked diffusion language model.
+L4/llama.py: Standalone Llama 3.1 model implementation.
+L4/llama4.py: Llama 4 Scout model: MoE with NoPE, QK norm, and temperature tuning.
+L4/llama_eagle3.py: EAGLE-3 draft model for Llama-3.x family.
+L4/mamba.py: Standalone Mamba v1 model implementation.
+L4/mamba2.py: Standalone Mamba2 model implementation (Codestral / SSD architecture).
+L4/mixtral.py: Standalone Mixtral-8x7B model implementation.
+L4/mobilenetv4.py: MobileNetV4 Conv Medium image classifier (L4).
+L4/oasis.py: Oasis 500M world-model pipeline wiring.
+L4/openfold3.py: OpenFold3 / AlphaFold3 structure prediction pipeline (L4 pipeline).
+L4/pi0.py: Pi0 vision-language-action model (L4 pipeline).
+L4/pointtransformerv3.py: Repo-native PointTransformerV3.
+L4/qwen25_vl_encoder.py: Qwen2.5-VL text encoder for HunyuanVideo-1.5 (L4).
+L4/qwen2_5_omni.py: Qwen2.5-Omni Thinker model.
+L4/qwen2_vl.py: Qwen2-VL model: vision encoder + Qwen2 language model with M-RoPE.
+L4/qwen3_next.py: Standalone Qwen3-Next model implementation.
+L4/qwen3_vl.py: Qwen3-VL model: vision encoder with DeepStack + Qwen3 language model with M-RoPE.
+L4/qwen3_vl_moe.py: Qwen3-VL-MoE model: vision encoder with DeepStack + Qwen3-MoE language model.
+L4/recurrent_cache.py: Per-layer recurrent state cache for FLA-family models.
+L4/retnet.py: Standalone RetNet (Retentive Network) model implementation.
+L4/rtdetrv2.py: Repo-native RTDetrV2 object detector (L4 wiring).
+L4/rwkv7.py: Standalone RWKV7 model implementation.
+L4/sam3.py: SAM3 image segmentation pipeline (L4 pipeline).
+L4/sam3_tracker.py: SAM3 Tracker: tracker base + predictor for video segmentation.
+L4/sam3_video.py: SAM3 Video Pipeline: detection + tracking + association.
+L4/sdxl.py: SDXL text-to-image pipeline (L4).
+L4/siglip2.py: SigLIP-2 NaFlexVit SO400M vision encoder (L4).
+L4/swinv2.py: SwinV2 Large vision encoder (L4).
+L4/t5_encoder.py: TP-aware T5 encoder model for diffusion pipelines (L4).
+L4/ttt_e2e.py: TTT-E2E pipeline (L4).
+L4/vjepa2.py: V-JEPA 2 base model and video classification head.
+L4/whisper.py: Standalone Whisper encoder-decoder model for speech-to-text.
+L4/yolov10.py: Native YOLOv10 detector model.
