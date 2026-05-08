@@ -427,3 +427,325 @@ agent verdict log) and applied uniformly across all matching folders.
 | **Bespoke autograd.Function with novel math** | Differential attention (paired softmax + λ subtraction); integer-arithmetic GELU/Softmax. | diffllama, ibert |
 | **Compounding gaps** (multiple unsupported sub-systems) | E.g. timm vision tower + Conformer audio + AltUp ladder. | gemma3n |
 
+---
+
+## 10. Per-folder partial gap rationale (all 171 folders)
+
+§9 lists the recurring patterns; this section enumerates every partial
+folder, grouped by primary gap, with a one-line rationale for each.
+For full per-class breakdowns see `tools/manual_audit_shard_*.md` and
+`audit_evidence.csv`.
+
+### partial-rotary RoPE (`partial_rotary_factor < 1.0`; q_rot/q_pass split) (23)
+
+> kb-nano `L1/rotary_emb.RotaryEmbedding` rotates the full head_dim. Needs external slicing in user code or a Gemma4-style proportional rotary wrapper.
+
+- `bamba` — BambaConfig hardcodes `partial_rotary_factor = 0.5` (configuration_bamba.py). kb-nano L1/rotary_emb.py rotates the full head_dim; partial-rotary requires either external q_rot/q_pass slicing in user code or a Gemma4-style proportional embedding wr...
+- `codegen` — GPT-J derivative: fused QKV with mp_num=4 split, partial NeoX RoPE (rotary_dim), MHA with no GQA, fc1+gelu_new+fc2 MLP, LayerNorm. All compute primitives exist (linear, rotary_emb, gelu, layer_norm, dense_attention).
+- `fuyu` — Fuyu wraps a Persimmon (parallel-attention) language model with a single Linear vision_embed_tokens projecting raw image patches to text embedding space. Persimmon is not in kb-nano, and there is no Fuyu/Persimmon L4 pipeline.
+- `glm` — GLM = Llama attention + Phi3MLP (gate_up_proj + chunk + down_proj, same SwiGLU pattern as llama_mlp) + interleaved (rotate-pairs) RoPE. The interleave-2 rotary is a variant of NeoX rotary; can be done via reshape outside rotary_emb.
+- `glm4` — GLM-4 = Glm attention + Phi3MLP + extra post-self-attn / post-mlp RMSNorms (sandwich norm). All ops map to existing kb-nano kernels.
+- `glm46v` — (see shard)
+- `glm4_moe` — GLM-4 MoE = Llama-style attention (Cohere bias config) + DeepSeekV3 MoE (top-k softmax router with shared expert) + RMSNorm + Llama RoPE. Maps cleanly to L2/attention.py + L2/shared_expert_moe.py + L1/rms_norm + L1/rotary_emb.
+- `glm4v` — GLM-4V = Glm4 (Llama-style) text decoder with M-RoPE for multimodal positions + Qwen2.5-VL-style vision encoder (Conv3d patch embed + 2D RoPE + SwiGLU vision MLP). All ops map to existing kb-nano kernels (mrope, vision_rotary_emb, llama_mlp, atten...
+- `glm4v_moe` — configuration_glm4v_moe.py defaults `partial_rotary_factor = 0.5`; modeling_glm4v_moe.py:apply_rotary_pos_emb slices q[..., :rotary_dim] / q[..., rotary_dim:] before rotating. kb-nano L1/rotary_emb.py rotates the full head; partial-rotary needs ex...
+- `glm_image` — GLM-Image adds a Chameleon-style VQVAE for image generation. The VQVAE has bespoke ResNet/Conv2d blocks and a vector quantizer with EMA codebook updates — kb-nano has no Chameleon VQVAE kernels and no L4 pipeline for it.
+- `glm_ocr` — GLM-OCR = pure subclass of Glm4v vision + text components, inheritance only (no new compute). Same as Glm4v structurally.
+- `glmasr` — GLM-ASR adds an audio Conformer encoder (AudioFlamingo3 style) with depthwise Conv1d + GLU + BatchNorm1d + Shaw relative positional embeddings. kb-nano has no Conformer/audio-encoder kernels (no audio_flamingo or whisper-non-attention modules cove...
+- `gpt_neox` — GPT-NeoX = LlamaModel base with NeoX-style RoPE on first part of head_dim, separate q/k/v projections fused into qkv linear, GELU MLP. Maps cleanly to L2/attention + L2/llama_mlp + L1/rotary_emb.
+- `gptj` — GPT-J = parallel residual: attention and MLP run in parallel from same input, summed with residual. Uses GPT-J-style RoPE (rotary on first rotary_dim of head_dim, NeoX layout) without bias on q/k/v. All ops standard.
+- `laguna` — configuration_laguna.py sets `full_attention.partial_rotary_factor = 0.5` (sliding_attention uses 1.0). kb-nano L1/rotary_emb.py rotates the full head_dim; partial-rotary on the full-attention layers requires either Gemma4-style proportional embed...
+- `musicflamingo` — configuration_musicflamingo.py sets `partial_rotary_factor = 0.2` for the Qwen2 LM rope_parameters; standard L1/rotary_emb rotates the full head_dim, so the LM path needs external q_rot/q_pass slicing or Gemma4-style proportional rotary. Custom Mu...
+- `nemotron` — NemotronLayerNorm1P (F.layer_norm with weight+1 reparam) has no kb-nano kernel. Partial-RoPE (rotates only first int(head_dim*partial_rotary_factor) channels) not implemented in L1/rotary_emb.py which assumes full head_dim rotation. squared_relu M...
+- `persimmon` — (see shard)
+- `phi` — PhiAttention overrides Q/K/V to separate Linears with bias=True and applies partial RoPE; PhiMLP inherits CLIPMLP (fc1+activation_fn+fc2 with QuickGELU). PhiDecoderLayer uses nn.LayerNorm and a parallel attn+mlp residual. The compute relies on tor...
+- `phi3` — Phi3Attention uses one fused qkv_proj of width Hq*D + 2*Hkv*D, then apply_rotary_pos_emb slices q/k to rotary_dim only and concatenates back the unrotated tail. kb-nano L1/rotary_emb operates on the full head; partial-rotary requires manual slicin...
+- `phi4_multimodal` — Phi-4 multimodal = Phi-3 LLM + SigLIP vision tower + Conformer-style audio encoder with NeMo conv subsampling, depth-wise separable Conv1d, GLU pointwise conv, relative attention bias, and mean-variance norm. Conformer audio block, NeMo conv subsa...
+- `recurrent_gemma` — configuration_recurrent_gemma.py sets `partial_rotary_factor = 0.5`. RecurrentGemmaSdpaAttention does q_rot, q_pass split and rotates only q_rot. kb-nano L2/attention.py forwards full q,k to rotary_emb; standard L1/RotaryEmbedding rotates the full...
+- `solar_open` — configuration_solar_open.py inherits the GLM4-MoE BC default `kwargs.setdefault("partial_rotary_factor", 0.5)`. Standard L1/rotary_emb rotates the full head_dim; partial-rotary needs external slicing or Gemma4-style proportional rotary. Same gap a...
+
+### Interleaved RoPE (`cos[..., :d//2].repeat_interleave(2, dim=-1)`) (2)
+
+> kb-nano `L1/rotary_emb` applies rotate_half-style NeoX rotation; the GLM/Cohere interleaved variant needs a different rotation pattern. (Already covered above for glm-family in the partial-rotary group; listed here for non-glm interleaved cases.)
+
+- `cohere` — Llama-derived: GQA attention with optional QK-LayerNorm, SwiGLU MLP, custom CohereLayerNorm (centered LayerNorm = standard nn.LayerNorm without bias), interleaved RoPE. All primitives exist.
+- `helium` — Helium = Llama-family with HeliumRMSNorm (fp32 cast inside) + GraniteAttention base (no attention_multiplier override here — rebound to 1/sqrt(d_k)) + HeliumMLP (= LlamaMLP) + interleaved RoPE (rotate_half via stack). All maps to L2/attention + L2...
+
+### LayerNorm-decoder (Phi/Persimmon/GPT-NeoX, not RMSNorm) (1)
+
+> kb-nano `L2/attention.py` expects `RMSNorm` and SwiGLU MLP. LayerNorm-decoder paths need a separate L2 wrapper. Often combined with parallel-attention residual.
+
+- `mpt` — build_mpt_alibi_tensor produces an additive [n_heads, q_len, k_len] bias added to attention scores. kb-nano flash kernels lack ALiBi support; torch.matmul-based softmax is the only path. Per consistency reminder: ALiBi-as-additive-bias is partial.
+
+### ALiBi positional bias (`build_alibi_tensor` injection) (2)
+
+> kb-nano has no ALiBi kernel; the slopes can be injected via `attn_mask` but no dedicated wrapper / fused path.
+
+- `bloom` — ALiBi-biased multi-head attention via additive bias on attention scores -- supported by L1/dense_attention or L1/flash_attn_decode (alibi_slopes). MLP is fc1->gelu_new->fc2; LayerNorm + fused QKV linear.
+- `falcon` — Falcon supports both RoPE (new arch) and ALiBi (legacy 7B/40B) attention biases plus parallel-attention layer topology. kb-nano attention kernels (LlamaAttention/Attention impl) have no ALiBi additive bias support.
+
+### AutoBackbone / `load_backbone()` infrastructure routing (14)
+
+> HF AutoModel registry config-driven dispatch; the backbone *itself* is composable when its model_type maps to a kb-nano-supported family but kb-nano has no AutoBackbone shim. Folders that route to timm/detectron2 escalate to unsupported.
+
+- `chmv2` — Depth estimation model that loads its backbone via HF AutoBackbone (load_backbone) -- requires a separate vision backbone (DPT-style) that kb-nano does not expose as an L4 pipeline. The DPT head itself (Reassemble + Fusion + UpsampleConv) is compo...
+- `conditional_detr` — DETR-derived object detector that loads its CNN backbone via transformers.backbone_utils.load_backbone (typically ResNet from timm or AutoBackbone). kb-nano has no backbone-loading abstraction. The transformer encoder/decoder itself is composable...
+- `dab_detr` — Standard DETR-style enc-dec with conditional cross-attention with q/k content/position projections; all compute is matmul/softmax/linear/layer_norm/conv (via load_backbone) — all primitives exist.
+- `detr` — Standard DETR enc-dec: ResNet backbone (AutoBackbone) + sinusoidal/learned position embeddings + standard MHA self/cross attention + MLP. All primitives exist.
+- `mask2former` — Pixel encoder is loaded via AutoBackbone (load_backbone) — kb-nano has no AutoBackbone/timm equivalent. Decoder also uses nn.MultiheadAttention for cross-attn.
+- `mm_grounding_dino` — Inherits Grounding DINO conv encoder which calls load_backbone(config) for the (Swin) image backbone, plus loads BERT text backbone via AutoModel.from_config. AutoBackbone has no kb-nano equivalent.
+- `modernvbert` — ModernVBert composes a SigLIP vision tower with a ModernBert text encoder via AutoModel.from_config. The ModernBertConnector does pixel-shuffle + Linear, but ModernBert (text) itself is partial (sliding-window+RoPE encoder attention with no kb-nan...
+- `omdet_turbo` — Open-vocab detection model: depends on AutoBackbone (timm) for vision tower, AutoModel for text, plus multi-scale deformable attention (MSDA v1, kernels-community kernel) and a custom hybrid encoder/decoder. No L4 pipeline; kb-nano deformable atte...
+- `oneformer` — OneFormer universal segmentation depends on multi-scale deformable attention, bare nn.MultiheadAttention (Transformer decoder cross-attn), Hungarian matcher (scipy), and AutoBackbone (timm/swin/dinat). No kb-nano equivalent for the cross-attention...
+- `perception_lm` — Vision tower is loaded via AutoModel.from_config with model_args['embed_dim'] suggesting a custom timm-like perception encoder; no fixed kb-nano vision pipeline corresponds. Adaptive avg pool 2d exists in kb-nano (L1/adaptive_avg_pool2d.py).
+- `prompt_depth_anything` — Depth-Anything depth estimator with prompt-depth fusion. Backbone is loaded externally via load_backbone (e.g. DPT/DINOv2). Compute classes are pure Conv2d + ReLU + bilinear upsample + residual fusion; no novel ops.
+- `sam` — SamVisionAttention's decomposed 2D relative position embeddings (rel_pos_h / rel_pos_w with F.interpolate + einsum to add to attention scores) have no kb-nano L2 equivalent. The base attention compute (qk@k.T + softmax + p@v) is composable from De...
+- `sam_hq` — SAM-HQ adds high-quality output token with Hiera-style ViT vision encoder + standard SAM prompt encoder + two-way transformer + HQ-augmented mask decoder. All compute primitives (Conv2d, LayerNorm, Linear, attention, GELU, interpolate) exist in kb...
+- `tvp` — TvpVisionModel uses Transformers' load_backbone for an external ResNet (not a kb-nano backbone). TvpFrameDownPadPrompter / TvpFramePadPrompter implement learnable padding around video frames as nn.Parameter padding masks — no kb-nano equivalent. T...
+
+### BART-style separate q/k/v projections + (seq, batch, dim) layout (7)
+
+> kb-nano `L2/whisper_attention.py` uses `QKVParallelLinear` (merged QKV). BART-family uses 3 separate Linear projections + (seq, batch, dim) layout. Decomposable from L1 ops but no L2 wrapper for that exact layout.
+
+- `flaubert` — Flaubert (XLM-derived) uses BART-style attention with separate q_lin/k_lin/v_lin and supports both encoder and cross-attention with EncoderDecoderCache. The kb-nano encoder_attention.py does not support cross-attention, and the bare q/k/v separate...
+- `florence2` — Florence-2 = DaViT vision backbone (channel attention + window spatial attention with depth-wise Conv2d positional encoding) + BART-style seq2seq language model. Vision backbone is bespoke DaViT not present in kb-nano; BART seq2seq is also not imp...
+- `fsmt` — FSMT is a BART-style encoder-decoder seq2seq model with cross-attention. Although kb-nano has whisper_attention.py (3 sibling classes: encoder/decoder/cross), there is no FSMT/BART L4 pipeline and the FSMT Attention class uses (seq, batch, dim) la...
+- `lilt` — LiltSelfAttention runs two parallel QKV streams (text + layout) and adds the scaled-dot-product scores before softmax; the cross-stream score addition has no kb-nano L2 equivalent. Implemented in HF via raw torch.matmul + nn.Softmax, so it works o...
+- `pp_formulanet` — PPFormulaNetMultiModalProjector wraps Florence-2 projection (custom). PPFormulaNetVisionAttention inherits SLANeXtVisionAttention (custom encoder attention). PPFormulaNetAttention + PPFormulaNetDecoderLayer follow MBart enc-dec with cross-attentio...
+- `time_series_transformer` — TimeSeriesTransformerAttention is BART-style (bmm-flatten + Q*scaling + LayerNorm-around) — kb-nano L2/whisper_attention.py covers the closest pattern but the per-class structure (no relative bias, no RoPE, plain multi-head with key_value_states f...
+- `trocr` — TrOCRAttention is BART-style (Q*scaling -> bmm-flattened multi-head SDPA) with EncoderDecoderCache for cross-attn — kb-nano L2/whisper_attention.py is the closest sibling but is structured around Whisper's three sibling classes; the bare 'TrOCRAtt...
+
+### T5 cross-attention (`T5LayerCrossAttention` not wrapped) (10)
+
+> kb-nano `L2/t5_attention.py` implements self-attention with relative bias; the cross-attn variant (with `key_value_states` from encoder + `EncoderDecoderCache`) is not wrapped. Encoder-only path is composable; decoder makes the folder partial.
+
+- `longt5` — LongT5 adds Local and TransientGlobal block-sparse attention variants on top of T5 relative-bias attention; no kb-nano kernel for the local-block / transient-global attention.
+- `mt5` — T5 decoder cross-attention with relative-position bias has no kb-nano L2 (kb-nano whisper_attention.py is BART-style without T5 relative bias; t5_attention.py is encoder self-attn). Per consistency reminder: T5 cross-attn unsupported in kb-nano.
+- `pix2struct` — Pix2StructTextLayerCrossAttention wraps a Pix2StructTextAttention configured for cross-attention with relative bias. kb-nano L2/t5_attention.py implements only T5SelfAttention; cross-attention with the T5 relative-position-bias path is not present...
+- `pop2piano` — Pop2PianoLayerCrossAttention wraps Pop2PianoAttention configured for cross-attention. kb-nano L2/t5_attention.py implements T5SelfAttention only; cross-attention path (separate K/V from encoder hidden states with relative bias) is not implemented....
+- `switch_transformers` — SwitchTransformersTop1Router applies token-priority cumsum + capacity overflow masking and SwitchTransformersExperts loops over experts with index_add_; the capacity-limited Switch routing is structurally different from standard fused-MoE (top-k s...
+- `t5` — T5LayerCrossAttention (T5Attention with key_value_states from encoder + EncoderDecoderCache) is not implemented in kb-nano (L2/t5_attention.py covers only T5SelfAttention); the relative-bias bucket helper exists encoder-side but the cross-attn pat...
+- `t5gemma` — T5GemmaCrossAttention (Gemma2Attention with overridden forward that pulls cross KV from encoder_hidden_states + EncoderDecoderCache.cross_attention_cache + soft-cap + sliding_window=None) has no kb-nano L2 equivalent; L2/attention.py covers self-a...
+- `t5gemma2` — T5Gemma2MergedAttention concatenates [self_KV \| cross_KV] along the seq dim and runs a single fused softmax (with masking); kb-nano L2/attention.py is vanilla self-attention, no merged self+cross variant exists. Q/K RMS-norm is present (matches Ge...
+- `udop` — UdopLayerCrossAttention has no kb-nano kernel (kb-nano L2/t5_attention.py covers only self-attention with relative bias). RelativePositionBiasHorizontal / RelativePositionBiasVertical compute bbox-based 2D relative-position buckets (uses bbox coor...
+- `umt5` — UMT5LayerCrossAttention has no kb-nano kernel (L2/t5_attention.py covers only self-attention). The relative-bias-per-layer variation is computed inside UMT5Attention itself; kb-nano's L2/t5_attention.py is also self-attn only with the standard fir...
+
+### Conformer relative-position rel_shift / `matrix_bd shift_relative_position_tensor` (12)
+
+> Decomposes from `gather` + `bmm` + `softmax` (all in L1) but no kb-nano kernel implements the rel_shift index gymnastics. Common in audio/Conformer encoders.
+
+- `fastspeech2_conformer` — Conformer-based TTS encoder with relative positional encoding (Transformer-XL style) attention plus duration/pitch/energy predictors and HiFi-GAN vocoder. The relative-position attention with learnable u/v biases and the conformer convolution modu...
+- `granite_speech` — Granite Speech encoder is a Conformer with depthwise Conv1d + GLU + BatchNorm1d + Shaw relative positional embeddings (einsum-based pos_attn). kb-nano has no Conformer block and no Shaw relpos primitive.
+- `granite_speech_plus` — GraniteSpeechConformerConvModule uses nn.BatchNorm1d (granite_speech/modeling_granite_speech.py:226) — kb-nano only has L1/batch_norm2d.py; BatchNorm1d would fall back to torch.nn.BatchNorm1d.
+- `lasr` — Conformer convolution module (inherited from Parakeet) uses nn.BatchNorm1d as the in-conv normalization. kb-nano has BatchNorm2d, GroupNorm, FrozenBatchNorm2d but no BatchNorm1d. ReLU + nn.Conv1d (subsampling) are present.
+- `parakeet` — ParakeetEncoderAttention adds learnable bias_u/bias_v (Transformer-XL style) and applies _rel_shift on relative positional logits before SDPA; this fused (matrix_ac + matrix_bd) addition pattern is not exposed as a kb-nano kernel. FastSpeech2Confo...
+- `seamless_m4t` — Conformer relative-position attention + GLU activation + custom rel-pos shift are torch-native (matmul/softmax/Linear) but no fused kb-nano kernel; SeamlessM4TVariancePredictor uses standard Conv1d + LN.
+- `seamless_m4t_v2` — Conformer relative-position attention has no fused kb-nano kernel (same as v1); rest is torch-native and composable.
+- `sew_d` — DisentangledSelfAttention (DeBERTa-v2 style content/pos/c2p/p2c scoring) and ConvLayer relative-pos handling have no fused kb-nano kernel; rely on torch matmul/gather/softmax/Linear.
+- `wav2vec2` — (see shard)
+- `wav2vec2_bert` — Wav2Vec2BertSelfAttention is a Conformer attention with Transformer-XL relative bias (pos_bias_u/pos_bias_v) and a custom rel-shift; no kb-nano L2 attention implements relative bias attention.
+- `wav2vec2_conformer` — Wav2Vec2ConformerSelfAttention implements Transformer-XL relative bias attention (linear_pos + pos_bias_u/v + rel-shift) and the ConvolutionModule needs nn.functional.glu; no kb-nano L2 covers either compute.
+- `wavlm` — WavLMAttention uses gated relative position bias (T5-style buckets gated by GRU-style projection of hidden states) and calls F.multi_head_attention_forward; no kb-nano L2 covers this gated relative bias attention.
+
+### Swin V1 `relative_position_bias_table` windowed attention (3)
+
+> kb-nano `L2/swinv2_window_attention.py` is V2-specific (cosine attention + CPB MLP). V1 uses additive `relative_position_bias_table` indexed via `relative_position_index`.
+
+- `donut_swin` — Swin V1 windowed attention uses relative_position_bias_table lookup (additive bias on attention scores). kb-nano L2/swinv2_window_attention.py is V2-only (cosine attention + CPB MLP) — different math.
+- `maskformer_swin` — Original Swin V1 backbone (relative-position-bias window attention with shifted windows, drop-path, patch merging) — kb-nano only has Swin V2 (cosine attention with continuous position bias), which is a different attention formulation.
+- `swin` — SwinSelfAttention uses standard scaled dot-product attention plus a learnable relative_position_bias_table (Embedding-like) indexed by relative_position_index — kb-nano has L2/swinv2_window_attention.py for V2 (cosine + CPB MLP) but no V1 (additiv...
+
+### BatchNorm1d (no kb-nano BN1d wrapper; only BN2d) (4)
+
+> `L1/batch_norm2d.py` exists; BN1d is a torch.nn primitive but no kb-nano wrapper.
+
+- `hubert` — BatchNorm1d (used in HubertPositionalConvEmbedding when conv_pos_batch_norm=True) and Conv1d weight_norm parametrization have no kb-nano L1 equivalent. GroupNorm is available, BatchNorm2d is, but BatchNorm1d is missing.
+- `levit` — MLPLayerWithBN applies nn.BatchNorm1d after every Linear; kb-nano has BatchNorm2d but no BatchNorm1d. LevitAttention/LevitAttentionSubsample also add a learned 2D positional attention_biases tensor to attention scores before softmax — kb-nano flas...
+- `speecht5` — SpeechT5RelativePositionalEncoding requires custom shift-relative-pos handling (no fused kb-nano kernel); SpeechT5BatchNormConvLayer uses nn.BatchNorm1d which has no kb-nano kernel (only BN2d in L1).
+- `superglue` — SuperGlueMultiLayerPerceptron uses nn.BatchNorm1d on transposed channels — kb-nano has L1/batch_norm2d.py but no BatchNorm1d. The Sinkhorn matching for the final assignment (in SuperGlueForKeypointMatching) is also a custom optimization-style op n...
+
+### `torch.nn.utils.weight_norm` parametrization (4)
+
+> Reparametrization decomposes from L1 ops but no kb-nano wrapper for `WeightNorm`.
+
+- `kyutai_speech_to_text` — The codec_model (Mimi) uses MimiConv1d with streaming padding cache and weight-normalized Conv1d/ConvTranspose1d (audio codec primitives). kb-nano has Conv1d but no weight_norm parametrization or streaming padding cache. The Llama text decoder por...
+- `mimi` — MimiVectorQuantization / MimiEuclideanCodebook / MimiResidualVectorQuantizer perform nearest-neighbour codebook lookup with EMA updates; no kb-nano L1 for VQ. The Conv1d/ConvTranspose1d wrappers use nn.utils.weight_norm and a runtime padding cache...
+- `univnet` — (see shard)
+- `vits` — All compute primitives (Conv1d, ConvTranspose1d, sigmoid, tanh, relu, leaky_relu, Linear, softmax) exist in kb-nano. However: (1) nn.utils.weight_norm parametrization on conv layers is a PyTorch-only utility with no kb-nano primitive; (2) fused_ad...
+
+### Custom 2D / segment-aware position encoding (5)
+
+> Fourier basis (perceiver), IndexMap segment-reduce (tapas), LSH bucketing (reformer), torch.fft (autoformer / fnet) — decomposable from arange + einsum + fft but no kb-nano kernel for these patterns.
+
+- `autoformer` — AutoformerAttention replaces SDPA with autocorrelation: q/k FFT -> conjugate multiply -> inverse FFT -> top-k autocorrelation delay aggregation via torch.gather/roll. PyTorch supplies torch.fft.rfft/irfft, but kb-nano has no FFT primitive and no a...
+- `fnet` — FNetBasicFourierTransform uses torch.fft.fftn (or scipy linalg.dft fallback). torch.fft.fftn exists in PyTorch, so a partial port is possible by calling it directly, but kb-nano has no L1 FFT primitive.
+- `perceiver` — Fourier-based position encoding (PerceiverFourierPositionEncoding) builds frequency basis with linspace + cos/sin; not in kb-nano. The cross-attention pattern (latent_array attend to inputs) uses generic attention but kb-nano doesn't have a Percei...
+- `reformer` — LSH/local chunked attention with bucketing and sort/unsort logic has no kb-nano equivalent; the underlying ops (matmul, softmax, gather) are torch primitives but no kb-nano L2 module wraps the LSH attention pattern.
+- `tapas` — TapasEmbeddings.forward uses IndexMap / ProductIndexMap / reduce_min / gather (segment-aware reductions for cell-relative position) — these operate on per-token table indices and have no kb-nano L1 / L2 wrapper. The downstream cell-selection / agg...
+
+### Block-sparse / sliding-window / chunked attention (12)
+
+> BigBird (block-sparse), Longformer (sliding + global), Cohere2 (sliding window without flag in L2 wrapper), LED, ModernBERT, Pegasus-X, Nystromformer (Moore-Penrose pseudo-inverse). Decomposes via `attn_mask` injection but no kb-nano L2 wrapper for these routing patterns.
+
+- `big_bird` — BigBirdBlockSparseAttention combines global tokens + sliding window + random-blocks attention via masked dense matmuls on grouped block tensors. PyTorch supplies the underlying ops (matmul, softmax, gather), but kb-nano has no block-sparse attenti...
+- `bigbird_pegasus` — BigBirdPegasusBlockSparseAttention reuses the BigBird block-sparse pattern (global + sliding window + random blocks). No kb-nano equivalent. The decoder full attention is composable via whisper_attention.
+- `cohere2` — Cohere2 extends Cohere with sliding-window attention (SWA), Gemma2-style hybrid local/global attention. Same compute primitives as Cohere; sliding window handled as attention mask in dense_attention.
+- `led` — LED uses Longformer-style sliding-window self-attention (O(N*W)) with global attention on a subset of tokens. The chunked sliding-window matmul algorithm (_sliding_chunks_query_key_matmul, _sliding_chunks_matmul_attn_probs_value) and global-token...
+- `longformer` — Sliding-chunk local attention with global-attention tokens — bespoke attention pattern requiring custom CUDA-style kernels (sliding-chunk QK matmul, padded diagonal mask handling).
+- `mistral3` — Mistral3PatchMerger relies on torch.nn.functional.unfold (sliding-window patch extraction). No kb-nano L1 op for unfold; PyTorch has it natively. Vision tower + projector also depend on Pixtral encoder (not in shard).
+- `modernbert` — Encoder self-attention with both RoPE on Q/K and sliding-window masking is not implemented in kb-nano L2; HF uses ALL_ATTENTION_FUNCTIONS path with sliding_window kwarg. kb-nano flash_attn_prefill supports causal sliding window but encoder_attenti...
+- `modernbert_decoder` — Same GLU MLP issue as modernbert (packed Wi); attention itself maps to LlamaAttention with LayerNorm replacing RMSNorm. kb-nano L2/llama_mlp.py uses gate_proj/up_proj/down_proj layout, not chunked Wi.
+- `moonshine` — MoonshineAttention requires RoPE before the SDPA call (encoder-decoder path with cross-attention), and head_dim padding to a multiple. kb-nano whisper_attention.py has no RoPE pre-application; llama-family attention.py is causal-only. Pure-torch p...
+- `moonshine_streaming` — MoonshineStreamingFrameCMVN, MoonshineStreamingAsinhCompression, MoonshineStreamingCausalConv1d (with mask propagation), and MoonshineStreamingLayerNorm (unit-offset gamma) all compose via torch ops; no kb-nano L1 implements these specifically. Sl...
+- `nystromformer` — Nystromformer's self-attention is a custom Nystrom approximation requiring iterative pseudo-inverse computation and depthwise conv2d residual — no kb-nano kernel approximates this.
+- `pegasus_x` — PegasusXGlobalLocalAttention implements custom block-wise local attention with cross-attention to global tokens via einsum (BHGF/BHXF, BHGX/BHXF). The block-local + global-token pattern has no kb-nano kernel; would need a custom L1/L2 or torch fal...
+
+### MoE with bespoke routing logic (9)
+
+> The MoE expert kernel (`L1/moe_grouped_gemm.py`, `L2/shared_expert_moe.py`, etc.) exists but the routing layer needs custom logic (JetMoe Mixture-of-Attention, longcat identity-experts, NLLB-MoE conditional expert, switch_transformers token routing).
+
+- `jetmoe` — JetMoeMoA wraps the attention computation with input-side routed q-projection and output-side routed combine, with per-expert weights stored in JetMoeParallelExperts (looped F.linear per expert). kb-nano has no equivalent for routing query project...
+- `longcat_flash` — LongcatFlashExperts has zero-compute (Identity) experts (modular_longcat_flash.py:97, 134-135) — kb-nano L1/moe_grouped_gemm.py and L2/deepseek_moe.py have no pass-through identity-expert path; the routing+identity branch falls back to torch index...
+- `nemotron_h` — NemotronHExperts uses non-gated up_proj+act+down_proj (not SwiGLU); kb-nano fused_experts/L2 mixtral_moe.py and shared_expert_moe.py both assume gated experts. NemotronHMoE adds optional fc1_latent_proj/fc2_latent_proj wrapping the experts. No kb-...
+- `nllb_moe` — NllbMoeTop2Router implements fairseq-style capacity-based Top-2 routing (cumsum < capacity, batch-prioritized, gumbel sampling) — semantically different from kb-nano top-k routers (L1/topk_softmax.py, grouped_topk.py). Experts stored as ModuleDict...
+- `olmo` — OlmoAttention applies torch.Tensor.clamp_ on Q/K/V if config.clip_qkv is set; kb-nano L2/attention.py:LlamaAttention has no clip_qkv option. clamp_ is a torch primitive but isn't exposed through the kb-nano attention class.
+- `olmoe` — OlmoeAttention applies torch.Tensor.clamp_ on Q/K/V if config.clip_qkv is set; same gap as olmo. kb-nano L2/attention.py:LlamaAttention has no clip_qkv knob.
+- `phimoe` — Mixtral-derived MoE LLM but with bespoke sparsemixer router (Heun's-third-order gradient estimator wrapping a custom torch.autograd.Function PhimoeMultiplier) and nn.LayerNorm in place of RMSNorm. The sparsemixer top-k has no kb-nano analog; stand...
+- `qwen3_5` — Qwen3_5GatedDeltaNet uses split in_proj_qkv/in_proj_z/in_proj_b/in_proj_a Linear projections; kb-nano L2/qwen3_next_gdn_attention.py expects fused in_proj_qkvz/in_proj_ba and would need a small wrapper to consume split projections. The underlying...
+- `qwen3_5_moe` — Inherits Qwen3_5GatedDeltaNet split projection layout (in_proj_qkv/z/b/a); same wiring gap as qwen3_5. MoE block uses Qwen3MoeSparseMoeBlock pattern (no shared expert) which is L2/qwen3_moe.py.
+
+### Snake1d / xIELU / non-standard activation (7)
+
+> Snake1d (sin-based, used in audio codecs); xIELU (apertus/arcee learnable α); squared-ReLU + non-gated MLP without an L2 wrapper (jais2-style).
+
+- `apertus` — Uses xIELU activation (a learnable activation introduced in the Apertus paper) as ACT2CLS['xielu'](dtype=...). xIELU is not in PyTorch's standard activation set and has no kb-nano kernel.
+- `arcee` — ArceeMLP is up_proj -> ACT2FN['relu2'] -> down_proj (no gate), i.e. a two-layer MLP with squared-ReLU activation. kb-nano provides L1/squared_relu.py and the fused L1/squared_relu_and_mul.py used in BitNet's gated MLP, but no L2 module for the bar...
+- `dac` — Snake1d activation (x + (1/(alpha+eps)) * sin(alpha*x).pow(2)) has no fused kb-nano kernel; would fall back to torch elementwise sin/pow/mul/add.
+- `pe_audio` — DacEncoder uses Snake1d activation: x + (1/alpha) * sin^2(alpha * x). Not in kb-nano L1; pure torch primitives but no fused kernel.
+- `pe_audio_video` — PeAudioVideoMaskedGroupNorm uses torch.masked.mean/var for padding-aware GroupNorm; kb-nano has L1/group_norm.py but no masked variant. Plus AutoModel coupling for sub-encoders.
+- `pe_video` — Inherits PeAudioVideoMaskedGroupNorm using torch.masked.mean/var; missing in kb-nano. Plus AutoModel coupling for video sub-encoder.
+- `qwen3_omni_moe` — Code2Wav stack (CausalConvNet, CausalTransConvNet, ConvNeXtBlock, SnakeBeta-based decoder, AMP block, BigVGAN-style decoder) is a speech vocoder/codec that has no kb-nano equivalent. The transformer layers (Code2WavAttention, Code2WavMlp, Code2Wav...
+
+### `nn.MultiheadAttention` black-box wrapper (3)
+
+> Decomposes to separate Q/K/V Linear + sdpa + output Linear (covered by `L2/encoder_attention.py`), but the folders use the opaque `nn.MultiheadAttention` class and the audit was conservative.
+
+- `aria` — AriaCrossAttention uses torch.nn.MultiheadAttention as a black box (with batch_first=True). PyTorch implements it via _scaled_dot_product_attention, so the compute is available via L1/dense_attention.py, but there is no kb-nano L2 wrapper for nn.M...
+- `bridgetower` — Vision tower: CLIP-style ResidualAttention using nn.MultiheadAttention; text tower: BERT-style self/cross attention; cross-modal layers compose the two. Compute is plain MHA with QuickGELU MLP.
+- `idefics2` — SigLIP-style vision encoder + Perceiver resampler with cross-attn + AutoModel text decoder + Idefics2Connector (linear projection). MultiheadAttentionPoolingHead uses torch.nn.MultiheadAttention which is plain SDPA. All primitives present.
+
+### Mamba / SSM variant with custom mixer wiring (3)
+
+> Zamba/Zamba2 use Mamba2 with bespoke `Zamba2RMSNormGated` and fused `in_proj` of `intermediate + conv_dim + num_heads`; MiniMax uses lightning attention.
+
+- `minimax` — (see shard)
+- `zamba` — Multi-head Mamba mixer (per-head x_proj_weight / dt_proj_weight / dt_proj_bias / A_log / D over n_mamba_heads) is not realised by any L2 mamba mixer; kb-nano supports single-head Mamba via L2/mamba_mixer.py and L2/jamba_mamba_mixer.py but a multi-...
+- `zamba2` — Zamba2MambaMixer uses a custom layout (in_proj fused output with intermediate + conv_dim + num_heads, group-norm-gated activation via Zamba2RMSNormGated) that is not reproduced by kb-nano's L2/mamba2_mixer.py; kb-nano has the underlying L1 ops (ca...
+
+### Vision encoder w/o existing kb-nano L4 (multimodal pipelines) (11)
+
+> These VLMs combine a vision tower (often Qwen2-VL/2.5-VL or SigLIP-style) with a text decoder; all compute primitives are present but there is no end-to-end L4 pipeline tying them together. Composable in spirit; partial because the wiring isn't materialized.
+
+- `cohere2_vision` — VLM pipeline: SigLIP-style vision tower + Cohere2 LM + multi-modal projector (pixel-shuffle + SwiGLU). All sub-modules map to existing kb-nano kernels (siglip_attention/mlp, cohere2 stack, llama_mlp pattern for projector).
+- `deepseek_vl_hybrid` — Hybrid adds a SAM vision encoder branch with neck + DeepseekVLSamVisionProj (Conv2d twice) and a hybrid aligner (two Linear projections + GELU + Linear); all primitives exist (Conv2d/interpolate/Linear/GELU).
+- `evolla` — (see shard)
+- `exaone4_5` — EXAONE 4.5 is a Qwen2.5-VL multimodal model with vision encoder + 2D-RoPE + GQA. The vision tower components (ViT-style with 2D RoPE) and the multimodal projector pipeline have no kb-nano L4 wrapper or vision-encoder L2/L3 stack equivalent.
+- `got_ocr2` — GOT-OCR-2 vision tower is the SAM ViT encoder, which uses decomposed relative positional embeddings (MViT-v2 / Shaw style) with custom einsum scoring. kb-nano has SAM3 vision attention (uses 2D RoPE, not decomposed relpos), so the SAM-style attent...
+- `mllama` — MllamaPrecomputedAspectRatioEmbedding/MllamaPrecomputedPositionEmbedding are bespoke gated tile-aware embeddings. MllamaTextCrossAttention has tanh-gated residuals, q/k RMSNorm, and a custom cross-attention cache pattern (update only on first call...
+- `mvp` — MvpAttention supports an attn_prompt argument that prepends learned prompt tensors to key_states/value_states within the attention call. kb-nano whisper_attention.py has no prompt-prepend hook. Pure-torch composition possible but no L2 covers it.
+- `ovis2` — Ovis2VisionModel.forward calls nn.functional.gumbel_softmax (when tokenize_function='gumbel_argmax') which is not in kb-nano L1; it's a torch primitive but no fused kernel.
+- `paddleocr_vl` — OCR-focused VLM combining Ernie4.5 (Llama-style) LLM + Qwen2.5-Omni attention + Qwen2-VL RoPE + SigLIP vision MLP + VideoLlama3 vision attention. All architectural pieces map to existing kb-nano L2/L3 (encoder/llama-style attention, SwiGLU MLP, vi...
+- `pixtral` — PixtralRotaryEmbedding precomputes inv_freq per (h,w) position by interleaving freqs[::2] (h dim) and freqs[1::2] (w dim) and indexing by position_ids. kb-nano L1/vision_rotary_emb.py builds cos_sin from a 1D max_grid_size table indexed via grid_t...
+- `qianfan_ocr` — QianfanOCRVisionAttention applies QianfanOCRVisionRMSNorm to Q and K before the per-head reshape (use_qk_norm flag). kb-nano L2/encoder_attention.py does not support QK-norm in the vision branch (LlamaAttention-style qk_norm exists in L2/attention...
+
+### CNN / vision backbone structural mismatch (6)
+
+> EfficientNet-style or BiT-style CNN where the building blocks differ from kb-nano's ConvNeXtV2 / EfficientNetV2 (different block ordering, depthwise stride/padding, weight standardization, etc.).
+
+- `align` — EfficientNet vision encoder is structurally similar to but not the same as kb-nano's EfficientNetV2 building blocks (different block sequence, depthwise stride/padding handling, dropout-based stochastic depth). Compute primitives all exist in PyTo...
+- `bit` — WeightStandardizedConv2d standardizes the conv weights (batch_norm on weight tensor) on every forward pass. Implemented with PyTorch's nn.functional.batch_norm + conv2d but no kb-nano L1 op fuses or wraps this; existing L1/conv2d.py is a vanilla c...
+- `focalnet` — FocalNet uses Focal Modulation: a bespoke replacement for self-attention that combines depthwise Conv2d hierarchical context aggregation with gating. No kb-nano kernel implements this pattern, and there is no Focal-Modulation L4.
+- `mobilevitv2` — MobileViTV2LinearSelfAttention is a custom O(N) attention: softmax over single-query channel + element-wise (key * scores) sum + relu(value)*context. No kb-nano kernel matches; pure torch primitives suffice.
+- `pp_lcnet_v3` — PPLCNetV3LearnableAffineBlock applies learnable scale * x + learnable bias as a separate parameter pair. PPLCNetV3LearnableRepLayer reparameterizes a stack of (DWConv + LearnableAffineBlock) into a single conv at inference (RepVGG-style) with affi...
+- `swiftformer` — SwiftFormerEfficientAdditiveAttention computes a single global query via softmax(Q @ w_g) -> sum, then proj(global * key) — this 'efficient additive attention' pattern is not a kb-nano kernel and falls back to torch ops (matmul + softmax + F.norma...
+
+### Bespoke novel attention (decomposable, no kb-nano L2) (5)
+
+> DeepSeek V4 (HCA + CSA + Indexer + HyperConnection); Doge (Dynamic Mask Attention); ESMFold (AlphaFold-style triangle attention); FocalNet (focal modulation); Funnel (pooled-query relative-pos); Informer (ProbSparse).
+
+- `deepseek_v4` — DeepSeek V4 introduces novel Heavily Compressed Attention (HCA), Compressed Sparse Attention (CSA), Indexer for sparse attention, multi-rope-type Laguna-style rotary, HyperConnection routing, hash router, grouped output projection — none of these...
+- `doge` — DogeAttention.prepare_dynamic_mask uses torch.topk + scatter to build a sparse attention mask each step (no kb-nano kernel for DMA). DogeCDMoE uses two nn.Embedding(num_experts, hidden_size) tables + matmul to materialize per-token expert weights,...
+- `esmfold` — EsmFoldTriangleAttention is AlphaFold-style triangular attention (no kb-nano L2 wrapper). The compute decomposes from torch primitives (matmul + softmax + tensor reshape) but no kb-nano kernel implements the triangular pattern.
+- `funnel` — Funnel Transformer uses pooled-query relative-position multi-head attention with per-block q/k stride pooling and a custom learned positional structure. The relative-attention structure (FunnelAttentionStructure with phi/pi/psi/omega bias terms) i...
+- `informer` — Informer's defining contribution is InformerProbSparseAttention: random key sampling, sparsity measurement (max - mean) on Q-K_sample, top-u query selection, sparse attention only on top-u queries with cumsum-based context for the rest. This algor...
+
+### DETR-family deformable / cross-modal grounding (3)
+
+> kb-nano has `L1/rtdetrv2_deformable_attention.py` for the V2-specific path; older deformable_detr / grounding_dino use a different deformable variant + bi-modal cross-attention without kb-nano L2 wrappers.
+
+- `deformable_detr` — Deformable DETR uses MultiScaleDeformableAttention via grid_sample + standard transformer enc-dec. kb-nano has L1/grid_sample.py and L1/L2 rtdetrv2_deformable_attention.py (used for the same family).
+- `grounding_dino` — MultiScaleDeformableAttention compute matches L1/rtdetrv2_deformable_attention.py, but GroundingDinoBiMultiHeadAttention (text-vision cross-attention with separate Q/K/V/projection for both modalities), GroundingDinoFusionLayer, and GroundingDinoC...
+- `maskformer` — Instance-segmentation model with bespoke FPN pixel decoder, DETR-style decoder, Hungarian matcher, dice/focal losses, and a small mask-head ConvNet — many components have no kb-nano kernel.
+
+### Encoder-decoder seq2seq + non-trivial bias / temporal head (3)
+
+> BART/Pegasus-style models with custom temporal heads (musicgen / pop2piano), or seq2seq with extra bias in the cross-attention path.
+
+- `musicgen` — Per-codebook embedding tables summed at the input + sinusoidal positional embeddings + delay-pattern in autoregressive generation. The attention itself (self + cross) maps to whisper_attention.py, but the codebook input layer and audio_encoder dep...
+- `musicgen_melody` — Same as musicgen — per-codebook embedding sum and conditional generation wiring not in kb-nano. Attention itself composes from whisper_attention.py.
+- `prophetnet` — ProphetNet uses NgramSelfAttention with stream-level n-gram prediction, custom relative-position-bucket bias projected via a learned Linear(hidden -> num_buckets*num_heads), and the self-attention attends to a main stream + n predict streams. No k...
+
+### Per-token / additive attention bias (DeBERTa, LayoutLM, RoFormer) (3)
+
+> kb-nano flash-attn kernels do not support additive attention bias (DeBERTa-v2 bucket relative pos, LayoutLMv3 rel_pos + rel_2d_pos, RoFormer encoder-RoPE). Decomposable from `dense_attention.py` but no L2 wrapper.
+
+- `deberta_v2` — DeBERTa-v2 extends DeBERTa with bucket-style relative position attention + ConvLayer; same compute primitives (linear/matmul/softmax/layer_norm/conv1d/embedding) all available.
+- `layoutlmv3` — LayoutLMv3SelfAttention adds rel_pos + rel_2d_pos to attention scores before softmax (additive bias not supported by kb-nano flash kernels) and uses the CogView numerical-stability softmax variant (not in kb-nano L1/softmax.py). Otherwise the rest...
+- `roformer` — EncoderSelfAttention in kb-nano (L2/encoder_attention.py) does not apply rotary position embeddings inside the bidirectional encoder; would need a small variant that calls L1/rotary_emb.py on Q/K (and optionally V) before SDPA. The L1 RoPE op exis...
+
+### Time-series-specific (FFT autocorrelation, ProbSparse, hierarchical patches) (4)
+
+> TimeSeriesTransformer / PatchTST / PatchTSMixer / Informer / Autoformer use bespoke time-series structures.
+
+- `patchtsmixer` — PatchTSMixerBatchNorm uses nn.BatchNorm1d. kb-nano has L1/batch_norm2d.py but no batch_norm1d.py; would need an additional L1 op (trivial wrapper around F.batch_norm).
+- `patchtst` — PatchTSTBatchNorm uses nn.BatchNorm1d (L1 only has batch_norm2d.py). Needs new L1 op or torch fallback.
+- `timesfm` — TimesFM forecasting decoder uses learnable per-dimension query scaling (softplus(scaling) * 1.4427/sqrt(d_h)) inside attention — a custom op with no PyTorch built-in equivalent; the MLP also embeds its layernorm and a paddings-mask multiplication...
+- `timesfm2_5` — TimesFM 2.5 keeps the per-dim learnable softplus query-scaling from v1 plus adds Q/K RMS-norms and standard NeoX RoPE; the per-dim scaling is the same op-level gap and has no kb-nano equivalent.
+
+### Pre-projection position addition (DETR `with_pos_embed`) (1)
+
+> TableTransformer / DETR add object_queries / spatial_position_embeddings *before* q_proj/k_proj. Decomposable but the sequencing is non-standard for kb-nano L2 wrappers.
+
+- `table_transformer` — TableTransformerAttention adds object_queries to hidden_states and spatial_position_embeddings to key_value_states *before* the q_proj/k_proj projections (DETR's 'with_pos_embed' pattern), then runs bmm-flattened cross-attn — kb-nano has no DETR-s...
+
+### XLNet permutation language modeling (two-stream relative attention) (1)
+
+> XLNetRelativeAttention is Transformer-XL two-stream attention with `g`/`h` streams, segment embeddings, and a custom rel_shift. Bespoke; decomposable but no kb-nano L2 equivalent.
+
+- `xlnet` — XLNetRelativeAttention is two-stream Transformer-XL relative attention with permutation-language-modeling g/h streams, segment embeddings, and a custom rel_shift; bespoke compute with no kb-nano L2 equivalent.
+
+### OCR / table-parsing layouts (2)
+
+> SLANet/SLANeXt use bespoke document-table head; pp_formulanet has custom math-OCR head.
+
+- `slanet` — SLANetAttentionGRUCell (and SLANetSLAHead) use nn.GRUCell — torch handles the recurrence but kb-nano has no GRU kernel (only L1/lstm.py); rest of pipeline (Conv2d, depthwise conv, hardswish, Linear) is composable.
+- `slanext` — SLANeXtAttentionGRUCell uses nn.GRUCell which has no kb-nano kernel (kb-nano only ships L1/lstm.py for RNN family).
+
+### Other unique gaps (11)
+
+Folders whose gap doesn't fit any of the groups above. Each has a
+one-off rationale.
+
+- `ernie4_5_vl_moe` — VL extension of Ernie4_5_Moe: Qwen2-VL/2.5-VL vision tower + Ernie4_5 MoE text decoder + variable-resolution resampler. All compute uses kernels already present (vision_attention, vision_mlp, attention.py, mixtral_moe, llama_mlp).
+- `groupvit` — GroupViT = CLIP-text + GroupViT vision (with token-grouping cross-attention and Gumbel softmax assign). Standard linear + softmax + LN + GELU MLP composition. clip_attention + clip_mlp cover the text side; vision uses standard MHA with extra group...
+- `lightglue` — Keypoint-matching graph network with depth-confidence early stopping, point-pruning, log-double-softmax assignment, and a SuperPoint detector backbone — no kb-nano L4 / L2 covers this domain.
+- `moshi` — MoshiFlexibleLinear (per-codebook 3D weight bank with torch.index_select + batched matmul) is a custom op without kb-nano equivalent; closest is moe_grouped_gemm but the routing is different (codebook index, not top-k). The depth decoder relies on...
+- `mpnet` — Relative position bias added to attention scores: kb-nano flash_attn/dense_attention have no additive-bias parameter, and t5_attention.py is T5-specific (not the same bucket function used by MPNet which has its own compute_position_bias). Addition...
+- `nanochat` — NanoChatRMSNorm = Llama4TextL2Norm = pure F.normalize(p=2) without learned weight; kb-nano L1/l2_norm.py covers F.normalize but is used in RWKV7 context, not as a transformer pre-norm. Custom rotate_half((x2, -x1) order) means the standard kb-nano...
+- `sam3_lite_text` — RepMixer/MobileOneBlock structure relies on nn.BatchNorm2d (kb-nano L1/batch_norm2d.py exists but the depthwise-conv reparameterization wrapper has no fused kb-nano kernel) and nn.functional.interpolate handled in pure torch.
+- `stablelm` — (see shard)
+- `unispeech` — Wav2Vec2PositionalConvEmbedding uses nn.utils.weight_norm-parametrized Conv1d (weight reparameterization not exposed in kb-nano L1/conv1d.py). Wav2Vec2GumbelVectorQuantizer uses nn.functional.gumbel_softmax — no kb-nano kernel. Wav2Vec2Attention i...
+- `unispeech_sat` — Same as unispeech: Wav2Vec2-style weight-norm Conv1d positional embedding, multi-stage Conv1d feature encoder with group-norm, BART-style Wav2Vec2Attention, and Gumbel-softmax vector quantizer are not implemented as kb-nano kernels.
+- `zoedepth` — LogBinomialSoftmax uses torch.lgamma to compute log binomial coefficients (log_binom = lgamma(n+1) - lgamma(k+1) - lgamma(n-k+1)); torch supplies lgamma but kb-nano has no L1 lgamma kernel.
+
+<!-- Total: 171 partial folders documented -->

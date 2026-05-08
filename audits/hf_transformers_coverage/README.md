@@ -36,6 +36,7 @@ The 12 unsupported (canonical):
 | §7 | **The 27 L4 promotions** — per-folder rationale (HF folder ↔ kb-nano L4 file) + 4 calls intentionally NOT promoted (qwen2_5_vl, falcon_mamba, gemma4_assistant, sam2_video) |
 | §8 | **The 12 unsupported folders** — per-folder rationale with HF source line evidence |
 | §9 | **Cross-pattern judgment calls (the ambiguous decisions)** — every recurring partial-vs-composable / composable-vs-unsupported call, with the consistency rule applied |
+| §10 | **Per-folder partial gap rationale (all 171)** — every partial folder grouped by gap pattern (partial-rotary, AutoBackbone, T5 cross-attn, Conformer rel_shift, sliding-window, MoE bespoke routing, etc.) with a one-line specific reason for each folder |
 
 ### Companion docs
 
