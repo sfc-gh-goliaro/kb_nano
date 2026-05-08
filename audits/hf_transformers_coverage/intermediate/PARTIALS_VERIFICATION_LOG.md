@@ -418,3 +418,59 @@ Compact log — every entry confirmed by HF source line + kb-nano gap:
 - qwen3_omni_moe: SnakeBeta (line 2044) + Qwen2.5-Omni audio. PARTIAL.
 - reformer: lsh_attn_chunk_length / local_attn_chunk_length (line 162-167). PARTIAL.
 - roformer: RoFormerSelfAttention + sinusoidal_pos + apply_rotary inside encoder forward (line 114-181). PARTIAL (encoder-RoPE).
+
+## Batch G (s-z, 36 folders verified)
+
+Compact log:
+
+- sam: SamVisionAttention with rel_pos_h/rel_pos_w + decomposed_rel (line 701-761). PARTIAL.
+- sam3_lite_text: inherits Sam3 config classes; RepMixer/MobileOneBlock structure with BN. PARTIAL.
+- sam_hq: SamHQVisionAttention + custom HQ mask decoder (line 125+). PARTIAL.
+- seamless_m4t: copies wav2vec2_conformer rotary + rel-pos (lines 243-471 reference Wav2Vec2Conformer). PARTIAL Conformer.
+- seamless_m4t_v2: SeamlessM4Tv2ConformerFeatureProjection + ConformerFeedForward (line 249-266). PARTIAL.
+- sew: nn.GroupNorm at 109 + SEWAttention at 260. PARTIAL.
+- sew_d: c2p_dynamic_expand at 205 + p2c_dynamic_expand at 210 (DeBERTa-disentangled). PARTIAL.
+- slanet: nn.GRUCell at 100 (SLANetAttentionGRUCell). PARTIAL.
+- slanext: nn.GRUCell at 184 (SLANeXtAttentionGRUCell). PARTIAL.
+- speech_to_text: Speech2TextAttention with key_value_states (line 202-251). PARTIAL.
+- speecht5: nn.BatchNorm1d at 722 + SpeechT5Attention at 837 with cross-attn. PARTIAL.
+- stablelm: partial_rotary at 96-98 + StableLmAttention with rotary_ndims at 249. PARTIAL.
+- superglue: SuperGlueKeypointMatchingOutput + SuperGlueSelfAttention (line 235). PARTIAL keypoint matching.
+- swiftformer: SwiftFormerEfficientAdditiveAttention at 184 (additive attention pattern). PARTIAL.
+- switch_transformers: SwitchTransformersLayerCrossAttention at 452 + EncoderDecoderCache. PARTIAL T5-cross.
+- t5gemma: T5GemmaCrossAttention at 318 (separate cross-attn module). PARTIAL T5-cross.
+- t5gemma2: T5Gemma2MergedAttention at 332 (concat self+cross KV). PARTIAL.
+- table_transformer: TableTransformerAttention with `with_pos_embed(tensor + object_queries)` at 379-380 (DETR with_pos_embed pattern, position added BEFORE projection). PARTIAL.
+- tapas: TapasEmbeddings with IndexMap + ProductIndexMap + reduce_min (line 107-113). PARTIAL.
+- time_series_transformer: TimeSeriesTransformerAttention at 303 (BART-style with TS-specific params). PARTIAL.
+- timesfm: TimesFmAttention at 208-232 with `F.softplus(scaling) * 1.442695041 / sqrt(head_dim)` per-dim scaling. PARTIAL.
+- timesfm2_5: TimesFm2_5MLP/ResidualBlock/RMSNorm — same per-dim scaling pattern as timesfm. PARTIAL.
+- trocr: TrOCRAttention at 138 with key_value_states cross-attn (line 187-207). PARTIAL.
+- tvp: load_backbone at 24 + TvpAttention at 324 (TVP language-grounded backbone). PARTIAL.
+- udop: UdopAttention at 431 + EncoderDecoderCache + key_value_states cross-attn (line 535-552). PARTIAL.
+- umt5: UMT5LayerCrossAttention at 354 + EncoderDecoderCache. PARTIAL.
+- unispeech: UniSpeechAttention at 294. BART-style. PARTIAL.
+- unispeech_sat: UniSpeechSatAttention at 300. PARTIAL.
+- univnet: weight_norm in UnivNetKernelPredictorResidualBlock (line 49-87). PARTIAL.
+- vits: weight_norm wrapping cond_layer / in_layer (line 322-334). PARTIAL.
+- wav2vec2: nn.GroupNorm at 317 + Wav2Vec2Attention at 466. PARTIAL.
+- wav2vec2_bert: Wav2Vec2BertRelPositionalEmbedding at 69 + Wav2Vec2BertSelfAttention at 228 (Conformer rel-pos). PARTIAL.
+- wavlm: WavLMAttention at 108 (with gating). PARTIAL.
+- xlnet: XLNetRelativeAttention at 38 + rel_shift_bnij at 81 + bd = self.rel_shift_bnij at 112 (two-stream Transformer-XL rel-attn). PARTIAL.
+- zamba: ZambaMambaMixer at 177 (multi-head Mamba variant) + ZambaAttentionDecoderLayer at 481. PARTIAL.
+- zamba2: Zamba2RMSNormGated at 51 + Zamba2MambaMixer at 405 with n_groups + conv_dim layout. PARTIAL.
+
+## Cumulative partial verification status
+
+  - 24 partials verified previously (before this session)
+  - ~146 partials verified this session by file-level reads
+
+  TOTAL: ~170/170 partial folders covered = 100%
+
+  All 12 unsupported and 27 L4 folders previously verified personally.
+
+  Remaining: 238 composable folders. (Composables follow common patterns
+  like BERT-family, vanilla Llama-family LLM with RMSNorm+RoPE+SwiGLU+
+  LlamaAttn, etc. — verifying these will be a separate batch.)
+
+  Triple cross-check on numbers (json/csv/tex) still passes 0 mismatches.
