@@ -1,0 +1,66 @@
+{
+  "starting_counts": {
+    "kb_nano_l4": 27,
+    "composable": 238,
+    "partial": 170,
+    "unsupported": 12
+  },
+  "high_confidence_composable_to_partial": [
+    "beit",
+    "clap",
+    "data2vec_vision",
+    "clvp",
+    "convbert",
+    "deberta",
+    "depth_anything",
+    "depth_pro",
+    "dpt",
+    "upernet",
+    "encodec",
+    "sew",
+    "jais2",
+    "vitdet",
+    "voxtral_realtime",
+    "colmodernvbert",
+    "gemma4_assistant",
+    "lighton_ocr",
+    "xcodec",
+    "vibevoice_acoustic_tokenizer",
+    "vibevoice_asr",
+    "vaultgemma",
+    "starcoder2",
+    "swin2sr",
+    "ministral3",
+    "mistral4",
+    "pp_doclayout_v2"
+  ],
+  "high_confidence_composable_to_unsupported": [
+    "edgetam",
+    "donut->higgs_audio_v2_tokenizer replacement"
+  ],
+  "high_confidence_partial_to_composable": [
+    "solar_open"
+  ],
+  "ambiguous_not_counted": [
+    "bamba",
+    "siglip2 L4 scope",
+    "sam3 L4 scope",
+    "sam3_tracker L4 scope",
+    "sam3_video L4 scope",
+    "BART-family exact L2 parity",
+    "superpoint",
+    "pp_doclayout_v3"
+  ],
+  "suggested_counts_higgs_tokenizer_unsupported": {
+    "kb_nano_l4": 27,
+    "composable": 210,
+    "partial": 196,
+    "unsupported": 14
+  },
+  "suggested_counts_higgs_tokenizer_partial": {
+    "kb_nano_l4": 27,
+    "composable": 210,
+    "partial": 197,
+    "unsupported": 13
+  }
+}

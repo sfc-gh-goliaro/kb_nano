@@ -1,0 +1,2240 @@
+{
+  "count": 447,
+  "rows": [
+    {
+      "row": "afmoe",
+      "folder": "afmoe",
+      "modeling_file": "afmoe/modeling_afmoe.py"
+    },
+    {
+      "row": "aimv2",
+      "folder": "aimv2",
+      "modeling_file": "aimv2/modeling_aimv2.py"
+    },
+    {
+      "row": "albert",
+      "folder": "albert",
+      "modeling_file": "albert/modeling_albert.py"
+    },
+    {
+      "row": "align",
+      "folder": "align",
+      "modeling_file": "align/modeling_align.py"
+    },
+    {
+      "row": "altclip",
+      "folder": "altclip",
+      "modeling_file": "altclip/modeling_altclip.py"
+    },
+    {
+      "row": "apertus",
+      "folder": "apertus",
+      "modeling_file": "apertus/modeling_apertus.py"
+    },
+    {
+      "row": "arcee",
+      "folder": "arcee",
+      "modeling_file": "arcee/modeling_arcee.py"
+    },
+    {
+      "row": "aria",
+      "folder": "aria",
+      "modeling_file": "aria/modeling_aria.py"
+    },
+    {
+      "row": "audio_spectrogram_transformer",
+      "folder": "audio_spectrogram_transformer",
+      "modeling_file": "audio_spectrogram_transformer/modeling_audio_spectrogram_transformer.py"
+    },
+    {
+      "row": "audioflamingo3",
+      "folder": "audioflamingo3",
+      "modeling_file": "audioflamingo3/modeling_audioflamingo3.py"
+    },
+    {
+      "row": "autoformer",
+      "folder": "autoformer",
+      "modeling_file": "autoformer/modeling_autoformer.py"
+    },
+    {
+      "row": "aya_vision",
+      "folder": "aya_vision",
+      "modeling_file": "aya_vision/modeling_aya_vision.py"
+    },
+    {
+      "row": "bamba",
+      "folder": "bamba",
+      "modeling_file": "bamba/modeling_bamba.py"
+    },
+    {
+      "row": "bark",
+      "folder": "bark",
+      "modeling_file": "bark/modeling_bark.py"
+    },
+    {
+      "row": "bart",
+      "folder": "bart",
+      "modeling_file": "bart/modeling_bart.py"
+    },
+    {
+      "row": "beit",
+      "folder": "beit",
+      "modeling_file": "beit/modeling_beit.py"
+    },
+    {
+      "row": "bert",
+      "folder": "bert",
+      "modeling_file": "bert/modeling_bert.py"
+    },
+    {
+      "row": "bert_generation",
+      "folder": "bert_generation",
+      "modeling_file": "bert_generation/modeling_bert_generation.py"
+    },
+    {
+      "row": "big_bird",
+      "folder": "big_bird",
+      "modeling_file": "big_bird/modeling_big_bird.py"
+    },
+    {
+      "row": "bigbird_pegasus",
+      "folder": "bigbird_pegasus",
+      "modeling_file": "bigbird_pegasus/modeling_bigbird_pegasus.py"
+    },
+    {
+      "row": "biogpt",
+      "folder": "biogpt",
+      "modeling_file": "biogpt/modeling_biogpt.py"
+    },
+    {
+      "row": "bit",
+      "folder": "bit",
+      "modeling_file": "bit/modeling_bit.py"
+    },
+    {
+      "row": "bitnet",
+      "folder": "bitnet",
+      "modeling_file": "bitnet/modeling_bitnet.py"
+    },
+    {
+      "row": "blenderbot",
+      "folder": "blenderbot",
+      "modeling_file": "blenderbot/modeling_blenderbot.py"
+    },
+    {
+      "row": "blenderbot_small",
+      "folder": "blenderbot_small",
+      "modeling_file": "blenderbot_small/modeling_blenderbot_small.py"
+    },
+    {
+      "row": "blip/blip",
+      "folder": "blip",
+      "modeling_file": "blip/modeling_blip.py"
+    },
+    {
+      "row": "blip/blip_text",
+      "folder": "blip",
+      "modeling_file": "blip/modeling_blip_text.py"
+    },
+    {
+      "row": "blip_2",
+      "folder": "blip_2",
+      "modeling_file": "blip_2/modeling_blip_2.py"
+    },
+    {
+      "row": "bloom",
+      "folder": "bloom",
+      "modeling_file": "bloom/modeling_bloom.py"
+    },
+    {
+      "row": "blt",
+      "folder": "blt",
+      "modeling_file": "blt/modeling_blt.py"
+    },
+    {
+      "row": "bridgetower",
+      "folder": "bridgetower",
+      "modeling_file": "bridgetower/modeling_bridgetower.py"
+    },
+    {
+      "row": "bros",
+      "folder": "bros",
+      "modeling_file": "bros/modeling_bros.py"
+    },
+    {
+      "row": "camembert",
+      "folder": "camembert",
+      "modeling_file": "camembert/modeling_camembert.py"
+    },
+    {
+      "row": "canine",
+      "folder": "canine",
+      "modeling_file": "canine/modeling_canine.py"
+    },
+    {
+      "row": "chameleon",
+      "folder": "chameleon",
+      "modeling_file": "chameleon/modeling_chameleon.py"
+    },
+    {
+      "row": "chinese_clip",
+      "folder": "chinese_clip",
+      "modeling_file": "chinese_clip/modeling_chinese_clip.py"
+    },
+    {
+      "row": "chmv2",
+      "folder": "chmv2",
+      "modeling_file": "chmv2/modeling_chmv2.py"
+    },
+    {
+      "row": "clap",
+      "folder": "clap",
+      "modeling_file": "clap/modeling_clap.py"
+    },
+    {
+      "row": "clip",
+      "folder": "clip",
+      "modeling_file": "clip/modeling_clip.py"
+    },
+    {
+      "row": "clipseg",
+      "folder": "clipseg",
+      "modeling_file": "clipseg/modeling_clipseg.py"
+    },
+    {
+      "row": "clvp",
+      "folder": "clvp",
+      "modeling_file": "clvp/modeling_clvp.py"
+    },
+    {
+      "row": "codegen",
+      "folder": "codegen",
+      "modeling_file": "codegen/modeling_codegen.py"
+    },
+    {
+      "row": "cohere",
+      "folder": "cohere",
+      "modeling_file": "cohere/modeling_cohere.py"
+    },
+    {
+      "row": "cohere2",
+      "folder": "cohere2",
+      "modeling_file": "cohere2/modeling_cohere2.py"
+    },
+    {
+      "row": "cohere2_vision",
+      "folder": "cohere2_vision",
+      "modeling_file": "cohere2_vision/modeling_cohere2_vision.py"
+    },
+    {
+      "row": "cohere_asr",
+      "folder": "cohere_asr",
+      "modeling_file": "cohere_asr/modeling_cohere_asr.py"
+    },
+    {
+      "row": "colmodernvbert",
+      "folder": "colmodernvbert",
+      "modeling_file": "colmodernvbert/modeling_colmodernvbert.py"
+    },
+    {
+      "row": "colpali",
+      "folder": "colpali",
+      "modeling_file": "colpali/modeling_colpali.py"
+    },
+    {
+      "row": "colqwen2",
+      "folder": "colqwen2",
+      "modeling_file": "colqwen2/modeling_colqwen2.py"
+    },
+    {
+      "row": "conditional_detr",
+      "folder": "conditional_detr",
+      "modeling_file": "conditional_detr/modeling_conditional_detr.py"
+    },
+    {
+      "row": "convbert",
+      "folder": "convbert",
+      "modeling_file": "convbert/modeling_convbert.py"
+    },
+    {
+      "row": "convnext",
+      "folder": "convnext",
+      "modeling_file": "convnext/modeling_convnext.py"
+    },
+    {
+      "row": "convnextv2",
+      "folder": "convnextv2",
+      "modeling_file": "convnextv2/modeling_convnextv2.py"
+    },
+    {
+      "row": "cpmant",
+      "folder": "cpmant",
+      "modeling_file": "cpmant/modeling_cpmant.py"
+    },
+    {
+      "row": "csm",
+      "folder": "csm",
+      "modeling_file": "csm/modeling_csm.py"
+    },
+    {
+      "row": "ctrl",
+      "folder": "ctrl",
+      "modeling_file": "ctrl/modeling_ctrl.py"
+    },
+    {
+      "row": "cvt",
+      "folder": "cvt",
+      "modeling_file": "cvt/modeling_cvt.py"
+    },
+    {
+      "row": "cwm",
+      "folder": "cwm",
+      "modeling_file": "cwm/modeling_cwm.py"
+    },
+    {
+      "row": "d_fine",
+      "folder": "d_fine",
+      "modeling_file": "d_fine/modeling_d_fine.py"
+    },
+    {
+      "row": "dab_detr",
+      "folder": "dab_detr",
+      "modeling_file": "dab_detr/modeling_dab_detr.py"
+    },
+    {
+      "row": "dac",
+      "folder": "dac",
+      "modeling_file": "dac/modeling_dac.py"
+    },
+    {
+      "row": "data2vec_audio",
+      "folder": "data2vec",
+      "modeling_file": "data2vec/modeling_data2vec_audio.py"
+    },
+    {
+      "row": "data2vec_text",
+      "folder": "data2vec",
+      "modeling_file": "data2vec/modeling_data2vec_text.py"
+    },
+    {
+      "row": "data2vec_vision",
+      "folder": "data2vec",
+      "modeling_file": "data2vec/modeling_data2vec_vision.py"
+    },
+    {
+      "row": "dbrx",
+      "folder": "dbrx",
+      "modeling_file": "dbrx/modeling_dbrx.py"
+    },
+    {
+      "row": "deberta",
+      "folder": "deberta",
+      "modeling_file": "deberta/modeling_deberta.py"
+    },
+    {
+      "row": "deberta_v2",
+      "folder": "deberta_v2",
+      "modeling_file": "deberta_v2/modeling_deberta_v2.py"
+    },
+    {
+      "row": "decision_transformer",
+      "folder": "decision_transformer",
+      "modeling_file": "decision_transformer/modeling_decision_transformer.py"
+    },
+    {
+      "row": "deepseek_v2",
+      "folder": "deepseek_v2",
+      "modeling_file": "deepseek_v2/modeling_deepseek_v2.py"
+    },
+    {
+      "row": "deepseek_v3",
+      "folder": "deepseek_v3",
+      "modeling_file": "deepseek_v3/modeling_deepseek_v3.py"
+    },
+    {
+      "row": "deepseek_v4",
+      "folder": "deepseek_v4",
+      "modeling_file": "deepseek_v4/modeling_deepseek_v4.py"
+    },
+    {
+      "row": "deepseek_vl",
+      "folder": "deepseek_vl",
+      "modeling_file": "deepseek_vl/modeling_deepseek_vl.py"
+    },
+    {
+      "row": "deepseek_vl_hybrid",
+      "folder": "deepseek_vl_hybrid",
+      "modeling_file": "deepseek_vl_hybrid/modeling_deepseek_vl_hybrid.py"
+    },
+    {
+      "row": "deformable_detr",
+      "folder": "deformable_detr",
+      "modeling_file": "deformable_detr/modeling_deformable_detr.py"
+    },
+    {
+      "row": "deimv2",
+      "folder": "deimv2",
+      "modeling_file": "deimv2/modeling_deimv2.py"
+    },
+    {
+      "row": "deit",
+      "folder": "deit",
+      "modeling_file": "deit/modeling_deit.py"
+    },
+    {
+      "row": "depth_anything",
+      "folder": "depth_anything",
+      "modeling_file": "depth_anything/modeling_depth_anything.py"
+    },
+    {
+      "row": "depth_pro",
+      "folder": "depth_pro",
+      "modeling_file": "depth_pro/modeling_depth_pro.py"
+    },
+    {
+      "row": "detr",
+      "folder": "detr",
+      "modeling_file": "detr/modeling_detr.py"
+    },
+    {
+      "row": "dia",
+      "folder": "dia",
+      "modeling_file": "dia/modeling_dia.py"
+    },
+    {
+      "row": "diffllama",
+      "folder": "diffllama",
+      "modeling_file": "diffllama/modeling_diffllama.py"
+    },
+    {
+      "row": "dinat",
+      "folder": "dinat",
+      "modeling_file": "dinat/modeling_dinat.py"
+    },
+    {
+      "row": "dinov2",
+      "folder": "dinov2",
+      "modeling_file": "dinov2/modeling_dinov2.py"
+    },
+    {
+      "row": "dinov2_with_registers",
+      "folder": "dinov2_with_registers",
+      "modeling_file": "dinov2_with_registers/modeling_dinov2_with_registers.py"
+    },
+    {
+      "row": "dinov3_convnext",
+      "folder": "dinov3_convnext",
+      "modeling_file": "dinov3_convnext/modeling_dinov3_convnext.py"
+    },
+    {
+      "row": "dinov3_vit",
+      "folder": "dinov3_vit",
+      "modeling_file": "dinov3_vit/modeling_dinov3_vit.py"
+    },
+    {
+      "row": "distilbert",
+      "folder": "distilbert",
+      "modeling_file": "distilbert/modeling_distilbert.py"
+    },
+    {
+      "row": "doge",
+      "folder": "doge",
+      "modeling_file": "doge/modeling_doge.py"
+    },
+    {
+      "row": "donut_swin",
+      "folder": "donut",
+      "modeling_file": "donut/modeling_donut_swin.py"
+    },
+    {
+      "row": "dots1",
+      "folder": "dots1",
+      "modeling_file": "dots1/modeling_dots1.py"
+    },
+    {
+      "row": "dpr",
+      "folder": "dpr",
+      "modeling_file": "dpr/modeling_dpr.py"
+    },
+    {
+      "row": "dpt",
+      "folder": "dpt",
+      "modeling_file": "dpt/modeling_dpt.py"
+    },
+    {
+      "row": "edgetam",
+      "folder": "edgetam",
+      "modeling_file": "edgetam/modeling_edgetam.py"
+    },
+    {
+      "row": "edgetam_video",
+      "folder": "edgetam_video",
+      "modeling_file": "edgetam_video/modeling_edgetam_video.py"
+    },
+    {
+      "row": "efficientloftr",
+      "folder": "efficientloftr",
+      "modeling_file": "efficientloftr/modeling_efficientloftr.py"
+    },
+    {
+      "row": "efficientnet",
+      "folder": "efficientnet",
+      "modeling_file": "efficientnet/modeling_efficientnet.py"
+    },
+    {
+      "row": "electra",
+      "folder": "electra",
+      "modeling_file": "electra/modeling_electra.py"
+    },
+    {
+      "row": "emu3",
+      "folder": "emu3",
+      "modeling_file": "emu3/modeling_emu3.py"
+    },
+    {
+      "row": "encodec",
+      "folder": "encodec",
+      "modeling_file": "encodec/modeling_encodec.py"
+    },
+    {
+      "row": "encoder_decoder",
+      "folder": "encoder_decoder",
+      "modeling_file": "encoder_decoder/modeling_encoder_decoder.py"
+    },
+    {
+      "row": "eomt",
+      "folder": "eomt",
+      "modeling_file": "eomt/modeling_eomt.py"
+    },
+    {
+      "row": "eomt_dinov3",
+      "folder": "eomt_dinov3",
+      "modeling_file": "eomt_dinov3/modeling_eomt_dinov3.py"
+    },
+    {
+      "row": "ernie",
+      "folder": "ernie",
+      "modeling_file": "ernie/modeling_ernie.py"
+    },
+    {
+      "row": "ernie4_5",
+      "folder": "ernie4_5",
+      "modeling_file": "ernie4_5/modeling_ernie4_5.py"
+    },
+    {
+      "row": "ernie4_5_moe",
+      "folder": "ernie4_5_moe",
+      "modeling_file": "ernie4_5_moe/modeling_ernie4_5_moe.py"
+    },
+    {
+      "row": "ernie4_5_vl_moe",
+      "folder": "ernie4_5_vl_moe",
+      "modeling_file": "ernie4_5_vl_moe/modeling_ernie4_5_vl_moe.py"
+    },
+    {
+      "row": "esm",
+      "folder": "esm",
+      "modeling_file": "esm/modeling_esm.py"
+    },
+    {
+      "row": "esmfold",
+      "folder": "esm",
+      "modeling_file": "esm/modeling_esmfold.py"
+    },
+    {
+      "row": "eurobert",
+      "folder": "eurobert",
+      "modeling_file": "eurobert/modeling_eurobert.py"
+    },
+    {
+      "row": "evolla",
+      "folder": "evolla",
+      "modeling_file": "evolla/modeling_evolla.py"
+    },
+    {
+      "row": "exaone4",
+      "folder": "exaone4",
+      "modeling_file": "exaone4/modeling_exaone4.py"
+    },
+    {
+      "row": "exaone4_5",
+      "folder": "exaone4_5",
+      "modeling_file": "exaone4_5/modeling_exaone4_5.py"
+    },
+    {
+      "row": "exaone_moe",
+      "folder": "exaone_moe",
+      "modeling_file": "exaone_moe/modeling_exaone_moe.py"
+    },
+    {
+      "row": "falcon",
+      "folder": "falcon",
+      "modeling_file": "falcon/modeling_falcon.py"
+    },
+    {
+      "row": "falcon_h1",
+      "folder": "falcon_h1",
+      "modeling_file": "falcon_h1/modeling_falcon_h1.py"
+    },
+    {
+      "row": "falcon_mamba",
+      "folder": "falcon_mamba",
+      "modeling_file": "falcon_mamba/modeling_falcon_mamba.py"
+    },
+    {
+      "row": "fast_vlm",
+      "folder": "fast_vlm",
+      "modeling_file": "fast_vlm/modeling_fast_vlm.py"
+    },
+    {
+      "row": "fastspeech2_conformer",
+      "folder": "fastspeech2_conformer",
+      "modeling_file": "fastspeech2_conformer/modeling_fastspeech2_conformer.py"
+    },
+    {
+      "row": "flaubert",
+      "folder": "flaubert",
+      "modeling_file": "flaubert/modeling_flaubert.py"
+    },
+    {
+      "row": "flava",
+      "folder": "flava",
+      "modeling_file": "flava/modeling_flava.py"
+    },
+    {
+      "row": "flex_olmo",
+      "folder": "flex_olmo",
+      "modeling_file": "flex_olmo/modeling_flex_olmo.py"
+    },
+    {
+      "row": "florence2",
+      "folder": "florence2",
+      "modeling_file": "florence2/modeling_florence2.py"
+    },
+    {
+      "row": "fnet",
+      "folder": "fnet",
+      "modeling_file": "fnet/modeling_fnet.py"
+    },
+    {
+      "row": "focalnet",
+      "folder": "focalnet",
+      "modeling_file": "focalnet/modeling_focalnet.py"
+    },
+    {
+      "row": "fsmt",
+      "folder": "fsmt",
+      "modeling_file": "fsmt/modeling_fsmt.py"
+    },
+    {
+      "row": "funnel",
+      "folder": "funnel",
+      "modeling_file": "funnel/modeling_funnel.py"
+    },
+    {
+      "row": "fuyu",
+      "folder": "fuyu",
+      "modeling_file": "fuyu/modeling_fuyu.py"
+    },
+    {
+      "row": "gemma",
+      "folder": "gemma",
+      "modeling_file": "gemma/modeling_gemma.py"
+    },
+    {
+      "row": "gemma2",
+      "folder": "gemma2",
+      "modeling_file": "gemma2/modeling_gemma2.py"
+    },
+    {
+      "row": "gemma3",
+      "folder": "gemma3",
+      "modeling_file": "gemma3/modeling_gemma3.py"
+    },
+    {
+      "row": "gemma3n",
+      "folder": "gemma3n",
+      "modeling_file": "gemma3n/modeling_gemma3n.py"
+    },
+    {
+      "row": "gemma4",
+      "folder": "gemma4",
+      "modeling_file": "gemma4/modeling_gemma4.py"
+    },
+    {
+      "row": "gemma4_assistant",
+      "folder": "gemma4_assistant",
+      "modeling_file": "gemma4_assistant/modeling_gemma4_assistant.py"
+    },
+    {
+      "row": "git",
+      "folder": "git",
+      "modeling_file": "git/modeling_git.py"
+    },
+    {
+      "row": "glm",
+      "folder": "glm",
+      "modeling_file": "glm/modeling_glm.py"
+    },
+    {
+      "row": "glm4",
+      "folder": "glm4",
+      "modeling_file": "glm4/modeling_glm4.py"
+    },
+    {
+      "row": "glm46v",
+      "folder": "glm46v",
+      "modeling_file": "glm46v/modeling_glm46v.py"
+    },
+    {
+      "row": "glm4_moe",
+      "folder": "glm4_moe",
+      "modeling_file": "glm4_moe/modeling_glm4_moe.py"
+    },
+    {
+      "row": "glm4_moe_lite",
+      "folder": "glm4_moe_lite",
+      "modeling_file": "glm4_moe_lite/modeling_glm4_moe_lite.py"
+    },
+    {
+      "row": "glm4v",
+      "folder": "glm4v",
+      "modeling_file": "glm4v/modeling_glm4v.py"
+    },
+    {
+      "row": "glm4v_moe",
+      "folder": "glm4v_moe",
+      "modeling_file": "glm4v_moe/modeling_glm4v_moe.py"
+    },
+    {
+      "row": "glm_image",
+      "folder": "glm_image",
+      "modeling_file": "glm_image/modeling_glm_image.py"
+    },
+    {
+      "row": "glm_moe_dsa",
+      "folder": "glm_moe_dsa",
+      "modeling_file": "glm_moe_dsa/modeling_glm_moe_dsa.py"
+    },
+    {
+      "row": "glm_ocr",
+      "folder": "glm_ocr",
+      "modeling_file": "glm_ocr/modeling_glm_ocr.py"
+    },
+    {
+      "row": "glmasr",
+      "folder": "glmasr",
+      "modeling_file": "glmasr/modeling_glmasr.py"
+    },
+    {
+      "row": "glpn",
+      "folder": "glpn",
+      "modeling_file": "glpn/modeling_glpn.py"
+    },
+    {
+      "row": "got_ocr2",
+      "folder": "got_ocr2",
+      "modeling_file": "got_ocr2/modeling_got_ocr2.py"
+    },
+    {
+      "row": "gpt2",
+      "folder": "gpt2",
+      "modeling_file": "gpt2/modeling_gpt2.py"
+    },
+    {
+      "row": "gpt_bigcode",
+      "folder": "gpt_bigcode",
+      "modeling_file": "gpt_bigcode/modeling_gpt_bigcode.py"
+    },
+    {
+      "row": "gpt_neo",
+      "folder": "gpt_neo",
+      "modeling_file": "gpt_neo/modeling_gpt_neo.py"
+    },
+    {
+      "row": "gpt_neox",
+      "folder": "gpt_neox",
+      "modeling_file": "gpt_neox/modeling_gpt_neox.py"
+    },
+    {
+      "row": "gpt_neox_japanese",
+      "folder": "gpt_neox_japanese",
+      "modeling_file": "gpt_neox_japanese/modeling_gpt_neox_japanese.py"
+    },
+    {
+      "row": "gpt_oss",
+      "folder": "gpt_oss",
+      "modeling_file": "gpt_oss/modeling_gpt_oss.py"
+    },
+    {
+      "row": "gptj",
+      "folder": "gptj",
+      "modeling_file": "gptj/modeling_gptj.py"
+    },
+    {
+      "row": "granite",
+      "folder": "granite",
+      "modeling_file": "granite/modeling_granite.py"
+    },
+    {
+      "row": "granite4_vision",
+      "folder": "granite4_vision",
+      "modeling_file": "granite4_vision/modeling_granite4_vision.py"
+    },
+    {
+      "row": "granite_speech",
+      "folder": "granite_speech",
+      "modeling_file": "granite_speech/modeling_granite_speech.py"
+    },
+    {
+      "row": "granite_speech_plus",
+      "folder": "granite_speech_plus",
+      "modeling_file": "granite_speech_plus/modeling_granite_speech_plus.py"
+    },
+    {
+      "row": "granitemoe",
+      "folder": "granitemoe",
+      "modeling_file": "granitemoe/modeling_granitemoe.py"
+    },
+    {
+      "row": "granitemoehybrid",
+      "folder": "granitemoehybrid",
+      "modeling_file": "granitemoehybrid/modeling_granitemoehybrid.py"
+    },
+    {
+      "row": "granitemoeshared",
+      "folder": "granitemoeshared",
+      "modeling_file": "granitemoeshared/modeling_granitemoeshared.py"
+    },
+    {
+      "row": "grounding_dino",
+      "folder": "grounding_dino",
+      "modeling_file": "grounding_dino/modeling_grounding_dino.py"
+    },
+    {
+      "row": "groupvit",
+      "folder": "groupvit",
+      "modeling_file": "groupvit/modeling_groupvit.py"
+    },
+    {
+      "row": "helium",
+      "folder": "helium",
+      "modeling_file": "helium/modeling_helium.py"
+    },
+    {
+      "row": "hgnet_v2",
+      "folder": "hgnet_v2",
+      "modeling_file": "hgnet_v2/modeling_hgnet_v2.py"
+    },
+    {
+      "row": "hiera",
+      "folder": "hiera",
+      "modeling_file": "hiera/modeling_hiera.py"
+    },
+    {
+      "row": "higgs_audio_v2",
+      "folder": "higgs_audio_v2",
+      "modeling_file": "higgs_audio_v2/modeling_higgs_audio_v2.py"
+    },
+    {
+      "row": "higgs_audio_v2_tokenizer",
+      "folder": "higgs_audio_v2_tokenizer",
+      "modeling_file": "higgs_audio_v2_tokenizer/modeling_higgs_audio_v2_tokenizer.py"
+    },
+    {
+      "row": "hubert",
+      "folder": "hubert",
+      "modeling_file": "hubert/modeling_hubert.py"
+    },
+    {
+      "row": "hunyuan_v1_dense",
+      "folder": "hunyuan_v1_dense",
+      "modeling_file": "hunyuan_v1_dense/modeling_hunyuan_v1_dense.py"
+    },
+    {
+      "row": "hunyuan_v1_moe",
+      "folder": "hunyuan_v1_moe",
+      "modeling_file": "hunyuan_v1_moe/modeling_hunyuan_v1_moe.py"
+    },
+    {
+      "row": "hy_v3",
+      "folder": "hy_v3",
+      "modeling_file": "hy_v3/modeling_hy_v3.py"
+    },
+    {
+      "row": "ibert",
+      "folder": "ibert",
+      "modeling_file": "ibert/modeling_ibert.py"
+    },
+    {
+      "row": "idefics",
+      "folder": "idefics",
+      "modeling_file": "idefics/modeling_idefics.py"
+    },
+    {
+      "row": "idefics2",
+      "folder": "idefics2",
+      "modeling_file": "idefics2/modeling_idefics2.py"
+    },
+    {
+      "row": "idefics3",
+      "folder": "idefics3",
+      "modeling_file": "idefics3/modeling_idefics3.py"
+    },
+    {
+      "row": "ijepa",
+      "folder": "ijepa",
+      "modeling_file": "ijepa/modeling_ijepa.py"
+    },
+    {
+      "row": "imagegpt",
+      "folder": "imagegpt",
+      "modeling_file": "imagegpt/modeling_imagegpt.py"
+    },
+    {
+      "row": "informer",
+      "folder": "informer",
+      "modeling_file": "informer/modeling_informer.py"
+    },
+    {
+      "row": "instructblip",
+      "folder": "instructblip",
+      "modeling_file": "instructblip/modeling_instructblip.py"
+    },
+    {
+      "row": "instructblipvideo",
+      "folder": "instructblipvideo",
+      "modeling_file": "instructblipvideo/modeling_instructblipvideo.py"
+    },
+    {
+      "row": "internvl",
+      "folder": "internvl",
+      "modeling_file": "internvl/modeling_internvl.py"
+    },
+    {
+      "row": "jais2",
+      "folder": "jais2",
+      "modeling_file": "jais2/modeling_jais2.py"
+    },
+    {
+      "row": "jamba",
+      "folder": "jamba",
+      "modeling_file": "jamba/modeling_jamba.py"
+    },
+    {
+      "row": "janus",
+      "folder": "janus",
+      "modeling_file": "janus/modeling_janus.py"
+    },
+    {
+      "row": "jetmoe",
+      "folder": "jetmoe",
+      "modeling_file": "jetmoe/modeling_jetmoe.py"
+    },
+    {
+      "row": "jina_embeddings_v3",
+      "folder": "jina_embeddings_v3",
+      "modeling_file": "jina_embeddings_v3/modeling_jina_embeddings_v3.py"
+    },
+    {
+      "row": "kosmos2",
+      "folder": "kosmos2",
+      "modeling_file": "kosmos2/modeling_kosmos2.py"
+    },
+    {
+      "row": "kosmos2_5",
+      "folder": "kosmos2_5",
+      "modeling_file": "kosmos2_5/modeling_kosmos2_5.py"
+    },
+    {
+      "row": "kyutai_speech_to_text",
+      "folder": "kyutai_speech_to_text",
+      "modeling_file": "kyutai_speech_to_text/modeling_kyutai_speech_to_text.py"
+    },
+    {
+      "row": "laguna",
+      "folder": "laguna",
+      "modeling_file": "laguna/modeling_laguna.py"
+    },
+    {
+      "row": "lasr",
+      "folder": "lasr",
+      "modeling_file": "lasr/modeling_lasr.py"
+    },
+    {
+      "row": "layoutlm",
+      "folder": "layoutlm",
+      "modeling_file": "layoutlm/modeling_layoutlm.py"
+    },
+    {
+      "row": "layoutlmv2",
+      "folder": "layoutlmv2",
+      "modeling_file": "layoutlmv2/modeling_layoutlmv2.py"
+    },
+    {
+      "row": "layoutlmv3",
+      "folder": "layoutlmv3",
+      "modeling_file": "layoutlmv3/modeling_layoutlmv3.py"
+    },
+    {
+      "row": "led",
+      "folder": "led",
+      "modeling_file": "led/modeling_led.py"
+    },
+    {
+      "row": "levit",
+      "folder": "levit",
+      "modeling_file": "levit/modeling_levit.py"
+    },
+    {
+      "row": "lfm2",
+      "folder": "lfm2",
+      "modeling_file": "lfm2/modeling_lfm2.py"
+    },
+    {
+      "row": "lfm2_moe",
+      "folder": "lfm2_moe",
+      "modeling_file": "lfm2_moe/modeling_lfm2_moe.py"
+    },
+    {
+      "row": "lfm2_vl",
+      "folder": "lfm2_vl",
+      "modeling_file": "lfm2_vl/modeling_lfm2_vl.py"
+    },
+    {
+      "row": "lightglue",
+      "folder": "lightglue",
+      "modeling_file": "lightglue/modeling_lightglue.py"
+    },
+    {
+      "row": "lighton_ocr",
+      "folder": "lighton_ocr",
+      "modeling_file": "lighton_ocr/modeling_lighton_ocr.py"
+    },
+    {
+      "row": "lilt",
+      "folder": "lilt",
+      "modeling_file": "lilt/modeling_lilt.py"
+    },
+    {
+      "row": "llama",
+      "folder": "llama",
+      "modeling_file": "llama/modeling_llama.py"
+    },
+    {
+      "row": "llama4",
+      "folder": "llama4",
+      "modeling_file": "llama4/modeling_llama4.py"
+    },
+    {
+      "row": "llava",
+      "folder": "llava",
+      "modeling_file": "llava/modeling_llava.py"
+    },
+    {
+      "row": "llava_next",
+      "folder": "llava_next",
+      "modeling_file": "llava_next/modeling_llava_next.py"
+    },
+    {
+      "row": "llava_next_video",
+      "folder": "llava_next_video",
+      "modeling_file": "llava_next_video/modeling_llava_next_video.py"
+    },
+    {
+      "row": "llava_onevision",
+      "folder": "llava_onevision",
+      "modeling_file": "llava_onevision/modeling_llava_onevision.py"
+    },
+    {
+      "row": "longcat_flash",
+      "folder": "longcat_flash",
+      "modeling_file": "longcat_flash/modeling_longcat_flash.py"
+    },
+    {
+      "row": "longformer",
+      "folder": "longformer",
+      "modeling_file": "longformer/modeling_longformer.py"
+    },
+    {
+      "row": "longt5",
+      "folder": "longt5",
+      "modeling_file": "longt5/modeling_longt5.py"
+    },
+    {
+      "row": "luke",
+      "folder": "luke",
+      "modeling_file": "luke/modeling_luke.py"
+    },
+    {
+      "row": "lw_detr",
+      "folder": "lw_detr",
+      "modeling_file": "lw_detr/modeling_lw_detr.py"
+    },
+    {
+      "row": "lxmert",
+      "folder": "lxmert",
+      "modeling_file": "lxmert/modeling_lxmert.py"
+    },
+    {
+      "row": "m2m_100",
+      "folder": "m2m_100",
+      "modeling_file": "m2m_100/modeling_m2m_100.py"
+    },
+    {
+      "row": "mamba",
+      "folder": "mamba",
+      "modeling_file": "mamba/modeling_mamba.py"
+    },
+    {
+      "row": "mamba2",
+      "folder": "mamba2",
+      "modeling_file": "mamba2/modeling_mamba2.py"
+    },
+    {
+      "row": "marian",
+      "folder": "marian",
+      "modeling_file": "marian/modeling_marian.py"
+    },
+    {
+      "row": "markuplm",
+      "folder": "markuplm",
+      "modeling_file": "markuplm/modeling_markuplm.py"
+    },
+    {
+      "row": "mask2former",
+      "folder": "mask2former",
+      "modeling_file": "mask2former/modeling_mask2former.py"
+    },
+    {
+      "row": "maskformer",
+      "folder": "maskformer",
+      "modeling_file": "maskformer/modeling_maskformer.py"
+    },
+    {
+      "row": "maskformer_swin",
+      "folder": "maskformer",
+      "modeling_file": "maskformer/modeling_maskformer_swin.py"
+    },
+    {
+      "row": "mbart",
+      "folder": "mbart",
+      "modeling_file": "mbart/modeling_mbart.py"
+    },
+    {
+      "row": "megatron_bert",
+      "folder": "megatron_bert",
+      "modeling_file": "megatron_bert/modeling_megatron_bert.py"
+    },
+    {
+      "row": "metaclip_2",
+      "folder": "metaclip_2",
+      "modeling_file": "metaclip_2/modeling_metaclip_2.py"
+    },
+    {
+      "row": "mgp_str",
+      "folder": "mgp_str",
+      "modeling_file": "mgp_str/modeling_mgp_str.py"
+    },
+    {
+      "row": "mimi",
+      "folder": "mimi",
+      "modeling_file": "mimi/modeling_mimi.py"
+    },
+    {
+      "row": "minicpmv4_6",
+      "folder": "minicpmv4_6",
+      "modeling_file": "minicpmv4_6/modeling_minicpmv4_6.py"
+    },
+    {
+      "row": "minimax",
+      "folder": "minimax",
+      "modeling_file": "minimax/modeling_minimax.py"
+    },
+    {
+      "row": "minimax_m2",
+      "folder": "minimax_m2",
+      "modeling_file": "minimax_m2/modeling_minimax_m2.py"
+    },
+    {
+      "row": "ministral",
+      "folder": "ministral",
+      "modeling_file": "ministral/modeling_ministral.py"
+    },
+    {
+      "row": "ministral3",
+      "folder": "ministral3",
+      "modeling_file": "ministral3/modeling_ministral3.py"
+    },
+    {
+      "row": "mistral",
+      "folder": "mistral",
+      "modeling_file": "mistral/modeling_mistral.py"
+    },
+    {
+      "row": "mistral3",
+      "folder": "mistral3",
+      "modeling_file": "mistral3/modeling_mistral3.py"
+    },
+    {
+      "row": "mistral4",
+      "folder": "mistral4",
+      "modeling_file": "mistral4/modeling_mistral4.py"
+    },
+    {
+      "row": "mixtral",
+      "folder": "mixtral",
+      "modeling_file": "mixtral/modeling_mixtral.py"
+    },
+    {
+      "row": "mlcd",
+      "folder": "mlcd",
+      "modeling_file": "mlcd/modeling_mlcd.py"
+    },
+    {
+      "row": "mllama",
+      "folder": "mllama",
+      "modeling_file": "mllama/modeling_mllama.py"
+    },
+    {
+      "row": "mm_grounding_dino",
+      "folder": "mm_grounding_dino",
+      "modeling_file": "mm_grounding_dino/modeling_mm_grounding_dino.py"
+    },
+    {
+      "row": "mobilebert",
+      "folder": "mobilebert",
+      "modeling_file": "mobilebert/modeling_mobilebert.py"
+    },
+    {
+      "row": "mobilenet_v1",
+      "folder": "mobilenet_v1",
+      "modeling_file": "mobilenet_v1/modeling_mobilenet_v1.py"
+    },
+    {
+      "row": "mobilenet_v2",
+      "folder": "mobilenet_v2",
+      "modeling_file": "mobilenet_v2/modeling_mobilenet_v2.py"
+    },
+    {
+      "row": "mobilevit",
+      "folder": "mobilevit",
+      "modeling_file": "mobilevit/modeling_mobilevit.py"
+    },
+    {
+      "row": "mobilevitv2",
+      "folder": "mobilevitv2",
+      "modeling_file": "mobilevitv2/modeling_mobilevitv2.py"
+    },
+    {
+      "row": "modernbert",
+      "folder": "modernbert",
+      "modeling_file": "modernbert/modeling_modernbert.py"
+    },
+    {
+      "row": "modernbert_decoder",
+      "folder": "modernbert_decoder",
+      "modeling_file": "modernbert_decoder/modeling_modernbert_decoder.py"
+    },
+    {
+      "row": "modernvbert",
+      "folder": "modernvbert",
+      "modeling_file": "modernvbert/modeling_modernvbert.py"
+    },
+    {
+      "row": "moonshine",
+      "folder": "moonshine",
+      "modeling_file": "moonshine/modeling_moonshine.py"
+    },
+    {
+      "row": "moonshine_streaming",
+      "folder": "moonshine_streaming",
+      "modeling_file": "moonshine_streaming/modeling_moonshine_streaming.py"
+    },
+    {
+      "row": "moshi",
+      "folder": "moshi",
+      "modeling_file": "moshi/modeling_moshi.py"
+    },
+    {
+      "row": "mpnet",
+      "folder": "mpnet",
+      "modeling_file": "mpnet/modeling_mpnet.py"
+    },
+    {
+      "row": "mpt",
+      "folder": "mpt",
+      "modeling_file": "mpt/modeling_mpt.py"
+    },
+    {
+      "row": "mra",
+      "folder": "mra",
+      "modeling_file": "mra/modeling_mra.py"
+    },
+    {
+      "row": "mt5",
+      "folder": "mt5",
+      "modeling_file": "mt5/modeling_mt5.py"
+    },
+    {
+      "row": "musicflamingo",
+      "folder": "musicflamingo",
+      "modeling_file": "musicflamingo/modeling_musicflamingo.py"
+    },
+    {
+      "row": "musicgen",
+      "folder": "musicgen",
+      "modeling_file": "musicgen/modeling_musicgen.py"
+    },
+    {
+      "row": "musicgen_melody",
+      "folder": "musicgen_melody",
+      "modeling_file": "musicgen_melody/modeling_musicgen_melody.py"
+    },
+    {
+      "row": "mvp",
+      "folder": "mvp",
+      "modeling_file": "mvp/modeling_mvp.py"
+    },
+    {
+      "row": "nanochat",
+      "folder": "nanochat",
+      "modeling_file": "nanochat/modeling_nanochat.py"
+    },
+    {
+      "row": "nemotron",
+      "folder": "nemotron",
+      "modeling_file": "nemotron/modeling_nemotron.py"
+    },
+    {
+      "row": "nemotron_h",
+      "folder": "nemotron_h",
+      "modeling_file": "nemotron_h/modeling_nemotron_h.py"
+    },
+    {
+      "row": "nllb_moe",
+      "folder": "nllb_moe",
+      "modeling_file": "nllb_moe/modeling_nllb_moe.py"
+    },
+    {
+      "row": "nomic_bert",
+      "folder": "nomic_bert",
+      "modeling_file": "nomic_bert/modeling_nomic_bert.py"
+    },
+    {
+      "row": "nystromformer",
+      "folder": "nystromformer",
+      "modeling_file": "nystromformer/modeling_nystromformer.py"
+    },
+    {
+      "row": "olmo",
+      "folder": "olmo",
+      "modeling_file": "olmo/modeling_olmo.py"
+    },
+    {
+      "row": "olmo2",
+      "folder": "olmo2",
+      "modeling_file": "olmo2/modeling_olmo2.py"
+    },
+    {
+      "row": "olmo3",
+      "folder": "olmo3",
+      "modeling_file": "olmo3/modeling_olmo3.py"
+    },
+    {
+      "row": "olmo_hybrid",
+      "folder": "olmo_hybrid",
+      "modeling_file": "olmo_hybrid/modeling_olmo_hybrid.py"
+    },
+    {
+      "row": "olmoe",
+      "folder": "olmoe",
+      "modeling_file": "olmoe/modeling_olmoe.py"
+    },
+    {
+      "row": "omdet_turbo",
+      "folder": "omdet_turbo",
+      "modeling_file": "omdet_turbo/modeling_omdet_turbo.py"
+    },
+    {
+      "row": "oneformer",
+      "folder": "oneformer",
+      "modeling_file": "oneformer/modeling_oneformer.py"
+    },
+    {
+      "row": "openai",
+      "folder": "openai",
+      "modeling_file": "openai/modeling_openai.py"
+    },
+    {
+      "row": "openai_privacy_filter",
+      "folder": "openai_privacy_filter",
+      "modeling_file": "openai_privacy_filter/modeling_openai_privacy_filter.py"
+    },
+    {
+      "row": "opt",
+      "folder": "opt",
+      "modeling_file": "opt/modeling_opt.py"
+    },
+    {
+      "row": "ovis2",
+      "folder": "ovis2",
+      "modeling_file": "ovis2/modeling_ovis2.py"
+    },
+    {
+      "row": "owlv2",
+      "folder": "owlv2",
+      "modeling_file": "owlv2/modeling_owlv2.py"
+    },
+    {
+      "row": "owlvit",
+      "folder": "owlvit",
+      "modeling_file": "owlvit/modeling_owlvit.py"
+    },
+    {
+      "row": "paddleocr_vl",
+      "folder": "paddleocr_vl",
+      "modeling_file": "paddleocr_vl/modeling_paddleocr_vl.py"
+    },
+    {
+      "row": "paligemma",
+      "folder": "paligemma",
+      "modeling_file": "paligemma/modeling_paligemma.py"
+    },
+    {
+      "row": "parakeet",
+      "folder": "parakeet",
+      "modeling_file": "parakeet/modeling_parakeet.py"
+    },
+    {
+      "row": "patchtsmixer",
+      "folder": "patchtsmixer",
+      "modeling_file": "patchtsmixer/modeling_patchtsmixer.py"
+    },
+    {
+      "row": "patchtst",
+      "folder": "patchtst",
+      "modeling_file": "patchtst/modeling_patchtst.py"
+    },
+    {
+      "row": "pe_audio",
+      "folder": "pe_audio",
+      "modeling_file": "pe_audio/modeling_pe_audio.py"
+    },
+    {
+      "row": "pe_audio_video",
+      "folder": "pe_audio_video",
+      "modeling_file": "pe_audio_video/modeling_pe_audio_video.py"
+    },
+    {
+      "row": "pe_video",
+      "folder": "pe_video",
+      "modeling_file": "pe_video/modeling_pe_video.py"
+    },
+    {
+      "row": "pegasus",
+      "folder": "pegasus",
+      "modeling_file": "pegasus/modeling_pegasus.py"
+    },
+    {
+      "row": "pegasus_x",
+      "folder": "pegasus_x",
+      "modeling_file": "pegasus_x/modeling_pegasus_x.py"
+    },
+    {
+      "row": "perceiver",
+      "folder": "perceiver",
+      "modeling_file": "perceiver/modeling_perceiver.py"
+    },
+    {
+      "row": "perception_lm",
+      "folder": "perception_lm",
+      "modeling_file": "perception_lm/modeling_perception_lm.py"
+    },
+    {
+      "row": "persimmon",
+      "folder": "persimmon",
+      "modeling_file": "persimmon/modeling_persimmon.py"
+    },
+    {
+      "row": "phi",
+      "folder": "phi",
+      "modeling_file": "phi/modeling_phi.py"
+    },
+    {
+      "row": "phi3",
+      "folder": "phi3",
+      "modeling_file": "phi3/modeling_phi3.py"
+    },
+    {
+      "row": "phi4_multimodal",
+      "folder": "phi4_multimodal",
+      "modeling_file": "phi4_multimodal/modeling_phi4_multimodal.py"
+    },
+    {
+      "row": "phimoe",
+      "folder": "phimoe",
+      "modeling_file": "phimoe/modeling_phimoe.py"
+    },
+    {
+      "row": "pi0",
+      "folder": "pi0",
+      "modeling_file": "pi0/modeling_pi0.py"
+    },
+    {
+      "row": "pix2struct",
+      "folder": "pix2struct",
+      "modeling_file": "pix2struct/modeling_pix2struct.py"
+    },
+    {
+      "row": "pixio",
+      "folder": "pixio",
+      "modeling_file": "pixio/modeling_pixio.py"
+    },
+    {
+      "row": "pixtral",
+      "folder": "pixtral",
+      "modeling_file": "pixtral/modeling_pixtral.py"
+    },
+    {
+      "row": "plbart",
+      "folder": "plbart",
+      "modeling_file": "plbart/modeling_plbart.py"
+    },
+    {
+      "row": "poolformer",
+      "folder": "poolformer",
+      "modeling_file": "poolformer/modeling_poolformer.py"
+    },
+    {
+      "row": "pop2piano",
+      "folder": "pop2piano",
+      "modeling_file": "pop2piano/modeling_pop2piano.py"
+    },
+    {
+      "row": "pp_doclayout_v2",
+      "folder": "pp_doclayout_v2",
+      "modeling_file": "pp_doclayout_v2/modeling_pp_doclayout_v2.py"
+    },
+    {
+      "row": "pp_doclayout_v3",
+      "folder": "pp_doclayout_v3",
+      "modeling_file": "pp_doclayout_v3/modeling_pp_doclayout_v3.py"
+    },
+    {
+      "row": "pp_formulanet",
+      "folder": "pp_formulanet",
+      "modeling_file": "pp_formulanet/modeling_pp_formulanet.py"
+    },
+    {
+      "row": "pp_lcnet",
+      "folder": "pp_lcnet",
+      "modeling_file": "pp_lcnet/modeling_pp_lcnet.py"
+    },
+    {
+      "row": "pp_lcnet_v3",
+      "folder": "pp_lcnet_v3",
+      "modeling_file": "pp_lcnet_v3/modeling_pp_lcnet_v3.py"
+    },
+    {
+      "row": "pp_ocrv5_mobile_det",
+      "folder": "pp_ocrv5_mobile_det",
+      "modeling_file": "pp_ocrv5_mobile_det/modeling_pp_ocrv5_mobile_det.py"
+    },
+    {
+      "row": "pp_ocrv5_mobile_rec",
+      "folder": "pp_ocrv5_mobile_rec",
+      "modeling_file": "pp_ocrv5_mobile_rec/modeling_pp_ocrv5_mobile_rec.py"
+    },
+    {
+      "row": "pp_ocrv5_server_det",
+      "folder": "pp_ocrv5_server_det",
+      "modeling_file": "pp_ocrv5_server_det/modeling_pp_ocrv5_server_det.py"
+    },
+    {
+      "row": "pp_ocrv5_server_rec",
+      "folder": "pp_ocrv5_server_rec",
+      "modeling_file": "pp_ocrv5_server_rec/modeling_pp_ocrv5_server_rec.py"
+    },
+    {
+      "row": "prompt_depth_anything",
+      "folder": "prompt_depth_anything",
+      "modeling_file": "prompt_depth_anything/modeling_prompt_depth_anything.py"
+    },
+    {
+      "row": "prophetnet",
+      "folder": "prophetnet",
+      "modeling_file": "prophetnet/modeling_prophetnet.py"
+    },
+    {
+      "row": "pvt",
+      "folder": "pvt",
+      "modeling_file": "pvt/modeling_pvt.py"
+    },
+    {
+      "row": "pvt_v2",
+      "folder": "pvt_v2",
+      "modeling_file": "pvt_v2/modeling_pvt_v2.py"
+    },
+    {
+      "row": "qianfan_ocr",
+      "folder": "qianfan_ocr",
+      "modeling_file": "qianfan_ocr/modeling_qianfan_ocr.py"
+    },
+    {
+      "row": "qwen2",
+      "folder": "qwen2",
+      "modeling_file": "qwen2/modeling_qwen2.py"
+    },
+    {
+      "row": "qwen2_5_omni",
+      "folder": "qwen2_5_omni",
+      "modeling_file": "qwen2_5_omni/modeling_qwen2_5_omni.py"
+    },
+    {
+      "row": "qwen2_5_vl",
+      "folder": "qwen2_5_vl",
+      "modeling_file": "qwen2_5_vl/modeling_qwen2_5_vl.py"
+    },
+    {
+      "row": "qwen2_audio",
+      "folder": "qwen2_audio",
+      "modeling_file": "qwen2_audio/modeling_qwen2_audio.py"
+    },
+    {
+      "row": "qwen2_moe",
+      "folder": "qwen2_moe",
+      "modeling_file": "qwen2_moe/modeling_qwen2_moe.py"
+    },
+    {
+      "row": "qwen2_vl",
+      "folder": "qwen2_vl",
+      "modeling_file": "qwen2_vl/modeling_qwen2_vl.py"
+    },
+    {
+      "row": "qwen3",
+      "folder": "qwen3",
+      "modeling_file": "qwen3/modeling_qwen3.py"
+    },
+    {
+      "row": "qwen3_5",
+      "folder": "qwen3_5",
+      "modeling_file": "qwen3_5/modeling_qwen3_5.py"
+    },
+    {
+      "row": "qwen3_5_moe",
+      "folder": "qwen3_5_moe",
+      "modeling_file": "qwen3_5_moe/modeling_qwen3_5_moe.py"
+    },
+    {
+      "row": "qwen3_moe",
+      "folder": "qwen3_moe",
+      "modeling_file": "qwen3_moe/modeling_qwen3_moe.py"
+    },
+    {
+      "row": "qwen3_next",
+      "folder": "qwen3_next",
+      "modeling_file": "qwen3_next/modeling_qwen3_next.py"
+    },
+    {
+      "row": "qwen3_omni_moe",
+      "folder": "qwen3_omni_moe",
+      "modeling_file": "qwen3_omni_moe/modeling_qwen3_omni_moe.py"
+    },
+    {
+      "row": "qwen3_vl",
+      "folder": "qwen3_vl",
+      "modeling_file": "qwen3_vl/modeling_qwen3_vl.py"
+    },
+    {
+      "row": "qwen3_vl_moe",
+      "folder": "qwen3_vl_moe",
+      "modeling_file": "qwen3_vl_moe/modeling_qwen3_vl_moe.py"
+    },
+    {
+      "row": "rag",
+      "folder": "rag",
+      "modeling_file": "rag/modeling_rag.py"
+    },
+    {
+      "row": "recurrent_gemma",
+      "folder": "recurrent_gemma",
+      "modeling_file": "recurrent_gemma/modeling_recurrent_gemma.py"
+    },
+    {
+      "row": "reformer",
+      "folder": "reformer",
+      "modeling_file": "reformer/modeling_reformer.py"
+    },
+    {
+      "row": "regnet",
+      "folder": "regnet",
+      "modeling_file": "regnet/modeling_regnet.py"
+    },
+    {
+      "row": "rembert",
+      "folder": "rembert",
+      "modeling_file": "rembert/modeling_rembert.py"
+    },
+    {
+      "row": "resnet",
+      "folder": "resnet",
+      "modeling_file": "resnet/modeling_resnet.py"
+    },
+    {
+      "row": "roberta",
+      "folder": "roberta",
+      "modeling_file": "roberta/modeling_roberta.py"
+    },
+    {
+      "row": "roberta_prelayernorm",
+      "folder": "roberta_prelayernorm",
+      "modeling_file": "roberta_prelayernorm/modeling_roberta_prelayernorm.py"
+    },
+    {
+      "row": "roc_bert",
+      "folder": "roc_bert",
+      "modeling_file": "roc_bert/modeling_roc_bert.py"
+    },
+    {
+      "row": "roformer",
+      "folder": "roformer",
+      "modeling_file": "roformer/modeling_roformer.py"
+    },
+    {
+      "row": "rt_detr/rt_detr",
+      "folder": "rt_detr",
+      "modeling_file": "rt_detr/modeling_rt_detr.py"
+    },
+    {
+      "row": "rt_detr/rt_detr_resnet",
+      "folder": "rt_detr",
+      "modeling_file": "rt_detr/modeling_rt_detr_resnet.py"
+    },
+    {
+      "row": "rt_detr_v2",
+      "folder": "rt_detr_v2",
+      "modeling_file": "rt_detr_v2/modeling_rt_detr_v2.py"
+    },
+    {
+      "row": "rwkv",
+      "folder": "rwkv",
+      "modeling_file": "rwkv/modeling_rwkv.py"
+    },
+    {
+      "row": "sam",
+      "folder": "sam",
+      "modeling_file": "sam/modeling_sam.py"
+    },
+    {
+      "row": "sam2",
+      "folder": "sam2",
+      "modeling_file": "sam2/modeling_sam2.py"
+    },
+    {
+      "row": "sam2_video",
+      "folder": "sam2_video",
+      "modeling_file": "sam2_video/modeling_sam2_video.py"
+    },
+    {
+      "row": "sam3",
+      "folder": "sam3",
+      "modeling_file": "sam3/modeling_sam3.py"
+    },
+    {
+      "row": "sam3_lite_text",
+      "folder": "sam3_lite_text",
+      "modeling_file": "sam3_lite_text/modeling_sam3_lite_text.py"
+    },
+    {
+      "row": "sam3_tracker",
+      "folder": "sam3_tracker",
+      "modeling_file": "sam3_tracker/modeling_sam3_tracker.py"
+    },
+    {
+      "row": "sam3_tracker_video",
+      "folder": "sam3_tracker_video",
+      "modeling_file": "sam3_tracker_video/modeling_sam3_tracker_video.py"
+    },
+    {
+      "row": "sam3_video",
+      "folder": "sam3_video",
+      "modeling_file": "sam3_video/modeling_sam3_video.py"
+    },
+    {
+      "row": "sam_hq",
+      "folder": "sam_hq",
+      "modeling_file": "sam_hq/modeling_sam_hq.py"
+    },
+    {
+      "row": "seamless_m4t",
+      "folder": "seamless_m4t",
+      "modeling_file": "seamless_m4t/modeling_seamless_m4t.py"
+    },
+    {
+      "row": "seamless_m4t_v2",
+      "folder": "seamless_m4t_v2",
+      "modeling_file": "seamless_m4t_v2/modeling_seamless_m4t_v2.py"
+    },
+    {
+      "row": "seed_oss",
+      "folder": "seed_oss",
+      "modeling_file": "seed_oss/modeling_seed_oss.py"
+    },
+    {
+      "row": "segformer",
+      "folder": "segformer",
+      "modeling_file": "segformer/modeling_segformer.py"
+    },
+    {
+      "row": "seggpt",
+      "folder": "seggpt",
+      "modeling_file": "seggpt/modeling_seggpt.py"
+    },
+    {
+      "row": "sew",
+      "folder": "sew",
+      "modeling_file": "sew/modeling_sew.py"
+    },
+    {
+      "row": "sew_d",
+      "folder": "sew_d",
+      "modeling_file": "sew_d/modeling_sew_d.py"
+    },
+    {
+      "row": "shieldgemma2",
+      "folder": "shieldgemma2",
+      "modeling_file": "shieldgemma2/modeling_shieldgemma2.py"
+    },
+    {
+      "row": "siglip",
+      "folder": "siglip",
+      "modeling_file": "siglip/modeling_siglip.py"
+    },
+    {
+      "row": "siglip2",
+      "folder": "siglip2",
+      "modeling_file": "siglip2/modeling_siglip2.py"
+    },
+    {
+      "row": "slanet",
+      "folder": "slanet",
+      "modeling_file": "slanet/modeling_slanet.py"
+    },
+    {
+      "row": "slanext",
+      "folder": "slanext",
+      "modeling_file": "slanext/modeling_slanext.py"
+    },
+    {
+      "row": "smollm3",
+      "folder": "smollm3",
+      "modeling_file": "smollm3/modeling_smollm3.py"
+    },
+    {
+      "row": "smolvlm",
+      "folder": "smolvlm",
+      "modeling_file": "smolvlm/modeling_smolvlm.py"
+    },
+    {
+      "row": "solar_open",
+      "folder": "solar_open",
+      "modeling_file": "solar_open/modeling_solar_open.py"
+    },
+    {
+      "row": "speech_encoder_decoder",
+      "folder": "speech_encoder_decoder",
+      "modeling_file": "speech_encoder_decoder/modeling_speech_encoder_decoder.py"
+    },
+    {
+      "row": "speech_to_text",
+      "folder": "speech_to_text",
+      "modeling_file": "speech_to_text/modeling_speech_to_text.py"
+    },
+    {
+      "row": "speecht5",
+      "folder": "speecht5",
+      "modeling_file": "speecht5/modeling_speecht5.py"
+    },
+    {
+      "row": "splinter",
+      "folder": "splinter",
+      "modeling_file": "splinter/modeling_splinter.py"
+    },
+    {
+      "row": "squeezebert",
+      "folder": "squeezebert",
+      "modeling_file": "squeezebert/modeling_squeezebert.py"
+    },
+    {
+      "row": "stablelm",
+      "folder": "stablelm",
+      "modeling_file": "stablelm/modeling_stablelm.py"
+    },
+    {
+      "row": "starcoder2",
+      "folder": "starcoder2",
+      "modeling_file": "starcoder2/modeling_starcoder2.py"
+    },
+    {
+      "row": "superglue",
+      "folder": "superglue",
+      "modeling_file": "superglue/modeling_superglue.py"
+    },
+    {
+      "row": "superpoint",
+      "folder": "superpoint",
+      "modeling_file": "superpoint/modeling_superpoint.py"
+    },
+    {
+      "row": "swiftformer",
+      "folder": "swiftformer",
+      "modeling_file": "swiftformer/modeling_swiftformer.py"
+    },
+    {
+      "row": "swin",
+      "folder": "swin",
+      "modeling_file": "swin/modeling_swin.py"
+    },
+    {
+      "row": "swin2sr",
+      "folder": "swin2sr",
+      "modeling_file": "swin2sr/modeling_swin2sr.py"
+    },
+    {
+      "row": "swinv2",
+      "folder": "swinv2",
+      "modeling_file": "swinv2/modeling_swinv2.py"
+    },
+    {
+      "row": "switch_transformers",
+      "folder": "switch_transformers",
+      "modeling_file": "switch_transformers/modeling_switch_transformers.py"
+    },
+    {
+      "row": "t5",
+      "folder": "t5",
+      "modeling_file": "t5/modeling_t5.py"
+    },
+    {
+      "row": "t5gemma",
+      "folder": "t5gemma",
+      "modeling_file": "t5gemma/modeling_t5gemma.py"
+    },
+    {
+      "row": "t5gemma2",
+      "folder": "t5gemma2",
+      "modeling_file": "t5gemma2/modeling_t5gemma2.py"
+    },
+    {
+      "row": "table_transformer",
+      "folder": "table_transformer",
+      "modeling_file": "table_transformer/modeling_table_transformer.py"
+    },
+    {
+      "row": "tapas",
+      "folder": "tapas",
+      "modeling_file": "tapas/modeling_tapas.py"
+    },
+    {
+      "row": "textnet",
+      "folder": "textnet",
+      "modeling_file": "textnet/modeling_textnet.py"
+    },
+    {
+      "row": "time_series_transformer",
+      "folder": "time_series_transformer",
+      "modeling_file": "time_series_transformer/modeling_time_series_transformer.py"
+    },
+    {
+      "row": "timesfm",
+      "folder": "timesfm",
+      "modeling_file": "timesfm/modeling_timesfm.py"
+    },
+    {
+      "row": "timesfm2_5",
+      "folder": "timesfm2_5",
+      "modeling_file": "timesfm2_5/modeling_timesfm2_5.py"
+    },
+    {
+      "row": "timesformer",
+      "folder": "timesformer",
+      "modeling_file": "timesformer/modeling_timesformer.py"
+    },
+    {
+      "row": "timm_backbone",
+      "folder": "timm_backbone",
+      "modeling_file": "timm_backbone/modeling_timm_backbone.py"
+    },
+    {
+      "row": "timm_wrapper",
+      "folder": "timm_wrapper",
+      "modeling_file": "timm_wrapper/modeling_timm_wrapper.py"
+    },
+    {
+      "row": "trocr",
+      "folder": "trocr",
+      "modeling_file": "trocr/modeling_trocr.py"
+    },
+    {
+      "row": "tvp",
+      "folder": "tvp",
+      "modeling_file": "tvp/modeling_tvp.py"
+    },
+    {
+      "row": "udop",
+      "folder": "udop",
+      "modeling_file": "udop/modeling_udop.py"
+    },
+    {
+      "row": "umt5",
+      "folder": "umt5",
+      "modeling_file": "umt5/modeling_umt5.py"
+    },
+    {
+      "row": "unispeech",
+      "folder": "unispeech",
+      "modeling_file": "unispeech/modeling_unispeech.py"
+    },
+    {
+      "row": "unispeech_sat",
+      "folder": "unispeech_sat",
+      "modeling_file": "unispeech_sat/modeling_unispeech_sat.py"
+    },
+    {
+      "row": "univnet",
+      "folder": "univnet",
+      "modeling_file": "univnet/modeling_univnet.py"
+    },
+    {
+      "row": "upernet",
+      "folder": "upernet",
+      "modeling_file": "upernet/modeling_upernet.py"
+    },
+    {
+      "row": "uvdoc",
+      "folder": "uvdoc",
+      "modeling_file": "uvdoc/modeling_uvdoc.py"
+    },
+    {
+      "row": "vaultgemma",
+      "folder": "vaultgemma",
+      "modeling_file": "vaultgemma/modeling_vaultgemma.py"
+    },
+    {
+      "row": "vibevoice_acoustic_tokenizer",
+      "folder": "vibevoice_acoustic_tokenizer",
+      "modeling_file": "vibevoice_acoustic_tokenizer/modeling_vibevoice_acoustic_tokenizer.py"
+    },
+    {
+      "row": "vibevoice_asr",
+      "folder": "vibevoice_asr",
+      "modeling_file": "vibevoice_asr/modeling_vibevoice_asr.py"
+    },
+    {
+      "row": "video_llama_3",
+      "folder": "video_llama_3",
+      "modeling_file": "video_llama_3/modeling_video_llama_3.py"
+    },
+    {
+      "row": "video_llava",
+      "folder": "video_llava",
+      "modeling_file": "video_llava/modeling_video_llava.py"
+    },
+    {
+      "row": "videomae",
+      "folder": "videomae",
+      "modeling_file": "videomae/modeling_videomae.py"
+    },
+    {
+      "row": "videomt",
+      "folder": "videomt",
+      "modeling_file": "videomt/modeling_videomt.py"
+    },
+    {
+      "row": "vilt",
+      "folder": "vilt",
+      "modeling_file": "vilt/modeling_vilt.py"
+    },
+    {
+      "row": "vipllava",
+      "folder": "vipllava",
+      "modeling_file": "vipllava/modeling_vipllava.py"
+    },
+    {
+      "row": "vision_encoder_decoder",
+      "folder": "vision_encoder_decoder",
+      "modeling_file": "vision_encoder_decoder/modeling_vision_encoder_decoder.py"
+    },
+    {
+      "row": "vision_text_dual_encoder",
+      "folder": "vision_text_dual_encoder",
+      "modeling_file": "vision_text_dual_encoder/modeling_vision_text_dual_encoder.py"
+    },
+    {
+      "row": "visual_bert",
+      "folder": "visual_bert",
+      "modeling_file": "visual_bert/modeling_visual_bert.py"
+    },
+    {
+      "row": "vit",
+      "folder": "vit",
+      "modeling_file": "vit/modeling_vit.py"
+    },
+    {
+      "row": "vit_mae",
+      "folder": "vit_mae",
+      "modeling_file": "vit_mae/modeling_vit_mae.py"
+    },
+    {
+      "row": "vit_msn",
+      "folder": "vit_msn",
+      "modeling_file": "vit_msn/modeling_vit_msn.py"
+    },
+    {
+      "row": "vitdet",
+      "folder": "vitdet",
+      "modeling_file": "vitdet/modeling_vitdet.py"
+    },
+    {
+      "row": "vitmatte",
+      "folder": "vitmatte",
+      "modeling_file": "vitmatte/modeling_vitmatte.py"
+    },
+    {
+      "row": "vitpose",
+      "folder": "vitpose",
+      "modeling_file": "vitpose/modeling_vitpose.py"
+    },
+    {
+      "row": "vitpose_backbone",
+      "folder": "vitpose_backbone",
+      "modeling_file": "vitpose_backbone/modeling_vitpose_backbone.py"
+    },
+    {
+      "row": "vits",
+      "folder": "vits",
+      "modeling_file": "vits/modeling_vits.py"
+    },
+    {
+      "row": "vivit",
+      "folder": "vivit",
+      "modeling_file": "vivit/modeling_vivit.py"
+    },
+    {
+      "row": "vjepa2",
+      "folder": "vjepa2",
+      "modeling_file": "vjepa2/modeling_vjepa2.py"
+    },
+    {
+      "row": "voxtral",
+      "folder": "voxtral",
+      "modeling_file": "voxtral/modeling_voxtral.py"
+    },
+    {
+      "row": "voxtral_realtime",
+      "folder": "voxtral_realtime",
+      "modeling_file": "voxtral_realtime/modeling_voxtral_realtime.py"
+    },
+    {
+      "row": "wav2vec2",
+      "folder": "wav2vec2",
+      "modeling_file": "wav2vec2/modeling_wav2vec2.py"
+    },
+    {
+      "row": "wav2vec2_bert",
+      "folder": "wav2vec2_bert",
+      "modeling_file": "wav2vec2_bert/modeling_wav2vec2_bert.py"
+    },
+    {
+      "row": "wav2vec2_conformer",
+      "folder": "wav2vec2_conformer",
+      "modeling_file": "wav2vec2_conformer/modeling_wav2vec2_conformer.py"
+    },
+    {
+      "row": "wavlm",
+      "folder": "wavlm",
+      "modeling_file": "wavlm/modeling_wavlm.py"
+    },
+    {
+      "row": "whisper",
+      "folder": "whisper",
+      "modeling_file": "whisper/modeling_whisper.py"
+    },
+    {
+      "row": "x_clip",
+      "folder": "x_clip",
+      "modeling_file": "x_clip/modeling_x_clip.py"
+    },
+    {
+      "row": "xcodec",
+      "folder": "xcodec",
+      "modeling_file": "xcodec/modeling_xcodec.py"
+    },
+    {
+      "row": "xglm",
+      "folder": "xglm",
+      "modeling_file": "xglm/modeling_xglm.py"
+    },
+    {
+      "row": "xlm",
+      "folder": "xlm",
+      "modeling_file": "xlm/modeling_xlm.py"
+    },
+    {
+      "row": "xlm_roberta",
+      "folder": "xlm_roberta",
+      "modeling_file": "xlm_roberta/modeling_xlm_roberta.py"
+    },
+    {
+      "row": "xlm_roberta_xl",
+      "folder": "xlm_roberta_xl",
+      "modeling_file": "xlm_roberta_xl/modeling_xlm_roberta_xl.py"
+    },
+    {
+      "row": "xlnet",
+      "folder": "xlnet",
+      "modeling_file": "xlnet/modeling_xlnet.py"
+    },
+    {
+      "row": "xlstm",
+      "folder": "xlstm",
+      "modeling_file": "xlstm/modeling_xlstm.py"
+    },
+    {
+      "row": "xmod",
+      "folder": "xmod",
+      "modeling_file": "xmod/modeling_xmod.py"
+    },
+    {
+      "row": "yolos",
+      "folder": "yolos",
+      "modeling_file": "yolos/modeling_yolos.py"
+    },
+    {
+      "row": "yoso",
+      "folder": "yoso",
+      "modeling_file": "yoso/modeling_yoso.py"
+    },
+    {
+      "row": "youtu",
+      "folder": "youtu",
+      "modeling_file": "youtu/modeling_youtu.py"
+    },
+    {
+      "row": "zamba",
+      "folder": "zamba",
+      "modeling_file": "zamba/modeling_zamba.py"
+    },
+    {
+      "row": "zamba2",
+      "folder": "zamba2",
+      "modeling_file": "zamba2/modeling_zamba2.py"
+    },
+    {
+      "row": "zoedepth",
+      "folder": "zoedepth",
+      "modeling_file": "zoedepth/modeling_zoedepth.py"
+    }
+  ]
+}

@@ -1,0 +1,16 @@
+{
+  "methodology": "/tmp/paper_quality_reaudit_methodology.md",
+  "source_manifest": "/tmp/paper_quality_reaudit_source_manifest.json",
+  "rows_total": 447,
+  "row_evidence": {},
+  "batch_status": {
+    "A-C": "completed_subagent_parent_review_partial",
+    "D-G": "pending_subagent",
+    "H-M": "pending_subagent",
+    "N-S": "completed_subagent_parent_review_partial",
+    "T-Z": "pending_subagent"
+  },
+  "parent_review_notes": "/tmp/paper_quality_parent_review_working.md",
+  "rules": [],
+  "findings": []
+}
