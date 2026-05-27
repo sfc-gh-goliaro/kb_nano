@@ -13,14 +13,14 @@ from typing import Any
 
 
 DEFAULT_WORKLOAD_DATASETS: dict[str, str] = {
-    "prefill-heavy": "sfc-gh-goliaro/wildchat-kb-nano-prefill-heavy-1k",
-    "balanced": "sfc-gh-goliaro/wildchat-kb-nano-balanced-1k",
-    "decode-heavy": "sfc-gh-goliaro/wildchat-kb-nano-decode-heavy-1k",
+    "prefill-heavy": "sfc-gh-goliaro/wildchat-fastkernels-prefill-heavy-1k",
+    "balanced": "sfc-gh-goliaro/wildchat-fastkernels-balanced-1k",
+    "decode-heavy": "sfc-gh-goliaro/wildchat-fastkernels-decode-heavy-1k",
 }
 
 LEGACY_WORKLOAD_DATASETS: dict[str, str] = {
     "prefill-heavy": "sfc-gh-goliaro/wildchat-prefill-heavy-1k",
-    "balanced": "sfc-gh-goliaro/kb-nano-balanced",
+    "balanced": "sfc-gh-goliaro/fastkernels-balanced",
     "decode-heavy": "sfc-gh-goliaro/wildchat-decode-heavy-1k",
 }
 
