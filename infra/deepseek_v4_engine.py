@@ -63,6 +63,11 @@ class DeepseekV4Engine:
             enable_prefix_caching=False,
             # DeepSeek V4 only supports the fp8 (fp8_ds_mla) KV-cache layout.
             kv_cache_dtype="fp8",
+            # Match the benchmark's vLLM reference worker config exactly so the
+            # comparison isolates the kb_nano serving stack, not loader/stats
+            # differences.
+            load_format="fastsafetensors",
+            disable_log_stats=True,
         )
 
         # --- Fast-iteration overrides -------------------------------------
@@ -78,7 +83,7 @@ class DeepseekV4Engine:
         self.block_manager = _BlockManagerShim()
         self.model_name = model_name
 
-    def _to_vllm_sp(self, sp: SamplingParams):
+    def _to_vllm_sp(self, sp: SamplingParams, detokenize: bool = True):
         from vllm import SamplingParams as VLLMSamplingParams
 
         return VLLMSamplingParams(
@@ -87,7 +92,10 @@ class DeepseekV4Engine:
             max_tokens=sp.max_tokens,
             seed=sp.seed,
             ignore_eos=sp.ignore_eos,
-            detokenize=True,
+            # Match the reference vLLM worker: throughput runs use
+            # detokenize=False so per-token detokenization overhead does not
+            # skew the comparison; only decode-text requests detokenize.
+            detokenize=detokenize,
         )
 
     def generate(
@@ -104,9 +112,9 @@ class DeepseekV4Engine:
         from vllm import SamplingParams as VLLMSamplingParams  # noqa: F401
 
         if isinstance(sampling_params, (list, tuple)):
-            sp_list = [self._to_vllm_sp(sp) for sp in sampling_params]
+            sp_list = [self._to_vllm_sp(sp, decode_text) for sp in sampling_params]
         else:
-            sp_list = self._to_vllm_sp(sampling_params)
+            sp_list = self._to_vllm_sp(sampling_params, decode_text)
 
         vllm_prompts = []
         for p in prompts:
