@@ -1363,6 +1363,19 @@ def load_model(
             "fastkernels.infra.pi0_engine.Pi0Engine, "
             "not the LLM load_model() path."
         )
+    if model_type == "deepseek_v4":
+        # DeepSeek-V4-Flash uses an attention stack (sparse sliding-window MLA
+        # with per-layer compression ratios, attention sink, fp8_ds_mla cache,
+        # Lightning indexer + compressor) and MXFP4 routed experts that do not
+        # map onto the generic paged-KV ``LlamaEngine`` attention path. It is
+        # served by the dedicated ``fastkernels.infra.deepseek_v4_engine.
+        # DeepseekV4Engine`` (Pattern 2), which reuses the vLLM 0.20.0 wheel's
+        # compiled V4 kernels under kb_nano's scheduler.
+        raise ValueError(
+            "DeepSeek-V4-Flash models should be loaded via "
+            "fastkernels.infra.deepseek_v4_engine.DeepseekV4Engine, "
+            "not the LLM load_model() path."
+        )
     if model_type == "gpt_oss":
         from ..tasks.baseline.L4.gpt_oss import GptOssConfig, GptOssForCausalLM
         config = GptOssConfig.from_pretrained(model_name)

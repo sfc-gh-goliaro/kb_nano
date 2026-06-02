@@ -393,6 +393,8 @@ def main():
         max_model_len=cfg["max_model_len"],
         enable_prefix_caching=False,
     )
+    if cfg.get("kv_cache_dtype"):
+        llm_kwargs["kv_cache_dtype"] = cfg["kv_cache_dtype"]
     if cfg.get("trust_remote_code"):
         llm_kwargs["trust_remote_code"] = True
     if cfg.get("is_qwen_omni", False):
@@ -522,6 +524,16 @@ def main():
     mod = __import__(f"{pkg}.infra.engine", fromlist=["LlamaEngine", "SamplingParams"])
     LlamaEngine, SamplingParams = mod.LlamaEngine, mod.SamplingParams
 
+    # DeepSeek-V4-Flash is served by a dedicated engine (sparse-SWA MLA +
+    # MXFP4 experts reusing the vLLM 0.20.0 compiled V4 kernels).
+    if "deepseek-v4" in cfg["model"].lower():
+        v4mod = __import__(
+            f"{pkg}.infra.deepseek_v4_engine", fromlist=["DeepseekV4Engine"]
+        )
+        EngineCls = v4mod.DeepseekV4Engine
+    else:
+        EngineCls = LlamaEngine
+
     engine_kwargs = dict(
         model_name=cfg["model"],
         seed=cfg["seed"],
@@ -532,7 +544,7 @@ def main():
         engine_kwargs["gpu_memory_utilization"] = cfg["gpu_memory_utilization"]
     if "max_model_len" in cfg:
         engine_kwargs["max_model_len"] = cfg["max_model_len"]
-    engine = LlamaEngine(**engine_kwargs)
+    engine = EngineCls(**engine_kwargs)
 
     # Warmup
     engine.generate(["warmup"], SamplingParams(temperature=0.0, max_tokens=16))
@@ -1139,6 +1151,16 @@ def main():
     mod = __import__(f"{pkg}.infra.engine", fromlist=["LlamaEngine", "SamplingParams"])
     LlamaEngine, SamplingParams = mod.LlamaEngine, mod.SamplingParams
 
+    # DeepSeek-V4-Flash is served by a dedicated engine (sparse-SWA MLA +
+    # MXFP4 experts reusing the vLLM 0.20.0 compiled V4 kernels).
+    if "deepseek-v4" in cfg["model"].lower():
+        v4mod = __import__(
+            f"{pkg}.infra.deepseek_v4_engine", fromlist=["DeepseekV4Engine"]
+        )
+        EngineCls = v4mod.DeepseekV4Engine
+    else:
+        EngineCls = LlamaEngine
+
     engine_kwargs = dict(
         model_name=cfg["model"],
         seed=cfg["seed"],
@@ -1149,7 +1171,7 @@ def main():
         engine_kwargs["gpu_memory_utilization"] = cfg["gpu_memory_utilization"]
     if "max_model_len" in cfg:
         engine_kwargs["max_model_len"] = cfg["max_model_len"]
-    engine = LlamaEngine(**engine_kwargs)
+    engine = EngineCls(**engine_kwargs)
 
     engine.generate(["warmup"], SamplingParams(temperature=0.0, max_tokens=16))
 
@@ -1896,18 +1918,46 @@ def main():
 
             modality = scenario.get("modality", "text") if (is_vlm or is_qwen_omni) else "text"
             if modality == "text":
+                samples = None
                 if scenario.get("dataset") is not None:
-                    samples = load_real_prompt_workload(
-                        scenario["name"],
-                        tokenizer,
-                        num_requests=args.num_seqs,
-                        decode_cap=None,
-                        dataset_name=scenario["dataset"],
-                        seed=args.seed + i,
-                    )
+                    try:
+                        samples = load_real_prompt_workload(
+                            scenario["name"],
+                            tokenizer,
+                            num_requests=args.num_seqs,
+                            decode_cap=None,
+                            dataset_name=scenario["dataset"],
+                            seed=args.seed + i,
+                        )
+                    except Exception as exc:
+                        # The curated WildChat workload datasets are private and
+                        # may be unavailable in some environments. Fall back to a
+                        # deterministic synthetic workload using the standardized
+                        # prefill/decode token budgets from the guidelines
+                        # (prefill-heavy 1024/512, balanced 512/512,
+                        # decode-heavy 512/1024). Both engines receive the same
+                        # pre-generated prompts, so token-alignment stays valid.
+                        std = {
+                            "prefill-heavy": (1024, 512),
+                            "balanced": (512, 512),
+                            "decode-heavy": (512, 1024),
+                        }.get(scenario["name"], (512, 512))
+                        print(f"  NOTE: dataset {scenario['dataset']!r} unavailable "
+                              f"({type(exc).__name__}); using synthetic "
+                              f"{std[0]}/{std[1]} prefill/decode workload.")
+                        in_len, out_len = std
+                        rng_seed = args.seed + i
+                        random.seed(rng_seed)
+                        np.random.seed(rng_seed)
+                        prompt_token_ids = [
+                            [randint(0, 10000) for _ in range(in_len)]
+                            for _ in range(args.num_seqs)
+                        ]
+                        output_lens = [out_len] * args.num_seqs
+                if samples is not None:
                     prompt_token_ids = [s.prompt_token_ids for s in samples]
                     output_lens = [s.output_len for s in samples]
-                else:
+                elif scenario.get("dataset") is None:
                     input_len = scenario["input_len"]
                     output_len = scenario["output_len"]
                     rng_seed = args.seed + i
@@ -1967,15 +2017,27 @@ def main():
             modality = ls.get("modality", "text") if (is_vlm or is_qwen_omni) else "text"
             if modality == "text":
                 bs = ls["batch_size"]
-                samples = load_real_prompt_workload(
-                    "balanced",
-                    tokenizer,
-                    num_requests=bs,
-                    decode_cap=None,
-                    seed=args.seed + 100 + j,
-                )
-                prompt_token_ids = [s.prompt_token_ids for s in samples]
-                output_lens = [s.output_len for s in samples]
+                try:
+                    samples = load_real_prompt_workload(
+                        "balanced",
+                        tokenizer,
+                        num_requests=bs,
+                        decode_cap=None,
+                        seed=args.seed + 100 + j,
+                    )
+                    prompt_token_ids = [s.prompt_token_ids for s in samples]
+                    output_lens = [s.output_len for s in samples]
+                except Exception:
+                    in_len = ls.get("input_len", 128)
+                    out_len = ls.get("output_len", 128)
+                    rng_seed = args.seed + 100 + j
+                    random.seed(rng_seed)
+                    np.random.seed(rng_seed)
+                    prompt_token_ids = [
+                        [randint(0, 10000) for _ in range(in_len)]
+                        for _ in range(bs)
+                    ]
+                    output_lens = [out_len] * bs
                 seq_len = max(
                     len(p) + ol
                     for p, ol in zip(prompt_token_ids, output_lens)
@@ -2073,6 +2135,9 @@ def main():
             "load_format": "fastsafetensors",
             "is_qwen_omni": is_qwen_omni,
         }
+        # DeepSeek-V4-Flash requires the fp8 (fp8_ds_mla) KV-cache layout.
+        if "deepseek-v4" in args.model.lower():
+            vllm_config["kv_cache_dtype"] = "fp8"
         if is_qwen_omni:
             vllm_config["limit_mm_per_prompt"] = {
                 "image": 1,
