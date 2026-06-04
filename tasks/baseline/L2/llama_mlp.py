@@ -10,14 +10,15 @@ from __future__ import annotations
 import torch.nn as nn
 
 from .parallel_linear import MergedColumnParallelLinear, RowParallelLinear
-from ..L1.silu_and_mul import SiluAndMul
+from ..L1.silu_and_mul import SiluAndMul, SiluAndMulWithClamp
 
 
 class LlamaMLP(nn.Module):
     def __init__(self, config, quant_config: dict | None = None,
                  hidden_size: int | None = None,
                  intermediate_size: int | None = None,
-                 reduce_results: bool = True):
+                 reduce_results: bool = True,
+                 swiglu_limit: float | None = None):
         super().__init__()
         h = hidden_size if hidden_size is not None else config.hidden_size
         i = intermediate_size if intermediate_size is not None else config.intermediate_size
@@ -30,7 +31,10 @@ class LlamaMLP(nn.Module):
             quant_config=quant_config,
             reduce_results=reduce_results,
         )
-        self.act_fn = SiluAndMul()
+        if swiglu_limit is not None:
+            self.act_fn = SiluAndMulWithClamp(swiglu_limit)
+        else:
+            self.act_fn = SiluAndMul()
 
     def forward(self, x):
         x = self.gate_up_proj(x)

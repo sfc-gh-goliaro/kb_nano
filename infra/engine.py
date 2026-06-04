@@ -429,7 +429,8 @@ class ModelRunner:
             getattr(self.config, "vision", None), "deepstack_visual_indexes"
         )
         self.is_whisper = getattr(self.config, "is_encoder_decoder", False)
-        self.is_deepseek_mla = hasattr(self.config, "kv_lora_rank")
+        self.is_deepseek_v4 = model_type == "deepseek_v4"
+        self.is_deepseek_mla = hasattr(self.config, "kv_lora_rank") or self.is_deepseek_v4
         if self.is_qwen3_next:
             if self.max_num_batched_tokens <= _DEFAULT_MAX_NUM_BATCHED_TOKENS:
                 _, total_mem = torch.cuda.mem_get_info()
@@ -3257,6 +3258,7 @@ class ModelRunner:
         """
         from ..tasks.baseline.L2.mla_attention_impl import MLAAttention
         from ..tasks.baseline.L2.sparse_attn_indexer import SparseAttnIndexer
+        from ..tasks.baseline.L2.deepseek_v4_attention import DeepSeekV4Attention
 
         _MLA_BLOCK_SIZE = 64  # FlashMLA uses block_size=64
         _INDEXER_CACHE_BYTES = 132
@@ -3266,6 +3268,8 @@ class ModelRunner:
         indexer_layers = []
         for module in self.model.modules():
             if isinstance(module, MLAAttention):
+                mla_layers.append(module)
+            elif isinstance(module, DeepSeekV4Attention):
                 mla_layers.append(module)
             elif isinstance(module, SparseAttnIndexer):
                 indexer_layers.append(module)

@@ -77,6 +77,14 @@ _DEEPSEEK_SHARED_EXPERT_RE = re.compile(
     r"(.+\.mlp)\.shared_experts\.(gate_proj|up_proj|down_proj)\.(weight|weight_scale_inv)"
 )
 
+# DeepSeek-V4 per-expert weight and scale pattern (w1/w2/w3 naming)
+_DEEPSEEK_V4_EXPERT_RE = re.compile(
+    r"(.+\.ffn)\.experts\.(\d+)\.(w[123])\.(weight|weight_scale_inv|weight_scale)$"
+)
+_DEEPSEEK_V4_EXPERT_RAW_RE = re.compile(
+    r"(.+\.ffn)\.experts\.(\d+)\.(w[123])$"
+)
+
 # Qwen3-MoE fused expert weight patterns: gate_up_proj [E, 2*inter, hidden], down_proj [E, hidden, inter]
 _QWEN3_MOE_FUSED_EXPERT_RE = re.compile(
     r"(.+\.mlp)\.experts\.(gate_up_proj|down_proj)$"
@@ -717,6 +725,39 @@ def load_weights(model, model_path: str, model_type: str = "llama") -> None:
             if mapped_name == "backbone.embeddings.weight":
                 mapped_name = "backbone.embeddings.embedding_op.emb.weight"
 
+        if model_type == "deepseek_v4":
+            # Prefix mapping: checkpoint → model params
+            if mapped_name.startswith("layers."):
+                mapped_name = "model." + mapped_name
+            elif mapped_name.startswith("embed.weight"):
+                mapped_name = "model.embed_tokens.embedding_op.emb.weight"
+            elif mapped_name.startswith("norm."):
+                mapped_name = "model." + mapped_name
+            elif mapped_name.startswith("hc_head"):
+                mapped_name = "model." + mapped_name
+            elif mapped_name == "head.weight":
+                mapped_name = "lm_head.weight"
+            # Suffix/substr mapping
+            mapped_name = mapped_name.replace(
+                ".ffn.gate.bias", ".ffn.e_score_correction_bias")
+            mapped_name = mapped_name.replace(
+                ".ffn.gate.weight", ".ffn.gate_weight")
+            mapped_name = mapped_name.replace(
+                ".ffn.gate.tid2eid", ".ffn.tid2eid")
+            mapped_name = mapped_name.replace(
+                ".shared_experts.", ".shared_expert.")
+            # w2 → down_proj for shared expert (w1/w3 handled by packed_modules)
+            if ".shared_expert.w2." in mapped_name:
+                mapped_name = mapped_name.replace(
+                    ".shared_expert.w2.", ".shared_expert.down_proj.")
+            # Expert scales: .wX.scale → .wX.weight_scale (experts)
+            # Non-expert .scale → .weight_scale_inv
+            if mapped_name.endswith(".scale"):
+                if ".experts." in mapped_name:
+                    mapped_name = mapped_name[:-len(".scale")] + ".weight_scale"
+                else:
+                    mapped_name = mapped_name[:-len(".scale")] + ".weight_scale_inv"
+
         if model_type == "deepseek_v3":
             mapped_name = mapped_name.replace(
                 ".shared_experts.", ".shared_expert.")
@@ -893,7 +934,74 @@ def load_weights(model, model_path: str, model_type: str = "llama") -> None:
                 loaded += _load_vision_qkv(model, prefix, _get_tensor(), wb)
                 continue
 
-        # DeepSeek MoE expert weights/scales — must be checked BEFORE
+        # DeepSeek V4 MoE expert weights/scales (w1/w2/w3 naming)
+        m_ds_v4 = _DEEPSEEK_V4_EXPERT_RE.match(mapped_name)
+        if not m_ds_v4:
+            m_ds_v4 = _DEEPSEEK_V4_EXPERT_RAW_RE.match(mapped_name)
+            if m_ds_v4 and model_type == "deepseek_v4":
+                moe_prefix, expert_id_str, proj_name = m_ds_v4.groups()
+                attr = "weight"
+            else:
+                m_ds_v4 = None
+        else:
+            moe_prefix, expert_id_str, proj_name, attr = m_ds_v4.groups()
+        if m_ds_v4:
+            expert_id = int(expert_id_str)
+            tensor = _get_tensor()
+            if tensor.dtype == torch.float8_e8m0fnu:
+                tensor = tensor.view(torch.uint8)
+            # Find the MoE module to call its loaders directly
+            moe_module = None
+            try:
+                for name_part, mod in model.named_modules():
+                    if name_part == moe_prefix:
+                        moe_module = mod
+                        break
+            except Exception:
+                pass
+
+            if proj_name in ("w1", "w3"):
+                is_w1 = (proj_name == "w1")
+                if attr == "weight":
+                    param_name = f"{moe_prefix}.w13"
+                    try:
+                        param = model.get_parameter(param_name)
+                    except AttributeError:
+                        continue
+                    param.weight_loader(param, tensor, expert_id, is_w1=is_w1)
+                else:
+                    # Scale: call the module's scale loader if available
+                    if moe_module and hasattr(moe_module, '_w13_scale_loader'):
+                        moe_module._w13_scale_loader(None, tensor, expert_id, is_w1=is_w1)
+                    else:
+                        param_name = f"{moe_prefix}.w13_weight_scale_inv"
+                        try:
+                            param = model.get_parameter(param_name)
+                            param.weight_loader(param, tensor, expert_id, is_w1=is_w1)
+                        except AttributeError:
+                            continue
+            else:
+                if attr == "weight":
+                    param_name = f"{moe_prefix}.w2"
+                    try:
+                        param = model.get_parameter(param_name)
+                    except AttributeError:
+                        continue
+                    param.weight_loader(param, tensor, expert_id)
+                else:
+                    if moe_module and hasattr(moe_module, '_w2_scale_loader'):
+                        moe_module._w2_scale_loader(None, tensor, expert_id)
+                    else:
+                        param_name = f"{moe_prefix}.w2_weight_scale_inv"
+                        try:
+                            param = model.get_parameter(param_name)
+                            param.weight_loader(param, tensor, expert_id)
+                        except AttributeError:
+                            continue
+            loaded += 1
+            continue
+
+        # DeepSeek V3 MoE expert weights/scales — must be checked BEFORE
         # _WEIGHT_SCALE_INV_RE to avoid the generic scale handler consuming
         # expert weight_scale_inv names and silently skipping them.
         m_ds = _DEEPSEEK_EXPERT_RE.match(mapped_name)
@@ -1043,6 +1151,22 @@ def load_weights(model, model_path: str, model_type: str = "llama") -> None:
             continue
         if "rotary_emb" in mapped_name:
             continue
+
+        # DeepSeek V4 attn_sink: TP shard by num_heads
+        if model_type == "deepseek_v4" and "attn_sink" in mapped_name:
+            try:
+                param = model.get_parameter(mapped_name)
+            except AttributeError:
+                continue
+            tensor = _get_tensor()
+            from .tp import _tp_rank, _tp_size
+            tp, rank = _tp_size(), _tp_rank()
+            n_head = tensor.shape[0]
+            n_local = n_head // tp
+            param.data[:n_local].copy_(tensor[rank * n_local:(rank + 1) * n_local])
+            loaded += 1
+            continue
+
         m_emb_w = _EMBED_WEIGHT_RE.match(mapped_name)
         if m_emb_w:
             mapped_name = f"{m_emb_w.group(1)}.embedding_op.emb.weight"
@@ -1262,6 +1386,8 @@ def _detect_model_type(model_name: str) -> str:
         model_type = _load_config_dict(model_name).get("model_type", "llama")
     if model_type == "deepseek_v32":
         model_type = "deepseek_v3"
+    if model_type == "deepseek_v4":
+        model_type = "deepseek_v4"
     return model_type
 
 
@@ -1363,19 +1489,6 @@ def load_model(
             "fastkernels.infra.pi0_engine.Pi0Engine, "
             "not the LLM load_model() path."
         )
-    if model_type == "deepseek_v4":
-        # DeepSeek-V4-Flash uses an attention stack (sparse sliding-window MLA
-        # with per-layer compression ratios, attention sink, fp8_ds_mla cache,
-        # Lightning indexer + compressor) and MXFP4 routed experts that do not
-        # map onto the generic paged-KV ``LlamaEngine`` attention path. It is
-        # served by the dedicated ``fastkernels.infra.deepseek_v4_engine.
-        # DeepseekV4Engine`` (Pattern 2), which reuses the vLLM 0.20.0 wheel's
-        # compiled V4 kernels under kb_nano's scheduler.
-        raise ValueError(
-            "DeepSeek-V4-Flash models should be loaded via "
-            "fastkernels.infra.deepseek_v4_engine.DeepseekV4Engine, "
-            "not the LLM load_model() path."
-        )
     if model_type == "gpt_oss":
         from ..tasks.baseline.L4.gpt_oss import GptOssConfig, GptOssForCausalLM
         config = GptOssConfig.from_pretrained(model_name)
@@ -1466,6 +1579,16 @@ def load_model(
               f"(L={config.num_hidden_layers}, hidden={config.hidden_size}, "
               f"intermediate={config.intermediate_size}, state={config.state_size})...")
         model = MambaForCausalLM(config)
+    elif model_type == "deepseek_v4":
+        from ..tasks.baseline.L4.deepseek_v4 import (
+            DeepSeekV4Config, DeepSeekV4ForCausalLM,
+        )
+        config = DeepSeekV4Config.from_pretrained(model_name)
+        config.dtype = dtype
+        print(f"  Allocating DeepSeek V4 model ({config.n_routed_experts} experts, "
+              f"top-{config.num_experts_per_tok}, hash_layers={config.num_hash_layers}, "
+              f"hc_mult={config.hc_mult})...")
+        model = DeepSeekV4ForCausalLM(config, quant_config=quant_config)
     elif model_type == "deepseek_v3":
         from ..tasks.baseline.L4.deepseek import (
             DeepSeekV3Config, DeepSeekV3ForCausalLM,
@@ -1507,7 +1630,7 @@ def load_model(
             f"TP degree {tp} is incompatible with {config.num_attention_heads} Q heads "
             f"(num_attention_heads must be divisible by tensor_parallel_size)"
         )
-    if (model_type != "deepseek_v3"
+    if (model_type not in ("deepseek_v3", "deepseek_v4")
             and hasattr(config, "num_key_value_heads")
             and config.num_key_value_heads % tp != 0):
         raise ValueError(

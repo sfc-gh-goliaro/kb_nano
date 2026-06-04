@@ -23,7 +23,7 @@ from ..L1.moe_grouped_gemm import (
 )
 from ..L1.moe_sum import MoeSum
 from ..L1.gelu_and_mul import GeluAndMul
-from ..L1.silu_and_mul import SiluAndMul
+from ..L1.silu_and_mul import SiluAndMul, SiluAndMulWithClamp
 from ..L1.silu_mul_quant_fp8 import SiluMulQuantFp8
 
 SPARSITY_FACTOR = 4
@@ -163,7 +163,8 @@ class FusedExperts(nn.Module):
       MoeAlign -> Triton grouped GEMM1 -> SiLU+mul -> FP8 quant -> Triton grouped GEMM2 -> MoeSum
     """
 
-    def __init__(self, activation: str = "silu", config_style: str = "legacy"):
+    def __init__(self, activation: str = "silu", config_style: str = "legacy",
+                 swiglu_limit: float | None = None):
         super().__init__()
         if activation not in ("silu", "gelu_tanh"):
             raise ValueError(f"Unsupported MoE activation: {activation}")
@@ -173,7 +174,12 @@ class FusedExperts(nn.Module):
         self.config_style = config_style
         self.moe_align = MoeAlign()
         self.moe_grouped_gemm = MoeGroupedGemm()
-        self.act_fn = SiluAndMul() if activation == "silu" else GeluAndMul("tanh")
+        if activation == "silu" and swiglu_limit is not None:
+            self.act_fn = SiluAndMulWithClamp(swiglu_limit)
+        elif activation == "silu":
+            self.act_fn = SiluAndMul()
+        else:
+            self.act_fn = GeluAndMul("tanh")
         self.moe_sum = MoeSum()
         self.per_token_group_quant_fp8 = PerTokenGroupQuantFp8()
         self.silu_mul_quant_fp8 = SiluMulQuantFp8()
