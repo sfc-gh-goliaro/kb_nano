@@ -37,7 +37,7 @@ def _detect_flashinfer_rope() -> bool:
 
 _USE_FLASHINFER_ROPE = _detect_flashinfer_rope()
 
-from .rotary_emb import RotaryEmbedding
+from .rotary_emb import RotaryEmbedding, _apply_rotary_embedding_cuda
 
 
 def _yarn_find_correction_dim(
@@ -141,7 +141,7 @@ class YaRNRotaryEmbedding(nn.Module):
             return RotaryEmbedding.forward_native(
                 positions, query, key, self.head_dim, cache,
             )
-        torch.ops.fastkernels_rope.rotary_embedding(
+        _apply_rotary_embedding_cuda(
             positions, query, key, self.head_dim, cache, True,
         )
         return query, key
@@ -218,7 +218,7 @@ class YarnRotaryEmbedding(nn.Module):
         cache = self.cos_sin_cache
         if cache.dtype != query.dtype:
             cache = cache.to(query.dtype)
-        torch.ops.fastkernels_rope.rotary_embedding(
+        _apply_rotary_embedding_cuda(
             positions, query, key, self.head_dim, cache, self.is_neox_style,
         )
         return query, key

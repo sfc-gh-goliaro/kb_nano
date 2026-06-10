@@ -7,8 +7,8 @@ tokenized exactly as that model expects.
 
 from __future__ import annotations
 
-from dataclasses import dataclass
 from collections.abc import Mapping
+from dataclasses import dataclass
 from typing import Any
 
 
@@ -16,12 +16,6 @@ DEFAULT_WORKLOAD_DATASETS: dict[str, str] = {
     "prefill-heavy": "sfc-gh-goliaro/wildchat-fastkernels-prefill-heavy-1k",
     "balanced": "sfc-gh-goliaro/wildchat-fastkernels-balanced-1k",
     "decode-heavy": "sfc-gh-goliaro/wildchat-fastkernels-decode-heavy-1k",
-}
-
-LEGACY_WORKLOAD_DATASETS: dict[str, str] = {
-    "prefill-heavy": "sfc-gh-goliaro/wildchat-prefill-heavy-1k",
-    "balanced": "sfc-gh-goliaro/fastkernels-balanced",
-    "decode-heavy": "sfc-gh-goliaro/wildchat-decode-heavy-1k",
 }
 
 
@@ -101,6 +95,17 @@ def _tokenize_response(tokenizer: Any, text: str) -> list[int]:
     return list(tokenizer.encode(text, add_special_tokens=False))
 
 
+def _download_dataset(dataset_id: str) -> str:
+    """Return a local snapshot path, downloading the public HF dataset if needed."""
+    from huggingface_hub import get_token, snapshot_download
+
+    return snapshot_download(
+        repo_id=dataset_id,
+        repo_type="dataset",
+        token=get_token(),
+    )
+
+
 def load_real_prompt_workload(
     scenario_name: str,
     tokenizer: Any,
@@ -119,13 +124,8 @@ def load_real_prompt_workload(
     from datasets import load_dataset
 
     dataset_id = dataset_name or DEFAULT_WORKLOAD_DATASETS[scenario_name]
-    try:
-        ds = load_dataset(dataset_id, split=split)
-    except Exception:
-        legacy_id = LEGACY_WORKLOAD_DATASETS.get(scenario_name)
-        if legacy_id is None or legacy_id == dataset_id:
-            raise
-        ds = load_dataset(legacy_id, split=split)
+    dataset_path = _download_dataset(dataset_id)
+    ds = load_dataset(dataset_path, split=split)
 
     if seed is not None:
         ds = ds.shuffle(seed=seed)

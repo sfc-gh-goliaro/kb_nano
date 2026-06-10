@@ -45,7 +45,8 @@ class LlamaAttention(nn.Module):
                  o_proj_bias: bool = False,              # GPT-OSS
                  use_sinks: bool = False,                # GPT-OSS
                  sliding_window: int | None = None,      # GPT-OSS
-                 layer_idx: int = 0):                     # GPT-OSS
+                 layer_idx: int = 0,                     # GPT-OSS
+                 disable_fa_scheduler: bool = False):
         super().__init__()
         tp = _tp_size()
         self.num_heads = num_attention_heads // tp
@@ -94,6 +95,7 @@ class LlamaAttention(nn.Module):
             sliding_window=per_layer_sw,
             sinks=self.sinks,
             attention_chunk_size=attention_chunk_size,
+            disable_fa_scheduler=disable_fa_scheduler,
         )
 
     def _sinks_weight_loader(self, param, loaded_weight):
@@ -111,6 +113,14 @@ class LlamaAttention(nn.Module):
         return scale.unsqueeze(-1)
 
     def forward(self, positions, hidden_states, rotary_emb=None):
+        attn_output = self.forward_attn_output(positions, hidden_states, rotary_emb)
+        return self.o_proj(attn_output)
+
+    def forward_local_o_proj(self, positions, hidden_states, rotary_emb=None):
+        attn_output = self.forward_attn_output(positions, hidden_states, rotary_emb)
+        return self.o_proj.forward_local(attn_output)
+
+    def forward_attn_output(self, positions, hidden_states, rotary_emb=None):
         N = hidden_states.shape[0]
         qkv = self.qkv_proj(hidden_states)
         q_size = self.num_heads * self.head_dim
@@ -137,5 +147,4 @@ class LlamaAttention(nn.Module):
         if self.attn_temperature_tuning:
             q = (q * self._get_attn_scale(positions)).to(q.dtype)
 
-        attn_output = self.attn(q, k, v)
-        return self.o_proj(attn_output)
+        return self.attn(q, k, v)

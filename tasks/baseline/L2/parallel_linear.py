@@ -325,11 +325,15 @@ class RowParallelLinear(nn.Module):
         param.data.copy_(loaded_weight)
 
     def forward(self, x):
+        y = self.forward_local(x)
+        if self.reduce_results and self.tp_size > 1:
+            y = self.allreduce(y)
+        return y
+
+    def forward_local(self, x):
         if self.use_fp8:
             y = self.linear_op(x, self.weight, self.weight_scale_inv,
                                self.bias if self.tp_rank == 0 else None)
         else:
             y = F.linear(x, self.weight, self.bias if self.tp_rank == 0 else None)
-        if self.reduce_results and self.tp_size > 1:
-            y = self.allreduce(y)
         return y

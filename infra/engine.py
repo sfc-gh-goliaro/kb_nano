@@ -41,7 +41,12 @@ from .mamba_state import (
     KimiLinearStateManager, Mamba2Metadata, MambaMetadata, MambaStateManager,
     build_chunk_metadata, compute_causal_conv1d_metadata,
 )
-from ..tasks.baseline.L1.allreduce import set_custom_ar
+from ..tasks.baseline.L1.allreduce import (
+    make_flashinfer_ar_workspace,
+    set_custom_ar,
+    set_flashinfer_ar_workspace,
+)
+from ..tasks.baseline.L1.vllm_greedy_sample import vllm_greedy_sample
 from .weight_loader import load_model
 
 MAX_MODEL_LEN = 131072
@@ -444,6 +449,28 @@ class ModelRunner:
                 getattr(self.config, "max_target_positions", self.max_model_len),
             )
 
+        self.flashinfer_ar_workspace = None
+        if world_size > 1:
+            hidden_size = getattr(self.config, "hidden_size", None)
+            if hidden_size is not None:
+                # Allocate enough FlashInfer allreduce/RMS workspace for the
+                # largest mixed/prefill batch we schedule.  vLLM's default
+                # 64 MiB cap falls back above ~11.6k GPT-OSS tokens; avoiding
+                # that fallback is important for the prefill-heavy workload.
+                max_tokens = int(os.environ.get(
+                    "FASTKERNELS_FLASHINFER_AR_MAX_TOKENS",
+                    str(self.max_num_batched_tokens),
+                ))
+                self.flashinfer_ar_workspace = make_flashinfer_ar_workspace(
+                    world_size=world_size,
+                    rank=rank,
+                    max_token_num=max_tokens,
+                    hidden_dim=hidden_size,
+                    dtype=dtype,
+                    group=dist.group.WORLD,
+                )
+                set_flashinfer_ar_workspace(self.flashinfer_ar_workspace)
+
         auto_register_no_compile_layers(self.model)
 
         self._compiled = False
@@ -554,6 +581,7 @@ class ModelRunner:
             self.custom_ar.close()
             self.custom_ar = None
             set_custom_ar(None)
+        set_flashinfer_ar_workspace(None)
         if self.world_size > 1:
             self.shm.close()
             dist.barrier()
@@ -594,7 +622,8 @@ class ModelRunner:
                     continue
                 n = int.from_bytes(buf[0:4], "little")
                 method_name, *args = pickle.loads(buf[4:n+4])
-                getattr(self, method_name)(*args)
+                with torch.inference_mode():
+                    getattr(self, method_name)(*args)
                 if method_name == "exit":
                     break
                 continue
@@ -3679,11 +3708,28 @@ class ModelRunner:
             dc_bt[i, :len(b)] = b
         dc_max_cl = int(dc_cl[:nd].max()) if nd > 0 else 0
 
-        logit_idx = []
-        for i in range(num_prefill_seqs):
-            logit_idx.append(pf_cu_q[i + 1] - 1)
-        for j in range(nd):
-            logit_idx.append(num_prefill_tokens + j)
+        decode_first = (
+            self.is_gpt_oss
+            and nd > 0
+            and num_prefill_tokens > 0
+            and not use_mrope
+        )
+        total_tokens = num_prefill_tokens + nd
+        if decode_first:
+            order = list(range(num_prefill_tokens, total_tokens))
+            order.extend(range(num_prefill_tokens))
+            input_ids = [input_ids[i] for i in order]
+            positions = [positions[i] for i in order]
+            slot_mapping = [slot_mapping[i] for i in order]
+            logit_idx = list(range(nd))
+            for i in range(num_prefill_seqs):
+                logit_idx.append(nd + pf_cu_q[i + 1] - 1)
+        else:
+            logit_idx = []
+            for i in range(num_prefill_seqs):
+                logit_idx.append(pf_cu_q[i + 1] - 1)
+            for j in range(nd):
+                logit_idx.append(num_prefill_tokens + j)
 
         chunked_context = None
         if self.is_deepseek_mla and num_prefill_seqs > 0:
@@ -3698,7 +3744,6 @@ class ModelRunner:
         # ``_forward_sparse_bf16``) is laid out as
         # ``[decode_seqs..., prefill_seqs...]``; hence prefill tokens map
         # to rows ``num_decode_seqs + r`` and decode tokens to row ``j``.
-        total_tokens = num_prefill_tokens + nd
         if total_tokens > 0:
             if num_prefill_tokens > 0:
                 pf_ids_np = np.repeat(
@@ -3708,7 +3753,10 @@ class ModelRunner:
             else:
                 pf_ids_np = np.empty(0, dtype=np.int32)
             dc_ids_np = np.arange(nd, dtype=np.int32)
-            req_id_np = np.concatenate([pf_ids_np, dc_ids_np])
+            req_id_np = (
+                np.concatenate([dc_ids_np, pf_ids_np])
+                if decode_first else np.concatenate([pf_ids_np, dc_ids_np])
+            )
             req_id_per_token = torch.from_numpy(req_id_np).pin_memory().cuda(
                 non_blocking=True,
             )
@@ -3733,6 +3781,7 @@ class ModelRunner:
             logit_indices=torch.tensor(logit_idx, dtype=torch.int64, pin_memory=True).cuda(non_blocking=True),
             chunked_context=chunked_context,
             req_id_per_token=req_id_per_token,
+            decode_first=decode_first,
         )
 
         input_ids_t = torch.tensor(input_ids, dtype=torch.int64, pin_memory=True).cuda(non_blocking=True)
@@ -3753,7 +3802,15 @@ class ModelRunner:
     def run_model(self, input_ids, positions, is_prefill, inputs_embeds=None,
                   deepstack_embeds=None, encoder_outputs=None,
                   skip_final_softcap=False):
-        if is_prefill or self.enforce_eager or input_ids.size(0) > self.graph_bs_list[-1]:
+        disable_cudagraph_replay = (
+            os.environ.get("FASTKERNELS_DISABLE_CUDAGRAPH_REPLAY", "0") == "1"
+        )
+        if (
+            is_prefill
+            or self.enforce_eager
+            or disable_cudagraph_replay
+            or input_ids.size(0) > self.graph_bs_list[-1]
+        ):
             model = self.model
             if is_prefill and self.is_bitnet and self._compiled:
                 # BitNet's BitLinear switches between bf16 fake-quant prefill
@@ -3841,7 +3898,10 @@ class ModelRunner:
         """
         n, ids_np, pos_np, sm_np, cl_np, bt_np = decode_data
 
-        if self.enforce_eager:
+        if (
+            self.enforce_eager
+            or os.environ.get("FASTKERNELS_DISABLE_CUDAGRAPH_REPLAY", "0") == "1"
+        ):
             return self._run_decode_greedy_eager(n, ids_np, pos_np, sm_np, cl_np, bt_np)
         if n > self.graph_bs_list[-1]:
             return self._run_decode_greedy_eager(n, ids_np, pos_np, sm_np, cl_np, bt_np)
@@ -3880,7 +3940,10 @@ class ModelRunner:
         """
         n, ids_np, pos_np, sm_np, cl_np, bt_np = decode_data
 
-        if self.enforce_eager:
+        if (
+            self.enforce_eager
+            or os.environ.get("FASTKERNELS_DISABLE_CUDAGRAPH_REPLAY", "0") == "1"
+        ):
             result = self._run_decode_greedy_eager(n, ids_np, pos_np, sm_np, cl_np, bt_np)
             if result is not None:
                 main_stream = torch.cuda.current_stream()
@@ -3953,6 +4016,26 @@ class ModelRunner:
                 hidden = model(input_ids, positions)
             lm_head = model.lm_head
             logits = lm_head.linear_op(hidden, lm_head.embedding_op.emb.weight).float()
+            if self.is_gpt_oss:
+                if self.world_size == 1:
+                    sample_logits = logits[:, :self._greedy_org_vocab_size]
+                else:
+                    parts = [p[:n] for p in self._greedy_full_logits_parts]
+                    dist.all_gather(parts, logits)
+                    full_logits = self._greedy_full_logits[:n]
+                    torch.cat(parts, dim=-1, out=full_logits)
+                    sample_logits = full_logits[:, :self._greedy_org_vocab_size]
+                if self.rank == 0:
+                    return vllm_greedy_sample(
+                        sample_logits,
+                        local_argmax=self._greedy_vllm_argmax,
+                        local_max=self._greedy_vllm_max,
+                        expanded_idx_mapping=self._greedy_sample_idx_mapping,
+                        temperature=self._greedy_sample_temperature,
+                        seeds=self._greedy_sample_seeds,
+                        positions=self._greedy_sample_positions,
+                    )
+                return None
             max_vals, max_idxs = logits.max(dim=-1)
         finally:
             if use_bitnet_eager_model:
@@ -3983,6 +4066,14 @@ class ModelRunner:
             for _ in range(self.world_size)
         ]
         self._greedy_all_info = torch.zeros(self.world_size, max_bs, 2, dtype=torch.float32, device=dev)
+        self._greedy_tie_info = torch.zeros(max_bs, 3, dtype=torch.float32, device=dev)
+        self._greedy_tie_gathered = [
+            torch.zeros(max_bs, 3, dtype=torch.float32, device=dev)
+            for _ in range(self.world_size)
+        ]
+        self._greedy_tie_all_info = torch.zeros(
+            self.world_size, max_bs, 3, dtype=torch.float32, device=dev,
+        )
         self._greedy_arange = torch.arange(max_bs, device=dev)
 
         max_num_blocks = (self.max_model_len + BLOCK_SIZE - 1) // BLOCK_SIZE
@@ -4014,6 +4105,39 @@ class ModelRunner:
         self._copy_stream = torch.cuda.Stream(device=dev)
         self._copy_event = torch.cuda.Event()
 
+        if self.is_gpt_oss:
+            lm_head = self.model.lm_head
+            local_vocab = lm_head.per_partition
+            full_partition_vocab = local_vocab * self.world_size
+            org_vocab = getattr(lm_head, "org_vocab_size", full_partition_vocab)
+            self._greedy_org_vocab_size = org_vocab
+            self._greedy_full_logits_parts = [
+                torch.empty(max_bs, local_vocab, dtype=torch.float32, device=dev)
+                for _ in range(self.world_size)
+            ]
+            self._greedy_full_logits = torch.empty(
+                max_bs, full_partition_vocab, dtype=torch.float32, device=dev,
+            )
+            sample_blocks = (org_vocab + 1023) // 1024
+            self._greedy_vllm_argmax = torch.empty(
+                max_bs, sample_blocks, dtype=torch.int64, device=dev,
+            )
+            self._greedy_vllm_max = torch.empty(
+                max_bs, sample_blocks, dtype=torch.float32, device=dev,
+            )
+            self._greedy_sample_idx_mapping = torch.zeros(
+                max_bs, dtype=torch.int32, device=dev,
+            )
+            self._greedy_sample_temperature = torch.zeros(
+                max_bs, dtype=torch.float32, device=dev,
+            )
+            self._greedy_sample_seeds = torch.zeros(
+                max_bs, dtype=torch.int64, device=dev,
+            )
+            self._greedy_sample_positions = torch.zeros(
+                max_bs, dtype=torch.int64, device=dev,
+            )
+
     def _greedy_from_hidden(self, n):
         """Use CUDA-graph-captured LM head + local argmax, then allgather.
         
@@ -4021,6 +4145,9 @@ class ModelRunner:
         Caller must call .tolist() to sync.
         """
         gv = self.graph_vars
+
+        if self.is_gpt_oss and self._compiled:
+            return self._greedy_from_hidden_stable(n)
 
         if self.world_size == 1:
             return gv["lm_max_idxs"][:n]
@@ -4039,6 +4166,37 @@ class ModelRunner:
         torch.stack(gathered, out=all_info[:, :n])
         best_rank = all_info[:, :n, 0].argmax(dim=0)
         token_ids = all_info[:, :n, 1].long()[best_rank, self._greedy_arange[:n]]
+
+        if self.rank == 0:
+            return token_ids
+        return None
+
+    def _greedy_from_hidden_stable(self, n):
+        """vLLM-compatible compiled GPT-OSS greedy sampling."""
+        gv = self.graph_vars
+        local_logits = gv["lm_logits"][:n]
+
+        if self.world_size == 1:
+            sample_logits = local_logits[:, :self._greedy_org_vocab_size]
+        else:
+            parts = [p[:n] for p in self._greedy_full_logits_parts]
+            dist.all_gather(parts, local_logits)
+            full_logits = self._greedy_full_logits[:n]
+            torch.cat(parts, dim=-1, out=full_logits)
+            sample_logits = full_logits[:, :self._greedy_org_vocab_size]
+
+        if self.rank != 0:
+            return None
+
+        token_ids = vllm_greedy_sample(
+            sample_logits,
+            local_argmax=self._greedy_vllm_argmax,
+            local_max=self._greedy_vllm_max,
+            expanded_idx_mapping=self._greedy_sample_idx_mapping,
+            temperature=self._greedy_sample_temperature,
+            seeds=self._greedy_sample_seeds,
+            positions=self._greedy_sample_positions,
+        )
 
         if self.rank == 0:
             return token_ids
@@ -4765,8 +4923,11 @@ class ModelRunner:
 
         lm_head = self.model.lm_head
         vocab_per_rank = lm_head.per_partition
-        lm_logits = torch.zeros(max_bs, vocab_per_rank)
-        lm_max_vals = torch.zeros(max_bs)
+        # Match the eager/vLLM greedy path: compute argmax on fp32 logits.
+        # Keeping this buffer in the default bf16 dtype can flip close logits
+        # during CUDA-graph decode even when the hidden states are aligned.
+        lm_logits = torch.zeros(max_bs, vocab_per_rank, dtype=torch.float32)
+        lm_max_vals = torch.zeros(max_bs, dtype=torch.float32)
         lm_max_idxs = torch.zeros(max_bs, dtype=torch.int64)
 
         ar_ctx = self.custom_ar.capture() if self.custom_ar is not None else nullcontext()
@@ -4810,9 +4971,10 @@ class ModelRunner:
         else:
             outputs[:largest_bs] = self.model(warmup_ids, warmup_pos)
         lm_logits[:largest_bs] = lm_head.linear_op(
-            outputs[:largest_bs], lm_head.embedding_op.emb.weight)
-        lm_max_vals[:largest_bs], lm_max_idxs[:largest_bs] = \
-            lm_logits[:largest_bs].max(dim=-1)
+            outputs[:largest_bs], lm_head.embedding_op.emb.weight).float()
+        if not self.is_gpt_oss:
+            lm_max_vals[:largest_bs], lm_max_idxs[:largest_bs] = \
+                lm_logits[:largest_bs].max(dim=-1)
         reset_context()
         torch.cuda.synchronize()
 
@@ -4868,8 +5030,9 @@ class ModelRunner:
                 else:
                     outputs[:bs] = self.model(ids_slice, pos_slice)
                 lm_logits[:bs] = lm_head.linear_op(
-                    outputs[:bs], lm_head.embedding_op.emb.weight)
-                lm_max_vals[:bs], lm_max_idxs[:bs] = lm_logits[:bs].max(dim=-1)
+                    outputs[:bs], lm_head.embedding_op.emb.weight).float()
+                if not self.is_gpt_oss:
+                    lm_max_vals[:bs], lm_max_idxs[:bs] = lm_logits[:bs].max(dim=-1)
 
                 with torch.cuda.graph(graph, self.graph_pool):
                     if ie_slice is not None:
@@ -4881,8 +5044,9 @@ class ModelRunner:
                     else:
                         outputs[:bs] = self.model(ids_slice, pos_slice)
                     lm_logits[:bs] = lm_head.linear_op(
-                        outputs[:bs], lm_head.embedding_op.emb.weight)
-                    lm_max_vals[:bs], lm_max_idxs[:bs] = lm_logits[:bs].max(dim=-1)
+                        outputs[:bs], lm_head.embedding_op.emb.weight).float()
+                    if not self.is_gpt_oss:
+                        lm_max_vals[:bs], lm_max_idxs[:bs] = lm_logits[:bs].max(dim=-1)
 
                 if self.graph_pool is None:
                     self.graph_pool = graph.pool()
@@ -5027,6 +5191,9 @@ class LlamaEngine:
             torch.cuda.empty_cache()
 
     def _sample_greedy(self, logits):
+        mr = getattr(self, "model_runner", None)
+        if mr is not None and getattr(mr, "is_gpt_oss", False):
+            return vllm_greedy_sample(logits.float()).tolist()
         return logits.argmax(dim=-1).tolist()
 
     def _sample(self, logits, params):
@@ -6234,6 +6401,11 @@ class LlamaEngine:
 
         use_greedy = (sp_list[0].temperature == 0.0
                       and not collect_logits)
+        gpt_oss_prefill_first = (
+            use_greedy
+            and getattr(self.model_runner, "is_gpt_oss", False)
+            and os.environ.get("FASTKERNELS_GPTOSS_PREFILL_FIRST", "0") == "1"
+        )
         is_bitnet = getattr(
             self.model_runner.config, "model_type", "",
         ) == "bitnet"
@@ -6352,6 +6524,7 @@ class LlamaEngine:
             return (
                 running
                 and use_greedy
+                and (not gpt_oss_prefill_first or (not waiting and not prefilling))
                 and _prefill_blocked_by_capacity()
             )
 
@@ -6593,6 +6766,15 @@ class LlamaEngine:
                 # the prefill path and break alignment. Try prefill first; if
                 # no prefill work can be scheduled this step, fall back to
                 # pure decode below to avoid scheduler empty-spin/deadlock.
+                pass
+            elif gpt_oss_prefill_first and (waiting or prefilling):
+                # GPT-OSS is very sensitive to small mixed prefill/decode
+                # numerical differences: high-concurrency runs can diverge
+                # after a few decode tokens even though pure prefill and pure
+                # decode align with vLLM. Drain prefill admission first, then
+                # run greedy decode through the vLLM-compatible graph/sampler
+                # path. This remains bounded by the existing block budget and
+                # only affects deterministic GPT-OSS benchmarking.
                 pass
             else:
                 _schedule_decode_tokens()
@@ -6890,8 +7072,12 @@ class LlamaEngine:
                         use_greedy and not collect_logits,
                     )
                 if logits is not None:
-                    pf_logits = logits[:n_pf]
-                    dc_logits = logits[n_pf:]
+                    if getattr(self.model_runner, "is_gpt_oss", False):
+                        dc_logits = logits[:n_dc]
+                        pf_logits = logits[n_dc:]
+                    else:
+                        pf_logits = logits[:n_pf]
+                        dc_logits = logits[n_pf:]
 
                     self._process_prefill_logits(
                         pf_logits, prefill_seqs, prefill_chunk_sizes,

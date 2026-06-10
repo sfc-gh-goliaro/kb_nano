@@ -10,6 +10,8 @@ No dequantization is performed.
 
 from __future__ import annotations
 
+import os
+
 import torch
 import torch.nn as nn
 
@@ -191,14 +193,13 @@ class GptOssMoE(nn.Module):
         )
         self._processed = True
 
-    def forward_impl(self, hidden_states: torch.Tensor) -> torch.Tensor:
+    def _experts_local_impl(
+        self,
+        hidden_states: torch.Tensor,
+        router_logits: torch.Tensor,
+    ) -> torch.Tensor:
         if not self._processed:
             self.process_weights_after_loading()
-
-        orig_shape = hidden_states.shape
-        hidden_states = hidden_states.view(-1, self.hidden_size)
-
-        router_logits = self.router(hidden_states)
 
         output = self.mxfp4_moe(
             hidden_states=hidden_states,
@@ -211,10 +212,36 @@ class GptOssMoE(nn.Module):
             apply_router_weight_on_input=False,
         )
 
+        return output
+
+    def _forward_local_impl(self, hidden_states: torch.Tensor) -> torch.Tensor:
+        orig_shape = hidden_states.shape
+        hidden_states = hidden_states.view(-1, self.hidden_size)
+        router_logits = self.router(hidden_states)
+        output = self._experts_local_impl(hidden_states, router_logits)
+        return output.view(orig_shape)
+
+    def forward_local(self, hidden_states: torch.Tensor) -> torch.Tensor:
+        if (
+            self._use_custom_op
+            and os.environ.get("FASTKERNELS_GPTOSS_MOE_CUSTOM_OP", "1") == "1"
+        ):
+            orig_shape = hidden_states.shape
+            hidden_states = hidden_states.view(-1, self.hidden_size)
+            router_logits = self.router(hidden_states)
+            output = torch.ops.fastkernels.moe_experts_local(
+                hidden_states, router_logits, self._layer_name,
+            )
+            return output.view(orig_shape)
+        return self._forward_local_impl(hidden_states)
+
+    def forward_impl(self, hidden_states: torch.Tensor) -> torch.Tensor:
+        output = self._forward_local_impl(hidden_states)
+
         if self.tp_size > 1:
             output = self.allreduce(output)
 
-        return output.view(orig_shape)
+        return output
 
     def forward(self, hidden_states: torch.Tensor) -> torch.Tensor:
         if self._use_custom_op:

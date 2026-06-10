@@ -32,12 +32,12 @@ class AttnBackendConfig:
     """Selects attention backend and associated KV cache parameters.
 
     Blackwell (sm_100+) uses TRTLLM-gen kernels via FlashInfer (HND layout,
-    block_size=16).  Hopper and below use flash_attn (NHD layout,
-    block_size=256).  Auto-detection picks the optimal backend for the
-    current GPU.
+    block_size=16).  Hopper and below use flash_attn (NHD layout).  vLLM's
+    default KV cache block size is 16, so use 16 here as well to keep
+    paged-attention layout and FA scheduler inputs aligned.
     """
     backend: str = "flash_attn"
-    block_size: int = 256
+    block_size: int = 16
     kv_layout: str = "NHD"
 
     @classmethod
@@ -147,6 +147,7 @@ class Context:
     num_prefill_tokens: int = 0
     num_decode_tokens: int = 0
     num_prefill_seqs: int = 0
+    mixed_decode_first: bool = False
 
     # Prefill-specific metadata (indexed over prefill seqs only)
     prefill_cu_seqlens_q: torch.Tensor | None = None
@@ -343,6 +344,7 @@ def set_mixed_context(
     logit_indices,
     chunked_context=None,
     req_id_per_token=None,
+    decode_first: bool = False,
 ):
     global _CONTEXT
     _CONTEXT = Context(
@@ -351,6 +353,7 @@ def set_mixed_context(
         num_prefill_tokens=num_prefill_tokens,
         num_decode_tokens=num_decode_tokens,
         num_prefill_seqs=num_prefill_seqs,
+        mixed_decode_first=decode_first,
         prefill_cu_seqlens_q=prefill_cu_seqlens_q,
         prefill_cu_seqlens_k=prefill_cu_seqlens_k,
         prefill_max_seqlen_q=prefill_max_seqlen_q,

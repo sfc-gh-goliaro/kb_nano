@@ -33,6 +33,9 @@ _TRITON_MIN_LAUNCH_GRID_SIZE_2D = 128
 _TRITON_NUM_PAR_SOFTMAX_SEGMENTS = 16
 
 try:
+    from vllm.v1.attention.backends.fa_utils import (
+        get_scheduler_metadata as _fa_get_scheduler_metadata,
+    )
     from vllm.v1.attention.ops.triton_unified_attention import (
         unified_attention as _triton_unified_attention,
     )
@@ -40,6 +43,7 @@ try:
 
     _TRITON_UNIFIED_AVAILABLE = True
 except Exception:  # pragma: no cover - optional vLLM runtime dependency.
+    _fa_get_scheduler_metadata = None
     _triton_unified_attention = None
     _VllmKVQuantMode = None
     _TRITON_UNIFIED_AVAILABLE = False
@@ -179,7 +183,8 @@ class Attention(nn.Module):
                  num_kv_heads: int | None = None,
                  sliding_window: int | None = None,
                  sinks: torch.nn.Parameter | None = None,
-                 attention_chunk_size: int | None = None):
+                 attention_chunk_size: int | None = None,
+                 disable_fa_scheduler: bool = False):
         super().__init__()
         self.num_heads = num_heads
         self.head_size = head_size
@@ -188,6 +193,7 @@ class Attention(nn.Module):
         self.sliding_window = sliding_window
         self.sinks = sinks
         self.attention_chunk_size = attention_chunk_size
+        self.disable_fa_scheduler = disable_fa_scheduler
 
         # TODO(tech-debt): For chunked local attention layers the KV cache
         # could be limited to ``attention_chunk_size`` tokens per layer instead
@@ -236,9 +242,11 @@ class Attention(nn.Module):
             from ..L1.flash_attn_decode import FlashAttnDecode
             self.prefill_op = FlashAttnPrefill(
                 self.num_heads, self.num_kv_heads, head_size,
+                has_sinks=sinks is not None,
             )
             self.decode_op = FlashAttnDecode(
                 self.num_heads, self.num_kv_heads, head_size,
+                has_sinks=sinks is not None,
             )
 
         from ..L1.tree_attn_prefill import TreeAttnPrefill
@@ -331,19 +339,27 @@ class Attention(nn.Module):
                 )
 
             if bt is not None:
+                descale = self._fa3_descale_kwargs(cu_q.shape[0] - 1)
+                sched = self._fa3_scheduler_kwargs(
+                    q, cu_q, msq, cu_k[1:] - cu_k[:-1], msk, True,
+                )
                 return self.prefill_op(
                     q, k_cache, v_cache,
                     cu_seqlens_q=cu_q, cu_seqlens_k=cu_k,
                     max_seqlen_q=msq, max_seqlen_k=msk,
                     softmax_scale=self.scale, causal=True,
-                    block_table=bt, **fa_extra,
+                    block_table=bt, **descale, **sched, **fa_extra,
                 )
+            descale = self._fa3_descale_kwargs(cu_q.shape[0] - 1)
+            sched = self._fa3_scheduler_kwargs(
+                q, cu_q, msq, cu_k[1:] - cu_k[:-1], msk, True,
+            )
             return self.prefill_op(
                 q, k, v,
                 cu_seqlens_q=cu_q, cu_seqlens_k=cu_k,
                 max_seqlen_q=msq, max_seqlen_k=msk,
                 softmax_scale=self.scale, causal=True,
-                **fa_extra,
+                **descale, **sched, **fa_extra,
             )
 
         cache_seqlens = ctx.context_lens
@@ -355,11 +371,17 @@ class Attention(nn.Module):
                 cache_seqlens, bt, self.attention_chunk_size, self._block_size,
             )
 
+        descale = self._fa3_descale_kwargs(cache_seqlens.shape[0])
+        sched = self._fa3_scheduler_kwargs(q, self._get_decode_cu_seqlens_q(
+            q.shape[0], q.device), 1, cache_seqlens, max_ctx, True)
+        if "num_splits" not in sched:
+            sched["num_splits"] = 32 if torch.cuda.is_current_stream_capturing() else None
         return self.decode_op(
             q, k_cache, v_cache,
             cache_seqlens=cache_seqlens, block_table=bt,
             softmax_scale=self.scale, causal=True,
-            max_seq_len=max_ctx, **fa_extra,
+            max_seq_len=max_ctx,
+            **descale, **sched, **fa_extra,
         )
 
     def _can_use_triton_unified(
@@ -393,6 +415,44 @@ class Attention(nn.Module):
         num_kv_heads: int,
     ) -> torch.Tensor:
         return self._triton_kv_scale.expand(num_seqs, num_kv_heads)
+
+    def _fa3_descale_kwargs(self, num_seqs: int) -> dict[str, torch.Tensor]:
+        scale = self._triton_kv_descale(num_seqs, self.num_kv_heads)
+        return {"q_descale": scale, "k_descale": scale, "v_descale": scale}
+
+    def _fa3_scheduler_kwargs(
+        self,
+        q: torch.Tensor,
+        cu_seqlens_q: torch.Tensor,
+        max_seqlen_q: int,
+        cache_seqlens: torch.Tensor,
+        max_seqlen_k: int,
+        causal: bool,
+    ) -> dict[str, torch.Tensor | int]:
+        if (
+            _fa_get_scheduler_metadata is None
+            or self.disable_fa_scheduler
+            or self._fa3_window_size != (-1, -1)
+            or getattr(self.prefill_op, "fa_version", None) != 3
+        ):
+            return {}
+        num_splits = 32 if torch.cuda.is_current_stream_capturing() else 0
+        metadata = _fa_get_scheduler_metadata(
+            batch_size=cache_seqlens.shape[0],
+            max_seqlen_q=max_seqlen_q,
+            max_seqlen_k=max_seqlen_k,
+            num_heads_q=self.num_heads,
+            num_heads_kv=self.num_kv_heads,
+            headdim=self.head_size,
+            cache_seqlens=cache_seqlens,
+            qkv_dtype=q.dtype,
+            cu_seqlens_q=cu_seqlens_q,
+            page_size=self._block_size,
+            causal=causal,
+            window_size=self._fa3_window_size,
+            num_splits=num_splits,
+        )
+        return {"scheduler_metadata": metadata, "num_splits": num_splits}
 
     def _get_triton_3d_buffers(
         self,
@@ -599,6 +659,59 @@ class Attention(nn.Module):
         nd = ctx.num_decode_tokens
         out = torch.empty_like(q)
 
+        if getattr(ctx, "mixed_decode_first", False):
+            if nd > 0:
+                cache_seqlens = ctx.decode_context_lens
+                bt = ctx.decode_block_tables
+                max_ctx = ctx.decode_max_context_len
+
+                if self.attention_chunk_size is not None:
+                    cache_seqlens, bt, max_ctx = _chunked_decode_remap(
+                        cache_seqlens, bt,
+                        self.attention_chunk_size, self._block_size,
+                    )
+
+                descale = self._fa3_descale_kwargs(cache_seqlens.shape[0])
+                sched = self._fa3_scheduler_kwargs(
+                    q[:nd], self._get_decode_cu_seqlens_q(nd, q.device),
+                    1, cache_seqlens, max_ctx, True,
+                )
+                if "num_splits" not in sched:
+                    sched["num_splits"] = 32 if torch.cuda.is_current_stream_capturing() else None
+                out[:nd] = self.decode_op(
+                    q[:nd], k_cache, v_cache,
+                    cache_seqlens=cache_seqlens, block_table=bt,
+                    softmax_scale=self.scale, causal=True,
+                    max_seq_len=max_ctx,
+                    **descale, **sched, **fa_extra,
+                )
+
+            if np_ > 0:
+                cu_q = ctx.prefill_cu_seqlens_q
+                cu_k = ctx.prefill_cu_seqlens_k
+                msq = ctx.prefill_max_seqlen_q
+                msk = ctx.prefill_max_seqlen_k
+                bt = ctx.prefill_block_tables
+
+                if self.attention_chunk_size is not None:
+                    cu_q, cu_k, msq, msk, bt = _chunked_prefill_remap(
+                        cu_q, cu_k, bt, self.attention_chunk_size, self._block_size,
+                    )
+
+                pq = q[nd:].contiguous() if self._use_trtllm else q[nd:]
+                descale = self._fa3_descale_kwargs(cu_q.shape[0] - 1)
+                sched = self._fa3_scheduler_kwargs(
+                    pq, cu_q, msq, cu_k[1:] - cu_k[:-1], msk, True,
+                )
+                out[nd:] = self.prefill_op(
+                    pq, k_cache, v_cache,
+                    cu_seqlens_q=cu_q, cu_seqlens_k=cu_k,
+                    max_seqlen_q=msq, max_seqlen_k=msk,
+                    softmax_scale=self.scale, causal=True,
+                    block_table=bt, **descale, **sched, **fa_extra,
+                )
+            return out
+
         if np_ > 0:
             cu_q = ctx.prefill_cu_seqlens_q
             cu_k = ctx.prefill_cu_seqlens_k
@@ -612,12 +725,16 @@ class Attention(nn.Module):
                 )
 
             pq = q[:np_].contiguous() if self._use_trtllm else q[:np_]
+            descale = self._fa3_descale_kwargs(cu_q.shape[0] - 1)
+            sched = self._fa3_scheduler_kwargs(
+                pq, cu_q, msq, cu_k[1:] - cu_k[:-1], msk, True,
+            )
             out[:np_] = self.prefill_op(
                 pq, k_cache, v_cache,
                 cu_seqlens_q=cu_q, cu_seqlens_k=cu_k,
                 max_seqlen_q=msq, max_seqlen_k=msk,
                 softmax_scale=self.scale, causal=True,
-                block_table=bt, **fa_extra,
+                block_table=bt, **descale, **sched, **fa_extra,
             )
 
         if nd > 0:
@@ -631,11 +748,19 @@ class Attention(nn.Module):
                     self.attention_chunk_size, self._block_size,
                 )
 
+            descale = self._fa3_descale_kwargs(cache_seqlens.shape[0])
+            sched = self._fa3_scheduler_kwargs(
+                q[np_:], self._get_decode_cu_seqlens_q(nd, q.device),
+                1, cache_seqlens, max_ctx, True,
+            )
+            if "num_splits" not in sched:
+                sched["num_splits"] = 32 if torch.cuda.is_current_stream_capturing() else None
             out[np_:] = self.decode_op(
                 q[np_:], k_cache, v_cache,
                 cache_seqlens=cache_seqlens, block_table=bt,
                 softmax_scale=self.scale, causal=True,
-                max_seq_len=max_ctx, **fa_extra,
+                max_seq_len=max_ctx,
+                **descale, **sched, **fa_extra,
             )
         return out
 

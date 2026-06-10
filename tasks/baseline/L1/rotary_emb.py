@@ -14,6 +14,31 @@ import torch.nn as nn
 
 from .csrc import _C
 
+try:
+    from vllm import _custom_ops as _vllm_ops
+    _VLLM_ROTARY_AVAILABLE = hasattr(_vllm_ops, "rotary_embedding")
+except Exception:  # pragma: no cover - optional vLLM runtime dependency.
+    _vllm_ops = None
+    _VLLM_ROTARY_AVAILABLE = False
+
+
+def _apply_rotary_embedding_cuda(
+    positions,
+    query,
+    key,
+    head_size,
+    cos_sin_cache,
+    is_neox,
+):
+    if _VLLM_ROTARY_AVAILABLE:
+        _vllm_ops.rotary_embedding(
+            positions, query, key, head_size, cos_sin_cache, is_neox,
+        )
+    else:
+        _C.rotary_embedding(
+            positions, query, key, head_size, cos_sin_cache, is_neox,
+        )
+
 # ---------------------------------------------------------------------------
 # Register in-place rotary embedding op for torch.compile compatibility.
 # Uses Tensor(a!) annotations so Inductor auto-functionalizes correctly.
@@ -30,7 +55,9 @@ _lib.define(
 def _rotary_embedding_impl(
     positions, query, key, head_size, cos_sin_cache, is_neox,
 ):
-    _C.rotary_embedding(positions, query, key, head_size, cos_sin_cache, is_neox)
+    _apply_rotary_embedding_cuda(
+        positions, query, key, head_size, cos_sin_cache, is_neox,
+    )
 
 _lib.impl("rotary_embedding", _rotary_embedding_impl, "CUDA")
 
@@ -169,7 +196,7 @@ class RotaryEmbedding(nn.Module):
         cache = self.cos_sin_cache
         if cache.dtype != query.dtype:
             cache = cache.to(query.dtype)
-        torch.ops.fastkernels_rope.rotary_embedding(
+        _apply_rotary_embedding_cuda(
             positions, query, key, self.head_dim, cache, self.is_neox_style,
         )
         return query, key

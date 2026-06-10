@@ -25,6 +25,7 @@ from __future__ import annotations
 
 import functools
 import importlib.util
+import inspect
 import os
 import sys
 from dataclasses import dataclass
@@ -183,6 +184,15 @@ def _pack_bitmatrix_kernel(
 def _routing_from_bitmatrix(bitmatrix, expt_scal, expt_indx, n_expts_tot, n_expts_act):
     """Build (RoutingData, GatherIndx, ScatterIndx) from a packed bitmatrix."""
     _ensure_triton_kernels_on_path()
+    try:
+        from triton_kernels.routing import routing_from_bitmatrix
+    except ImportError:
+        routing_from_bitmatrix = None
+    if routing_from_bitmatrix is not None:
+        return routing_from_bitmatrix(
+            bitmatrix, expt_scal, expt_indx, n_expts_tot, n_expts_act,
+        )
+
     from triton_kernels.matmul_ogs import GatherIndx, RoutingData, ScatterIndx
     from triton_kernels.tensor import SparseMatrix, make_ragged_tensor_metadata
 
@@ -214,10 +224,16 @@ def _routing_from_logits(logits: torch.Tensor, n_expts_act: int, sm_first: bool)
     if sm_first:
         logits = torch.softmax(logits, dim=-1)
     sparse_logits = topk(logits, n_expts_act, apply_softmax=not sm_first)
+    if isinstance(sparse_logits, tuple):
+        expt_scal, expt_indx, bitmatrix = sparse_logits
+    else:
+        expt_scal = sparse_logits.vals
+        expt_indx = sparse_logits.indx
+        bitmatrix = sparse_logits.mask
     return _routing_from_bitmatrix(
-        sparse_logits.mask,
-        sparse_logits.vals,
-        sparse_logits.indx,
+        bitmatrix,
+        expt_scal,
+        expt_indx,
         logits.shape[-1],
         n_expts_act,
     )
@@ -275,15 +291,22 @@ def _fused_experts(
     intermediate_cache = _resize_cache(intermediate_cache, (batch_dim, M * topk, N // 2))
     output_tensor = _resize_cache(output_tensor, (batch_dim, M, K))
 
-    act = FusedActivation(
-        FnSpecs(
-            "swiglu",
-            triton_kernels.swiglu.swiglu_fn,
-            ("alpha", "limit"),
-            reduction_n=2,
-        ),
-        (swiglu_alpha, swiglu_limit),
-    )
+    if "reduction_n" in inspect.signature(FnSpecs).parameters:
+        act = FusedActivation(
+            FnSpecs(
+                "swiglu",
+                triton_kernels.swiglu.swiglu_fn,
+                ("alpha", "limit"),
+                reduction_n=2,
+            ),
+            (swiglu_alpha, swiglu_limit),
+        )
+    else:
+        act = FusedActivation(
+            FnSpecs("swiglu", triton_kernels.swiglu.swiglu_fn, ("alpha", "limit")),
+            (swiglu_alpha, swiglu_limit),
+            2,
+        )
     gammas = routing_data.gate_scal if routing_data else None
 
     matmul_ogs(
@@ -377,6 +400,26 @@ class Mxfp4MoE(nn.Module):
         and ``quant_config`` must carry the matching precision configs and
         expert biases. ``hidden_states`` must be bfloat16 and 2D.
         """
+        try:
+            from vllm.model_executor.layers.fused_moe.activation import MoEActivation
+            from vllm.model_executor.layers.fused_moe.experts.gpt_oss_triton_kernels_moe import (
+                triton_kernel_moe_forward,
+            )
+        except Exception:
+            triton_kernel_moe_forward = None
+        if triton_kernel_moe_forward is not None:
+            return triton_kernel_moe_forward(
+                hidden_states=hidden_states,
+                w1=w1,
+                w2=w2,
+                gating_output=gating_output,
+                topk=topk,
+                renormalize=renormalize,
+                activation=MoEActivation.SWIGLUOAI,
+                quant_config=quant_config,
+                apply_router_weight_on_input=apply_router_weight_on_input,
+            )
+
         routing_data, gather_idx, scatter_idx = _routing_from_logits(
             gating_output, topk, sm_first=not renormalize
         )

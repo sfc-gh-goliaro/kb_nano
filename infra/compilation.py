@@ -69,6 +69,8 @@ SPLITTING_OPS: list[str] = [
     "fastkernels::sparse_attn_indexer",
 ]
 
+VLLM_INDUCTOR_OPTIONS: dict[str, Any] = {}
+
 
 def _moe_forward_impl(
     hidden_states: torch.Tensor,
@@ -76,6 +78,23 @@ def _moe_forward_impl(
 ) -> torch.Tensor:
     layer = get_no_compile_layers()[layer_name]
     return layer.forward_impl(hidden_states)
+
+
+def _moe_forward_local_impl(
+    hidden_states: torch.Tensor,
+    layer_name: str,
+) -> torch.Tensor:
+    layer = get_no_compile_layers()[layer_name]
+    return layer._forward_local_impl(hidden_states)
+
+
+def _moe_experts_local_impl(
+    hidden_states: torch.Tensor,
+    router_logits: torch.Tensor,
+    layer_name: str,
+) -> torch.Tensor:
+    layer = get_no_compile_layers()[layer_name]
+    return layer._experts_local_impl(hidden_states, router_logits)
 
 
 def _moe_forward_fake(
@@ -203,9 +222,25 @@ def ensure_custom_ops_registered() -> None:
     )
     lib.impl("moe_forward", _moe_forward_impl, "CUDA")
     lib.impl("moe_forward", _moe_forward_impl, "CPU")
+    lib.define(
+        "moe_forward_local(Tensor hidden_states, str layer_name) -> Tensor"
+    )
+    lib.impl("moe_forward_local", _moe_forward_local_impl, "CUDA")
+    lib.impl("moe_forward_local", _moe_forward_local_impl, "CPU")
+    lib.define(
+        "moe_experts_local(Tensor hidden_states, Tensor router_logits, "
+        "str layer_name) -> Tensor"
+    )
+    lib.impl("moe_experts_local", _moe_experts_local_impl, "CUDA")
+    lib.impl("moe_experts_local", _moe_experts_local_impl, "CPU")
 
     abstract_lib = torch.library.Library("fastkernels", "IMPL", "Meta")
     abstract_lib.impl("moe_forward", _moe_forward_fake)
+    abstract_lib.impl("moe_forward_local", _moe_forward_fake)
+    abstract_lib.impl(
+        "moe_experts_local",
+        lambda hidden_states, router_logits, layer_name: torch.empty_like(hidden_states),
+    )
 
     lib.define(
         "gemma4_moe_forward(Tensor hidden_states, Tensor router_logits, "
@@ -598,6 +633,9 @@ class AlwaysHitShapeEnv:
 
     def __init__(self) -> None:
         self.guards: list[Any] = []
+        # Read by torch._inductor.codecache.FxGraphHashDetails (torch>=2.11).
+        # We never override dynamic-shape hints, so an empty dict is correct.
+        self.var_to_hint_override: dict[Any, int] = {}
 
     def evaluate_guards_expression(self, *args: Any, **kwargs: Any) -> bool:
         return True
@@ -775,6 +813,7 @@ class PiecewiseBackend:
                     graph_copy,
                     fake_args,
                     config_patches={
+                        **VLLM_INDUCTOR_OPTIONS,
                         "fx_graph_cache": True,
                         "fx_graph_remote_cache": False,
                     },
@@ -903,6 +942,7 @@ class FastKernelsBackend:
         self,
         graph: fx.GraphModule,
         example_inputs: list[torch.Tensor],
+        **kwargs: Any,
     ) -> Any:
         assert not self._called, "FastKernelsBackend should only be called once"
         self._called = True
@@ -975,7 +1015,7 @@ def compile_model(
         cudagraph_enabled=cudagraph_enabled,
     )
 
-    options: dict[str, Any] = {}
+    options: dict[str, Any] = dict(VLLM_INDUCTOR_OPTIONS)
     if hasattr(torch.compiler, "skip_all_guards_unsafe"):
         options["guard_filter_fn"] = torch.compiler.skip_all_guards_unsafe
     else:

@@ -41,13 +41,18 @@ class VocabParallelEmbedding(nn.Module):
         param.data.copy_(loaded_weight.narrow(0, rank * shard, shard))
 
     def forward(self, x):
+        y = self.forward_local(x)
+        if self.tp_size > 1:
+            y = self.allreduce(y)
+        return y
+
+    def forward_local(self, x):
         if self.tp_size > 1:
             mask = (x >= self.vocab_start) & (x < self.vocab_end)
             x = mask * (x - self.vocab_start)
         y = self.embedding_op(x)
         if self.tp_size > 1:
             y = mask.unsqueeze(-1) * y
-            y = self.allreduce(y)
         return y
 
 

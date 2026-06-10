@@ -30,6 +30,7 @@ Weight names match HuggingFace checkpoint convention:
 from __future__ import annotations
 
 import json
+import os
 from dataclasses import dataclass
 from pathlib import Path
 
@@ -38,9 +39,11 @@ import torch.nn as nn
 from transformers import AutoConfig
 
 from ..L1.rms_norm import RMSNorm
+from ..L1.allreduce import fused_allreduce_rmsnorm, has_flashinfer_ar_workspace
 from ..L1.yarn_rotary_emb import YaRNRotaryEmbedding
 from ..L2.parallel_embedding import ParallelLMHead, VocabParallelEmbedding
 from ..L3.gpt_oss_decoder import GptOssDecoderLayer
+from ....infra.tp import _tp_size
 
 
 @dataclass
@@ -60,7 +63,7 @@ class GptOssConfig:
     rope_original_max_position_embeddings: int = 4096
     rope_beta_fast: float = 32.0
     rope_beta_slow: float = 1.0
-    rope_truncate: bool = False
+    rope_truncate: bool = True
     # MoE
     num_local_experts: int = 32
     num_experts_per_tok: int = 4
@@ -106,7 +109,7 @@ class GptOssConfig:
             ),
             rope_beta_fast=rs.get("beta_fast", 32.0),
             rope_beta_slow=rs.get("beta_slow", 1.0),
-            rope_truncate=rs.get("truncate", False),
+            rope_truncate=rs.get("truncate", True),
             num_local_experts=getattr(hf, "num_local_experts", 32),
             num_experts_per_tok=getattr(hf, "num_experts_per_tok", 4),
             swiglu_limit=getattr(hf, "swiglu_limit", 7.0),
@@ -136,7 +139,7 @@ class GptOssConfig:
             ),
             rope_beta_fast=merged.get("beta_fast", 32.0),
             rope_beta_slow=merged.get("beta_slow", 1.0),
-            rope_truncate=merged.get("truncate", False),
+            rope_truncate=merged.get("truncate", True),
             num_local_experts=data.get("num_local_experts", 32),
             num_experts_per_tok=data.get("num_experts_per_tok", 4),
             swiglu_limit=data.get("swiglu_limit", 7.0),
@@ -156,7 +159,11 @@ class GptOssModel(nn.Module):
         self.norm = RMSNorm(config.hidden_size, eps=config.rms_norm_eps)
         self.rotary_emb = YaRNRotaryEmbedding(
             config.head_dim,
-            config.max_position_embeddings,
+            # vLLM's get_rope() passes original_max_position_embeddings into
+            # YaRNScalingRotaryEmbedding; that class expands the cache by
+            # scaling_factor internally and uses the original length for the
+            # correction range.
+            config.rope_original_max_position_embeddings,
             config.rope_theta,
             scaling_factor=config.rope_scaling_factor,
             original_max_position_embeddings=config.rope_original_max_position_embeddings,
@@ -166,13 +173,46 @@ class GptOssModel(nn.Module):
         )
 
     def forward(self, input_ids, positions):
-        hidden_states = self.embed_tokens(input_ids)
+        use_compiled_fused_ar_norm = (
+            torch.compiler.is_compiling()
+            and _tp_size() > 1
+            and has_flashinfer_ar_workspace()
+        )
+        if use_compiled_fused_ar_norm:
+            hidden_states = self.embed_tokens.forward_local(input_ids)
+        else:
+            hidden_states = self.embed_tokens(input_ids)
+        fuse_mlp_ar_norm = (
+            os.environ.get("FASTKERNELS_GPTOSS_FUSE_MLP_AR_RMS", "1") == "1"
+        )
         residual = None
-        for layer in self.layers:
-            hidden_states, residual = layer(
-                positions, hidden_states, residual, self.rotary_emb,
-            )
-        hidden_states, _ = self.norm(hidden_states, residual)
+        for layer_idx, layer in enumerate(self.layers):
+            if use_compiled_fused_ar_norm:
+                hidden_states, residual = layer.forward_compiled_fused_ar_norm(
+                    positions,
+                    hidden_states,
+                    residual,
+                    self.rotary_emb,
+                    fuse_input_ar_norm=(layer_idx == 0 or fuse_mlp_ar_norm),
+                    fuse_mlp_ar_norm=fuse_mlp_ar_norm,
+                )
+            else:
+                hidden_states, residual = layer(
+                    positions, hidden_states, residual, self.rotary_emb,
+                )
+        if use_compiled_fused_ar_norm:
+            assert residual is not None
+            if fuse_mlp_ar_norm:
+                hidden_states, _ = fused_allreduce_rmsnorm(
+                    hidden_states,
+                    residual,
+                    self.norm.weight,
+                    self.norm.eps,
+                )
+            else:
+                hidden_states, _ = self.norm(hidden_states, residual)
+        else:
+            hidden_states, _ = self.norm(hidden_states, residual)
         return hidden_states
 
 
