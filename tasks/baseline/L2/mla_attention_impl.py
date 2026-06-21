@@ -425,6 +425,24 @@ class MLAAttention(nn.Module):
     def _forward_dense_decode(self, q, kv_cache, ctx):
         cache_seqlens = ctx.context_lens
         block_table = ctx.block_tables
+        if not self.use_fp8_kv_cache:
+            q = self._absorb_q_to_latent(q)
+            q = q.unsqueeze(1)
+            tile_sched_meta, _ = self.get_metadata(
+                cache_seqlens, self.num_heads, num_heads_k=1,
+            )
+            o, _ = self.decode_op(
+                q,
+                kv_cache.unsqueeze(-2),
+                block_table,
+                cache_seqlens,
+                head_dim_v=_MLA_HEAD_DIM_V,
+                tile_scheduler_metadata=tile_sched_meta,
+                softmax_scale=self.scale,
+                causal=True,
+            )
+            o = o.reshape(-1, o.shape[-2], o.shape[-1])
+            return self._v_up_proj(o)
 
         # Mirrors vLLM's dense FP8 MLA decode path
         # (vllm/v1/attention/backends/mla/flashmla.py:289-302):
@@ -435,7 +453,7 @@ class MLAAttention(nn.Module):
                 cache_seqlens, self.num_heads, num_heads_k=1,
             )
             o, _ = self.decode_op_fp8(
-                q, kv_cache.view(torch.uint8).unsqueeze(-2),
+                q.unsqueeze(1), kv_cache.view(torch.uint8).unsqueeze(-2),
                 block_table, cache_seqlens,
                 head_dim_v=_MLA_HEAD_DIM_V,
                 tile_scheduler_metadata=tile_sched_meta,
@@ -445,6 +463,7 @@ class MLAAttention(nn.Module):
                 descale_q=self._q_scale.reshape(1),
                 descale_k=self._k_scale.reshape(1),
             )
+            o = o.reshape(-1, o.shape[-2], o.shape[-1])
             return self._v_up_proj(o)
 
         # Fallback: generic kernel with is_fp8_kvcache=True (older vLLM).
@@ -452,7 +471,7 @@ class MLAAttention(nn.Module):
             cache_seqlens, self.num_heads, num_heads_k=1,
             is_fp8_kvcache=True)
         o, _ = self.decode_op(
-            q, kv_cache.view(torch.uint8).unsqueeze(-2),
+            q.unsqueeze(1), kv_cache.view(torch.uint8).unsqueeze(-2),
             block_table, cache_seqlens,
             head_dim_v=_MLA_HEAD_DIM_V,
             tile_scheduler_metadata=tile_sched_meta,
@@ -460,6 +479,7 @@ class MLAAttention(nn.Module):
             causal=True,
             is_fp8_kvcache=True,
         )
+        o = o.reshape(-1, o.shape[-2], o.shape[-1])
         return self._v_up_proj(o)
 
     def _forward_sparse(self, q, kv_c_normed, k_pe, kv_b_proj, kv_cache, ctx, topk_indices):
@@ -1091,12 +1111,30 @@ class MLAAttention(nn.Module):
             cache_seqlens = ctx.decode_context_lens
             block_table = ctx.decode_block_tables
 
-            if self.decode_op_fp8.available:
+            if not self.use_fp8_kv_cache:
+                q_dc = self._absorb_q_to_latent(q_dc)
+                q_dc = q_dc.unsqueeze(1)
+                tile_sched_meta, _ = self.get_metadata(
+                    cache_seqlens, self.num_heads, num_heads_k=1,
+                )
+                o, _ = self.decode_op(
+                    q_dc,
+                    kv_cache.unsqueeze(-2),
+                    block_table,
+                    cache_seqlens,
+                    head_dim_v=_MLA_HEAD_DIM_V,
+                    tile_scheduler_metadata=tile_sched_meta,
+                    softmax_scale=self.scale,
+                    causal=True,
+                )
+                o = o.reshape(-1, o.shape[-2], o.shape[-1])
+                out[np_:] = self._v_up_proj(o)
+            elif self.decode_op_fp8.available:
                 tile_sched_meta, num_splits = self.get_metadata_dense_fp8(
                     cache_seqlens, self.num_heads, num_heads_k=1,
                 )
                 o, _ = self.decode_op_fp8(
-                    q_dc, kv_cache.view(torch.uint8).unsqueeze(-2),
+                    q_dc.unsqueeze(1), kv_cache.view(torch.uint8).unsqueeze(-2),
                     block_table, cache_seqlens,
                     head_dim_v=_MLA_HEAD_DIM_V,
                     tile_scheduler_metadata=tile_sched_meta,
@@ -1106,12 +1144,14 @@ class MLAAttention(nn.Module):
                     descale_q=self._q_scale.reshape(1),
                     descale_k=self._k_scale.reshape(1),
                 )
+                o = o.reshape(-1, o.shape[-2], o.shape[-1])
+                out[np_:] = self._v_up_proj(o)
             else:
                 tile_sched_meta, _ = self.get_metadata(
                     cache_seqlens, self.num_heads, num_heads_k=1,
                     is_fp8_kvcache=True)
                 o, _ = self.decode_op(
-                    q_dc, kv_cache.view(torch.uint8).unsqueeze(-2),
+                    q_dc.unsqueeze(1), kv_cache.view(torch.uint8).unsqueeze(-2),
                     block_table, cache_seqlens,
                     head_dim_v=_MLA_HEAD_DIM_V,
                     tile_scheduler_metadata=tile_sched_meta,
@@ -1119,6 +1159,7 @@ class MLAAttention(nn.Module):
                     causal=True,
                     is_fp8_kvcache=True,
                 )
-            out[np_:] = self._v_up_proj(o)
+                o = o.reshape(-1, o.shape[-2], o.shape[-1])
+                out[np_:] = self._v_up_proj(o)
 
         return out

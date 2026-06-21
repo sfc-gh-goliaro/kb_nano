@@ -64,6 +64,7 @@ class GroupedTopK(nn.Module):
         scoring_func: str = "sigmoid",
         renormalize: bool = True,
         routed_scaling_factor: float = 1.0,
+        force_sorted: bool = False,
     ) -> None:
         super().__init__()
         if scoring_func not in ("sigmoid", "softmax"):
@@ -71,6 +72,31 @@ class GroupedTopK(nn.Module):
         self.scoring_func = scoring_func
         self.renormalize = renormalize
         self.routed_scaling_factor = routed_scaling_factor
+        self.force_sorted = force_sorted
+
+    def _postprocess_selected(
+        self,
+        gating_output: torch.Tensor,
+        topk_weights: torch.Tensor,
+        topk_ids: torch.Tensor,
+    ) -> tuple[torch.Tensor, torch.Tensor]:
+        if not (self.force_sorted or _is_batch_invariant()):
+            return topk_weights, topk_ids
+
+        gather_ids = topk_ids.to(torch.int64)
+        if self.scoring_func == "sigmoid":
+            selected_weights = gating_output.gather(1, gather_ids).sigmoid()
+        else:
+            selected_weights = torch.softmax(gating_output, dim=-1).gather(
+                1, gather_ids,
+            )
+
+        topk_weights = selected_weights
+        if self.renormalize:
+            topk_weights = topk_weights / topk_weights.sum(dim=-1, keepdim=True)
+        if self.routed_scaling_factor != 1.0:
+            topk_weights = topk_weights * self.routed_scaling_factor
+        return topk_weights.to(torch.float32), topk_ids
 
     def forward(
         self,
@@ -93,7 +119,7 @@ class GroupedTopK(nn.Module):
         ):
             if self.scoring_func == "sigmoid":
                 # Kernel applies sigmoid internally.
-                return _C.grouped_topk(
+                topk_weights, topk_ids = _C.grouped_topk(
                     gating_output,
                     num_expert_group,
                     topk_group,
@@ -103,9 +129,14 @@ class GroupedTopK(nn.Module):
                     e_score_correction_bias,
                     1,  # scoring_func=1 (sigmoid)
                 )
+                return self._postprocess_selected(
+                    gating_output,
+                    topk_weights,
+                    topk_ids,
+                )
             # Softmax: precompute scores (kernel doesn't have softmax).
             scores = torch.softmax(gating_output, dim=-1)
-            return _C.grouped_topk(
+            topk_weights, topk_ids = _C.grouped_topk(
                 scores,
                 num_expert_group,
                 topk_group,
@@ -114,6 +145,11 @@ class GroupedTopK(nn.Module):
                 self.routed_scaling_factor,
                 e_score_correction_bias,
                 0,  # scoring_func=0 (no activation, scores precomputed)
+            )
+            return self._postprocess_selected(
+                gating_output,
+                topk_weights,
+                topk_ids,
             )
 
         # Score computation in the *gating output* dtype (vLLM does *not*
@@ -142,7 +178,7 @@ class GroupedTopK(nn.Module):
                 .values
             )
 
-        use_sorted = _is_batch_invariant()
+        use_sorted = self.force_sorted or _is_batch_invariant()
         group_idx = torch.topk(
             group_scores, k=topk_group, dim=-1, sorted=use_sorted,
         )[1]

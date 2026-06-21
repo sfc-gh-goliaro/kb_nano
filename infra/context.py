@@ -92,6 +92,44 @@ class ChunkedContextMetadata:
 
 
 @dataclass
+class KimiLinearMetadata:
+    """Per-batch metadata for Kimi-Linear and Qwen3-Next hybrid layers."""
+
+    num_actual_tokens: int = 0
+
+    query_start_loc: torch.Tensor | None = None
+    max_query_len: int = 0
+
+    seq_lens: torch.Tensor | None = None
+    max_seq_len: int = 0
+
+    state_indices: torch.Tensor | None = None
+
+    num_prefills: int = 0
+    num_prefill_tokens: int = 0
+    num_decodes: int = 0
+    num_decode_tokens: int = 0
+
+    has_initial_state: torch.Tensor | None = None
+
+    slot_mapping: torch.Tensor | None = None
+    block_tables: torch.Tensor | None = None
+
+    # vLLM's varlen causal-conv kernels read these fields from ``metadata``.
+    nums_dict: dict | None = None
+    batch_ptr: torch.Tensor | None = None
+    token_chunk_offset_ptr: torch.Tensor | None = None
+
+    @property
+    def non_spec_state_indices_tensor(self) -> torch.Tensor | None:
+        return self.state_indices
+
+    @property
+    def non_spec_query_start_loc(self) -> torch.Tensor | None:
+        return self.query_start_loc
+
+
+@dataclass
 class Context:
     is_prefill: bool = False
     cu_seqlens_q: torch.Tensor | None = None
@@ -159,6 +197,10 @@ class Context:
     # metadata read by every Mamba mixer in its forward pass.
     mamba_state: object = None
     mamba_metadata: object = None
+
+    # Hybrid recurrent state for Kimi Linear KDA and Qwen3-Next GDN layers.
+    kda_state: object = None
+    kda_metadata: object = None
 
 
 # Global module registry populated once at model init; copied into each
