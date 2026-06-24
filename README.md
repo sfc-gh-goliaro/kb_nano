@@ -1,6 +1,6 @@
 # kb-nano
 
-A standalone, high-performance inference engine supporting **LLMs** (Llama 3.1, Llama 4, Mixtral-8x7B, DeepSeek V3.2, GPT-OSS, Qwen2-VL, Qwen3-VL), **linear-attention LLMs** (GLA, RetNet, RWKV7), **embedding / retrieval models** (BGE-M3, ColBERTv2), **diffusion models** (FLUX.1-dev, SDXL, HunyuanVideo-1.5), **world models** (Oasis 500M), **detection models** (YOLOv10, RTDetrV2), **vision encoders** (SigLIP-2, DINOv3, SwinV2), **segmentation models** (SAM3.1), **3D point models** (PointTransformerV3), **protein structure prediction** (OpenFold3), audio models (Whisper), and **TTS models** (CosyVoice3) with tensor parallelism and FP8 quantization. No vLLM dependency at runtime — just PyTorch, Triton, and Flash Attention.
+A standalone, high-performance inference engine supporting **LLMs** (Llama 3.1, Llama 4, Mixtral-8x7B, DeepSeek V3.2, GPT-OSS, Qwen2.5-Omni, Qwen2-VL, Qwen3-VL), **linear-attention LLMs** (GLA, RetNet, RWKV7), **embedding / retrieval models** (BGE-M3, ColBERTv2), **diffusion models** (FLUX.1-dev, SDXL, HunyuanVideo-1.5), **world models** (Oasis 500M), **detection models** (YOLOv10, RTDetrV2), **vision encoders** (SigLIP-2, DINOv3, SwinV2), **segmentation models** (SAM3.1), **3D point models** (PointTransformerV3), **protein structure prediction** (OpenFold3), audio models (Whisper), and **TTS models** (CosyVoice3) with tensor parallelism and FP8 quantization. No vLLM dependency at runtime — just PyTorch, Triton, and Flash Attention.
 
 ## Features
 
@@ -9,6 +9,7 @@ A standalone, high-performance inference engine supporting **LLMs** (Llama 3.1, 
 - **Mixtral-8x7B** with fused Triton MoE grouped-GEMM kernels
 - **DeepSeek V3.2** with MLA (Multi-head Latent Attention), 256-expert MoE via DeepGEMM FP8, DSA (DeepSeek Sparse Attention), and YARN RoPE — currently **0.78–0.90× of vLLM** throughput on 8×H200 (gap due to kernel-launch overhead, GEMM kernel selection, and AllReduce+RMSNorm fusion)
 - **GPT-OSS** (20B, 120B) MXFP4-quantized MoE with native Triton inference, YaRN RoPE, attention sinks, and sliding window
+- **Qwen2.5-Omni** (`Qwen/Qwen2.5-Omni-3B`) Thinker path with real text, image, video, and audio inputs
 - **BGE-M3** dense + sparse + ColBERT-style embedding outputs
 - **ColBERTv2** query/doc encoders with MaxSim scoring
 - **Mamba / Mamba2** (`state-spaces/mamba-2.8b-hf`, `mistralai/Mamba-Codestral-7B-v0.1`) selective state-space models with vLLM-aligned `causal_conv1d` + `mamba_chunk_scan` / `selective_scan` kernels, slot-based recurrent state cache, chunked-prefill metadata, and TP sharding (incl. `n_groups % tp != 0` head-shard groups)
@@ -127,6 +128,10 @@ python tests/bench_vllm.py \
 # GPT-OSS MoE (MXFP4 quantized)
 python tests/bench_vllm.py \
     --model openai/gpt-oss-120b --tp 2
+
+# Qwen2.5-Omni Thinker path (text + image + video + audio)
+python tests/bench_vllm.py \
+    --model Qwen/Qwen2.5-Omni-3B --num-seqs 1000
 
 # Whisper speech-to-text
 python tests/bench_vllm.py --model openai/whisper-large-v3
@@ -638,6 +643,32 @@ Run `tests/bench_vllm.py` to reproduce. Three scenarios per model, 1000 sequence
 | Mixtral-8x7B | 4 | prefill-heavy | 1024/512  | 15,060 | 23,064 | **1.53x** |
 | Mixtral-8x7B | 4 | balanced      |  512/512  | 20,530 | 33,443 | **1.63x** |
 | Mixtral-8x7B | 4 | decode-heavy  |  512/1024 | 24,728 | 37,761 | **1.53x** |
+
+### Qwen2.5-Omni
+
+Run `tests/bench_vllm.py --model Qwen/Qwen2.5-Omni-3B --num-seqs 1000` to reproduce. The benchmark uses the real `Qwen/Qwen2.5-Omni-3B` checkpoint and exercises the Thinker understanding path for four modalities. The speech-generation `talker` and `token2wav` modules are intentionally outside this benchmark.
+
+Datasets and workload: text uses `sfc-gh-goliaro/wildchat-kb-nano-balanced-1k`, image uses `lmarena-ai/VisionArena-Chat`, video uses `yale-nlp/MMVU`, and audio uses `openslr/librispeech_asr` (`test.clean`). Throughput runs 1000 requests per modality (4000 total requests), with 512 output tokens for text/image/video and 256 output tokens for audio. Audio samples are decoded from the real LibriSpeech FLAC payloads to mono float32 samples before being passed to both engines.
+
+Throughput and generated-token alignment (TP=1, H200, `temperature=0`, CUDA graphs enabled):
+
+| Model | TP | Scenario | Requests | Output | vLLM (tok/s) | Ours (tok/s) | Ratio | Exact Matches | Avg Match Tokens |
+|-------|---:|----------|---------:|-------:|-------------:|-------------:|------:|--------------:|-----------------:|
+| Qwen2.5-Omni-3B | 1 | text  | 1000 | 512 | 23,495 | 27,969 | **1.19x** | 915/1000 | 515.7/526.1 |
+| Qwen2.5-Omni-3B | 1 | image | 1000 | 512 | 12,664 | 12,059 | **0.95x** | 156/1000 | 179.2/512.0 |
+| Qwen2.5-Omni-3B | 1 | video | 1000 | 512 |  2,061 |  2,121 | **1.03x** | 153/1000 | 171.3/512.0 |
+| Qwen2.5-Omni-3B | 1 | audio | 1000 | 256 |  1,769 |  8,669 | **4.90x** | 223/1000 | 131.8/256.0 |
+
+Latency (single request, 128 output tokens, 5 timed iterations):
+
+| Model | TP | Scenario | vLLM median | Ours median | vLLM ms/tok | Ours ms/tok | Ratio |
+|-------|---:|----------|------------:|------------:|------------:|------------:|------:|
+| Qwen2.5-Omni-3B | 1 | single-text  | 1.678s | 1.767s | 13.11 | 13.80 | 0.95x |
+| Qwen2.5-Omni-3B | 1 | single-image | 0.427s | 0.500s |  3.34 |  3.91 | 0.85x |
+| Qwen2.5-Omni-3B | 1 | single-video | 0.473s | 0.696s |  3.70 |  5.44 | 0.68x |
+| Qwen2.5-Omni-3B | 1 | single-audio | 0.415s | 0.543s |  3.24 |  4.24 | 0.77x |
+
+Alignment here is exact generated-token prefix matching against vLLM. Single-request eager smoke tests matched vLLM exactly for text, image, video, and audio; long multimodal greedy generations can diverge from vLLM's CUDA-graph path numerically, so the multimodal alignment rows are best interpreted as regression signals rather than a top-k logit proof.
 
 ### Qwen2-VL / Qwen3-VL (VLM)
 

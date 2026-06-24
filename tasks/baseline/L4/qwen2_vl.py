@@ -206,11 +206,13 @@ class Qwen2VLForConditionalGeneration(nn.Module):
         video_grid_thw: list[list[int]] | None = None,
         image_offsets: list[int] | None = None,
         video_offsets: list[int] | None = None,
+        video_second_per_grid: list[float] | None = None,
     ) -> tuple[torch.Tensor, int]:
         return self._mrope_positions(
             input_tokens, self.config.vision.spatial_merge_size,
             image_grid_thw, video_grid_thw,
             image_offsets, video_offsets,
+            video_second_per_grid=video_second_per_grid,
         )
 
     def forward(self, input_ids, positions, inputs_embeds=None, **kwargs):
