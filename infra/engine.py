@@ -47,6 +47,11 @@ from .weight_loader import load_model
 MAX_MODEL_LEN = 131072
 NCCL_PORT = int(os.environ.get("FASTKERNELS_NCCL_PORT", "29501"))
 
+# Max steps decoded per device-resident bulk call in the ragged hybrid-decode
+# path. Bounds the per-call output buffer / re-staging latency while still
+# amortizing away almost all per-step host round trips.
+_BULK_CHUNK_CAP = 512
+
 
 def _load_tokenizer(model_name: str):
     try:
@@ -543,6 +548,11 @@ class ModelRunner:
                 self.shm = SharedMemory(name=shm_name, create=True, size=2**20)
                 self.shm.buf[self._SHM_FLAG_OFFSET] = 0
                 self.shm.buf[self._SHM_SEQ_OFFSET:self._SHM_SEQ_OFFSET+4] = (0).to_bytes(4, "little")
+                # Zero the per-rank ACK counters so the first _signal_workers()
+                # handshake (which waits for ack == 1) starts from a clean 0.
+                self.shm.buf[self._SHM_ACK_OFFSET:self._SHM_SEQ_OFFSET] = bytes(
+                    self._SHM_SEQ_OFFSET - self._SHM_ACK_OFFSET
+                )
                 dist.barrier()
             else:
                 dist.barrier()
@@ -570,8 +580,22 @@ class ModelRunner:
     #                              2=mamba decode_greedy,
     #                              3=hybrid recurrent decode_greedy
     # bytes[-5:-1] (_SHM_SEQ_OFFSET): 4-byte little-endian sequence counter
+    # bytes[-37:-5] (_SHM_ACK_OFFSET): per-rank 4-byte consumed-seq counters
+    #     (rank r writes its slot at _SHM_ACK_OFFSET + 4*r after it has
+    #     copied a command out of the buffer). Rank 0 spins on these in
+    #     _signal_workers() so it never overwrites the command buffer or
+    #     bumps the seq counter again until every worker has consumed the
+    #     previous command. Without this handshake the seq counter is a
+    #     bare latest-value mailbox: if rank 0 posts a second command before
+    #     a worker observes the first (e.g. the hybrid decode path posts an
+    #     async decode then a generic deallocate with no synchronizing
+    #     collective in between), the seq bump coalesces, the worker
+    #     processes only the latest buffer, and the dropped command desyncs
+    #     the ranks' collective sequences -> NCCL ALLGATHER timeout / torn
+    #     pickle reads.
     _SHM_FLAG_OFFSET = 2**20 - 1
     _SHM_SEQ_OFFSET = 2**20 - 5
+    _SHM_ACK_OFFSET = 2**20 - 5 - 4 * 8  # 8 ranks max, 4 bytes each
 
     def loop(self):
         """Worker loop: spin-wait on SHM sequence counter for decode, event for generic."""
@@ -586,14 +610,17 @@ class ModelRunner:
                 flag = buf[flag_off]
                 if flag != 0:
                     if flag == 1:
-                        self._loop_decode_greedy()
+                        self._loop_decode_greedy(cur_seq)
                     elif flag == 2:
-                        self._loop_mamba_decode_greedy()
+                        self._loop_mamba_decode_greedy(cur_seq)
                     elif flag == 3:
-                        self._loop_kimi_decode_greedy()
+                        self._loop_kimi_decode_greedy(cur_seq)
                     continue
                 n = int.from_bytes(buf[0:4], "little")
                 method_name, *args = pickle.loads(buf[4:n+4])
+                # Command is fully copied out of the buffer (pickle.loads
+                # deep-copies); release rank 0 to post the next command.
+                self._ack_consumed(cur_seq)
                 getattr(self, method_name)(*args)
                 if method_name == "exit":
                     break
@@ -602,12 +629,41 @@ class ModelRunner:
             pass
 
     def _signal_workers(self):
-        """Increment SHM sequence counter to wake spin-waiting workers."""
+        """Increment SHM sequence counter to wake spin-waiting workers, then
+        block until every worker has consumed (copied out) the command.
+
+        The seq counter is a latest-value mailbox, not a queue. Waiting for
+        each worker to acknowledge the just-posted seq before returning
+        guarantees rank 0 cannot post a second command — overwriting the
+        shared buffer or bumping the counter a second time — until the
+        previous command has been copied out by every worker. This prevents
+        command coalescing / torn reads that would otherwise desync the
+        ranks' collective sequences (NCCL ALLGATHER timeouts). The wait is
+        cheap: workers ack immediately after a memcpy, before running the
+        (possibly long) GPU work, so async-decode overlap is preserved.
+        """
         buf = self.shm.buf
         seq_off = self._SHM_SEQ_OFFSET
         cur = int.from_bytes(buf[seq_off:seq_off+4], "little")
         nxt = (cur + 1) & 0xFFFFFFFF
         buf[seq_off:seq_off+4] = nxt.to_bytes(4, "little")
+        self._await_workers_consumed(nxt)
+
+    def _await_workers_consumed(self, target_seq):
+        """Spin until every worker rank's ACK counter reaches ``target_seq``."""
+        buf = self.shm.buf
+        ack_off = self._SHM_ACK_OFFSET
+        target = target_seq.to_bytes(4, "little")
+        for r in range(1, self.world_size):
+            base = ack_off + 4 * r
+            while bytes(buf[base:base+4]) != target:
+                pass
+
+    def _ack_consumed(self, seq):
+        """Worker: record that seq ``seq``'s command has been copied out of
+        the shared buffer, releasing rank 0 to post the next command."""
+        base = self._SHM_ACK_OFFSET + 4 * self.rank
+        self.shm.buf[base:base+4] = seq.to_bytes(4, "little")
 
     def call(self, method_name, *args):
         """Called by rank 0 to execute method on ALL ranks."""
@@ -615,6 +671,14 @@ class ModelRunner:
             data = pickle.dumps([method_name, *args])
             n = len(data)
             buf = self.shm.buf
+            if n + 4 > self._SHM_ACK_OFFSET:
+                raise RuntimeError(
+                    f"SHM generic-call payload too large for method "
+                    f"{method_name!r}: {n} bytes (limit "
+                    f"{self._SHM_ACK_OFFSET - 4}); would overwrite the "
+                    f"ack/seq/flag control bytes and corrupt the command "
+                    f"channel."
+                )
             buf[0:4] = n.to_bytes(4, "little")
             buf[4:n+4] = data
             buf[self._SHM_FLAG_OFFSET] = 0  # generic path
@@ -1366,7 +1430,13 @@ class ModelRunner:
             return
 
         if self.is_qwen3_next:
-            usable_slots = min(self.max_num_seqs, 512)
+            # Match the Kimi path: run the full requested concurrency rather
+            # than a hard 512-slot cap. The paged-MHA block pool below is sized
+            # from the memory remainder after GDN state, so more slots simply
+            # trade a slice of KV headroom for concurrency. vLLM runs ~727+
+            # concurrent for this model; capping at 512 left ~40% throughput on
+            # the table.
+            usable_slots = max(1, self.max_num_seqs)
             use_decode_graph = not self.enforce_eager
             num_slots = usable_slots + (1 if use_decode_graph else 0)
             device = torch.device(f"cuda:{self.rank}")
@@ -1765,6 +1835,18 @@ class ModelRunner:
             self.world_size, max_bs, 2, dtype=torch.float32, device=dev,
         )
         self._kd_greedy_arange = torch.arange(max_bs, device=dev)
+        # Persistent device accumulator for bulk multi-step decode
+        # (run_kimi_decode_many). MUST be allocated here, before CUDA-graph
+        # capture, and reused across chunks. A fresh per-call torch.empty is
+        # served by the caching allocator from free segments that can overlap
+        # the graph's private pool; graph replays then clobber the already
+        # copied rows with int32/activation data, producing out-of-vocab token
+        # ids on the 2nd+ bulk chunk. A pre-capture persistent buffer lives at a
+        # stable address the graphs never touch. Shape (_BULK_CHUNK_CAP, max_bs)
+        # bounds every (steps<=_BULK_CHUNK_CAP, n<=max_bs) slice.
+        self._kd_bulk_outputs = torch.zeros(
+            _BULK_CHUNK_CAP, max_bs, dtype=torch.int64, device=dev,
+        )
 
     def _prepare_kimi_decode_arrays(self, seqs, copy_block_tables: bool = True):
         """Fill pinned staging buffers for hybrid greedy decode fast path."""
@@ -1827,7 +1909,7 @@ class ModelRunner:
         """
         from contextlib import nullcontext
 
-        graph_max_default = 512 if self.is_qwen3_next else self.max_num_seqs
+        graph_max_default = self.max_num_seqs
         max_bs = min(self.max_num_seqs, graph_max_default)
         bs_candidates = [
             1, 2, 4, 8, 16, 32, 48, 64, 96, 128, 160, 192, 224, 256,
@@ -2085,9 +2167,19 @@ class ModelRunner:
         if not seqs or steps <= 0:
             return [] if self.rank == 0 else None
 
-        final_tokens = max(seq.num_computed_tokens + steps for seq in seqs)
+        # Allocate KV blocks per sequence for exactly the positions THIS
+        # sequence will occupy after ``steps`` decode steps. Previously this
+        # reserved ``max(num_computed + steps)`` blocks for *every* sequence,
+        # padding short sequences up to the longest one in the batch. On
+        # heterogeneous batches (e.g. prefill-heavy WildChat prompts spanning
+        # ~0.5k..3k tokens) that over-allocated the paged MLA pool ~3x and
+        # exhausted it at high concurrency ("No free MLA KV cache blocks").
+        # Paged attention indexes each sequence's own block table, so per-seq
+        # allocation is both correct and far more memory efficient.
         for seq in seqs:
-            self.mamba_state_manager.ensure_blocks_for(seq, final_tokens)
+            self.mamba_state_manager.ensure_blocks_for(
+                seq, seq.num_computed_tokens + steps,
+            )
 
         decode_data = self._prepare_kimi_decode_arrays(
             seqs, copy_block_tables=True,
@@ -2096,9 +2188,11 @@ class ModelRunner:
         self._stage_kimi_decode_graph_inputs(n, copy_block_tables=True)
 
         dev = self._kd_input_ids.device
+        # Persistent pre-capture accumulator (see __init__). Never torch.empty
+        # here: a fresh device allocation can alias the CUDA-graph private pool
+        # and be clobbered by replays on the 2nd+ chunk.
         outputs_dev = (
-            torch.empty((steps, n), dtype=torch.int64, device=dev)
-            if self.rank == 0 else None
+            self._kd_bulk_outputs[:steps, :n] if self.rank == 0 else None
         )
         arange = self._kd_greedy_arange[:n]
         block_size = int(self._kd_block_size)
@@ -2177,7 +2271,7 @@ class ModelRunner:
             + n * 4
             + (n * max_blocks * 4 if copy_block_tables else 0)
         )
-        if payload_bytes > self._SHM_SEQ_OFFSET:
+        if payload_bytes > self._SHM_ACK_OFFSET:
             raise RuntimeError(
                 f"Hybrid decode SHM payload too large: {payload_bytes} bytes",
             )
@@ -2196,7 +2290,7 @@ class ModelRunner:
             buf[off:off + len(raw)] = raw
 
     @torch.inference_mode()
-    def _loop_kimi_decode_greedy(self):
+    def _loop_kimi_decode_greedy(self, cur_seq):
         """Worker fast path for hybrid greedy decode."""
         buf = self.shm.buf
         n = int.from_bytes(buf[0:2], "little")
@@ -2226,6 +2320,9 @@ class ModelRunner:
         self._kd_slot_mapping_int64_np[:n] = slot
         if max_blocks > 0:
             self._kd_block_tables_np[:n, :max_blocks] = bt
+        # Command copied into staging buffers; release rank 0 before the
+        # (async) GPU launch so decode overlap is preserved.
+        self._ack_consumed(cur_seq)
         self.run_kimi_decode_fast_async((n, max_blocks > 0))
 
     @torch.inference_mode()
@@ -3206,7 +3303,7 @@ class ModelRunner:
             off += nb
 
     @torch.inference_mode()
-    def _loop_mamba_decode_greedy(self):
+    def _loop_mamba_decode_greedy(self, cur_seq):
         """Worker fast path for Mamba: read decode arrays from SHM into
         the pinned-CPU staging buffers, then dispatch the same fast path
         as rank 0 (the kernels read state_indices_d which we just wrote)."""
@@ -3222,6 +3319,8 @@ class ModelRunner:
         self._md_input_ids_np[:n] = ids
         self._md_positions_np[:n] = pos
         self._md_state_indices_np[:n] = si
+        # Command copied out; release rank 0 before the (async) GPU launch.
+        self._ack_consumed(cur_seq)
         self.run_mamba_decode_fast_async(
             (n,
              self._md_input_ids_np[:n],
@@ -4171,7 +4270,7 @@ class ModelRunner:
             buf[off:off+nb] = arr.tobytes()
             off += nb
 
-    def _loop_decode_greedy(self):
+    def _loop_decode_greedy(self, cur_seq):
         """Worker fast path: read decode arrays from SHM without pickle.
 
         Must mirror :meth:`_write_decode_shm` exactly. In particular, MLA
@@ -4196,6 +4295,9 @@ class ModelRunner:
             sm_np = np.frombuffer(buf, dtype=np.int32, count=n, offset=off).copy(); off += n * 4
         cl_np = np.frombuffer(buf, dtype=np.int32, count=n, offset=off).copy(); off += n * 4
         bt_np = np.frombuffer(buf, dtype=np.int32, count=n*max_bt, offset=off).copy().reshape(n, max_bt)
+        # All decode arrays are .copy()'d out of the buffer above; release
+        # rank 0 to post the next command before the (async) GPU launch.
+        self._ack_consumed(cur_seq)
         self.run_decode_greedy_fast((n, ids_np, pos_np, sm_np, cl_np, bt_np))
 
     def call_decode_greedy(self, seqs):
@@ -5479,9 +5581,40 @@ class LlamaEngine:
             )
         decode_bt_dirty = True
 
+        # KV-block-aware admission. Unlike vLLM, fastkernels has no
+        # preemption/recompute path: once a sequence is admitted it must be
+        # able to grow to its full length (prompt + max_tokens) without the
+        # paged MLA pool running dry mid-decode -- otherwise ``ensure_blocks_for``
+        # hard-raises "No free MLA KV cache blocks". We therefore reserve each
+        # admitted sequence's *worst-case* block footprint up front and stop
+        # admitting once the live working set would exceed the pool, deferring
+        # the remaining prompts to a later wave (they are admitted as running
+        # sequences finish and return their blocks). This lets decode-heavy
+        # (short prompts) admit almost the whole batch in one wave while
+        # prefill-heavy (long prompts) throttles safely instead of crashing.
+        _sm = mr.mamba_state_manager
+        block_size = getattr(_sm, "block_size", 0) or 1
+        total_kv_blocks = getattr(_sm, "num_mla_blocks", 0) or 0
+        # Leave a little headroom for the reserved pad/scratch block(s).
+        block_budget = max(1, total_kv_blocks - 2) if total_kv_blocks else 0
+
+        def _worst_case_blocks(seq: "Sequence") -> int:
+            prompt_len = len(seq.token_ids) - len(seq.generated_ids)
+            final_len = prompt_len + seq.max_tokens
+            return (final_len + block_size - 1) // block_size
+
         while waiting or running:
             prefill_seqs: list[Sequence] = []
             prefill_tokens = 0
+            # Blocks already promised to the live decode set. Only needed when
+            # there are waiting prompts to admit -- skip the O(running) scan on
+            # steady-state pure-decode steps (waiting empty) to keep the hot
+            # decode loop cheap.
+            committed_blocks = (
+                sum(_worst_case_blocks(s) for s in running)
+                if (total_kv_blocks and waiting) else 0
+            )
+            blocked_by_kv = False
             while (
                 waiting
                 and len(prefill_seqs) < max_num_seqs
@@ -5494,6 +5627,16 @@ class LlamaEngine:
                     and prefill_tokens + seq_len > max_batched_tokens
                 ):
                     break
+                if total_kv_blocks:
+                    cand_blocks = _worst_case_blocks(waiting[0])
+                    must_admit = (len(running) + len(prefill_seqs)) == 0
+                    if (
+                        not must_admit
+                        and committed_blocks + cand_blocks > block_budget
+                    ):
+                        blocked_by_kv = True
+                        break
+                    committed_blocks += cand_blocks
                 seq = waiting.popleft()
                 prefill_seqs.append(seq)
                 prefill_tokens += seq_len
@@ -5537,13 +5680,17 @@ class LlamaEngine:
 
             if (
                 waiting
+                and not blocked_by_kv
                 and all_greedy
                 and all(seq.ignore_eos for seq in running)
                 and len(running) < max_num_seqs
             ):
                 # Throughput mode: admit/prefill all fixed-length requests
                 # first so the steady-state decode batch has uniform length
-                # and can use the bulk graph replay path below.
+                # and can use the bulk graph replay path below. Skipped when
+                # admission is KV-block limited (``blocked_by_kv``) -- otherwise
+                # we would spin re-admitting zero seqs forever instead of
+                # decoding the running set to free blocks for the next wave.
                 continue
 
             if (
@@ -5554,29 +5701,47 @@ class LlamaEngine:
                 and getattr(mr, "_kimi_graph_bs_for_n", None) is not None
                 and all(seq.ignore_eos for seq in running)
             ):
+                # Ragged bulk decode: the steady-state batch has non-uniform
+                # remaining lengths (real WildChat outputs span ~700..2700
+                # tokens), so requiring min==max would almost never fire and
+                # the whole batch would fall to the per-step async path. We
+                # instead decode min(remaining) steps device-resident for the
+                # entire batch in one graph-replay loop (no per-step host round
+                # trips), then drop the sequence(s) that just finished and
+                # repeat. The first chunk alone moves the large common prefix
+                # of the decode onto the fast path.
                 remaining = [
                     seq.max_tokens - len(seq.generated_ids)
                     for seq in running
                 ]
-                if remaining and min(remaining) == max(remaining) and remaining[0] > 1:
+                min_rem = min(remaining) if remaining else 0
+                if min_rem > 1:
+                    chunk = min(min_rem, _BULK_CHUNK_CAP)
                     graph_max = mr._kimi_graph_bs_list[-1]
                     for start in range(0, len(running), graph_max):
                         mr.call(
                             "run_kimi_decode_many",
                             running[start:start + graph_max],
-                            remaining[0],
+                            chunk,
                         )
                     finished_payloads = [
                         (seq.state_slot, list(seq.block_table))
                         for seq in running
+                        if len(seq.generated_ids) >= seq.max_tokens
                     ]
-                    mr.call("deallocate_mamba_state_batch", finished_payloads)
+                    if finished_payloads:
+                        mr.call("deallocate_mamba_state_batch", finished_payloads)
+                    next_running = []
                     for seq in running:
-                        seq.block_table = []
-                        seq.state_slot = None
-                        if pbar is not None:
-                            pbar.update(1)
-                    running = []
+                        if len(seq.generated_ids) >= seq.max_tokens:
+                            seq.block_table = []
+                            seq.state_slot = None
+                            if pbar is not None:
+                                pbar.update(1)
+                        else:
+                            next_running.append(seq)
+                    running = next_running
+                    decode_bt_dirty = True
                     continue
 
             decode_seqs = list(running)

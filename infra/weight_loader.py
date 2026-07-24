@@ -1481,7 +1481,13 @@ def load_model(
             f"({config.num_experts} experts, "
             f"{len(config.kda_layers)} KDA + {len(config.full_attn_layers)} MLA layers)..."
         )
-        model = KimiLinearForCausalLM(config, quant_config=quant_config)
+        # Kimi's KDA attention borrows vLLM's FusedRMSNormGated CustomOp, whose
+        # __init__ eagerly reads get_current_vllm_config() (vLLM >=0.18). We build
+        # the model outside vLLM's engine, so establish a default config context
+        # to let the CustomOp bind its forward impl (numerics unchanged).
+        from vllm.config import VllmConfig, set_current_vllm_config
+        with set_current_vllm_config(VllmConfig()):
+            model = KimiLinearForCausalLM(config, quant_config=quant_config)
     else:
         config = LlamaConfig.from_pretrained(model_name)
         config.dtype = dtype
