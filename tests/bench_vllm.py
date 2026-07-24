@@ -1366,14 +1366,20 @@ _configure_parallel_safe_flashinfer()
 
 def _load_librispeech(dataset_name, dataset_split, num_seqs, seed):
     """Load audio samples from LibriSpeech and return as list of numpy arrays."""
-    from datasets import load_dataset
+    from datasets import Audio, load_dataset
     ds = load_dataset(dataset_name, split=dataset_split, streaming=True)
+    # HF datasets' Audio feature auto-decodes via torchcodec, whose prebuilt
+    # libtorchcodec is ABI-incompatible with the installed torch (undefined
+    # symbol: torch_from_blob) and aborts. Keep the raw bytes and decode with
+    # PyAV via _decode_audio_array instead.
+    ds = ds.cast_column("audio", Audio(decode=False))
     ds = ds.shuffle(seed=seed)
     samples = []
     for item in ds:
-        audio = item["audio"]
-        arr = np.array(audio["array"], dtype=np.float32)
-        sr = audio["sampling_rate"]
+        try:
+            arr, sr = _decode_audio_array(item["audio"])
+        except Exception:
+            continue
         samples.append({"audio": arr, "sampling_rate": sr, "text": item["text"]})
         if len(samples) >= num_seqs:
             break
@@ -1530,14 +1536,20 @@ import numpy as np
 
 def _load_librispeech(dataset_name, dataset_split, num_seqs, seed):
     """Load audio samples from LibriSpeech and return as list of numpy arrays."""
-    from datasets import load_dataset
+    from datasets import Audio, load_dataset
     ds = load_dataset(dataset_name, split=dataset_split, streaming=True)
+    # HF datasets' Audio feature auto-decodes via torchcodec, whose prebuilt
+    # libtorchcodec is ABI-incompatible with the installed torch (undefined
+    # symbol: torch_from_blob) and aborts. Keep the raw bytes and decode with
+    # PyAV via _decode_audio_array instead.
+    ds = ds.cast_column("audio", Audio(decode=False))
     ds = ds.shuffle(seed=seed)
     samples = []
     for item in ds:
-        audio = item["audio"]
-        arr = np.array(audio["array"], dtype=np.float32)
-        sr = audio["sampling_rate"]
+        try:
+            arr, sr = _decode_audio_array(item["audio"])
+        except Exception:
+            continue
         samples.append({"audio": arr, "sampling_rate": sr, "text": item["text"]})
         if len(samples) >= num_seqs:
             break
