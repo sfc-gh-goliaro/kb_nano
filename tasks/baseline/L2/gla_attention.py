@@ -216,12 +216,34 @@ class GatedLinearAttention(nn.Module):
             if past_key_values is not None:
                 offsets = getattr(past_key_values, "seq_offsets", None)
             local = torch.arange(T, device=q.device, dtype=torch.int64)
-            if offsets is None:
+            if cu_seqlens is not None:
+                # Packed varlen prefill: N sub-sequences are concatenated
+                # into a single B=1 row of length T (cu_seqlens marks the
+                # boundaries). RoPE positions must be built PER SEGMENT:
+                # token t in segment i (cu_seqlens[i] <= t < cu_seqlens[i+1])
+                # sits at absolute position seq_offsets[i] + (t - cu_seqlens[i]).
+                # The old ``offsets.unsqueeze(1) + local`` broadcast assumed
+                # one row per offset and produced N*T positions instead of T,
+                # which crashed the RoPE kernel for N > 1.
+                seg_lengths = cu_seqlens[1:] - cu_seqlens[:-1]          # [N]
+                seg_starts = cu_seqlens[:-1].to(torch.int64)           # [N]
+                local_within = local - torch.repeat_interleave(seg_starts, seg_lengths)
+                if offsets is None:
+                    positions = local_within.contiguous()
+                else:
+                    off_t = (offsets.to(device=q.device, dtype=torch.int64)
+                             if torch.is_tensor(offsets)
+                             else torch.full((seg_lengths.numel(),), int(offsets),
+                                             device=q.device, dtype=torch.int64))
+                    base = torch.repeat_interleave(off_t, seg_lengths)
+                    positions = (base + local_within).contiguous()
+            elif offsets is None:
                 positions = local.repeat(B)
             elif isinstance(offsets, int):
                 positions = (local + offsets).repeat(B)
             else:
-                # [B] int64 tensor of per-row prefix lengths
+                # [B] int64 tensor of per-row prefix lengths (padded batched
+                # / decode path: one row per sequence, B rows of T tokens).
                 positions = (offsets.to(device=q.device, dtype=torch.int64)
                              .unsqueeze(1) + local.unsqueeze(0)).reshape(-1)
                 positions = positions.contiguous()

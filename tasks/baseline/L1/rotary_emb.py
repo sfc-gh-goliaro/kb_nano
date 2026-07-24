@@ -208,6 +208,10 @@ class Gemma4ProportionalRotaryEmbedding(RotaryEmbedding):
     ):
         nn.Module.__init__(self)
         self.head_dim = head_dim
+        # Gemma4 uses NeOX-style (rotate-half) RoPE; the inherited
+        # forward_cuda reads self.is_neox_style, which our custom __init__
+        # (bypassing RotaryEmbedding.__init__) must set explicitly.
+        self.is_neox_style = True
         rope_angles = rotary_dim // 2
         nope_angles = (head_dim // 2) - rope_angles
 

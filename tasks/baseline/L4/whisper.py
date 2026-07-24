@@ -184,7 +184,6 @@ class WhisperForConditionalGeneration(nn.Module):
         self.encoder = WhisperEncoder(config)
         self.decoder = WhisperDecoder(config)
         self.lm_head = ParallelLMHead(config.vocab_size, config.d_model)
-        self._linear_op = Linear()
 
     def get_multimodal_embeddings(
         self, input_features: torch.Tensor,
