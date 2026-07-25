@@ -34,7 +34,8 @@ from .context import (
     AttnBackendConfig, CUDAGraphMode, auto_register_no_compile_layers,
     disable_custom_ops, enable_custom_ops,
     get_attn_backend_config, get_context,
-    KimiLinearMetadata, reset_context, set_context, set_forward_context,
+    KimiLinearMetadata, reset_context, set_attn_backend_config,
+    set_context, set_forward_context,
     set_mamba_context, set_mixed_context,
 )
 from .mamba_state import (
@@ -79,20 +80,94 @@ def _load_tokenizer(model_name: str):
         )
 
 
+def _max_head_dim(cfg) -> int:
+    """Largest per-head dimension any attention layer will use.
+
+    Gemma-4 carries two: ``head_dim`` 256 for its sliding layers and
+    ``global_head_dim`` 512 for full attention. Scan rather than assume one
+    field, and look inside ``text_config`` for multimodal configs.
+    """
+    def _fields(node):
+        if isinstance(node, dict):
+            return node
+        return getattr(node, "__dict__", {}) or {}
+
+    def _sub(node, name):
+        if isinstance(node, dict):
+            return node.get(name)
+        return getattr(node, name, None)
+
+    best = 0
+    # ``cfg`` may be a transformers config object *or* a raw config.json dict:
+    # models transformers does not recognise (gemma4 needs transformers >= 5.5)
+    # only ever reach us as a dict, and that is exactly the model whose large
+    # head dim matters.
+    for node in (cfg, _sub(cfg, "text_config")):
+        if node is None:
+            continue
+        for k, v in _fields(node).items():
+            if isinstance(v, int) and not isinstance(v, bool) and "head_dim" in k:
+                best = max(best, v)
+    return best
+
+
+def _pin_attn_backend(config) -> None:
+    """Rebind this module's attention-backend globals.
+
+    They are bound at import time, so ``set_attn_backend_config`` alone does not
+    move the KV cache layout the way it does for ``eagle3_engine`` (which reads
+    ``get_attn_backend_config()`` at construction). Every read here happens at
+    call time, and nothing imports these names by value, so rebinding is safe as
+    long as it happens before any Sequence, BlockManager or cache is created.
+    """
+    global ATTN_BACKEND_CONFIG, USE_TRTLLM, BLOCK_SIZE, USE_FLASHINFER
+    set_attn_backend_config(config)
+    ATTN_BACKEND_CONFIG = config
+    USE_TRTLLM = config.use_trtllm
+    BLOCK_SIZE = config.block_size
+    USE_FLASHINFER = USE_TRTLLM
+    # Say so. An A/B of the attention backend is worthless without evidence that
+    # the switch actually took effect, and the first Qwen3-Next A/B produced two
+    # near-identical runs precisely because there was no way to tell.
+    print(f"[attn] pinned backend: use_trtllm={USE_TRTLLM} "
+          f"block_size={BLOCK_SIZE}", flush=True)
+
+
 def _detect_scheduling_defaults() -> tuple[int, int]:
     """Choose max_num_batched_tokens and max_num_seqs based on GPU memory.
 
     Mirrors vLLM's heuristic: high-memory GPUs (>=70 GiB, non-A100) get
     larger defaults; everything else gets conservative values.
+
+    ``FASTKERNELS_MAX_NUM_BATCHED_TOKENS`` / ``FASTKERNELS_MAX_NUM_SEQS``
+    override the result. These exist to make the scheduling width measurable:
+    the recurrent engines cap decode CUDA-graph capture well below the number of
+    state slots a large-memory GPU affords, so concurrency and graph coverage
+    trade off against each other and the trade needs to be experimentally
+    separable.
     """
+    def _override(name: str, value: int) -> int:
+        raw = os.environ.get(name)
+        if not raw:
+            return value
+        try:
+            parsed = int(raw)
+        except ValueError:
+            return value
+        return parsed if parsed > 0 else value
+
     if not torch.cuda.is_available():
-        return 8192, 256
-    _GiB = 1 << 30
-    _, total = torch.cuda.mem_get_info()
-    name = torch.cuda.get_device_name(0).lower()
-    if total >= 70 * _GiB and "a100" not in name:
-        return 16384, 1024
-    return 8192, 256
+        tokens, seqs = 8192, 256
+    else:
+        _GiB = 1 << 30
+        _, total = torch.cuda.mem_get_info()
+        name = torch.cuda.get_device_name(0).lower()
+        if total >= 70 * _GiB and "a100" not in name:
+            tokens, seqs = 16384, 1024
+        else:
+            tokens, seqs = 8192, 256
+    return (_override("FASTKERNELS_MAX_NUM_BATCHED_TOKENS", tokens),
+            _override("FASTKERNELS_MAX_NUM_SEQS", seqs))
 
 
 _DEFAULT_MAX_NUM_BATCHED_TOKENS, _DEFAULT_MAX_NUM_SEQS = (
@@ -100,6 +175,9 @@ _DEFAULT_MAX_NUM_BATCHED_TOKENS, _DEFAULT_MAX_NUM_SEQS = (
 )
 
 _PROFILE = os.environ.get("FASTKERNELS_PROFILE", "0") == "1"
+# See the admission loop: reserve each sequence's whole generation up front
+# (default, never preempts) or only its prompt (higher concurrency, may preempt).
+_ADMIT_RESERVE_PEAK = os.environ.get("FASTKERNELS_ADMIT_RESERVE", "1") == "1"
 
 
 ATTN_BACKEND_CONFIG = get_attn_backend_config()
@@ -207,9 +285,23 @@ class Sequence:
         return max(0, blocks_after - len(self.block_table))
 
     def preempt(self):
-        """Reset to re-prefillable state (vLLM-style recompute preemption)."""
+        """Reset to re-prefillable state (vLLM-style recompute preemption).
+
+        Recompute preemption must *resume* the sequence, not restart it: vLLM
+        re-prefills prompt+generated and carries on decoding from there. This used to
+        reset ``token_ids`` to the prompt and clear ``generated_ids``, throwing the
+        generated output away, so a preempted request silently produced a fresh
+        completion from scratch.
+
+        The generated tokens are folded into ``prompt_ids`` because that is what
+        ``num_prompt_tokens`` -- and therefore ``num_remaining_prefill`` and the
+        scheduler's chunking -- measures; ``generated_ids`` is left intact so the
+        output and the ``max_tokens`` accounting are unchanged. ``prompt_ids`` is read
+        nowhere else except for its length and to rebuild ``token_ids``, so widening
+        its meaning to "tokens that must be recomputed" is safe.
+        """
+        self.prompt_ids = list(self.prompt_ids) + list(self.generated_ids)
         self.token_ids = list(self.prompt_ids)
-        self.generated_ids.clear()
         self.block_table.clear()
         self.cross_block_table.clear()
         self.num_computed_tokens = 0
@@ -387,6 +479,11 @@ class ModelRunner:
                             _cfg_path = hf_hub_download(model_name, "config.json")
                         with open(_cfg_path) as _f:
                             _cfg_dict = _json.load(_f)
+                        # Keep the raw dict: models transformers does not
+                        # recognise (gemma4 needs transformers >= 5.5) never
+                        # produce a config object, and the attention-backend pin
+                        # below still needs their head dims.
+                        _cfg_raw = _cfg_dict
                         _td = _cfg_dict.get("torch_dtype", None)
                         cfg_dtype = getattr(torch, _td) if isinstance(_td, str) else None
                         model_type = _cfg_dict.get("model_type", "")
@@ -403,6 +500,53 @@ class ModelRunner:
                 dtype = cfg_dtype
             elif dtype is None:
                 dtype = torch.bfloat16
+        # Blackwell's TRTLLM backend uses an HND cache, which excludes the Triton
+        # unified attention kernel (it reads k_cache.shape[2] as num_kv_heads and
+        # so requires NHD). For head sizes above 256 that leaves only
+        # ``_decode_torch``, which syncs per sequence and cannot be CUDA-graph
+        # captured -- capture dies with cudaErrorStreamCaptureUnsupported. Pin
+        # such models to the flash_attn/NHD backend, as eagle3_engine does for
+        # its own layout requirement.
+        #
+        # ``FASTKERNELS_FORCE_NHD=1`` applies the same pin to any model. That is a
+        # diagnostic: several Blackwell rows run but disagree with the reference,
+        # and the only way to tell "the TRTLLM path is wrong" from "something else
+        # is wrong" is to re-run the identical harness on the NHD path. Off by
+        # default, so it changes nothing on H200.
+        _hd_src = _cfg if _cfg is not None else locals().get("_cfg_raw")
+        if _hd_src is not None and ATTN_BACKEND_CONFIG.use_trtllm:
+            _mhd = _max_head_dim(_hd_src)
+            # ``FASTKERNELS_HND_PAGE_SIZE`` keeps the TRTLLM/HND kernels but changes
+            # the page size (the kernels accept 16/32/64). It bisects the two things
+            # the NHD pin changes at once: kernel family, and the page-size-dependent
+            # store/block-table plumbing around it. The kernels themselves are
+            # equally accurate at either page size, so a change in end-to-end
+            # agreement here points at the plumbing rather than the maths.
+            _hnd_page = os.environ.get("FASTKERNELS_HND_PAGE_SIZE")
+            if _mhd > 256 or os.environ.get("FASTKERNELS_FORCE_NHD", "0") == "1":
+                _pin_attn_backend(AttnBackendConfig())
+                # These were captured from the module globals earlier in
+                # __init__, before the pin could know the model's head dims.
+                # Leaving them stale gave a block_size of 16 against a cache
+                # built at 256, so prepare_mixed_batch indexed
+                # seq.block_table[p // 16] and ran off the end (IndexError).
+                self.block_size = BLOCK_SIZE
+                self.max_model_len = (
+                    (max_model_len + BLOCK_SIZE - 1) // BLOCK_SIZE + 2
+                ) * BLOCK_SIZE
+                if rank == 0:
+                    print(f"  Attention backend pinned to flash_attn "
+                          f"(NHD, block_size={BLOCK_SIZE}): max head_dim "
+                          f"{_mhd} > 256 cannot use the Blackwell HND path.",
+                          flush=True)
+            elif _hnd_page:
+                _pin_attn_backend(AttnBackendConfig(
+                    backend="trtllm", block_size=int(_hnd_page), kv_layout="HND"))
+                self.block_size = BLOCK_SIZE
+                self.max_model_len = (
+                    (max_model_len + BLOCK_SIZE - 1) // BLOCK_SIZE + 2
+                ) * BLOCK_SIZE
+
         self.dtype = dtype
         default_dtype = torch.get_default_dtype()
         torch.set_default_dtype(dtype)
@@ -700,7 +844,7 @@ class ModelRunner:
         trtllm_workspace = torch.zeros(
             512 * 1024 * 1024, dtype=torch.uint8, device=f"cuda:{self.rank}"
         )
-        for layer in self._attn_layers:
+        for layer in self._attn_layers + self._cross_attn_layers:
             layer.set_trtllm_workspace(trtllm_workspace)
         torch.cuda.empty_cache()
 
@@ -3081,8 +3225,20 @@ class ModelRunner:
         # to capturing only up to ``cudagraph_capture_sizes`` (typically
         # <= 512) for the same reason.
         max_bs = min(self.max_num_seqs, 256)
+        # ``FASTKERNELS_MAMBA_GRAPH_MAX_BS`` raises that cap. The 256 was chosen
+        # against H200's 141 GiB; B200 has 183 GiB, and Mamba-Codestral runs with 987
+        # state slots here, so every decode batch above 256 replays no graph at all.
+        # Opt-in, because exceeding the memory this comment describes OOMs the slot
+        # pool rather than degrading gracefully.
+        _cap_override = os.environ.get("FASTKERNELS_MAMBA_GRAPH_MAX_BS")
+        if _cap_override:
+            try:
+                max_bs = min(self.max_num_seqs, int(_cap_override))
+            except ValueError:
+                pass
         self._mamba_graph_bs_list = sorted(set(
-            [1, 2, 4, 8, 16, 32, 48, 64, 96, 128, 160, 192, 224, 256]
+            [1, 2, 4, 8, 16, 32, 48, 64, 96, 128, 160, 192, 224, 256,
+             320, 384, 448, 512, 640, 768, 896, 1024]
         ))
         self._mamba_graph_bs_list = [
             b for b in self._mamba_graph_bs_list if b <= max_bs
@@ -6758,6 +6914,15 @@ class LlamaEngine:
                             bm.deallocate(seq)
                             bm.deallocate_cross(seq)
                             seq.preempt()
+                            # Preemption is the one scheduler event that can change
+                            # a sequence's output, so count it: an unexplained
+                            # alignment gap at high concurrency looks very different
+                            # if thousands of sequences were preempted.
+                            _n = getattr(self, "_num_preemptions", 0) + 1
+                            self._num_preemptions = _n
+                            if _n == 1 or _n % 500 == 0:
+                                print(f"  [sched] preempted {_n} sequence(s) "
+                                      f"(KV blocks exhausted)", flush=True)
                             waiting.appendleft(seq)
                             continue
                         seq.block_table.append(bm.free_block_ids.popleft())
@@ -6841,8 +7006,19 @@ class LlamaEngine:
                 free = len(bm.free_block_ids)
                 if free < blocks_needed + watermark_blocks:
                     break
-                seq_peak = (prompt_len + seq.max_tokens
-                            + block_size - 1) // block_size
+                # Worst-case reservation: require room for this sequence's entire
+                # generation before admitting it. That is what keeps the engine from
+                # ever preempting, but it caps concurrency and leaves the prefill token
+                # budget ~40% unused (measured: 9.8k of 16384 tokens per mixed step on
+                # Llama-3.1), where vLLM allocates lazily and preempts instead.
+                # FASTKERNELS_ADMIT_RESERVE=0 relaxes it to reserving only the prompt,
+                # which is safe now that Sequence.preempt() resumes rather than
+                # restarts. Off by default until the throughput win is demonstrated.
+                if _ADMIT_RESERVE_PEAK:
+                    seq_peak = (prompt_len + seq.max_tokens
+                                + block_size - 1) // block_size
+                else:
+                    seq_peak = (prompt_len + block_size - 1) // block_size
                 if total_peak + seq_peak > num_blocks:
                     break
                 num_scheduled = len(prefill_seqs) + len(decode_seqs)
