@@ -36,13 +36,31 @@ try:
     from vllm.v1.attention.ops.triton_unified_attention import (
         unified_attention as _triton_unified_attention,
     )
-    from vllm.v1.kv_cache_interface import KVQuantMode as _VllmKVQuantMode
 
     _TRITON_UNIFIED_AVAILABLE = True
 except Exception:  # pragma: no cover - optional vLLM runtime dependency.
     _triton_unified_attention = None
-    _VllmKVQuantMode = None
     _TRITON_UNIFIED_AVAILABLE = False
+
+# ``KVQuantMode`` and the ``kv_quant_mode`` kwarg were removed from
+# ``unified_attention`` in newer vLLM (>=0.18); import it independently so a
+# failure here does not disable the whole triton-unified path (needed by the
+# head_dim>256 decode path, e.g. Gemma-4's 512-dim global-attention layers).
+try:
+    from vllm.v1.kv_cache_interface import KVQuantMode as _VllmKVQuantMode
+except Exception:  # pragma: no cover - optional vLLM runtime dependency.
+    _VllmKVQuantMode = None
+
+if _TRITON_UNIFIED_AVAILABLE:
+    import inspect as _inspect
+
+    _TRITON_UNIFIED_ACCEPTS_KV_QUANT = (
+        _VllmKVQuantMode is not None
+        and "kv_quant_mode"
+        in _inspect.signature(_triton_unified_attention).parameters
+    )
+else:
+    _TRITON_UNIFIED_ACCEPTS_KV_QUANT = False
 
 
 def _chunked_prefill_remap(
@@ -450,6 +468,8 @@ class Attention(nn.Module):
                 "softmax_segm_max": segm_max,
                 "softmax_segm_expsum": segm_expsum,
             }
+        if _TRITON_UNIFIED_ACCEPTS_KV_QUANT:
+            triton_extra["kv_quant_mode"] = _VllmKVQuantMode.NONE
         _triton_unified_attention(
             q=q,
             k=k_cache,
@@ -468,7 +488,6 @@ class Attention(nn.Module):
             k_descale=kv_descale,
             v_descale=kv_descale,
             sinks=self._fa3_sinks,
-            kv_quant_mode=_VllmKVQuantMode.NONE,
             **triton_extra,
         )
         return out

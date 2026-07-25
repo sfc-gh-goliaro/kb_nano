@@ -743,10 +743,12 @@ def load_weights(model, model_path: str, model_type: str = "llama") -> None:
             if m_conv:
                 prefix, wb = m_conv.groups()
                 mapped_name = f"{prefix}.conv.{wb}"
-            m_ln = _WHISPER_LAYER_NORM_RE.match(mapped_name)
-            if m_ln:
-                prefix, wb = m_ln.groups()
-                mapped_name = f"{prefix}.norm.{wb}"
+            # NOTE: the L1 LayerNorm wrapper exposes .weight/.bias directly
+            # (not nested under .norm), so LayerNorm checkpoint names already
+            # match the model parameter names -- no remap needed. Remapping to
+            # ".norm.<wb>" here silently skipped every LayerNorm weight, leaving
+            # them at init (weight=1, bias=0) and producing garbage encoder
+            # output (cosine ~0.001 vs reference).
             m_emb = _WHISPER_EMBED_RE.match(mapped_name)
             if m_emb:
                 prefix = m_emb.group(1)
@@ -1481,7 +1483,13 @@ def load_model(
             f"({config.num_experts} experts, "
             f"{len(config.kda_layers)} KDA + {len(config.full_attn_layers)} MLA layers)..."
         )
-        model = KimiLinearForCausalLM(config, quant_config=quant_config)
+        # Kimi's KDA attention borrows vLLM's FusedRMSNormGated CustomOp, whose
+        # __init__ eagerly reads get_current_vllm_config() (vLLM >=0.18). We build
+        # the model outside vLLM's engine, so establish a default config context
+        # to let the CustomOp bind its forward impl (numerics unchanged).
+        from vllm.config import VllmConfig, set_current_vllm_config
+        with set_current_vllm_config(VllmConfig()):
+            model = KimiLinearForCausalLM(config, quant_config=quant_config)
     else:
         config = LlamaConfig.from_pretrained(model_name)
         config.dtype = dtype

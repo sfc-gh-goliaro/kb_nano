@@ -207,7 +207,11 @@ class Qwen2VLForConditionalGeneration(nn.Module):
         image_offsets: list[int] | None = None,
         video_offsets: list[int] | None = None,
         video_second_per_grid: list[float] | None = None,
+        audio_feature_lengths=None,
     ) -> tuple[torch.Tensor, int]:
+        # ``audio_feature_lengths`` is passed by the engine for the unified
+        # Qwen-VL/Omni mrope call site; Qwen2-VL has no audio stream, so it is
+        # always None here and is accepted only to match that signature.
         return self._mrope_positions(
             input_tokens, self.config.vision.spatial_merge_size,
             image_grid_thw, video_grid_thw,

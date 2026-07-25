@@ -16,7 +16,11 @@ dependencies = [
     "huggingface_hub",
     "safetensors",
     "tqdm",
-    "flash-attn",
+    # Pin to the prebuilt local-version wheel (see [tool.uv] find-links) so uv
+    # installs it instead of building from source. Unpinned resolves to PyPI's
+    # 2.8.3.post1 sdist, which outranks the "+cu128torch2.10" wheel and triggers
+    # a ~30min CUDA source build. This pin matches the cu128 / torch2.10 stack.
+    "flash-attn==2.8.3+cu128torch2.10",
     "vllm==0.18.0",
     "deep-gemm @ git+https://github.com/deepseek-ai/DeepGEMM.git@v2.1.1.post3",
     "decord",

@@ -912,7 +912,15 @@ def main():
 
     kb_cfg = dict(base_cfg)
     kb_cfg["project_root"] = str(_PROJECT_ROOT)
-    kb_cfg["package_name"] = _PACKAGE_DIR.name
+    # The installed package is named ``fastkernels`` (the repo dir is still
+    # ``kb_nano``). The worker loads the engine as ``{pkg}.infra.fla_engine``;
+    # its RELATIVE imports must land in the SAME namespace as the engine's
+    # own hardcoded ``from fastkernels.tasks...`` imports, or a module like
+    # ``L1/rms_norm.py`` gets imported under two names and its top-level
+    # ``torch.library.Library("fastkernels_norm", "DEF")`` runs twice,
+    # crashing with "Only a single TORCH_LIBRARY can be used". Using
+    # ``_PACKAGE_DIR.name`` ("kb_nano") here caused exactly that.
+    kb_cfg["package_name"] = "fastkernels"
     kb_cfg["max_num_seqs"] = args.max_num_seqs
     kb_cfg["chunked_prefill_size"] = args.chunked_prefill_size
     kb_cfg["pytorch_reference"] = args.pytorch_reference

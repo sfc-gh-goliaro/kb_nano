@@ -76,13 +76,14 @@ class RWKV7Block(nn.Module):
             attention_mask=attention_mask,
             past_key_values=past_key_values,
             use_cache=use_cache,
+            **kwargs,
         )
         hidden_states = residual + h
 
         residual = hidden_states
         h = self.ffn_norm(hidden_states)
         hidden_states = residual + self.ffn(
-            h, past_key_values=past_key_values, use_cache=use_cache,
+            h, past_key_values=past_key_values, use_cache=use_cache, **kwargs,
         )
 
         return hidden_states, v_first, attentions, past_key_values

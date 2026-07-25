@@ -241,3 +241,4 @@ data/
 .claude/
 .cursor/
 CLAUDE.md
+third_party/

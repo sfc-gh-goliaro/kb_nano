@@ -294,7 +294,14 @@ class Qwen3VLForConditionalGeneration(nn.Module):
         video_grid_thw: list[list[int]] | None = None,
         image_offsets: list[int] | None = None,
         video_offsets: list[int] | None = None,
+        video_second_per_grid: list[float] | None = None,
+        audio_feature_lengths=None,
     ) -> tuple[torch.Tensor, int]:
+        # Qwen3-VL derives video temporal positions from the per-frame
+        # ``video_offsets`` the engine builds (one offset per frame), so the
+        # timestamp-based ``video_second_per_grid`` and the audio-only
+        # ``audio_feature_lengths`` are accepted only to match the unified
+        # engine call site and are intentionally unused.
         return self._mrope_positions(
             input_tokens, self.config.vision.spatial_merge_size,
             image_grid_thw, video_grid_thw,

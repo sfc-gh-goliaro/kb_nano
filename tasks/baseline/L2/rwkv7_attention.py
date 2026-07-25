@@ -148,6 +148,13 @@ class RWKV7Attention(nn.Module):
         **kwargs,
     ) -> tuple[torch.Tensor, None, object | None, torch.Tensor]:
         B, T, _ = hidden_states.shape
+        cu_seqlens = kwargs.get("cu_seqlens")
+        max_seqlen = None
+        if cu_seqlens is not None:
+            if B != 1:
+                raise ValueError("cu_seqlens prefill expects packed hidden_states with batch size 1")
+            lengths = cu_seqlens[1:] - cu_seqlens[:-1]
+            max_seqlen = int(lengths.max().item()) if lengths.numel() else 0
 
         # Token shift: shifted[t] = previous token's hidden state.
         # For cached decode the previous token lives in past_key_values.conv_states[id(self)]
@@ -158,15 +165,41 @@ class RWKV7Attention(nn.Module):
             if cs is not None:
                 prev_shift = cs.get(id(self))
         shifted = torch.empty_like(hidden_states)
-        if prev_shift is not None:
-            shifted[:, 0] = prev_shift
+        if cu_seqlens is not None:
+            # Packed varlen prefill: N sub-sequences concatenated into a
+            # single B=1 row (cu_seqlens marks the boundaries). The token
+            # shift must NOT cross a segment boundary: segment i's first
+            # token sees its own incoming conv_state (per-segment, gathered
+            # as [N, hidden]) or zero for a fresh segment — never segment
+            # i-1's last token. A plain shift-by-one would leak the previous
+            # sequence's final hidden state into the next sequence.
+            if T > 1:
+                shifted[:, 1:] = hidden_states[:, :-1]
+            seg_starts = cu_seqlens[:-1].to(torch.int64)   # [N], includes 0
+            if prev_shift is not None:
+                shifted[0, seg_starts] = prev_shift.to(shifted.dtype)
+            else:
+                shifted[0, seg_starts] = 0
         else:
-            shifted[:, 0].zero_()
-        if T > 1:
-            shifted[:, 1:] = hidden_states[:, :-1]
+            if prev_shift is not None:
+                shifted[:, 0] = prev_shift
+            else:
+                shifted[:, 0].zero_()
+            if T > 1:
+                shifted[:, 1:] = hidden_states[:, :-1]
         delta = shifted - hidden_states
-        # Save the last hidden vec as the conv_state for the next call.
-        new_conv_state = hidden_states[:, -1].detach() if use_cache else None
+        # Save each sequence's last hidden vec as the conv_state for the next
+        # call. In the packed varlen path that is the last token of EACH
+        # segment -> [N, hidden] (one row per sub-sequence, matching the
+        # engine's per-slot scatter); otherwise the last column -> [B, hidden].
+        if use_cache:
+            if cu_seqlens is not None:
+                seg_last = (cu_seqlens[1:] - 1).to(torch.int64)   # [N]
+                new_conv_state = hidden_states[0].index_select(0, seg_last).detach()
+            else:
+                new_conv_state = hidden_states[:, -1].detach()
+        else:
+            new_conv_state = None
 
         # Fused addcmul: xi = hidden_states + delta * x_i
         xr = torch.addcmul(hidden_states, delta, self.x_r)
@@ -218,7 +251,11 @@ class RWKV7Attention(nn.Module):
         #   T  < 64 + fast kernels -> fused_mul_recurrent_rwkv7 (decode)
         #   no fast kernels         -> naive PyTorch (CPU / debug / reference)
         if self.use_fast_kernels and r.is_cuda:
-            if T >= _CHUNK_THRESHOLD:
+            # In packed varlen prefill dispatch on the longest segment, not
+            # the total packed length T, and thread cu_seqlens through so the
+            # kernel produces one final_state per sub-sequence ([N, ...]).
+            dispatch_len = max_seqlen if max_seqlen is not None else T
+            if dispatch_len >= _CHUNK_THRESHOLD:
                 # The chunk kernel takes the DPLR decomposition (a=-kk, b=kk*gate_a).
                 o, final_state = self.chunk(
                     r=r_mh, w=w_mh, k=k_mh, v=v_mh,
@@ -226,6 +263,7 @@ class RWKV7Attention(nn.Module):
                     scale=1.0,
                     initial_state=initial_state,
                     output_final_state=use_cache,
+                    cu_seqlens=cu_seqlens,
                 )
             else:
                 o, final_state = self.fused_recurrence(
@@ -234,6 +272,7 @@ class RWKV7Attention(nn.Module):
                     scale=1.0,
                     initial_state=initial_state,
                     output_final_state=use_cache,
+                    cu_seqlens=cu_seqlens,
                 )
             # Fast-path output is already [B, T, H, V] — no transpose needed.
         else:
