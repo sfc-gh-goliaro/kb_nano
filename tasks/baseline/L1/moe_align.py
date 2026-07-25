@@ -14,6 +14,25 @@ import triton
 from .csrc import _C
 
 
+def _persistent(factory, *args, **kwargs) -> torch.Tensor:
+    """Allocate a reusable buffer that is safe to mutate from anywhere.
+
+    These buffers are created lazily on first forward, which usually runs under
+    ``torch.inference_mode()``. A tensor created there is an *inference tensor*,
+    and PyTorch rejects in-place updates to it from outside inference mode --
+    which is exactly what happens once the surrounding module is compiled and
+    Inductor calls the op from its generated wrapper:
+
+        RuntimeError: Inplace update to inference tensor outside InferenceMode
+        is not allowed.
+
+    Allocating with inference mode explicitly disabled keeps the buffer a normal
+    tensor, so both call paths may write it.
+    """
+    with torch.inference_mode(False):
+        return factory(*args, **kwargs)
+
+
 class MoeAlign(nn.Module):
     """MoE token-to-expert alignment using sgl_kernel.
 
@@ -31,23 +50,23 @@ class MoeAlign(nn.Module):
     def _ensure_buffers(self, max_padded, max_blocks, num_experts, device):
         if (self._sorted_token_ids is None
                 or self._sorted_token_ids.size(0) < max_padded):
-            self._sorted_token_ids = torch.empty(
-                max_padded, dtype=torch.int32, device=device,
+            self._sorted_token_ids = _persistent(
+                torch.empty, max_padded, dtype=torch.int32, device=device,
             )
         if (self._expert_ids is None
                 or self._expert_ids.size(0) < max_blocks):
-            self._expert_ids = torch.empty(
-                max_blocks, dtype=torch.int32, device=device,
+            self._expert_ids = _persistent(
+                torch.empty, max_blocks, dtype=torch.int32, device=device,
             )
         if (self._num_tokens_post_padded is None
                 or self._num_tokens_post_padded.device != device):
-            self._num_tokens_post_padded = torch.zeros(
-                1, dtype=torch.int32, device=device,
+            self._num_tokens_post_padded = _persistent(
+                torch.zeros, 1, dtype=torch.int32, device=device,
             )
         if (self._cumsum_buffer is None
                 or self._cumsum_buffer.size(0) < num_experts + 1):
-            self._cumsum_buffer = torch.zeros(
-                num_experts + 1, dtype=torch.int32, device=device,
+            self._cumsum_buffer = _persistent(
+                torch.zeros, num_experts + 1, dtype=torch.int32, device=device,
             )
 
     def _naive_forward(
@@ -61,8 +80,8 @@ class MoeAlign(nn.Module):
         expert_ids = topk_ids.view(-1).to(torch.int32)
         if (self._naive_num_tokens_post_padded is None
                 or self._naive_num_tokens_post_padded.device != topk_ids.device):
-            self._naive_num_tokens_post_padded = torch.empty(
-                1, dtype=torch.int32, device=topk_ids.device,
+            self._naive_num_tokens_post_padded = _persistent(
+                torch.empty, 1, dtype=torch.int32, device=topk_ids.device,
             )
         self._naive_num_tokens_post_padded.fill_(max_num_tokens_padded)
         return None, expert_ids, self._naive_num_tokens_post_padded
