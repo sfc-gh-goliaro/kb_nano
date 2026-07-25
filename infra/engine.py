@@ -4026,7 +4026,21 @@ class ModelRunner:
             positions = self._eager_positions[:n]
         slot_mapping = self._eager_slot_mapping[:n]
         context_lens = self._eager_context_lens[:n]
-        block_tables = self._eager_block_tables[:n, :bt_cols]
+        if ATTN_BACKEND_CONFIG.use_trtllm:
+            # Full width, NOT [:n, :bt_cols]. FlashInfer's TRTLLM-gen launcher derives
+            # the block-table row stride from size(-1) rather than from stride(0), so a
+            # column slice of a wider allocation makes every row but row 0 read the
+            # wrong KV pages -- verified in probe_blocktable_stride.py, where the sliced
+            # table gives cosine ~0.0 against the identical table copied contiguously,
+            # for 7 of 8 rows. The captured-graph path always passed the full width and
+            # so was unaffected; this is why B200, whose larger KV cache pushes
+            # concurrency past the 512-entry graph ceiling and onto this path, collapsed
+            # to ~23 matched tokens of 507 while H200 never reached it. The kernel walks
+            # only ceil(seq_len/page) columns per row, which are exactly the ones copied
+            # above, so the untouched tail is never read.
+            block_tables = self._eager_block_tables[:n]
+        else:
+            block_tables = self._eager_block_tables[:n, :bt_cols]
 
         req_id_per_token = getattr(self, "_decode_req_id_buf", None)
         if req_id_per_token is not None:
