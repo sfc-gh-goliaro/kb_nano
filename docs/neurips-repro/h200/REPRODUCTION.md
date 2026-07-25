@@ -102,7 +102,7 @@ today and are listed for completeness.
 | Vision/Video/Audio | **Whisper** | vLLM | 0.95× / 388.7/444 | **0.83× / match 390.9/444** | dev | ✓ align **today** (fixed) |
 | Vision/Video/Audio | **CosyVoice3** | vllm-omni | 2.13× / mel cos 0.999 | **~2.0× / code2wav mel cos 0.9994** | dev | ✓ **today** |
 | Multimodal/Enc | Qwen2-VL / Qwen3-VL | vLLM | 0.91× / 1.39× | reproduced *(prior)* | dev | ✓ |
-| Multimodal/Enc | **Qwen-2.5-Omni** | vLLM | 2.02× / exact match 36.2% | vs 0.18: **1.57× / 22.3%**; vs 0.20.1: *(pending)* | vLLM venv | ⚠ baseline-version-sensitive |
+| Multimodal/Enc | **Qwen-2.5-Omni** | vLLM | 2.02× / exact match 36.2% | vs 0.16: 0.76×; vs 0.18: 1.57× / 22.3%; vs 0.20.1: 1.57× / 19.9% | vLLM venv | ⚠ not reproduced — baseline-version-sensitive |
 | Multimodal/Enc | SigLIP-2 / DINOv3 / SwinV2 | timm | 0.93× / 0.99× / 1.17×, cos 1.000 | reproduced *(prior)* | dev | ✓ |
 | Edge/Detection | MobileNetV4 / ConvNeXtV2 / EfficientNetV2 | timm/transformers | 1.15× / 0.99× / 1.05×, cos 1.000 | reproduced *(prior)* | dev | ✓ |
 | Edge/Detection | YOLOv10 / RTDetrV2 | THU-MIG / transformers | 1.06× / 1.08× | reproduced *(prior)* | dev | ✓ |
@@ -124,10 +124,14 @@ today and are listed for completeness.
   (unmerged `deepseek-optim` indexer opts + engine plumbing). To resume, see the
   memory note / task #18.
 - **Qwen-2.5-Omni** — reproduces structurally on all scenarios, but the exact
-  2.02× / 36.2% is highly sensitive to the vLLM baseline version (vLLM audio
-  throughput swung ~9× between 0.16 and 0.18). vs vLLM 0.18: 1.57× / 22.3% exact
-  match; the divergence is numerical (greedy outputs match for 42–201 tokens then
-  drift), not a fastkernels bug. Re-running against paper-era vLLM 0.20.1.
+  2.02× / 36.2% is NOT reproduced against any available vLLM (0.16: 0.76×;
+  0.18: 1.57× / 22.3%; paper-era 0.20.1: 1.57× / 19.9%). fastkernels' own
+  throughput is stable across all three (text ~16k, image ~9.5k, video ~1.7k,
+  audio ~8.7k tok/s); the swings are entirely on the vLLM side — audio throughput
+  changed ~9× between 0.16 and 0.18/0.20.1, and the image exact-match ranges
+  0–14% by version. The greedy-output divergence is numerical (outputs match for
+  tens–hundreds of tokens then drift), not a fastkernels bug. The paper's figure
+  reflects a specific vLLM build/config that is none of 0.16/0.18/0.20.1.
 - **Whisper / OpenFold3 / HunyuanVideo / FLUX / Oasis / DP3** — speedups run
   slightly under the paper target because the *reference* (vLLM/vllm-omni/gsplat)
   is a newer, faster build than at paper time; the **alignment/correctness**
