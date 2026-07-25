@@ -1,0 +1,262 @@
+{
+ "ada_layer_norm": {
+  "class": "CONFIG",
+  "error": "scenario raised TypeError: AdaLayerNormZeroSingle.__init__() missing 1 required positional argument: 'embedding_dim'\nTraceback (most recent call last):\n  File \"/home/olu/kb_nano/bench/kernels/runner.py\", line 94, in _instantiate_module\n    module = cls(**kwarg"
+ },
+ "ada_layer_norm_continuous": {
+  "class": "CONFIG",
+  "error": "scenario raised TypeError: AdaLayerNormContinuous.__init__() missing 2 required positional arguments: 'embedding_dim' and 'conditioning_embedding_dim'\nTraceback (most recent call last):\n  File \"/home/olu/kb_nano/bench/kernels/runner.py\", line 94, in _instantia"
+ },
+ "allreduce": {
+  "class": "DIST",
+  "error": "scenario raised ValueError: Default process group has not been initialized, please make sure to call init_process_group.\nTraceback (most recent call last):\n  File \"/home/olu/kb_nano/tools/agent_eval/agent_entrypoint.py\", line 407, in run\n    baseline_out = R._"
+ },
+ "attention": {
+  "class": "CONFIG",
+  "error": "scenario raised TypeError: LlamaAttention.__init__() missing 4 required positional arguments: 'hidden_size', 'num_attention_heads', 'num_key_value_heads', and 'head_dim'\nTraceback (most recent call last):\n  File \"/home/olu/kb_nano/bench/kernels/runner.py\", lin"
+ },
+ "attention_impl": {
+  "class": "CONFIG",
+  "error": "scenario raised TypeError: Attention.__init__() missing 3 required positional arguments: 'num_heads', 'head_size', and 'scale'\nTraceback (most recent call last):\n  File \"/home/olu/kb_nano/bench/kernels/runner.py\", line 94, in _instantiate_module\n    module = c"
+ },
+ "conv2d": {
+  "class": "CONFIG",
+  "error": "scenario raised TypeError: Conv2d.__init__() missing 3 required positional arguments: 'in_channels', 'out_channels', and 'kernel_size'\nTraceback (most recent call last):\n  File \"/home/olu/kb_nano/bench/kernels/runner.py\", line 94, in _instantiate_module\n    mo"
+ },
+ "embedding": {
+  "class": "CONFIG",
+  "error": "scenario raised TypeError: Embedding.__init__() missing 2 required positional arguments: 'num_embeddings' and 'embedding_dim'\nTraceback (most recent call last):\n  File \"/home/olu/kb_nano/bench/kernels/runner.py\", line 94, in _instantiate_module\n    module = cl"
+ },
+ "encoder_embeddings": {
+  "class": "CONFIG",
+  "error": "scenario raised TypeError: XLMRobertaEmbeddings.__init__() missing 1 required positional argument: 'config'\nTraceback (most recent call last):\n  File \"/home/olu/kb_nano/bench/kernels/runner.py\", line 94, in _instantiate_module\n    module = cls(**kwargs)\n      "
+ },
+ "encoder_mlp": {
+  "class": "CONFIG",
+  "error": "scenario raised TypeError: EncoderOutput.__init__() missing 1 required positional argument: 'config'\nTraceback (most recent call last):\n  File \"/home/olu/kb_nano/bench/kernels/runner.py\", line 94, in _instantiate_module\n    module = cls(**kwargs)\n             "
+ },
+ "flux_feedforward": {
+  "class": "CONFIG",
+  "error": "scenario raised TypeError: FeedForward.__init__() missing 1 required positional argument: 'dim'\nTraceback (most recent call last):\n  File \"/home/olu/kb_nano/bench/kernels/runner.py\", line 94, in _instantiate_module\n    module = cls(**kwargs)\n             ^^^^^"
+ },
+ "flux_transformer_block": {
+  "class": "CONFIG",
+  "error": "scenario raised TypeError: FluxSingleTransformerBlock.__init__() missing 3 required positional arguments: 'dim', 'num_attention_heads', and 'attention_head_dim'\nTraceback (most recent call last):\n  File \"/home/olu/kb_nano/bench/kernels/runner.py\", line 94, in "
+ },
+ "fp8_linear": {
+  "class": "OTHER",
+  "error": "scenario raised RuntimeError: Assertion error (csrc/apis/../jit_kernels/impls/../heuristics/../../utils/layout.hpp:85): sf.stride(-2) == 1\nTraceback (most recent call last):\n  File \"/home/olu/kb_nano/tools/agent_eval/agent_entrypoint.py\", line 407, in run\n    "
+ },
+ "gla": {
+  "class": "CONFIG",
+  "error": "scenario raised TypeError: GLAForCausalLM.__init__() missing 1 required positional argument: 'config'\nTraceback (most recent call last):\n  File \"/home/olu/kb_nano/bench/kernels/runner.py\", line 94, in _instantiate_module\n    module = cls(**kwargs)\n            "
+ },
+ "gla_attention": {
+  "class": "CONFIG",
+  "error": "scenario raised TypeError: GatedLinearAttention.__init__() missing 2 required positional arguments: 'hidden_size' and 'num_heads'\nTraceback (most recent call last):\n  File \"/home/olu/kb_nano/bench/kernels/runner.py\", line 94, in _instantiate_module\n    module "
+ },
+ "gla_decoder": {
+  "class": "CONFIG",
+  "error": "scenario raised TypeError: GLADecoderLayer.__init__() missing 2 required positional arguments: 'config' and 'layer_idx'\nTraceback (most recent call last):\n  File \"/home/olu/kb_nano/bench/kernels/runner.py\", line 94, in _instantiate_module\n    module = cls(**kw"
+ },
+ "gla_mlp": {
+  "class": "CONFIG",
+  "error": "scenario raised TypeError: GLAMLP.__init__() missing 2 required positional arguments: 'hidden_size' and 'intermediate_size'\nTraceback (most recent call last):\n  File \"/home/olu/kb_nano/bench/kernels/runner.py\", line 94, in _instantiate_module\n    module = cls("
+ },
+ "gpt_oss": {
+  "class": "CONFIG",
+  "error": "scenario raised TypeError: GptOssForCausalLM.__init__() missing 1 required positional argument: 'config'\nTraceback (most recent call last):\n  File \"/home/olu/kb_nano/bench/kernels/runner.py\", line 94, in _instantiate_module\n    module = cls(**kwargs)\n         "
+ },
+ "gpt_oss_decoder": {
+  "class": "CONFIG",
+  "error": "scenario raised TypeError: GptOssDecoderLayer.__init__() missing 2 required positional arguments: 'config' and 'layer_idx'\nTraceback (most recent call last):\n  File \"/home/olu/kb_nano/bench/kernels/runner.py\", line 94, in _instantiate_module\n    module = cls(*"
+ },
+ "gpt_oss_moe": {
+  "class": "CONFIG",
+  "error": "scenario raised TypeError: GptOssMoE.__init__() missing 1 required positional argument: 'config'\nTraceback (most recent call last):\n  File \"/home/olu/kb_nano/bench/kernels/runner.py\", line 94, in _instantiate_module\n    module = cls(**kwargs)\n             ^^^^"
+ },
+ "layer_norm": {
+  "class": "CONFIG",
+  "error": "scenario raised TypeError: layer_norm(): argument 'normalized_shape' (position 2) must be tuple of ints, but found element of type list at pos 0\nTraceback (most recent call last):\n  File \"/home/olu/kb_nano/tools/agent_eval/agent_entrypoint.py\", line 407, in ru"
+ },
+ "linear": {
+  "class": "CONFIG",
+  "error": "scenario raised TypeError: Linear.__init__() missing 2 required positional arguments: 'in_features' and 'out_features'\nTraceback (most recent call last):\n  File \"/home/olu/kb_nano/bench/kernels/runner.py\", line 94, in _instantiate_module\n    module = cls(**kwa"
+ },
+ "llama": {
+  "class": "CONFIG",
+  "error": "scenario raised TypeError: LlamaForCausalLM.__init__() missing 1 required positional argument: 'config'\nTraceback (most recent call last):\n  File \"/home/olu/kb_nano/bench/kernels/runner.py\", line 94, in _instantiate_module\n    module = cls(**kwargs)\n          "
+ },
+ "llama_decoder": {
+  "class": "CONFIG",
+  "error": "scenario raised TypeError: LlamaDecoderLayer.__init__() missing 1 required positional argument: 'config'\nTraceback (most recent call last):\n  File \"/home/olu/kb_nano/bench/kernels/runner.py\", line 94, in _instantiate_module\n    module = cls(**kwargs)\n         "
+ },
+ "llama_mlp": {
+  "class": "CONFIG",
+  "error": "scenario raised TypeError: LlamaMLP.__init__() missing 1 required positional argument: 'config'\nTraceback (most recent call last):\n  File \"/home/olu/kb_nano/bench/kernels/runner.py\", line 94, in _instantiate_module\n    module = cls(**kwargs)\n             ^^^^^"
+ },
+ "moe_grouped_gemm": {
+  "class": "CRASH",
+  "error": "scenario raised AcceleratorError: CUDA error: an illegal memory access was encountered\nSearch for `cudaErrorIllegalAddress' in https://docs.nvidia.com/cuda/cuda-runtime-api/group__CUDART__TYPES.html for more information.\nCUDA kernel errors might be asynchronou"
+ },
+ "mrope": {
+  "class": "CONFIG",
+  "error": "scenario raised TypeError: MRotaryEmbedding.__init__() missing 4 required positional arguments: 'head_dim', 'max_position_embeddings', 'rope_theta', and 'mrope_section'\nTraceback (most recent call last):\n  File \"/home/olu/kb_nano/bench/kernels/runner.py\", line"
+ },
+ "mrope_input_positions": {
+  "class": "CONFIG",
+  "error": "scenario raised TypeError: MRopeInputPositions.forward() missing 1 required positional argument: 'input_tokens'\nTraceback (most recent call last):\n  File \"/home/olu/kb_nano/tools/agent_eval/agent_entrypoint.py\", line 407, in run\n    baseline_out = R._run_forwa"
+ },
+ "mxfp4_moe": {
+  "class": "CONFIG",
+  "error": "scenario raised TypeError: Mxfp4MoE.forward() missing 3 required positional arguments: 'w1', 'w2', and 'quant_config'\nTraceback (most recent call last):\n  File \"/home/olu/kb_nano/tools/agent_eval/agent_entrypoint.py\", line 407, in run\n    baseline_out = R._run"
+ },
+ "oasis_block": {
+  "class": "CONFIG",
+  "error": "scenario raised TypeError: SpatioTemporalDiTBlock.__init__() missing 2 required positional arguments: 'hidden_size' and 'num_heads'\nTraceback (most recent call last):\n  File \"/home/olu/kb_nano/bench/kernels/runner.py\", line 94, in _instantiate_module\n    modul"
+ },
+ "oasis_final_layer": {
+  "class": "CONFIG",
+  "error": "scenario raised TypeError: OasisFinalLayer.__init__() missing 3 required positional arguments: 'hidden_size', 'patch_size', and 'out_channels'\nTraceback (most recent call last):\n  File \"/home/olu/kb_nano/bench/kernels/runner.py\", line 94, in _instantiate_modul"
+ },
+ "oasis_mlp": {
+  "class": "CONFIG",
+  "error": "scenario raised TypeError: OasisMLP.__init__() missing 1 required positional argument: 'in_features'\nTraceback (most recent call last):\n  File \"/home/olu/kb_nano/bench/kernels/runner.py\", line 94, in _instantiate_module\n    module = cls(**kwargs)\n             "
+ },
+ "oasis_patch_embed": {
+  "class": "OTHER",
+  "error": "scenario raised AssertionError: Input image size (360*640) doesn't match model (256, 256).\nTraceback (most recent call last):\n  File \"/home/olu/kb_nano/tools/agent_eval/agent_entrypoint.py\", line 407, in run\n    baseline_out = R._run_forward_once(baseline_mod,"
+ },
+ "oasis_rollout": {
+  "class": "CONFIG",
+  "error": "scenario raised TypeError: OasisRollout.forward() missing 2 required positional arguments: 'model' and 'vae'\nTraceback (most recent call last):\n  File \"/home/olu/kb_nano/tools/agent_eval/agent_entrypoint.py\", line 407, in run\n    baseline_out = R._run_forward_"
+ },
+ "oasis_spatial_axial_attention": {
+  "class": "CONFIG",
+  "error": "scenario raised TypeError: OasisSpatialAxialAttention.__init__() missing 4 required positional arguments: 'dim', 'heads', 'dim_head', and 'rotary_emb'\nTraceback (most recent call last):\n  File \"/home/olu/kb_nano/bench/kernels/runner.py\", line 94, in _instantia"
+ },
+ "oasis_temporal_axial_attention": {
+  "class": "CONFIG",
+  "error": "scenario raised TypeError: OasisTemporalAxialAttention.__init__() missing 4 required positional arguments: 'dim', 'heads', 'dim_head', and 'rotary_emb'\nTraceback (most recent call last):\n  File \"/home/olu/kb_nano/bench/kernels/runner.py\", line 94, in _instanti"
+ },
+ "oasis_timestep_embedder": {
+  "class": "CONFIG",
+  "error": "scenario raised TypeError: OasisTimestepEmbedder.__init__() missing 1 required positional argument: 'hidden_size'\nTraceback (most recent call last):\n  File \"/home/olu/kb_nano/bench/kernels/runner.py\", line 94, in _instantiate_module\n    module = cls(**kwargs)\n"
+ },
+ "oasis_vae_attention": {
+  "class": "CONFIG",
+  "error": "scenario raised TypeError: OasisVAEAttention.__init__() missing 4 required positional arguments: 'dim', 'num_heads', 'frame_height', and 'frame_width'\nTraceback (most recent call last):\n  File \"/home/olu/kb_nano/bench/kernels/runner.py\", line 94, in _instantia"
+ },
+ "oasis_vae_attention_block": {
+  "class": "CONFIG",
+  "error": "scenario raised TypeError: OasisVAEAttentionBlock.__init__() missing 4 required positional arguments: 'dim', 'num_heads', 'frame_height', and 'frame_width'\nTraceback (most recent call last):\n  File \"/home/olu/kb_nano/bench/kernels/runner.py\", line 94, in _inst"
+ },
+ "parallel_linear": {
+  "class": "CONFIG",
+  "error": "scenario raised TypeError: RowParallelLinear.__init__() missing 2 required positional arguments: 'input_size' and 'output_size'\nTraceback (most recent call last):\n  File \"/home/olu/kb_nano/bench/kernels/runner.py\", line 94, in _instantiate_module\n    module = "
+ },
+ "qwen3_moe": {
+  "class": "CONFIG",
+  "error": "scenario raised TypeError: Qwen3MoE.__init__() missing 1 required positional argument: 'config'\nTraceback (most recent call last):\n  File \"/home/olu/kb_nano/bench/kernels/runner.py\", line 94, in _instantiate_module\n    module = cls(**kwargs)\n             ^^^^^"
+ },
+ "qwen3_moe_decoder": {
+  "class": "CONFIG",
+  "error": "scenario raised TypeError: Qwen3MoEDecoderLayer.__init__() missing 1 required positional argument: 'config'\nTraceback (most recent call last):\n  File \"/home/olu/kb_nano/bench/kernels/runner.py\", line 94, in _instantiate_module\n    module = cls(**kwargs)\n      "
+ },
+ "qwen3_vl": {
+  "class": "CONFIG",
+  "error": "scenario raised TypeError: Qwen3VLForConditionalGeneration.__init__() missing 1 required positional argument: 'config'\nTraceback (most recent call last):\n  File \"/home/olu/kb_nano/bench/kernels/runner.py\", line 94, in _instantiate_module\n    module = cls(**kwa"
+ },
+ "rotary_emb": {
+  "class": "CONFIG",
+  "error": "scenario raised TypeError: Gemma4ProportionalRotaryEmbedding.__init__() missing 4 required positional arguments: 'head_dim', 'rotary_dim', 'max_position_embeddings', and 'rope_theta'\nTraceback (most recent call last):\n  File \"/home/olu/kb_nano/bench/kernels/ru"
+ },
+ "t5_layer_norm": {
+  "class": "CONFIG",
+  "error": "scenario raised TypeError: T5LayerNorm.__init__() missing 1 required positional argument: 'hidden_size'\nTraceback (most recent call last):\n  File \"/home/olu/kb_nano/bench/kernels/runner.py\", line 94, in _instantiate_module\n    module = cls(**kwargs)\n          "
+ },
+ "tensor_ops": {
+  "class": "CONFIG",
+  "error": "scenario raised TypeError: Exp.forward() got an unexpected keyword argument 'num_classes'\nTraceback (most recent call last):\n  File \"/home/olu/kb_nano/tools/agent_eval/agent_entrypoint.py\", line 407, in run\n    baseline_out = R._run_forward_once(baseline_mod, "
+ },
+ "timestep_embedding": {
+  "class": "CONFIG",
+  "error": "scenario raised TypeError: CombinedTimestepGuidanceTextProjEmbeddings.__init__() missing 2 required positional arguments: 'embedding_dim' and 'pooled_projection_dim'\nTraceback (most recent call last):\n  File \"/home/olu/kb_nano/bench/kernels/runner.py\", line 94"
+ },
+ "vision_attention": {
+  "class": "CONFIG",
+  "error": "scenario raised TypeError: VisionAttention.__init__() missing 2 required positional arguments: 'embed_dim' and 'num_heads'\nTraceback (most recent call last):\n  File \"/home/olu/kb_nano/bench/kernels/runner.py\", line 94, in _instantiate_module\n    module = cls(*"
+ },
+ "vision_block": {
+  "class": "CONFIG",
+  "error": "scenario raised TypeError: VisionBlock.__init__() missing 3 required positional arguments: 'embed_dim', 'num_heads', and 'mlp_hidden_dim'\nTraceback (most recent call last):\n  File \"/home/olu/kb_nano/bench/kernels/runner.py\", line 94, in _instantiate_module\n   "
+ },
+ "vision_mlp": {
+  "class": "CONFIG",
+  "error": "scenario raised TypeError: VisionMLP.__init__() missing 2 required positional arguments: 'in_features' and 'hidden_features'\nTraceback (most recent call last):\n  File \"/home/olu/kb_nano/bench/kernels/runner.py\", line 94, in _instantiate_module\n    module = cls"
+ },
+ "vision_patch_embed": {
+  "class": "CONFIG",
+  "error": "scenario raised TypeError: VisionPatchEmbed.__init__() missing 4 required positional arguments: 'patch_size', 'temporal_patch_size', 'in_channels', and 'embed_dim'\nTraceback (most recent call last):\n  File \"/home/olu/kb_nano/bench/kernels/runner.py\", line 94, "
+ },
+ "vision_patch_merger": {
+  "class": "CONFIG",
+  "error": "scenario raised TypeError: VisionPatchMerger.__init__() missing 2 required positional arguments: 'd_model' and 'context_dim'\nTraceback (most recent call last):\n  File \"/home/olu/kb_nano/bench/kernels/runner.py\", line 94, in _instantiate_module\n    module = cls"
+ },
+ "vision_pos_embed_interpolate": {
+  "class": "CONFIG",
+  "error": "scenario raised TypeError: VisionPosEmbedInterpolate.__init__() missing 3 required positional arguments: 'num_position_embeddings', 'hidden_size', and 'spatial_merge_size'\nTraceback (most recent call last):\n  File \"/home/olu/kb_nano/bench/kernels/runner.py\", l"
+ },
+ "vision_rotary_emb": {
+  "class": "CONFIG",
+  "error": "scenario raised TypeError: VisionRotaryEmbedding.__init__() missing 1 required positional argument: 'rotary_dim'\nTraceback (most recent call last):\n  File \"/home/olu/kb_nano/bench/kernels/runner.py\", line 94, in _instantiate_module\n    module = cls(**kwargs)\n "
+ },
+ "yolov10_attention": {
+  "class": "CONFIG",
+  "error": "scenario raised TypeError: YOLOAttention.__init__() missing 1 required positional argument: 'dim'\nTraceback (most recent call last):\n  File \"/home/olu/kb_nano/bench/kernels/runner.py\", line 94, in _instantiate_module\n    module = cls(**kwargs)\n             ^^^"
+ },
+ "yolov10_bottleneck": {
+  "class": "CONFIG",
+  "error": "scenario raised TypeError: YOLOBottleneck.__init__() missing 2 required positional arguments: 'c1' and 'c2'\nTraceback (most recent call last):\n  File \"/home/olu/kb_nano/bench/kernels/runner.py\", line 94, in _instantiate_module\n    module = cls(**kwargs)\n      "
+ },
+ "yolov10_c2f": {
+  "class": "CONFIG",
+  "error": "scenario raised TypeError: YOLOC2fCIB.__init__() missing 2 required positional arguments: 'c1' and 'c2'\nTraceback (most recent call last):\n  File \"/home/olu/kb_nano/bench/kernels/runner.py\", line 94, in _instantiate_module\n    module = cls(**kwargs)\n          "
+ },
+ "yolov10_cib": {
+  "class": "CONFIG",
+  "error": "scenario raised TypeError: YOLOCIB.__init__() missing 2 required positional arguments: 'c1' and 'c2'\nTraceback (most recent call last):\n  File \"/home/olu/kb_nano/bench/kernels/runner.py\", line 94, in _instantiate_module\n    module = cls(**kwargs)\n             "
+ },
+ "yolov10_concat": {
+  "class": "CONFIG",
+  "error": "scenario raised TypeError: YOLOConcat.forward() missing 1 required positional argument: 'xs'\nTraceback (most recent call last):\n  File \"/home/olu/kb_nano/tools/agent_eval/agent_entrypoint.py\", line 407, in run\n    baseline_out = R._run_forward_once(baseline_mo"
+ },
+ "yolov10_conv": {
+  "class": "CONFIG",
+  "error": "scenario raised TypeError: YOLOConv.__init__() missing 2 required positional arguments: 'c1' and 'c2'\nTraceback (most recent call last):\n  File \"/home/olu/kb_nano/bench/kernels/runner.py\", line 94, in _instantiate_module\n    module = cls(**kwargs)\n            "
+ },
+ "yolov10_head": {
+  "class": "CONFIG",
+  "error": "scenario raised TypeError: YOLOv10DetectHead.forward() missing 1 required positional argument: 'x'\nTraceback (most recent call last):\n  File \"/home/olu/kb_nano/tools/agent_eval/agent_entrypoint.py\", line 407, in run\n    baseline_out = R._run_forward_once(basel"
+ },
+ "yolov10_neck": {
+  "class": "CONFIG",
+  "error": "scenario raised TypeError: YOLOv10Neck.forward() missing 1 required positional argument: 'feats'\nTraceback (most recent call last):\n  File \"/home/olu/kb_nano/tools/agent_eval/agent_entrypoint.py\", line 407, in run\n    baseline_out = R._run_forward_once(baselin"
+ },
+ "yolov10_psa": {
+  "class": "CONFIG",
+  "error": "scenario raised TypeError: YOLOPSA.__init__() missing 2 required positional arguments: 'c1' and 'c2'\nTraceback (most recent call last):\n  File \"/home/olu/kb_nano/bench/kernels/runner.py\", line 94, in _instantiate_module\n    module = cls(**kwargs)\n             "
+ },
+ "yolov10_repvggdw": {
+  "class": "CONFIG",
+  "error": "scenario raised TypeError: YOLORepVGGDW.__init__() missing 1 required positional argument: 'ed'\nTraceback (most recent call last):\n  File \"/home/olu/kb_nano/bench/kernels/runner.py\", line 94, in _instantiate_module\n    module = cls(**kwargs)\n             ^^^^^"
+ },
+ "yolov10_scdown": {
+  "class": "CONFIG",
+  "error": "scenario raised TypeError: YOLOSCDown.__init__() missing 4 required positional arguments: 'c1', 'c2', 'k', and 's'\nTraceback (most recent call last):\n  File \"/home/olu/kb_nano/bench/kernels/runner.py\", line 94, in _instantiate_module\n    module = cls(**kwargs)"
+ },
+ "yolov10_sppf": {
+  "class": "CONFIG",
+  "error": "scenario raised TypeError: YOLOSPPF.__init__() missing 2 required positional arguments: 'c1' and 'c2'\nTraceback (most recent call last):\n  File \"/home/olu/kb_nano/bench/kernels/runner.py\", line 94, in _instantiate_module\n    module = cls(**kwargs)\n            "
+ }
+}

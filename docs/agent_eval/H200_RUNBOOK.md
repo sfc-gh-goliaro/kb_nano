@@ -135,11 +135,17 @@ is exported.
 
 ## 6. Named follow-up tasks (not in the pilot)
 
-1. **Port the experiments-codex runner's init-arg reconstruction** into the
-   entrypoint path — required before any op beyond the ones with complete
-   registry init_args (blocks full 48-op L1 coverage and all L3 work; on
-   release, `linear`/`embedding`/`conv2d`/`layer_norm` baselines cannot
-   instantiate).
+1. **Populate the 61 CONFIG-blocked ops** — see `OP_CENSUS.md` for the
+   measured per-op survey (33 runnable today / 61 config-blocked / 7 mixed /
+   4 special) and the two-lane plan: Lane A (model-scoped ops: static
+   config.json values into registry init_args + a one-time generic
+   dict-to-object shim in the entrypoint; verify via identity), Lane B
+   (dimension-generic ops: team decision required — replicate the
+   experiments-codex fabricated dims for comparability with published
+   numbers, or reconstruct real call-site dims for production fidelity).
+   The experiments-codex runner's if/elif reconstructions
+   (`bench/kernels/runner.py` on that branch, ~lines 88-360) remain useful
+   as a cross-check and as ready-made code for several classes.
 2. **rms_norm fixture sharpening** — seed registry inputs or drop <=4-token
    scenarios from the correctness gate (see VALIDATION_REPORT fixture
    finding) before trusting per-scenario verdicts near tolerance.

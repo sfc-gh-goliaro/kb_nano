@@ -1,0 +1,858 @@
+{
+ "ada_layer_norm": {
+  "verdict": "PARTIAL",
+  "tally": {
+   "RUNTIME_ERROR": 2
+  },
+  "n_scenarios": 2,
+  "seconds": 3.0
+ },
+ "ada_layer_norm_continuous": {
+  "verdict": "PARTIAL",
+  "tally": {
+   "RUNTIME_ERROR": 2
+  },
+  "n_scenarios": 2,
+  "seconds": 3.0
+ },
+ "allreduce": {
+  "verdict": "PARTIAL",
+  "tally": {
+   "RUNTIME_ERROR": 15
+  },
+  "n_scenarios": 15,
+  "seconds": 2.9
+ },
+ "attention": {
+  "verdict": "PARTIAL",
+  "tally": {
+   "RUNTIME_ERROR": 15
+  },
+  "n_scenarios": 15,
+  "seconds": 6.5
+ },
+ "attention_impl": {
+  "verdict": "PARTIAL",
+  "tally": {
+   "RUNTIME_ERROR": 20
+  },
+  "n_scenarios": 20,
+  "seconds": 5.6
+ },
+ "batch_norm2d": {
+  "verdict": "RUNNABLE",
+  "tally": {
+   "PASSED": 1
+  },
+  "n_scenarios": 1,
+  "seconds": 3.1
+ },
+ "chunk_gla": {
+  "verdict": "PARTIAL",
+  "tally": {
+   "INCORRECT_NUMERICAL": 2,
+   "PASSED": 1,
+   "RUNTIME_ERROR": 2
+  },
+  "n_scenarios": 5,
+  "seconds": 7.7
+ },
+ "chunk_retention": {
+  "verdict": "RUNNABLE",
+  "tally": {
+   "PASSED": 1
+  },
+  "n_scenarios": 1,
+  "seconds": 5.3
+ },
+ "conv2d": {
+  "verdict": "PARTIAL",
+  "tally": {
+   "RUNTIME_ERROR": 39
+  },
+  "n_scenarios": 39,
+  "seconds": 2.9
+ },
+ "conv3d": {
+  "verdict": "RUNNABLE",
+  "tally": {
+   "PASSED": 1
+  },
+  "n_scenarios": 1,
+  "seconds": 3.3
+ },
+ "dense_attention": {
+  "verdict": "RUNNABLE",
+  "tally": {
+   "PASSED": 17
+  },
+  "n_scenarios": 17,
+  "seconds": 5.3
+ },
+ "diffusion_rope": {
+  "verdict": "RUNNABLE",
+  "tally": {
+   "PASSED": 2
+  },
+  "n_scenarios": 2,
+  "seconds": 3.5
+ },
+ "embedding": {
+  "verdict": "PARTIAL",
+  "tally": {
+   "RUNTIME_ERROR": 13
+  },
+  "n_scenarios": 13,
+  "seconds": 2.9
+ },
+ "encoder_embeddings": {
+  "verdict": "PARTIAL",
+  "tally": {
+   "RUNTIME_ERROR": 1
+  },
+  "n_scenarios": 1,
+  "seconds": 3.3
+ },
+ "encoder_mlp": {
+  "verdict": "PARTIAL",
+  "tally": {
+   "RUNTIME_ERROR": 1
+  },
+  "n_scenarios": 1,
+  "seconds": 3.8
+ },
+ "flash_attn_decode": {
+  "verdict": "RUNNABLE",
+  "tally": {
+   "PASSED": 1
+  },
+  "n_scenarios": 1,
+  "seconds": 3.8
+ },
+ "flash_attn_prefill": {
+  "verdict": "PARTIAL",
+  "tally": {
+   "PASSED": 2,
+   "INCORRECT_NUMERICAL": 3
+  },
+  "n_scenarios": 5,
+  "seconds": 4.0
+ },
+ "flash_attn_varlen": {
+  "verdict": "PARTIAL",
+  "tally": {
+   "INCORRECT_NUMERICAL": 1
+  },
+  "n_scenarios": 1,
+  "seconds": 4.2
+ },
+ "flashinfer_decode": {
+  "verdict": "PARTIAL",
+  "tally": {
+   "PASSED": 47,
+   "INCORRECT_NUMERICAL": 9
+  },
+  "n_scenarios": 56,
+  "seconds": 9.6
+ },
+ "flashinfer_prefill": {
+  "verdict": "PARTIAL",
+  "tally": {
+   "INCORRECT_NUMERICAL": 17,
+   "PASSED": 1
+  },
+  "n_scenarios": 18,
+  "seconds": 5.7
+ },
+ "flux_attention": {
+  "verdict": "PARTIAL",
+  "tally": {
+   "PASSED": 3,
+   "INCORRECT_NUMERICAL": 1
+  },
+  "n_scenarios": 4,
+  "seconds": 9.2
+ },
+ "flux_feedforward": {
+  "verdict": "PARTIAL",
+  "tally": {
+   "RUNTIME_ERROR": 4
+  },
+  "n_scenarios": 4,
+  "seconds": 2.9
+ },
+ "flux_pos_embed": {
+  "verdict": "RUNNABLE",
+  "tally": {
+   "PASSED": 2
+  },
+  "n_scenarios": 2,
+  "seconds": 3.2
+ },
+ "flux_transformer_block": {
+  "verdict": "PARTIAL",
+  "tally": {
+   "RUNTIME_ERROR": 4
+  },
+  "n_scenarios": 4,
+  "seconds": 3.0
+ },
+ "fp8_linear": {
+  "verdict": "PARTIAL",
+  "tally": {
+   "RUNTIME_ERROR": 14
+  },
+  "n_scenarios": 14,
+  "seconds": 4.0
+ },
+ "fused_experts": {
+  "verdict": "RUNNABLE",
+  "tally": {
+   "PASSED": 5
+  },
+  "n_scenarios": 5,
+  "seconds": 15.0
+ },
+ "fused_recurrent_gla": {
+  "verdict": "RUNNABLE",
+  "tally": {
+   "PASSED": 5
+  },
+  "n_scenarios": 5,
+  "seconds": 6.8
+ },
+ "fused_recurrent_retention": {
+  "verdict": "RUNNABLE",
+  "tally": {
+   "PASSED": 1
+  },
+  "n_scenarios": 1,
+  "seconds": 7.2
+ },
+ "gelu": {
+  "verdict": "RUNNABLE",
+  "tally": {
+   "PASSED": 31
+  },
+  "n_scenarios": 31,
+  "seconds": 5.8
+ },
+ "gla": {
+  "verdict": "PARTIAL",
+  "tally": {
+   "RUNTIME_ERROR": 10
+  },
+  "n_scenarios": 10,
+  "seconds": 5.4
+ },
+ "gla_attention": {
+  "verdict": "PARTIAL",
+  "tally": {
+   "RUNTIME_ERROR": 10
+  },
+  "n_scenarios": 10,
+  "seconds": 5.1
+ },
+ "gla_decoder": {
+  "verdict": "PARTIAL",
+  "tally": {
+   "RUNTIME_ERROR": 320
+  },
+  "n_scenarios": 320,
+  "seconds": 5.3
+ },
+ "gla_mlp": {
+  "verdict": "PARTIAL",
+  "tally": {
+   "RUNTIME_ERROR": 9
+  },
+  "n_scenarios": 9,
+  "seconds": 3.1
+ },
+ "gla_recurrence": {
+  "verdict": "RUNNABLE",
+  "tally": {
+   "PASSED": 1
+  },
+  "n_scenarios": 1,
+  "seconds": 3.2
+ },
+ "gpt_oss": {
+  "verdict": "PARTIAL",
+  "tally": {
+   "RUNTIME_ERROR": 5
+  },
+  "n_scenarios": 5,
+  "seconds": 7.1
+ },
+ "gpt_oss_decoder": {
+  "verdict": "PARTIAL",
+  "tally": {
+   "RUNTIME_ERROR": 10
+  },
+  "n_scenarios": 10,
+  "seconds": 5.9
+ },
+ "gpt_oss_moe": {
+  "verdict": "PARTIAL",
+  "tally": {
+   "RUNTIME_ERROR": 5
+  },
+  "n_scenarios": 5,
+  "seconds": 3.0
+ },
+ "interpolate": {
+  "verdict": "RUNNABLE",
+  "tally": {
+   "PASSED": 2
+  },
+  "n_scenarios": 2,
+  "seconds": 3.1
+ },
+ "l2_norm": {
+  "verdict": "RUNNABLE",
+  "tally": {
+   "PASSED": 1
+  },
+  "n_scenarios": 1,
+  "seconds": 3.1
+ },
+ "layer_norm": {
+  "verdict": "PARTIAL",
+  "tally": {
+   "RUNTIME_ERROR": 34
+  },
+  "n_scenarios": 34,
+  "seconds": 3.0
+ },
+ "linear": {
+  "verdict": "PARTIAL",
+  "tally": {
+   "RUNTIME_ERROR": 66
+  },
+  "n_scenarios": 66,
+  "seconds": 3.4
+ },
+ "llama": {
+  "verdict": "PARTIAL",
+  "tally": {
+   "RUNTIME_ERROR": 5
+  },
+  "n_scenarios": 5,
+  "seconds": 6.1
+ },
+ "llama_decoder": {
+  "verdict": "PARTIAL",
+  "tally": {
+   "RUNTIME_ERROR": 10
+  },
+  "n_scenarios": 10,
+  "seconds": 5.9
+ },
+ "llama_mlp": {
+  "verdict": "PARTIAL",
+  "tally": {
+   "RUNTIME_ERROR": 5
+  },
+  "n_scenarios": 5,
+  "seconds": 3.6
+ },
+ "log_sigmoid": {
+  "verdict": "RUNNABLE",
+  "tally": {
+   "PASSED": 9
+  },
+  "n_scenarios": 9,
+  "seconds": 3.2
+ },
+ "max_pool2d": {
+  "verdict": "RUNNABLE",
+  "tally": {
+   "PASSED": 1
+  },
+  "n_scenarios": 1,
+  "seconds": 3.0
+ },
+ "moe_align": {
+  "verdict": "PARTIAL",
+  "tally": {
+   "PASSED": 1,
+   "INCORRECT_NUMERICAL": 9
+  },
+  "n_scenarios": 10,
+  "seconds": 4.2
+ },
+ "moe_grouped_gemm": {
+  "verdict": "PARTIAL",
+  "tally": {
+   "RUNTIME_ERROR": 12
+  },
+  "n_scenarios": 12,
+  "seconds": 3.5
+ },
+ "moe_sum": {
+  "verdict": "RUNNABLE",
+  "tally": {
+   "PASSED": 5
+  },
+  "n_scenarios": 5,
+  "seconds": 3.6
+ },
+ "mrope": {
+  "verdict": "PARTIAL",
+  "tally": {
+   "RUNTIME_ERROR": 5
+  },
+  "n_scenarios": 5,
+  "seconds": 3.4
+ },
+ "mrope_input_positions": {
+  "verdict": "PARTIAL",
+  "tally": {
+   "RUNTIME_ERROR": 5
+  },
+  "n_scenarios": 5,
+  "seconds": 2.4
+ },
+ "mxfp4_moe": {
+  "verdict": "PARTIAL",
+  "tally": {
+   "RUNTIME_ERROR": 5
+  },
+  "n_scenarios": 5,
+  "seconds": 3.0
+ },
+ "oasis_block": {
+  "verdict": "PARTIAL",
+  "tally": {
+   "RUNTIME_ERROR": 10
+  },
+  "n_scenarios": 10,
+  "seconds": 2.9
+ },
+ "oasis_dit": {
+  "verdict": "RUNNABLE",
+  "tally": {
+   "PASSED": 15
+  },
+  "n_scenarios": 15,
+  "seconds": 553.0
+ },
+ "oasis_final_layer": {
+  "verdict": "PARTIAL",
+  "tally": {
+   "RUNTIME_ERROR": 10
+  },
+  "n_scenarios": 10,
+  "seconds": 3.3
+ },
+ "oasis_mlp": {
+  "verdict": "PARTIAL",
+  "tally": {
+   "RUNTIME_ERROR": 10
+  },
+  "n_scenarios": 10,
+  "seconds": 3.3
+ },
+ "oasis_patch_embed": {
+  "verdict": "PARTIAL",
+  "tally": {
+   "RUNTIME_ERROR": 7
+  },
+  "n_scenarios": 7,
+  "seconds": 3.1
+ },
+ "oasis_rollout": {
+  "verdict": "PARTIAL",
+  "tally": {
+   "RUNTIME_ERROR": 4
+  },
+  "n_scenarios": 4,
+  "seconds": 3.1
+ },
+ "oasis_rotary": {
+  "verdict": "RUNNABLE",
+  "tally": {
+   "PASSED": 1
+  },
+  "n_scenarios": 1,
+  "seconds": 3.0
+ },
+ "oasis_spatial_axial_attention": {
+  "verdict": "PARTIAL",
+  "tally": {
+   "RUNTIME_ERROR": 10
+  },
+  "n_scenarios": 10,
+  "seconds": 2.9
+ },
+ "oasis_temporal_axial_attention": {
+  "verdict": "PARTIAL",
+  "tally": {
+   "RUNTIME_ERROR": 10
+  },
+  "n_scenarios": 10,
+  "seconds": 2.9
+ },
+ "oasis_timestep_embedder": {
+  "verdict": "PARTIAL",
+  "tally": {
+   "RUNTIME_ERROR": 5
+  },
+  "n_scenarios": 5,
+  "seconds": 2.8
+ },
+ "oasis_vae_attention": {
+  "verdict": "PARTIAL",
+  "tally": {
+   "RUNTIME_ERROR": 5
+  },
+  "n_scenarios": 5,
+  "seconds": 2.9
+ },
+ "oasis_vae_attention_block": {
+  "verdict": "PARTIAL",
+  "tally": {
+   "RUNTIME_ERROR": 5
+  },
+  "n_scenarios": 5,
+  "seconds": 2.9
+ },
+ "parallel_embedding": {
+  "verdict": "RUNNABLE",
+  "tally": {
+   "PASSED": 10
+  },
+  "n_scenarios": 10,
+  "seconds": 117.6
+ },
+ "parallel_linear": {
+  "verdict": "PARTIAL",
+  "tally": {
+   "RUNTIME_ERROR": 43
+  },
+  "n_scenarios": 43,
+  "seconds": 2.9
+ },
+ "quickgelu": {
+  "verdict": "RUNNABLE",
+  "tally": {
+   "PASSED": 1
+  },
+  "n_scenarios": 1,
+  "seconds": 3.1
+ },
+ "qwen3_moe": {
+  "verdict": "PARTIAL",
+  "tally": {
+   "RUNTIME_ERROR": 5
+  },
+  "n_scenarios": 5,
+  "seconds": 4.0
+ },
+ "qwen3_moe_decoder": {
+  "verdict": "PARTIAL",
+  "tally": {
+   "RUNTIME_ERROR": 10
+  },
+  "n_scenarios": 10,
+  "seconds": 5.8
+ },
+ "qwen3_vl": {
+  "verdict": "PARTIAL",
+  "tally": {
+   "RUNTIME_ERROR": 8
+  },
+  "n_scenarios": 8,
+  "seconds": 6.1
+ },
+ "relu": {
+  "verdict": "RUNNABLE",
+  "tally": {
+   "PASSED": 1
+  },
+  "n_scenarios": 1,
+  "seconds": 3.2
+ },
+ "rms_norm": {
+  "verdict": "RUNNABLE",
+  "tally": {
+   "PASSED": 35
+  },
+  "n_scenarios": 35,
+  "seconds": 5.4
+ },
+ "rotary_emb": {
+  "verdict": "PARTIAL",
+  "tally": {
+   "RUNTIME_ERROR": 5
+  },
+  "n_scenarios": 5,
+  "seconds": 3.3
+ },
+ "sigmoid": {
+  "verdict": "RUNNABLE",
+  "tally": {
+   "PASSED": 1
+  },
+  "n_scenarios": 1,
+  "seconds": 3.0
+ },
+ "silu": {
+  "verdict": "RUNNABLE",
+  "tally": {
+   "PASSED": 24
+  },
+  "n_scenarios": 24,
+  "seconds": 3.2
+ },
+ "silu_and_mul": {
+  "verdict": "RUNNABLE",
+  "tally": {
+   "PASSED": 10
+  },
+  "n_scenarios": 10,
+  "seconds": 3.9
+ },
+ "silu_mul_quant_fp8": {
+  "verdict": "RUNNABLE",
+  "tally": {
+   "PASSED": 1
+  },
+  "n_scenarios": 1,
+  "seconds": 3.6
+ },
+ "softmax": {
+  "verdict": "RUNNABLE",
+  "tally": {
+   "PASSED": 2
+  },
+  "n_scenarios": 2,
+  "seconds": 3.1
+ },
+ "store_kvcache": {
+  "verdict": "PARTIAL",
+  "tally": {
+   "PASSED": 14,
+   "INCORRECT_NUMERICAL": 1
+  },
+  "n_scenarios": 15,
+  "seconds": 4.5
+ },
+ "t5_layer_norm": {
+  "verdict": "PARTIAL",
+  "tally": {
+   "RUNTIME_ERROR": 6
+  },
+  "n_scenarios": 6,
+  "seconds": 2.9
+ },
+ "tensor_ops": {
+  "verdict": "PARTIAL",
+  "tally": {
+   "RUNTIME_ERROR": 1
+  },
+  "n_scenarios": 1,
+  "seconds": 2.8
+ },
+ "timestep_embedding": {
+  "verdict": "PARTIAL",
+  "tally": {
+   "RUNTIME_ERROR": 2
+  },
+  "n_scenarios": 2,
+  "seconds": 2.8
+ },
+ "topk_softmax": {
+  "verdict": "RUNNABLE",
+  "tally": {
+   "PASSED": 5
+  },
+  "n_scenarios": 5,
+  "seconds": 3.5
+ },
+ "vision_attention": {
+  "verdict": "PARTIAL",
+  "tally": {
+   "RUNTIME_ERROR": 5
+  },
+  "n_scenarios": 5,
+  "seconds": 3.7
+ },
+ "vision_block": {
+  "verdict": "PARTIAL",
+  "tally": {
+   "RUNTIME_ERROR": 5
+  },
+  "n_scenarios": 5,
+  "seconds": 3.7
+ },
+ "vision_mlp": {
+  "verdict": "PARTIAL",
+  "tally": {
+   "RUNTIME_ERROR": 5
+  },
+  "n_scenarios": 5,
+  "seconds": 3.2
+ },
+ "vision_patch_embed": {
+  "verdict": "PARTIAL",
+  "tally": {
+   "RUNTIME_ERROR": 5
+  },
+  "n_scenarios": 5,
+  "seconds": 3.2
+ },
+ "vision_patch_merger": {
+  "verdict": "PARTIAL",
+  "tally": {
+   "RUNTIME_ERROR": 10
+  },
+  "n_scenarios": 10,
+  "seconds": 3.5
+ },
+ "vision_pos_embed_interpolate": {
+  "verdict": "PARTIAL",
+  "tally": {
+   "RUNTIME_ERROR": 5
+  },
+  "n_scenarios": 5,
+  "seconds": 2.5
+ },
+ "vision_rotary_emb": {
+  "verdict": "PARTIAL",
+  "tally": {
+   "RUNTIME_ERROR": 5
+  },
+  "n_scenarios": 5,
+  "seconds": 2.5
+ },
+ "yarn_rotary_emb": {
+  "verdict": "RUNNABLE",
+  "tally": {
+   "PASSED": 1
+  },
+  "n_scenarios": 1,
+  "seconds": 7.8
+ },
+ "yolov10": {
+  "verdict": "RUNNABLE",
+  "tally": {
+   "PASSED": 1
+  },
+  "n_scenarios": 1,
+  "seconds": 5.3
+ },
+ "yolov10_attention": {
+  "verdict": "PARTIAL",
+  "tally": {
+   "RUNTIME_ERROR": 1
+  },
+  "n_scenarios": 1,
+  "seconds": 2.8
+ },
+ "yolov10_backbone": {
+  "verdict": "RUNNABLE",
+  "tally": {
+   "PASSED": 1
+  },
+  "n_scenarios": 1,
+  "seconds": 4.4
+ },
+ "yolov10_bottleneck": {
+  "verdict": "PARTIAL",
+  "tally": {
+   "RUNTIME_ERROR": 8
+  },
+  "n_scenarios": 8,
+  "seconds": 3.1
+ },
+ "yolov10_c2f": {
+  "verdict": "PARTIAL",
+  "tally": {
+   "RUNTIME_ERROR": 1
+  },
+  "n_scenarios": 1,
+  "seconds": 3.4
+ },
+ "yolov10_cib": {
+  "verdict": "PARTIAL",
+  "tally": {
+   "RUNTIME_ERROR": 1
+  },
+  "n_scenarios": 1,
+  "seconds": 3.2
+ },
+ "yolov10_concat": {
+  "verdict": "PARTIAL",
+  "tally": {
+   "RUNTIME_ERROR": 4
+  },
+  "n_scenarios": 4,
+  "seconds": 2.4
+ },
+ "yolov10_conv": {
+  "verdict": "PARTIAL",
+  "tally": {
+   "RUNTIME_ERROR": 7
+  },
+  "n_scenarios": 7,
+  "seconds": 2.9
+ },
+ "yolov10_dfl": {
+  "verdict": "RUNNABLE",
+  "tally": {
+   "PASSED": 1
+  },
+  "n_scenarios": 1,
+  "seconds": 3.4
+ },
+ "yolov10_head": {
+  "verdict": "PARTIAL",
+  "tally": {
+   "RUNTIME_ERROR": 1
+  },
+  "n_scenarios": 1,
+  "seconds": 3.2
+ },
+ "yolov10_neck": {
+  "verdict": "PARTIAL",
+  "tally": {
+   "RUNTIME_ERROR": 1
+  },
+  "n_scenarios": 1,
+  "seconds": 3.0
+ },
+ "yolov10_psa": {
+  "verdict": "PARTIAL",
+  "tally": {
+   "RUNTIME_ERROR": 1
+  },
+  "n_scenarios": 1,
+  "seconds": 3.0
+ },
+ "yolov10_repvggdw": {
+  "verdict": "PARTIAL",
+  "tally": {
+   "RUNTIME_ERROR": 1
+  },
+  "n_scenarios": 1,
+  "seconds": 2.9
+ },
+ "yolov10_scdown": {
+  "verdict": "PARTIAL",
+  "tally": {
+   "RUNTIME_ERROR": 2
+  },
+  "n_scenarios": 2,
+  "seconds": 3.8
+ },
+ "yolov10_sppf": {
+  "verdict": "PARTIAL",
+  "tally": {
+   "RUNTIME_ERROR": 1
+  },
+  "n_scenarios": 1,
+  "seconds": 3.1
+ }
+}
