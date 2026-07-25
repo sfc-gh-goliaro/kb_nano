@@ -1863,6 +1863,11 @@ def main():
     )
     parser.add_argument("--enforce-eager", action="store_true", default=False)
     parser.add_argument("--skip-vllm", action="store_true")
+    parser.add_argument("--vllm-python", type=str, default=None,
+                        help="Python interpreter for the vLLM baseline worker "
+                             "(e.g. an isolated env with a specific vLLM version). "
+                             "Defaults to the current interpreter. fastkernels always "
+                             "runs in the current env.")
     parser.add_argument("--skip-throughput", action="store_true",
                         help="Skip the throughput phase (run latency only)")
     parser.add_argument("--skip-latency", action="store_true",
@@ -2191,6 +2196,7 @@ def main():
             vllm_worker, vllm_config,
             f"vLLM [{short_name}] all scenarios (TP={args.tp})",
             timeout=10800,
+            python_executable=args.vllm_python,
         )
         if previous_flashinfer_namespace_env is None:
             os.environ.pop("FASTKERNELS_FLASHINFER_SOCKET_NAMESPACE", None)
