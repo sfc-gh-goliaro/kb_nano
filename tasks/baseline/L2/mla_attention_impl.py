@@ -45,6 +45,22 @@ from ..L1.convert_indices import ConvertIndicesToGlobal
 _MLA_HEAD_DIM_V = 512
 _MLA_WORKSPACE_HEAD_SIZE = 576  # 512 NoPE + 64 RoPE = 576 BF16 dims
 MIN_HEADS_FOR_BF16_PREFILL = 32
+# Must match the engine's MLA KV cache page size (``_MLA_BLOCK_SIZE``).
+_MLA_PAGE_SIZE = 64
+
+try:
+    from ..L1.flashinfer_mla_decode import TRTLLMMLADecode
+except ImportError:  # pragma: no cover - flashinfer is optional
+    TRTLLMMLADecode = None
+
+
+def _is_blackwell() -> bool:
+    if not torch.cuda.is_available():
+        return False
+    try:
+        return torch.cuda.get_device_capability()[0] >= 10
+    except Exception:
+        return False
 
 
 def _default_kv_cache_dtype() -> str:
@@ -140,6 +156,15 @@ class MLAAttention(nn.Module):
         self.gather_kvcache = GatherKVCacheFP8MLA()
         self.gather_dequant_kvcache = GatherAndDequantKVCacheMLA()
         self.decode_op = FlashMLADecode()
+        # FlashMLA's dense decode kernel is SM90a-only. On Blackwell use
+        # FlashInfer's TRTLLM-gen MLA decode instead, which is what vLLM's
+        # FLASHINFER_MLA backend does for capability major 10.
+        self.trtllm_decode_op = None
+        if TRTLLMMLADecode is not None and _is_blackwell():
+            if TRTLLMMLADecode.supported(qk_nope_head_dim, _MLA_PAGE_SIZE):
+                self.trtllm_decode_op = TRTLLMMLADecode(
+                    qk_nope_head_dim, kv_lora_rank, qk_rope_head_dim,
+                )
         # Dense FP8 decode entry-point (matches vLLM's
         # ``flash_mla_with_kvcache_fp8`` path used in
         # ``vllm/v1/attention/backends/mla/flashmla.py``). Falls back to the
@@ -427,6 +452,13 @@ class MLAAttention(nn.Module):
         block_table = ctx.block_tables
         if not self.use_fp8_kv_cache:
             q = self._absorb_q_to_latent(q)
+            if self.trtllm_decode_op is not None:
+                o = self.trtllm_decode_op(
+                    q, kv_cache, block_table, cache_seqlens,
+                    max_seq_len=int(ctx.max_context_len),
+                    softmax_scale=self.scale,
+                )
+                return self._v_up_proj(o)
             q = q.unsqueeze(1)
             tile_sched_meta, _ = self.get_metadata(
                 cache_seqlens, self.num_heads, num_heads_k=1,
@@ -1113,6 +1145,14 @@ class MLAAttention(nn.Module):
 
             if not self.use_fp8_kv_cache:
                 q_dc = self._absorb_q_to_latent(q_dc)
+                if self.trtllm_decode_op is not None:
+                    o = self.trtllm_decode_op(
+                        q_dc, kv_cache, block_table, cache_seqlens,
+                        max_seq_len=int(ctx.decode_max_context_len),
+                        softmax_scale=self.scale,
+                    )
+                    out[np_:] = self._v_up_proj(o)
+                    return out
                 q_dc = q_dc.unsqueeze(1)
                 tile_sched_meta, _ = self.get_metadata(
                     cache_seqlens, self.num_heads, num_heads_k=1,
