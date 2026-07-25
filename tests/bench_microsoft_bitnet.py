@@ -924,6 +924,30 @@ def _persist_results(output_dir: str, model: str, num_prompts: int,
     print(f"\n  Results saved under: {output_dir}")
 
 
+def _default_bitnet_repo() -> str:
+    """Locate the Microsoft BitNet checkout holding the GPU reference.
+
+    ``BITNET_REPO`` wins if set. Otherwise probe the usual checkout locations
+    rather than a single host-specific path, so a machine that clones the repo
+    somewhere else still gets the reference instead of silently reporting
+    ``sota: null``.
+    """
+    env = os.environ.get("BITNET_REPO")
+    if env:
+        return env
+    candidates = [
+        os.path.expanduser("~/reference_code/BitNet"),
+        "/home/yak/reference_code/BitNet",
+        "/home/yak/vllm_repo/BitNet",
+        os.path.join(os.path.dirname(os.path.dirname(os.path.abspath(__file__))),
+                     "third_party", "BitNet"),
+    ]
+    for c in candidates:
+        if os.path.exists(os.path.join(c, "gpu", "bitnet_kernels", "libbitnet.so")):
+            return c
+    return candidates[0]
+
+
 def main():
     ap = argparse.ArgumentParser()
     ap.add_argument("--model", default=MODEL_ID)
@@ -944,9 +968,7 @@ def main():
     ap.add_argument("--dataset-split", default="train",
                     help="HF dataset split for --prompt-source real")
     ap.add_argument("--bitnet-repo",
-                    default=os.environ.get(
-                        "BITNET_REPO",
-                        "/home/yak/vllm_repo/BitNet"),
+                    default=_default_bitnet_repo(),
                     help="Path to the Microsoft BitNet repo "
                          "(must contain gpu/checkpoints/model_state_int2.pt and "
                          "gpu/bitnet_kernels/libbitnet.so)")

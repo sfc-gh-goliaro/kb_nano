@@ -403,6 +403,26 @@ def main():
         }
     if cfg.get("load_format"):
         llm_kwargs["load_format"] = cfg["load_format"]
+    # vLLM 0.18 replaced VLLM_ATTENTION_BACKEND with AttentionConfig.backend, so
+    # an env var alone no longer pins the reference's backend. Needed when vLLM's
+    # own default is broken on the host arch -- e.g. it selects FLASHINFER_MLA for
+    # Kimi-Linear on B200 and then dies with an illegal memory access inside
+    # gpu_model_runner, leaving the row with no reference at all.
+    _vb = os.environ.get("FASTKERNELS_VLLM_ATTENTION_BACKEND")
+    if _vb:
+        llm_kwargs["attention_config"] = {"backend": _vb}
+        print(f"  vLLM attention backend pinned to {_vb}", flush=True)
+    # vLLM's decode auto-detection is `use_trtllm = num_tokens <= 256`
+    # (vllm/utils/flashinfer.py:use_trtllm_attention), so above a 256-token decode
+    # batch the reference silently leaves TRTLLM-gen for
+    # BatchDecodeWithPagedKVCacheWrapper while fastkernels stays on TRTLLM-gen.
+    # The two kernels differ by ~3e-3 relative, which is enough to flip a greedy
+    # argmax, and that is what collapses token agreement at 1000 prompts but not at
+    # 64. Forcing the reference to keep TRTLLM-gen at every batch size makes the
+    # comparison kernel-for-kernel and isolates that effect.
+    if os.environ.get("FASTKERNELS_VLLM_FORCE_TRTLLM") == "1":
+        llm_kwargs.setdefault("attention_config", {})["use_trtllm_attention"] = True
+        print("  vLLM forced to TRTLLM attention at all batch sizes", flush=True)
     llm = LLM(**llm_kwargs)
 
     # Warmup
@@ -951,6 +971,26 @@ def main():
         llm_kwargs["trust_remote_code"] = True
     if cfg.get("load_format"):
         llm_kwargs["load_format"] = cfg["load_format"]
+    # vLLM 0.18 replaced VLLM_ATTENTION_BACKEND with AttentionConfig.backend, so
+    # an env var alone no longer pins the reference's backend. Needed when vLLM's
+    # own default is broken on the host arch -- e.g. it selects FLASHINFER_MLA for
+    # Kimi-Linear on B200 and then dies with an illegal memory access inside
+    # gpu_model_runner, leaving the row with no reference at all.
+    _vb = os.environ.get("FASTKERNELS_VLLM_ATTENTION_BACKEND")
+    if _vb:
+        llm_kwargs["attention_config"] = {"backend": _vb}
+        print(f"  vLLM attention backend pinned to {_vb}", flush=True)
+    # vLLM's decode auto-detection is `use_trtllm = num_tokens <= 256`
+    # (vllm/utils/flashinfer.py:use_trtllm_attention), so above a 256-token decode
+    # batch the reference silently leaves TRTLLM-gen for
+    # BatchDecodeWithPagedKVCacheWrapper while fastkernels stays on TRTLLM-gen.
+    # The two kernels differ by ~3e-3 relative, which is enough to flip a greedy
+    # argmax, and that is what collapses token agreement at 1000 prompts but not at
+    # 64. Forcing the reference to keep TRTLLM-gen at every batch size makes the
+    # comparison kernel-for-kernel and isolates that effect.
+    if os.environ.get("FASTKERNELS_VLLM_FORCE_TRTLLM") == "1":
+        llm_kwargs.setdefault("attention_config", {})["use_trtllm_attention"] = True
+        print("  vLLM forced to TRTLLM attention at all batch sizes", flush=True)
     if cfg.get("limit_mm_per_prompt"):
         llm_kwargs["limit_mm_per_prompt"] = cfg["limit_mm_per_prompt"]
     llm = LLM(**llm_kwargs)
@@ -1451,6 +1491,26 @@ def main():
         llm_kwargs["trust_remote_code"] = True
     if cfg.get("load_format"):
         llm_kwargs["load_format"] = cfg["load_format"]
+    # vLLM 0.18 replaced VLLM_ATTENTION_BACKEND with AttentionConfig.backend, so
+    # an env var alone no longer pins the reference's backend. Needed when vLLM's
+    # own default is broken on the host arch -- e.g. it selects FLASHINFER_MLA for
+    # Kimi-Linear on B200 and then dies with an illegal memory access inside
+    # gpu_model_runner, leaving the row with no reference at all.
+    _vb = os.environ.get("FASTKERNELS_VLLM_ATTENTION_BACKEND")
+    if _vb:
+        llm_kwargs["attention_config"] = {"backend": _vb}
+        print(f"  vLLM attention backend pinned to {_vb}", flush=True)
+    # vLLM's decode auto-detection is `use_trtllm = num_tokens <= 256`
+    # (vllm/utils/flashinfer.py:use_trtllm_attention), so above a 256-token decode
+    # batch the reference silently leaves TRTLLM-gen for
+    # BatchDecodeWithPagedKVCacheWrapper while fastkernels stays on TRTLLM-gen.
+    # The two kernels differ by ~3e-3 relative, which is enough to flip a greedy
+    # argmax, and that is what collapses token agreement at 1000 prompts but not at
+    # 64. Forcing the reference to keep TRTLLM-gen at every batch size makes the
+    # comparison kernel-for-kernel and isolates that effect.
+    if os.environ.get("FASTKERNELS_VLLM_FORCE_TRTLLM") == "1":
+        llm_kwargs.setdefault("attention_config", {})["use_trtllm_attention"] = True
+        print("  vLLM forced to TRTLLM attention at all batch sizes", flush=True)
     llm = LLM(**llm_kwargs)
 
     from vllm.inputs import ExplicitEncoderDecoderPrompt, TextPrompt
