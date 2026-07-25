@@ -430,7 +430,7 @@ def main():
 
         vllm_prompts = [dict(prompt_token_ids=p) for p in prompt_token_ids]
         start = time.perf_counter()
-        outputs = llm.generate(vllm_prompts, sp_list, use_tqdm=False)
+        outputs = llm.generate(vllm_prompts, sp_list, use_tqdm=True)
         elapsed = time.perf_counter() - start
 
         total_prompt_tokens = sum(
@@ -562,7 +562,7 @@ def main():
         outputs = engine.generate(
             prompts,
             sp_list,
-            use_tqdm=False,
+            use_tqdm=True,
             decode_text=False,
         )
         torch.cuda.synchronize()
@@ -1364,6 +1364,44 @@ def _configure_parallel_safe_flashinfer():
 
 _configure_parallel_safe_flashinfer()
 
+def _decode_audio_array(audio):
+    """Decode a HF Audio item to mono float32 samples without torchcodec.
+
+    Self-contained copy for the generated worker scripts (the module-level
+    helper in bench_vllm.py is not visible inside these standalone templates).
+    """
+    import numpy as np
+    from io import BytesIO
+    if isinstance(audio, dict) and audio.get("array") is not None:
+        return np.asarray(audio["array"], dtype=np.float32), int(audio["sampling_rate"])
+    import av
+    source = None
+    if isinstance(audio, dict):
+        if audio.get("bytes") is not None:
+            source = BytesIO(audio["bytes"])
+        elif audio.get("path") is not None:
+            source = audio["path"]
+    if source is None:
+        raise ValueError("Unsupported audio sample format")
+    chunks = []
+    sampling_rate = None
+    with av.open(source) as container:
+        for frame in container.decode(audio=0):
+            chunks.append(frame.to_ndarray())
+            sampling_rate = frame.sample_rate
+    if not chunks or sampling_rate is None:
+        raise ValueError("Audio sample has no decodable frames")
+    samples = np.concatenate(chunks, axis=-1)
+    if np.issubdtype(samples.dtype, np.integer):
+        info = np.iinfo(samples.dtype)
+        samples = samples.astype(np.float32) / max(abs(info.min), info.max)
+    else:
+        samples = samples.astype(np.float32)
+    if samples.ndim == 2:
+        samples = samples.mean(axis=0)
+    return samples, int(sampling_rate)
+
+
 def _load_librispeech(dataset_name, dataset_split, num_seqs, seed):
     """Load audio samples from LibriSpeech and return as list of numpy arrays."""
     from datasets import Audio, load_dataset
@@ -1375,14 +1413,23 @@ def _load_librispeech(dataset_name, dataset_split, num_seqs, seed):
     ds = ds.cast_column("audio", Audio(decode=False))
     ds = ds.shuffle(seed=seed)
     samples = []
+    _seen = _fail = 0
+    _first_err = None
     for item in ds:
+        _seen += 1
         try:
             arr, sr = _decode_audio_array(item["audio"])
         except Exception:
+            _fail += 1
+            if _first_err is None:
+                import traceback as _tb
+                _first_err = _tb.format_exc()
             continue
         samples.append({"audio": arr, "sampling_rate": sr, "text": item["text"]})
         if len(samples) >= num_seqs:
             break
+    if len(samples) == 0:
+        print(f"  [librispeech diag] seen={_seen} fail={_fail} first_err=\n{_first_err}", flush=True)
     return samples
 
 def main():
@@ -1534,6 +1581,44 @@ FASTKERNELS_WHISPER_WORKER = r'''
 import json, sys, time
 import numpy as np
 
+def _decode_audio_array(audio):
+    """Decode a HF Audio item to mono float32 samples without torchcodec.
+
+    Self-contained copy for the generated worker scripts (the module-level
+    helper in bench_vllm.py is not visible inside these standalone templates).
+    """
+    import numpy as np
+    from io import BytesIO
+    if isinstance(audio, dict) and audio.get("array") is not None:
+        return np.asarray(audio["array"], dtype=np.float32), int(audio["sampling_rate"])
+    import av
+    source = None
+    if isinstance(audio, dict):
+        if audio.get("bytes") is not None:
+            source = BytesIO(audio["bytes"])
+        elif audio.get("path") is not None:
+            source = audio["path"]
+    if source is None:
+        raise ValueError("Unsupported audio sample format")
+    chunks = []
+    sampling_rate = None
+    with av.open(source) as container:
+        for frame in container.decode(audio=0):
+            chunks.append(frame.to_ndarray())
+            sampling_rate = frame.sample_rate
+    if not chunks or sampling_rate is None:
+        raise ValueError("Audio sample has no decodable frames")
+    samples = np.concatenate(chunks, axis=-1)
+    if np.issubdtype(samples.dtype, np.integer):
+        info = np.iinfo(samples.dtype)
+        samples = samples.astype(np.float32) / max(abs(info.min), info.max)
+    else:
+        samples = samples.astype(np.float32)
+    if samples.ndim == 2:
+        samples = samples.mean(axis=0)
+    return samples, int(sampling_rate)
+
+
 def _load_librispeech(dataset_name, dataset_split, num_seqs, seed):
     """Load audio samples from LibriSpeech and return as list of numpy arrays."""
     from datasets import Audio, load_dataset
@@ -1545,14 +1630,23 @@ def _load_librispeech(dataset_name, dataset_split, num_seqs, seed):
     ds = ds.cast_column("audio", Audio(decode=False))
     ds = ds.shuffle(seed=seed)
     samples = []
+    _seen = _fail = 0
+    _first_err = None
     for item in ds:
+        _seen += 1
         try:
             arr, sr = _decode_audio_array(item["audio"])
         except Exception:
+            _fail += 1
+            if _first_err is None:
+                import traceback as _tb
+                _first_err = _tb.format_exc()
             continue
         samples.append({"audio": arr, "sampling_rate": sr, "text": item["text"]})
         if len(samples) >= num_seqs:
             break
+    if len(samples) == 0:
+        print(f"  [librispeech diag] seen={_seen} fail={_fail} first_err=\n{_first_err}", flush=True)
     return samples
 
 def main():

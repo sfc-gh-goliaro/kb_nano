@@ -743,10 +743,12 @@ def load_weights(model, model_path: str, model_type: str = "llama") -> None:
             if m_conv:
                 prefix, wb = m_conv.groups()
                 mapped_name = f"{prefix}.conv.{wb}"
-            m_ln = _WHISPER_LAYER_NORM_RE.match(mapped_name)
-            if m_ln:
-                prefix, wb = m_ln.groups()
-                mapped_name = f"{prefix}.norm.{wb}"
+            # NOTE: the L1 LayerNorm wrapper exposes .weight/.bias directly
+            # (not nested under .norm), so LayerNorm checkpoint names already
+            # match the model parameter names -- no remap needed. Remapping to
+            # ".norm.<wb>" here silently skipped every LayerNorm weight, leaving
+            # them at init (weight=1, bias=0) and producing garbage encoder
+            # output (cosine ~0.001 vs reference).
             m_emb = _WHISPER_EMBED_RE.match(mapped_name)
             if m_emb:
                 prefix = m_emb.group(1)
