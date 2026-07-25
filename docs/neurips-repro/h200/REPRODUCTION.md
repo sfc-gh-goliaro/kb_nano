@@ -8,7 +8,7 @@ transformers 4.57.6, fastkernels installed `-e`).
 
 ```bash
 bash /code/users/goliaro/init.sh          # base env (torch 2.10 + vLLM 0.18 + fastkernels -e)
-bash reproduction/setup_repro_envs.sh     # this session's extras, isolated venvs, repos, instant-ngp, models
+bash docs/neurips-repro/h200/setup_repro_envs.sh   # this session's extras, isolated venvs, repos, instant-ngp, models
 ```
 
 `setup_repro_envs.sh` creates isolated uv venvs under `~/repro_venvs/` for rows

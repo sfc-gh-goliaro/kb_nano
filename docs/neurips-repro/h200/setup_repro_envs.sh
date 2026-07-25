@@ -19,7 +19,7 @@
 # Most rows run in the base `dev` env. The isolated venvs are used ONLY for the
 # reference side of a handful of rows (via bench flags like --vllm-python /
 # --reference-python, or by running the whole bench in the venv). See
-# reproduction/REPRODUCTION.md for the exact per-row run commands.
+# docs/neurips-repro/h200/REPRODUCTION.md for the exact per-row run commands.
 #
 # Idempotent-ish: safe to re-run; existing venvs/clones are reused.
 # ============================================================================
@@ -180,6 +180,6 @@ done
 # (needs the aws CLI, present in dev). ScanObjectNN (PTv3) + gym-xarm-pointcloud (DP3)
 # auto-download from HF at run time.
 
-log "DONE. See reproduction/REPRODUCTION.md for per-row run commands."
+log "DONE. See docs/neurips-repro/h200/REPRODUCTION.md for per-row run commands."
 echo "Isolated venvs created under $VENVS :"
 ls -1 "$VENVS"
