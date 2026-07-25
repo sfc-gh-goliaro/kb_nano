@@ -139,6 +139,10 @@ class VllmFusedExperts(nn.Module):
         config = get_triton_config(
             M, w13.shape, w2.shape, top_k,
             use_fp8=True, block_shape=block_shape,
+            # vLLM-style fallback for shapes with no tuned JSON (e.g. tp=1
+            # N=2048): its K=128 default is block_shape-compatible, unlike the
+            # "legacy" large heuristic (K=64) which is ~4.6x slower at M>=128.
+            default_style="vllm",
         )
         block_m = config["BLOCK_SIZE_M"]
 
