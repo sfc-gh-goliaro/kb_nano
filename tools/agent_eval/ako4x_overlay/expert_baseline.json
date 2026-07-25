@@ -1,0 +1,10 @@
+{
+  "name": "kb_rms_norm-expert-baseline",
+  "definition": "kb_rms_norm",
+  "author": "baseline",
+  "entry_file": "kernel.py",
+  "language": "python",
+  "sources": {
+    "kernel.py": "\"\"\"Expert baseline for kb_rms_norm \u2014 the kb production baseline itself.\n\nThis file is INFRA, not an agent solution: it is packed into `expert_baseline.json`\nat the child's root, where bench_utils profiles it to produce the score's\ndenominator. The delegation ban that applies to `solution/kernel.py` does NOT apply\nhere \u2014 the whole point of this file is to measure the incumbent kb kernel.\n\nIt imports through the `fastkernels` package name rather than a bare\n`tasks.baseline...` path on purpose: the entrypoint binds `fastkernels` in\nsys.modules before importing the candidate, so this resolves to the very module\nobject the entrypoint already loaded as the baseline. The expert and the\ncorrectness oracle are then the same class \u2014 no second copy of the module, no\nsecond JIT load of the CUDA extension.\n\"\"\"\n\nfrom fastkernels.tasks.baseline.L1.rms_norm import RMSNorm as RMSNorm  # noqa: F401\n"
+  }
+}

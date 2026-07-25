@@ -1,0 +1,96 @@
+diff --git a/cuda_kernel_optimizer_multi.py b/cuda_kernel_optimizer_multi.py
+index cf40940..ca24d5e 100644
+--- a/cuda_kernel_optimizer_multi.py
++++ b/cuda_kernel_optimizer_multi.py
+@@ -32,6 +32,37 @@ from format import (
+     format_comparison_summary, format_results
+ )
+ 
++# ---------------------------------------------------------------------------
++# Claude (Anthropic) backend wiring.
++#
++# The Agents SDK talks to any OpenAI-compatible endpoint. Anthropic serves one
++# at /v1/chat/completions, so we point the default client there and force the
++# chat_completions API (the SDK defaults to the Responses API, which Anthropic
++# does not implement). Tracing is disabled because it would otherwise upload to
++# OpenAI's tracing backend using an OpenAI key we do not have.
++#
++# Gated so importing this module stays side-effect-free unless a key or an
++# explicit base-URL override is present (ASTRA_BASE_URL also lets tests point
++# the SDK at a local stub server).
++# ---------------------------------------------------------------------------
++ASTRA_MODEL = os.environ.get("ASTRA_MODEL", "claude-opus-4-7")
++
++if os.environ.get("ANTHROPIC_API_KEY") or os.environ.get("ASTRA_BASE_URL"):
++    from agents import (
++        set_default_openai_client,
++        set_default_openai_api,
++        set_tracing_disabled,
++    )
++    from openai import AsyncOpenAI
++
++    _astra_client = AsyncOpenAI(
++        base_url=os.environ.get("ASTRA_BASE_URL", "https://api.anthropic.com/v1/"),
++        api_key=os.environ.get("ANTHROPIC_API_KEY", "dummy-key-for-offline"),
++    )
++    set_default_openai_client(_astra_client, use_for_tracing=False)
++    set_default_openai_api("chat_completions")
++    set_tracing_disabled(True)
++
+ # Configure logging
+ logging.basicConfig(
+     level=logging.INFO,
+@@ -580,14 +611,14 @@ def benchmark_kernel(version: str, input_sizes: str = "1024,4096,16384,65536") -
+ # Agent definitions using OpenAI Agents SDK
+ orchestrator_agent = Agent(
+     name="Orchestrator",
+-    model="o4-mini",
++    model=ASTRA_MODEL,
+     instructions=AGENT_INSTRUCTIONS["orchestrator"],
+     tools=[]  # Orchestrator only receives notifications, no tools needed
+ )
+ 
+ code_generation_agent = Agent(
+     name="CodeGenerator", 
+-    model="o4-mini",
++    model=ASTRA_MODEL,
+     instructions=AGENT_INSTRUCTIONS["code_generator"],
+     tools=[save_kernel_code, compile_cuda_kernel],
+     input_guardrails=[validate_cuda_code_input]
+@@ -595,21 +626,21 @@ code_generation_agent = Agent(
+ 
+ correctness_testing_agent = Agent(
+     name="CorrectnessTester",
+-    model="o4-mini",
++    model=ASTRA_MODEL,
+     instructions=AGENT_INSTRUCTIONS["correctness_tester"],
+     tools=[generate_comprehensive_test_cases, verify_kernel_correctness]
+ )
+ 
+ benchmarking_agent = Agent(
+     name="Benchmarker",
+-    model="o4-mini",
++    model=ASTRA_MODEL,
+     instructions=AGENT_INSTRUCTIONS["benchmarker"],
+     tools=[benchmark_kernel]
+ )
+ 
+ optimization_strategy_agent = Agent(
+     name="OptimizationStrategist",
+-    model="o4-mini",
++    model=ASTRA_MODEL,
+     instructions=AGENT_INSTRUCTIONS["optimization_strategist"],
+     tools=[]  # Strategist only provides suggestions, no tools needed
+ )
+diff --git a/requirements.txt b/requirements.txt
+index 02822f2..97ac460 100644
+--- a/requirements.txt
++++ b/requirements.txt
+@@ -4,6 +4,5 @@ torch>=2.0.0
+ matplotlib>=3.5.0
+ pandas>=1.3.0
+ tqdm>=4.62.0
+-pycuda>=2022.1; platform_system != "Windows"
+ sgl-kernel
+ openai-agents
+\ No newline at end of file
