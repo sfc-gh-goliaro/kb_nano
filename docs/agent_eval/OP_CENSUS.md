@@ -36,10 +36,14 @@ Two lanes with different work:
 
 **Lane A — model-scoped ops (the majority: decoders, MLPs, MoEs, oasis_*,
 vision_*, yolov10_*, gla_*, ...).** Deterministic recipe, fully static, no
-runs: op name -> the family's single representative checkpoint -> its
-config.json -> write the constructor fields as per-scenario `init_args`
-(registry data), plus a one-time generic shim in the entrypoint ("if an init
-arg named `config` arrives as a dict, wrap it in an attribute object").
+runs: op name -> the traced checkpoint -> its config.json -> write the
+constructor fields as per-scenario `init_args` (registry data), plus a
+one-time generic shim in the entrypoint ("if an init arg named `config`
+arrives as a dict, wrap it in an attribute object"). The authoritative list
+of traced checkpoints is `bench/kernels/benchmark_scenarios/small/config.yaml`
+(9 models: llama31-8b, gpt-oss-120b, gla-2.7b-100b, flux1-dev,
+qwen3-vl-235b-a22b-fp8, yolov1on, openfold3, bge-m3, oasis-500m); op->model
+matching uses the same family logic as `scenario_pipeline._resolve_targets`.
 Verify each op with the identity check; it flips to RUNNABLE. Sanity
 cross-check: diff derived values against the experiments-codex runner's
 hardcoded reconstructions (`bench/kernels/runner.py` on that branch, the
