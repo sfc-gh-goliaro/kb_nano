@@ -1,27 +1,18 @@
 """Flash attention decode kernel (with paged KV cache).
 
-On Hopper (SM90) when vLLM's bundled FA3 is available, uses the unified
-``flash_attn_varlen_func(fa_version=3)`` interface which is significantly
-faster.  Falls back to ``flash_attn_with_kvcache`` (FA2) otherwise.
+When vLLM's bundled FlashAttention is available (FA3 on Hopper, FA4 on
+Blackwell), uses the unified ``flash_attn_varlen_func(fa_version=...)``
+interface which is significantly faster.  Falls back to
+``flash_attn_with_kvcache`` (FA2) otherwise, including for head sizes FA4
+cannot serve on Blackwell.
 """
 
 import torch
 import torch.nn as nn
 
-_FA3_AVAILABLE = False
-_fa3_varlen_func = None
-try:
-    from vllm.vllm_flash_attn import (
-        flash_attn_varlen_func as _vllm_fa_varlen,
-        is_fa_version_supported,
-    )
-    if is_fa_version_supported(3) and torch.cuda.is_available():
-        cc = torch.cuda.get_device_capability()
-        if cc[0] >= 9:
-            _FA3_AVAILABLE = True
-            _fa3_varlen_func = _vllm_fa_varlen
-except ImportError:
-    pass
+from ._fa_backend import VLLM_FA_AVAILABLE as _FA3_AVAILABLE
+from ._fa_backend import fa_version_for_head_dim as _fa_version_for_head_dim
+from ._fa_backend import vllm_fa_varlen_func as _fa3_varlen_func
 
 if not _FA3_AVAILABLE:
     from flash_attn import flash_attn_with_kvcache
@@ -33,6 +24,8 @@ class FlashAttnDecode(nn.Module):
         self.num_heads = num_heads
         self.num_kv_heads = num_kv_heads
         self.head_dim = head_dim
+        # FA4 cannot serve every head size on Blackwell; resolve per layer.
+        self._fa_version = _fa_version_for_head_dim(head_dim)
         self._cu_seqlens_q = None
 
     def _get_cu_seqlens_q(self, n: int, device: torch.device) -> torch.Tensor:
@@ -68,7 +61,7 @@ class FlashAttnDecode(nn.Module):
                 softmax_scale=softmax_scale,
                 causal=True,
                 block_table=block_table,
-                fa_version=3,
+                fa_version=self._fa_version,
             )
             fa3_kw.update(kwargs)
             return _fa3_varlen_func(**fa3_kw)

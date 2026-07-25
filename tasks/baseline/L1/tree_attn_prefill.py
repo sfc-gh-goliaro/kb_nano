@@ -62,16 +62,20 @@ except ImportError:
 
 _FA3_AVAILABLE = False
 _FA3_VARLEN_FUNC = None
+_FA_VERSION = None
 try:
-    from vllm.vllm_flash_attn.flash_attn_interface import (
-        FA3_AVAILABLE as _VLLM_FA3_AVAILABLE,
-        flash_attn_varlen_func as _vllm_fa_varlen,
-    )
-    if _VLLM_FA3_AVAILABLE and torch.cuda.is_available():
-        cc = torch.cuda.get_device_capability()
-        if cc[0] == 9:
-            _FA3_AVAILABLE = True
-            _FA3_VARLEN_FUNC = _vllm_fa_varlen
+    from ._fa_backend import FA_VERSION as _fa_backend_version
+    from ._fa_backend import VLLM_FA_AVAILABLE as _vllm_fa_available
+    from ._fa_backend import fa_version_for_head_dim as _fa_version_for_head_dim
+    from ._fa_backend import vllm_fa_varlen_func as _vllm_fa_varlen
+
+    # FA3 on Hopper, FA4 on Blackwell. Both accept a paged KV cache with vLLM's
+    # page sizes; upstream flash_attn (the fallback below) requires the page size
+    # to be a multiple of 256.
+    if _vllm_fa_available:
+        _FA3_AVAILABLE = True
+        _FA3_VARLEN_FUNC = _vllm_fa_varlen
+        _FA_VERSION = _fa_backend_version
 except ImportError:
     pass
 
@@ -96,7 +100,8 @@ def _sgl_fa3_paged(q, k_cache, v_cache, cu_seqlens_q, cache_seqlens,
 
 
 def _fa3_paged(q, k_cache, v_cache, cu_seqlens_q, seqused_k,
-               max_seqlen_q, max_seqlen_k, block_table, softmax_scale):
+               max_seqlen_q, max_seqlen_k, block_table, softmax_scale,
+               fa_version=None):
     out, lse = _FA3_VARLEN_FUNC(
         q, k_cache, v_cache,
         max_seqlen_q=max_seqlen_q,
@@ -107,7 +112,7 @@ def _fa3_paged(q, k_cache, v_cache, cu_seqlens_q, seqused_k,
         softmax_scale=softmax_scale,
         causal=False,
         return_softmax_lse=True,
-        fa_version=3,
+        fa_version=fa_version if fa_version is not None else _FA_VERSION,
     )
     return out, lse
 
@@ -152,6 +157,10 @@ class TreeAttnPrefill(nn.Module):
         self.num_kv_heads = num_kv_heads
         self.head_dim = head_dim
         self.sm_scale = head_dim ** -0.5
+        # FA4 cannot serve every head size on Blackwell; resolve per layer.
+        self._fa_version = (
+            _fa_version_for_head_dim(head_dim) if _FA3_AVAILABLE else None
+        )
 
     def forward(
         self,
@@ -241,6 +250,7 @@ class TreeAttnPrefill(nn.Module):
                 max_seqlen_k=max_seqlen_k_prefix,
                 block_table=block_table_prefix,
                 softmax_scale=scale,
+                fa_version=self._fa_version,
             )
 
             kc_tok = k_cache.view(-1, 1, H_kv, D)
@@ -253,6 +263,7 @@ class TreeAttnPrefill(nn.Module):
                 max_seqlen_k=max_seqlen_k_expand,
                 block_table=page_table_expand,
                 softmax_scale=scale,
+                fa_version=self._fa_version,
             )
         else:
             cu_seqlens_k_prefix = torch.zeros(
