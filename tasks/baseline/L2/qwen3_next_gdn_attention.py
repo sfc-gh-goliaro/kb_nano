@@ -254,9 +254,14 @@ class Qwen3NextGDNAttention(nn.Module):
         # Output projection
         self.out_proj = RowParallelLinear(self.value_dim, hidden_size)
         self._triton_allocator_ready = False
+        # FlashInfer's GDN prefill kernel is built for SM90 only -- on
+        # Blackwell it raises "delta rule kernel does not support this device
+        # major version: 10" from gdn_prefill_sm90. vLLM gates it the same way
+        # (``ChunkGatedDeltaRule``: ``is_device_capability(90)``) and falls back
+        # to the Triton/FLA kernel, which is the ``else`` branch below.
         self._use_flashinfer_prefill = (
             torch.cuda.is_available()
-            and torch.cuda.get_device_capability()[0] >= 9
+            and torch.cuda.get_device_capability() == (9, 0)
         )
 
     @staticmethod
