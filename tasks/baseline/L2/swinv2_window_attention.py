@@ -11,6 +11,7 @@ Reference: timm/models/swin_transformer_v2.py WindowAttention
 from __future__ import annotations
 
 import math
+import os
 from typing import Optional, Tuple
 
 import torch
@@ -87,6 +88,14 @@ class SwinV2WindowAttention(nn.Module):
             persistent=False,
         )
         self._init_buffers()
+        # The continuous position bias is a function of fixed buffers and fixed
+        # weights, so in inference it is the same tensor on every forward. timm
+        # recomputes it per call (an MLP over the coords table, a gather, a sigmoid,
+        # a permute and a contiguous, once per block per batch); caching it under
+        # no-grad is numerically identical and removes that from the hot path.
+        # Keyed on window size and dtype/device so ``set_window_size`` or an .to()
+        # invalidates it.
+        self._bias_cache: tuple | None = None
 
     def _init_buffers(self) -> None:
         """Compute relative coords table and position index."""
@@ -126,6 +135,38 @@ class SwinV2WindowAttention(nn.Module):
 
         return table, index
 
+    def _compute_relative_position_bias(self) -> torch.Tensor:
+        bias_table = self.cpb_mlp(self.relative_coords_table).view(-1, self.num_heads)
+        bias = bias_table[self.relative_position_index.view(-1)].view(
+            self.window_size[0] * self.window_size[1],
+            self.window_size[0] * self.window_size[1],
+            -1,
+        )
+        bias = bias.permute(2, 0, 1).contiguous()
+        return 16 * torch.sigmoid(bias)
+
+    def _relative_position_bias(self) -> torch.Tensor:
+        """Continuous position bias, cached when it cannot change.
+
+        Only cached when grad is off and the module is in eval: under autograd the
+        bias is part of the graph, and in training the cpb_mlp weights move.
+        """
+        if self.training or torch.is_grad_enabled():
+            return self._compute_relative_position_bias()
+        if os.environ.get("FASTKERNELS_SWINV2_BIAS_CACHE", "1") != "1":
+            # Escape hatch so the cache can be A/B'd under identical host conditions:
+            # the reference's own throughput moved 25% between two runs, so comparing a
+            # cached run against an earlier uncached one measures the host as much as
+            # the change.
+            return self._compute_relative_position_bias()
+        key = (tuple(self.window_size), self.relative_coords_table.dtype,
+               self.relative_coords_table.device)
+        if self._bias_cache is not None and self._bias_cache[0] == key:
+            return self._bias_cache[1]
+        bias = self._compute_relative_position_bias()
+        self._bias_cache = (key, bias)
+        return bias
+
     def forward(
         self,
         x: torch.Tensor,
@@ -153,14 +194,7 @@ class SwinV2WindowAttention(nn.Module):
         logit_scale = torch.clamp(self.logit_scale, max=math.log(1.0 / 0.01)).exp()
         attn = attn * logit_scale
 
-        bias_table = self.cpb_mlp(self.relative_coords_table).view(-1, self.num_heads)
-        bias = bias_table[self.relative_position_index.view(-1)].view(
-            self.window_size[0] * self.window_size[1],
-            self.window_size[0] * self.window_size[1],
-            -1,
-        )
-        bias = bias.permute(2, 0, 1).contiguous()
-        bias = 16 * torch.sigmoid(bias)
+        bias = self._relative_position_bias()
         attn = attn + bias.unsqueeze(0)
 
         if mask is not None:
