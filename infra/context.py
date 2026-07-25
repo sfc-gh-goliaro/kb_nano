@@ -48,7 +48,17 @@ class AttnBackendConfig:
         if cc[0] >= 10:
             try:
                 from flashinfer.decode import trtllm_batch_decode_with_kv_cache  # noqa: F401
-                return cls(backend="trtllm", block_size=16, kv_layout="HND")
+                # Page 64, not 16. The TRTLLM-gen kernels accept 16/32/64; 64 means
+                # fewer partial reductions per sequence and a shorter block table to
+                # walk. A back-to-back A/B on one GPU puts the gain at about **1%**
+                # (Llama-3.1 1.02/0.95/0.97x at page 16 versus 1.04/0.96/0.97x at 64)
+                # with alignment unchanged (208.5 vs 209.4 matched tokens). Earlier
+                # cross-run comparisons suggested 7-12%, but those compared runs taken
+                # under different host load and were wrong -- only the paired A/B counts.
+                # Kept because it is consistently non-negative and costs nothing, not
+                # because it is a large win. Hopper keeps flash_attn/NHD at 256: this
+                # branch is sm100 only. Override with FASTKERNELS_HND_PAGE_SIZE.
+                return cls(backend="trtllm", block_size=64, kv_layout="HND")
             except ImportError:
                 pass
         return cls()
