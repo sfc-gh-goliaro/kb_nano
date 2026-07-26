@@ -47,6 +47,7 @@ from .weight_loader import load_model
 MAX_MODEL_LEN = 131072
 NCCL_PORT = int(os.environ.get("FASTKERNELS_NCCL_PORT", "29501"))
 
+
 # Max steps decoded per device-resident bulk call in the ragged hybrid-decode
 # path. Bounds the per-call output buffer / re-staging latency while still
 # amortizing away almost all per-step host round trips.
@@ -310,6 +311,24 @@ class BlockManager:
 # ---------------------------------------------------------------------------
 # ModelRunner — runs on EACH TP rank
 # ---------------------------------------------------------------------------
+def _seq_encoder_tokens(seq, merge_size: int) -> int:
+    """Post-merge vision tokens a sequence contributes to the encoder batch.
+
+    This is the unit the vision-encoder budget is accounted in: the tower is
+    run once per prefill step over every admitted sequence's patches
+    concatenated, so its activation footprint scales with this sum.
+    """
+    total = 0
+    for attr in ("image_grid_thw", "video_grid_thw"):
+        thw = getattr(seq, attr, None)
+        if thw is None:
+            continue
+        if not isinstance(thw, torch.Tensor):
+            thw = torch.tensor(thw, dtype=torch.long)
+        total += int((thw.prod(-1) // (merge_size ** 2)).sum().item())
+    return total
+
+
 class ModelRunner:
     def __init__(self, model_name: str, rank: int, world_size: int,
                  dtype: torch.dtype | None, enforce_eager: bool,
@@ -4833,11 +4852,30 @@ class ModelRunner:
         decode_req_id = torch.arange(max_bs, dtype=torch.int32).cuda()
         self._decode_req_id_buf = decode_req_id
 
-        # Match vLLM's default ``cudagraph_capture_sizes``:
+        # Match vLLM's default ``cudagraph_capture_sizes`` shape:
         # [1, 2, 4, 8, 16, 24, ..., 256, 272, ..., max_capture].
-        # vLLM normally caps captures at 512, but GPT-OSS overrides this to
-        # 1024 for better high-concurrency decode throughput.
-        max_capture_limit = 1024 if (self.is_gpt_oss or self.is_gemma4) else 512
+        #
+        # ``FASTKERNELS_MAX_CUDAGRAPH_BS`` overrides the cap.  Batches above the
+        # cap fall back to eager, which is costly for MoE models: a decode step
+        # is ~10 ops x num_layers launches, and the serving benchmarks run
+        # ``max_num_seqs=1024``, so a 512 cap leaves the entire 513..1024 decode
+        # range un-captured -- i.e. exactly the regime a high-concurrency run
+        # spends most of its time in.
+        # Default is unchanged (512, or 1024 for GPT-OSS / Gemma-4).  Callers
+        # that benefit from capturing the full schedulable range opt in via
+        # ``FASTKERNELS_MAX_CUDAGRAPH_BS`` -- see the per-model defaults in
+        # tests/bench_vllm.py.  Measured on Qwen3-VL-235B-A22B-FP8 TP4,
+        # text-only, 1000 seqs (max_num_seqs=1024): raising the cap to 1024
+        # takes 5,292 -> 8,549 out tok/s (+62%), because batches above the cap
+        # fall back to *full* eager here, unlike vLLM which keeps its
+        # piecewise-compiled regions.
+        _env_cap = os.environ.get("FASTKERNELS_MAX_CUDAGRAPH_BS")
+        if _env_cap:
+            max_capture_limit = int(_env_cap)
+        else:
+            max_capture_limit = (
+                1024 if (self.is_gpt_oss or self.is_gemma4) else 512
+            )
         max_capture = min(max_bs, max_capture_limit)
         self.graph_bs_list = [i for i in [1, 2, 4] if i <= max_capture]
         if max_capture >= 8:
@@ -6208,6 +6246,38 @@ class LlamaEngine:
         ]
 
     @torch.inference_mode()
+    def _vision_merge_size(self) -> int:
+        """``spatial_merge_size`` for vision models, 1 when there is no tower."""
+        try:
+            return int(self.model_runner.model.config.vision.spatial_merge_size)
+        except AttributeError:
+            return 1
+
+    def _max_encoder_tokens(self) -> int:
+        """Per-step cap on post-merge vision tokens fed to the vision tower.
+
+        The tower runs eagerly over all admitted sequences' patches at once, and
+        each post-merge token is ``spatial_merge_size**2`` patches wide, so its
+        transient (27 blocks x hidden 1152, MLP intermediate 4304) grows fast:
+        at a full ``max_num_batched_tokens`` of vision tokens the MLP activation
+        alone is hundreds of MiB per buffer and the run OOMs mid-flight
+        regardless of ``gpu_memory_utilization`` (lowering it 0.9 -> 0.85 freed
+        ~7 GiB of KV cache and still OOMed with 71 MiB free, because the tower
+        simply expands into whatever is free).
+
+        Defaults to ``max_num_batched_tokens``, i.e. unchanged scheduling for
+        every model.  Set ``FASTKERNELS_MAX_ENCODER_TOKENS`` to bound it -- see
+        the per-model defaults in tests/bench_vllm.py.  Measured on this box,
+        Qwen3-VL-235B-A22B-FP8 TP4: 4096 completes the image/video scenarios,
+        8192 OOMs in the vision tower.  (Chunking the tower's execution instead
+        was tried and still OOMed: admission volume also drives the size of the
+        output embeddings and of the LM prefill that consumes them.)
+        """
+        env = os.environ.get("FASTKERNELS_MAX_ENCODER_TOKENS")
+        if env:
+            return max(1, int(env))
+        return int(self.max_num_batched_tokens)
+
     def generate(self, prompts, sampling_params, collect_logits: bool = False,
                  images=None, videos=None, audio_features=None,
                  use_tqdm: bool = False,
@@ -6794,7 +6864,9 @@ class LlamaEngine:
             for seq in prefilling:
                 total_peak += (seq.num_prompt_tokens + seq.max_tokens
                                + block_size - 1) // block_size
-            encoder_budget = self.max_num_batched_tokens
+            encoder_budget = self._max_encoder_tokens()
+            _merge_size = self._vision_merge_size()
+            _mm_admitted = 0
             while waiting and token_budget > 0:
                 seq = waiting[0]
                 prompt_len = seq.num_prompt_tokens
@@ -6818,7 +6890,23 @@ class LlamaEngine:
                         break
                 elif has_mm:
                     chunk = min(prompt_len, token_budget)
-                    if chunk > encoder_budget:
+                    # Budget the *vision* tokens, not the prompt tokens: the
+                    # tower runs once per step over every admitted sequence's
+                    # patches concatenated, so its activation peak scales with
+                    # this sum and not with the text tokens beside it.
+                    # Accounting in prompt tokens made this mirror token_budget
+                    # exactly, so it imposed no bound at all and the tower could
+                    # be handed a full max_num_batched_tokens worth of vision
+                    # tokens (= 4x that many patches) and OOM.
+                    seq_enc_tokens = _seq_encoder_tokens(seq, _merge_size)
+                    # Guarantee forward progress: a single item whose vision
+                    # tokens exceed the whole budget must still be admitted, on
+                    # its own, or it can never be scheduled and the queue
+                    # deadlocks.  This is not hypothetical -- one 2048x2048
+                    # image is 4096 post-merge tokens on Qwen3-VL (patch 16,
+                    # merge 2) but 5349 on Qwen2-VL (patch 14), so the smaller
+                    # model would spin forever against a 4096 cap.
+                    if _mm_admitted and seq_enc_tokens > encoder_budget:
                         break
                 else:
                     chunk = min(prompt_len, token_budget)
@@ -6852,7 +6940,8 @@ class LlamaEngine:
                 token_budget -= chunk
                 total_peak += seq_peak
                 if has_mm:
-                    encoder_budget -= chunk
+                    encoder_budget -= seq_enc_tokens
+                    _mm_admitted += 1
 
             if is_bitnet and not prefill_seqs and not decode_seqs and running:
                 _schedule_decode_tokens()

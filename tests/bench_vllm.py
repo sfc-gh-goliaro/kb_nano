@@ -342,6 +342,73 @@ def _is_qwen_omni_model(model_name: str) -> bool:
     return "qwen" in lower and "omni" in lower
 
 
+# Per-model fastkernels engine tuning, applied via env so the engine keeps its
+# own defaults for every other model/path.  Only set when the user has not
+# already exported the variable.
+#
+# Qwen3-VL-235B (verified on 8x H200, Qwen3-VL-235B-A22B-Instruct-FP8 @ TP4,
+# 1000 seqs/scenario, vs vLLM 0.18):
+#   FASTKERNELS_MAX_CUDAGRAPH_BS=1024
+#     The serving benchmarks run max_num_seqs=1024, and batches above the
+#     capture cap fall back to *full* eager (vLLM keeps its piecewise-compiled
+#     regions above its own cap, so a 512 cap penalises us far more).
+#     text-only: 5,292 -> 8,549 out tok/s (+62%), for +5s of capture time.
+#   FASTKERNELS_MAX_ENCODER_TOKENS=4096
+#     Bounds post-merge vision tokens admitted per prefill step.  Without it the
+#     vision tower is handed a full max_num_batched_tokens (= 4x that many
+#     patches) in one call and OOMs mid-run, regardless of
+#     gpu_memory_utilization.  4096 completes image+video; 8192 OOMs.
+# Qwen2-VL (verified on 1x H200, Qwen2-VL-7B-Instruct @ TP1):
+#   FASTKERNELS_MAX_ENCODER_TOKENS=4096 + gpu_memory_utilization=0.85
+#     The image scenario OOMs without BOTH.  The unbounded encoder batch is the
+#     primary cause, but the cap alone is not enough here: the OOM lands in
+#     apply_rotary asking for only 80 MiB with 73 MiB free, i.e. the KV cache
+#     had consumed essentially all of the budget (PyTorch held 137.9 of
+#     139.8 GiB despite util=0.9), so the tower needs headroom too.  Lowering
+#     util alone is also not enough -- admission has to be bounded as well.
+#     0.85 clears the image scenario but video still OOMs the same way (94 MiB
+#     wanted, 55 MiB free), so 0.80 is used.
+#     Note one 2048x2048 image is 5349 post-merge tokens here (patch 14 vs
+#     Qwen3-VL's 16), i.e. above the cap, so it is admitted alone via the
+#     forward-progress rule in the scheduler.
+_PER_MODEL_DEFAULTS: dict[str, dict] = {
+    "qwen3-vl-235b": {
+        "env": {
+            "FASTKERNELS_MAX_CUDAGRAPH_BS": "1024",
+            "FASTKERNELS_MAX_ENCODER_TOKENS": "4096",
+        },
+    },
+    "qwen2-vl": {
+        "env": {"FASTKERNELS_MAX_ENCODER_TOKENS": "4096"},
+        "gpu_memory_utilization": 0.80,
+    },
+}
+
+
+def _apply_per_model_defaults(model_name: str, args) -> dict[str, str]:
+    """Apply verified per-model settings; returns what was applied, for logging.
+
+    Never overrides an explicit user setting (exported env var or CLI flag).
+    ``gpu_memory_utilization`` is applied to *both* engines so the comparison
+    stays symmetric.
+    """
+    lower = model_name.lower()
+    applied: dict[str, str] = {}
+    for key, spec in _PER_MODEL_DEFAULTS.items():
+        if key not in lower:
+            continue
+        for name, value in spec.get("env", {}).items():
+            if os.environ.get(name):
+                continue
+            os.environ[name] = value
+            applied[name] = value
+        util = spec.get("gpu_memory_utilization")
+        if util is not None and args.gpu_memory_utilization is None:
+            args.gpu_memory_utilization = util
+            applied["gpu_memory_utilization"] = str(util)
+    return applied
+
+
 # ---------------------------------------------------------------------------
 # Multi-scenario vLLM subprocess worker (LLM, text-only)
 # ---------------------------------------------------------------------------
@@ -799,14 +866,24 @@ def _preload_mm_data(dataset_name, dataset_split, num_seqs, seed,
             f"https://huggingface.co/datasets/{dataset_name}/resolve/main"
         )
         pbar = tqdm(data, total=num_seqs, desc="Loading videos")
+        skipped = 0
         for item in pbar:
             if len(results) >= num_seqs:
                 break
-            prompt = item["question"] + " " + " ".join(
-                f"{k}.{v}" for k, v in item["choices"].items())
-            video_path = item["video"].replace(remote_root, local_root)
-            frames, metadata = _load_video_opencv(
-                video_path, num_frames=num_video_frames)
+            # A single unreadable/corrupt clip must not abort the whole run:
+            # MMVU ships some files OpenCV cannot open (e.g.
+            # videos/Pharmacy/32.mp4), and raising here discarded every
+            # already-completed scenario for both engines.  Skip and count
+            # instead, matching the image/audio branches.
+            try:
+                prompt = item["question"] + " " + " ".join(
+                    f"{k}.{v}" for k, v in item["choices"].items())
+                video_path = item["video"].replace(remote_root, local_root)
+                frames, metadata = _load_video_opencv(
+                    video_path, num_frames=num_video_frames)
+            except Exception:
+                skipped += 1
+                continue
             results.append({
                 "prompt": prompt,
                 "images": None,
@@ -817,6 +894,10 @@ def _preload_mm_data(dataset_name, dataset_split, num_seqs, seed,
             })
             pbar.update(0)
         pbar.close()
+        if skipped:
+            print(f"  NOTE: skipped {skipped} unreadable video(s) from "
+                  f"{dataset_name}; loaded {len(results)}/{num_seqs}",
+                  flush=True)
     elif "librispeech_asr" in dataset_name:
         pbar = tqdm(data, total=num_seqs, desc="Loading audio")
         for item in pbar:
@@ -1850,6 +1931,14 @@ def main():
         "--model", type=str, default="meta-llama/Llama-3.1-8B-Instruct",
     )
     parser.add_argument("--tp", type=int, default=1)
+    parser.add_argument(
+        "--gpu-memory-utilization", type=float, default=None,
+        help="Fraction of GPU memory the engine may use, applied identically "
+             "to both the fastkernels and vLLM workers (default: each "
+             "worker's own 0.9). Lower it when a multimodal run OOMs in the "
+             "vision tower -- its activations are not fully covered by the "
+             "memory profile.",
+    )
     parser.add_argument("--num-seqs", type=int, default=None)
     parser.add_argument("--seed", type=int, default=42)
     parser.add_argument(
@@ -1911,6 +2000,7 @@ def main():
     is_vlm = _is_vlm_model(args.model)
     is_qwen_omni = _is_qwen_omni_model(args.model)
     is_whisper = _is_whisper_model(args.model)
+    engine_env = _apply_per_model_defaults(args.model, args)
 
     if args.output_dir is None:
         short = args.model.split("/")[-1]
@@ -2139,6 +2229,10 @@ def main():
     print(f"  Seed           : {args.seed}")
     print(f"  Trust RC       : {args.trust_remote_code}")
     print(f"  Max seq len    : {global_max_seq_len}")
+    if engine_env:
+        print("  Engine env     : "
+              + ", ".join(f"{k}={v}" for k, v in sorted(engine_env.items()))
+              + "  (per-model default)")
     print(f"  fastkernels port   : {kb_nccl_port}")
     if vllm_port is not None:
         print(f"  vLLM port      : {vllm_port}")
@@ -2178,6 +2272,8 @@ def main():
             "temperature": args.temperature,
             "enforce_eager": args.enforce_eager,
             "max_model_len": global_max_seq_len,
+            **({"gpu_memory_utilization": args.gpu_memory_utilization}
+               if args.gpu_memory_utilization is not None else {}),
             "scenarios": scenario_data,
             "latency_scenarios": latency_data,
             "trust_remote_code": args.trust_remote_code,
@@ -2215,6 +2311,8 @@ def main():
         "temperature": args.temperature,
         "enforce_eager": args.enforce_eager,
         "max_model_len": global_max_seq_len,
+        **({"gpu_memory_utilization": args.gpu_memory_utilization}
+           if args.gpu_memory_utilization is not None else {}),
         "project_root": kb_root,
         "package_name": package_name,
         "scenarios": scenario_data,
