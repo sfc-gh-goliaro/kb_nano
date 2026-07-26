@@ -72,11 +72,29 @@ reference, frozen as fixture data), or leave the op out of agent scoring.
 ## D6. allreduce: distributed harness or documented skip
 
 Multi-GPU communication op; the single-process grader has no process
-group (15/15 RUNTIME_ERROR by construction). Codex CSV: SKIPPED
-("requires a working distributed/NCCL process group") — its paper number
-came from the separate 4-rank harness. Options: port that 4-rank harness
-into the grader (real work), or keep the op out of agent campaigns with
-the same disclosure the paper already uses.
+group (15/15 RUNTIME_ERROR by construction). Reconciling the record
+(checked 2026-07-26):
+- The committed codex CSV run did NOT produce the paper's number: its row
+  is SKIPPED ("requires a working distributed/NCCL process group;
+  singleton NCCL failed... CUDA driver/runtime mismatch" — an env
+  breakage on that run's machine, not a hardware limit).
+- The paper's allreduce 0.84x comes from what its Table 1 caption calls
+  "a separate 4-rank NCCL+Gloo harness" (also referenced in §6.2, where
+  it catches a KernelAgent Triton kernel whose staged single-process
+  checker had reduced all-reduce to identity).
+- That harness's source is in NO branch we have (searched
+  experiments-codex/release/main for gloo/torchrun/nproc; only hit is
+  the TP engine's own `dist.new_group(backend="gloo")` in
+  infra/engine.py — reusable infra, not a bench harness). The paper
+  number is disclosed but not reproducible from committed artifacts.
+
+So: running allreduce IS possible on any >=4-GPU box with working NCCL
+(incl. our B200 node and the H200 cluster); what's missing is harness
+code. ASK THE MENTOR whether the 4-rank harness source still exists
+privately; if not, options: rebuild it (~day: torchrun 4 ranks,
+broadcast inputs, rank-0 compare + collective timing, reusing the
+engine's process-group setup), or keep the op out of agent campaigns
+with the paper's own disclosure.
 
 ## D7. Decoder L3 wiring (llama_decoder, gpt_oss_decoder, qwen3_moe_decoder)
 
