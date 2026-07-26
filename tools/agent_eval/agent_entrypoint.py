@@ -26,7 +26,7 @@ no CUDA, empty scenario selection).
 
 Correctness / timing semantics are the release runner's
 (``fastkernels/bench/kernels/runner.py``) -- its comparison helpers, its
-tolerances, its median timing are imported and reused, not reimplemented. Two
+tolerances, its median timing are imported and reused, not reimplemented. Seven
 deliberate differences from ``run_kernel_benchmark``:
 
 1. **Strict weight transfer.** The runner wraps ``load_state_dict`` in a bare
@@ -40,6 +40,26 @@ deliberate differences from ``run_kernel_benchmark``:
    (``tasks/baseline/L2/pointtransformerv3_layers.py`` -> ``import spconv``).
    ``_resolve_target`` below reproduces ``discover_targets``'s per-op logic
    (same module path, same ``kernel_swapper._find_module_class``) for one op only.
+3. **Local instantiation** (``_instantiate_module`` here, not the runner's): no
+   key mangling of the traced ``init_args``, no silent ``cls()`` fallback,
+   ``config``-shaped dicts wrapped into attribute-accessible namespaces, traced
+   activation names resolved to callables. See the block comment above
+   ``_instantiate_module``.
+4. **Deterministic fixtures.** torch's CPU+CUDA RNG is seeded from a stable hash
+   of (operator, scenario) before each scenario's inputs are materialised, so a
+   verdict is reproducible across processes and machines.
+5. **Input preparation.** Registry fixtures record *shapes*, not values, so
+   index-like arguments (``cu_seqlens``, ``block_table``, ``cache_seqlens``,
+   ``slot_mapping``, expert routing) arrive as uniform random integers that
+   violate the kernel's contract. ``_prepare_inputs_for_target`` repairs them
+   once, before either module runs, so both sides see identical valid inputs; it
+   also materialises the container input kinds the registry cannot build.
+6. **Non-finite baseline outputs are a fixture fault, not a verdict.** The
+   runner turns them into a numerical failure (runner.py:302-303); here they
+   become RUNTIME_ERROR, because nothing about the candidate was measured.
+7. **Uninitialised baseline parameters are repaired** (seeded, deterministic)
+   before the perturbation, because several baselines allocate parameters with
+   ``torch.empty`` and never fill them -- see ``_repair_degenerate_parameters``.
 
 Tolerances are NOT settable from the CLI: they are read from the runner's module
 constants. A calling agent must not be able to loosen its own correctness gate.
@@ -48,14 +68,17 @@ constants. A calling agent must not be able to loosen its own correctness gate.
 from __future__ import annotations
 
 import argparse
+import hashlib
 import importlib
 import importlib.util
+import inspect
 import json
 import math
 import os
 import shutil
 import sys
 import traceback
+from types import SimpleNamespace
 from typing import Any
 
 # --- stdout quarantine -------------------------------------------------------
@@ -214,6 +237,805 @@ def _load_candidate_from_path(path: str, baseline_cls: type) -> type:
     return cls
 
 
+# --- module instantiation -----------------------------------------------------
+#
+# The release runner's ``_instantiate_module`` is deliberately NOT reused; two of
+# its behaviours are wrong for a correctness harness.
+#
+# 1. **Key mangling** (runner.py:72-77) rewrites the traced ``init_args`` before
+#    construction: ``head_size`` -> ``head_dim``, ``base`` -> ``rope_theta``, and
+#    unconditional ``pop("rotary_dim")`` / ``pop("is_neox_style")``. The renamed
+#    or dropped key is then removed by the signature filter (the class never
+#    declared the new name), so the class is constructed *without* a parameter it
+#    declares as required. Measured on this registry: ``attention_impl``
+#    (``Attention(num_heads, head_size, scale)``) and ``mrope``
+#    (``MRotaryEmbedding(..., rotary_dim, ...)``) are unconstructible for that
+#    reason alone -- 20 + 5 scenarios that can never report a verdict. Nothing is
+#    mangled here: traced key names are passed through unchanged and only the
+#    signature filter (copied verbatim from the runner) applies.
+# 2. **The ``except TypeError: cls()`` fallback** silently default-constructs a
+#    module when the real call fails, so an unbuildable scenario either reports a
+#    numerical verdict computed on the wrong module, or -- as in the census --
+#    reports the *fallback's* exception ("Attention.__init__() missing 3 required
+#    positional arguments") instead of the real one. There is no fallback here:
+#    a construction failure propagates and becomes RUNTIME_ERROR with the real
+#    message.
+#
+# Added on top of the runner's logic: dict-valued ``init_args`` that stand in for
+# a model config object are converted recursively to attribute-accessible
+# namespaces, because HF-style modules read ``config.hidden_size``, not
+# ``config["hidden_size"]``. Nested dicts (e.g. a ``vision`` sub-config) and
+# lists of dicts are wrapped elementwise. The trigger is narrow on purpose --
+# key literally named ``config`` or a parameter annotated ``*Config`` -- so that
+# dict arguments which really are dicts (``quant_config={"weight_block_size":
+# ...}``) keep their mapping interface.
+
+
+def _wrap_namespaces(value: Any) -> Any:
+    """dict -> SimpleNamespace, recursively (lists/tuples elementwise)."""
+    if isinstance(value, dict):
+        return SimpleNamespace(**{
+            str(k): _wrap_namespaces(v) for k, v in value.items()
+        })
+    if isinstance(value, list):
+        return [_wrap_namespaces(v) for v in value]
+    if isinstance(value, tuple):
+        return tuple(_wrap_namespaces(v) for v in value)
+    return value
+
+
+def _callable_init_arg(value: str):
+    """Resolve a traced activation name to a fresh callable, or None.
+
+    A YAML trace cannot carry a ``Callable`` ctor argument, so an op like
+    ``vision_mlp`` (``act_fn: Callable = QuickGELU()``) silently benchmarks its
+    *default* activation while the real model uses another one -- Qwen3-VL's
+    vision config says ``gelu_pytorch_tanh``. Proposals therefore carry the
+    activation as a string and it is resolved here. A fresh instance per
+    construction keeps the baseline and the candidate from sharing a submodule;
+    none of these carry parameters, so the state_dict transfer is unaffected.
+    """
+    import torch.nn as nn
+
+    key = str(value).lower()
+    if key in ("gelu_tanh", "gelu_pytorch_tanh"):
+        return nn.GELU(approximate="tanh")
+    if key in ("quick_gelu", "quickgelu"):
+        from fastkernels.tasks.baseline.L1.quickgelu import QuickGELU
+
+        return QuickGELU()
+    if key == "silu":
+        return nn.SiLU()
+    return None
+
+
+def _wants_callable(name: str, param: Any) -> bool:
+    """True if a string passed as ``name`` names a callable, not a mode flag.
+
+    Deliberately narrow: HF-style configs carry ``hidden_act="silu"`` as a
+    *string* that modules compare against, so only arguments that are declared
+    callable (or named like one) are resolved.
+    """
+    # Name-based triggers are limited to slots that are callables by
+    # convention. Note ``hidden_act`` is deliberately NOT one of them: HF
+    # configs carry it as a mode string that modules compare against, and it
+    # would match a naive ``*_act`` suffix rule.
+    if name in ("act_fn", "act_layer", "norm_layer") or name.endswith(
+            ("_fn", "_layer")):
+        return True
+    if param is None:
+        return False
+    annotation = getattr(param, "annotation", inspect.Parameter.empty)
+    if annotation is inspect.Parameter.empty:
+        return False
+    text = annotation if isinstance(annotation, str) else str(annotation)
+    return "Callable" in text or "Module" in text
+
+
+def _wants_config_object(name: str, param: Any) -> bool:
+    """True if a dict passed as ``name`` should be namespace-wrapped."""
+    if name == "config":
+        return True
+    if param is None:
+        return False
+    annotation = getattr(param, "annotation", inspect.Parameter.empty)
+    if annotation is inspect.Parameter.empty:
+        return False
+    text = annotation if isinstance(annotation, str) else getattr(
+        annotation, "__name__", "")
+    return isinstance(text, str) and text.split(".")[-1].endswith("Config")
+
+
+def _instantiate_module(cls: type, init_args: dict[str, Any], device: str = "cuda",
+                        dtype: Any = None):
+    """Construct ``cls`` from traced ``init_args``. See the block comment above."""
+    import torch
+    import torch.nn as nn
+
+    kwargs = dict(init_args)
+    params: dict[str, Any] = {}
+    if cls.__init__ in (nn.Module.__init__, object.__init__):
+        # The class declares no constructor of its own. ``nn.Module.__init__``
+        # is ``(*args, **kwargs)``, so the signature filter below would see a
+        # VAR_KEYWORD parameter and forward every traced key into a constructor
+        # that accepts none of them (``FlashAttnVarlen(training=False)`` ->
+        # TypeError). The runner never noticed because its ``except TypeError:
+        # cls()`` fallback quietly produced the right module for the wrong
+        # reason; with the fallback gone the filter has to be correct.
+        kwargs = {}
+    else:
+        try:
+            params = dict(inspect.signature(cls.__init__).parameters)
+            accepts_kwargs = any(
+                p.kind == inspect.Parameter.VAR_KEYWORD for p in params.values()
+            )
+            if not accepts_kwargs:
+                kwargs = {
+                    k: v for k, v in kwargs.items()
+                    if k in params and k != "self"
+                }
+        except (TypeError, ValueError):
+            params = {}
+
+    for key, value in list(kwargs.items()):
+        if isinstance(value, dict) and _wants_config_object(key, params.get(key)):
+            kwargs[key] = _wrap_namespaces(value)
+        elif isinstance(value, str) and _wants_callable(key, params.get(key)):
+            resolved = _callable_init_arg(value)
+            if resolved is not None:
+                kwargs[key] = resolved
+
+    module = cls(**kwargs)  # no fallback: a TypeError here is the verdict
+
+    module = module.to(device)
+    if dtype is not None:
+        # Cast learnable parameters to the scenario dtype without changing
+        # precision-sensitive buffers such as RoPE/YARN cos/sin caches (from the
+        # runner), and without touching FP8 parameters: ``torch.float8_e4m3fn``
+        # answers True to ``is_floating_point()``, so the runner's version
+        # silently rewrites quantized expert weights to bf16 while the module's
+        # ``use_fp8`` flag stays set -- the FP8 Triton kernel then fails to
+        # compile (verified on qwen3_moe). A quantized parameter's dtype is part
+        # of the module's contract, not a scenario knob.
+        with torch.no_grad():
+            for param in module.parameters(recurse=True):
+                if param.is_floating_point() and "float8" not in str(param.dtype):
+                    param.data = param.data.to(dtype=dtype)
+    module.eval()
+    return module
+
+
+# --- deterministic fixtures ---------------------------------------------------
+
+def _stable_seed(*parts: str) -> int:
+    """Process-independent seed from a name (``hash()`` is salted per process)."""
+    digest = hashlib.sha256("/".join(parts).encode()).digest()
+    return int.from_bytes(digest[:8], "big") & 0x7FFF_FFFF_FFFF_FFFF
+
+
+def _repair_degenerate_parameters(module: Any, op: str) -> list[str]:
+    """Give uninitialised baseline parameters finite, non-degenerate values.
+
+    Several kb baselines allocate parameters with ``torch.empty`` and rely on a
+    later weight load that a kernel-level benchmark never performs, so the
+    "weights" are whatever the CUDA allocator handed back. Measured over 81
+    enumerated (op, shape) tuples: 62 came up NaN/Inf from stale device memory
+    and 11 came up all-zero. The perturbation below cannot rescue either --
+    ``NaN * s + shift`` is NaN (the forward then returns NaN and the scenario is
+    unmeasurable), and ``0 * s + shift`` leaves a weight matrix that is pure
+    noise of amplitude 0.05 with no structure.
+
+    Only degenerate parameters are touched: a parameter that is finite and not
+    identically zero is a real initialisation (``ones`` for norms, an embedding
+    table, ...) and is left for the perturbation step. FP8 parameters are left
+    alone -- a quantized tensor cannot be re-initialised without its scales.
+    Values are drawn from a CPU generator seeded by (op, parameter name), so the
+    fixture is identical on every machine and in every process.
+    """
+    import torch
+
+    repaired: list[str] = []
+
+    def _named_tensors():
+        # Buffers need the same treatment as parameters: BatchNorm running
+        # stats and similar non-parameter state are also torch.empty-allocated
+        # in several kb baselines (measured: the residual nonfinite failures in
+        # vision_block / yolov10* / attention were all buffer-borne).
+        yield from module.named_parameters(recurse=True)
+        yield from module.named_buffers(recurse=True)
+
+    with torch.no_grad():
+        for name, param in _named_tensors():
+            if not param.is_floating_point() or "float8" in str(param.dtype):
+                continue
+            values = param.detach().float()
+            degenerate = (
+                not bool(torch.isfinite(values).all())
+                or bool(values.abs().max().item() == 0.0)
+            )
+            if not degenerate:
+                continue
+            generator = torch.Generator(device="cpu").manual_seed(
+                _stable_seed(op, name))
+            if param.ndim >= 2:
+                # PyTorch's own default for Linear/Conv weights: uniform over
+                # +-1/sqrt(fan_in), which keeps activations O(1) at any width.
+                fan_in = max(1, int(param[0].numel()))
+                bound = 1.0 / math.sqrt(fan_in)
+                fresh = torch.empty(param.shape, dtype=torch.float32)
+                fresh.uniform_(-bound, bound, generator=generator)
+            else:
+                fresh = torch.randn(
+                    param.shape, generator=generator, dtype=torch.float32) * 0.02
+            if "running_var" in name or name.endswith("_var"):
+                # variance-like buffers must stay positive: BatchNorm computes
+                # sqrt(var + eps), so a negative repair value would emit NaN.
+                fresh = fresh.abs() + 0.5
+            param.copy_(fresh.to(device=param.device, dtype=param.dtype))
+            repaired.append(name)
+    return repaired
+
+
+def _seed_scenario(op: str, scenario_name: str) -> int:
+    """Seed torch (CPU + CUDA) from a stable hash of (operator, scenario).
+
+    The registry materialises every shape-only fixture with ``torch.randn`` /
+    ``torch.randint``, and the preparation layer below draws as well
+    (``randperm``). Unseeded, the fixture differs run to run, so any scenario
+    sitting near the tolerance edge flips verdict between runs -- measured:
+    repeated ``flashinfer_decode`` censuses failed *different* scenario sets.
+    ``hash()`` is salted per process, so the name is hashed explicitly.
+    """
+    import torch
+
+    seed = _stable_seed(op, scenario_name)
+    torch.manual_seed(seed)
+    torch.cuda.manual_seed_all(seed)
+    return seed
+
+
+# --- input preparation --------------------------------------------------------
+#
+# Ported from the codex kernel runner (validated on H200: 483/483 scenarios) and
+# extended where this harness's own failures pinned down a further root cause.
+# The registry records *shapes*; index-like arguments therefore arrive as uniform
+# random integers, which for most kernels is not a hard fixture but an invalid
+# one: ``cu_seqlens`` must be a monotonic partition, ``block_table`` entries must
+# be distinct in-range pages, ``slot_mapping`` entries must not collide,
+# ``cache_seqlens`` must be non-degenerate, GLA gates must be log-space. An
+# invalid fixture shows up as a *candidate* verdict (INCORRECT / RUNTIME_ERROR),
+# which is exactly the confusion this harness exists to avoid.
+#
+# Everything here runs ONCE per scenario, before either module is invoked, and
+# both sides are cloned from the same prepared dict -- so preparation can never
+# advantage one implementation over the other.
+
+# FlashInfer/TRTLLM paged caches use 16-token pages on this stack; used only as a
+# *lower bound* when converting a block-table width into a token capacity, so an
+# NHD cache with larger pages is merely under-filled, never read out of range.
+_PAGE_SIZE_LOWER_BOUND = 16
+# Confirmed: a decode row whose cache_seqlens is 0 leaves that output row
+# untouched (undefined memory), so the two sides disagree on garbage.
+_MIN_CACHE_SEQLEN = 64
+
+
+def _balanced_cu_seqlens(total_tokens: int, batch: int, max_seqlen: int | None,
+                         *, dtype: Any, device: Any):
+    """Monotonic cu_seqlens over ``total_tokens`` (codex port, verbatim).
+
+    Preserves the recorded tensor shape: ``cu[0] == 0``, ``cu[-1] ==
+    total_tokens``, ``batch`` segments, no segment wider than ``max_seqlen``.
+    """
+    import torch
+
+    batch = max(0, int(batch))
+    max_seqlen = int(max_seqlen) if max_seqlen is not None else total_tokens
+    max_seqlen = max(1, max_seqlen)
+    if batch == 0:
+        return torch.zeros(1, dtype=dtype, device=device), []
+    if total_tokens > batch * max_seqlen:
+        max_seqlen = math.ceil(total_tokens / batch)
+
+    base, extra = divmod(int(total_tokens), batch)
+    lengths = [base + (1 if i < extra else 0) for i in range(batch)]
+    if any(length > max_seqlen for length in lengths):
+        lengths = []
+        remaining = int(total_tokens)
+        for i in range(batch):
+            slots_left = batch - i
+            max_after = (slots_left - 1) * max_seqlen
+            length = min(max_seqlen, max(0, remaining - max_after))
+            lengths.append(length)
+            remaining -= length
+        if remaining > 0:
+            lengths[-1] += remaining
+
+    cu = [0]
+    for length in lengths:
+        cu.append(cu[-1] + int(length))
+    return torch.tensor(cu, dtype=dtype, device=device), lengths
+
+
+def _prepare_cu_seqlens(inputs: dict[str, Any]) -> None:
+    """Rebuild ``cu_seqlens_q`` / ``cu_seqlens_k`` (codex port, verbatim)."""
+    import torch
+
+    q_lengths: list[int] | None = None
+    if isinstance(inputs.get("cu_seqlens_q"), torch.Tensor):
+        cu = inputs["cu_seqlens_q"]
+        q = inputs.get("q")
+        if isinstance(q, torch.Tensor):
+            total_q = int(q.shape[0])
+            batch = max(0, int(cu.numel()) - 1)
+            inputs["cu_seqlens_q"], q_lengths = _balanced_cu_seqlens(
+                total_q, batch,
+                int(inputs["max_seqlen_q"]) if "max_seqlen_q" in inputs else None,
+                dtype=cu.dtype, device=cu.device,
+            )
+
+    if isinstance(inputs.get("cu_seqlens_k"), torch.Tensor):
+        cu = inputs["cu_seqlens_k"]
+        k = inputs.get("k")
+        batch = max(0, int(cu.numel()) - 1)
+        if (
+            isinstance(k, torch.Tensor)
+            and k.ndim == 4
+            and isinstance(inputs.get("block_table"), torch.Tensor)
+            and q_lengths is not None
+            and len(q_lengths) == batch
+        ):
+            # Paged K: ``k`` is the cache, not a token stream -- the per-request
+            # K length is the Q length (self-attention over the same tokens).
+            total_k = sum(q_lengths)
+        elif isinstance(k, torch.Tensor):
+            total_k = int(k.shape[0])
+        elif q_lengths is not None:
+            total_k = sum(q_lengths)
+        else:
+            total_k = batch
+        inputs["cu_seqlens_k"], _ = _balanced_cu_seqlens(
+            total_k, batch,
+            int(inputs["max_seqlen_k"]) if "max_seqlen_k" in inputs else None,
+            dtype=cu.dtype, device=cu.device,
+        )
+
+
+def _token_total(tensor: Any) -> int:
+    """Token count of a varlen-style activation ([1, T, ...] or [T, B, ...])."""
+    if tensor.ndim >= 3 and int(tensor.shape[0]) == 1:
+        return int(tensor.shape[1])
+    if tensor.ndim >= 2:
+        return int(tensor.shape[0]) * int(tensor.shape[1])
+    return int(tensor.shape[0])
+
+
+def _prepare_generic_cu_seqlens(inputs: dict[str, Any]) -> None:
+    """Rebuild any other ``cu_seqlens*`` argument (extends the codex port).
+
+    codex handled ``cu_seqlens`` per operator (chunk_gla, gla_attention); the
+    same contract holds for every operator that takes one, so the rule is
+    applied by name here. Random values are not merely a bad partition: FLA's
+    chunk kernels index with ``cu[i+1]-cu[i]`` and crash outright (2 of 5
+    ``chunk_gla`` scenarios were RUNTIME_ERROR for this reason).
+    """
+    import torch
+
+    for name in sorted(inputs):
+        if not name.startswith("cu_seqlens") or name in ("cu_seqlens_q", "cu_seqlens_k"):
+            continue
+        cu = inputs.get(name)
+        if not isinstance(cu, torch.Tensor):
+            continue
+        paired = None
+        for candidate in ("q", "query", "hidden_states", "x", "k", "key", "v"):
+            value = inputs.get(candidate)
+            if isinstance(value, torch.Tensor) and value.ndim >= 2:
+                paired = value
+                break
+        if paired is None:
+            continue
+        inputs[name], _ = _balanced_cu_seqlens(
+            _token_total(paired), max(0, int(cu.numel()) - 1), None,
+            dtype=cu.dtype, device=cu.device,
+        )
+
+
+def _cache_token_capacity(inputs: dict[str, Any]) -> int | None:
+    """Largest per-request KV length the fixture's cache can actually serve."""
+    import torch
+
+    capacity = None
+    block_table = inputs.get("block_table")
+    if isinstance(block_table, torch.Tensor) and block_table.ndim == 2:
+        capacity = int(block_table.shape[1]) * _PAGE_SIZE_LOWER_BOUND
+    else:
+        for name in ("k_cache", "kv_cache", "k"):
+            cache = inputs.get(name)
+            if isinstance(cache, torch.Tensor) and cache.ndim == 4:
+                # Unpaged layout [batch, seqlen, heads, dim].
+                capacity = int(cache.shape[1])
+                break
+    declared = inputs.get("max_seq_len")
+    if isinstance(declared, int) and declared > 0:
+        capacity = declared if capacity is None else min(capacity, declared)
+    return capacity
+
+
+def _prepare_paged_attention_inputs(inputs: dict[str, Any]) -> None:
+    """Valid ``block_table`` + non-degenerate ``cache_seqlens`` (codex port + fix).
+
+    ``block_table``: codex's arange-over-pages, verbatim -- every row gets
+    distinct in-range pages, so no two requests alias the same KV.
+
+    ``cache_seqlens``: codex filled with ``max_seq_len - i % 7`` clamped to >= 1.
+    Clamped to >= ``_MIN_CACHE_SEQLEN`` here (bounded by the cache's real
+    capacity), because the registry's uniform ``randint(0, 100)`` produces rows
+    of length 0 whose output rows are never written -- the confirmed cause of
+    ``flashinfer_decode`` failing a *different* ~9 of 56 scenarios per run.
+    """
+    import torch
+
+    block_table = inputs.get("block_table")
+    if isinstance(block_table, torch.Tensor):
+        num_blocks = 1
+        for cache_name in ("k_cache", "k"):
+            cache = inputs.get(cache_name)
+            if isinstance(cache, torch.Tensor) and cache.ndim == 4:
+                num_blocks = int(cache.shape[0])
+                break
+        inputs["block_table"] = (
+            torch.arange(block_table.numel(), dtype=block_table.dtype,
+                         device=block_table.device)
+            .reshape_as(block_table)
+            .remainder(max(1, num_blocks))
+        )
+
+    cache_seqlens = inputs.get("cache_seqlens")
+    if isinstance(cache_seqlens, torch.Tensor):
+        capacity = _cache_token_capacity(inputs) or 1
+        values = torch.full_like(cache_seqlens, capacity)
+        if cache_seqlens.numel() > 1:
+            values -= torch.arange(
+                cache_seqlens.numel(), dtype=cache_seqlens.dtype,
+                device=cache_seqlens.device,
+            ).remainder(min(capacity, 7))
+        values.clamp_(min=min(_MIN_CACHE_SEQLEN, capacity), max=capacity)
+        inputs["cache_seqlens"] = values
+
+
+def _prepare_slot_mapping(inputs: dict[str, Any], init_args: dict[str, Any]) -> None:
+    """Collision-free ``slot_mapping`` (replaces codex's ``arange``).
+
+    The registry draws slots i.i.d. from ``[0, num_slots)``; two tokens landing
+    on one slot means two thread blocks race for the same cache line, and the
+    winner differs between the baseline and candidate runs. At n=16384 over
+    111253*16 slots the expected number of colliding pairs is ~75, which is
+    exactly the one ``store_kvcache`` scenario that failed. Sampling without
+    replacement removes the race while keeping the writes spread across the
+    cache (codex's ``arange`` only ever touches slots 0..n-1, so the page
+    arithmetic of the HND kernel is never exercised).
+    """
+    import torch
+
+    slot_mapping = inputs.get("slot_mapping")
+    if not isinstance(slot_mapping, torch.Tensor) or slot_mapping.numel() == 0:
+        return
+    n = int(slot_mapping.numel())
+
+    upper = 0
+    page_size = init_args.get("page_size")
+    for name in ("k_cache", "kv_cache"):
+        cache = inputs.get(name)
+        if isinstance(cache, torch.Tensor) and cache.ndim >= 2 and isinstance(page_size, int):
+            upper = int(cache.shape[0]) * int(page_size)
+            break
+    if upper < n:
+        upper = max(int(slot_mapping.max().item()) + 1, n)
+
+    if upper < n:  # cache smaller than the token count: keep it in range
+        slots = torch.arange(n, dtype=torch.int64, device=slot_mapping.device)
+    else:
+        slots = torch.randperm(upper, device=slot_mapping.device)[:n]
+    inputs["slot_mapping"] = slots.to(dtype=slot_mapping.dtype).reshape(slot_mapping.shape)
+
+
+def _materialize_leaf_spec(spec: dict[str, Any], device: str):
+    """Build one tensor from the registry's ``{shape, dtype}`` leaf spec."""
+    import torch
+
+    from fastkernels.bench.kernels.scenario_registry import _parse_dtype
+
+    dtype = _parse_dtype(spec["dtype"])
+    shape = list(spec["shape"])
+    if dtype in (torch.int32, torch.int64):
+        return torch.randint(0, 100, shape, dtype=dtype, device=device)
+    if dtype == torch.bool:
+        return torch.randint(0, 2, shape, dtype=torch.uint8, device=device).bool()
+    if "float8" in str(dtype):
+        source = _parse_dtype(spec.get("source_dtype", "bfloat16"))
+        return torch.randn(shape, dtype=source, device=device).to(dtype)
+    return torch.randn(shape, dtype=dtype, device=device)
+
+
+def _prepare_structured_inputs(inputs: dict[str, Any], device: str) -> None:
+    """Materialize ``{kind: list|dict, items: ...}`` specs into real tensors.
+
+    Ops such as ``yolov10_concat(xs=[Tensor, ...])`` and
+    ``yolov10_neck(feats={name: Tensor})`` take a *container* of tensors.
+    ``scenario_registry._materialize_shape_inputs`` only understands a leaf
+    ``{shape, dtype}`` dict and passes anything else through verbatim, so the op
+    would receive the YAML dict itself. Building the container here keeps the
+    registry untouched (it is shared with the release runner).
+    """
+    for name, spec in list(inputs.items()):
+        if not isinstance(spec, dict) or "shape" in spec:
+            continue
+        kind, items = spec.get("kind"), spec.get("items")
+        if kind == "list" and isinstance(items, list):
+            inputs[name] = [_materialize_leaf_spec(i, device) for i in items]
+        elif kind == "dict" and isinstance(items, dict):
+            inputs[name] = {
+                k: _materialize_leaf_spec(v, device) for k, v in items.items()
+            }
+
+
+# Traced names for "how many rows does the table have"; first hit wins.
+_INDEX_LIMIT_KEYS = ("num_embeddings", "vocab_size", "org_num_embeddings",
+                     "org_vocab_size")
+
+
+def _prepare_index_inputs(op: str, inputs: dict[str, Any],
+                          init_args: dict[str, Any]) -> None:
+    """Fold token-index arguments into the table they index (extends the port).
+
+    The registry has no constrained path for ``input_ids``: it emits
+    ``randint(0, 100)``. Against an embedding table with fewer rows than that,
+    ``nn.Embedding`` raises a *device-side* assert, which does not just fail the
+    scenario -- it poisons the CUDA context, so every later scenario in the same
+    process dies too. Modulo keeps every id in range without changing the shape
+    or the dtype the trace recorded.
+    """
+    import torch
+
+    limit = None
+    for key in _INDEX_LIMIT_KEYS:
+        value = init_args.get(key)
+        if isinstance(value, int) and value > 0:
+            limit = value
+            break
+
+    names = ["input_ids"]
+    if "embed" in op:
+        # Position/segment ids index their own tables in embedding layers.
+        names += ["token_type_ids", "position_ids", "positions"]
+    for name in names:
+        tensor = inputs.get(name)
+        if not isinstance(tensor, torch.Tensor) or tensor.is_floating_point():
+            continue
+        bound = limit
+        if name == "token_type_ids":
+            declared = init_args.get("type_vocab_size")
+            bound = declared if isinstance(declared, int) and declared > 0 else limit
+        if name in ("position_ids", "positions"):
+            declared = init_args.get("max_position_embeddings")
+            bound = declared if isinstance(declared, int) and declared > 0 else limit
+        if isinstance(bound, int) and bound > 0:
+            inputs[name] = tensor.remainder(bound)
+
+
+def _prepare_log_gates(inputs: dict[str, Any]) -> None:
+    """Map GLA-family gates into log space (extends the codex port).
+
+    ``tasks/baseline/L1/chunk_gla.py`` documents ``g`` as a *log-space* forget
+    gate, and ``fused_recurrent_gla.py`` documents ``gk`` the same way, so the
+    kernel exponentiates a running sum of these values. The registry's
+    ``randn`` fixture is half positive, and over 1084 timesteps the cumulative
+    sum overflows to inf and then NaN. codex substituted ``-rand * 0.01``, which
+    discards the fixture; ``logsigmoid`` keeps it, is the convention FLA's own
+    tests use, and guarantees the required ``g <= 0``.
+    """
+    import torch
+
+    for name in ("g", "gk"):
+        gate = inputs.get(name)
+        if isinstance(gate, torch.Tensor) and gate.is_floating_point():
+            inputs[name] = torch.nn.functional.logsigmoid(gate.float()).to(gate.dtype)
+
+
+_FP8_WEIGHT_CACHE: dict[Any, Any] = {}
+
+
+def _prepare_fp8_linear_inputs(inputs: dict[str, Any]) -> None:
+    """Coherent FP8 weight + DeepGEMM scale layout (codex port, verbatim)."""
+    import torch
+
+    weight = inputs.get("weight_fp8")
+    if not isinstance(weight, torch.Tensor) or weight.ndim != 2:
+        return
+    if str(weight.dtype) != "torch.float8_e4m3fn":
+        return
+    # A shape-only fixture should not require runtime FlashInfer cubin
+    # compilation for tiny M; DeepGEMM covers the same contract here.
+    os.environ.setdefault("VLLM_BLOCKSCALE_FP8_GEMM_FLASHINFER", "0")
+
+    key = (str(weight.dtype), int(weight.shape[0]), int(weight.shape[1]), weight.device)
+    cached = _FP8_WEIGHT_CACHE.get(key)
+    if cached is None:
+        from fastkernels.tasks.baseline.L1.fp8_linear import postprocess_fp8_weights
+
+        n, k = int(weight.shape[0]), int(weight.shape[1])
+        block = 128
+        raw_scale = torch.ones(
+            math.ceil(n / block), math.ceil(k / block),
+            dtype=torch.float32, device=weight.device,
+        ) * 0.02
+        raw_weight = torch.randn(
+            n, k, dtype=torch.bfloat16, device=weight.device,
+        ).to(torch.float8_e4m3fn)
+        cached = postprocess_fp8_weights(raw_weight, raw_scale)
+        _FP8_WEIGHT_CACHE[key] = cached
+    inputs["weight_fp8"], inputs["weight_scale_inv"] = cached
+
+
+def _prepare_moe_grouped_gemm_inputs(inputs: dict[str, Any]) -> None:
+    """Block-aligned MoE routing metadata (codex port, verbatim).
+
+    ``sorted_token_ids`` becomes ``arange(valid)`` padded with the sentinel
+    ``valid`` (the kernel masks ``id < num_valid``), ``expert_ids`` one entry per
+    BLOCK_SIZE_M block in ascending order, and ``num_tokens_post_padded`` the
+    honest padded length rather than the registry's full-buffer value.
+    """
+    import torch
+
+    a = inputs.get("A")
+    b = inputs.get("B")
+    sorted_token_ids = inputs.get("sorted_token_ids")
+    expert_ids = inputs.get("expert_ids")
+    num_tokens_post_padded = inputs.get("num_tokens_post_padded")
+    if not (
+        isinstance(a, torch.Tensor)
+        and isinstance(b, torch.Tensor)
+        and isinstance(sorted_token_ids, torch.Tensor)
+        and isinstance(expert_ids, torch.Tensor)
+        and isinstance(num_tokens_post_padded, torch.Tensor)
+    ):
+        return
+
+    top_k = int(inputs.get("top_k", 1))
+    valid = int(a.shape[0]) * max(1, top_k)
+    inputs["config"] = {
+        "BLOCK_SIZE_M": 16,
+        "BLOCK_SIZE_N": 128,
+        "BLOCK_SIZE_K": 128,
+        "GROUP_SIZE_M": 16,
+        "num_warps": 4,
+        "num_stages": 5,
+    }
+    block_size = int(inputs["config"]["BLOCK_SIZE_M"])
+    padded = math.ceil(int(sorted_token_ids.numel()) / block_size) * block_size
+    values = torch.full(
+        (padded,), valid,
+        dtype=sorted_token_ids.dtype, device=sorted_token_ids.device,
+    )
+    values[: min(valid, padded)] = torch.arange(
+        min(valid, padded),
+        dtype=sorted_token_ids.dtype, device=sorted_token_ids.device,
+    )
+    inputs["sorted_token_ids"] = values
+
+    used_blocks = math.ceil(padded / block_size)
+    inputs["expert_ids"] = torch.arange(
+        used_blocks, dtype=expert_ids.dtype, device=expert_ids.device,
+    ).remainder(max(1, int(b.shape[0])))
+    inputs["num_tokens_post_padded"] = torch.full_like(num_tokens_post_padded, padded)
+
+
+def _prepare_fused_experts_inputs(inputs: dict[str, Any]) -> None:
+    """In-range expert ids + normalised routing weights (codex port, verbatim)."""
+    import torch
+
+    topk_ids = inputs.get("topk_ids")
+    topk_weights = inputs.get("topk_weights")
+    num_experts = int(inputs.get("num_experts", 0))
+    if isinstance(topk_ids, torch.Tensor) and num_experts > 0:
+        inputs["topk_ids"] = topk_ids.remainder(num_experts).to(torch.int32)
+    if isinstance(topk_weights, torch.Tensor):
+        inputs["topk_weights"] = torch.softmax(topk_weights.float(), dim=-1)
+
+    if bool(inputs.get("use_fp8_w8a8", False)):
+        for key in ("w13_scale", "w13_scale_dg", "w2_scale", "w2_scale_dg"):
+            scale = inputs.get(key)
+            if isinstance(scale, torch.Tensor):
+                inputs[key] = torch.full_like(scale.float(), 0.005)
+
+
+def _prepare_inputs_for_target(op: str, inputs: dict[str, Any], device: str,
+                               init_args: dict[str, Any]) -> dict[str, Any]:
+    """Repair a materialised fixture in place (codex port + the fixes above).
+
+    Not ported from codex, deliberately:
+      * ``_prepare_mxfp4_moe_inputs`` / ``_prepare_inputs_for_module`` -- they
+        pull weights out of a HuggingFace snapshot (``safetensors``,
+        ``huggingface_hub``) and then call *module* methods
+        (``module.prepare_weight``) to build per-implementation inputs, which
+        both breaks this file's stdlib+torch+repo-only rule and hands each side
+        differently-derived tensors, defeating the strict weight transfer.
+      * ``_canonicalize_output_for_target`` -- it re-sorts ``moe_align`` outputs
+        before comparison, i.e. it changes the comparator, not the fixture.
+    """
+    import torch
+
+    try:
+        from fastkernels.infra.context import set_context
+
+        set_context(False)
+    except Exception:
+        pass
+
+    _prepare_structured_inputs(inputs, device)
+    _prepare_cu_seqlens(inputs)
+    _prepare_generic_cu_seqlens(inputs)
+    _prepare_paged_attention_inputs(inputs)
+    _prepare_slot_mapping(inputs, init_args)
+    _prepare_index_inputs(op, inputs, init_args)
+    _prepare_log_gates(inputs)
+
+    if op == "mrope_input_positions" and "input_tokens" not in inputs:
+        offsets = []
+        for key in ("image_offsets", "video_offsets"):
+            value = inputs.get(key)
+            if isinstance(value, list):
+                offsets.extend(int(v) for v in value)
+        seq_len = (max(offsets) + 16) if offsets else 16
+        inputs["input_tokens"] = [0] * seq_len
+
+    if op == "vision_rotary_emb":
+        sms = int(inputs.get("spatial_merge_size", 2))
+        inputs.setdefault("grid_thw_list", [[1, sms, sms]])
+        inputs.setdefault("dtype", torch.bfloat16)
+        inputs.setdefault("device", torch.device(device))
+
+    if op == "vision_pos_embed_interpolate":
+        inputs.setdefault("grid_thw_list", [[1, 2, 2]])
+        inputs.setdefault("dtype", torch.bfloat16)
+        inputs.setdefault("device", torch.device(device))
+
+    if op == "yolov10_concat":
+        inputs.setdefault("xs", [
+            torch.randn((1, 8, 4, 4), dtype=torch.bfloat16, device=device),
+            torch.randn((1, 8, 4, 4), dtype=torch.bfloat16, device=device),
+        ])
+
+    if op == "oasis_patch_embed" and isinstance(inputs.get("x"), torch.Tensor):
+        inputs["x"] = inputs["x"].to(torch.bfloat16)
+
+    if op in ("attention", "attention_impl"):
+        # These layers read their KV metadata from the global Context, the way
+        # vLLM reads ``get_forward_context()``; the fixture carries none.
+        from fastkernels.infra.context import set_context
+
+        tensor = inputs.get("hidden_states", inputs.get("query"))
+        if isinstance(tensor, torch.Tensor):
+            n_tokens = int(tensor.shape[0])
+            cu = torch.tensor([0, n_tokens], dtype=torch.int32, device=tensor.device)
+            set_context(True, cu_seqlens_q=cu, cu_seqlens_k=cu,
+                        max_seqlen_q=n_tokens, max_seqlen_k=n_tokens)
+
+    if op == "fp8_linear":
+        _prepare_fp8_linear_inputs(inputs)
+
+    if op == "parallel_linear":
+        os.environ["VLLM_BLOCKSCALE_FP8_GEMM_FLASHINFER"] = "0"
+
+    if op == "moe_grouped_gemm":
+        _prepare_moe_grouped_gemm_inputs(inputs)
+
+    if op == "fused_experts":
+        _prepare_fused_experts_inputs(inputs)
+
+    return inputs
+
+
 # --- reporting helpers -------------------------------------------------------
 
 def _scenario_axes(scenario) -> dict[str, Any]:
@@ -241,6 +1063,24 @@ def _num(x: Any) -> Any:
     except (TypeError, ValueError):
         return "NaN"
     return f if math.isfinite(f) else "NaN"
+
+
+def _has_nonfinite(value: Any) -> bool:
+    """True if any floating tensor in the tree holds a NaN or an infinity."""
+    import torch
+
+    if isinstance(value, torch.Tensor):
+        if not value.is_floating_point():
+            return False
+        try:
+            return bool((~torch.isfinite(value.float())).any().item())
+        except Exception:
+            return False
+    if isinstance(value, (tuple, list)):
+        return any(_has_nonfinite(v) for v in value)
+    if isinstance(value, dict):
+        return any(_has_nonfinite(v) for v in value.values())
+    return False
 
 
 def _abs_rel_errors(baseline_out: Any, candidate_out: Any) -> tuple[float, float]:
@@ -350,13 +1190,24 @@ def run(op: str, candidate_path: str | None, scenario_filters: list[str] | None,
             "axes": _scenario_axes(scenario),
         }
         try:
+            _seed_scenario(op, scenario.name)
             inputs = registry.get_inputs(op, scenario.name, device="cuda")
+            inputs = _prepare_inputs_for_target(
+                op, inputs, "cuda", scenario.init_args)
             input_dtype = R._first_floating_dtype(inputs)
 
-            baseline_mod = R._instantiate_module(
+            baseline_mod = _instantiate_module(
                 target.target_cls, scenario.init_args, "cuda", dtype=input_dtype)
-            candidate_mod = R._instantiate_module(
+            candidate_mod = _instantiate_module(
                 user_impl, scenario.init_args, "cuda", dtype=input_dtype)
+
+            # --- uninitialised baseline parameters (torch.empty) ---
+            # Runs BEFORE the perturbation: a NaN parameter survives
+            # ``NaN * scale + shift`` and makes the scenario unmeasurable.
+            repaired = _repair_degenerate_parameters(baseline_mod, op)
+            if repaired:
+                _log(f"{scenario.name}: re-initialised uninitialised "
+                     f"parameter(s) {repaired}")
 
             # --- strict weight transfer (tightens runner.py:496-500) ---
             # Perturb the baseline's floating-point parameters (deterministic,
@@ -370,7 +1221,11 @@ def run(op: str, candidate_path: str | None, scenario_filters: list[str] | None,
             _pgen = torch.Generator(device="cpu").manual_seed(0x5EED)
             with torch.no_grad():
                 for _pname, _p in baseline_mod.named_parameters():
-                    if _p.is_floating_point():
+                    # float8 exempt: mul_/add_ are unimplemented for float8 on
+                    # CUDA, and quantized expert weights are not identity-valued
+                    # (the blind spot this perturbation closes); both sides
+                    # still share the identical copied fp8 tensors.
+                    if _p.is_floating_point() and "float8" not in str(_p.dtype):
                         _scale = torch.empty(_p.shape, dtype=torch.float32)
                         _scale.uniform_(0.75, 1.25, generator=_pgen)
                         _shift = torch.empty(_p.shape, dtype=torch.float32)
@@ -405,6 +1260,24 @@ def run(op: str, candidate_path: str | None, scenario_filters: list[str] | None,
             baseline_check_inputs = R._clone_inputs(inputs)
             candidate_check_inputs = R._clone_inputs(inputs)
             baseline_out = R._run_forward_once(baseline_mod, baseline_check_inputs)
+
+            # --- non-finite baseline output = fixture fault, not a verdict ---
+            # runner.py:302-303 turns "either side is non-finite" into a
+            # numerical failure. When it is the *baseline* that produced the
+            # NaN/inf, nothing about the candidate has been measured: the
+            # comparison is inf-vs-inf regardless of what the candidate did.
+            # Confirmed on flux_attention, where bitwise-identical outputs
+            # reported max_error_ratio=inf. Report the fixture instead. The
+            # candidate is NOT given the same excuse -- a candidate-only
+            # non-finite output still fails the comparison below.
+            if _has_nonfinite(baseline_out):
+                entry["status"] = STATUS_RUNTIME_ERROR
+                entry["error_log"] = (
+                    "baseline_output_nonfinite: degenerate fixture (uninitialized parameters or out-of-distribution inputs)"
+                )
+                results[scenario.name] = entry
+                continue
+
             candidate_out = R._run_forward_once(candidate_mod, candidate_check_inputs)
 
             correct, max_error_ratio, mean_diff = R._merge_correctness(

@@ -1,0 +1,839 @@
+{
+ "ada_layer_norm": {
+  "verdict": "RUNNABLE",
+  "tally": {
+   "PASSED": 2
+  },
+  "n_scenarios": 2,
+  "seconds": 11.9
+ },
+ "batch_norm2d": {
+  "verdict": "RUNNABLE",
+  "tally": {
+   "PASSED": 1
+  },
+  "n_scenarios": 1,
+  "seconds": 9.6
+ },
+ "dense_attention": {
+  "verdict": "RUNNABLE",
+  "tally": {
+   "PASSED": 17
+  },
+  "n_scenarios": 17,
+  "seconds": 9.2
+ },
+ "flash_attn_decode": {
+  "verdict": "RUNNABLE",
+  "tally": {
+   "PASSED": 1
+  },
+  "n_scenarios": 1,
+  "seconds": 12.1
+ },
+ "flux_attention": {
+  "verdict": "RUNNABLE",
+  "tally": {
+   "PASSED": 4
+  },
+  "n_scenarios": 4,
+  "seconds": 14.5
+ },
+ "fused_experts": {
+  "verdict": "RUNNABLE",
+  "tally": {
+   "PASSED": 5
+  },
+  "n_scenarios": 5,
+  "seconds": 14.8
+ },
+ "gla_attention": {
+  "verdict": "PARTIAL",
+  "tally": {
+   "PASSED": 8,
+   "RUNTIME_ERROR": 2
+  },
+  "n_scenarios": 10,
+  "seconds": 22.2
+ },
+ "gpt_oss_decoder": {
+  "verdict": "PARTIAL",
+  "tally": {
+   "RUNTIME_ERROR": 10
+  },
+  "n_scenarios": 10,
+  "seconds": 16.6
+ },
+ "linear": {
+  "verdict": "RUNNABLE",
+  "tally": {
+   "PASSED": 177
+  },
+  "n_scenarios": 177,
+  "seconds": 36.5
+ },
+ "max_pool2d": {
+  "verdict": "RUNNABLE",
+  "tally": {
+   "PASSED": 1
+  },
+  "n_scenarios": 1,
+  "seconds": 4.3
+ },
+ "mrope_input_positions": {
+  "verdict": "RUNNABLE",
+  "tally": {
+   "PASSED": 5
+  },
+  "n_scenarios": 5,
+  "seconds": 3.0
+ },
+ "oasis_mlp": {
+  "verdict": "RUNNABLE",
+  "tally": {
+   "PASSED": 10
+  },
+  "n_scenarios": 10,
+  "seconds": 6.0
+ },
+ "oasis_temporal_axial_attention": {
+  "verdict": "PARTIAL",
+  "tally": {
+   "RUNTIME_ERROR": 10
+  },
+  "n_scenarios": 10,
+  "seconds": 3.8
+ },
+ "parallel_linear": {
+  "verdict": "RUNNABLE",
+  "tally": {
+   "PASSED": 45
+  },
+  "n_scenarios": 45,
+  "seconds": 23.4
+ },
+ "relu": {
+  "verdict": "RUNNABLE",
+  "tally": {
+   "PASSED": 1
+  },
+  "n_scenarios": 1,
+  "seconds": 4.3
+ },
+ "silu_and_mul": {
+  "verdict": "RUNNABLE",
+  "tally": {
+   "PASSED": 10
+  },
+  "n_scenarios": 10,
+  "seconds": 4.7
+ },
+ "tensor_ops": {
+  "verdict": "PARTIAL",
+  "tally": {
+   "RUNTIME_ERROR": 1
+  },
+  "n_scenarios": 1,
+  "seconds": 3.4
+ },
+ "vision_mlp": {
+  "verdict": "RUNNABLE",
+  "tally": {
+   "PASSED": 5
+  },
+  "n_scenarios": 5,
+  "seconds": 4.5
+ },
+ "yarn_rotary_emb": {
+  "verdict": "RUNNABLE",
+  "tally": {
+   "PASSED": 1
+  },
+  "n_scenarios": 1,
+  "seconds": 9.0
+ },
+ "yolov10_c2f": {
+  "verdict": "RUNNABLE",
+  "tally": {
+   "PASSED": 1
+  },
+  "n_scenarios": 1,
+  "seconds": 4.3
+ },
+ "yolov10_head": {
+  "verdict": "RUNNABLE",
+  "tally": {
+   "PASSED": 1
+  },
+  "n_scenarios": 1,
+  "seconds": 4.9
+ },
+ "yolov10_sppf": {
+  "verdict": "RUNNABLE",
+  "tally": {
+   "PASSED": 1
+  },
+  "n_scenarios": 1,
+  "seconds": 4.1
+ },
+ "ada_layer_norm_continuous": {
+  "verdict": "RUNNABLE",
+  "tally": {
+   "PASSED": 2
+  },
+  "n_scenarios": 2,
+  "seconds": 11.9
+ },
+ "chunk_gla": {
+  "verdict": "RUNNABLE",
+  "tally": {
+   "PASSED": 5
+  },
+  "n_scenarios": 5,
+  "seconds": 15.7
+ },
+ "diffusion_rope": {
+  "verdict": "RUNNABLE",
+  "tally": {
+   "PASSED": 2
+  },
+  "n_scenarios": 2,
+  "seconds": 13.5
+ },
+ "flash_attn_prefill": {
+  "verdict": "RUNNABLE",
+  "tally": {
+   "PASSED": 5
+  },
+  "n_scenarios": 5,
+  "seconds": 7.7
+ },
+ "flux_feedforward": {
+  "verdict": "RUNNABLE",
+  "tally": {
+   "PASSED": 4
+  },
+  "n_scenarios": 4,
+  "seconds": 14.5
+ },
+ "fused_recurrent_gla": {
+  "verdict": "RUNNABLE",
+  "tally": {
+   "PASSED": 5
+  },
+  "n_scenarios": 5,
+  "seconds": 12.4
+ },
+ "gla_decoder": {
+  "verdict": "PARTIAL",
+  "tally": {
+   "PASSED": 313,
+   "RUNTIME_ERROR": 7
+  },
+  "n_scenarios": 320,
+  "seconds": 721.2
+ },
+ "gpt_oss_moe": {
+  "verdict": "RUNNABLE",
+  "tally": {
+   "PASSED": 5
+  },
+  "n_scenarios": 5,
+  "seconds": 23.0
+ },
+ "llama": {
+  "verdict": "PARTIAL",
+  "tally": {
+   "RUNTIME_ERROR": 5
+  },
+  "n_scenarios": 5,
+  "seconds": 182.7
+ },
+ "moe_align": {
+  "verdict": "PARTIAL",
+  "tally": {
+   "PASSED": 2,
+   "INCORRECT_NUMERICAL": 8
+  },
+  "n_scenarios": 10,
+  "seconds": 5.9
+ },
+ "mxfp4_moe": {
+  "verdict": "PARTIAL",
+  "tally": {
+   "RUNTIME_ERROR": 5
+  },
+  "n_scenarios": 5,
+  "seconds": 4.5
+ },
+ "oasis_patch_embed": {
+  "verdict": "RUNNABLE",
+  "tally": {
+   "PASSED": 7
+  },
+  "n_scenarios": 7,
+  "seconds": 5.8
+ },
+ "oasis_timestep_embedder": {
+  "verdict": "RUNNABLE",
+  "tally": {
+   "PASSED": 5
+  },
+  "n_scenarios": 5,
+  "seconds": 5.3
+ },
+ "quickgelu": {
+  "verdict": "RUNNABLE",
+  "tally": {
+   "PASSED": 1
+  },
+  "n_scenarios": 1,
+  "seconds": 4.1
+ },
+ "rms_norm": {
+  "verdict": "RUNNABLE",
+  "tally": {
+   "PASSED": 35
+  },
+  "n_scenarios": 35,
+  "seconds": 6.1
+ },
+ "silu_mul_quant_fp8": {
+  "verdict": "RUNNABLE",
+  "tally": {
+   "PASSED": 1
+  },
+  "n_scenarios": 1,
+  "seconds": 4.8
+ },
+ "timestep_embedding": {
+  "verdict": "RUNNABLE",
+  "tally": {
+   "PASSED": 2
+  },
+  "n_scenarios": 2,
+  "seconds": 8.0
+ },
+ "vision_patch_embed": {
+  "verdict": "RUNNABLE",
+  "tally": {
+   "PASSED": 5
+  },
+  "n_scenarios": 5,
+  "seconds": 8.3
+ },
+ "yolov10": {
+  "verdict": "PARTIAL",
+  "tally": {
+   "RUNTIME_ERROR": 1
+  },
+  "n_scenarios": 1,
+  "seconds": 4.9
+ },
+ "yolov10_cib": {
+  "verdict": "RUNNABLE",
+  "tally": {
+   "PASSED": 1
+  },
+  "n_scenarios": 1,
+  "seconds": 4.5
+ },
+ "yolov10_neck": {
+  "verdict": "RUNNABLE",
+  "tally": {
+   "PASSED": 1
+  },
+  "n_scenarios": 1,
+  "seconds": 9.2
+ },
+ "allreduce": {
+  "verdict": "PARTIAL",
+  "tally": {
+   "RUNTIME_ERROR": 15
+  },
+  "n_scenarios": 15,
+  "seconds": 8.5
+ },
+ "chunk_retention": {
+  "verdict": "RUNNABLE",
+  "tally": {
+   "PASSED": 1
+  },
+  "n_scenarios": 1,
+  "seconds": 13.1
+ },
+ "embedding": {
+  "verdict": "RUNNABLE",
+  "tally": {
+   "PASSED": 40
+  },
+  "n_scenarios": 40,
+  "seconds": 207.8
+ },
+ "flash_attn_varlen": {
+  "verdict": "RUNNABLE",
+  "tally": {
+   "PASSED": 1
+  },
+  "n_scenarios": 1,
+  "seconds": 5.3
+ },
+ "flux_pos_embed": {
+  "verdict": "RUNNABLE",
+  "tally": {
+   "PASSED": 2
+  },
+  "n_scenarios": 2,
+  "seconds": 3.7
+ },
+ "fused_recurrent_retention": {
+  "verdict": "RUNNABLE",
+  "tally": {
+   "PASSED": 1
+  },
+  "n_scenarios": 1,
+  "seconds": 6.3
+ },
+ "gla_mlp": {
+  "verdict": "RUNNABLE",
+  "tally": {
+   "PASSED": 9
+  },
+  "n_scenarios": 9,
+  "seconds": 14.4
+ },
+ "interpolate": {
+  "verdict": "RUNNABLE",
+  "tally": {
+   "PASSED": 2
+  },
+  "n_scenarios": 2,
+  "seconds": 5.0
+ },
+ "llama_decoder": {
+  "verdict": "PARTIAL",
+  "tally": {
+   "RUNTIME_ERROR": 10
+  },
+  "n_scenarios": 10,
+  "seconds": 43.5
+ },
+ "moe_grouped_gemm": {
+  "verdict": "RUNNABLE",
+  "tally": {
+   "PASSED": 12
+  },
+  "n_scenarios": 12,
+  "seconds": 7.1
+ },
+ "oasis_block": {
+  "verdict": "PARTIAL",
+  "tally": {
+   "RUNTIME_ERROR": 10
+  },
+  "n_scenarios": 10,
+  "seconds": 5.4
+ },
+ "oasis_rollout": {
+  "verdict": "PARTIAL",
+  "tally": {
+   "RUNTIME_ERROR": 4
+  },
+  "n_scenarios": 4,
+  "seconds": 5.6
+ },
+ "oasis_vae_attention": {
+  "verdict": "RUNNABLE",
+  "tally": {
+   "PASSED": 5
+  },
+  "n_scenarios": 5,
+  "seconds": 7.6
+ },
+ "qwen3_moe": {
+  "verdict": "RUNNABLE",
+  "tally": {
+   "PASSED": 5
+  },
+  "n_scenarios": 5,
+  "seconds": 12.6
+ },
+ "rotary_emb": {
+  "verdict": "PARTIAL",
+  "tally": {
+   "RUNTIME_ERROR": 5
+  },
+  "n_scenarios": 5,
+  "seconds": 4.1
+ },
+ "softmax": {
+  "verdict": "RUNNABLE",
+  "tally": {
+   "PASSED": 2
+  },
+  "n_scenarios": 2,
+  "seconds": 5.8
+ },
+ "topk_softmax": {
+  "verdict": "RUNNABLE",
+  "tally": {
+   "PASSED": 5
+  },
+  "n_scenarios": 5,
+  "seconds": 5.0
+ },
+ "vision_patch_merger": {
+  "verdict": "RUNNABLE",
+  "tally": {
+   "PASSED": 10
+  },
+  "n_scenarios": 10,
+  "seconds": 11.8
+ },
+ "yolov10_attention": {
+  "verdict": "RUNNABLE",
+  "note": "fixed post-census (data fix / buffer repair), verified by retest"
+ },
+ "yolov10_concat": {
+  "verdict": "RUNNABLE",
+  "tally": {
+   "PASSED": 4
+  },
+  "n_scenarios": 4,
+  "seconds": 4.2
+ },
+ "yolov10_psa": {
+  "verdict": "RUNNABLE",
+  "tally": {
+   "PASSED": 1
+  },
+  "n_scenarios": 1,
+  "seconds": 6.1
+ },
+ "attention": {
+  "verdict": "PARTIAL",
+  "tally": {
+   "PASSED": 14,
+   "RUNTIME_ERROR": 1
+  },
+  "n_scenarios": 15,
+  "seconds": 24.1
+ },
+ "conv2d": {
+  "verdict": "RUNNABLE",
+  "tally": {
+   "PASSED": 59
+  },
+  "n_scenarios": 59,
+  "seconds": 11.3
+ },
+ "encoder_embeddings": {
+  "verdict": "RUNNABLE",
+  "tally": {
+   "PASSED": 1
+  },
+  "n_scenarios": 1,
+  "seconds": 14.0
+ },
+ "flashinfer_decode": {
+  "verdict": "RUNNABLE",
+  "tally": {
+   "PASSED": 56
+  },
+  "n_scenarios": 56,
+  "seconds": 15.5
+ },
+ "flux_transformer_block": {
+  "verdict": "RUNNABLE",
+  "tally": {
+   "PASSED": 4
+  },
+  "n_scenarios": 4,
+  "seconds": 28.7
+ },
+ "gelu": {
+  "verdict": "RUNNABLE",
+  "tally": {
+   "PASSED": 31
+  },
+  "n_scenarios": 31,
+  "seconds": 4.8
+ },
+ "gla_recurrence": {
+  "verdict": "RUNNABLE",
+  "tally": {
+   "PASSED": 1
+  },
+  "n_scenarios": 1,
+  "seconds": 4.1
+ },
+ "l2_norm": {
+  "verdict": "RUNNABLE",
+  "tally": {
+   "PASSED": 1
+  },
+  "n_scenarios": 1,
+  "seconds": 4.3
+ },
+ "llama_mlp": {
+  "verdict": "RUNNABLE",
+  "tally": {
+   "PASSED": 5
+  },
+  "n_scenarios": 5,
+  "seconds": 21.5
+ },
+ "moe_sum": {
+  "verdict": "RUNNABLE",
+  "tally": {
+   "PASSED": 5
+  },
+  "n_scenarios": 5,
+  "seconds": 5.0
+ },
+ "oasis_dit": {
+  "verdict": "RUNNABLE",
+  "tally": {
+   "PASSED": 15
+  },
+  "n_scenarios": 15,
+  "seconds": 582.3
+ },
+ "oasis_rotary": {
+  "verdict": "RUNNABLE",
+  "tally": {
+   "PASSED": 1
+  },
+  "n_scenarios": 1,
+  "seconds": 5.1
+ },
+ "oasis_vae_attention_block": {
+  "verdict": "RUNNABLE",
+  "tally": {
+   "PASSED": 5
+  },
+  "n_scenarios": 5,
+  "seconds": 11.7
+ },
+ "qwen3_moe_decoder": {
+  "verdict": "PARTIAL",
+  "tally": {
+   "RUNTIME_ERROR": 10
+  },
+  "n_scenarios": 10,
+  "seconds": 13.9
+ },
+ "sigmoid": {
+  "verdict": "RUNNABLE",
+  "tally": {
+   "PASSED": 1
+  },
+  "n_scenarios": 1,
+  "seconds": 4.9
+ },
+ "store_kvcache": {
+  "verdict": "RUNNABLE",
+  "tally": {
+   "PASSED": 15
+  },
+  "n_scenarios": 15,
+  "seconds": 6.0
+ },
+ "vision_attention": {
+  "verdict": "RUNNABLE",
+  "tally": {
+   "PASSED": 5
+  },
+  "n_scenarios": 5,
+  "seconds": 7.7
+ },
+ "vision_pos_embed_interpolate": {
+  "verdict": "RUNNABLE",
+  "note": "fixed post-census (data fix / buffer repair), verified by retest"
+ },
+ "yolov10_backbone": {
+  "verdict": "PARTIAL",
+  "tally": {
+   "RUNTIME_ERROR": 1
+  },
+  "n_scenarios": 1,
+  "seconds": 4.6
+ },
+ "yolov10_conv": {
+  "verdict": "RUNNABLE",
+  "tally": {
+   "PASSED": 51
+  },
+  "n_scenarios": 51,
+  "seconds": 9.5
+ },
+ "yolov10_repvggdw": {
+  "verdict": "RUNNABLE",
+  "tally": {
+   "PASSED": 1
+  },
+  "n_scenarios": 1,
+  "seconds": 8.1
+ },
+ "attention_impl": {
+  "verdict": "RUNNABLE",
+  "tally": {
+   "PASSED": 20
+  },
+  "n_scenarios": 20,
+  "seconds": 19.6
+ },
+ "conv3d": {
+  "verdict": "RUNNABLE",
+  "tally": {
+   "PASSED": 1
+  },
+  "n_scenarios": 1,
+  "seconds": 6.0
+ },
+ "encoder_mlp": {
+  "verdict": "RUNNABLE",
+  "tally": {
+   "PASSED": 1
+  },
+  "n_scenarios": 1,
+  "seconds": 10.6
+ },
+ "flashinfer_prefill": {
+  "verdict": "RUNNABLE",
+  "tally": {
+   "PASSED": 18
+  },
+  "n_scenarios": 18,
+  "seconds": 10.7
+ },
+ "fp8_linear": {
+  "verdict": "RUNNABLE",
+  "tally": {
+   "PASSED": 14
+  },
+  "n_scenarios": 14,
+  "seconds": 10.6
+ },
+ "gla": {
+  "verdict": "PARTIAL",
+  "tally": {
+   "PASSED": 9,
+   "RUNTIME_ERROR": 1
+  },
+  "n_scenarios": 10,
+  "seconds": 633.0
+ },
+ "gpt_oss": {
+  "verdict": "PARTIAL",
+  "tally": {
+   "RUNTIME_ERROR": 5
+  },
+  "n_scenarios": 5,
+  "seconds": 88.4
+ },
+ "layer_norm": {
+  "verdict": "RUNNABLE",
+  "tally": {
+   "PASSED": 34
+  },
+  "n_scenarios": 34,
+  "seconds": 11.1
+ },
+ "log_sigmoid": {
+  "verdict": "RUNNABLE",
+  "tally": {
+   "PASSED": 9
+  },
+  "n_scenarios": 9,
+  "seconds": 4.9
+ },
+ "mrope": {
+  "verdict": "RUNNABLE",
+  "tally": {
+   "PASSED": 5
+  },
+  "n_scenarios": 5,
+  "seconds": 9.0
+ },
+ "oasis_final_layer": {
+  "verdict": "RUNNABLE",
+  "tally": {
+   "PASSED": 10
+  },
+  "n_scenarios": 10,
+  "seconds": 11.1
+ },
+ "oasis_spatial_axial_attention": {
+  "verdict": "PARTIAL",
+  "tally": {
+   "RUNTIME_ERROR": 10
+  },
+  "n_scenarios": 10,
+  "seconds": 3.9
+ },
+ "parallel_embedding": {
+  "verdict": "RUNNABLE",
+  "tally": {
+   "PASSED": 10
+  },
+  "n_scenarios": 10,
+  "seconds": 136.1
+ },
+ "qwen3_vl": {
+  "verdict": "PARTIAL",
+  "tally": {
+   "RUNTIME_ERROR": 8
+  },
+  "n_scenarios": 8,
+  "seconds": 9.6
+ },
+ "silu": {
+  "verdict": "RUNNABLE",
+  "tally": {
+   "PASSED": 24
+  },
+  "n_scenarios": 24,
+  "seconds": 8.1
+ },
+ "t5_layer_norm": {
+  "verdict": "RUNNABLE",
+  "tally": {
+   "PASSED": 6
+  },
+  "n_scenarios": 6,
+  "seconds": 7.7
+ },
+ "vision_block": {
+  "verdict": "RUNNABLE",
+  "note": "fixed post-census (data fix / buffer repair), verified by retest"
+ },
+ "vision_rotary_emb": {
+  "verdict": "RUNNABLE",
+  "note": "fixed post-census (data fix / buffer repair), verified by retest"
+ },
+ "yolov10_bottleneck": {
+  "verdict": "RUNNABLE",
+  "tally": {
+   "PASSED": 8
+  },
+  "n_scenarios": 8,
+  "seconds": 6.5
+ },
+ "yolov10_dfl": {
+  "verdict": "RUNNABLE",
+  "tally": {
+   "PASSED": 1
+  },
+  "n_scenarios": 1,
+  "seconds": 5.8
+ },
+ "yolov10_scdown": {
+  "verdict": "RUNNABLE",
+  "tally": {
+   "PASSED": 3
+  },
+  "n_scenarios": 3,
+  "seconds": 5.7
+ }
+}

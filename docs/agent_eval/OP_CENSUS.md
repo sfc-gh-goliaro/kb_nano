@@ -87,3 +87,49 @@ registry regeneration), dropping the ops (needless coverage loss).
    (`bench/kernels/scenario_pipeline.py:_extract_init_args`) — the config gap
    is a designed limitation of that extractor, not data loss; nothing needs
    re-running to fix it (values are static in each checkpoint's config.json).
+
+---
+
+# Census v2 (post-population, 2026-07-25 late)
+
+After registry population (1181 -> 1386 scenarios), the entrypoint upgrade
+(no-mangling instantiation + config namespace-wrap + seeded valid structured
+inputs ported/extended from the experiments-codex prep + weight/buffer repair
++ fp8 exemptions + non-finite policy), and three post-census data fixes:
+
+**85 / 106 fully RUNNABLE** (was 33). Raw data: census_v2.json.
+
+Near-runnable (1-7 failing scenarios each, cause known): attention 14/15
+(one activation-nonfinite scenario), gla 9/10 (one cu_seqlens step-sign
+scenario), gla_decoder 313/320, gla_attention 8-10/10 (intermittent,
+GPU-dependent -- monitor), moe_align 2/10 (permutation contract; the codex
+runner solved this with output canonicalization -- `_canonicalize_output_for_
+target` -- adopt after ratification).
+
+Remaining residuals by class:
+1. L4 identity is memory-bound: llama, gpt_oss, qwen3_vl (two whole-model
+   instances exceed single-GPU memory; L4 correctness belongs to Tier-2/3
+   e2e as designed). yolov10 L4: detection postprocess on noise inputs
+   (empty-tensor max) -- same conclusion.
+2. L3 composite depth: yolov10_backbone (activation blowup through deep
+   random-weight conv stack), llama_decoder / gpt_oss_decoder /
+   qwen3_moe_decoder (decoder forward wiring: rotary_emb forward arg,
+   TRTLLM decode-path cache API, deep_gemm fp8-in-module; recipes in
+   drill2_merged.json + this file).
+3. Class/scenario mismatches: rotary_emb, tensor_ops (discovery picks a
+   later-added class than the one traced; needs an op->class resolution
+   decision). NOTE: the experiments-codex CSV records bitwise-0 "PASS" for
+   both -- those published rows likely evaluated the wrong class.
+4. Constructor needs modules: oasis_block, oasis_spatial/temporal_axial_
+   attention (builder recipe documented; the codex runner built these
+   inline).
+5. Fixture-independence: mxfp4_moe (codex used real-checkpoint weights
+   prepared by the implementation under test -- rejected here by design;
+   bespoke trusted-preprocessing lane documented).
+6. Distributed: allreduce (codex CSV: SKIPPED distributed_not_run with an
+   NCCL env failure note; paper number came from the separate 4-rank
+   harness).
+
+How the codex branch handled each residual it faced is recorded above with
+CSV receipts; 4 of its 7 handlings used mechanisms we surface for
+ratification instead of adopting silently.
