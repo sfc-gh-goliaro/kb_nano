@@ -159,3 +159,41 @@ is exported.
 5. **ASTRA**: add ninja to its requirements upstream-style; consider a
    modern-model second row; note o4-mini API retires 2026-10-23 (published
    config unrunnable after that).
+
+---
+
+## FINAL: full-run quickstart (supersedes the per-op commands above)
+
+After setup + preflight, the whole kb evaluation is two commands:
+
+```bash
+# 1. (Re)generate the task menu from the current registry — 67 tasks,
+#    every seed verified through the real grader before shipping:
+PYTHONPATH=<this-repo> <kb-main-venv>/bin/python tools/agent_eval/package_tasks.py
+
+# 2. Run campaigns (resumable; one campaign per GPU, round-robin):
+bash tools/agent_eval/run_campaigns.sh --ops all --iters <N> \
+  --gpu-list "0,1,2,3" --tag h200-r1
+# -> summary CSV per tag; per-op artifacts in each child run dir.
+```
+
+Budget note: per-bench cost varies ~1000x by op (gelu seconds,
+flashinfer_decode minutes) — budget per-op, not uniformly. 18 ops are not
+packaged (PACKAGING_REPORT.md in the dataset dir lists each with its reason;
+12 trace to defective tasks/reference implementations — fixing those files
+unlocks the tasks).
+
+## ASTRA: final decision + reasoning
+
+Run ASTRA AS PUBLISHED on its own three kernels (astra_live_smoke.sh, needs
+an API key); do NOT port it to kb. Reasoning, not preference: (a) reviewer
+Q3 explicitly accepts disclosure of practical barriers — running as published
+exceeds that bar; (b) the run-on-our-benchmark requirement is satisfied by
+AKO4X (67 packaged tasks); (c) ASTRA's candidate format is one compiled CUDA
+function per run (verified in source: codegen prompt "Generate ... CUDA
+source code (.cu)", extract/is_valid_cuda_code filters, single PyBind
+export) — fits single-kernel L1s only; a composite L2/L3 candidate is not
+representable without rewriting its core loop; (d) an L1-subset fork is
+feasible (~2-4 days: _import_callable fix + per-op testgen scaffolding +
+naive .cu seeds) and documented here in case the team wants the extra row —
+but the same days buy more as AKO4X campaign coverage.

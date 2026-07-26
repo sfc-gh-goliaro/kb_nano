@@ -452,6 +452,12 @@ def _repair_degenerate_parameters(module: Any, op: str) -> list[str]:
             degenerate = (
                 not bool(torch.isfinite(values).all())
                 or bool(values.abs().max().item() == 0.0)
+                # finite allocator garbage: torch.empty residue that happens to
+                # be finite but astronomically scaled. Real initialisations are
+                # O(1); anything with |max| > 1e4 is stale memory (measured:
+                # yolov10_c2f flipped verdicts across runs because finite
+                # residue overflowed the forward on some draws only).
+                or bool(values.abs().max().item() > 1e4)
             )
             if not degenerate:
                 continue
