@@ -128,6 +128,37 @@ GPU-dependent -- monitor), moe_align 2/10 (permutation contract; the codex
 runner solved this with output canonicalization -- `_canonicalize_output_for_
 target` -- adopt after ratification).
 
+# Census v2.2 (2026-07-26, post threshold-fix re-measurement + rebase onto 28cf517)
+
+**Effectively 89/106 runnable.** The census-v2 "near-runnable" paragraph
+above is SUPERSEDED for four ops -- their failures were measured with the
+pre-8c46aa8 repair (NaN/Inf/zero only) and are gone under the current
+grader: attention 15/15, yolov10_backbone 1/1, gla_decoder 320/320,
+gla_attention stable (21 consecutive identity runs clean across GPUs 1/5/7,
+including 3 post-rebase).
+
+**gla_attention root cause (proven; kernel-nondeterminism hypothesis
+REFUTED).** GLA-family modules allocate weights UNINITIALIZED (repair logs
+name q/k/v/g_proj across every layer; the whole GLAForCausalLM state dict
+on the L4). Allocator garbage varies per run and per GPU-state; the old
+repair passed huge-but-finite garbage -> bf16 overflow ->
+baseline_output_nonfinite -> RUNTIME_ERROR on however many scenarios drew
+bad bytes. A/B on demand: ca58784 entrypoint = 4/8 runs fail with varying
+counts (10/10, 8/2, 2/8, 9/1); current entrypoint = 21/21 runs clean.
+Receipts: pilot scratch gla_attn_repro_*.json.
+
+**Remaining genuinely-failing:** gla 9/10 -- `tokens-70/2f8947b2` raises
+"upper bound and lower bound inconsistent with step sign" deterministically,
+including post-rebase (28cf517's per-segment varlen fix does NOT cover it).
+This is a harness input-prep defect; fix stream E1 (OPEN_DECISIONS.md).
+
+**Rebase note:** branch now sits on release @ 28cf517. attention_impl's
+fast dispatch (_TRITON_UNIFIED_AVAILABLE) flipped False -> True in our venv
+(vllm 0.18.0): correctness identity was never affected (same dispatch both
+sides), but census `seconds` fields recorded for attention_impl-family ops
+pre-rebase raced the slow path -- do not compare them to post-rebase
+timings.
+
 Remaining residuals by class:
 1. L4 identity is memory-bound: llama, gpt_oss, qwen3_vl (two whole-model
    instances exceed single-GPU memory; L4 correctness belongs to Tier-2/3
