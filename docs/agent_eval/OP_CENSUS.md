@@ -125,7 +125,7 @@ registry regeneration), dropping the ops (needless coverage loss).
 
 ---
 
-# Census v2 (post-population, 2026-07-25 late)
+# [HISTORY] Census v2 (2026-07-25) — SUPERSEDED
 
 After registry population (1181 -> 1386 scenarios), the entrypoint upgrade
 (no-mangling instantiation + config namespace-wrap + seeded valid structured
@@ -163,7 +163,7 @@ GPU-dependent -- monitor), moe_align 2/10 (permutation contract; the codex
 runner solved this with output canonicalization -- `_canonicalize_output_for_
 target` -- adopt after ratification).
 
-# Census v2.2 (2026-07-26, post threshold-fix re-measurement + rebase onto 28cf517)
+# [HISTORY] Census v2.2 (2026-07-26) — SUPERSEDED by the current-state header
 
 **Effectively 89/106 runnable.** The census-v2 "near-runnable" paragraph
 above is SUPERSEDED for four ops -- their failures were measured with the

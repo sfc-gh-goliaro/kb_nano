@@ -16,12 +16,12 @@
 #
 # Env passthrough (defaults shown) — these reach the child's benchmark_adapter,
 # which shells out to the kb grader:
-#   KB_EVAL_PYTHON=/raid/user_data/olu/venv/bin/python
-#   KB_EVAL_REPO=/home/olu/kb_nano
+#   KB_EVAL_PYTHON=<kb-main-venv>/bin/python  (or KB_MAIN_PY)
+#   KB_EVAL_REPO=<this repo>   (default: derived from script location)
 #   KB_EVAL_ENTRYPOINT=$KB_EVAL_REPO/tools/agent_eval/agent_entrypoint.py
-#   AKO_HOME=/raid/user_data/olu/agents/AKO4X
+#   AKO_HOME=$AGENTS_DIR/AKO4X (default)
 #   AKO_DATASET_PATH=<AKO_HOME>/../kb-trace
-#   AKO_VENV=/raid/user_data/olu/venv_ako4x
+#   AKO_VENV=$VENVS_DIR/venv_ako4x (default)
 #   CLAUDE_BIN=claude
 #
 # NOTE on KB_EVAL_ENTRYPOINT: the adapter's compiled-in default points at a
@@ -33,13 +33,16 @@ set -uo pipefail
 # --------------------------------------------------------------------------
 # Defaults
 # --------------------------------------------------------------------------
-KB_EVAL_PYTHON="${KB_EVAL_PYTHON:-/raid/user_data/olu/venv/bin/python}"
-KB_EVAL_REPO="${KB_EVAL_REPO:-/home/olu/kb_nano}"
+# Machine-neutral: repo derived from this script's location; the rest from
+# the runbook's variables block (AGENTS_DIR / VENVS_DIR / KB_MAIN_PY).
+_SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
+KB_EVAL_REPO="${KB_EVAL_REPO:-${KB_REPO:-$(cd "$_SCRIPT_DIR/../.." && pwd)}}"
+KB_EVAL_PYTHON="${KB_EVAL_PYTHON:-${KB_MAIN_PY:-python3}}"
 KB_EVAL_ENTRYPOINT="${KB_EVAL_ENTRYPOINT:-$KB_EVAL_REPO/tools/agent_eval/agent_entrypoint.py}"
-AKO_HOME="${AKO_HOME:-/raid/user_data/olu/agents/AKO4X}"
-AGENTS_DIR="$(dirname "$AKO_HOME")"
+: "${AGENTS_DIR:?set AGENTS_DIR (agent repos/datasets root) or AKO_HOME}"
+AKO_HOME="${AKO_HOME:-$AGENTS_DIR/AKO4X}"
 AKO_DATASET_PATH="${AKO_DATASET_PATH:-$AGENTS_DIR/kb-trace}"
-AKO_VENV="${AKO_VENV:-/raid/user_data/olu/venv_ako4x}"
+AKO_VENV="${AKO_VENV:-${VENVS_DIR:-$AGENTS_DIR/..}/venv_ako4x}"
 CLAUDE_BIN="${CLAUDE_BIN:-claude}"
 
 OPS_ARG=""

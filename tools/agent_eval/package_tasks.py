@@ -35,8 +35,7 @@ all-PASSED is skipped and reported rather than shipped.
 
 Usage
 -----
-    /raid/user_data/olu/venv/bin/python tools/agent_eval/package_tasks.py \
-        --gpus 3,4,5 --out /raid/user_data/olu/agents/kb-trace
+    python tools/agent_eval/package_tasks.py --gpus 0,1,2 [--out DIR]
 
     ... --ops gelu,flashinfer_decode        # subset
     ... --no-verify                         # dev aid; report is marked UNVERIFIED
@@ -61,10 +60,16 @@ import traceback
 from pathlib import Path
 
 HERE = Path(__file__).resolve().parent
-DEFAULT_REPO = Path("/home/olu/kb_nano")
-DEFAULT_PYTHON = "/raid/user_data/olu/venv/bin/python"
-DEFAULT_OUT = Path("/raid/user_data/olu/agents/kb-trace")
-DEFAULT_WORKDIR = Path("/raid/user_data/olu/scratch/agent_eval_pilot/pkg/work")
+# Machine-neutral defaults: derived from this file's location and the
+# environment, so the script works on any host. Override with the flags.
+DEFAULT_REPO = Path(os.environ.get("KB_REPO") or HERE.parents[1])
+DEFAULT_PYTHON = os.environ.get("KB_MAIN_PY") or sys.executable
+DEFAULT_OUT = Path(os.environ.get("KB_TRACE_DIR")
+                   or (Path(os.environ["AGENTS_DIR"]) / "kb-trace"
+                       if os.environ.get("AGENTS_DIR")
+                       else DEFAULT_REPO / "build" / "kb-trace"))
+DEFAULT_WORKDIR = Path(os.environ.get("KB_PKG_WORKDIR")
+                       or (DEFAULT_OUT.parent / "kb-trace-work"))
 
 OP_TYPE = "kb"
 DEF_PREFIX = "kb_"

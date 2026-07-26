@@ -12,23 +12,26 @@ Output layout (what spawn.py globs):
     <out>/workloads/kb/kb_rms_norm.jsonl
 
 Run with the kb main venv (needs pyyaml):
-    /raid/user_data/olu/venv/bin/python make_dataset.py
+    python make_dataset.py
 """
 
 from __future__ import annotations
 
 import argparse
 import json
+import os
 from pathlib import Path
 
 import yaml
 
 HERE = Path(__file__).resolve().parent
-DEFAULT_REGISTRY = Path(
-    "/raid/user_data/olu/kb_agent_eval/bench/kernels/benchmark_scenarios/"
-    "small/shape_registry.yaml"
-)
-DEFAULT_OUT = Path("/raid/user_data/olu/agents/kb-trace")
+_REPO = Path(os.environ.get("KB_REPO") or HERE.parents[2])
+DEFAULT_REGISTRY = (_REPO / "bench" / "kernels" / "benchmark_scenarios"
+                    / "small" / "shape_registry.yaml")
+DEFAULT_OUT = Path(os.environ.get("KB_TRACE_DIR")
+                   or (Path(os.environ["AGENTS_DIR"]) / "kb-trace"
+                       if os.environ.get("AGENTS_DIR")
+                       else _REPO / "build" / "kb-trace"))
 OP = "rms_norm"
 DEF_NAME = f"kb_{OP}"
 OP_TYPE = "kb"

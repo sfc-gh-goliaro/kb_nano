@@ -31,8 +31,8 @@
 set -euo pipefail
 
 GPU=${1:-$(nvidia-smi --query-gpu=index,memory.used --format=csv,noheader,nounits | awk -F', ' '$2 < 1000 {print $1; exit}')}
-ASTRA_DIR=${ASTRA_DIR:-/raid/user_data/olu/agents/Astra}
-ASTRA_PY=${ASTRA_PY:-/raid/user_data/olu/venv_astra/bin/python}
+ASTRA_DIR=${ASTRA_DIR:-${AGENTS_DIR:?set AGENTS_DIR or ASTRA_DIR}/Astra}
+ASTRA_PY=${ASTRA_PY:-${VENVS_DIR:?set VENVS_DIR or ASTRA_PY}/venv_astra/bin/python}
 
 if [ -n "${ANTHROPIC_API_KEY:-}" ]; then
     [ -z "${OPENAI_API_KEY:-}" ] || echo "WARNING: both keys set — ANTHROPIC_API_KEY wins (the patch's Claude override fires); unset it for the GPT row."
