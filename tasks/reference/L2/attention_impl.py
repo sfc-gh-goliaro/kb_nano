@@ -226,6 +226,19 @@ def get_context() -> Context:
     return _CONTEXT
 
 
+def _live_context() -> Context:
+    """Per-batch KV metadata lives in the engine's global Context
+    (``infra/context.py``), the way vLLM reads ``get_forward_context()``.
+    The harness populates THAT context, not this file's inlined copy, so
+    read the live one when the package is importable and only fall back to
+    the inlined default when running this file standalone."""
+    try:
+        from fastkernels.infra.context import get_context as _infra_get_context
+    except Exception:
+        return get_context()
+    return _infra_get_context()
+
+
 def set_context(is_prefill, cu_seqlens_q=None, cu_seqlens_k=None,
                 max_seqlen_q=0, max_seqlen_k=0, slot_mapping=None,
                 context_lens=None, block_tables=None,
@@ -821,7 +834,7 @@ class Attention(nn.Module):
 
     def forward_impl(self, query: torch.Tensor, key: torch.Tensor,
                      value: torch.Tensor) -> torch.Tensor:
-        ctx = get_context()
+        ctx = _live_context()
         n = query.shape[0]
         q = query.view(n, self.num_heads, self.head_size)
         k = key.view(n, self.num_kv_heads, self.head_size)

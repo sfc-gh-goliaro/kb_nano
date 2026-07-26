@@ -38,6 +38,53 @@ def _expand_weight_scale(weight_fp8: torch.Tensor, scale: torch.Tensor) -> torch
     return scale_f.expand_as(weight_fp8.float())
 
 
+def _decode_packed_ue8m0_scale(weight_fp8: torch.Tensor,
+                               scale: torch.Tensor) -> torch.Tensor:
+    """Decode DeepGEMM's transformed weight-scale layout to per-(row, k-group)
+    float scales.
+
+    ``postprocess_fp8_weights`` (the production weight post-processor) stores
+    block scales as ``transform_sf_into_required_layout(...)``: an int32
+    tensor of logical shape ``(rows, ceil(k_groups / 4))`` with column-major
+    storage, where each int32 packs 4 UE8M0 exponent bytes (one per
+    128-column group, scale = 2**(byte - 127)) and the 128-row block scale is
+    repeated for every row in the block.
+    """
+    rows, cols = weight_fp8.shape[-2], weight_fp8.shape[-1]
+    k_groups = _ceil_div(cols, _GROUP_SIZE)
+    packed = scale.transpose(-2, -1).contiguous()          # (ceil(kg/4), rows)
+    bytes_ = packed.view(torch.uint8).view(packed.shape[0], rows, 4)
+    exps = bytes_.permute(1, 0, 2).reshape(rows, -1)[:, :k_groups].float()
+    return torch.pow(2.0, exps - 127.0)
+
+
+def _quant_dequant_per_token_group(x: torch.Tensor, *, use_ue8m0: bool = True,
+                                   eps: float = 1e-10) -> torch.Tensor:
+    """Round a 2-D fp32 activation through per-token-group fp8, in fp32 out.
+
+    Mirrors the production external-quantization step feeding the block-scaled
+    GEMM: group size 128 along the feature dim, power-of-two (UE8M0) scales,
+    ``eps=1e-10``.
+    """
+    info = torch.finfo(torch.float8_e4m3fn)
+    tokens, k = x.shape
+    groups = _ceil_div(k, _GROUP_SIZE)
+    padded_cols = groups * _GROUP_SIZE
+    if padded_cols != k:
+        padded = x.new_zeros(tokens, padded_cols)
+        padded[:, :k] = x
+    else:
+        padded = x
+    grouped = padded.view(tokens, groups, _GROUP_SIZE)
+    scale = grouped.abs().amax(dim=-1).clamp_min(eps) / info.max
+    if use_ue8m0:
+        scale = torch.pow(2.0, torch.ceil(torch.log2(scale)))
+    fp8 = torch.clamp(grouped / scale.unsqueeze(-1), info.min, info.max)
+    fp8 = fp8.to(torch.float8_e4m3fn)
+    deq = fp8.float() * scale.unsqueeze(-1)
+    return deq.view(tokens, padded_cols)[:, :k]
+
+
 def _quantize_fp8_per_token_group(
     source: torch.Tensor,
     out_fp8: torch.Tensor,
@@ -99,8 +146,20 @@ class Fp8Linear(nn.Module):
                 bias: torch.Tensor | None = None) -> torch.Tensor:
         n, k = weight_fp8.shape
         input_2d = input_bf16.reshape(-1, k)
-        weight = weight_fp8.float() * _expand_weight_scale(weight_fp8, weight_scale_inv)
-        output = F.linear(input_2d.float(), weight.float(), bias.float() if bias is not None else None)
+        # The production path quantizes the activation to fp8 per token group
+        # before the GEMM; round-trip through fp8 here so the reference sees
+        # the same values the block-scaled GEMM consumes.
+        a_deq = _quant_dequant_per_token_group(input_2d.float())
+        if weight_scale_inv.dtype == torch.int32:
+            # DeepGEMM transformed layout (packed UE8M0), produced by the
+            # production ``postprocess_fp8_weights``.
+            w_scale = _decode_packed_ue8m0_scale(weight_fp8, weight_scale_inv)
+            w_scale = w_scale.repeat_interleave(_GROUP_SIZE, dim=-1)[:, :k]
+            weight = weight_fp8.float() * w_scale
+        else:
+            # Plain float block scales (pre-transform layout).
+            weight = weight_fp8.float() * _expand_weight_scale(weight_fp8, weight_scale_inv)
+        output = F.linear(a_deq, weight, bias.float() if bias is not None else None)
         return output.to(input_bf16.dtype).view(*input_bf16.shape[:-1], n)
 
 

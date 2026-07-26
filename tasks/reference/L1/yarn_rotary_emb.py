@@ -16,7 +16,7 @@ def _yarn_find_correction_dim(num_rotations, dim, base, max_position_embeddings)
     return (dim * math.log(max_position_embeddings / (num_rotations * 2 * math.pi))) / (2 * math.log(base))
 
 
-def _yarn_find_correction_range(low_rot, high_rot, dim, base, max_position_embeddings, truncate=False):
+def _yarn_find_correction_range(low_rot, high_rot, dim, base, max_position_embeddings, truncate=True):
     low = _yarn_find_correction_dim(low_rot, dim, base, max_position_embeddings)
     high = _yarn_find_correction_dim(high_rot, dim, base, max_position_embeddings)
     if truncate:
@@ -145,9 +145,13 @@ class YarnRotaryEmbedding(nn.Module):
         )
 
     def forward(self, positions, query, key):
+        # The production path applies the float32 cos/sin cache directly to the
+        # (possibly bf16/fp16) inputs and rounds once at write-back; casting the
+        # cache down first would round twice and exceed the low-precision
+        # tolerance.  Type promotion makes the rotation math float32 here.
         q, k = _apply_rope(
             positions, query, key, self.head_dim,
-            self.cos_sin_cache.to(query.dtype), self.is_neox_style,
+            self.cos_sin_cache, self.is_neox_style,
         )
         query.copy_(q)
         key.copy_(k)

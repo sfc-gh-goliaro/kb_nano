@@ -84,92 +84,13 @@ MAX_AXIS_VALUES = 24  # longer value lists are summarized as min/max/count
 # source; they must NOT import tasks.baseline (that would delegate).
 
 SEED_PATCHES: dict[str, str] = {
-    # tasks/baseline/L1/softmax.py defines Softmax then LogSoftmax; the grader
-    # benchmarks the last one, so operator `softmax` is really log-softmax.
-    # tasks/reference/L1/softmax.py only mirrors Softmax.
-    "softmax": '''
-
-class LogSoftmax(nn.Module):
-    """Mirrors tasks/baseline/L1/softmax.py::LogSoftmax (the graded class)."""
-
-    def __init__(self, dim: int = -1):
-        super().__init__()
-        self.dim = dim
-
-    def forward(self, x: torch.Tensor) -> torch.Tensor:
-        return F.log_softmax(x, dim=self.dim)
-''',
-
-    # tasks/reference/L1/flash_attn_varlen.py:218 calls the module-level
-    # varlen_attention() — defined at :94 with `*` before softmax_scale — with
-    # those two arguments POSITIONAL, so every scenario dies with
-    # "varlen_attention() takes 5 positional arguments but 7 were given".
-    # Restate the class with the arguments passed by keyword; the later binding
-    # shadows the broken one. Nothing else about the forward changes.
-    "flash_attn_varlen": '''
-
-class FlashAttnVarlen(nn.Module):
-    """Re-binding of the class above with the varlen_attention() call fixed.
-
-    Identical body except softmax_scale/causal are passed as keywords, which is
-    what the callee's signature (keyword-only after `*`) requires.
-    """
-
-    def forward(
-        self,
-        q: torch.Tensor,
-        k: torch.Tensor,
-        v: torch.Tensor,
-        cu_seqlens_q: torch.Tensor,
-        cu_seqlens_k: torch.Tensor,
-        max_seqlen_q: int,
-        max_seqlen_k: int,
-        softmax_scale: float,
-        causal: bool = True,
-        return_softmax_lse: bool = False,
-    ):
-        del max_seqlen_q, max_seqlen_k
-        out = varlen_attention(
-            q, k, v, cu_seqlens_q, cu_seqlens_k,
-            softmax_scale=softmax_scale, causal=causal,
-        )
-        if not return_softmax_lse:
-            return out
-        return out, _varlen_lse(q, k, cu_seqlens_q, cu_seqlens_k,
-                                softmax_scale, causal)
-''',
-
-    # tasks/reference/L2/flux_attention.py constructs FP32RMSNorm at :804/805/
-    # 824/825 but never defines it — the inliner dropped the baseline's aliased
-    # import `from ..L1.t5_layer_norm import T5LayerNorm as FP32RMSNorm`
-    # (tasks/baseline/L2/flux_attention.py:16). Restore the alias by inlining
-    # tasks/reference/L1/t5_layer_norm.py::T5LayerNorm, which is byte-identical
-    # to the baseline's class. Defined after the class body, which is fine: the
-    # name is resolved when __init__ runs, not at class-definition time.
-    "flux_attention": '''
-
-class FP32RMSNorm(nn.Module):
-    """Verbatim tasks/reference/L1/t5_layer_norm.py::T5LayerNorm.
-
-    The baseline reaches this class through
-    `from ..L1.t5_layer_norm import T5LayerNorm as FP32RMSNorm`; the reference
-    file above uses the alias but never binds it.
-    """
-
-    def __init__(self, hidden_size: int, eps: float = 1e-6):
-        super().__init__()
-        self.weight = nn.Parameter(torch.ones(hidden_size))
-        self.variance_epsilon = eps
-
-    def forward(self, hidden_states: torch.Tensor) -> torch.Tensor:
-        variance = hidden_states.to(torch.float32).pow(2).mean(-1, keepdim=True)
-        hidden_states = hidden_states * torch.rsqrt(variance + self.variance_epsilon)
-
-        if self.weight.dtype in [torch.float16, torch.bfloat16]:
-            hidden_states = hidden_states.to(self.weight.dtype)
-
-        return self.weight * hidden_states
-''',
+    # (empty) All three historical patches were retired on 2026-07-26:
+    # softmax    -- superseded by the registry class pin (op now grades the
+    #               true Softmax class, which the raw reference mirrors);
+    # flash_attn_varlen / flux_attention -- their reference files were
+    #               fixed in place (keyword-only call / FP32RMSNorm alias).
+    # The mechanism stays for future cases; raw-reference verification of
+    # all three post-retirement is recorded in the E3 stream reports.
 }
 
 

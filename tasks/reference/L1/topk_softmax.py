@@ -44,9 +44,24 @@ class TopKSoftmax(nn.Module):
         topk_weights = self._topk_weights[:M]
         topk_ids = self._topk_ids[:M]
         probs = torch.softmax(router_logits.float(), dim=-1)
-        weights, ids = torch.topk(probs, k=top_k, dim=-1)
+        # The production kernel selects experts by k sequential argmax passes
+        # with strict ">" while scanning ascending expert indices, so on tied
+        # probabilities the LOWEST expert index wins.  bf16 logits tie often;
+        # torch.topk's tie order is not the same, so mirror the sequential
+        # argmax (torch.argmax also returns the first maximal index).
+        work = probs.clone()
+        ids_cols = []
+        w_cols = []
+        for _ in range(top_k):
+            idx = work.argmax(dim=-1, keepdim=True)
+            w_cols.append(probs.gather(-1, idx))
+            ids_cols.append(idx)
+            work.scatter_(-1, idx, float("-inf"))
+        weights = torch.cat(w_cols, dim=-1)
+        ids = torch.cat(ids_cols, dim=-1)
         if renormalize:
-            weights = weights / weights.sum(dim=-1, keepdim=True).clamp_min(1e-20)
+            # kernel: multiply by the reciprocal of the selected sum (no eps)
+            weights = weights * (1.0 / weights.sum(dim=-1, keepdim=True))
         topk_weights.copy_(weights.to(topk_weights.dtype))
         topk_ids.copy_(ids.to(topk_ids.dtype))
         return topk_weights, topk_ids

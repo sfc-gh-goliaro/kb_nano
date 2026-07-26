@@ -147,7 +147,31 @@ once, trusted, frozen. Integrates after E1 (same file).
   Both ops PASS; rms_norm regression clean.
 - **SEED_PATCHES retired** (all three; raw references verified through
   packaging: softmax + flash_attn_varlen + flux_attention SEED_PASS).
-- **gpt_oss_moe reference reopened**: its earlier PASS was vacuous
-  (measured against all-zero packed weights, pre-Fix-7); on seeded real
-  weights it fails 5/5 — being re-fixed. The de-vacuization catching this
-  is the fixture-discrimination machinery working as designed.
+- **gpt_oss_moe reference reopened → resolved as M9 member**: its earlier
+  PASS was vacuous (all-zero packed weights, pre-Fix-7). Re-fix found and
+  repaired 3 real reference bugs (gate bf16 rounding, per-slot bf16
+  scratch rounding, chunked dequant; ratio 110.5 → ~1.4), and the residual
+  is PROVEN unreachable: at the cancellation offenders, bf16-rounding the
+  fp64-TRUTH slot values reproduces the REFERENCE bit-exactly — the
+  baseline is the side one ULP off truth (its fp32-accumulator noise).
+  Fixture scale-bound tightening (2^0 → 2^-3) was tried, shrank ratios
+  ~8x, cannot reach the band (the wall is relative-ULP vs fixed atol at
+  baseline-zero elements); REVERTED to the verified bounds.
+
+## M9 (new, consolidates three findings): cancellation-amplified grading
+
+For three ops, a correct-but-not-bit-identical implementation exceeds the
+1% band at cancellation elements, so candidate correctness is ungradeable
+under current tolerances regardless of which side is "right":
+- **gpt_oss_moe**: reference provably CLOSER to fp64 truth than the
+  baseline at the offenders (receipt: C stream ADDENDUM).
+- **chunk_gla o-path**: kernel and reference equidistant from fp64 truth
+  (kernel uses TF32 intra-chunk per FLA's own comment); stored-state
+  substitution control excludes state flips.
+- **vision_block**: ten pure-torch attention variants all sit at the same
+  2-ULP kernel deviation (UNDER band at the kernel), amplified 6x by
+  residual cancellation to 3.08 at the output.
+All three stay packaging-skipped with proofs; identity (baseline vs
+itself) is unaffected. Mentor decision: per-op ratio allowance (~2.5-3x),
+fp64-oracle band, or keep excluded. We recommend keeping them excluded
+from agent scoring until decided — a relaxed band admits real 2-3% errors.

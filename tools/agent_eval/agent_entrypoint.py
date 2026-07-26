@@ -78,6 +78,7 @@ from __future__ import annotations
 
 import argparse
 import hashlib
+import contextlib
 import importlib
 import importlib.util
 import inspect
@@ -377,6 +378,60 @@ def _build_oasis_rotary(kind: str, head_dim: int):
     return OasisRotaryEmbedding(dim=head_dim, freqs_for="lang")
 
 
+@contextlib.contextmanager
+def _low_precision_tolerances(runner_mod):
+    """Difference 9 helper: grade every tensor with the runner's
+    low-precision (bf16-class) tolerances regardless of container dtype.
+
+    Casting fp32 to bf16 instead was tried and rejected: values adjacent to
+    a bf16 rounding boundary amplify sub-tolerance fp32 noise into full-ULP
+    flips (measured: max_abs_error exactly one bf16 quantum). Patching the
+    tolerance selection keeps the raw values and the runner's traversal.
+    """
+    original = runner_mod._tolerances_for_dtype
+    low = (runner_mod._LOW_PRECISION_ATOL, runner_mod._LOW_PRECISION_RTOL)
+    runner_mod._tolerances_for_dtype = lambda dtype: low
+    try:
+        yield
+    finally:
+        runner_mod._tolerances_for_dtype = original
+
+
+def _boost_yolo_cls_bias(module: Any, scenario_name: str) -> None:
+    """Make YOLO detection fixtures produce non-empty detections.
+
+    The detect head's confidence selection reduces over the anchors that
+    clear the score threshold; on repaired random weights (whose production
+    ``bias_init`` prior is log(~few detections) -- very negative) NO anchor
+    clears it, and the reduction over an empty set raises
+    ``max(): Expected reduction dim ... numel() == 0``. Comparing hidden
+    states instead would over-constrain candidates (a fused kernel need not
+    materialise the baseline's intermediates), so the fix is fixture-side:
+    set the classification branches' final-conv biases to a positive
+    constant so sigmoid confidences (~0.98) put every anchor above any
+    threshold, deterministically. Runs before the weight transfer, so both
+    sides see identical values; the decode/select path is then genuinely
+    exercised and compared.
+    """
+    import torch.nn as nn
+
+    boosted = 0
+    for sub in module.modules():
+        if not (hasattr(sub, "cv3") and hasattr(sub, "one2one_cv3")
+                and hasattr(sub, "nc")):
+            continue
+        for branch_list in (sub.cv3, sub.one2one_cv3):
+            for branch in branch_list:
+                last = branch[-1] if isinstance(branch, nn.Sequential) else branch
+                bias = getattr(last, "bias", None)
+                if bias is not None:
+                    bias.data[: sub.nc] = 4.0
+                    boosted += 1
+    if boosted:
+        _log(f"{scenario_name}: boosted {boosted} YOLO cls-branch biases "
+             f"(non-empty detections fixture)")
+
+
 def _augment_oasis_init_args(class_name: str, kwargs: dict[str, Any],
                              inputs: dict[str, Any]) -> None:
     """Fill the Oasis constructor arguments the YAML trace cannot express.
@@ -598,6 +653,11 @@ def _repair_degenerate_parameters(module: Any, op: str) -> list[str]:
                     _REPAIR_VALUE_CACHE[cache_key] = prepared
                 param.copy_(prepared)
                 repaired.append(name)
+                continue
+            if param.numel() == 0:
+                # zero-element state (e.g. the YOLO head's lazily-filled
+                # anchor/stride buffers): nothing to repair, and reductions
+                # like .max() would raise on the empty tensor.
                 continue
             if not param.is_floating_point():
                 continue
@@ -1677,6 +1737,8 @@ def run(op: str, candidate_path: str | None, scenario_filters: list[str] | None,
             if repaired:
                 _log(f"{scenario.name}: re-initialised uninitialised "
                      f"parameter(s) {repaired}")
+            if op in ("yolov10_head", "yolov10"):
+                _boost_yolo_cls_bias(baseline_mod, scenario.name)
 
             # --- strict weight transfer (tightens runner.py:496-500) ---
             # Perturb the baseline's floating-point parameters (deterministic,
@@ -1767,10 +1829,29 @@ def run(op: str, candidate_path: str | None, scenario_filters: list[str] | None,
                 candidate_out = _canonicalize_moe_align_output(
                     candidate_out, candidate_check_inputs)
 
-            correct, max_error_ratio, mean_diff = R._merge_correctness(
-                R._compare_outputs(baseline_out, candidate_out),
-                R._compare_outputs(baseline_check_inputs, candidate_check_inputs),
-            )
+            if op == "chunk_gla":
+                # Difference 9: the kernel assembles its fp32 final state
+                # from bf16-rounded decayed keys whose decay uses Triton's
+                # ex2.approx; measured (E3 stream report, 2026-07-26), the
+                # BASELINE itself sits ~1.1e-4 from the fp64-exact value at
+                # elements where the fp32 tolerance band is ~1.1e-5 -- so
+                # fp32-dtype grading demands bit-reproduction of ex2.approx
+                # (Triton-only, forbidden to seeds), not semantic
+                # correctness. Grade this op at the computation precision:
+                # low-precision tolerances on the raw values (see
+                # _low_precision_tolerances for why not a bf16 cast).
+                with _low_precision_tolerances(R):
+                    correct, max_error_ratio, mean_diff = R._merge_correctness(
+                        R._compare_outputs(baseline_out, candidate_out),
+                        R._compare_outputs(
+                            baseline_check_inputs, candidate_check_inputs),
+                    )
+            else:
+                correct, max_error_ratio, mean_diff = R._merge_correctness(
+                    R._compare_outputs(baseline_out, candidate_out),
+                    R._compare_outputs(
+                        baseline_check_inputs, candidate_check_inputs),
+                )
             out_abs, out_rel = _abs_rel_errors(baseline_out, candidate_out)
             in_abs, in_rel = _abs_rel_errors(baseline_check_inputs, candidate_check_inputs)
             max_abs, max_rel = max(out_abs, in_abs), max(out_rel, in_rel)
