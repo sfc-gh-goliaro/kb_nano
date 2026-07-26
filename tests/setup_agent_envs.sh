@@ -5,10 +5,10 @@
 # Ends with a PASS/FAIL verification checklist. Safe to re-run.
 #
 # Layout (override via env):
-#   AGENTS_DIR   (default /raid/user_data/olu/agents)   — repos, dataset, run dirs
-#   VENVS_DIR    (default /raid/user_data/olu)          — venv_ako4x, venv_astra
-#   KB_REPO      (default /raid/user_data/olu/kb_agent_eval) — kb worktree (branch agent-eval-pilot)
-#   KB_MAIN_PY   (default /raid/user_data/olu/venv/bin/python) — kb main venv python
+#   AGENTS_DIR   (required) — repos, dataset, run dirs
+#   VENVS_DIR    (required) — venv_ako4x, venv_astra
+#   KB_REPO      (required) — this repo's checkout (branch agent-eval-pilot)
+#   KB_MAIN_PY   (required) — kb main venv python
 #   OVERLAY_DIR  (default <this script's dir>/../tools/agent_eval) — overlay + patch artifacts
 #
 # Pins (do not change without re-validating — see docs/agent_eval/H200_RUNBOOK.md):
@@ -25,10 +25,13 @@
 #   sgl-kernel       0.3.21
 set -u  # NOT -e: we collect failures into the final checklist instead of dying
 
-AGENTS_DIR=${AGENTS_DIR:-/raid/user_data/olu/agents}
-VENVS_DIR=${VENVS_DIR:-/raid/user_data/olu}
-KB_REPO=${KB_REPO:-/raid/user_data/olu/kb_agent_eval}
-KB_MAIN_PY=${KB_MAIN_PY:-/raid/user_data/olu/venv/bin/python}
+# Machine-neutral: all four locations must be provided by the caller (the
+# runbook's variables block). Refusing to guess prevents silently building
+# into another machine's conventions.
+: "${AGENTS_DIR:?set AGENTS_DIR (agent repos/datasets root, e.g. <big-storage>/agents)}"
+: "${VENVS_DIR:?set VENVS_DIR (where venv_ako4x/venv_astra will live)}"
+: "${KB_REPO:?set KB_REPO (path to this repo checkout, branch agent-eval-pilot)}"
+: "${KB_MAIN_PY:?set KB_MAIN_PY (python of a kb-nano main venv: torch+flash_attn+flashinfer)}"
 SCRIPT_DIR=$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)
 OVERLAY_DIR=${OVERLAY_DIR:-$SCRIPT_DIR/../tools/agent_eval}
 
