@@ -861,7 +861,33 @@ def _preload_mm_data(dataset_name, dataset_split, num_seqs, seed,
         pbar.close()
     elif "MMVU" in dataset_name:
         from huggingface_hub import snapshot_download
+        import glob as _glob
+        import os as _os
+        # Fetches the clips on first use.  But HF_HUB_OFFLINE=1 silently
+        # degrades snapshot_download to "return whatever is already cached",
+        # and MMVU's metadata (validation.json) caches separately from its
+        # videos -- so an offline run can return a snapshot with no .mp4 at all
+        # and then report every single clip as "could not open".  Check up front
+        # and say what is actually wrong.
         local_root = snapshot_download(dataset_name, repo_type="dataset")
+        n_clips = len(_glob.glob(
+            _os.path.join(local_root, "**", "*.mp4"), recursive=True))
+        if n_clips == 0:
+            offline = _os.environ.get("HF_HUB_OFFLINE", "")
+            reason = (
+                f"HF_HUB_OFFLINE={offline} is set, which prevents the clips "
+                "from being downloaded -- unset it for the first run"
+                if offline not in ("", "0")
+                else "the snapshot download produced no .mp4 files"
+            )
+            raise SystemExit(
+                f"\n  {dataset_name}: no video files under {local_root}\n"
+                f"  ({reason}).\n"
+                f"  Fetch them with:\n"
+                f"    python -c \"from huggingface_hub import "
+                f"snapshot_download; snapshot_download("
+                f"'{dataset_name}', repo_type='dataset')\"\n"
+            )
         remote_root = (
             f"https://huggingface.co/datasets/{dataset_name}/resolve/main"
         )
@@ -898,6 +924,14 @@ def _preload_mm_data(dataset_name, dataset_split, num_seqs, seed,
             print(f"  NOTE: skipped {skipped} unreadable video(s) from "
                   f"{dataset_name}; loaded {len(results)}/{num_seqs}",
                   flush=True)
+        if not results:
+            raise SystemExit(
+                f"\n  {dataset_name}: {skipped} clip(s) tried, none readable, "
+                f"despite {n_clips} .mp4 file(s) present under\n"
+                f"  {local_root}\n"
+                f"  Check that OpenCV can decode them (cv2.VideoCapture) and "
+                f"that the snapshot is complete.\n"
+            )
     elif "librispeech_asr" in dataset_name:
         pbar = tqdm(data, total=num_seqs, desc="Loading audio")
         for item in pbar:
