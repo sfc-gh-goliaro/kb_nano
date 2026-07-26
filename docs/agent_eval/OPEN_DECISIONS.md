@@ -35,16 +35,24 @@ the bottom) — reading it is optional.
 
 ## Policy calls
 
-- **M9 (DECIDED: keep the 3 ops excluded from agent scoring).** For gpt_oss_moe, chunk_gla (output path), and vision_block,
-  a correct-but-not-bit-identical implementation exceeds the 1% band at
-  cancellation elements (for gpt_oss_moe the reference is provably CLOSER
-  to fp64 truth than the baseline). Options: per-op ratio allowance
-  (~2.5-3x, admits real 2-3% errors), an fp64-oracle band, or keep them
-  excluded. We recommend excluded-until-decided; identity checks and all
-  other ops are unaffected.
-- **M5 (DECIDED: GPT-5.5 row, API billing, mentor runs the live smoke; smoke itself OPTIONAL — rebuttal-evidence value only).** Second ASTRA row uses GPT-5.5 (verify model
-  id via /v1/models); AK campaigns bill an Anthropic API key. The one
-  never-exercised step is ASTRA's live API call (needs a key; ~$1-3).
+- **M9 (DECIDED: fp64-oracle dual gate; exclusion rejected by the author).**
+  For gpt_oss_moe, chunk_gla (output path), and vision_block, a
+  correct-but-not-bit-identical implementation exceeds the 1% band at
+  cancellation elements. Codex receipts show the band is passable by
+  kernel-language candidates (its chunk_gla/gpt_oss_moe candidates were
+  Triton, same tolerance constants) — only naive pure-torch mirrors hit
+  the wall. Policy: scoped to these ops, a candidate passes if within the
+  standard band of the baseline OR elementwise no farther from a
+  harness-computed fp64 oracle than the baseline itself (+ low-precision
+  margin). Never fails a candidate at-least-as-accurate as the baseline;
+  never passes semantic wrongness (controls enforced); baseline-band
+  unchanged for comparability; restores all three ops to the task menu.
+- **M5 (DECIDED: ASTRA DROPPED from scope).** Running it as published adds
+  no benchmark row; the reviewer response cites the source-level receipts
+  instead (its candidate format is one self-contained CUDA function per
+  run — composite production modules are not expressible). The Claude
+  patch + smoke script remain in-tree as inert artifacts. AK campaigns
+  bill an Anthropic API key (decided).
 - **M6 (DECIDED: defaults — none used).** baseline-seeded
   AK arm; showing baseline source to the agent codex-style.
 

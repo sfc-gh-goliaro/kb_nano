@@ -1,4 +1,4 @@
-# Agent-eval runbook: AKO4X (+ ASTRA) on your cluster
+# Agent-eval runbook: AKO4X campaigns on your cluster
 
 Everything here is machine-neutral. Set these once and every command below
 works verbatim:
@@ -112,20 +112,7 @@ Before a new family: verify the FlashInfer expert baseline runs on sm_90a
 before comparing to archived numbers. AKO4X's hardware lock means H200
 campaigns start fresh families (by design).
 
-## 5. ASTRA (run as published; not ported to kb — reasoning in OPEN_DECISIONS M-notes)
-
-```bash
-# Claude mode:
-export ANTHROPIC_API_KEY=sk-ant-...
-ASTRA_DIR=$AGENTS_DIR/Astra ASTRA_PY=$VENVS_DIR/venv_astra/bin/python \
-  bash $KB_REPO/tools/agent_eval/astra_live_smoke.sh
-# GPT-5.5 mode (decided second row): see the script header — OPENAI_API_KEY
-# + ASTRA_MODEL=<id verified via /v1/models>, Anthropic vars unset.
-```
-
-This live call is the single step not exercised in the pilot (needs a key).
-
-## 6. Troubleshooting (all hit and fixed during the pilot)
+## 5. Troubleshooting (all hit and fixed during the pilot)
 
 | Symptom | Fix |
 |---|---|
@@ -137,10 +124,9 @@ This live call is the single step not exercised in the pilot (needs a key).
 | `Ninja is required` | keep venv_astra bin on PATH |
 | matmul_ogs illegal memory access (mxfp4 ops) | known upstream ragged-TMA OOB (SM100); grader auto-sets `PYTORCH_CUDA_ALLOC_CONF=expandable_segments:True` for those ops; re-check on H200 (M8) |
 
-## 7. What needs your decision (not blocking the run)
+## 6. What needs your decision (not blocking the run)
 
-See OPEN_DECISIONS.md — the M-items: ratifications for merge-to-main
-(fixture rebuild, class pins, comparison-semantics differences), the M9
-tolerance policy for three cancellation-amplified ops (excluded from
-scoring until decided), two found-in-passing issues (M7 baseline kwargs
-drop, M8 upstream Triton bug), and optional experiment knobs.
+See OPEN_DECISIONS.md — a decision RECORD, mostly already decided by the
+author; what remains with you: the merge-PR review itself, routing the M8
+upstream Triton bug report, and M7's outcome if its investigation
+confirms a baseline fix.
