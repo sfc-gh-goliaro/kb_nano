@@ -50,7 +50,11 @@ get fixed or their pin lands. Proactive sweep: verify EVERY existing
 reference file through the grader, not just the previously-failing set —
 the "12" is a lower bound from the 85-op packaging pass.
 
-### E4. moe_align output canonicalization (was D2)
+### E4. moe_align output canonicalization (was D2) — DONE
+Implemented + verified (10/10 twice; wrong-expert negative control 10/10
+INCORRECT). Original rationale below.
+
+### E4-history. moe_align output canonicalization (was D2)
 Adopted (user 2026-07-26): sort both sides within expert groups before
 comparing, scoped to this op. Grounded in the consumer:
 `fused_experts.py:309-354` uses `sorted_token_ids`/`expert_ids` purely as
@@ -70,13 +74,14 @@ once, trusted, frozen. Integrates after E1 (same file).
 - **M1 (was D1)**: ratify the Lane B fixture rebuild for merge + revision
   disclosure (codex numbers for linear/embedding/conv2d/parallel_linear
   were measured on fabricated dims).
-- **M2 (was D6)**: allreduce — does the paper's 4-rank NCCL+Gloo harness
-  source still exist? (Not in any branch; only the Table-1 caption and
-  §6.2 reference it.) If lost: rebuild spec is in OP_CENSUS/D6 history —
-  torchrun 4 ranks, broadcast inputs, rank-0 compare + collective timing.
-- **M3**: 6 composite ops have NO reference file (flux_transformer_block,
-  oasis_dit, oasis_vae_attention_block, vision_block, yolov10_head/neck) —
-  authoring work; priority call.
+- **M2 (was D6)**: IN EXECUTION (user 2026-07-26: build without waiting on
+  the mentor) — a 4-rank harness with analytic ground truth is being built
+  as fix stream; the original-source question survives only as a
+  comparability footnote for the published 0.84x.
+- **M3**: IN EXECUTION (user 2026-07-26: author them) — references for the
+  6 L3 composites (flux_transformer_block, oasis_dit,
+  oasis_vae_attention_block, vision_block, yolov10_head/neck) are being
+  written + grader-verified; they become 6 new packageable agent tasks.
 - **M4**: merge-to-main ratification of E2 (resolution semantics), E3
   (reference edits), E4 (comparison semantics).
 - **M5**: ASTRA — verify GPT-5.5 model id via /v1/models; run
@@ -119,3 +124,30 @@ once, trusted, frozen. Integrates after E1 (same file).
   pre-rebase census timing fields for attention_impl-family are stale).
 - flash_attn_varlen / moe_grouped_gemm / fp8_linear stale v1 flags lifted
   (see OP_CENSUS v2 supersession note).
+
+## Late additions (2026-07-26, execution round 2)
+
+- **Difference 9 (chunk_gla grading precision)**: the op's fp32-container
+  outputs carry bf16-precision computation (kernel ex2.approx + bf16
+  rounding; the BASELINE sits ~1e-4 from fp64 truth where the fp32 band is
+  ~1e-5 — E3 stream measurement), so the grader now applies low-precision
+  tolerances to this op (raw values, tolerance-scoped; a bf16 cast was
+  tried and rejected — quantization-boundary cliffs). Negative control: a
+  10% scale-error candidate fails 5/5. Residual o-path divergence under
+  investigation (reference side).
+- **yolov10_head / yolov10 closed**: two stacked causes, both fixed —
+  (1) the repair loop crashed on the head's zero-element anchor/stride
+  buffers (empty-tensor .max()); guard added. My earlier
+  "postprocess-on-noise" classification of yolov10_head was WRONG — the
+  crash frame was in the grader, not the model. (2) the head's production
+  bias prior yields zero detections on random weights; the fixture now
+  boosts cls biases so the decode/select path executes (comparing hidden
+  states instead was considered and rejected: intermediates are not part
+  of the op contract and fused candidates must remain free to skip them).
+  Both ops PASS; rms_norm regression clean.
+- **SEED_PATCHES retired** (all three; raw references verified through
+  packaging: softmax + flash_attn_varlen + flux_attention SEED_PASS).
+- **gpt_oss_moe reference reopened**: its earlier PASS was vacuous
+  (measured against all-zero packed weights, pre-Fix-7); on seeded real
+  weights it fails 5/5 — being re-fixed. The de-vacuization catching this
+  is the fixture-discrimination machinery working as designed.
