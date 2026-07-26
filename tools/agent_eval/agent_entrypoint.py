@@ -26,7 +26,7 @@ no CUDA, empty scenario selection).
 
 Correctness / timing semantics are the release runner's
 (``fastkernels/bench/kernels/runner.py``) -- its comparison helpers, its
-tolerances, its median timing are imported and reused, not reimplemented. Seven
+tolerances, its median timing are imported and reused, not reimplemented. Eight
 deliberate differences from ``run_kernel_benchmark``:
 
 1. **Strict weight transfer.** The runner wraps ``load_state_dict`` in a bare
@@ -60,6 +60,15 @@ deliberate differences from ``run_kernel_benchmark``:
 7. **Uninitialised baseline parameters are repaired** (seeded, deterministic)
    before the perturbation, because several baselines allocate parameters with
    ``torch.empty`` and never fill them -- see ``_repair_degenerate_parameters``.
+8. **``moe_align`` outputs are canonicalized before comparison** (both sides,
+   identically). The op's output is a token->expert grouping built by parallel
+   atomic appends; order *within* one expert's block-group is not part of the
+   contract -- its only consumer (``tasks/baseline/L2/fused_experts.py:309-354``)
+   uses ``sorted_token_ids``/``expert_ids`` purely as gather/scatter index
+   metadata. Baseline-vs-itself legitimately produces different-but-equivalent
+   permutations run to run, so both sides are sorted with the same
+   (expert, token) key before the runner's comparison. Scoped to this one op;
+   tolerances are untouched. See ``_canonicalize_moe_align_output``.
 
 Tolerances are NOT settable from the CLI: they are read from the runner's module
 constants. A calling agent must not be able to loosen its own correctness gate.
@@ -180,7 +189,9 @@ def _ensure_ninja_on_path() -> None:
 def _resolve_target(op: str):
     """BenchTarget for one op without importing the whole baseline corpus."""
     from fastkernels import KB_ROOT
-    from fastkernels.infra.kernel_swapper import BenchTarget, _find_module_class
+    from fastkernels.infra.kernel_swapper import (
+        BenchTarget, _find_module_class, registry_class_pin,
+    )
 
     for level in (1, 2, 3, 4):
         path = KB_ROOT / "tasks" / "baseline" / f"L{level}" / f"{op}.py"
@@ -188,7 +199,7 @@ def _resolve_target(op: str):
             continue
         module_path = f"tasks.baseline.L{level}.{op}"
         mod = importlib.import_module(f"fastkernels.{module_path}")
-        cls = _find_module_class(mod)
+        cls = _find_module_class(mod, pin=registry_class_pin(op))
         if cls is None:
             raise InfraError(f"no nn.Module class found in {path}")
         _log(f"baseline module: {mod.__file__}")
@@ -346,9 +357,74 @@ def _wants_config_object(name: str, param: Any) -> bool:
     return isinstance(text, str) and text.split(".")[-1].endswith("Config")
 
 
+def _build_oasis_rotary(kind: str, head_dim: int):
+    """Fresh OasisRotaryEmbedding, mirroring the model-level construction.
+
+    ``tasks/baseline/L3/oasis_dit.py:41-42`` is the in-repo ground truth for how
+    Oasis wires its rotary modules: spatial attention gets
+    ``OasisRotaryEmbedding(dim=head_dim // 2, freqs_for="pixel", max_freq=256)``,
+    temporal gets ``OasisRotaryEmbedding(dim=head_dim, freqs_for="lang")``.
+    (The codex runner used ``dim_head // 4`` with the default ``max_freq=10``
+    for the spatial module; the model file wins.) Construction is RNG-free, so
+    building a fresh instance per module keeps baseline and candidate from
+    sharing a submodule while guaranteeing identical values.
+    """
+    from fastkernels.tasks.baseline.L1.oasis_rotary import OasisRotaryEmbedding
+
+    if kind == "spatial":
+        return OasisRotaryEmbedding(dim=head_dim // 2, freqs_for="pixel",
+                                    max_freq=256)
+    return OasisRotaryEmbedding(dim=head_dim, freqs_for="lang")
+
+
+def _augment_oasis_init_args(class_name: str, kwargs: dict[str, Any],
+                             inputs: dict[str, Any]) -> None:
+    """Fill the Oasis constructor arguments the YAML trace cannot express.
+
+    The Oasis attention/block constructors require a rotary-embedding *module*
+    argument (and dims derivable only from the activation shape); the registry
+    records neither. The harness builds them here, in trusted code, identically
+    for both sides -- the same pattern as ``_callable_init_arg``.
+
+    ``x`` is ``[batch, time, height, width, dim]`` for all three classes.
+    ``num_heads`` for the DiT block is not traced; 16 is the model default
+    (``oasis_dit.py:26``), consistent with the ``heads: 16`` the attention
+    scenarios do record.
+    """
+    import torch
+
+    x = inputs.get("x")
+    if not isinstance(x, torch.Tensor) or x.ndim < 2:
+        return
+    dim = int(x.shape[-1])
+    if class_name in ("OasisSpatialAxialAttention", "OasisTemporalAxialAttention"):
+        heads = int(kwargs.get("heads", 16))
+        head_dim = dim // max(1, heads)
+        kwargs.setdefault("dim", dim)
+        kwargs.setdefault("dim_head", head_dim)
+        if "rotary_emb" not in kwargs:
+            kind = "spatial" if class_name == "OasisSpatialAxialAttention" else "temporal"
+            kwargs["rotary_emb"] = _build_oasis_rotary(kind, head_dim)
+    elif class_name == "SpatioTemporalDiTBlock":
+        num_heads = int(kwargs.get("num_heads", 16))
+        head_dim = dim // max(1, num_heads)
+        kwargs.setdefault("hidden_size", dim)
+        kwargs.setdefault("num_heads", num_heads)
+        kwargs.setdefault("is_causal", True)  # oasis_dit.py:50
+        if "spatial_rotary_emb" not in kwargs:
+            kwargs["spatial_rotary_emb"] = _build_oasis_rotary("spatial", head_dim)
+        if "temporal_rotary_emb" not in kwargs:
+            kwargs["temporal_rotary_emb"] = _build_oasis_rotary("temporal", head_dim)
+
+
 def _instantiate_module(cls: type, init_args: dict[str, Any], device: str = "cuda",
-                        dtype: Any = None):
-    """Construct ``cls`` from traced ``init_args``. See the block comment above."""
+                        dtype: Any = None, inputs: dict[str, Any] | None = None):
+    """Construct ``cls`` from traced ``init_args``. See the block comment above.
+
+    ``inputs`` (the already-prepared fixture dict) is consulted only by the
+    narrow per-class augmentations that need an activation shape or a module
+    argument the registry cannot express (currently the Oasis family).
+    """
     import torch
     import torch.nn as nn
 
@@ -385,6 +461,11 @@ def _instantiate_module(cls: type, init_args: dict[str, Any], device: str = "cud
             if resolved is not None:
                 kwargs[key] = resolved
 
+    if inputs is not None and cls.__name__ in (
+            "OasisSpatialAxialAttention", "OasisTemporalAxialAttention",
+            "SpatioTemporalDiTBlock"):
+        _augment_oasis_init_args(cls.__name__, kwargs, inputs)
+
     module = cls(**kwargs)  # no fallback: a TypeError here is the verdict
 
     module = module.to(device)
@@ -397,9 +478,18 @@ def _instantiate_module(cls: type, init_args: dict[str, Any], device: str = "cud
         # ``use_fp8`` flag stays set -- the FP8 Triton kernel then fails to
         # compile (verified on qwen3_moe). A quantized parameter's dtype is part
         # of the module's contract, not a scenario knob.
+        #
+        # Scale parameters are exempt for the same reason (codex runner
+        # precedent, runner.py:370-375): FP8 block-scale tensors such as
+        # ``parallel_linear``'s ``weight_scale_inv`` are float32 by kernel
+        # contract -- DeepGEMM asserts ``sfb_dtype == torch::kFloat or
+        # torch::kInt``, so casting them to bf16 makes every fp8-quantized
+        # module (qwen3_moe_decoder) unrunnable.
         with torch.no_grad():
-            for param in module.parameters(recurse=True):
-                if param.is_floating_point() and "float8" not in str(param.dtype):
+            for _name, param in module.named_parameters(recurse=True):
+                if (param.is_floating_point()
+                        and "float8" not in str(param.dtype)
+                        and "scale" not in _name):
                     param.data = param.data.to(dtype=dtype)
     module.eval()
     return module
@@ -411,6 +501,17 @@ def _stable_seed(*parts: str) -> int:
     """Process-independent seed from a name (``hash()`` is salted per process)."""
     digest = hashlib.sha256("/".join(parts).encode()).digest()
     return int.from_bytes(digest[:8], "big") & 0x7FFF_FFFF_FFFF_FFFF
+
+
+# Repaired values are a pure function of (op, tensor name, shape, dtype): the
+# per-tensor generator is seeded from (op, name) and the draw depends on
+# nothing else. Recomputing them for every scenario of a 32-layer model burns
+# tens of CPU-seconds per scenario (measured: ~30 s/scenario fixture prep on
+# gla, ~350 repaired tensors, ~2.7e9 elements), so the finished on-device
+# tensor is cached and re-copied on later scenarios -- byte-identical to a
+# fresh draw. Only the *draw* is cached; the degeneracy *decision* still runs
+# per scenario, exactly as before.
+_REPAIR_VALUE_CACHE: dict[tuple, Any] = {}
 
 
 def _repair_degenerate_parameters(module: Any, op: str) -> list[str]:
@@ -427,8 +528,33 @@ def _repair_degenerate_parameters(module: Any, op: str) -> list[str]:
 
     Only degenerate parameters are touched: a parameter that is finite and not
     identically zero is a real initialisation (``ones`` for norms, an embedding
-    table, ...) and is left for the perturbation step. FP8 parameters are left
-    alone -- a quantized tensor cannot be re-initialised without its scales.
+    table, ...) and is left for the perturbation step.
+
+    FP8 parameters are included: e.g. ``parallel_linear`` allocates
+    ``torch.empty(..., dtype=float8_e4m3fn)`` weights whose stale bytes can
+    encode e4m3 NaN (0x7f/0xff), which no downstream step can rescue. Their
+    block scales are separate float32 parameters (repaired/perturbed on their
+    own), so a plain seeded fp32 draw quantized to fp8 is a coherent fixture.
+    The ``|max| > 1e4`` stale-memory heuristic is skipped for fp8 (e4m3 tops
+    out at 448, so it can never fire and the fp32 upcast is exact).
+
+    PACKED-QUANTIZED uint8 state is also included: ``GptOssMoE`` holds its
+    MXFP4 expert weights as ``torch.zeros`` uint8 parameters (packed FP4
+    pairs) with uint8 E8M0 block scales (``gpt_oss_moe.py:54-78``), relying
+    on a checkpoint load that never happens here. All-zero packed weights
+    make the MoE output weight-independent (bias-only) -- the same vacuity
+    class as the historical weight=ones blind spot the perturbation step
+    closes for float parameters. A uint8 tensor is recognised as
+    packed-quantized payload when a sibling ``<name>_scale`` tensor exists
+    (and as an E8M0 scale when it is the uint8 ``*_scale`` of a uint8
+    payload); it is repaired only when ALL-ZERO (uint8 has no NaN; any
+    nonzero content is a real load). Draws use the mxfp4 fixture's bounds:
+    payload bytes are unconstrained (every byte is a valid e2m1/int2 pair --
+    neither format has NaN/Inf encodings), scale exponents are bounded to
+    [121, 127] (decoded 2^-6 .. 2^0) so activations stay finite. BitNet's
+    ``BitLinear`` (uint8 packed int2 ``weight`` + float ``weight_scale``)
+    matches the same payload rule; its float scale takes the float path.
+
     Values are drawn from a CPU generator seeded by (op, parameter name), so the
     fixture is identical on every machine and in every process.
     """
@@ -444,42 +570,177 @@ def _repair_degenerate_parameters(module: Any, op: str) -> list[str]:
         yield from module.named_parameters(recurse=True)
         yield from module.named_buffers(recurse=True)
 
+    named = list(_named_tensors())
+    by_name = {n: t for n, t in named}
+
     with torch.no_grad():
-        for name, param in _named_tensors():
-            if not param.is_floating_point() or "float8" in str(param.dtype):
+        for name, param in named:
+            if param.dtype == torch.uint8 and param.numel() > 0:
+                sibling_scale = by_name.get(name + "_scale")
+                base = name[: -len("_scale")] if name.endswith("_scale") else None
+                payload = base is not None and by_name.get(base) is not None \
+                    and by_name[base].dtype == torch.uint8
+                if sibling_scale is None and not payload:
+                    continue  # unpaired uint8 state: not quantized weights
+                is_scale = payload  # this tensor is the E8M0 scale of a payload
+                if bool((param != 0).any()):
+                    continue  # nonzero = actually loaded; leave it alone
+                cache_key = (op, name, tuple(param.shape), str(param.dtype),
+                             str(param.device))
+                prepared = _REPAIR_VALUE_CACHE.get(cache_key)
+                if prepared is None:
+                    generator = torch.Generator(device="cpu").manual_seed(
+                        _stable_seed(op, name))
+                    low, high = (121, 128) if is_scale else (0, 256)
+                    prepared = torch.randint(
+                        low, high, tuple(param.shape), generator=generator,
+                        dtype=torch.uint8).to(param.device)
+                    _REPAIR_VALUE_CACHE[cache_key] = prepared
+                param.copy_(prepared)
+                repaired.append(name)
                 continue
+            if not param.is_floating_point():
+                continue
+            is_fp8 = "float8" in str(param.dtype)
             values = param.detach().float()
+            finite = bool(torch.isfinite(values).all())
+            absmax = float(values.abs().max().item()) if finite else 0.0
             degenerate = (
-                not bool(torch.isfinite(values).all())
-                or bool(values.abs().max().item() == 0.0)
+                not finite
+                or absmax == 0.0
                 # finite allocator garbage: torch.empty residue that happens to
                 # be finite but astronomically scaled. Real initialisations are
                 # O(1); anything with |max| > 1e4 is stale memory (measured:
                 # yolov10_c2f flipped verdicts across runs because finite
                 # residue overflowed the forward on some draws only).
-                or bool(values.abs().max().item() > 1e4)
+                #
+                # float16 gets a tighter bound: its max is 65504, so garbage
+                # the generic rule tolerates (|max| <= 1e4) is one wide GEMM
+                # away from inf -- measured: oasis_block tokens-8/09bba215
+                # flipped between 10/10 PASSED and baseline_output_nonfinite
+                # across runs on identical code, the same lottery the 1e4 rule
+                # closed for bf16. 1024 clears the largest legitimate fp16
+                # initialisation in the corpus (the Oasis pixel rotary
+                # frequency table, |max| ~ 402) with a 2.5x margin.
+                or (not is_fp8 and absmax > (
+                    1024.0 if param.dtype == torch.float16 else 1e4))
+                # quantization scale tensors are strictly positive by contract
+                # (reciprocals of quantization step sizes), so any nonpositive
+                # entry is stale memory even when finite and O(1). This
+                # matters on SM100: DeepGEMM re-casts weight SFs to UE8M0
+                # (log2 of the scale), so one signed garbage entry in
+                # ``weight_scale_inv`` turns the whole projection output NaN
+                # (measured on qwen3_moe_decoder, where the repair lottery on
+                # ``o_proj.weight_scale_inv`` decided each run's fate).
+                or ("scale" in name and finite and bool((values <= 0).any()))
             )
             if not degenerate:
                 continue
-            generator = torch.Generator(device="cpu").manual_seed(
-                _stable_seed(op, name))
-            if param.ndim >= 2:
-                # PyTorch's own default for Linear/Conv weights: uniform over
-                # +-1/sqrt(fan_in), which keeps activations O(1) at any width.
-                fan_in = max(1, int(param[0].numel()))
-                bound = 1.0 / math.sqrt(fan_in)
-                fresh = torch.empty(param.shape, dtype=torch.float32)
-                fresh.uniform_(-bound, bound, generator=generator)
-            else:
-                fresh = torch.randn(
-                    param.shape, generator=generator, dtype=torch.float32) * 0.02
-            if "running_var" in name or name.endswith("_var"):
-                # variance-like buffers must stay positive: BatchNorm computes
-                # sqrt(var + eps), so a negative repair value would emit NaN.
-                fresh = fresh.abs() + 0.5
-            param.copy_(fresh.to(device=param.device, dtype=param.dtype))
+            cache_key = (op, name, tuple(param.shape), str(param.dtype),
+                         str(param.device))
+            prepared = _REPAIR_VALUE_CACHE.get(cache_key)
+            if prepared is None:
+                generator = torch.Generator(device="cpu").manual_seed(
+                    _stable_seed(op, name))
+                if param.ndim >= 2:
+                    # PyTorch's own default for Linear/Conv weights: uniform
+                    # over +-1/sqrt(fan_in), which keeps activations O(1) at
+                    # any width. For fp8 the fan-in is the last (reduction)
+                    # dim, not the whole trailing slice: a 3D expert weight
+                    # [E, N, K] would otherwise get bound = 1/sqrt(N*K), far
+                    # below e4m3's minimum subnormal, and quantize to
+                    # all-zero (measured on qwen3_moe's w13/w2).
+                    if is_fp8:
+                        fan_in = max(1, int(param.shape[-1]))
+                    else:
+                        fan_in = max(1, int(param[0].numel()))
+                    bound = 1.0 / math.sqrt(fan_in)
+                    fresh = torch.empty(param.shape, dtype=torch.float32)
+                    fresh.uniform_(-bound, bound, generator=generator)
+                else:
+                    fresh = torch.randn(
+                        param.shape, generator=generator,
+                        dtype=torch.float32) * 0.02
+                if "running_var" in name or name.endswith("_var"):
+                    # variance-like buffers must stay positive: BatchNorm
+                    # computes sqrt(var + eps), so a negative repair value
+                    # would emit NaN.
+                    fresh = fresh.abs() + 0.5
+                elif "scale" in name:
+                    # quantization scales must be positive: they are
+                    # reciprocals of quantization steps, and the SM100 fp8
+                    # GEMMs pack them as UE8M0 exponents (log2 of the
+                    # scale), so a negative repair value turns every output
+                    # element NaN (measured on qwen3_moe_decoder: all-NaN
+                    # qkv projection while a dequantized reference GEMM on
+                    # the same tensors was finite).
+                    fresh = fresh.abs() + 0.5
+                prepared = fresh.to(device=param.device, dtype=param.dtype)
+                _REPAIR_VALUE_CACHE[cache_key] = prepared
+            param.copy_(prepared)
             repaired.append(name)
     return repaired
+
+
+def _postprocess_fp8_module_weights(module: Any) -> int:
+    """Apply the engine's post-load FP8 weight processing to ``module``.
+
+    The kb engine does not run FP8 modules on their checkpoint-format weights:
+    ``infra/weight_loader.py:1127`` (``_postprocess_fp8_weights``) rewrites
+    every ``Fp8Linear``'s ``(weight, weight_scale_inv)`` through
+    ``postprocess_fp8_weights`` (UE8M0 re-quantization + DeepGEMM scale-layout
+    transform) and gives every fp8 ``Qwen3MoE`` its DeepGEMM-layout
+    ``w13_scale_dg`` / ``w2_scale_dg`` buffers. That step is part of the
+    module's forward contract on SM100 -- DeepGEMM reads the scale tensor as
+    UE8M0 exponent data, so raw (repaired/perturbed) fp32 scales produce
+    all-NaN projections (measured on qwen3_moe_decoder: the qkv output was
+    entirely NaN while a dequantized reference GEMM on the same tensors was
+    finite).
+
+    Called on BOTH modules AFTER the strict weight transfer: the transfer
+    stays in checkpoint space (raw shapes on both sides), and the
+    post-processing is a pure function of the transferred values, so both
+    sides end up bit-identical -- exactly the engine's load-then-postprocess
+    order. Returns the number of processed weight groups (0 for modules
+    without fp8 state, making this a no-op for every non-fp8 op). A candidate
+    that reuses the baseline's ``Fp8Linear`` / ``Qwen3MoE`` building blocks is
+    processed identically; one that rolls its own fp8 layout owns that layout.
+    """
+    import torch
+
+    if not any("float8" in str(p.dtype) for p in module.parameters(recurse=True)):
+        return 0
+
+    from fastkernels.tasks.baseline.L1.fp8_linear import (
+        Fp8Linear, postprocess_fp8_weights)
+
+    count = 0
+    for sub in module.modules():
+        if (isinstance(getattr(sub, "linear_op", None), Fp8Linear)
+                and isinstance(getattr(sub, "weight", None), torch.Tensor)
+                and "float8" in str(sub.weight.dtype)
+                and isinstance(getattr(sub, "weight_scale_inv", None), torch.Tensor)):
+            w_new, s_new = postprocess_fp8_weights(
+                sub.weight.data, sub.weight_scale_inv.data)
+            sub.weight = torch.nn.Parameter(w_new, requires_grad=False)
+            sub.weight_scale_inv = torch.nn.Parameter(s_new, requires_grad=False)
+            count += 1
+
+    moe_candidates = [
+        sub for sub in module.modules()
+        if getattr(sub, "use_fp8", False)
+        and isinstance(getattr(sub, "w13", None), torch.Tensor)
+        and "float8" in str(sub.w13.dtype)
+        and isinstance(getattr(sub, "w13_scale", None), torch.Tensor)
+    ]
+    if moe_candidates:
+        # The engine's own routine (keeps checkpoint scales, adds the
+        # DeepGEMM-layout ``*_scale_dg`` buffers the forward reads).
+        from fastkernels.infra.weight_loader import _postprocess_moe_fp8_weights
+
+        for sub in moe_candidates:
+            count += 1 if _postprocess_moe_fp8_weights(sub) else 0
+    return count
 
 
 def _seed_scenario(op: str, scenario_name: str) -> int:
@@ -623,6 +884,25 @@ def _prepare_generic_cu_seqlens(inputs: dict[str, Any]) -> None:
     applied by name here. Random values are not merely a bad partition: FLA's
     chunk kernels index with ``cu[i+1]-cu[i]`` and crash outright (2 of 5
     ``chunk_gla`` scenarios were RUNTIME_ERROR for this reason).
+
+    ``input_ids`` / ``inputs_embeds`` are pairing fallbacks (after the
+    activation names) for L4 causal-LM ops whose varlen scenarios carry only a
+    token stream: ``gla``'s ``cu_seqlens`` stayed raw ``randint(0, 100)``
+    because none of the activation names exist in its fixture, and FLA's
+    ``prepare_chunk_indices`` does ``torch.arange(cdiv(cu[i+1]-cu[i], 64))`` --
+    any segment of length <= -64 raises "upper bound and lower bound
+    inconsistent with step sign" (measured: gla tokens-70/2f8947b2, whose
+    seeded draw contains 39-89 = -50 ... 26-89 = -63 near-misses and several
+    <= -64 segments; tokens-2/-3 only survived because ``cdiv`` truncates
+    their small negative lengths to zero chunks). Registry census: ``gla`` is
+    the only op with an unpaired generic ``cu_seqlens``, so the fallback
+    changes exactly its 3 varlen scenarios.
+
+    When the fixture also records ``logits_indices`` with one entry per
+    segment, it is rebuilt as ``cu[1:] - 1`` (each sequence's last token), the
+    consistent pair the model contract expects -- the raw fixture's uniform
+    ``randint(0, 100)`` happens to stay in range but samples arbitrary
+    positions.
     """
     import torch
 
@@ -633,7 +913,8 @@ def _prepare_generic_cu_seqlens(inputs: dict[str, Any]) -> None:
         if not isinstance(cu, torch.Tensor):
             continue
         paired = None
-        for candidate in ("q", "query", "hidden_states", "x", "k", "key", "v"):
+        for candidate in ("q", "query", "hidden_states", "x", "k", "key", "v",
+                          "input_ids", "inputs_embeds"):
             value = inputs.get(candidate)
             if isinstance(value, torch.Tensor) and value.ndim >= 2:
                 paired = value
@@ -644,6 +925,15 @@ def _prepare_generic_cu_seqlens(inputs: dict[str, Any]) -> None:
             _token_total(paired), max(0, int(cu.numel()) - 1), None,
             dtype=cu.dtype, device=cu.device,
         )
+        rebuilt = inputs[name]
+        logits_indices = inputs.get("logits_indices")
+        if (isinstance(logits_indices, torch.Tensor)
+                and not logits_indices.is_floating_point()
+                and logits_indices.numel() == rebuilt.numel() - 1):
+            inputs["logits_indices"] = (
+                (rebuilt[1:] - 1).to(dtype=logits_indices.dtype)
+                .reshape(logits_indices.shape)
+            )
 
 
 def _cache_token_capacity(inputs: dict[str, Any]) -> int | None:
@@ -883,6 +1173,95 @@ def _prepare_fp8_linear_inputs(inputs: dict[str, Any]) -> None:
     inputs["weight_fp8"], inputs["weight_scale_inv"] = cached
 
 
+# One prepared (w1, w2, quant_config) triple per distinct problem shape; the
+# raw draws use a dedicated generator seeded from the shape (not the
+# per-scenario RNG), so the fixture is the same no matter which scenario runs
+# first or whether --scenarios filtered the selection.
+_MXFP4_FIXTURE_CACHE: dict[tuple, tuple] = {}
+
+
+def _prepare_mxfp4_moe_inputs(inputs: dict[str, Any], device: str) -> None:
+    """Materialise the MXFP4 expert-weight objects ``mxfp4_moe`` needs.
+
+    ``tasks/baseline/L1/mxfp4_moe.py::Mxfp4MoE`` is stateless: expert weights
+    arrive as *forward* arguments (``w1``/``w2`` are swizzled
+    ``triton_kernels`` tensors, ``quant_config`` an ``Mxfp4MoEQuantConfig``).
+    The tracer could not record those objects, so the registry carries only
+    ``hidden_states`` / ``gating_output`` / scalars and every scenario died
+    with missing forward arguments.
+
+    The harness generates seeded RAW MXFP4 tensors in the exact checkpoint
+    layout ``GptOssMoE`` declares (``gpt_oss_moe.py:54-78``): packed uint8
+    FP4 pairs ``[E, 2*I_pad, H//2]`` / ``[E, H, I_pad//2]`` with E8M0 block
+    scales over 32-element groups, biases float32 (the Triton kernel asserts
+    this). It then builds the forward objects through the baseline's own
+    trusted statics -- ``Mxfp4MoE.prepare_weight`` and ``make_quant_config``,
+    the same calls ``GptOssMoE.process_weights_after_loading`` makes -- ONCE,
+    and hands the identical objects to both sides. No per-side preparation.
+
+    Value ranges: every uint8 byte is a valid pair of e2m1 values (the format
+    has no NaN/Inf encodings), so the packed weights are unconstrained draws.
+    The E8M0 scale exponents ARE constrained, to [121, 127] (decoded 2^-6 ..
+    2^0): an unconstrained exponent can reach 2^+-127 and overflows the bf16
+    activations; a bounded random scale is still a fully valid, non-degenerate
+    MXFP4 fixture.
+
+    ``E`` and ``H`` come from the recorded activations; the intermediate size
+    is not recorded for this op, so it comes from the registry's
+    ``gpt_oss_moe`` config (``intermediate_size: 1440`` per rank), padded to
+    64 exactly like ``GptOssMoE`` (``_round_up`` -> 1472).
+    """
+    import torch
+
+    hidden = inputs.get("hidden_states")
+    gating = inputs.get("gating_output")
+    if not (isinstance(hidden, torch.Tensor) and isinstance(gating, torch.Tensor)):
+        return
+    if "w1" in inputs and "w2" in inputs and "quant_config" in inputs:
+        return
+
+    num_experts = int(gating.shape[-1])
+    hidden_size = int(hidden.shape[-1])
+    intermediate = 1440  # registry gpt_oss_moe config, per rank
+    i_pad = (intermediate + 63) // 64 * 64  # GptOssMoE._round_up(..., 64)
+    block = 32  # GptOssMoE.MXFP4_BLOCK
+
+    key = (num_experts, hidden_size, i_pad, str(device))
+    cached = _MXFP4_FIXTURE_CACHE.get(key)
+    if cached is None:
+        from fastkernels.tasks.baseline.L1.mxfp4_moe import Mxfp4MoE
+
+        generator = torch.Generator(device="cpu").manual_seed(_stable_seed(
+            "mxfp4_moe", "expert_weights",
+            f"{num_experts}x{hidden_size}x{i_pad}"))
+
+        def _u8(*shape: int, low: int = 0, high: int = 256):
+            return torch.randint(
+                low, high, shape, generator=generator, dtype=torch.uint8,
+            ).to(device)
+
+        w1_raw = _u8(num_experts, 2 * i_pad, hidden_size // 2)
+        w1_scale = _u8(num_experts, 2 * i_pad, hidden_size // block,
+                       low=121, high=128)
+        w2_raw = _u8(num_experts, hidden_size, i_pad // 2)
+        w2_scale = _u8(num_experts, hidden_size, i_pad // block,
+                       low=121, high=128)
+        w1_bias = (torch.randn(num_experts, 2 * i_pad, generator=generator,
+                               dtype=torch.float32) * 0.02).to(device)
+        w2_bias = (torch.randn(num_experts, hidden_size, generator=generator,
+                               dtype=torch.float32) * 0.02).to(device)
+
+        w1, w1_precision = Mxfp4MoE.prepare_weight(w1_raw, w1_scale)
+        w2, w2_precision = Mxfp4MoE.prepare_weight(w2_raw, w2_scale)
+        quant_config = Mxfp4MoE.make_quant_config(
+            w1_precision, w2_precision, w1_bias=w1_bias, w2_bias=w2_bias,
+        )
+        cached = (w1, w2, quant_config)
+        _MXFP4_FIXTURE_CACHE[key] = cached
+
+    inputs["w1"], inputs["w2"], inputs["quant_config"] = cached
+
+
 def _prepare_moe_grouped_gemm_inputs(inputs: dict[str, Any]) -> None:
     """Block-aligned MoE routing metadata (codex port, verbatim).
 
@@ -1015,9 +1394,16 @@ def _prepare_inputs_for_target(op: str, inputs: dict[str, Any], device: str,
     if op == "oasis_patch_embed" and isinstance(inputs.get("x"), torch.Tensor):
         inputs["x"] = inputs["x"].to(torch.bfloat16)
 
-    if op in ("attention", "attention_impl"):
+    if op in ("attention", "attention_impl",
+              "llama_decoder", "qwen3_moe_decoder", "gpt_oss_decoder"):
         # These layers read their KV metadata from the global Context, the way
-        # vLLM reads ``get_forward_context()``; the fixture carries none.
+        # vLLM reads ``get_forward_context()``; the fixture carries none. The
+        # L3 decoders wrap the same L2 ``Attention``: with only the default
+        # ``set_context(False)`` above, it takes the decode path and calls the
+        # TRTLLM decode kernel with no KV cache and no block table
+        # ("Mismatched type on argument #7 ... Expected DLTensor* but got
+        # None"). A single-sequence prefill context over the recorded token
+        # count is the valid fixture, exactly as for the L2 attention ops.
         from fastkernels.infra.context import set_context
 
         tensor = inputs.get("hidden_states", inputs.get("query"))
@@ -1026,6 +1412,35 @@ def _prepare_inputs_for_target(op: str, inputs: dict[str, Any], device: str,
             cu = torch.tensor([0, n_tokens], dtype=torch.int32, device=tensor.device)
             set_context(True, cu_seqlens_q=cu, cu_seqlens_k=cu,
                         max_seqlen_q=n_tokens, max_seqlen_k=n_tokens)
+
+    if op == "gpt_oss_decoder" and "rotary_emb" not in inputs:
+        # ``GptOssDecoderLayer.forward(positions, hidden_states, residual,
+        # rotary_emb)`` takes the rotary embedding as a *forward* argument
+        # (shared across layers at the model level); the registry cannot
+        # express a module input, so every scenario died with "missing 1
+        # required positional argument: 'rotary_emb'". Build it exactly as the
+        # model does (``tasks/baseline/L4/gpt_oss.py:157-166``) with the
+        # ``GptOssConfig`` defaults; construction is deterministic (no RNG)
+        # and the single instance is shared by both sides as a read-only
+        # forward input.
+        from fastkernels.tasks.baseline.L1.yarn_rotary_emb import YaRNRotaryEmbedding
+
+        cfg = init_args.get("config") or {}
+        head_dim = int(cfg.get("head_dim", 64)) if isinstance(cfg, dict) else 64
+        rotary = YaRNRotaryEmbedding(
+            head_dim,
+            131072,      # max_position_embeddings (GptOssConfig default)
+            150000.0,    # rope_theta
+            scaling_factor=32.0,
+            original_max_position_embeddings=4096,
+            beta_fast=32.0,
+            beta_slow=1.0,
+            truncate=False,
+        )
+        inputs["rotary_emb"] = rotary.to(device).eval()
+
+    if op == "mxfp4_moe":
+        _prepare_mxfp4_moe_inputs(inputs, device)
 
     if op == "fp8_linear":
         _prepare_fp8_linear_inputs(inputs)
@@ -1087,6 +1502,52 @@ def _has_nonfinite(value: Any) -> bool:
     if isinstance(value, dict):
         return any(_has_nonfinite(v) for v in value.values())
     return False
+
+
+def _canonicalize_moe_align_output(output: Any, inputs: dict[str, Any]) -> Any:
+    """Order-canonical form of ``moe_align``'s output triple (op-scoped).
+
+    ``MoeAlign`` returns ``(sorted_token_ids, expert_ids,
+    num_tokens_post_padded)`` built by parallel atomic appends, so the order of
+    token ids *within* one expert's block-group differs run to run. That order
+    is not part of the contract: the only consumer,
+    ``tasks/baseline/L2/fused_experts.py:309-354``, uses both arrays purely as
+    gather/scatter index metadata. The buffers are also pre-allocated
+    (``torch.empty``) and only the first ``num_tokens_post_padded`` entries are
+    written, so the tail beyond it is garbage on both sides.
+
+    Canonical form (ported from the codex runner's
+    ``_canonicalize_output_for_target``, runner.py:955): truncate both arrays
+    to the valid padded length, expand ``expert_ids`` from per-block to
+    per-token, and sort by (expert, token id). Expert grouping and the
+    padding sentinel (token id == numel, larger than every real id, so it
+    sorts to the end of its own expert's group) are preserved; a candidate
+    that assigns any token to a different expert, drops a token, or reports a
+    different padded length still mismatches. Applied identically to both
+    sides, before the runner's unmodified comparison; tolerances untouched.
+    """
+    import torch
+
+    if not (isinstance(output, (tuple, list)) and len(output) == 3):
+        return output
+    sorted_token_ids, expert_ids, num_tokens_post_padded = output
+    if not isinstance(num_tokens_post_padded, torch.Tensor):
+        return output
+    valid = int(num_tokens_post_padded.reshape(-1)[0].item())
+    block_size = max(1, int(inputs.get("block_size", 1) or 1))
+    if isinstance(sorted_token_ids, torch.Tensor) and isinstance(expert_ids, torch.Tensor):
+        sorted_token_ids = sorted_token_ids[:valid]
+        expert_ids = expert_ids[:math.ceil(valid / block_size)]
+        if sorted_token_ids.numel() > 0:
+            expanded_experts = expert_ids.repeat_interleave(
+                block_size)[:sorted_token_ids.numel()]
+            token_range = max(int(sorted_token_ids.max().item()) + 1, 1)
+            order = torch.argsort(
+                expanded_experts.to(torch.int64) * token_range
+                + sorted_token_ids.to(torch.int64))
+            sorted_token_ids = sorted_token_ids[order]
+            expert_ids = expanded_experts[order]
+    return type(output)((sorted_token_ids, expert_ids, num_tokens_post_padded))
 
 
 def _abs_rel_errors(baseline_out: Any, candidate_out: Any) -> tuple[float, float]:
@@ -1203,9 +1664,11 @@ def run(op: str, candidate_path: str | None, scenario_filters: list[str] | None,
             input_dtype = R._first_floating_dtype(inputs)
 
             baseline_mod = _instantiate_module(
-                target.target_cls, scenario.init_args, "cuda", dtype=input_dtype)
+                target.target_cls, scenario.init_args, "cuda",
+                dtype=input_dtype, inputs=inputs)
             candidate_mod = _instantiate_module(
-                user_impl, scenario.init_args, "cuda", dtype=input_dtype)
+                user_impl, scenario.init_args, "cuda",
+                dtype=input_dtype, inputs=inputs)
 
             # --- uninitialised baseline parameters (torch.empty) ---
             # Runs BEFORE the perturbation: a NaN parameter survives
@@ -1262,6 +1725,15 @@ def run(op: str, candidate_path: str | None, scenario_filters: list[str] | None,
                 results[scenario.name] = entry
                 continue
 
+            # --- engine-parity FP8 post-processing (after the transfer, so
+            # the transfer itself stays in checkpoint space; see the helper's
+            # docstring). Both sides transform identical transferred values.
+            fp8_groups = _postprocess_fp8_module_weights(baseline_mod)
+            if fp8_groups:
+                _postprocess_fp8_module_weights(candidate_mod)
+                _log(f"{scenario.name}: applied engine FP8 weight "
+                     f"post-processing to {fp8_groups} weight group(s) per side")
+
             # --- correctness: the runner's own comparison, unmodified ---
             baseline_check_inputs = R._clone_inputs(inputs)
             candidate_check_inputs = R._clone_inputs(inputs)
@@ -1285,6 +1757,15 @@ def run(op: str, candidate_path: str | None, scenario_filters: list[str] | None,
                 continue
 
             candidate_out = R._run_forward_once(candidate_mod, candidate_check_inputs)
+
+            if op == "moe_align":
+                # Difference 8 (see module docstring): order within an expert
+                # group is not contractual; canonicalize BOTH sides with the
+                # same key before the runner's unmodified comparison.
+                baseline_out = _canonicalize_moe_align_output(
+                    baseline_out, baseline_check_inputs)
+                candidate_out = _canonicalize_moe_align_output(
+                    candidate_out, candidate_check_inputs)
 
             correct, max_error_ratio, mean_diff = R._merge_correctness(
                 R._compare_outputs(baseline_out, candidate_out),
@@ -1372,6 +1853,29 @@ def main(argv: list[str] | None = None) -> int:
     parser.add_argument("--baseline-identity", action="store_true",
                         help="self-test: candidate := a second baseline instance")
     args = parser.parse_args(argv)
+
+    # The GPT-OSS MXFP4 family runs triton_kernels' persistent matmul_ogs,
+    # whose ragged-TMA load computes addresses outside the activation buffer
+    # (compute-sanitizer: "Warp illegal address ... _p_matmul_ogs_NNT_
+    # bf16xbf16xmxfp4 ... ragged_tma.py:74"; reproduced on BOTH mxfp4_moe and
+    # gpt_oss_decoder, every launch). The stray read is harmless when it lands
+    # on mapped pages -- vLLM production never faults because its VA space is
+    # dense -- but this small per-op process has sparse VA, and the read
+    # faulted reproducibly on gpt_oss_decoder's tokens-1 -> tokens-4 scenario
+    # transition (allocator-layout dependent; tokens-4 alone, or the reversed
+    # order, ran clean). The non-persistent kernel is not an alternative on
+    # SM100 ("Must use persistent kernel and be TMA-compliant for native
+    # MXFP4"). Expandable segments give the allocator one dense mapped arena,
+    # which removes the faulting case (measured: the failing pair goes
+    # 2/2 PASSED). Scoped to the affected ops so every other op keeps the
+    # allocator (and therefore its torch.empty garbage distribution, which
+    # the repair step's degeneracy DECISIONS depend on) byte-for-byte
+    # unchanged.
+    _MXFP4_MATMUL_OGS_OPS = ("mxfp4_moe", "gpt_oss_moe", "gpt_oss_decoder",
+                             "gpt_oss")
+    if args.op in _MXFP4_MATMUL_OGS_OPS:
+        os.environ.setdefault("PYTORCH_CUDA_ALLOC_CONF",
+                              "expandable_segments:True")
 
     try:
         if args.baseline_identity and args.candidate:

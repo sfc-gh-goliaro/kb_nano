@@ -869,6 +869,7 @@ layer_norm:
         - 4608
         dtype: bfloat16
 encoder_embeddings:
+  class_name: XLMRobertaEmbeddings
   scenarios:
   - name: tokens-13692/3a8c5d97
     init_args:
@@ -892,6 +893,7 @@ encoder_embeddings:
         - 13692
         dtype: int64
 linear:
+  class_name: Linear
   scenarios:
   - name: gpt-oss-120b-mlp-router/2880x128-tok1
     init_args:
@@ -3411,6 +3413,7 @@ gelu:
         - 4096
         dtype: float16
 encoder_mlp:
+  class_name: EncoderOutput
   scenarios:
   - name: tokens-13692/78c6f4c4
     init_args:
@@ -3686,6 +3689,7 @@ silu:
         - 1024
         dtype: float16
 timestep_embedding:
+  class_name: CombinedTimestepGuidanceTextProjEmbeddings
   scenarios:
   - name: tokens-4/c96c5db2
     init_args:
@@ -4347,6 +4351,7 @@ dense_attention:
         - 64
         dtype: float16
 parallel_linear:
+  class_name: RowParallelLinear
   scenarios:
   - name: llama31-8b-self-attn-o-proj/4096x4096-tok1
     init_args:
@@ -5028,6 +5033,7 @@ flux_attention:
         - 3072
         dtype: bfloat16
 flux_feedforward:
+  class_name: FeedForward
   scenarios:
   - name: tokens-4/00bc078e
     init_args:
@@ -5086,6 +5092,7 @@ flux_feedforward:
         - 3072
         dtype: bfloat16
 ada_layer_norm:
+  class_name: AdaLayerNormZeroSingle
   scenarios:
   - name: tokens-4/9e4677cc
     init_args:
@@ -5124,6 +5131,7 @@ ada_layer_norm:
         - 3072
         dtype: bfloat16
 flux_transformer_block:
+  class_name: FluxTransformerBlock
   scenarios:
   - name: tokens-4/61bc9697
     init_args:
@@ -15088,6 +15096,7 @@ gla_decoder:
         dtype: bfloat16
       use_cache: true
 gla:
+  class_name: GLAForCausalLM
   scenarios:
   - name: tokens-100/17414066
     init_args:
@@ -15682,6 +15691,7 @@ allreduce:
         - 2880
         dtype: bfloat16
 store_kvcache:
+  class_name: StoreKVCacheHND
   scenarios:
   - name: tokens-70616/64586312
     init_args:
@@ -18455,6 +18465,7 @@ gpt_oss_decoder:
         - 2880
         dtype: bfloat16
 gpt_oss:
+  class_name: GptOssForCausalLM
   scenarios:
   - name: tokens-1/cd4c67de
     init_args:
@@ -18622,6 +18633,7 @@ gpt_oss:
         - 16384
         dtype: int64
 parallel_embedding:
+  class_name: ParallelLMHead
   scenarios:
   - name: tokens-1993/b3fc6ea0
     init_args:
@@ -21140,10 +21152,17 @@ flashinfer_decode:
         - 128
         dtype: bfloat16
 rotary_emb:
+  class_name: RotaryEmbedding
   scenarios:
   - name: tokens-1/3516df83
     init_args:
       head_dim: 128
+      max_position_embeddings: 131072
+      rope_theta: 500000.0
+      rope_scaling_factor: 8.0
+      rope_low_freq_factor: 1.0
+      rope_high_freq_factor: 4.0
+      rope_original_max_position_embeddings: 8192
       training: false
     inputs:
       key:
@@ -21163,6 +21182,12 @@ rotary_emb:
   - name: tokens-4/21fd8902
     init_args:
       head_dim: 128
+      max_position_embeddings: 131072
+      rope_theta: 500000.0
+      rope_scaling_factor: 8.0
+      rope_low_freq_factor: 1.0
+      rope_high_freq_factor: 4.0
+      rope_original_max_position_embeddings: 8192
       training: false
     inputs:
       key:
@@ -21182,6 +21207,12 @@ rotary_emb:
   - name: tokens-16/bd73e209
     init_args:
       head_dim: 128
+      max_position_embeddings: 131072
+      rope_theta: 500000.0
+      rope_scaling_factor: 8.0
+      rope_low_freq_factor: 1.0
+      rope_high_freq_factor: 4.0
+      rope_original_max_position_embeddings: 8192
       training: false
     inputs:
       key:
@@ -21201,6 +21232,12 @@ rotary_emb:
   - name: tokens-64/026e646f
     init_args:
       head_dim: 128
+      max_position_embeddings: 131072
+      rope_theta: 500000.0
+      rope_scaling_factor: 8.0
+      rope_low_freq_factor: 1.0
+      rope_high_freq_factor: 4.0
+      rope_original_max_position_embeddings: 8192
       training: false
     inputs:
       key:
@@ -21220,6 +21257,12 @@ rotary_emb:
   - name: tokens-16384/b359bac8
     init_args:
       head_dim: 128
+      max_position_embeddings: 131072
+      rope_theta: 500000.0
+      rope_scaling_factor: 8.0
+      rope_low_freq_factor: 1.0
+      rope_high_freq_factor: 4.0
+      rope_original_max_position_embeddings: 8192
       training: false
     inputs:
       key:
@@ -21623,6 +21666,7 @@ llama_decoder:
         - 4096
         dtype: bfloat16
 llama:
+  class_name: LlamaForCausalLM
   scenarios:
   - name: tokens-1/22514e92
     init_args:
@@ -25938,6 +25982,7 @@ vision_patch_merger:
         - 1152
         dtype: bfloat16
 fp8_linear:
+  class_name: Fp8Linear
   scenarios:
   - name: tokens-2304/0036d940
     init_args:
@@ -28453,6 +28498,7 @@ qwen3_moe_decoder:
         - 4096
         dtype: bfloat16
 qwen3_vl:
+  class_name: Qwen3VLForConditionalGeneration
   scenarios:
   - name: tokens-1418/3d2aaa78
     init_args:
@@ -29826,6 +29872,7 @@ yolov10_sppf:
         - 20
         dtype: bfloat16
 softmax:
+  class_name: Softmax
   scenarios:
   - name: tokens-32/d927ac1b
     init_args:
@@ -30039,6 +30086,7 @@ yolov10_cib:
         - 20
         dtype: bfloat16
 yolov10_c2f:
+  class_name: YOLOC2fCIB
   scenarios:
   - name: tokens-32/503a393b
     init_args:
@@ -30390,6 +30438,7 @@ silu_mul_quant_fp8:
       use_ue8m0: true
       eps: 1.0e-10
 tensor_ops:
+  class_name: OneHot
   scenarios:
   - name: tokens-1024/manual_one_hot
     init_args:
@@ -30401,6 +30450,7 @@ tensor_ops:
         dtype: int64
       num_classes: 100
 yarn_rotary_emb:
+  class_name: YarnRotaryEmbedding
   scenarios:
   - name: tokens-512/manual_deepseek_yarn
     init_args:
