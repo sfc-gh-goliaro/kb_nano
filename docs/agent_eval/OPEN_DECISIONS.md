@@ -85,6 +85,21 @@ once, trusted, frozen. Integrates after E1 (same file).
 - **M6**: optional experiment knobs, disclose if used: baseline-seeded AK
   arm (only for ops with portable baselines); showing baseline source to
   the agent as reading material (codex-style).
+- **M7 (baseline-file territory, found by fix stream E1)**:
+  `TRTLLMPrefill.forward` silently drops the `s_aux` (attention sinks) and
+  `window_size` kwargs on the no-block-table path
+  (tasks/baseline/L1/flashinfer_prefill.py:26-55), so gpt-oss's
+  sinks/sliding-window semantics never reach the prefill kernel in the
+  Tier-1 harness context. Symmetric for baseline and candidate (identity
+  unaffected) but those semantics are therefore UNTESTED by Tier-1 for the
+  affected scenarios. Fixing means editing a baseline file — mentor call.
+- **M8 (upstream, found by fix stream E1)**: triton_kernels' `matmul_ogs`
+  ragged-TMA path performs an out-of-range read on every launch on
+  SM100/B200 (compute-sanitizer receipt in stream A's report; faults only
+  when it hits unmapped VA — order-dependent crashes). Grader mitigates
+  with `PYTORCH_CUDA_ALLOC_CONF=expandable_segments:True` scoped to the
+  four matmul_ogs ops. Worth escalating upstream (triton 3.6.0 /
+  triton_kernels) and re-checking on H200 (SM90 uses a different path).
 
 ## RESOLVED (this session; receipts in OP_CENSUS.md + pilot scratch)
 
