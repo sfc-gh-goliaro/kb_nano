@@ -49,16 +49,31 @@ cross-check: diff derived values against the experiments-codex runner's
 hardcoded reconstructions (`bench/kernels/runner.py` on that branch, the
 if/elif chain at ~lines 88-360) — they should agree for the traced models.
 
-**Lane B — dimension-generic ops (linear, embedding, conv2d, layer_norm,
-parallel_linear).** The registry records inputs only (no output shapes, no
-call-site provenance), so the output dimension is unrecoverable from the
-registry. The experiments-codex runner fabricated defaults here (Linear:
-out=in i.e. square; Embedding: dim=128; Conv2d: 1x1) — meaning the PUBLISHED
-per-op numbers for these ops were measured on non-production dimensions.
-DECISION REQUIRED (team level): replicate the fabrications (comparability
-with published numbers) vs reconstruct real call-site dims (production
-fidelity; per-model reasoning or re-trace with output capture). Both are
-small to implement once decided.
+**Lane B — dimension-generic ops (linear, embedding, conv2d,
+parallel_linear; layer_norm turned out input-derivable and belongs to Lane
+A).** The registry records inputs only (no output shapes, no call-site
+provenance), so a Linear scenario's `out_features` is unrecoverable from its
+record. Worse, the tracer deduplicated by input signature, so one record
+BUNDLES several distinct layers (q/o/gate/up_proj all receive the same
+tensor shape) — single-assignment of an `out` per old record is ill-posed,
+not merely hard. The experiments-codex runner fabricated defaults here
+(Linear: out=in i.e. square; Embedding: dim=128; Conv2d: 1x1) — meaning the
+PUBLISHED per-op numbers for these ops were measured on non-production
+dimensions.
+
+RECOMMENDED RESOLUTION (ratify, then ~1 day of work): **static rebuild** —
+walk each of the 9 traced models' module trees on the meta device (config ->
+model class -> no weights, no GPU; works even for the 235B), enumerate every
+real (in, out) call site, regenerate these ops' scenarios per distinct
+(in, out) with leading shapes curated to the standard regimes, retire the
+old bundled records, disclose the fixture correction in the revision.
+Expected scenario growth for `linear`: 66 -> roughly 130-260 (exact count
+falls out of the enumeration). Alternatives considered and rejected:
+replicate the fabrications (comparability with a fictional fixture; keep
+only if a transition table is wanted), heuristic single-assignment
+(ill-posed due to bundling), runtime re-trace (dominated — same information,
+plus GPU/download/disk costs; remains the right tool for future wholesale
+registry regeneration), dropping the ops (needless coverage loss).
 
 ## Flags for anyone scoring agents
 
