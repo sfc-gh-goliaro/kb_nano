@@ -26,7 +26,7 @@ no CUDA, empty scenario selection).
 
 Correctness / timing semantics are the release runner's
 (``fastkernels/bench/kernels/runner.py``) -- its comparison helpers, its
-tolerances, its median timing are imported and reused, not reimplemented. Eight
+tolerances, its median timing are imported and reused, not reimplemented. Ten
 deliberate differences from ``run_kernel_benchmark``:
 
 1. **Strict weight transfer.** The runner wraps ``load_state_dict`` in a bare
@@ -69,6 +69,41 @@ deliberate differences from ``run_kernel_benchmark``:
    permutations run to run, so both sides are sorted with the same
    (expert, token) key before the runner's comparison. Scoped to this one op;
    tolerances are untouched. See ``_canonicalize_moe_align_output``.
+9. **``chunk_gla`` is graded at its computation precision.** The FLA kernel
+   assembles its *float32* final state out of bf16-rounded decayed keys whose
+   decay factor comes from Triton's ``ex2.approx``; measured, the BASELINE sits
+   ~1.1e-4 from the fp64-exact value at elements where the fp32 tolerance band
+   is ~1.1e-5. Grading that output under fp32 tolerances therefore demands
+   bit-reproduction of ``ex2.approx`` -- a Triton-only artefact -- rather than
+   semantic correctness. Every tensor of this one op is compared with the
+   runner's low-precision (bf16-class) tolerances on the raw values; see
+   ``_low_precision_tolerances`` for why the values are not cast instead.
+10. **Three cancellation-amplified ops get a second, fp64-oracle pass arm.**
+   ``gpt_oss_moe``, ``chunk_gla`` (its o-path) and ``vision_block`` all
+   subtract nearly-equal large quantities (top-k slot sums, chunk-state vs
+   intra-chunk contributions, pre-norm residuals). A ~2-ULP kernel-level
+   difference -- comfortably inside the band where it is produced -- is
+   amplified to 1.1x-3.1x of the band at the output, so a correct
+   implementation that is not bit-identical to the kernel cannot pass. For
+   gpt_oss_moe the direction was proven: at the offending elements the
+   bf16-rounded fp64-exact slot values reproduce the naive reference exactly,
+   i.e. it is the BASELINE that is one ULP off the truth. Scoped to these three
+   ops, a candidate passes if EITHER (a) it is inside the standard band of the
+   baseline (unchanged behaviour), OR (b) elementwise
+   ``|cand - truth| <= |base - truth| + (atol_low + rtol_low * |truth|)``,
+   where ``truth`` is a float64 evaluation of the operator computed by this
+   harness from the same fixture inputs and the same transferred weights. Arm
+   (b) is evaluated only after arm (a) has already failed, so it can rescue a
+   verdict but never condemn one. Both arms' numbers are reported in the result
+   entry, together with the FlashAttention-style ratio.
+   **Arm (b) currently reports but does not enforce** (``_ORACLE_ARM_ENFORCED``
+   is False): measured, neither it nor the FlashAttention criterion clears the
+   acceptance matrix on all three ops -- the margin criterion fails the very
+   references it exists to rescue, and the FlashAttention criterion is blind on
+   ``gpt_oss_moe``, where the baseline's own worst error against the truth is
+   larger than a semantic bug's. The constant carries the measured numbers.
+   With it False, every op's verdict -- including these three -- is exactly
+   what the pre-M9 harness produced. See ``_FP64_ORACLE_OPS``.
 
 Tolerances are NOT settable from the CLI: they are read from the runner's module
 constants. A calling agent must not be able to loosen its own correctness gate.
@@ -1714,6 +1749,536 @@ def _canonicalize_moe_align_output(output: Any, inputs: dict[str, Any]) -> Any:
     return type(output)((sorted_token_ids, expert_ids, num_tokens_post_padded))
 
 
+# --- Difference 10: the fp64 oracle arm ---------------------------------------
+#
+# WHY these three ops need one. Each subtracts nearly-equal large quantities on
+# the way to its output -- gpt_oss_moe sums signed top-k slot contributions,
+# chunk_gla adds an inter-chunk state term to an intra-chunk attention term of
+# opposite sign, vision_block adds an attention/MLP update to a residual it
+# nearly cancels. Cancellation does not create error, it *reveals* it: the
+# absolute error carried by the large operands survives while the result
+# shrinks, so a difference that is 2 ULP where it is produced is 1.1x-3.1x of
+# the tolerance band by the time it reaches the output. Every one of the ten
+# independently-written pure-torch vision_block variants lands on the same
+# deviation, which is the signature of "the kernel rounds here and torch does
+# not", not of a bug in any of them.
+#
+# WHY AN ORACLE IS THE RIGHT INSTRUMENT. The standard arm asks "is the candidate
+# close to the baseline". At a cancellation element that question is unanswerable
+# without knowing which side is right -- and for gpt_oss_moe the measurement says
+# the baseline is the wrong one (bf16-rounding the fp64-exact slot values
+# reproduces the naive reference bit-for-bit). Arm (b) asks the answerable
+# question instead: "is the candidate at least as accurate as the production
+# baseline, up to the same tolerance band". That never fails an implementation
+# that is at least as good as what we ship, and it cannot be gamed by being
+# wrong, because being wrong moves a candidate away from the truth broadly while
+# the extra allowance |base - truth| is only large at the isolated elements where
+# the baseline itself is inaccurate.
+#
+# HOW THE TRUTH IS BUILT, AND WHY IT IS TRUSTWORTHY.
+#   * It is computed HERE, in the harness, from ``inputs`` (the prepared fixture
+#     dict, which neither module ever sees -- both sides run on clones) and from
+#     ``baseline_sd`` (the state_dict snapshot taken before either forward, i.e.
+#     exactly the tensors the strict transfer copied into the candidate). The
+#     candidate contributes nothing to it, and the same truth would be produced
+#     if the candidate did not exist.
+#   * It is float64 end to end, with no intermediate rounding: every stored
+#     value (bf16 weights, uint8 MXFP4 payloads, fp32 states) is upcast exactly,
+#     so the only error left is fp64 roundoff, ~1e-13 of a bf16 ULP even after
+#     the cancellation amplification that motivates this whole difference.
+#   * It is deterministic and side-independent: pure arithmetic on tensors that
+#     are already fixed before either module runs, no RNG, no kernel autotuning.
+#
+# WHY NOT JUST RUN ``tasks/reference/**`` IN FLOAT64 (the obvious construction).
+# Those files are *kernel mirrors*, not ideal-math references: they deliberately
+# hard-wire fp32 compute and reproduce the production kernel's rounding points,
+# which is what makes them good specification prose and useless as an oracle.
+# Feeding them float64 inputs silently computes in float32 rather than raising:
+#   * ``tasks/reference/L2/gpt_oss_moe.py:230-231`` (``output = zeros_like(...,
+#     dtype=torch.float32)``, ``x_all = hidden_states.float()``) and :244/:261
+#     (``w1[expert].float()``) pin the matmuls to fp32, while :256 and :267
+#     round the SwiGLU output and each slot's contribution back to the input
+#     dtype on purpose ("mirror that rounding"); ``prepare_weight`` (:181)
+#     dequantizes MXFP4 to bfloat16.
+#   * ``tasks/reference/L1/chunk_gla.py:80-90`` rounds the per-chunk state and
+#     the decayed q/k to the input dtype and calls ``.float()`` on every
+#     operand; its own docstring (:8-12) states that mirroring those rounding
+#     points is the point of the file.
+#   * ``tasks/reference/L3/vision_block.py:58`` (LayerNorm ``x.float()``),
+#     :260-266 (rotary in fp32, rounded once) do the same, and :147-151 dispatches
+#     to ``aten._scaled_dot_product_flash_attention``, which has no fp64 kernel
+#     at all.
+# So for all three ops the oracle is written out below as the same naive math in
+# float64. Each is a transcription of the reference's semantics (routing, SwiGLU
+# with the OAI clamps, the GLA recurrence, the pre-norm block wiring) with the
+# fp32/bf16 pins removed -- and it is checked against the baseline on every use:
+# ``oracle_baseline_ratio`` in the result entry is how far the BASELINE sits from
+# the oracle in tolerance units, which would be enormous if the oracle's
+# semantics were wrong, and is ~1 for these ops.
+#
+# FAILURE MODE. Anything unexpected (missing state_dict key, unknown activation,
+# structure mismatch) returns None / False and leaves the standard verdict
+# standing. The oracle never invents a pass it cannot justify.
+
+_FP64_ORACLE_OPS = ("gpt_oss_moe", "chunk_gla", "vision_block")
+
+# Whether arm (b) may CHANGE a verdict. False = the oracle is computed and its
+# numbers are reported, but the verdict is the standard arm's, i.e. grading is
+# byte-identical to the pre-M9 harness for every op including these three.
+#
+# It ships false because the acceptance matrix does not support enforcing
+# either candidate criterion (measured; full tables in the M9 stream report):
+#   * the M9 margin criterion fails the in-tree references it exists to rescue
+#     -- vision_block 5/5 scenarios (1.23-2.20), chunk_gla 2/5 (1.07, 1.50),
+#     gpt_oss_moe 3/5 (1.48, 2.73, 48.9) -- and where it passes gpt_oss_moe it
+#     passes at 0.9995 and 0.997 while a uniform +1% error on the same
+#     candidate scores 1.009, i.e. there is no discrimination left at the
+#     decision point;
+#   * FlashAttention's published 2x criterion (``oracle_flashattn_ratio``)
+#     does pass all three references (0.500 everywhere) and does reject both
+#     negative controls on vision_block (1.67-7.94) and chunk_gla (11.1-127),
+#     but it is BLIND on gpt_oss_moe: the SwiGLU-alpha control scores 0.500 on
+#     all 5 scenarios and the x1.10 gross control scores 0.533-0.546 on 3 of 5.
+#     Its threshold is 2x the baseline's own worst error, and on this fixture
+#     that error reaches 2.5e3 absolute (1.2e5 tolerance bands), which is
+#     larger than the entire signal a semantic bug produces.
+# Flipping this to True enables the M9 criterion exactly as specified.
+_ORACLE_ARM_ENFORCED = False
+
+# e2m1 code -> value (MXFP4). Every entry has at most 2 significant bits, so the
+# dequantized value ``LUT[code] * 2**(e8m0 - 127)`` is exact in fp64 (and, as it
+# happens, already exact in bf16 -- the packed format loses nothing on upcast).
+_FP4_E2M1_VALUES = (0.0, 0.5, 1.0, 1.5, 2.0, 3.0, 4.0, 6.0,
+                    -0.0, -0.5, -1.0, -1.5, -2.0, -3.0, -4.0, -6.0)
+
+
+def _oracle_linear(x: Any, weight: Any, bias: Any) -> Any:
+    """``F.linear`` in fp64 (weight/bias upcast from their stored dtype)."""
+    import torch.nn.functional as F
+
+    return F.linear(x, weight.double(), None if bias is None else bias.double())
+
+
+def _oracle_layer_norm(x: Any, weight: Any, bias: Any, eps: float) -> Any:
+    """LayerNorm over the last axis in fp64 (biased variance, as ``F.layer_norm``)."""
+    import torch
+
+    mean = x.mean(-1, keepdim=True)
+    centered = x - mean
+    var = centered.pow(2).mean(-1, keepdim=True)
+    out = centered * torch.rsqrt(var + eps)
+    if weight is not None:
+        out = out * weight.double()
+    if bias is not None:
+        out = out + bias.double()
+    return out
+
+
+def _oracle_apply_rotary(x: Any, cos: Any, sin: Any) -> Any:
+    """Non-interleaved (NeoX) rotary in fp64 over ``x`` = [batch, seq, heads, dim]."""
+    import torch
+
+    rotary_dim = 2 * int(cos.shape[-1])
+    seqlen = int(x.shape[1])
+    c = torch.cat([cos[:seqlen].double()] * 2, dim=-1)[None, :, None, :]
+    s = torch.cat([sin[:seqlen].double()] * 2, dim=-1)[None, :, None, :]
+    rot = x[..., :rotary_dim]
+    half = rotary_dim // 2
+    rotated = torch.cat((-rot[..., half:], rot[..., :half]), dim=-1)
+    out = rot * c + rotated * s
+    if rotary_dim < int(x.shape[-1]):
+        out = torch.cat([out, x[..., rotary_dim:]], dim=-1)
+    return out
+
+
+def _oracle_vision_block(module: Any, sd: dict[str, Any],
+                         inputs: dict[str, Any]) -> Any:
+    """fp64 truth for ``vision_block`` (tasks/baseline/L3/vision_block.py).
+
+    Pre-norm residual block: ``x + proj(attn(norm1(x)))`` then ``x + mlp(norm2(x))``,
+    with non-causal full attention inside every ``cu_seqlens`` segment and the
+    rotary applied to q and k exactly as ``VisionAttention.forward`` does
+    (concatenate over the batch axis, one cos/sin table for both). Attention is
+    walked per (segment, head) so the fp64 score matrix stays small.
+    """
+    import torch
+
+    x = inputs.get("x")
+    cu = inputs.get("cu_seqlens")
+    cos = inputs.get("rotary_pos_emb_cos")
+    sin = inputs.get("rotary_pos_emb_sin")
+    if not (isinstance(x, torch.Tensor) and isinstance(cu, torch.Tensor)):
+        return None
+    act_name = type(getattr(module.mlp, "act_fn", None)).__name__
+    if act_name == "QuickGELU":
+        def activation(t):
+            return t * torch.sigmoid(1.702 * t)
+    elif act_name == "SiLU":
+        def activation(t):
+            return t * torch.sigmoid(t)
+    else:
+        _log(f"fp64 oracle: unsupported vision_block activation {act_name!r}")
+        return None
+
+    heads = int(module.attn.num_heads)
+    head_dim = int(module.attn.head_dim)
+
+    x64 = x.double()
+    seq_len, batch, _ = x64.shape
+    hidden = _oracle_layer_norm(x64, sd.get("norm1.weight"), sd.get("norm1.bias"),
+                                float(module.norm1.eps))
+    qkv = _oracle_linear(hidden, sd["attn.qkv.weight"], sd.get("attn.qkv.bias"))
+    q_size = heads * head_dim
+    q, k, v = qkv.split([q_size, q_size, q_size], dim=-1)
+    q = q.view(seq_len, batch, heads, head_dim).transpose(0, 1)
+    k = k.view(seq_len, batch, heads, head_dim).transpose(0, 1)
+    v = v.view(seq_len, batch, heads, head_dim).transpose(0, 1)
+    if isinstance(cos, torch.Tensor) and isinstance(sin, torch.Tensor):
+        qk = _oracle_apply_rotary(torch.cat([q, k], dim=0), cos, sin)
+        q, k = qk.chunk(2, dim=0)
+    q = q.reshape(-1, heads, head_dim)
+    k = k.reshape(-1, heads, head_dim)
+    v = v.reshape(-1, heads, head_dim)
+
+    scale = float(head_dim) ** -0.5
+    attn = torch.zeros_like(q)
+    bounds = [int(b) for b in cu.to(torch.int64).tolist()]
+    for i in range(len(bounds) - 1):
+        s0, s1 = bounds[i], bounds[i + 1]
+        if s1 <= s0:
+            continue
+        for h in range(heads):
+            scores = (q[s0:s1, h] @ k[s0:s1, h].transpose(0, 1)) * scale
+            attn[s0:s1, h] = torch.softmax(scores, dim=-1) @ v[s0:s1, h]
+
+    x64 = x64 + _oracle_linear(attn.reshape(seq_len, batch, -1),
+                               sd["attn.proj.weight"], sd.get("attn.proj.bias"))
+    hidden = _oracle_layer_norm(x64, sd.get("norm2.weight"), sd.get("norm2.bias"),
+                                float(module.norm2.eps))
+    hidden = activation(
+        _oracle_linear(hidden, sd["mlp.fc1.weight"], sd.get("mlp.fc1.bias")))
+    return x64 + _oracle_linear(hidden, sd["mlp.fc2.weight"], sd.get("mlp.fc2.bias"))
+
+
+def _oracle_gla_intra_A(q_c: Any, k_c: Any, gc: Any, scale: float,
+                        sub_block: int = 16) -> Any:
+    """fp64 intra-chunk attention matrix (see tasks/reference/L1/chunk_gla.py).
+
+    ``A[l, j] = scale * sum_k q[l,k] k[j,k] exp(gc[l,k] - gc[j,k])`` for j <= l.
+    Blocks strictly below the diagonal are factored through the sub-block's
+    first row so the tensors stay matmul-shaped; the diagonal block is masked
+    before the exponential. Both exponents are <= 0 because ``gc`` is a cumsum
+    of a log-space (non-positive) gate.
+    """
+    import torch
+
+    N, L, H, K = q_c.shape
+    A = q_c.new_zeros((N, H, L, L))
+    for i0 in range(0, L, sub_block):
+        i1 = min(i0 + sub_block, L)
+        gn = gc[:, i0]
+        qi = q_c[:, i0:i1]
+        gi = gc[:, i0:i1]
+        if i0 > 0:
+            qg = qi * torch.exp(gi - gn[:, None]) * scale
+            kg = k_c[:, :i0] * torch.exp(gn[:, None] - gc[:, :i0])
+            A[:, :, i0:i1, :i0] = torch.einsum("nlhk,njhk->nhlj", qg, kg)
+        kj = k_c[:, i0:i1]
+        gj = gc[:, i0:i1]
+        li = i1 - i0
+        diff = gi[:, :, None] - gj[:, None, :]
+        tri = (torch.arange(li, device=q_c.device)[:, None]
+               >= torch.arange(li, device=q_c.device)[None, :])
+        diff = torch.where(tri[None, :, :, None, None], diff,
+                           torch.full_like(diff, float("-inf")))
+        Ad = (qi[:, :, None] * kj[:, None] * torch.exp(diff)).sum(-1) * scale
+        A[:, :, i0:i1, i0:i1] = Ad.permute(0, 3, 1, 2)
+    return A
+
+
+def _oracle_gla_run(q: Any, k: Any, v: Any, g: Any, scale: float, h: Any,
+                    o_out: Any, chunk_size: int = 64) -> Any:
+    """fp64 GLA recurrence over one packed slab; writes ``o_out``, returns state.
+
+    ``S[t] = diag(exp(g[t])) S[t-1] + k[t] (x) v[t]``, ``o[t] = scale q[t]^T S[t]``
+    -- evaluated chunk-wise so the work is matmul-shaped. In fp64 the chunk size
+    is a performance knob only: unlike the production kernel there is no rounding
+    at the chunk boundary, so the result is the exact recurrence to ~1e-16.
+    Slices are upcast per chunk to keep the fp64 footprint bounded.
+    """
+    import torch
+
+    T = int(q.shape[1])
+    for s in range(0, T, chunk_size):
+        e = min(s + chunk_size, T)
+        q_c = q[:, s:e].double()
+        k_c = k[:, s:e].double()
+        v_c = v[:, s:e].double()
+        gc = g[:, s:e].double().cumsum(1)
+        o_c = torch.einsum("nlhk,nhkv->nlhv", q_c * torch.exp(gc), h) * scale
+        o_c = o_c + torch.einsum(
+            "nhlj,njhv->nlhv", _oracle_gla_intra_A(q_c, k_c, gc, scale), v_c)
+        o_out[:, s:e] = o_c
+        g_last = gc[:, -1]
+        kg = k_c * torch.exp(g_last[:, None] - gc)
+        h = h * torch.exp(g_last)[..., None] + torch.einsum(
+            "nlhk,nlhv->nhkv", kg, v_c)
+        del q_c, k_c, v_c, gc, o_c, kg
+    return h
+
+
+def _oracle_chunk_gla(module: Any, sd: dict[str, Any],
+                      inputs: dict[str, Any]) -> Any:
+    """fp64 truth for ``chunk_gla`` (parameter-free: everything is a forward arg)."""
+    import torch
+
+    q, k, v, g = (inputs.get(n) for n in ("q", "k", "v", "g"))
+    if not all(isinstance(t, torch.Tensor) for t in (q, k, v, g)):
+        return None
+    scale = inputs.get("scale")
+    scale = float(q.shape[-1]) ** -0.5 if scale is None else float(scale)
+    initial_state = inputs.get("initial_state")
+    output_final_state = bool(inputs.get("output_final_state", False))
+    cu_seqlens = inputs.get("cu_seqlens")
+
+    B, T, H, K = q.shape
+    V = int(v.shape[-1])
+    o = torch.empty((B, T, H, V), dtype=torch.float64, device=q.device)
+
+    if not isinstance(cu_seqlens, torch.Tensor):
+        h = (initial_state.double().clone() if isinstance(initial_state, torch.Tensor)
+             else torch.zeros((B, H, K, V), dtype=torch.float64, device=q.device))
+        h = _oracle_gla_run(q, k, v, g, scale, h, o)
+        return o, (h if output_final_state else None)
+
+    num_seqs = int(cu_seqlens.numel()) - 1
+    ht = torch.zeros((num_seqs, H, K, V), dtype=torch.float64, device=q.device)
+    bounds = [int(b) for b in cu_seqlens.to(torch.int64).tolist()]
+    for n in range(num_seqs):
+        s0, s1 = bounds[n], bounds[n + 1]
+        if s1 <= s0:
+            continue
+        h = (initial_state[n:n + 1].double().clone()
+             if isinstance(initial_state, torch.Tensor)
+             else torch.zeros((1, H, K, V), dtype=torch.float64, device=q.device))
+        h = _oracle_gla_run(q[:, s0:s1], k[:, s0:s1], v[:, s0:s1], g[:, s0:s1],
+                            scale, h, o[:, s0:s1])
+        ht[n] = h[0]
+    return o, (ht if output_final_state else None)
+
+
+def _oracle_dequant_mxfp4(blocks: Any, scales: Any) -> Any:
+    """Unpack one expert's MXFP4 payload + E8M0 block scales to a dense fp64 tensor.
+
+    ``blocks``: (..., cols // 2) uint8, low nibble = even element (checkpoint
+    convention, verified bitwise against ``triton_kernels...upcast_from_mxfp``
+    by tasks/reference/L1/mxfp4_moe.py). ``scales``: (..., cols // 32) uint8
+    exponents, value = ``2 ** (byte - 127)``. Both factors are exact in fp64,
+    so this loses nothing relative to what the kernel reads.
+    """
+    import torch
+
+    lut = torch.tensor(_FP4_E2M1_VALUES, dtype=torch.float64, device=blocks.device)
+    low = (blocks & 0x0F).long()
+    high = ((blocks >> 4) & 0x0F).long()
+    values = lut[torch.stack([low, high], dim=-1).reshape(*blocks.shape[:-1], -1)]
+    scale = torch.exp2(scales.double() - 127.0)
+    values = values.view(*values.shape[:-1], int(scales.shape[-1]), 32)
+    values = values * scale.unsqueeze(-1)
+    return values.reshape(*values.shape[:-2], -1)
+
+
+def _oracle_gpt_oss_moe(module: Any, sd: dict[str, Any],
+                        inputs: dict[str, Any]) -> Any:
+    """fp64 truth for ``gpt_oss_moe`` (tasks/baseline/L2/gpt_oss_moe.py).
+
+    Router GEMM -> top-k on the raw logits -> softmax over the selected logits
+    (``renormalize=True``) -> per-expert OAI SwiGLU
+    (``s = gate*sigmoid(alpha*gate)``, ``out = s*up + s``, alpha 1.702, gate
+    clamped above at 7 and up clamped to +-7 -- ``triton_kernels/swiglu_details/
+    _swiglu.py::compute_swiglu``, gate/up interleaved even/odd as ``tl.split``
+    reads them) -> gamma-weighted sum over the slots. Tokens are grouped by
+    expert so each expert costs two fp64 GEMMs instead of one per token; the
+    packed weights are dequantized one expert at a time.
+    """
+    import torch
+
+    x = inputs.get("hidden_states")
+    if not isinstance(x, torch.Tensor):
+        return None
+    for key in ("router.weight", "router.bias", "w13_weight", "w13_weight_scale",
+                "w13_bias", "w2_weight", "w2_weight_scale", "w2_bias"):
+        if key not in sd:
+            _log(f"fp64 oracle: gpt_oss_moe state_dict is missing {key!r}")
+            return None
+
+    top_k = int(module.top_k)
+    xf = x.reshape(-1, int(module.hidden_size)).double()
+    logits = _oracle_linear(xf, sd["router.weight"], sd["router.bias"])
+    top_vals, top_ids = torch.topk(logits, top_k, dim=-1)
+    gammas = torch.softmax(top_vals, dim=-1)
+
+    w13, w13_scale = sd["w13_weight"], sd["w13_weight_scale"]
+    w2, w2_scale = sd["w2_weight"], sd["w2_weight_scale"]
+    b13, b2 = sd["w13_bias"].double(), sd["w2_bias"].double()
+
+    out = torch.zeros_like(xf)
+    for expert in sorted(int(e) for e in torch.unique(top_ids).tolist()):
+        rows, slots = (top_ids == expert).nonzero(as_tuple=True)
+        if rows.numel() == 0:
+            continue
+        gate_up = _oracle_linear(
+            xf[rows], _oracle_dequant_mxfp4(w13[expert], w13_scale[expert]),
+            b13[expert])
+        gate = gate_up[:, 0::2].clamp(max=7.0)
+        up = gate_up[:, 1::2].clamp(min=-7.0, max=7.0)
+        s = gate / (1.0 + torch.exp(-1.702 * gate))
+        y = _oracle_linear(
+            s * up + s, _oracle_dequant_mxfp4(w2[expert], w2_scale[expert]),
+            b2[expert])
+        out.index_add_(0, rows, y * gammas[rows, slots].unsqueeze(-1))
+        del gate_up, gate, up, s, y
+    return out.reshape(x.shape)
+
+
+_FP64_ORACLE_BUILDERS = {
+    "gpt_oss_moe": _oracle_gpt_oss_moe,
+    "chunk_gla": _oracle_chunk_gla,
+    "vision_block": _oracle_vision_block,
+}
+
+
+_ORACLE_FAIL = {"margin_ratio": float("inf"), "baseline_ratio": float("inf"),
+                "flashattn_ratio": float("inf"), "max_abs_base_err": float("inf"),
+                "max_abs_cand_err": float("inf"), "structural": True}
+
+
+def _oracle_metrics(baseline_out: Any, candidate_out: Any, truth: Any,
+                    atol: float, rtol: float) -> dict[str, Any]:
+    """Both arm-(b) criteria against the fp64 truth. Fails closed on surprises.
+
+    ``margin_ratio`` (the M9 criterion) =
+        max_e |cand - truth| / (|base - truth| + atol + rtol|truth|)
+    -- elementwise; <= 1.0 means "nowhere farther from the truth than the
+    baseline is, plus one tolerance band".
+
+    ``flashattn_ratio`` (FlashAttention's published correctness test, which
+    compares GLOBAL maxima rather than elements) =
+        max_e |cand - truth| / (2 * max_e |base - truth|)
+    -- <= 1.0 means "the candidate's worst error is at most 2x the worst error
+    of the in-tree implementation". Reported for comparison; see the note in
+    the module docstring for why neither number is currently enforced.
+
+    ``baseline_ratio`` = max_e |base - truth| / (atol + rtol|truth|) is the
+    audit number: how far the production baseline itself sits from the truth,
+    in tolerance bands. It is what would explode if the oracle's semantics were
+    wrong, and it is what makes ``flashattn_ratio`` blind on the MoE.
+    """
+    import torch
+
+    if isinstance(truth, torch.Tensor):
+        if not (isinstance(baseline_out, torch.Tensor)
+                and isinstance(candidate_out, torch.Tensor)):
+            return dict(_ORACLE_FAIL)
+        if baseline_out.shape != truth.shape or candidate_out.shape != truth.shape:
+            return dict(_ORACLE_FAIL)
+        t = truth.double()
+        b = baseline_out.double()
+        c = candidate_out.double()
+        if not (bool(torch.isfinite(t).all()) and bool(torch.isfinite(b).all())
+                and bool(torch.isfinite(c).all())):
+            return dict(_ORACLE_FAIL)
+        band = atol + rtol * t.abs()
+        base_err = (b - t).abs()
+        cand_err = (c - t).abs()
+        return {
+            "margin_ratio": float((cand_err / (base_err + band)).max().item()),
+            "baseline_ratio": float((base_err / band).max().item()),
+            "max_abs_base_err": float(base_err.max().item()),
+            "max_abs_cand_err": float(cand_err.max().item()),
+            "structural": False,
+        }
+
+    if isinstance(truth, (tuple, list)):
+        if not (isinstance(baseline_out, (tuple, list))
+                and isinstance(candidate_out, (tuple, list))):
+            return dict(_ORACLE_FAIL)
+        if not len(truth) == len(baseline_out) == len(candidate_out):
+            return dict(_ORACLE_FAIL)
+        merged = {"margin_ratio": 0.0, "baseline_ratio": 0.0,
+                  "max_abs_base_err": 0.0, "max_abs_cand_err": 0.0,
+                  "structural": False}
+        for t, b, c in zip(truth, baseline_out, candidate_out):
+            part = _oracle_metrics(b, c, t, atol, rtol)
+            for key in ("margin_ratio", "baseline_ratio", "max_abs_base_err",
+                        "max_abs_cand_err"):
+                merged[key] = max(merged[key], part[key])
+            merged["structural"] = merged["structural"] or part["structural"]
+        return merged
+
+    if truth is None:
+        # Nothing to grade at this slot (e.g. ``output_final_state=False``);
+        # a tensor on either side is a structure mismatch, not a free pass.
+        if isinstance(baseline_out, torch.Tensor) or isinstance(candidate_out, torch.Tensor):
+            return dict(_ORACLE_FAIL)
+        return {"margin_ratio": 0.0, "baseline_ratio": 0.0,
+                "max_abs_base_err": 0.0, "max_abs_cand_err": 0.0,
+                "structural": False}
+
+    return dict(_ORACLE_FAIL)
+
+
+def _apply_fp64_oracle_arm(op: str, entry: dict[str, Any], correct: bool,
+                           inputs_correct: bool, module: Any,
+                           state_dict: dict[str, Any], inputs: dict[str, Any],
+                           baseline_out: Any, candidate_out: Any,
+                           standard_ratio: float, runner_mod: Any) -> bool:
+    """Evaluate arm (b) when arm (a) failed; annotate ``entry``; return the verdict.
+
+    With ``_ORACLE_ARM_ENFORCED`` false (the measured default -- see the module
+    docstring) the numbers are reported and the verdict is exactly the standard
+    arm's, so this function is observational for every op.
+    """
+    import torch
+
+    entry["standard_arm_ratio"] = _num(standard_ratio)
+    if correct:
+        entry["oracle_arm"] = "not_evaluated:standard_arm_passed"
+        return True
+
+    truth = None
+    try:
+        truth = _FP64_ORACLE_BUILDERS[op](module, state_dict, inputs)
+    except Exception as exc:  # an unbuildable oracle must not change a verdict
+        _log(f"fp64 oracle unavailable for {op}: {type(exc).__name__}: {exc}")
+    if truth is None:
+        entry["oracle_arm"] = "unavailable"
+        return correct
+
+    m = _oracle_metrics(baseline_out, candidate_out, truth,
+                        runner_mod._LOW_PRECISION_ATOL,
+                        runner_mod._LOW_PRECISION_RTOL)
+    del truth
+    torch.cuda.empty_cache()
+
+    base_err = m["max_abs_base_err"]
+    fa_ratio = (m["max_abs_cand_err"] / (2.0 * base_err)) if base_err > 0 \
+        else float("inf")
+    ok = (not m["structural"]) and m["margin_ratio"] <= 1.0 and inputs_correct
+    entry["oracle_margin_ratio"] = _num(m["margin_ratio"])
+    entry["oracle_baseline_ratio"] = _num(m["baseline_ratio"])
+    entry["oracle_flashattn_ratio"] = _num(fa_ratio)
+    entry["oracle_arm_enforced"] = bool(_ORACLE_ARM_ENFORCED)
+    entry["oracle_arm"] = ("would_pass" if ok else "would_fail") if not \
+        _ORACLE_ARM_ENFORCED else ("passed" if ok else "failed")
+    _log(f"fp64 oracle arm {entry['oracle_arm']}: margin ratio "
+         f"{m['margin_ratio']:.4g}, FlashAttention-style ratio {fa_ratio:.4g} "
+         f"(standard arm {standard_ratio:.4g}; the baseline itself is "
+         f"{m['baseline_ratio']:.4g} tolerance bands / {base_err:.4g} absolute "
+         f"from the truth)")
+    return (correct or ok) if _ORACLE_ARM_ENFORCED else correct
+
+
 def _abs_rel_errors(baseline_out: Any, candidate_out: Any) -> tuple[float, float]:
     """max |b-c| and max |b-c|/|b| over a matching output tree.
 
@@ -1945,17 +2510,27 @@ def run(op: str, candidate_path: str | None, scenario_filters: list[str] | None,
                 # low-precision tolerances on the raw values (see
                 # _low_precision_tolerances for why not a bf16 cast).
                 with _low_precision_tolerances(R):
-                    correct, max_error_ratio, mean_diff = R._merge_correctness(
-                        R._compare_outputs(baseline_out, candidate_out),
-                        R._compare_outputs(
-                            baseline_check_inputs, candidate_check_inputs),
-                    )
+                    output_check = R._compare_outputs(baseline_out, candidate_out)
+                    input_check = R._compare_outputs(
+                        baseline_check_inputs, candidate_check_inputs)
             else:
-                correct, max_error_ratio, mean_diff = R._merge_correctness(
-                    R._compare_outputs(baseline_out, candidate_out),
-                    R._compare_outputs(
-                        baseline_check_inputs, candidate_check_inputs),
-                )
+                output_check = R._compare_outputs(baseline_out, candidate_out)
+                input_check = R._compare_outputs(
+                    baseline_check_inputs, candidate_check_inputs)
+            correct, max_error_ratio, mean_diff = R._merge_correctness(
+                output_check, input_check)
+
+            if op in _FP64_ORACLE_OPS:
+                # Difference 10: second (fp64-oracle) pass arm, consulted only
+                # now that the standard arm has produced its verdict. ``inputs``
+                # is the pristine prepared fixture -- both modules ran on clones
+                # of it -- and ``baseline_sd`` was snapshotted before either
+                # forward, so the truth is independent of the candidate.
+                correct = _apply_fp64_oracle_arm(
+                    op, entry, correct, input_check[0], baseline_mod,
+                    baseline_sd, inputs, baseline_out, candidate_out,
+                    max_error_ratio, R)
+
             out_abs, out_rel = _abs_rel_errors(baseline_out, candidate_out)
             in_abs, in_rel = _abs_rel_errors(baseline_check_inputs, candidate_check_inputs)
             max_abs, max_rel = max(out_abs, in_abs), max(out_rel, in_rel)
