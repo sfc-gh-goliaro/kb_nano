@@ -18,8 +18,9 @@ df -h <big-storage>           # ~25 GB for venvs+repos+dataset
 - **Driver < 580**: CUPTI-13 timing silently degrades to CUDA events —
   numbers then are NOT methodologically comparable to AKO4X's published
   results or to our B200 pilot. Get the driver upgraded first.
-- **claude auth**: campaigns bill someone. For real campaigns use an API key
-  (`export ANTHROPIC_API_KEY=...`) — no five-hour subscription windows
+- **claude auth**: campaigns bill someone. **Decision (2026-07-26): AKO4X
+  campaigns run on Anthropic API billing, not a subscription** — use an API
+  key (`export ANTHROPIC_API_KEY=...`): no five-hour subscription windows
   mid-campaign, clean lab attribution — and set `ENABLE_PROMPT_CACHING_1H=1`
   (restores the 1-hour cache TTL that subscription auth gets by default;
   AKO4X respawns child sessions constantly, so cache TTL is a first-order
@@ -156,9 +157,15 @@ is exported.
    any new agent's number is only comparable to Table 1 if the original
    three ran on the same GPU. (Paper's Table 1 is H200; Appendix E's "H100"
    is an erratum to fix in the revision.)
-5. **ASTRA**: add ninja to its requirements upstream-style; consider a
-   modern-model second row; note o4-mini API retires 2026-10-23 (published
-   config unrunnable after that).
+5. **ASTRA**: add ninja to its requirements upstream-style; note o4-mini API
+   retires 2026-10-23 (published config unrunnable after that).
+   **Model decision (2026-07-26)**: the modern-model second row uses
+   **GPT-5.5** (same provider as the published o4-mini row, so the row-pair
+   isolates the model variable). No code change needed — run with
+   `OPENAI_API_KEY` + `ASTRA_MODEL=<gpt-5.5 id>` and ANTHROPIC_API_KEY unset;
+   `astra_live_smoke.sh` documents both provider modes in its header and
+   guards the env combinations. Verify the exact model id against
+   `/v1/models` before the run.
 
 ---
 

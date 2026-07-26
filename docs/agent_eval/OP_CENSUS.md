@@ -99,6 +99,28 @@ inputs ported/extended from the experiments-codex prep + weight/buffer repair
 
 **85 / 106 fully RUNNABLE** (was 33). Raw data: census_v2.json.
 
+Supersedes three v1 flags above: `flash_attn_varlen` now PASSES identity (the
+v1 "nondeterministic" symptom was invalid unseeded varlen metadata, fixed by
+the entrypoint's seeded structured-input prep — the "do not score" flag is
+lifted), and `moe_grouped_gemm` / `fp8_linear` both pass on B200 (the v1
+deep_gemm crash/assert was garbage-weight-induced, fixed by fp8-aware weight
+prep).
+
+Codex cross-check (2026-07-26, scratch codex_crosscheck.py): replaying the
+experiments-codex runner's init-arg reconstruction formulas over the
+pre-population records and diffing against our populated init_args gives
+43/49 Lane A field agreements. Every disagreement is a codex FABRICATION
+default where ours holds the checkpoint-true value: gla_mlp intermediate
+(codex hidden*4=10240 vs true 6912 — fla derives int(2560*4*2/3) rounded up
+to a 256 multiple; config.json has intermediate_size=null + hidden_ratio=4),
+yolov10 conv/scdown out-channels (codex c2:=c1 / c2:=2*c1 vs real yolov10n
+head/backbone channels), parallel_linear 4096-in (codex square-only vs our
+enumeration carrying BOTH real layers the old bundled record covered:
+llama o_proj 4096->4096 AND gpt-oss o_proj 4096->2880). Lane B by design
+diverges from codex's fabrications (square Linears: ours 21/177 square with
+30 real (in,out) pairs; Embedding dim 128: ours {4096,2880,2560,1152,1024};
+Conv2d 1x1: ours 31/59).
+
 Near-runnable (1-7 failing scenarios each, cause known): attention 14/15
 (one activation-nonfinite scenario), gla 9/10 (one cu_seqlens step-sign
 scenario), gla_decoder 313/320, gla_attention 8-10/10 (intermittent,
