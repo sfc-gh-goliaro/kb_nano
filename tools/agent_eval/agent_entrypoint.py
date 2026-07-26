@@ -641,7 +641,7 @@ def _repair_degenerate_parameters(module: Any, op: str) -> list[str]:
     nonzero content is a real load). Draws use the mxfp4 fixture's bounds:
     payload bytes are unconstrained (every byte is a valid e2m1/int2 pair --
     neither format has NaN/Inf encodings), scale exponents are bounded to
-    [121, 127] (decoded 2^-6 .. 2^0) so activations stay finite. BitNet's
+    [114, 120] (decoded 2^-13 .. 2^-7) so activations stay finite. BitNet's
     ``BitLinear`` (uint8 packed int2 ``weight`` + float ``weight_scale``)
     matches the same payload rule; its float scale takes the float path.
 
@@ -681,7 +681,7 @@ def _repair_degenerate_parameters(module: Any, op: str) -> list[str]:
                 if prepared is None:
                     generator = torch.Generator(device="cpu").manual_seed(
                         _stable_seed(op, name))
-                    low, high = (121, 128) if is_scale else (0, 256)
+                    low, high = (114, 121) if is_scale else (0, 256)
                     prepared = torch.randint(
                         low, high, tuple(param.shape), generator=generator,
                         dtype=torch.uint8).to(param.device)
@@ -1337,10 +1337,10 @@ def _prepare_mxfp4_moe_inputs(inputs: dict[str, Any], device: str) -> None:
 
         w1_raw = _u8(num_experts, 2 * i_pad, hidden_size // 2)
         w1_scale = _u8(num_experts, 2 * i_pad, hidden_size // block,
-                       low=121, high=128)
+                       low=114, high=121)
         w2_raw = _u8(num_experts, hidden_size, i_pad // 2)
         w2_scale = _u8(num_experts, hidden_size, i_pad // block,
-                       low=121, high=128)
+                       low=114, high=121)
         w1_bias = (torch.randn(num_experts, 2 * i_pad, generator=generator,
                                dtype=torch.float32) * 0.02).to(device)
         w2_bias = (torch.randn(num_experts, hidden_size, generator=generator,

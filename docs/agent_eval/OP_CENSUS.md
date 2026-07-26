@@ -18,10 +18,20 @@ Ops needing special handling, all closed and verified:
   (`tools/agent_eval/allreduce_runner.py`), analytic ground truth; 15/15.
 - `oasis_rollout` — forward takes whole sub-models; the grader builds the
   DiT+VAE fixture in trusted code.
-- `gpt_oss_moe`, `chunk_gla`, `vision_block` — gradeable, but their
-  cancellation structure means non-bit-identical implementations exceed
-  the 1% band; see the fp64-oracle dual-gate policy in OPEN_DECISIONS
-  history. Excluded from the packaged task menu until that lands.
+- `chunk_gla`, `vision_block` — non-bit-identical implementations exceed
+  the 1% band because these ops cancel nearly-equal large quantities. Two
+  candidate gates were built and BOTH measured unshippable (the margin
+  criterion fails the references it should rescue; FlashAttention's 2x
+  criterion is blind on ill-conditioned ops), so the harness ships the
+  fp64 oracle as INSTRUMENTATION ONLY — campaign JSON carries
+  `oracle_*` audit numbers, verdicts are unchanged, and these two stay
+  out of the packaged task menu.
+- `gpt_oss_moe` — RESOLVED, and it was our bug: the harness drew packed
+  MXFP4 fixture weights without fan-in scaling (the float path scales by
+  1/sqrt(fan_in), the packed path did not), inflating expert activations
+  ~sqrt(2880)x and manufacturing the cancellation. With scale exponents
+  matched to fan-in the naive reference grades at 0.09-0.15 of the
+  ordinary 1% band -- no special case needed.
 
 Task menu: see `PACKAGING_REPORT.md` in the generated dataset dir (the
 authoritative list; every seed is grader-verified before shipping).
