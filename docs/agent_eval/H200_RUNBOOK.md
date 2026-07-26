@@ -115,6 +115,20 @@ Correctness inside these campaigns is computed by
 STRICT weight-transfer check, tolerances fixed from the runner's constants
 (deliberately not overridable by the agent's config.toml).
 
+**Anti-gaming stack for kb campaigns (know what's active):** AK's native
+`cheat_check` is a SKIPPED stub in our adapter (kb outputs don't fit its
+pointer/mutation probes), so for kb tasks the load-bearing layers are
+(1) the grader's design — strict weight transfer, seeded parameter
+perturbation, fixed tolerances — (2) the master agent's code inspection of
+candidate kernels (MASTER.md round loop; sub agents never see the grader
+internals they'd need to game), and (3) the negative-control battery
+(`tools/agent_eval/controls/`) re-run after any grader edit to prove the
+checker still discriminates: each file is a known-wrong kernel that must
+FAIL. Controls test the GRADER, not the candidate — they exist because a
+vacuous fixture (flux_attention's zero-vs-zero "PASS", the weight=ones
+blind spot) is invisible to candidate inspection: an honest kernel passes
+a powerless test with nothing suspicious to see.
+
 ## 4. Budget anchors
 
 AKO4X's published campaigns: 4-50 h GPU wall-clock per operator family,
@@ -135,6 +149,10 @@ is exported.
 | git clone/checkout fails with `git-lfs: not found` | `export PATH=<VENVS_DIR>/bin:$PATH` (user-level git-lfs installed by the script) |
 
 ## 6. Named follow-up tasks (not in the pilot)
+
+> Every decision awaiting mentor/team ratification is consolidated in
+> **OPEN_DECISIONS.md** (same directory) with plain-language context —
+> read that first; the items below are the original working notes.
 
 1. **Populate the 61 CONFIG-blocked ops** — see `OP_CENSUS.md` for the
    measured per-op survey (33 runnable today / 61 config-blocked / 7 mixed /
