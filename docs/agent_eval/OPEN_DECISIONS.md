@@ -1,10 +1,10 @@
-# Open items (mentor)
+# Open items
 
 Everything previously listed here was decided by the author and executed
 on this branch — full decision record and rationale live in the git
 history of this file (see `git log --follow docs/agent_eval/OPEN_DECISIONS.md`,
 esp. commits 3478fb6, 22a55c2, 2e8f59c) and the commit messages carrying
-per-change verification tallies. Only genuinely open items remain below.
+per-change verification tallies. Only genuinely open items remain below — for the team / whoever runs and merges this.
 
 ## OPEN-1 — Route the upstream Triton bug (M8)
 
@@ -25,12 +25,13 @@ and may be unaffected.
 and candidate, so grading verdicts are unaffected — but those semantics
 are untested at Tier-1. The author directed: fix only if confirmed a bug
 with certainty; the investigation is running. If a fix lands it is a
-baseline-file edit — review that hunk specifically in the merge PR.
+baseline-file edit — reviewers should look at that hunk specifically in
+the merge PR.
 
 ## OPEN-3 — Merge-PR review
 
 The branch carries author-decided changes that alter benchmark semantics
-and therefore deserve your eyes at merge time: the Lane-B fixture rebuild
+and therefore deserve reviewer attention at merge time: the Lane-B fixture rebuild
 (real dims replacing fabricated ones), the op→class pins, two scoped
 comparison differences (moe_align canonicalization; chunk_gla computation-
 precision grading), the fp64-oracle dual gate for three cancellation-

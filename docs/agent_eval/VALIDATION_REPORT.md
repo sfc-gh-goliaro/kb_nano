@@ -162,7 +162,7 @@ paths" pattern as the paper's headline result.
    preflight.
 3. **Full-clean-state setup run** — the setup script was verified idempotent
    over existing state; a from-scratch run on a blank machine is exactly what
-   the mentor's H200 setup will be (script is the recipe; ~10 GB of wheel
+   the target H200 setup will be (script is the recipe; ~10 GB of wheel
    downloads were not re-downloaded here to conserve the shared /raid, which
    sits at 100% with ~156 GB free).
 4. **ASTRA multi-iteration loop, merge/silu kernels, prompts.py contents** —
