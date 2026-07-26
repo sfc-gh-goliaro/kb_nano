@@ -61,7 +61,7 @@ not merely hard. The experiments-codex runner fabricated defaults here
 PUBLISHED per-op numbers for these ops were measured on non-production
 dimensions.
 
-RECOMMENDED RESOLUTION (ratify, then ~1 day of work): **static rebuild** —
+RECOMMENDED RESOLUTION (ratify, then execute; done 2026-07-25): **static rebuild** —
 walk each of the 9 traced models' module trees on the meta device (config ->
 model class -> no weights, no GPU; works even for the 235B), enumerate every
 real (in, out) call site, regenerate these ops' scenarios per distinct

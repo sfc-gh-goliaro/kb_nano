@@ -219,6 +219,6 @@ function per run (verified in source: codegen prompt "Generate ... CUDA
 source code (.cu)", extract/is_valid_cuda_code filters, single PyBind
 export) — fits single-kernel L1s only; a composite L2/L3 candidate is not
 representable without rewriting its core loop; (d) an L1-subset fork is
-feasible (~2-4 days: _import_callable fix + per-op testgen scaffolding +
+feasible (bounded scope: _import_callable fix + per-op testgen scaffolding +
 naive .cu seeds) and documented here in case the team wants the extra row —
-but the same days buy more as AKO4X campaign coverage.
+but the same effort buys more as AKO4X campaign coverage.

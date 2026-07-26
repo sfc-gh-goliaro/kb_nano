@@ -91,17 +91,19 @@ group (15/15 RUNTIME_ERROR by construction). Reconciling the record
 So: running allreduce IS possible on any >=4-GPU box with working NCCL
 (incl. our B200 node and the H200 cluster); what's missing is harness
 code. ASK THE MENTOR whether the 4-rank harness source still exists
-privately; if not, options: rebuild it (~day: torchrun 4 ranks,
-broadcast inputs, rank-0 compare + collective timing, reusing the
-engine's process-group setup), or keep the op out of agent campaigns
-with the paper's own disclosure.
+privately; if not, options: rebuild it (fully specified, no discovery
+needed: torchrun 4 ranks, broadcast inputs, rank-0 compare + collective
+timing, reusing the engine's process-group setup), or keep the op out of
+agent campaigns with the paper's own disclosure.
 
 ## D7. Decoder L3 wiring (llama_decoder, gpt_oss_decoder, qwen3_moe_decoder)
 
 Identity fails on harness plumbing, not configs: rotary-embedding forward
 argument, decode-path KV-cache API, fp8-inside-module. Recipes in
-drill2_merged.json (pilot scratch) + OP_CENSUS residuals. ~day of work to
-unlock 3 high-value composite ops. Do, or accept the coverage gap.
+drill2_merged.json (pilot scratch) + OP_CENSUS residuals. Recipes are
+written; remaining work is implementation + identity verification, no
+unknowns identified. Unlocks 3 high-value composite ops. Do, or accept
+the coverage gap.
 
 ## D8. oasis_block + oasis spatial/temporal attention: module-arg builders
 
@@ -121,9 +123,10 @@ paper-relevant finding on its own. Decide: fix now vs disclose.
 
 Decided (2026-07-26): run ASTRA as published on its own kernels, second
 row with GPT-5.5 (see runbook); do NOT port to kb. Reopen only if the
-team wants the extra benchmark row badly enough to spend ~2-4 days on an
-L1-subset fork (single-.cu-function candidate format is the wall;
-reasoning in the runbook's ASTRA section).
+team wants the extra benchmark row enough to fund an L1-subset fork
+(scope: _import_callable fix + per-op test scaffolding + naive .cu seeds;
+single-.cu-function candidate format is the wall; reasoning in the
+runbook's ASTRA section).
 
 ## D11. Model IDs to verify at run time (cannot be verified from here)
 
