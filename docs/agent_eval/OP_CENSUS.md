@@ -1,4 +1,39 @@
-# Op census: what is evaluable today (B200, 2026-07-25)
+# Op census — current state
+
+**Scoreboard (2026-07-26, final pass): 103 of 106 registry ops fully
+RUNNABLE** under the Tier-1 grader (baseline builds from registry
+init_args -> strict weight transfer -> recorded inputs -> compare).
+Started this effort at 33.
+
+The 3 residuals are by design, not defects:
+
+| op | why | where its correctness lives |
+|---|---|---|
+| llama | identity needs two whole-model copies on one GPU | e2e tier (token-matching vs vLLM) |
+| gpt_oss | same | e2e tier |
+| qwen3_vl | same | e2e tier |
+
+Ops needing special handling, all closed and verified:
+- `allreduce` — graded by its own multi-rank harness
+  (`tools/agent_eval/allreduce_runner.py`), analytic ground truth; 15/15.
+- `oasis_rollout` — forward takes whole sub-models; the grader builds the
+  DiT+VAE fixture in trusted code.
+- `gpt_oss_moe`, `chunk_gla`, `vision_block` — gradeable, but their
+  cancellation structure means non-bit-identical implementations exceed
+  the 1% band; see the fp64-oracle dual-gate policy in OPEN_DECISIONS
+  history. Excluded from the packaged task menu until that lands.
+
+Task menu: see `PACKAGING_REPORT.md` in the generated dataset dir (the
+authoritative list; every seed is grader-verified before shipping).
+
+Raw data: `census_v3.json` / `census_final.json` + per-op receipts in the
+pilot scratch. Everything below this line is the historical record of how
+the number moved 33 -> 103; it contains superseded statements and is kept
+for audit only.
+
+---
+
+# [HISTORY] Census v1 (2026-07-25) — SUPERSEDED
 
 Method: for every operator in the shape registry (106), run the entrypoint's
 baseline-identity check (build baseline twice from registry init_args -> strict

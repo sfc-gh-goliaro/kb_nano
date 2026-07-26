@@ -192,7 +192,8 @@ class TRTLLMPrefill(nn.Module):
 
     def forward(self, q, k, v, cu_seqlens_q, cu_seqlens_k,
                 max_seqlen_q, max_seqlen_k, softmax_scale=None,
-                causal=True, block_table=None, **kwargs):
+                causal=True, block_table=None, window_size=None,
+                s_aux=None, **kwargs):
         del max_seqlen_q, max_seqlen_k, kwargs
         if block_table is not None and k.ndim == 4:
             k_parts = []
@@ -212,4 +213,5 @@ class TRTLLMPrefill(nn.Module):
             q, k, v, cu_seqlens_q, cu_seqlens_k,
             softmax_scale=softmax_scale if softmax_scale is not None else self.sm_scale,
             causal=causal,
+            window_size=window_size, s_aux=s_aux,
         )

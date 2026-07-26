@@ -5,8 +5,8 @@ works verbatim:
 
 ```bash
 export KB_REPO=~/kb_agent_eval          # this repo, branch agent-eval-pilot
-export AGENTS_DIR=<big-storage>/agents  # AKO4X + ASTRA clones + datasets
-export VENVS_DIR=<big-storage>          # venv_ako4x / venv_astra live here
+export AGENTS_DIR=<big-storage>/agents  # AKO4X clone + datasets
+export VENVS_DIR=<big-storage>          # venv_ako4x lives here
 export KB_MAIN_PY=<kb-main-venv>/bin/python   # kb-nano stack: torch 2.10+cu128-era,
                                               # flash_attn, flashinfer (build from
                                               # this repo's pyproject if absent)
@@ -16,6 +16,15 @@ export GPUS=0,1,2,3                     # the GPUs campaigns may use
 Everything was validated end-to-end on an 8xB200 machine (evidence:
 VALIDATION_REPORT.md and the pilot scratch — reference material only, not
 needed to run). H200-specific caveats are marked H200:.
+
+**Scope note:** this pilot evaluates **AKO4X** on the kb benchmark.
+**ASTRA was evaluated and DROPPED** (2026-07-26): its agents emit one
+self-contained CUDA function per run, so kb's composite production
+modules are not expressible as ASTRA candidates, and running it on its own
+built-in kernels would add no row to our table. Its patch and smoke script
+remain in `tools/agent_eval/` as inert artifacts for the reviewer
+response; the setup script still builds its venv. Reasoning:
+`git log --follow docs/agent_eval/OPEN_DECISIONS.md` (commit 3478fb6).
 
 ## 0. Preflight (minutes)
 
@@ -118,15 +127,22 @@ campaigns start fresh families (by design).
 |---|---|
 | `Incompatible CUPTI Library ... libcupti.so.12` | venv not built by setup script (it installs a `.pth` preload) |
 | `ValidationError: Definition reference Field required` | dataset not at pin 37c121a |
-| sgl_kernel `undefined symbol ...c10_cuda_check...` | torch >= 2.10 in venv_astra; must be 2.9.1 |
 | headless claude does nothing / "not trusted" | pass `--allowedTools "Bash,Read,Edit,Write,Glob,Grep"` |
-| ASTRA `no attribute 'sgl_fused_add_rmsnorm'` | pass `--baseline-func fused_add_rmsnorm --generated-export-func sgl_fused_add_rmsnorm` (smoke script does) |
-| `Ninja is required` | keep venv_astra bin on PATH |
 | matmul_ogs illegal memory access (mxfp4 ops) | known upstream ragged-TMA OOB (SM100); grader auto-sets `PYTORCH_CUDA_ALLOC_CONF=expandable_segments:True` for those ops; re-check on H200 (M8) |
 
-## 6. What needs your decision (not blocking the run)
+## 6. Open items (read before merging)
 
-See OPEN_DECISIONS.md — a decision RECORD, mostly already decided by the
-author; what remains with you: the merge-PR review itself, routing the M8
-upstream Triton bug report, and M7's outcome if its investigation
-confirms a baseline fix.
+See **OPEN_DECISIONS.md** — three items, none blocking a campaign run:
+1. Route the upstream Triton bug (SM100 `matmul_ogs` out-of-range read;
+   the grader already mitigates it, but it should be reported and
+   re-checked on H200).
+2. Rebase onto release `a863ded` and re-grade the two moe ops whose
+   baselines it changes (recipe in the doc).
+3. Merge-PR review — the branch changes benchmark semantics in named,
+   deliberate ways (fixture rebuild, op->class pins, two scoped
+   comparison differences, the fp64-oracle gate, the repaired reference
+   corpus, the multi-rank allreduce harness). Each commit message states
+   what was verified and how.
+
+Everything else was decided and executed; the decision history is in
+`git log --follow docs/agent_eval/OPEN_DECISIONS.md`.

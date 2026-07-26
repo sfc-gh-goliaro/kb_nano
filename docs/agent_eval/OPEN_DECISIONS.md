@@ -17,16 +17,16 @@ affected ops. Worth filing upstream (triton 3.6.0 / triton_kernels) with
 the receipts, and re-checking on H200 — SM90 uses a different code path
 and may be unaffected.
 
-## OPEN-2 — M7 outcome (pending in-flight investigation)
+## OPEN-2 — Rebase onto the newest release commit
 
-`TRTLLMPrefill.forward` silently drops the `s_aux` (attention sinks) and
-`window_size` kwargs on its no-block-table path
-(tasks/baseline/L1/flashinfer_prefill.py:26-55). Symmetric for baseline
-and candidate, so grading verdicts are unaffected — but those semantics
-are untested at Tier-1. The author directed: fix only if confirmed a bug
-with certainty; the investigation is running. If a fix lands it is a
-baseline-file edit — reviewers should look at that hunk specifically in
-the merge PR.
+This branch is based on release `28cf517`. A newer release commit
+(`a863ded`, "Qwen3 h200 fix") changes two baselines we sit downstream of:
+`moe_grouped_gemm`'s kernel-config heuristic (new block-wise FP8 branch)
+and `moe_align`. Our repaired references mirror the OLD heuristic, so
+after rebasing, re-grade `moe_grouped_gemm` and `fused_experts`
+(reference-as-candidate) and `moe_align` (identity + the canonicalization
+control) and update the mirrors if the selected config changed. Nothing
+else in that commit touches our files.
 
 ## OPEN-3 — Merge-PR review
 

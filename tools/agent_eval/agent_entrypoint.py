@@ -1322,6 +1322,107 @@ def _prepare_mxfp4_moe_inputs(inputs: dict[str, Any], device: str) -> None:
     inputs["w1"], inputs["w2"], inputs["quant_config"] = cached
 
 
+# One (model, vae) fixture pair per distinct problem geometry, built ONCE per
+# process; the draws happen inside a fork_rng'd CPU stream seeded from the op
+# name (not the per-scenario RNG), so the fixture is bit-identical no matter
+# which scenario runs first or whether --scenarios filtered the selection.
+_OASIS_ROLLOUT_MODULE_CACHE: dict[tuple, tuple] = {}
+
+
+def _prepare_oasis_rollout_inputs(inputs: dict[str, Any], device: str) -> None:
+    """Materialise the DiT + VAE sub-networks ``oasis_rollout`` needs.
+
+    ``tasks/baseline/L3/oasis_rollout.py:69-81`` -- ``OasisRollout.forward(
+    model, vae, prompt, actions, ...)`` -- takes the ENTIRE Oasis diffusion
+    transformer and VAE decoder as *forward* arguments (the L4 pipeline owns
+    them and passes its own, ``tasks/baseline/L4/oasis.py:74-81,103-113``).
+    The registry records only tensor shapes, so every scenario died with
+    "missing 2 required positional arguments: 'model' and 'vae'". The harness
+    builds both here, in trusted code, exactly as the L4 pipeline does --
+    ``DiT_S_2`` (oasis.py:19-20: patch_size=2, hidden_size=1024, depth=16,
+    num_heads=16, max_frames=32) and ``ViT_L_20_Shallow_Encoder``
+    (oasis.py:23-35: latent_dim=16, patch_size=20, enc 1024x6x16, dec
+    1024x12x16) -- and hands the IDENTICAL instances to both sides as
+    read-only forward inputs (the ``gpt_oss_decoder`` rotary_emb pattern; the
+    runner's ``_clone_inputs`` passes non-tensor values through by
+    reference). Geometry the fixture *does* record is derived from it rather
+    than assumed: ``external_cond_dim`` from ``actions.shape[-1]``, the frame
+    size from ``prompt.shape[-2:]``, and the DiT's latent grid from the frame
+    size over the VAE patch size.
+
+    Construction is wrapped in a CPU ``fork_rng`` seeded from the op name:
+    both nets initialise through the global RNG (``oasis_dit.py:60-83``,
+    ``oasis_autoencoder_kl.py:97-111``), so this keeps the modules
+    reproducible across processes and scenario orders while leaving the
+    per-scenario fixture stream untouched.
+
+    The fresh DiT is deliberately degenerate: ``initialize_weights`` zeroes
+    every adaLN modulation head AND the final projection
+    (``oasis_dit.py:74-83``), so an untouched instance predicts exactly v=0
+    and the rollout output would not depend on the model calls at all -- a
+    candidate that never invokes the DiT would pass vacuously. Running the
+    harness's own ``_repair_degenerate_parameters`` over both sub-networks
+    replaces exactly those all-zero tensors (and the zero-init biases) with
+    seeded non-degenerate values, so the fixture discriminates how the
+    candidate drives the model; the xavier-initialised weights are finite,
+    non-zero, and left untouched. No perturbation: these are fixtures, not
+    the module under test, and they never pass through the weight transfer.
+
+    Kept at construction dtype (fp32): the rollout itself autocasts the DiT
+    calls and the prompt encode to the scenario's fp16
+    (oasis_rollout.py:28-32,54,116) and ``decode_latents`` reads its compute
+    dtype from the VAE's own weights (oasis_rollout.py:63), so the modules'
+    storage dtype is not a scenario knob.
+    """
+    import torch
+
+    prompt = inputs.get("prompt")
+    actions = inputs.get("actions")
+    if not (isinstance(prompt, torch.Tensor) and prompt.ndim == 5
+            and isinstance(actions, torch.Tensor)):
+        return
+    if isinstance(inputs.get("model"), torch.nn.Module) and isinstance(
+            inputs.get("vae"), torch.nn.Module):
+        return
+
+    vae_patch = 20  # ViT-L/20 shallow encoder (oasis.py:23-35)
+    height, width = int(prompt.shape[-2]), int(prompt.shape[-1])
+    external_cond_dim = int(actions.shape[-1])
+    key = (external_cond_dim, height, width, str(device))
+    cached = _OASIS_ROLLOUT_MODULE_CACHE.get(key)
+    if cached is None:
+        from fastkernels.tasks.baseline.L3.oasis_autoencoder_kl import (
+            OasisAutoencoderKL)
+        from fastkernels.tasks.baseline.L3.oasis_dit import OasisDiT
+
+        with torch.random.fork_rng(devices=[]):
+            torch.manual_seed(_stable_seed(
+                "oasis_rollout", "fixture_modules",
+                f"{external_cond_dim}x{height}x{width}"))
+            model = OasisDiT(
+                input_h=height // vae_patch, input_w=width // vae_patch,
+                patch_size=2, hidden_size=1024, depth=16, num_heads=16,
+                external_cond_dim=external_cond_dim, max_frames=32,
+            )
+            vae = OasisAutoencoderKL(
+                latent_dim=16, patch_size=vae_patch,
+                enc_dim=1024, enc_depth=6, enc_heads=16,
+                dec_dim=1024, dec_depth=12, dec_heads=16,
+                input_height=height, input_width=width,
+            )
+        model = model.to(device).eval()
+        vae = vae.to(device).eval()
+        repaired = _repair_degenerate_parameters(model, "oasis_rollout.model")
+        repaired += _repair_degenerate_parameters(vae, "oasis_rollout.vae")
+        _log(f"oasis_rollout: built DiT+VAE fixture modules (latent grid "
+             f"{height // vae_patch}x{width // vae_patch}, external_cond_dim "
+             f"{external_cond_dim}); re-initialised {len(repaired)} zero-init/"
+             f"degenerate tensor(s)")
+        cached = (model, vae)
+        _OASIS_ROLLOUT_MODULE_CACHE[key] = cached
+    inputs["model"], inputs["vae"] = cached
+
+
 def _prepare_moe_grouped_gemm_inputs(inputs: dict[str, Any]) -> None:
     """Block-aligned MoE routing metadata (codex port, verbatim).
 
@@ -1453,6 +1554,9 @@ def _prepare_inputs_for_target(op: str, inputs: dict[str, Any], device: str,
 
     if op == "oasis_patch_embed" and isinstance(inputs.get("x"), torch.Tensor):
         inputs["x"] = inputs["x"].to(torch.bfloat16)
+
+    if op == "oasis_rollout":
+        _prepare_oasis_rollout_inputs(inputs, device)
 
     if op in ("attention", "attention_impl",
               "llama_decoder", "qwen3_moe_decoder", "gpt_oss_decoder"):
@@ -1857,10 +1961,16 @@ def run(op: str, candidate_path: str | None, scenario_filters: list[str] | None,
             max_abs, max_rel = max(out_abs, in_abs), max(out_rel, in_rel)
 
             # --- timing: the runner's median-of-N ---
+            # Identity mode needs correctness, not benchmark-grade timing:
+            # baseline-vs-itself latency is ~1.0x by construction, and the
+            # full median-of-100 protocol costs ~220 forward executions per
+            # scenario (30 min/run on generative-loop ops like
+            # oasis_rollout). Candidate grading keeps the full protocol.
+            n_warm, n_runs = (1, 3) if baseline_identity else (NUM_WARMUP, NUM_RUNS)
             _, baseline_ms = R._time_forward(
-                baseline_mod, R._clone_inputs(inputs), NUM_WARMUP, NUM_RUNS)
+                baseline_mod, R._clone_inputs(inputs), n_warm, n_runs)
             _, candidate_ms = R._time_forward(
-                candidate_mod, R._clone_inputs(inputs), NUM_WARMUP, NUM_RUNS)
+                candidate_mod, R._clone_inputs(inputs), n_warm, n_runs)
 
             entry["status"] = STATUS_PASSED if correct else STATUS_INCORRECT_NUMERICAL
             entry["latency_ms"] = _num(candidate_ms)
