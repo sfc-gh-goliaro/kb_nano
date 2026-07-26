@@ -917,7 +917,7 @@ def main(argv=None) -> int:
     repo = Path(args.repo).resolve()
     args.repo = str(repo)
     if not args.census:
-        args.census = str(repo / "docs" / "agent_eval" / "census_v2.json")
+        args.census = str(repo / "docs" / "agent_eval" / "census_current.json")
     if not args.registry:
         args.registry = str(repo / "bench" / "kernels" / "benchmark_scenarios"
                             / "small" / "shape_registry.yaml")
