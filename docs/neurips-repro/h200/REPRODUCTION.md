@@ -102,6 +102,8 @@ today and are listed for completeness.
 | Vision/Video/Audio | **Whisper** | vLLM | 0.95× / 388.7/444 | **0.83× / match 390.9/444** | dev | ✓ align **today** (fixed) |
 | Vision/Video/Audio | **CosyVoice3** | vllm-omni | 2.13× / mel cos 0.999 | **~2.0× / code2wav mel cos 0.9994** | dev | ✓ **today** |
 | Multimodal/Enc | Qwen2-VL / Qwen3-VL | vLLM | 0.91× / 1.39× | reproduced *(prior)* | dev | ✓ |
+| Multimodal/Enc | **Qwen2-VL-7B (all 3 scenarios)** | vLLM | 0.91× / 539.4 tok | **0.90× (0.98 / 0.86 / 0.85) / 556.8 tok** | dev | ✓ **today** |
+| Multimodal/Enc | **Qwen3-VL-235B-A22B-FP8** | vLLM | 1.68× / 289.8 tok | **1.68× (1.05 / 0.65 / 3.35)** / 201.7 tok | dev | ✓ **today** |
 | Multimodal/Enc | **Qwen-2.5-Omni** | vLLM | 2.02× / exact match 36.2% | vs 0.16: 0.76×; vs 0.18: 1.57× / 22.3%; vs 0.20.1: 1.57× / 19.9% | vLLM venv | ⚠ not reproduced — baseline-version-sensitive |
 | Multimodal/Enc | SigLIP-2 / DINOv3 / SwinV2 | timm | 0.93× / 0.99× / 1.17×, cos 1.000 | reproduced *(prior)* | dev | ✓ |
 | Edge/Detection | MobileNetV4 / ConvNeXtV2 / EfficientNetV2 | timm/transformers | 1.15× / 0.99× / 1.05×, cos 1.000 | reproduced *(prior)* | dev | ✓ |
@@ -120,6 +122,71 @@ today and are listed for completeness.
 | World Models | V-JEPA 2 | transformers | 1.01× / cos 1.000 | reproduced *(prior)* | dev | ✓ |
 
 ### Notes
+- **Qwen2-VL-7B** — the image and video scenarios previously OOMed in the vision
+  tower (`vision_attention` -> `apply_rotary`), so only text-only had ever been
+  run. Both now complete and the row reproduces on **both** metrics: mean
+  speedup **0.90×** vs the paper's 0.91×, mean avg-match-toks **556.8** vs
+  539.4. Per scenario (fastkernels / vLLM out tok/s, speedup, avg match toks):
+  text-only 19,703 / 20,055, 0.98×, 941.5; image 9,303 / 10,800, 0.86×, 331.3;
+  video 1,866 / 2,200, 0.85×, 397.6. Needs **both** an encoder-token cap and
+  extra memory headroom — either alone still OOMs (the failures are ~50-100 MiB
+  short with the KV cache holding 137.9 of 139.8 GiB). Applied automatically by
+  `_PER_MODEL_DEFAULTS` in `tests/bench_vllm.py`
+  (`FASTKERNELS_MAX_ENCODER_TOKENS=4096`, `gpu_memory_utilization=0.80`, the
+  latter applied to *both* engines so the comparison stays symmetric).
+  ```bash
+  python tests/bench_vllm.py --model Qwen/Qwen2-VL-7B-Instruct \
+    --tp 1 --skip-latency --num-seqs 1000 --modality all
+  ```
+- **Qwen3-VL-235B-A22B-FP8** (the commented-out FP8 row in `table_results.tex`)
+  — reproduced today, all three scenarios, 1000 seqs each, vs vLLM 0.18
+  in-process. Per scenario (fastkernels / vLLM out tok/s, speedup, avg match
+  toks): text-only 8,564 / 8,192, 1.05×, 433.3; image 4,420 / 6,819, 0.65×,
+  94.1; video 5,319 / 1,590, 3.35×, 77.5. Mean speedup **1.68×** matches the
+  paper target; mean avg-match-toks is 201.7 vs the paper's 289.8 (0.70).
+  Getting there needed three fixes plus two per-model engine settings:
+  * `moe_align` cached a 1-element buffer created inside `inference_mode()` and
+    then mutated it in place; once torch.compile invokes the op outside that
+    mode it raises `Inplace update to inference tensor`. Fires on every decode
+    step with <= 4 tokens. Now allocated per call, as vLLM does.
+  * The tuned Triton fused-MoE configs were only looked up in a `vllm_repo/`
+    source checkout beside this repo, so in a normal install the lookup missed
+    and we silently used a size heuristic while vLLM used a hand-tuned config
+    for the identical `(E, N, dtype, block_shape)`. Worth **2.1-2.3x on the MoE
+    kernel**. The needed JSONs are now vendored in
+    `tasks/baseline/L1/moe_configs/` (verbatim, Apache-2.0; no runtime
+    dependency on vLLM being importable).
+  * `_preload_mm_data` raised on the first unreadable MMVU clip, discarding
+    every already-completed scenario for both engines. It now skips and counts.
+    This exposed the real problem: `_preload_mm_data` *does* call
+    `snapshot_download` for MMVU, but `HF_HUB_OFFLINE=1` silently degrades that
+    to "return whatever is already cached", and MMVU's metadata caches
+    separately from its clips — so the snapshot held only `validation.json`,
+    there were **zero** `.mp4` files, and all 1000 clips reported "could not
+    open". The loader now checks for clips up front and fails with the actual
+    reason (naming `HF_HUB_OFFLINE` when it is set) plus the one-line fetch
+    command, instead of 1000 opaque decode errors. No manual step is needed for
+    an online run; the clips (583 / 822 MB) download on first use.
+  * `FASTKERNELS_MAX_CUDAGRAPH_BS=1024` — the serving benchmarks use
+    `max_num_seqs=1024`, and batches above the capture cap fall back to *full*
+    eager (vLLM keeps its piecewise-compiled regions above its own 512 cap, so
+    the default penalises us far more). text-only 5,292 -> 8,549 tok/s (+62%).
+  * `FASTKERNELS_MAX_ENCODER_TOKENS=4096` — bounds post-merge vision tokens
+    admitted per prefill step. Without it the vision tower gets a full
+    `max_num_batched_tokens` (= 4x that many patches) in one call and OOMs
+    mid-run *regardless* of `gpu_memory_utilization` (0.9 -> 0.85 freed ~7 GiB
+    of KV cache and it still OOMed with 71 MiB free). 4096 completes; 8192
+    OOMs. Chunking the tower's execution instead was tried and still OOMed,
+    because admission volume also drives the output-embedding and LM-prefill
+    footprint.
+
+  Both settings are applied automatically for this model by
+  `_PER_MODEL_ENGINE_ENV` in `tests/bench_vllm.py`; engine defaults are
+  unchanged, so no other model or path is affected. Reproduce with:
+  ```bash
+  python tests/bench_vllm.py --model Qwen/Qwen3-VL-235B-A22B-Instruct-FP8 \
+    --tp 4 --skip-latency --num-seqs 1000 --modality all
+  ```
 - **DeepSeek-V3.2** — intentionally left blank; decode-heavy regression root-caused
   (unmerged `deepseek-optim` indexer opts + engine plumbing). To resume, see the
   memory note / task #18.
