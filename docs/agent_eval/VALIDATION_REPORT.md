@@ -1,7 +1,7 @@
 # Agent-eval pilot: validation report (B200, catalyst-fleet1, 2026-07-25)
 
 Evidence, not claims: every item lists the command actually run and its key
-output. Raw outputs live in `/raid/user_data/olu/scratch/agent_eval_pilot/`
+output. Raw outputs live in `<pilot-scratch>/`
 (entrypoint test JSONs, driver/stub logs) and in the run dirs cited below.
 Hardware: NVIDIA B200 (cc 10.0), driver 595.58.03, system nvcc 13.2.51.
 
@@ -45,7 +45,7 @@ re-passes all checks.
 
 Runs under the kb main venv against the `agent-eval-pilot` worktree
 (provenance printed and checked: `runner.__file__ =
-/raid/user_data/olu/kb_agent_eval/bench/kernels/runner.py`; all
+<storage>/kb_agent_eval/bench/kernels/runner.py`; all
 `fastkernels.*` modules resolve under the worktree).
 
 | Test | Result |

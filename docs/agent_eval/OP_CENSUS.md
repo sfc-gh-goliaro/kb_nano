@@ -26,7 +26,7 @@ Ops needing special handling, all closed and verified:
 Task menu: see `PACKAGING_REPORT.md` in the generated dataset dir (the
 authoritative list; every seed is grader-verified before shipping).
 
-Raw data: `census_v3.json` / `census_final.json` + per-op receipts in the
+Raw data: `census_current.json` / `census_current.json` + per-op receipts in the
 pilot scratch. Everything below this line is the historical record of how
 the number moved 33 -> 103; it contains superseded statements and is kept
 for audit only.
@@ -39,8 +39,8 @@ Method: for every operator in the shape registry (106), run the entrypoint's
 baseline-identity check (build baseline twice from registry init_args -> strict
 weight transfer -> feed recorded shapes -> compare -> time) in an isolated
 subprocess; then rerun every all-scenarios-fail op once and classify its actual
-error message. Raw data: `census.json` / `drilldown.json` in the pilot scratch
-(`/raid/user_data/olu/scratch/agent_eval_pilot/`), summary tables committed
+error message. Raw data: the pilot scratch dir (superseded) in the pilot scratch
+(`<pilot-scratch>/`), summary tables committed
 here.
 
 ## Headline
@@ -56,8 +56,7 @@ here.
 RUNNABLE (33): batch_norm2d, chunk_retention, conv3d, dense_attention,
 diffusion_rope, flash_attn_decode, flux_pos_embed, fused_experts,
 fused_recurrent_gla, fused_recurrent_retention, gelu, gla_recurrence,
-interpolate, l2_norm, log_sigmoid, max_pool2d, moe_sum, rms_norm, ... (full
-list with per-op tallies in census.json).
+interpolate, l2_norm, log_sigmoid, max_pool2d, moe_sum, rms_norm, ... (full list with per-op tallies in the pilot scratch).
 
 Mixed (7): chunk_gla, flash_attn_prefill, flashinfer_decode (47/56 pass),
 flashinfer_prefill (1/18), flux_attention, moe_align (1/10), store_kvcache
@@ -132,7 +131,7 @@ After registry population (1181 -> 1386 scenarios), the entrypoint upgrade
 inputs ported/extended from the experiments-codex prep + weight/buffer repair
 + fp8 exemptions + non-finite policy), and three post-census data fixes:
 
-**85 / 106 fully RUNNABLE** (was 33). Raw data: census_v2.json.
+**85 / 106 fully RUNNABLE** (was 33). Raw data: superseded (see census_current.json).
 
 Supersedes three v1 flags above: `flash_attn_varlen` now PASSES identity (the
 v1 "nondeterministic" symptom was invalid unseeded varlen metadata, fixed by
