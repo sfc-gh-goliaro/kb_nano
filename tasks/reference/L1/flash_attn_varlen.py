@@ -223,8 +223,8 @@ class FlashAttnVarlen(nn.Module):
             v,
             cu_seqlens_q,
             cu_seqlens_k,
-            softmax_scale,
-            causal,
+            softmax_scale=softmax_scale,
+            causal=causal,
         )
         if not return_softmax_lse:
             return out

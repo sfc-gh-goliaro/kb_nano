@@ -25,7 +25,10 @@ class TRTLLMDecode(nn.Module):
 
     def forward(self, q, k_cache, v_cache, cache_seqlens=None,
                 block_table=None, softmax_scale=None, causal=True,
-                max_seq_len=None, **kwargs):
+                max_seq_len=None, window_size=None, s_aux=None, **kwargs):
+        # ``window_size`` is the FA convention (left, right); ``s_aux`` is the
+        # FA3 name for GPT-OSS attention sinks (one extra logit per head with
+        # value 0). Both change outputs and must never be silently dropped.
         if max_seq_len is None:
             max_seq_len = int(cache_seqlens.max().item())
         return trtllm_batch_decode_with_kv_cache(
@@ -37,5 +40,8 @@ class TRTLLMDecode(nn.Module):
             max_seq_len=max_seq_len,
             bmm1_scale=softmax_scale if softmax_scale is not None else self.sm_scale,
             bmm2_scale=1.0,
+            window_left=int(window_size[0]) if window_size is not None else -1,
+            # The TRTLLM kernel requires fp32 sinks (rejects bf16).
+            sinks=s_aux.to(torch.float32) if s_aux is not None else None,
             kv_layout="HND",
         )

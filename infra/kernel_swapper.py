@@ -35,7 +35,7 @@ from pathlib import Path
 
 import torch.nn as nn
 
-from fastkernels import BASELINE_DIR, CANDIDATE_DIR, KB_ROOT, REFERENCE_DIR
+from fastkernels import BASELINE_DIR, CANDIDATE_DIR, INPUTS_DIR, KB_ROOT, REFERENCE_DIR
 
 _KB_ROOT = KB_ROOT
 _CANDIDATE_DIR = CANDIDATE_DIR
@@ -137,20 +137,66 @@ def _resolve_internal_imports(filepath: Path, visited: set[Path] | None = None) 
     return visited
 
 
-def _find_module_class(mod) -> type | None:
+def _find_module_class(mod, pin: str | None = None) -> type | None:
     """Find the primary nn.Module subclass defined in a target module.
 
-    Returns the last nn.Module class defined in the file, since the
-    top-level class is conventionally the final definition.
+    With ``pin=None`` (default) returns the last nn.Module class defined in
+    the file, since the top-level class is conventionally the final
+    definition.  That convention is wrong for 4 of the 20 multi-class op
+    files (e.g. ``rotary_emb`` traces target ``RotaryEmbedding``, the FIRST
+    class), so the registry can pin an explicit class per op (op-level
+    ``class_name`` key); pass it here to resolve that exact class or raise
+    a clear error if it is absent.
     """
-    result = None
-    for v in vars(mod).values():
+    candidates: dict[str, type] = {}
+    for k, v in vars(mod).items():
         if (isinstance(v, type)
                 and issubclass(v, nn.Module)
                 and v is not nn.Module
                 and v.__module__ == mod.__name__):
-            result = v
-    return result
+            candidates[k] = v
+    if pin is not None:
+        cls = candidates.get(pin)
+        if cls is None:
+            raise ValueError(
+                f"pinned class {pin!r} not found in "
+                f"{getattr(mod, '__file__', mod.__name__)}; nn.Module classes "
+                f"defined there: {sorted(candidates) or '(none)'}"
+            )
+        return cls
+    # dict preserves insertion order == definition order: last class wins.
+    return next(reversed(candidates.values()), None) if candidates else None
+
+
+_CLASS_PINS: dict[str, str] | None = None
+
+
+def registry_class_pin(name: str) -> str | None:
+    """Op-level ``class_name`` pin from the input registry, or None.
+
+    The registry (``shape_registry.yaml`` under ``INPUTS_DIR``) may pin the
+    benchmarked class per op as a sibling of ``scenarios``; ops without a pin
+    keep the last-defined-class rule.  Trees without a registry directory
+    yield no pins, so every existing caller is unaffected.
+    """
+    global _CLASS_PINS
+    if _CLASS_PINS is None:
+        pins: dict[str, str] = {}
+        if INPUTS_DIR.is_dir():
+            import yaml  # deferred: only benchmark trees carry a registry
+
+            for yaml_file in sorted(INPUTS_DIR.glob("*.yaml")):
+                with open(yaml_file) as f:
+                    data = yaml.safe_load(f) or {}
+                if not isinstance(data, dict):
+                    continue
+                for op_name, op_spec in data.items():
+                    cn = (op_spec.get("class_name")
+                          if isinstance(op_spec, dict) else None)
+                    if isinstance(cn, str):
+                        pins[op_name] = cn
+        _CLASS_PINS = pins
+    return _CLASS_PINS.get(name)
 
 
 def _build_model_map() -> dict[str, set[str]]:
@@ -211,7 +257,7 @@ def discover_targets() -> list[BenchTarget]:
                 continue
 
             mod = importlib.import_module(f"{pkg_root}.{module_path}")
-            target_cls = _find_module_class(mod)
+            target_cls = _find_module_class(mod, pin=registry_class_pin(name))
             if target_cls is None:
                 continue
 

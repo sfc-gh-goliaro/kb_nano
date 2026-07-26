@@ -194,7 +194,7 @@ class TRTLLMDecode(nn.Module):
 
     def forward(self, q, k_cache, v_cache, cache_seqlens=None,
                 block_table=None, softmax_scale=None, causal=True,
-                max_seq_len=None, **kwargs):
+                max_seq_len=None, window_size=None, s_aux=None, **kwargs):
         del causal, max_seq_len, kwargs
         if cache_seqlens is None:
             cache_seqlens = torch.full((q.shape[0],), k_cache.shape[2], device=q.device, dtype=torch.int32)
@@ -204,9 +204,12 @@ class TRTLLMDecode(nn.Module):
             seq_len = int(cache_seqlens[i].item())
             k = gather_paged_cache(k_cache, block_table, i, seq_len, hnd=True)
             v = gather_paged_cache(v_cache, block_table, i, seq_len, hnd=True)
+            # dense_attention aligns the query to the end of the keys, so the
+            # sliding window and sink land on the correct decode positions.
             out = dense_attention(
                 q[i:i + 1].unsqueeze(0), k.unsqueeze(0), v.unsqueeze(0),
-                softmax_scale=scale, causal=False,
+                softmax_scale=scale, causal=True,
+                window_size=window_size, s_aux=s_aux,
             ).squeeze(0).squeeze(0)
             outs.append(out)
         return torch.stack(outs, dim=0)

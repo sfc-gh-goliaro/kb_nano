@@ -696,15 +696,25 @@ def _rotate_half(x: torch.Tensor) -> torch.Tensor:
 
 
 def apply_rotary(x: torch.Tensor, cos: torch.Tensor, sin: torch.Tensor) -> torch.Tensor:
-    cos = cos.to(device=x.device, dtype=x.dtype)
-    sin = sin.to(device=x.device, dtype=x.dtype)
-    if cos.shape[-1] * 2 == x.shape[-1]:
-        cos = torch.cat([cos, cos], dim=-1)
-        sin = torch.cat([sin, sin], dim=-1)
-    while cos.ndim < x.ndim:
-        cos = cos.unsqueeze(0)
-        sin = sin.unsqueeze(0)
-    return x * cos + _rotate_half(x) * sin
+    """Rotary embedding matching flash_attn.ops.triton.rotary.apply_rotary.
+
+    ``x``: (batch, seqlen, nheads, headdim); ``cos``/``sin``: (seqlen_ro,
+    rotary_dim / 2).  Non-interleaved (NeoX) rotation applied to the first
+    ``rotary_dim`` features, the rest passed through.  The production kernel
+    computes in fp32 and rounds once when writing back to x.dtype.
+    """
+    rotary_dim = 2 * cos.shape[-1]
+    seqlen = x.shape[1]
+    cos = cos[:seqlen].to(device=x.device, dtype=torch.float32)
+    sin = sin[:seqlen].to(device=x.device, dtype=torch.float32)
+    # (seqlen, rot/2) -> (1, seqlen, 1, rot): same cos/sin for both halves.
+    cos = torch.cat([cos, cos], dim=-1)[None, :, None, :]
+    sin = torch.cat([sin, sin], dim=-1)[None, :, None, :]
+    x_rot = x[..., :rotary_dim].float()
+    out = (x_rot * cos + _rotate_half(x_rot) * sin).to(x.dtype)
+    if rotary_dim < x.shape[-1]:
+        out = torch.cat([out, x[..., rotary_dim:]], dim=-1)
+    return out
 
 
 class VisionAttention(nn.Module):

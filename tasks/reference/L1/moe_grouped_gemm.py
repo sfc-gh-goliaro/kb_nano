@@ -6,17 +6,33 @@ import torch
 import torch.nn as nn
 
 
+_DEFAULT_CONFIG_HEURISTIC = {
+    "small": {
+        "BLOCK_SIZE_M": 16, "BLOCK_SIZE_N": 128, "BLOCK_SIZE_K": 128,
+        "GROUP_SIZE_M": 16, "num_warps": 4, "num_stages": 5,
+    },
+    "medium": {
+        "BLOCK_SIZE_M": 32, "BLOCK_SIZE_N": 128, "BLOCK_SIZE_K": 128,
+        "GROUP_SIZE_M": 64, "num_warps": 4, "num_stages": 3,
+    },
+    "large": {
+        "BLOCK_SIZE_M": 128, "BLOCK_SIZE_N": 256, "BLOCK_SIZE_K": 64,
+        "GROUP_SIZE_M": 16, "num_warps": 8, "num_stages": 4,
+    },
+}
+
+
 def _get_default_config(M: int, E: int = 0, N: int = 0,
                         block_shape: list[int] | None = None) -> dict:
-    del M, E, N, block_shape
-    return {
-        "BLOCK_SIZE_M": 16,
-        "BLOCK_SIZE_N": 128,
-        "BLOCK_SIZE_K": 128,
-        "GROUP_SIZE_M": 16,
-        "num_warps": 4,
-        "num_stages": 5,
-    }
+    """Mirror of the production M-tier heuristic.  BLOCK_SIZE_M matters for
+    correctness, not just speed: in naive mode the per-block gate is
+    ``block * BLOCK_SIZE_M >= num_tokens_post_padded``."""
+    del E, N, block_shape
+    if M <= 4:
+        return dict(_DEFAULT_CONFIG_HEURISTIC["small"])
+    if M <= 64:
+        return dict(_DEFAULT_CONFIG_HEURISTIC["medium"])
+    return dict(_DEFAULT_CONFIG_HEURISTIC["large"])
 
 
 def get_triton_config(M: int, w1_shape: tuple[int, ...], w2_shape: tuple[int, ...],
@@ -71,9 +87,15 @@ def _dequant_a(
     A_f = A.float()
     if a_scale is None:
         return A_f
-    if block_shape is None and a_scale.ndim == 2 and a_scale.shape[0] == A.shape[0]:
-        repeat = (A.shape[1] + a_scale.shape[1] - 1) // a_scale.shape[1]
-        scale = a_scale.float().repeat_interleave(repeat, dim=1)[:, : A.shape[1]]
+    if a_scale.ndim == 2 and a_scale.shape[0] == A.shape[0]:
+        # Activation scales are PER TOKEN-GROUP: row i belongs to token i and
+        # column g scales its g-th group of K features (group = block_shape's
+        # K block).  Never expand along the token axis.
+        if block_shape is not None and len(block_shape) == 2:
+            group = int(block_shape[1])
+        else:
+            group = (A.shape[1] + a_scale.shape[1] - 1) // a_scale.shape[1]
+        scale = a_scale.float().repeat_interleave(group, dim=1)[:, : A.shape[1]]
     else:
         scale = _expand_group_scale(A, a_scale, block_shape)
     return A_f * scale
@@ -116,16 +138,25 @@ class MoeGroupedGemm(nn.Module):
         use_fp8_w8a8: bool = False,
         block_shape: list[int] | None = None,
     ):
-        del num_tokens_post_padded, use_fp8_w8a8
+        del use_fp8_w8a8
         config = _get_default_config(A.size(0)) if config is None else config
         block_size = int(config.get("BLOCK_SIZE_M", 1))
         valid_tokens = A.size(0) * top_k
+        # The kernel gates every block on num_tokens_post_padded
+        # (``pid_m * BLOCK_SIZE_M >= ntpp -> return``) and NEVER zeroes C:
+        # rows it does not compute keep whatever the output buffer held.
+        if isinstance(num_tokens_post_padded, torch.Tensor):
+            ntpp = int(num_tokens_post_padded.reshape(-1)[0].item())
+        else:
+            ntpp = int(num_tokens_post_padded)
         A_deq = _dequant_a(A, a_scale, block_shape)
         flat_weights = topk_weights.reshape(-1).float() if topk_weights is not None else None
-        C.zero_()
 
         if sorted_token_ids is None:
+            # naive mode: block ``row`` handles flat token ``row`` alone
             for row, expert in enumerate(expert_ids.reshape(-1).tolist()):
+                if row * block_size >= ntpp:
+                    continue
                 flat_id = row
                 if flat_id >= valid_tokens or expert < 0:
                     continue
@@ -143,22 +174,24 @@ class MoeGroupedGemm(nn.Module):
 
         sorted_ids = sorted_token_ids.reshape(-1).to(torch.int64)
         for block, expert in enumerate(expert_ids.reshape(-1).tolist()):
+            if block * block_size >= ntpp:
+                continue
             if expert < 0:
                 continue
             start = block * block_size
             end = min(start + block_size, sorted_ids.numel())
+            flat_ids = sorted_ids[start:end]
+            flat_ids = flat_ids[flat_ids < valid_tokens]
+            if flat_ids.numel() == 0:
+                continue
             B_e = _dequant_b(
                 B[int(expert)],
                 b_scale[int(expert)] if b_scale is not None and b_scale.ndim >= 1 else b_scale,
                 block_shape,
             )
-            for flat_id_t in sorted_ids[start:end]:
-                flat_id = int(flat_id_t.item())
-                if flat_id >= valid_tokens:
-                    continue
-                token = flat_id // top_k
-                out = torch.matmul(A_deq[token], B_e.t())
-                if mul_routed_weight and flat_weights is not None:
-                    out = out * flat_weights[flat_id]
-                C[flat_id].copy_(out.to(C.dtype))
+            tokens = torch.div(flat_ids, top_k, rounding_mode="floor")
+            out = torch.matmul(A_deq[tokens], B_e.t())
+            if mul_routed_weight and flat_weights is not None:
+                out = out * flat_weights[flat_ids, None]
+            C[flat_ids] = out.to(C.dtype)
         return C

@@ -134,14 +134,38 @@ def _dequant_mxfp4(
     scales: torch.Tensor,
     dtype: torch.dtype = torch.bfloat16,
 ) -> torch.Tensor:
+    """Unpack flat MXFP4 bytes + E8M0 block scales to a dense tensor.
+
+    ``blocks``: (..., cols // 2) uint8, two FP4 values per byte (low nibble =
+    even element, high nibble = odd element — checkpoint convention; verified
+    bitwise against ``triton_kernels...upcast_from_mxfp``).
+    ``scales``: (..., cols // 32) uint8 E8M0 exponents, one per 32-element
+    group along the last dim; scale = 2 ** (byte - 127).
+
+    Processed expert-by-expert to bound the int64 index transients (a fused
+    unpack of the full expert stack transiently needs ~4x the payload size).
+    """
     lut = _FP4_E2M1_LUT.to(blocks.device)
-    low = (blocks & 0x0F).long()
-    high = ((blocks >> 4) & 0x0F).long()
-    unpacked = torch.stack([low, high], dim=-1).reshape(*blocks.shape[:-1], 32)
-    values = lut[unpacked]
-    scale_float = torch.pow(2.0, scales.float() - 127.0)
-    values = values * scale_float.unsqueeze(-1)
-    return values.reshape(*values.shape[:-2], -1).to(dtype)
+
+    def one(blk: torch.Tensor, scl: torch.Tensor) -> torch.Tensor:
+        low = (blk & 0x0F).long()
+        high = ((blk >> 4) & 0x0F).long()
+        values = torch.stack([low, high], dim=-1).reshape(*blk.shape[:-1], -1)
+        values = lut[values]
+        scale_float = torch.pow(2.0, scl.float() - 127.0)
+        values = values.view(*values.shape[:-1], scl.shape[-1], 32)
+        values = values * scale_float.unsqueeze(-1)
+        return values.reshape(*values.shape[:-2], -1).to(dtype)
+
+    if blocks.ndim <= 2:
+        return one(blocks, scales)
+    out = torch.empty(
+        (*blocks.shape[:-1], blocks.shape[-1] * 2),
+        dtype=dtype, device=blocks.device,
+    )
+    for e in range(blocks.shape[0]):
+        out[e] = one(blocks[e], scales[e])
+    return out
 
 
 class Mxfp4MoE(nn.Module):
@@ -181,13 +205,28 @@ class Mxfp4MoE(nn.Module):
         quant_config: Mxfp4MoEQuantConfig,
         apply_router_weight_on_input: bool = False,
     ) -> torch.Tensor:
-        scores = torch.softmax(gating_output.float(), dim=-1)
-        topk_weights, topk_ids = torch.topk(scores, k=topk, dim=-1)
+        # Routing mirrors the production topk kernel: select top-k on the raw
+        # (bf16) logits with lowest-index tie-breaking, then (renormalize=True)
+        # softmax the SELECTED logits in fp32 and round the weights back to the
+        # logits' dtype -- the fused kernel stores its gate weights in the
+        # input dtype and only upcasts when applying them.
+        logits = gating_output
+        if not renormalize:
+            logits = torch.softmax(logits, dim=-1)
+        work = logits.float().clone()
+        id_cols, val_cols = [], []
+        for _ in range(topk):
+            idx = work.argmax(dim=-1, keepdim=True)   # first index wins ties
+            val_cols.append(logits.float().gather(-1, idx))
+            id_cols.append(idx)
+            work.scatter_(-1, idx, float("-inf"))
+        topk_ids = torch.cat(id_cols, dim=-1)
+        selected = torch.cat(val_cols, dim=-1)
         if renormalize:
-            topk_weights = topk_weights / topk_weights.sum(dim=-1, keepdim=True).clamp_min(1e-20)
+            topk_weights = torch.softmax(selected, dim=-1).to(gating_output.dtype).float()
+        else:
+            topk_weights = selected.to(gating_output.dtype).float()
 
-        w1_dense = w1.float()
-        w2_dense = w2.float()
         output = torch.zeros_like(hidden_states, dtype=torch.float32)
         x_all = hidden_states.float()
 
@@ -202,20 +241,30 @@ class Mxfp4MoE(nn.Module):
                 bias1 = None
                 if quant_config.w1_bias is not None:
                     bias1 = quant_config.w1_bias[expert].float()
-                gate_up = F.linear(x, w1_dense[expert], bias1)
+                gate_up = F.linear(x, w1[expert].float(), bias1)
                 gate = gate_up[0::2]
                 up = gate_up[1::2]
+                # Exact mirror of the fused kernel's OAI SwiGLU:
+                #   s = gate / (1 + exp(-alpha * gate));  out = s * linear + s
+                # with gate clamped above only and linear clamped both ways.
                 gate = gate.clamp(max=7.0)
                 up = up.clamp(min=-7.0, max=7.0)
-                hidden = (up + 1.0) * gate * torch.sigmoid(1.702 * gate)
+                s = gate / (1.0 + torch.exp(-1.702 * gate))
+                hidden = s * up + s
+                # The fused kernel stores the activation in the input dtype
+                # between the two matmuls; mirror that rounding.
+                hidden = hidden.to(hidden_states.dtype).float()
 
                 bias2 = None
                 if quant_config.w2_bias is not None:
                     bias2 = quant_config.w2_bias[expert].float()
-                y = F.linear(hidden, w2_dense[expert], bias2)
+                y = F.linear(hidden, w2[expert].float(), bias2)
                 if not apply_router_weight_on_input:
                     y = y * weight
-                output[token] += y
+                # The fused kernel writes each gamma-weighted slot row to a
+                # scratch buffer in the INPUT dtype and only then reduces the
+                # top-k rows in fp32 -- mirror that per-slot rounding.
+                output[token] += y.to(hidden_states.dtype).float()
 
         return output.to(hidden_states.dtype)
 

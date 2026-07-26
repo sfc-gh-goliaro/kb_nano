@@ -1,0 +1,38 @@
+# Benchmark defaults + per-op_type overrides for kb-nano / fastkernels.
+# [default] values apply to all operators; per-op_type sections (keyed by op_type,
+# e.g. [kb] — match the dataset's definitions/<op_type>/ directory names) override
+# specific fields. To target a single operator, use the op_type its definition
+# lives under; there is no per-operator-name section.
+# These values are merged into the child's config.toml [benchmark] at spawn time.
+# File location is the benchmark-binding marker. The repo assumes a single active
+# benchmark (see CLAUDE.md): switching benchmarks is fork-level — rename this dir
+# and the matching templates/skills/<name>/, not "add a sibling".
+#
+# Which of these kb actually honors: timeout_seconds only. The iteration/trial keys
+# are required by bench_utils._load_benchmark_config() (a renamed key is silently
+# ignored, so they must be present with these names) but kb's runner pins its own
+# protocol: 10 warmup + median of 100, in-process. The tolerance keys are inert for
+# the same reason correctness cannot be relaxed from here — the adapter drops them
+# and kb's per-dtype tolerances decide. See the `benchmark` skill.
+
+[default]
+baseline_iterations = 5
+solution_iterations = 100
+num_trials = 3
+warmup_runs = 3
+# Per WORKLOAD. The kb entrypoint runs every requested workload in ONE subprocess,
+# so the adapter enforces timeout_seconds x n_workloads on that process.
+timeout_seconds = 240
+# FIB-internal isolated runner; kb has no analogue. Isolation here is the
+# subprocess the adapter spawns per bench run — one fresh interpreter, no
+# cross-run state. Leave false so the config doesn't imply a mechanism kb lacks.
+use_isolated_runner = false
+
+[kb]
+# Inert for kb (the adapter drops them; kb's runner constants decide per dtype:
+# bf16/fp16 atol=rtol=1e-2, fp32 atol=1e-5/rtol=1e-3). Emitted so bench_utils
+# finds the keys it expects and so the values a reader sees match kb's bf16 gate
+# rather than suggesting a knob that does not exist.
+atol = 0.01
+rtol = 0.01
+required_matched_ratio = 1.0

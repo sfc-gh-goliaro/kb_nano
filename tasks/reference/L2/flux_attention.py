@@ -43,6 +43,12 @@ class T5LayerNorm(nn.Module):
         return self.weight * hidden_states
 
 
+# The baseline reaches T5LayerNorm through
+# `from ..L1.t5_layer_norm import T5LayerNorm as FP32RMSNorm`
+# (tasks/baseline/L2/flux_attention.py:16); mirror that alias here.
+FP32RMSNorm = T5LayerNorm
+
+
 # Inlined from tasks/reference/L1/diffusion_rope.py
 from typing import Optional, Union
 

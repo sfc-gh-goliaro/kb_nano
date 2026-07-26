@@ -226,6 +226,19 @@ def get_context() -> Context:
     return _CONTEXT
 
 
+def _live_context() -> Context:
+    """Per-batch KV metadata lives in the engine's global Context
+    (``infra/context.py``), the way vLLM reads ``get_forward_context()``.
+    The harness populates THAT context, not this file's inlined copy, so
+    read the live one when the package is importable and only fall back to
+    the inlined default when running this file standalone."""
+    try:
+        from fastkernels.infra.context import get_context as _infra_get_context
+    except Exception:
+        return get_context()
+    return _infra_get_context()
+
+
 def set_context(is_prefill, cu_seqlens_q=None, cu_seqlens_k=None,
                 max_seqlen_q=0, max_seqlen_k=0, slot_mapping=None,
                 context_lens=None, block_tables=None,
@@ -595,7 +608,7 @@ class TRTLLMDecode(nn.Module):
 
     def forward(self, q, k_cache, v_cache, cache_seqlens=None,
                 block_table=None, softmax_scale=None, causal=True,
-                max_seq_len=None, **kwargs):
+                max_seq_len=None, window_size=None, s_aux=None, **kwargs):
         del causal, max_seq_len, kwargs
         if cache_seqlens is None:
             cache_seqlens = torch.full((q.shape[0],), k_cache.shape[2], device=q.device, dtype=torch.int32)
@@ -605,9 +618,12 @@ class TRTLLMDecode(nn.Module):
             seq_len = int(cache_seqlens[i].item())
             k = gather_paged_cache(k_cache, block_table, i, seq_len, hnd=True)
             v = gather_paged_cache(v_cache, block_table, i, seq_len, hnd=True)
+            # dense_attention aligns the query to the end of the keys, so the
+            # sliding window and sink land on the correct decode positions.
             out = dense_attention(
                 q[i:i + 1].unsqueeze(0), k.unsqueeze(0), v.unsqueeze(0),
-                softmax_scale=scale, causal=False,
+                softmax_scale=scale, causal=True,
+                window_size=window_size, s_aux=s_aux,
             ).squeeze(0).squeeze(0)
             outs.append(out)
         return torch.stack(outs, dim=0)
@@ -633,7 +649,8 @@ class TRTLLMPrefill(nn.Module):
 
     def forward(self, q, k, v, cu_seqlens_q, cu_seqlens_k,
                 max_seqlen_q, max_seqlen_k, softmax_scale=None,
-                causal=True, block_table=None, **kwargs):
+                causal=True, block_table=None, window_size=None,
+                s_aux=None, **kwargs):
         del max_seqlen_q, max_seqlen_k, kwargs
         if block_table is not None and k.ndim == 4:
             k_parts = []
@@ -653,6 +670,7 @@ class TRTLLMPrefill(nn.Module):
             q, k, v, cu_seqlens_q, cu_seqlens_k,
             softmax_scale=softmax_scale if softmax_scale is not None else self.sm_scale,
             causal=causal,
+            window_size=window_size, s_aux=s_aux,
         )
 
 
@@ -823,7 +841,7 @@ class Attention(nn.Module):
 
     def forward_impl(self, query: torch.Tensor, key: torch.Tensor,
                      value: torch.Tensor) -> torch.Tensor:
-        ctx = get_context()
+        ctx = _live_context()
         n = query.shape[0]
         q = query.view(n, self.num_heads, self.head_size)
         k = key.view(n, self.num_kv_heads, self.head_size)

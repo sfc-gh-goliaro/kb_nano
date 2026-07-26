@@ -143,10 +143,13 @@ def gather_paged_cache(
     hnd: bool = False,
 ) -> torch.Tensor:
     if block_table is None:
+        # Unpaged cache: 4-D layout is batch-indexed ([batch, seqlen, heads,
+        # dim], or [batch, heads, seqlen, dim] for HND) — sequence ``seq_idx``
+        # owns row ``seq_idx``, so slice per batch rather than flattening.
         if cache.ndim == 4 and hnd:
-            return cache.reshape(-1, cache.shape[1], cache.shape[-1])[:seq_len]
+            return cache[seq_idx].transpose(0, 1)[:seq_len]
         if cache.ndim == 4:
-            return cache.reshape(-1, cache.shape[-2], cache.shape[-1])[:seq_len]
+            return cache[seq_idx, :seq_len]
         return cache[:seq_len]
 
     blocks = block_table[seq_idx]

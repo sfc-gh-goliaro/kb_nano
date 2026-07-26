@@ -1,0 +1,86 @@
+{
+  "name": "kb_rms_norm",
+  "op_type": "kb",
+  "description": "RMSNorm over the last dimension of a 2-D [tokens, hidden] activation tensor, as used by the kb-nano/fastkernels L1 baseline (tasks/baseline/L1/rms_norm.py). 35 scenarios taken verbatim from the kb shape registry (operator 'rms_norm', small suite): hidden sizes [128, 512, 2560, 2880, 4096], token counts 1-542000, eps in [1e-06, 1e-05], dtype bfloat16 for every tensor in every scenario (the kb registry declares no fp16 or fp32 rms_norm scenario). 10 of the 35 scenarios also pass a `residual` tensor: that path is the fused add+norm, and it is IN-PLACE \u2014 `residual := x + residual` and `x := rmsnorm(residual) * weight`, returning `(x, residual)`. The kb harness compares mutated inputs as well as returned outputs, so the mutation is part of the contract.\n\nInterface contract (frozen \u2014 the harness copies the baseline's state_dict into your module and calls it by keyword):\n  class RMSNorm(nn.Module)\n    __init__(self, hidden_size, eps=1e-6, elementwise_affine=True, **kwargs)\n    forward(self, x, residual=None) -> Tensor | (Tensor, Tensor)\n  parameter name `weight` (shape [hidden_size]) when elementwise_affine, else a non-persistent `_unit_weight` buffer.\nRenaming/adding/removing parameters fails the scenario with RUNTIME_ERROR (weight_transfer_incomplete) before any numerics run.",
+  "axes": {
+    "tokens": {
+      "type": "var",
+      "description": "rows of the activation tensor (x.shape[0]); the grouping axis for scoring",
+      "values": [
+        1,
+        4,
+        5,
+        8,
+        16,
+        25,
+        32,
+        64,
+        100,
+        265,
+        500,
+        1600,
+        16384,
+        86960,
+        262144,
+        542000
+      ]
+    },
+    "hidden": {
+      "type": "var",
+      "description": "normalized dimension (x.shape[1]) == hidden_size",
+      "values": [
+        128,
+        512,
+        2560,
+        2880,
+        4096
+      ]
+    },
+    "eps": {
+      "type": "var",
+      "description": "variance epsilon passed to __init__",
+      "values": [
+        1e-06,
+        1e-05
+      ]
+    },
+    "residual": {
+      "type": "var",
+      "description": "whether the scenario passes a residual tensor (fused add+norm, in-place)",
+      "values": [
+        false,
+        true
+      ]
+    }
+  },
+  "inputs": {
+    "x": {
+      "dtype": "bfloat16",
+      "shape": [
+        "tokens",
+        "hidden"
+      ],
+      "description": "activations; mutated in place on the residual path"
+    },
+    "residual": {
+      "dtype": "bfloat16",
+      "shape": [
+        "tokens",
+        "hidden"
+      ],
+      "optional": true,
+      "description": "residual stream; mutated in place (residual := x + residual)"
+    }
+  },
+  "outputs": {
+    "out": {
+      "dtype": "bfloat16",
+      "shape": [
+        "tokens",
+        "hidden"
+      ],
+      "description": "normalized activations; on the residual path the return is the tuple (x, residual) and both alias the mutated inputs"
+    }
+  },
+  "reference": "\"\"\"Seed kernel for the kb_rms_norm task \u2014 a self-contained pure-PyTorch RMSNorm.\n\nThis is the agent's STARTING POINT (spawn.py copies it to solution/kernel.py) and\nalso the definition's `reference` string. It must satisfy the kb candidate\ncontract exactly, because the harness transfers the baseline's weights into it\nand calls it with the baseline's forward signature:\n\n  * class name          : RMSNorm  (matches tasks/baseline/L1/rms_norm.py)\n  * __init__            : (hidden_size, eps=1e-6, elementwise_affine=True, **kwargs)\n                          \u2014 **kwargs swallows scenario init_args the baseline\n                          filters out (e.g. `training`).\n  * parameter name      : `weight` when elementwise_affine, else a NON-persistent\n                          `_unit_weight` buffer \u2014 the baseline's state_dict must\n                          load with no missing/unexpected keys.\n  * forward             : (x, residual=None) -> Tensor | (Tensor, Tensor)\n\nNumerics mirror the baseline's `forward_native` (fp32 variance, rsqrt, cast back\nto the input dtype, then multiply by weight \u2014 vLLM's rms_norm kernel applies the\nweight AFTER the narrowing cast, so the order matters).\n\nThe residual path is IN-PLACE on both `x` and `residual`, mirroring vLLM's\n`fused_add_rms_norm` which the baseline calls: residual := x + residual, then\nx := rmsnorm(residual) * weight. The kb harness compares mutated inputs as well\nas returned outputs, so a functional (non-mutating) residual path would be\nreported as INCORRECT_NUMERICAL even if the returned tensors were right.\n\"\"\"\n\nfrom __future__ import annotations\n\nimport torch\nimport torch.nn as nn\n\n\nclass RMSNorm(nn.Module):\n    def __init__(self, hidden_size: int, eps: float = 1e-6,\n                 elementwise_affine: bool = True, **kwargs):\n        super().__init__()\n        self.hidden_size = hidden_size\n        self.eps = eps\n        self.elementwise_affine = elementwise_affine\n        if elementwise_affine:\n            self.weight = nn.Parameter(torch.ones(hidden_size))\n        else:\n            self.register_buffer(\"_unit_weight\", torch.ones(hidden_size),\n                                 persistent=False)\n\n    def _scale(self, x: torch.Tensor) -> torch.Tensor:\n        w = self.weight if self.elementwise_affine else self._unit_weight\n        if w.dtype != x.dtype or w.device != x.device:\n            w = w.to(device=x.device, dtype=x.dtype)\n        return w\n\n    def forward(self, x: torch.Tensor, residual: torch.Tensor | None = None):\n        weight = self._scale(x)\n        orig_dtype = x.dtype\n\n        if residual is not None:\n            residual.add_(x)                       # residual := x + residual\n            acc = residual.float()\n            var = acc.pow(2).mean(dim=-1, keepdim=True)\n            normed = (acc * torch.rsqrt(var + self.eps)).to(orig_dtype) * weight\n            x.copy_(normed)                        # x := rmsnorm(residual)\n            return x, residual\n\n        acc = x.float()\n        var = acc.pow(2).mean(dim=-1, keepdim=True)\n        return (acc * torch.rsqrt(var + self.eps)).to(orig_dtype) * weight\n"
+}
