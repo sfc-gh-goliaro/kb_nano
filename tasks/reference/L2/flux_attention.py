@@ -769,6 +769,15 @@ def _tensor_model_parallel_all_gather(tensor: torch.Tensor, dim: int = -1) -> to
     return torch.cat(gather_list, dim=dim)
 
 
+# The baseline spells this ``from ..L1.t5_layer_norm import T5LayerNorm as
+# FP32RMSNorm``; inlining drops the alias, so rebind it here.  It has to live
+# in this module's own section rather than inside the inlined t5_layer_norm
+# block: a composite reference emits each inlined block once by path, so an
+# alias parked in a shared block is lost whenever another module contributes
+# that same block first.
+FP32RMSNorm = T5LayerNorm
+
+
 class FluxAttention(nn.Module):
     """Multi-head attention for FLUX diffusion transformer.
 

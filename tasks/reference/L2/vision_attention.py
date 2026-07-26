@@ -8,7 +8,9 @@ for variable-length sequence support within the vision encoder.
 from __future__ import annotations
 
 
-# Inlined from tasks/reference/L1/_attention.py
+# Inlined helper (no baseline task): pure-torch dense/varlen attention
+# and paged-cache gather.  The baselines call flash_attn / vllm_flash_attn
+# here, so there is no baseline file to inline this from.
 import torch
 import torch.nn.functional as F
 

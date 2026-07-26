@@ -1,4 +1,4 @@
-"""Oasis VAE attention block."""
+"""Oasis VAE autoencoder."""
 
 
 from __future__ import annotations
@@ -41,16 +41,6 @@ class LayerNorm(nn.Module):
         ).to(orig_dtype)
 
 
-# Inlined from tasks/reference/L1/gelu.py
-class GELU(nn.Module):
-    def __init__(self, approximate: str = "none"):
-        super().__init__()
-        self.approximate = approximate
-
-    def forward(self, x: torch.Tensor) -> torch.Tensor:
-        return F.gelu(x, approximate=self.approximate)
-
-
 # Inlined from tasks/reference/L1/linear.py
 class Matmul(nn.Module):
     """Pure functional linear: takes input, weight, and optional bias as forward args."""
@@ -77,6 +67,104 @@ class Linear(nn.Module):
 
     def forward(self, input):
         return self.matmul(input, self.weight, self.bias)
+
+
+# Inlined from tasks/reference/L1/conv2d.py
+class Conv2d(nn.Module):
+    """Parametric 2D convolution: stores weight and bias internally."""
+
+    def __init__(
+        self,
+        in_channels: int,
+        out_channels: int,
+        kernel_size: int | tuple[int, int],
+        stride: int | tuple[int, int] = 1,
+        padding: int | tuple[int, int] = 0,
+        groups: int = 1,
+        dilation: int | tuple[int, int] = 1,
+        bias: bool = True,
+    ):
+        super().__init__()
+        if isinstance(kernel_size, int):
+            kernel_size = (kernel_size, kernel_size)
+        if isinstance(stride, int):
+            stride = (stride, stride)
+        if isinstance(padding, int):
+            padding = (padding, padding)
+        if isinstance(dilation, int):
+            dilation = (dilation, dilation)
+
+        self.stride = stride
+        self.padding = padding
+        self.groups = groups
+        self.dilation = dilation
+
+        self.weight = nn.Parameter(
+            torch.empty(out_channels, in_channels // groups, *kernel_size)
+        )
+        self.bias = nn.Parameter(torch.empty(out_channels)) if bias else None
+
+    def forward(self, x: torch.Tensor) -> torch.Tensor:
+        return F.conv2d(
+            x,
+            self.weight,
+            self.bias,
+            stride=self.stride,
+            padding=self.padding,
+            dilation=self.dilation,
+            groups=self.groups,
+        )
+
+
+# Inlined from tasks/reference/L2/oasis_patch_embed.py
+class OasisPatchEmbed(nn.Module):
+    def __init__(
+        self,
+        img_height: int = 256,
+        img_width: int = 256,
+        patch_size: int = 16,
+        in_chans: int = 3,
+        embed_dim: int = 768,
+        norm_layer=None,
+        flatten: bool = True,
+    ):
+        super().__init__()
+        self.img_size = (img_height, img_width)
+        self.patch_size = (patch_size, patch_size)
+        self.grid_size = (img_height // patch_size, img_width // patch_size)
+        self.num_patches = self.grid_size[0] * self.grid_size[1]
+        self.flatten = flatten
+        self.proj = Conv2d(
+            in_chans,
+            embed_dim,
+            kernel_size=self.patch_size,
+            stride=self.patch_size,
+            bias=True,
+        )
+        self.norm = norm_layer(embed_dim) if norm_layer else None
+
+    def forward(self, x: torch.Tensor, random_sample: bool = False) -> torch.Tensor:
+        _, _, height, width = x.shape
+        if not random_sample and (height, width) != self.img_size:
+            raise AssertionError(
+                f"Input image size ({height}*{width}) doesn't match model {self.img_size}.",
+            )
+        x = self.proj(x)
+        if self.flatten:
+            x = x.flatten(2).transpose(1, 2)
+        else:
+            x = x.permute(0, 2, 3, 1)
+        return self.norm(x) if self.norm is not None else x
+
+
+# Inlined from tasks/reference/L1/gelu.py
+class GELU(nn.Module):
+    def __init__(self, approximate: str = "none"):
+        super().__init__()
+        self.approximate = approximate
+
+    def forward(self, x: torch.Tensor) -> torch.Tensor:
+        return F.gelu(x, approximate=self.approximate)
 
 
 # Inlined from tasks/reference/L2/oasis_mlp.py
@@ -266,6 +354,7 @@ class OasisVAEAttention(nn.Module):
         return self.proj(out)
 
 
+# Inlined from tasks/reference/L3/oasis_vae_attention_block.py
 class OasisVAEAttentionBlock(nn.Module):
     def __init__(
         self,
@@ -293,3 +382,160 @@ class OasisVAEAttentionBlock(nn.Module):
         x = x + self.attn(self.norm1(x))
         x = x + self.mlp(self.norm2(x))
         return x
+
+
+class DiagonalGaussianDistribution:
+    def __init__(self, parameters: torch.Tensor, deterministic: bool = False, dim: int = 1):
+        self.parameters = parameters
+        self.mean, self.logvar = torch.chunk(parameters, 2, dim=dim)
+        self.logvar = torch.clamp(self.logvar, -30.0, 20.0)
+        self.deterministic = deterministic
+        self.std = torch.exp(0.5 * self.logvar)
+        self.var = torch.exp(self.logvar)
+        if self.deterministic:
+            self.var = self.std = torch.zeros_like(self.mean, device=self.parameters.device)
+
+    def sample(self) -> torch.Tensor:
+        return self.mean + self.std * torch.randn(self.mean.shape, device=self.parameters.device)
+
+    def mode(self) -> torch.Tensor:
+        return self.mean
+
+
+class OasisAutoencoderKL(nn.Module):
+    def __init__(
+        self,
+        latent_dim: int,
+        *,
+        input_height: int = 360,
+        input_width: int = 640,
+        patch_size: int = 20,
+        enc_dim: int = 1024,
+        enc_depth: int = 6,
+        enc_heads: int = 16,
+        dec_dim: int = 1024,
+        dec_depth: int = 12,
+        dec_heads: int = 16,
+        mlp_ratio: float = 4.0,
+        use_variational: bool = True,
+    ):
+        super().__init__()
+        self.input_height = input_height
+        self.input_width = input_width
+        self.patch_size = patch_size
+        self.seq_h = input_height // patch_size
+        self.seq_w = input_width // patch_size
+        self.seq_len = self.seq_h * self.seq_w
+        self.patch_dim = 3 * patch_size ** 2
+        self.latent_dim = latent_dim
+        self.use_variational = use_variational
+
+        self.patch_embed = OasisPatchEmbed(input_height, input_width, patch_size, 3, enc_dim)
+        self.encoder = nn.ModuleList(
+            [
+                OasisVAEAttentionBlock(
+                    enc_dim,
+                    enc_heads,
+                    self.seq_h,
+                    self.seq_w,
+                    mlp_ratio=mlp_ratio,
+                    qkv_bias=True,
+                )
+                for _ in range(enc_depth)
+            ]
+        )
+        self.enc_norm = LayerNorm(enc_dim, eps=1e-6)
+
+        mult = 2 if self.use_variational else 1
+        self.quant_conv = Linear(enc_dim, mult * latent_dim, bias=True)
+        self.post_quant_conv = Linear(latent_dim, dec_dim, bias=True)
+
+        self.decoder = nn.ModuleList(
+            [
+                OasisVAEAttentionBlock(
+                    dec_dim,
+                    dec_heads,
+                    self.seq_h,
+                    self.seq_w,
+                    mlp_ratio=mlp_ratio,
+                    qkv_bias=True,
+                )
+                for _ in range(dec_depth)
+            ]
+        )
+        self.dec_norm = LayerNorm(dec_dim, eps=1e-6)
+        self.predictor = Linear(dec_dim, self.patch_dim, bias=True)
+        self.initialize_weights()
+
+    def initialize_weights(self) -> None:
+        def _init_weights(module):
+            if isinstance(module, Linear):
+                nn.init.xavier_uniform_(module.weight)
+                if module.bias is not None:
+                    nn.init.constant_(module.bias, 0.0)
+            elif isinstance(module, LayerNorm):
+                if module.bias is not None:
+                    nn.init.constant_(module.bias, 0.0)
+                if module.weight is not None:
+                    nn.init.constant_(module.weight, 1.0)
+
+        self.apply(_init_weights)
+        weight = self.patch_embed.proj.weight.data
+        nn.init.xavier_uniform_(weight.view(weight.shape[0], -1))
+
+    def unpatchify(self, x: torch.Tensor) -> torch.Tensor:
+        bsz = x.shape[0]
+        x = x.reshape(bsz, self.seq_h, self.seq_w, self.patch_dim).permute(0, 3, 1, 2)
+        x = x.reshape(bsz, 3, self.patch_size, self.patch_size, self.seq_h, self.seq_w)
+        x = x.permute(0, 1, 4, 2, 5, 3)
+        return x.reshape(bsz, 3, self.input_height, self.input_width)
+
+    def encode(self, x: torch.Tensor) -> DiagonalGaussianDistribution:
+        x = self.patch_embed(x)
+        for block in self.encoder:
+            x = block(x)
+        x = self.enc_norm(x)
+        moments = self.quant_conv(x)
+        if not self.use_variational:
+            moments = torch.cat((moments, torch.zeros_like(moments)), dim=2)
+        return DiagonalGaussianDistribution(moments, deterministic=not self.use_variational, dim=2)
+
+    def decode(self, z: torch.Tensor) -> torch.Tensor:
+        z = self.post_quant_conv(z)
+        for block in self.decoder:
+            z = block(z)
+        z = self.dec_norm(z)
+        z = self.predictor(z)
+        return self.unpatchify(z)
+
+    def autoencode(
+        self,
+        input: torch.Tensor,
+        sample_posterior: bool = True,
+    ) -> tuple[torch.Tensor, DiagonalGaussianDistribution, torch.Tensor]:
+        posterior = self.encode(input)
+        if self.use_variational and sample_posterior:
+            z = posterior.sample()
+        else:
+            z = posterior.mode()
+        dec = self.decode(z)
+        return dec, posterior, z
+
+    def get_input(self, batch: dict[str, torch.Tensor], k: str) -> torch.Tensor:
+        x = batch[k]
+        if len(x.shape) == 3:
+            x = x[..., None]
+        return x.permute(0, 3, 1, 2).to(memory_format=torch.contiguous_format).float()
+
+    def forward(
+        self,
+        inputs: torch.Tensor,
+        labels: torch.Tensor,
+        split: str = "train",
+    ) -> tuple[torch.Tensor, DiagonalGaussianDistribution, torch.Tensor]:
+        del labels, split
+        rec, post, latent = self.autoencode(inputs)
+        return rec, post, latent
+
+    def get_last_layer(self) -> torch.Tensor:
+        return self.predictor.weight

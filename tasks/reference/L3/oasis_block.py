@@ -1,15 +1,47 @@
-"""Oasis diffusion transformer."""
+"""Oasis DiT blocks."""
 
 
 from __future__ import annotations
 
 
-# Inlined from tasks/reference/L1/linear.py
+# Inlined from tasks/reference/L1/layer_norm.py
 import torch
 import torch.nn as nn
 import torch.nn.functional as F
 
 
+class LayerNorm(nn.Module):
+    def __init__(
+        self,
+        normalized_shape: int,
+        eps: float = 1e-5,
+        elementwise_affine: bool = True,
+        create_scale: bool = True,
+        create_offset: bool = True,
+    ):
+        super().__init__()
+        self.normalized_shape = (normalized_shape,)
+        self.eps = eps
+        self.elementwise_affine = elementwise_affine
+        if elementwise_affine and create_scale:
+            self.weight = nn.Parameter(torch.ones(normalized_shape))
+        else:
+            self.register_parameter("weight", None)
+        if elementwise_affine and create_offset:
+            self.bias = nn.Parameter(torch.zeros(normalized_shape))
+        else:
+            self.register_parameter("bias", None)
+
+    def forward(self, x: torch.Tensor) -> torch.Tensor:
+        orig_dtype = x.dtype
+        weight = self.weight.float() if self.weight is not None else None
+        bias = self.bias.float() if self.bias is not None else None
+        return F.layer_norm(
+            x.float(), self.normalized_shape, weight, bias, self.eps,
+        ).to(orig_dtype)
+
+
+# Inlined from tasks/reference/L1/linear.py
 class Matmul(nn.Module):
     """Pure functional linear: takes input, weight, and optional bias as forward args."""
 
@@ -120,192 +152,10 @@ class OasisRotaryEmbedding(nn.Module):
         return torch.cat(all_freqs, dim=-1)
 
 
-# Inlined from tasks/reference/L1/layer_norm.py
-class LayerNorm(nn.Module):
-    def __init__(
-        self,
-        normalized_shape: int,
-        eps: float = 1e-5,
-        elementwise_affine: bool = True,
-        create_scale: bool = True,
-        create_offset: bool = True,
-    ):
-        super().__init__()
-        self.normalized_shape = (normalized_shape,)
-        self.eps = eps
-        self.elementwise_affine = elementwise_affine
-        if elementwise_affine and create_scale:
-            self.weight = nn.Parameter(torch.ones(normalized_shape))
-        else:
-            self.register_parameter("weight", None)
-        if elementwise_affine and create_offset:
-            self.bias = nn.Parameter(torch.zeros(normalized_shape))
-        else:
-            self.register_parameter("bias", None)
-
-    def forward(self, x: torch.Tensor) -> torch.Tensor:
-        orig_dtype = x.dtype
-        weight = self.weight.float() if self.weight is not None else None
-        bias = self.bias.float() if self.bias is not None else None
-        return F.layer_norm(
-            x.float(), self.normalized_shape, weight, bias, self.eps,
-        ).to(orig_dtype)
-
-
 # Inlined from tasks/reference/L1/silu.py
 class SiLU(nn.Module):
     def forward(self, x: torch.Tensor) -> torch.Tensor:
         return F.silu(x)
-
-
-# Inlined from tasks/reference/L2/oasis_final_layer.py
-class OasisFinalLayer(nn.Module):
-    def __init__(self, hidden_size: int, patch_size: int, out_channels: int):
-        super().__init__()
-        self.norm_final = LayerNorm(hidden_size, eps=1e-6, elementwise_affine=False)
-        self.linear = Linear(hidden_size, patch_size * patch_size * out_channels, bias=True)
-        self.adaLN_modulation = nn.ModuleList(
-            [
-                SiLU(),
-                Linear(hidden_size, 2 * hidden_size, bias=True),
-            ]
-        )
-
-    def forward(self, x: torch.Tensor, c: torch.Tensor) -> torch.Tensor:
-        modulation = c
-        for layer in self.adaLN_modulation:
-            modulation = layer(modulation)
-        shift, scale = modulation.chunk(2, dim=-1)
-        while shift.dim() < x.dim():
-            shift = shift.unsqueeze(-2)
-            scale = scale.unsqueeze(-2)
-        x = self.norm_final(x) * (1 + scale) + shift
-        return self.linear(x)
-
-
-# Inlined from tasks/reference/L1/conv2d.py
-class Conv2d(nn.Module):
-    """Parametric 2D convolution: stores weight and bias internally."""
-
-    def __init__(
-        self,
-        in_channels: int,
-        out_channels: int,
-        kernel_size: int | tuple[int, int],
-        stride: int | tuple[int, int] = 1,
-        padding: int | tuple[int, int] = 0,
-        groups: int = 1,
-        dilation: int | tuple[int, int] = 1,
-        bias: bool = True,
-    ):
-        super().__init__()
-        if isinstance(kernel_size, int):
-            kernel_size = (kernel_size, kernel_size)
-        if isinstance(stride, int):
-            stride = (stride, stride)
-        if isinstance(padding, int):
-            padding = (padding, padding)
-        if isinstance(dilation, int):
-            dilation = (dilation, dilation)
-
-        self.stride = stride
-        self.padding = padding
-        self.groups = groups
-        self.dilation = dilation
-
-        self.weight = nn.Parameter(
-            torch.empty(out_channels, in_channels // groups, *kernel_size)
-        )
-        self.bias = nn.Parameter(torch.empty(out_channels)) if bias else None
-
-    def forward(self, x: torch.Tensor) -> torch.Tensor:
-        return F.conv2d(
-            x,
-            self.weight,
-            self.bias,
-            stride=self.stride,
-            padding=self.padding,
-            dilation=self.dilation,
-            groups=self.groups,
-        )
-
-
-# Inlined from tasks/reference/L2/oasis_patch_embed.py
-class OasisPatchEmbed(nn.Module):
-    def __init__(
-        self,
-        img_height: int = 256,
-        img_width: int = 256,
-        patch_size: int = 16,
-        in_chans: int = 3,
-        embed_dim: int = 768,
-        norm_layer=None,
-        flatten: bool = True,
-    ):
-        super().__init__()
-        self.img_size = (img_height, img_width)
-        self.patch_size = (patch_size, patch_size)
-        self.grid_size = (img_height // patch_size, img_width // patch_size)
-        self.num_patches = self.grid_size[0] * self.grid_size[1]
-        self.flatten = flatten
-        self.proj = Conv2d(
-            in_chans,
-            embed_dim,
-            kernel_size=self.patch_size,
-            stride=self.patch_size,
-            bias=True,
-        )
-        self.norm = norm_layer(embed_dim) if norm_layer else None
-
-    def forward(self, x: torch.Tensor, random_sample: bool = False) -> torch.Tensor:
-        _, _, height, width = x.shape
-        if not random_sample and (height, width) != self.img_size:
-            raise AssertionError(
-                f"Input image size ({height}*{width}) doesn't match model {self.img_size}.",
-            )
-        x = self.proj(x)
-        if self.flatten:
-            x = x.flatten(2).transpose(1, 2)
-        else:
-            x = x.permute(0, 2, 3, 1)
-        return self.norm(x) if self.norm is not None else x
-
-
-# Inlined from tasks/reference/L2/oasis_timestep_embedder.py
-import math
-
-
-class OasisTimestepEmbedder(nn.Module):
-    def __init__(self, hidden_size: int, frequency_embedding_size: int = 256):
-        super().__init__()
-        self.mlp = nn.ModuleList(
-            [
-                Linear(frequency_embedding_size, hidden_size, bias=True),
-                SiLU(),
-                Linear(hidden_size, hidden_size, bias=True),
-            ]
-        )
-        self.frequency_embedding_size = frequency_embedding_size
-
-    @staticmethod
-    def timestep_embedding(t: torch.Tensor, dim: int, max_period: int = 10000) -> torch.Tensor:
-        half = dim // 2
-        freqs = torch.exp(
-            -math.log(max_period)
-            * torch.arange(start=0, end=half, dtype=torch.float32, device=t.device)
-            / half,
-        )
-        args = t[:, None].float() * freqs[None]
-        embedding = torch.cat([torch.cos(args), torch.sin(args)], dim=-1)
-        if dim % 2:
-            embedding = torch.cat([embedding, torch.zeros_like(embedding[:, :1])], dim=-1)
-        return embedding
-
-    def forward(self, t: torch.Tensor) -> torch.Tensor:
-        x = self.timestep_embedding(t, self.frequency_embedding_size)
-        for layer in self.mlp:
-            x = layer(x)
-        return x
 
 
 # Inlined from tasks/reference/L1/gelu.py
@@ -451,7 +301,6 @@ class OasisTemporalAxialAttention(nn.Module):
         return self.to_out(out.to(q.dtype))
 
 
-# Inlined from tasks/reference/L3/oasis_block.py
 def _modulate(x: torch.Tensor, shift: torch.Tensor, scale: torch.Tensor) -> torch.Tensor:
     fixed_dims = [1] * len(shift.shape[1:])
     shift = shift.repeat(x.shape[0] // shift.shape[0], *fixed_dims)
@@ -532,98 +381,3 @@ class SpatioTemporalDiTBlock(nn.Module):
         x = x + _gate(self.t_attn(_modulate(self.t_norm1(x), t_shift_msa, t_scale_msa)), t_gate_msa)
         x = x + _gate(self.t_mlp(_modulate(self.t_norm2(x), t_shift_mlp, t_scale_mlp)), t_gate_mlp)
         return x
-
-
-class OasisDiT(nn.Module):
-    def __init__(
-        self,
-        *,
-        input_h: int = 18,
-        input_w: int = 32,
-        patch_size: int = 2,
-        in_channels: int = 16,
-        hidden_size: int = 1024,
-        depth: int = 16,
-        num_heads: int = 16,
-        mlp_ratio: float = 4.0,
-        external_cond_dim: int = 25,
-        max_frames: int = 32,
-    ):
-        super().__init__()
-        self.in_channels = in_channels
-        self.out_channels = in_channels
-        self.patch_size = patch_size
-        self.num_heads = num_heads
-        self.max_frames = max_frames
-
-        self.x_embedder = OasisPatchEmbed(input_h, input_w, patch_size, in_channels, hidden_size, flatten=False)
-        self.t_embedder = OasisTimestepEmbedder(hidden_size)
-        head_dim = hidden_size // num_heads
-        self.spatial_rotary_emb = OasisRotaryEmbedding(dim=head_dim // 2, freqs_for="pixel", max_freq=256)
-        self.temporal_rotary_emb = OasisRotaryEmbedding(dim=head_dim, freqs_for="lang")
-        self.external_cond = Linear(external_cond_dim, hidden_size, bias=True) if external_cond_dim > 0 else nn.Identity()
-        self.blocks = nn.ModuleList(
-            [
-                SpatioTemporalDiTBlock(
-                    hidden_size,
-                    num_heads,
-                    mlp_ratio=mlp_ratio,
-                    is_causal=True,
-                    spatial_rotary_emb=self.spatial_rotary_emb,
-                    temporal_rotary_emb=self.temporal_rotary_emb,
-                )
-                for _ in range(depth)
-            ]
-        )
-        self.final_layer = OasisFinalLayer(hidden_size, patch_size, self.out_channels)
-        self.initialize_weights()
-
-    def initialize_weights(self) -> None:
-        def _basic_init(module):
-            if isinstance(module, Linear):
-                nn.init.xavier_uniform_(module.weight)
-                if module.bias is not None:
-                    nn.init.constant_(module.bias, 0)
-
-        self.apply(_basic_init)
-        weight = self.x_embedder.proj.weight.data
-        nn.init.xavier_uniform_(weight.view(weight.shape[0], -1))
-        if self.x_embedder.proj.bias is not None:
-            nn.init.constant_(self.x_embedder.proj.bias, 0)
-        nn.init.normal_(self.t_embedder.mlp[0].weight, std=0.02)
-        nn.init.normal_(self.t_embedder.mlp[2].weight, std=0.02)
-        for block in self.blocks:
-            nn.init.constant_(block.s_adaLN_modulation[-1].weight, 0)
-            nn.init.constant_(block.s_adaLN_modulation[-1].bias, 0)
-            nn.init.constant_(block.t_adaLN_modulation[-1].weight, 0)
-            nn.init.constant_(block.t_adaLN_modulation[-1].bias, 0)
-        nn.init.constant_(self.final_layer.adaLN_modulation[-1].weight, 0)
-        nn.init.constant_(self.final_layer.adaLN_modulation[-1].bias, 0)
-        nn.init.constant_(self.final_layer.linear.weight, 0)
-        if self.final_layer.linear.bias is not None:
-            nn.init.constant_(self.final_layer.linear.bias, 0)
-
-    def unpatchify(self, x: torch.Tensor) -> torch.Tensor:
-        c = self.out_channels
-        p = self.x_embedder.patch_size[0]
-        h = x.shape[1]
-        w = x.shape[2]
-        x = x.reshape(x.shape[0], h, w, p, p, c)
-        x = torch.einsum("nhwpqc->nchpwq", x)
-        return x.reshape(x.shape[0], c, h * p, w * p)
-
-    def forward(self, x: torch.Tensor, t: torch.Tensor, external_cond: torch.Tensor | None = None) -> torch.Tensor:
-        bsz, time, channels, height, width = x.shape
-        x = x.reshape(bsz * time, channels, height, width)
-        x = self.x_embedder(x)
-        x = x.reshape(bsz, time, x.shape[1], x.shape[2], x.shape[3])
-        t = t.reshape(bsz * time)
-        c = self.t_embedder(t).reshape(bsz, time, -1)
-        if torch.is_tensor(external_cond):
-            c = c + self.external_cond(external_cond)
-        for block in self.blocks:
-            x = block(x, c)
-        x = self.final_layer(x, c)
-        x = x.reshape(bsz * time, x.shape[2], x.shape[3], x.shape[4])
-        x = self.unpatchify(x)
-        return x.reshape(bsz, time, x.shape[1], x.shape[2], x.shape[3])

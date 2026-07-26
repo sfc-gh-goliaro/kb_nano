@@ -1,34 +1,15 @@
-"""YOLOv10 native neck."""
+"""YOLOv10 native backbone."""
 
 
 from __future__ import annotations
 
 
-# Inlined from tasks/reference/L1/interpolate.py
+# Inlined from tasks/reference/L1/batch_norm2d.py
 import torch
 import torch.nn as nn
 import torch.nn.functional as F
 
 
-class Interpolate(nn.Module):
-    def forward(
-        self,
-        x: torch.Tensor,
-        size: int | tuple[int, ...] | None = None,
-        scale_factor: float | tuple[float, ...] | None = None,
-        mode: str = "nearest",
-        align_corners: bool | None = None,
-    ) -> torch.Tensor:
-        return F.interpolate(
-            x,
-            size=size,
-            scale_factor=scale_factor,
-            mode=mode,
-            align_corners=align_corners,
-        )
-
-
-# Inlined from tasks/reference/L1/batch_norm2d.py
 class BatchNorm2d(nn.Module):
     def __init__(
         self,
@@ -315,14 +296,63 @@ class YOLOC2fCIB(YOLOC2f):
         self.m = nn.ModuleList(YOLOCIB(self.c, self.c, shortcut, e=1.0, lk=lk) for _ in range(n))
 
 
-# Inlined from tasks/reference/L2/yolov10_concat.py
-class YOLOConcat(nn.Module):
-    def __init__(self, dimension: int = 1):
+# Inlined from tasks/reference/L1/softmax.py
+class Softmax(nn.Module):
+    def __init__(self, dim: int = -1):
         super().__init__()
-        self.d = dimension
+        self.dim = dim
 
-    def forward(self, xs: list[torch.Tensor]) -> torch.Tensor:
-        return torch.cat(xs, self.d)
+    def forward(self, x: torch.Tensor) -> torch.Tensor:
+        return F.softmax(x, dim=self.dim)
+
+
+# Inlined from tasks/reference/L2/yolov10_attention.py
+class YOLOAttention(nn.Module):
+    def __init__(self, dim: int, num_heads: int = 8, attn_ratio: float = 0.5):
+        super().__init__()
+        self.num_heads = num_heads
+        self.head_dim = dim // num_heads
+        self.key_dim = int(self.head_dim * attn_ratio)
+        self.scale = self.key_dim ** -0.5
+        nh_kd = self.key_dim * num_heads
+        h = dim + nh_kd * 2
+        self.qkv = YOLOConv(dim, h, 1, act=False)
+        self.proj = YOLOConv(dim, dim, 1, act=False)
+        self.pe = YOLOConv(dim, dim, 3, 1, g=dim, act=False)
+        self._softmax = Softmax(dim=-1)
+
+    def forward(self, x: torch.Tensor) -> torch.Tensor:
+        b, c, h, w = x.shape
+        n = h * w
+        qkv = self.qkv(x)
+        q, k, v = qkv.view(b, self.num_heads, self.key_dim * 2 + self.head_dim, n).split(
+            [self.key_dim, self.key_dim, self.head_dim], dim=2
+        )
+        attn = (q.transpose(-2, -1) @ k) * self.scale
+        attn = self._softmax(attn)
+        x = (v @ attn.transpose(-2, -1)).view(b, c, h, w) + self.pe(v.reshape(b, c, h, w))
+        return self.proj(x)
+
+
+# Inlined from tasks/reference/L2/yolov10_psa.py
+class YOLOPSA(nn.Module):
+    def __init__(self, c1: int, c2: int, e: float = 0.5):
+        super().__init__()
+        assert c1 == c2
+        self.c = int(c1 * e)
+        self.cv1 = YOLOConv(c1, 2 * self.c, 1, 1)
+        self.cv2 = YOLOConv(2 * self.c, c1, 1, 1)
+        self.attn = YOLOAttention(self.c, attn_ratio=0.5, num_heads=max(self.c // 64, 1))
+        self.ffn = nn.Sequential(
+            YOLOConv(self.c, self.c * 2, 1, 1),
+            YOLOConv(self.c * 2, self.c, 1, 1, act=False),
+        )
+
+    def forward(self, x: torch.Tensor) -> torch.Tensor:
+        a, b = self.cv1(x).split((self.c, self.c), dim=1)
+        b = b + self.attn(b)
+        b = b + self.ffn(b)
+        return self.cv2(torch.cat((a, b), 1))
 
 
 # Inlined from tasks/reference/L2/yolov10_scdown.py
@@ -336,39 +366,72 @@ class YOLOSCDown(nn.Module):
         return self.cv2(self.cv1(x))
 
 
-class YOLOv10Neck(nn.Module):
+# Inlined from tasks/reference/L1/max_pool2d.py
+class MaxPool2d(nn.Module):
+    def __init__(
+        self,
+        kernel_size: int | tuple[int, int],
+        stride: int | tuple[int, int] | None = None,
+        padding: int | tuple[int, int] = 0,
+        ceil_mode: bool = False,
+    ):
+        super().__init__()
+        self.kernel_size = kernel_size
+        self.stride = stride if stride is not None else kernel_size
+        self.padding = padding
+        self.ceil_mode = ceil_mode
+
+    def forward(self, x: torch.Tensor) -> torch.Tensor:
+        return F.max_pool2d(
+            x,
+            self.kernel_size,
+            self.stride,
+            self.padding,
+            ceil_mode=self.ceil_mode,
+        )
+
+
+# Inlined from tasks/reference/L2/yolov10_sppf.py
+class YOLOSPPF(nn.Module):
+    def __init__(self, c1: int, c2: int, k: int = 5):
+        super().__init__()
+        c_ = c1 // 2
+        self.cv1 = YOLOConv(c1, c_, 1, 1)
+        self.cv2 = YOLOConv(c_ * 4, c2, 1, 1)
+        self.m = MaxPool2d(kernel_size=k, stride=1, padding=k // 2)
+
+    def forward(self, x: torch.Tensor) -> torch.Tensor:
+        x = self.cv1(x)
+        y1 = self.m(x)
+        y2 = self.m(y1)
+        return self.cv2(torch.cat((x, y1, y2, self.m(y2)), 1))
+
+
+class YOLOv10Backbone(nn.Module):
     def __init__(self):
         super().__init__()
-        self._upsample = Interpolate()
-        self.cat1 = YOLOConcat(1)
-        self.c2f_p4 = YOLOC2f(384, 128, n=1, shortcut=False)
-        self.cat2 = YOLOConcat(1)
-        self.c2f_p3 = YOLOC2f(192, 64, n=1, shortcut=False)
-        self.down_p3 = YOLOConv(64, 64, 3, 2)
-        self.cat3 = YOLOConcat(1)
-        self.c2f_n4 = YOLOC2f(192, 128, n=1, shortcut=False)
-        self.down_n4 = YOLOSCDown(128, 128, 3, 2)
-        self.cat4 = YOLOConcat(1)
-        self.c2fcib_n5 = YOLOC2fCIB(384, 256, n=1, shortcut=True, lk=True)
+        self.stem1 = YOLOConv(3, 16, 3, 2)
+        self.stem2 = YOLOConv(16, 32, 3, 2)
+        self.stage2 = YOLOC2f(32, 32, n=1, shortcut=True)
+        self.down3 = YOLOConv(32, 64, 3, 2)
+        self.stage3 = YOLOC2f(64, 64, n=2, shortcut=True)
+        self.down4 = YOLOSCDown(64, 128, 3, 2)
+        self.stage4 = YOLOC2f(128, 128, n=2, shortcut=True)
+        self.down5 = YOLOSCDown(128, 256, 3, 2)
+        self.stage5 = YOLOC2f(256, 256, n=1, shortcut=True)
+        self.sppf = YOLOSPPF(256, 256, 5)
+        self.psa = YOLOPSA(256, 256)
 
-    def forward(self, feats: dict[str, torch.Tensor]):
-        p3_backbone = feats["p3_backbone"]
-        p4_backbone = feats["p4_backbone"]
-        p5_backbone = feats["p5_backbone"]
-
-        x = self._upsample(p5_backbone, scale_factor=2.0, mode="nearest")
-        x = self.cat1([x, p4_backbone])
-        p4 = self.c2f_p4(x)
-
-        x = self._upsample(p4, scale_factor=2.0, mode="nearest")
-        x = self.cat2([x, p3_backbone])
-        p3 = self.c2f_p3(x)
-
-        x = self.down_p3(p3)
-        x = self.cat3([x, p4])
-        n4 = self.c2f_n4(x)
-
-        x = self.down_n4(n4)
-        x = self.cat4([x, p5_backbone])
-        n5 = self.c2fcib_n5(x)
-        return [p3, n4, n5]
+    def forward(self, x: torch.Tensor):
+        x = self.stem1(x)
+        x = self.stem2(x)
+        p2 = self.stage2(x)
+        x = self.down3(p2)
+        p3 = self.stage3(x)
+        x = self.down4(p3)
+        p4 = self.stage4(x)
+        x = self.down5(p4)
+        p5 = self.stage5(x)
+        p5 = self.sppf(p5)
+        p5 = self.psa(p5)
+        return {"p3_backbone": p3, "p4_backbone": p4, "p5_backbone": p5}
