@@ -136,6 +136,51 @@ def _constrained_integer_tensor(
         if upper is not None:
             return torch.randint(0, upper, shape, dtype=dtype, device=device)
 
+    # ``cu_seqlens`` is a cumulative-length vector: it must start at 0 and be
+    # non-decreasing.  Random ints make FLA's prepare_lens produce negative
+    # lengths, and prepare_chunk_indices then dies with "upper bound and lower
+    # bound inconsistent with step sign" -- the failure behind 31 of
+    # gla_decoder's 320 scenarios.  Build an evenly-spaced prefix sum over the
+    # scenario's own token count instead.
+    if "cu_seq" in arg_name or arg_name in ("cu_seqlens_q", "cu_seqlens_k",
+                                            "seq_offsets", "cu_seqlen_ks",
+                                            "cu_seqlen_ke"):
+        n_bounds = int(torch.tensor(shape).prod().item())
+        if n_bounds >= 2:
+            total = None
+            for key in ("hidden_states", "x", "q", "query", "inputs_embeds"):
+                # Read the *declared* shape: ``result`` only holds inputs
+                # materialized so far, and dict order puts cu_seqlens before x.
+                decl = _input_shape(scenario.inputs, key)
+                if decl:
+                    total = (
+                        int(decl[0]) if len(decl) < 3 or int(decl[1]) == 1
+                        else int(decl[0]) * int(decl[1])
+                    )
+                    break
+                ref = result.get(key)
+                if not hasattr(ref, "shape") or ref.ndim < 1:
+                    continue
+                if ref.ndim >= 3:
+                    # Two conventions share this rank: [batch, seq, hidden]
+                    # (batch-major) and [tokens, batch, hidden] (the packed
+                    # varlen layout Qwen-VL's vision tower uses).  A middle dim
+                    # of 1 means the leading axis already *is* the token count;
+                    # multiplying would overstate it and truncate cu_seqlens.
+                    total = (
+                        int(ref.shape[0]) if int(ref.shape[1]) == 1
+                        else int(ref.shape[0]) * int(ref.shape[1])
+                    )
+                else:
+                    total = int(ref.shape[0])
+                break
+            if total is None:
+                total = (n_bounds - 1) * 64
+            step = max(1, total // (n_bounds - 1))
+            bounds = [min(i * step, total) for i in range(n_bounds)]
+            bounds[-1] = total
+            return torch.tensor(bounds, dtype=dtype, device=device).reshape(shape)
+
     if operator == "moe_grouped_gemm" and arg_name == "num_tokens_post_padded":
         sorted_shape = _input_shape(scenario.inputs, "sorted_token_ids")
         value = int(sorted_shape[0]) if sorted_shape else max(1, int(torch.tensor(shape).prod().item()))

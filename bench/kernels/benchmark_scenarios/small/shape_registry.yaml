@@ -21861,3 +21861,203 @@ yarn_rotary_emb:
       key:
         shape: [512, 8, 128]
         dtype: bfloat16
+bge_m3:
+  scenarios:
+  - init_args:
+      training: false
+    inputs:
+      input_ids:
+        dtype: int64
+        shape:
+        - 1
+        - 1
+      positions:
+        dtype: int64
+        shape:
+        - 1
+        - 1
+    name: tokens-1/synthetic
+  - init_args:
+      training: false
+    inputs:
+      input_ids:
+        dtype: int64
+        shape:
+        - 1
+        - 4
+      positions:
+        dtype: int64
+        shape:
+        - 1
+        - 4
+    name: tokens-4/synthetic
+  - init_args:
+      training: false
+    inputs:
+      input_ids:
+        dtype: int64
+        shape:
+        - 1
+        - 32
+      positions:
+        dtype: int64
+        shape:
+        - 1
+        - 32
+    name: tokens-32/synthetic
+  - init_args:
+      training: false
+    inputs:
+      input_ids:
+        dtype: int64
+        shape:
+        - 1
+        - 256
+      positions:
+        dtype: int64
+        shape:
+        - 1
+        - 256
+    name: tokens-256/synthetic
+xlm_roberta_encoder:
+  scenarios:
+  - init_args:
+      training: false
+    inputs:
+      hidden_states:
+        dtype: bfloat16
+        shape:
+        - 1
+        - 1
+        - 1024
+    name: tokens-1/synthetic
+  - init_args:
+      training: false
+    inputs:
+      hidden_states:
+        dtype: bfloat16
+        shape:
+        - 1
+        - 4
+        - 1024
+    name: tokens-4/synthetic
+  - init_args:
+      training: false
+    inputs:
+      hidden_states:
+        dtype: bfloat16
+        shape:
+        - 1
+        - 32
+        - 1024
+    name: tokens-32/synthetic
+  - init_args:
+      training: false
+    inputs:
+      hidden_states:
+        dtype: bfloat16
+        shape:
+        - 1
+        - 256
+        - 1024
+    name: tokens-256/synthetic
+xlm_roberta_layer:
+  scenarios:
+  - init_args:
+      training: false
+    inputs:
+      hidden_states:
+        dtype: bfloat16
+        shape:
+        - 1
+        - 1
+        - 1024
+    name: tokens-1/synthetic
+  - init_args:
+      training: false
+    inputs:
+      hidden_states:
+        dtype: bfloat16
+        shape:
+        - 1
+        - 4
+        - 1024
+    name: tokens-4/synthetic
+  - init_args:
+      training: false
+    inputs:
+      hidden_states:
+        dtype: bfloat16
+        shape:
+        - 1
+        - 32
+        - 1024
+    name: tokens-32/synthetic
+  - init_args:
+      training: false
+    inputs:
+      hidden_states:
+        dtype: bfloat16
+        shape:
+        - 1
+        - 256
+        - 1024
+    name: tokens-256/synthetic
+xlm_roberta_model:
+  scenarios:
+  - init_args:
+      training: false
+    inputs:
+      input_ids:
+        dtype: int64
+        shape:
+        - 1
+        - 1
+      positions:
+        dtype: int64
+        shape:
+        - 1
+        - 1
+    name: tokens-1/synthetic
+  - init_args:
+      training: false
+    inputs:
+      input_ids:
+        dtype: int64
+        shape:
+        - 1
+        - 4
+      positions:
+        dtype: int64
+        shape:
+        - 1
+        - 4
+    name: tokens-4/synthetic
+  - init_args:
+      training: false
+    inputs:
+      input_ids:
+        dtype: int64
+        shape:
+        - 1
+        - 32
+      positions:
+        dtype: int64
+        shape:
+        - 1
+        - 32
+    name: tokens-32/synthetic
+  - init_args:
+      training: false
+    inputs:
+      input_ids:
+        dtype: int64
+        shape:
+        - 1
+        - 256
+      positions:
+        dtype: int64
+        shape:
+        - 1
+        - 256
+    name: tokens-256/synthetic
