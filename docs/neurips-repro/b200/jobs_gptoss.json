@@ -1,0 +1,38 @@
+[
+ {
+  "name": "go20_splitk1",
+  "gpus": 1,
+  "timeout": 10800,
+  "cmd": "python tests/bench_vllm.py --model openai/gpt-oss-20b --skip-latency",
+  "env": {
+   "FASTKERNELS_MXFP4_SM100_CONSTRAINTS": "split_k=1"
+  }
+ },
+ {
+  "name": "go120_splitk1",
+  "gpus": 2,
+  "timeout": 14400,
+  "cmd": "python tests/bench_vllm.py --model openai/gpt-oss-120b --tp 2 --skip-latency",
+  "env": {
+   "FASTKERNELS_MXFP4_SM100_CONSTRAINTS": "split_k=1"
+  }
+ },
+ {
+  "name": "go20_nopersist",
+  "gpus": 1,
+  "timeout": 10800,
+  "cmd": "python tests/bench_vllm.py --model openai/gpt-oss-20b --skip-latency",
+  "env": {
+   "FASTKERNELS_MXFP4_SM100_CONSTRAINTS": "split_k=1,is_persistent=0"
+  }
+ },
+ {
+  "name": "go120_nopersist",
+  "gpus": 2,
+  "timeout": 14400,
+  "cmd": "python tests/bench_vllm.py --model openai/gpt-oss-120b --tp 2 --skip-latency",
+  "env": {
+   "FASTKERNELS_MXFP4_SM100_CONSTRAINTS": "split_k=1,is_persistent=0"
+  }
+ }
+]

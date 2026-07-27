@@ -14,7 +14,7 @@ contamination.
 
 Usage:
     python tests/bench_detection.py --model jameslahm/yolov10n
-    python tests/bench_detection.py --model PekingU/rtdetr_v2_r18vd
+    python tests/bench_detection.py --model PekingU/rtdetr_v2_r101vd
     python tests/bench_detection.py --skip-reference  # fastkernels only
 """
 

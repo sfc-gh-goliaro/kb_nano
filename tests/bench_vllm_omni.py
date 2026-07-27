@@ -1005,6 +1005,32 @@ def _init_preprocessing(model_dir, config):
     return tokenizer, speech_tokenizer, campplus, feat_extractor
 
 
+def _cfm_decoder_forward(decoder, cfm_seed, **kwargs):
+    """Call a CosyVoice3 CFM decoder with reproducible noise.
+
+    The code2wav equivalence check only means anything if both engines draw the
+    *same* CFM noise. Newer vllm-omni builds accept a ``cfm_seed`` for this;
+    vllm-omni 0.18.0's ``CausalConditionalCFM.forward`` does not, and samples
+    ``torch.randn_like(mu)`` from the default generator -- so seed that generator
+    instead of passing an argument the installed build rejects with
+    "got an unexpected keyword argument 'cfm_seed'", which otherwise loses the
+    deterministic metric and leaves only the end-to-end mel cosine (which also
+    carries talker sampling noise).
+    """
+    import inspect
+
+    try:
+        accepts = "cfm_seed" in inspect.signature(decoder.forward).parameters
+    except (TypeError, ValueError):
+        accepts = False
+    if accepts:
+        return decoder(cfm_seed=cfm_seed, **kwargs)
+    if cfm_seed is not None:
+        torch.manual_seed(cfm_seed)
+        torch.cuda.manual_seed_all(cfm_seed)
+    return decoder(**kwargs)
+
+
 def _preprocess(text, prompt_text, ref_audio, ref_sr, tokenizer, speech_tok, campplus, feat_ext, config, device):
     """Run the same preprocessing as vllm-omni to produce model inputs."""
     from vllm_omni.model_executor.models.cosyvoice3.utils import (
@@ -1262,14 +1288,16 @@ def main():
             conds = conds.transpose(1, 2)
             mel_mask = (~make_pad_mask(torch.tensor([mel_len1 + mel_len2]))).to(h_kb)
 
-            feat_kb, _ = kb_c2w.flow_model.decoder(
+            feat_kb, _ = _cfm_decoder_forward(
+                kb_c2w.flow_model.decoder, 12345,
                 mu=h_kb.transpose(1, 2).contiguous(), mask=mel_mask.unsqueeze(1),
-                spks=emb_kb, cond=conds, n_timesteps=10, cfm_seed=12345,
+                spks=emb_kb, cond=conds, n_timesteps=10,
             )
 
-            feat_vl, _ = vl_c2w.flow_model.decoder(
+            feat_vl, _ = _cfm_decoder_forward(
+                vl_c2w.flow_model.decoder, 12345,
                 mu=h_vl.transpose(1, 2).contiguous(), mask=mel_mask.unsqueeze(1),
-                spks=emb_vl, cond=conds, n_timesteps=10, cfm_seed=12345,
+                spks=emb_vl, cond=conds, n_timesteps=10,
             )
 
             feat_kb_gen = feat_kb[:, :, mel_len1:].float()

@@ -404,6 +404,26 @@ def _take_dataset_rows(dataset, *, start: int, count: int) -> list[dict[str, Any
     ]
 
 
+def _assert_finite_state(state_dict, what: str) -> None:
+    """Refuse to trust a checkpoint whose weights are not finite.
+
+    The DLRMv2 checkpoint is trained on the fly. When that training diverges the
+    saved weights are all NaN, and every later run then reports
+    ``cosine=nan`` for each alignment tensor while still printing a perfectly
+    healthy throughput ratio -- so the row looks measured when it is not. Fail
+    loudly instead.
+    """
+    bad = [k for k, v in state_dict.items()
+           if torch.is_tensor(v) and v.is_floating_point()
+           and not torch.isfinite(v).all()]
+    if bad:
+        raise RuntimeError(
+            f"{what}: {len(bad)} non-finite tensor(s), e.g. {bad[:3]}. "
+            "Training diverged; re-run with --retrain-checkpoints after "
+            "reducing --dlrm-train-lr."
+        )
+
+
 def _dlrm_checkpoint_path(args: argparse.Namespace) -> Path:
     return args.checkpoint_root / f"dlrmv2_{args.dlrm_dataset}_seed{args.seed}.pt"
 
@@ -424,7 +444,15 @@ def _ensure_dlrm_checkpoint(
         device=device,
     )
     if checkpoint is not None:
-        return checkpoint_path, checkpoint["metadata"]
+        try:
+            _assert_finite_state(checkpoint["state_dict"], "cached DLRMv2 checkpoint")
+        except RuntimeError as exc:
+            # Derived artifact: discard and retrain rather than poisoning the run.
+            print(f"  WARNING: {exc}\n  discarding {checkpoint_path} and retraining",
+                  flush=True)
+            checkpoint = None
+        else:
+            return checkpoint_path, checkpoint["metadata"]
 
     shuffled = train_split.shuffle(seed=args.seed)
     train_rows = _take_dataset_rows(shuffled, start=0, count=len(train_split))
@@ -456,9 +484,17 @@ def _ensure_dlrm_checkpoint(
         loss.backward()
         optimizer.step()
         final_loss = float(loss.detach().item())
+        if not math.isfinite(final_loss):
+            raise RuntimeError(
+                f"DLRMv2 training diverged at step {step} "
+                f"(loss={final_loss}, lr={args.dlrm_train_lr}, "
+                f"batch={args.dlrm_train_batch_size}). Refusing to save a "
+                "non-finite checkpoint."
+            )
 
     _maybe_sync(device)
     model.eval()
+    _assert_finite_state(model.state_dict(), "DLRMv2 trained weights")
     metadata = {
         "dataset": ADULT_DATASET_ID,
         "split": "train",

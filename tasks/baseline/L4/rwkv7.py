@@ -84,6 +84,8 @@ class RWKV7Model(nn.Module):
         self.norm = LayerNorm(
             config.hidden_size, eps=config.norm_eps,
             create_offset=config.norm_bias,
+            # bf16 reduction, matching FLA's final norm; see RWKV7Block.
+            promote_fp32=False,
         )
 
     def forward(

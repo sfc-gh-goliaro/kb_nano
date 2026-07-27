@@ -1,26 +1,16 @@
 """Flash attention prefill kernel (variable-length sequences).
 
-On Hopper (SM90) when vLLM's bundled FA3 is available, uses FA3 to match
-vLLM's numerical behavior. Falls back to FA2 otherwise.
+Uses vLLM's bundled FlashAttention when available so numerics match vLLM:
+FA3 on Hopper (SM90), FA4 on Blackwell (SM100+). Falls back to FA2 otherwise,
+including for head sizes FA4 cannot serve on Blackwell.
 """
 
 import torch
 import torch.nn as nn
 
-_FA3_AVAILABLE = False
-_fa3_varlen_func = None
-try:
-    from vllm.vllm_flash_attn import (
-        flash_attn_varlen_func as _vllm_fa_varlen,
-        is_fa_version_supported,
-    )
-    if is_fa_version_supported(3) and torch.cuda.is_available():
-        cc = torch.cuda.get_device_capability()
-        if cc[0] >= 9:
-            _FA3_AVAILABLE = True
-            _fa3_varlen_func = _vllm_fa_varlen
-except ImportError:
-    pass
+from ._fa_backend import VLLM_FA_AVAILABLE as _FA3_AVAILABLE
+from ._fa_backend import fa_version_for_head_dim as _fa_version_for_head_dim
+from ._fa_backend import vllm_fa_varlen_func as _fa3_varlen_func
 
 if not _FA3_AVAILABLE:
     from flash_attn import flash_attn_varlen_func as _fa2_varlen_func
@@ -33,6 +23,8 @@ class FlashAttnPrefill(nn.Module):
         self.num_kv_heads = num_kv_heads
         self.head_dim = head_dim
         self.sm_scale = head_dim ** -0.5
+        # FA4 cannot serve every head size on Blackwell; resolve per layer.
+        self._fa_version = _fa_version_for_head_dim(head_dim)
 
     def forward(self, q, k, v, cu_seqlens_q, cu_seqlens_k, max_seqlen_q, max_seqlen_k, **kwargs):
         if _FA3_AVAILABLE:
@@ -42,7 +34,7 @@ class FlashAttnPrefill(nn.Module):
                 max_seqlen_q=max_seqlen_q,
                 cu_seqlens_q=cu_seqlens_q,
                 max_seqlen_k=max_seqlen_k,
-                fa_version=3,
+                fa_version=self._fa_version,
             )
             if kwargs.get("block_table") is not None:
                 seqused_k = cu_seqlens_k[1:] - cu_seqlens_k[:-1]

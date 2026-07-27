@@ -504,6 +504,9 @@ class FLAEngine:
             out = self.model(
                 input_ids=ids, past_key_values=cache, use_cache=True,
                 logits_indices=logits_indices, cu_seqlens=cu_seqlens,
+                # Known on the host already: passing it saves each layer a
+                # ``cu_seqlens.max().item()`` sync just to pick a dispatch branch.
+                max_seqlen=max(len(chunk) for chunk in chunks),
             )
         self._slot_cache.scatter(slot_ids, out.past_key_values)
 

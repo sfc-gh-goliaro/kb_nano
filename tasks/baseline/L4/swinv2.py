@@ -83,7 +83,16 @@ class SwinV2Model(nn.Module):
             in_chans, embed_dims[0],
             kernel_size=patch_size, stride=patch_size, bias=True,
         )
-        self.patch_embed.norm = LayerNorm(embed_dims[0])
+        # promote_fp32=False: match timm, which runs LayerNorm natively in
+        # the model dtype. The fp32 promotion default exists for
+        # DeepSeek-V3.2's indexer k_norm, where a bf16 reduction shifts the
+        # FP8 indexer cache and changes top-2048 selection. SwinV2 needs
+        # none of that and paid
+        # 30% of its GPU time for it -- an ours-only nsys capture showed
+        # vectorized_layer_norm_kernel<float> at 1691ms/29,256 calls and
+        # 87,768 direct_copy conversions, both absent from timm's trace, while
+        # every GEMM and reduce matched within 1%.
+        self.patch_embed.norm = LayerNorm(embed_dims[0], promote_fp32=False)
 
         layers = []
         in_dim = embed_dims[0]
@@ -107,7 +116,7 @@ class SwinV2Model(nn.Module):
                 scale *= 2
 
         self.layers = nn.Sequential(*layers)
-        self.norm = LayerNorm(self.num_features)
+        self.norm = LayerNorm(self.num_features, promote_fp32=False)
 
         self.head = nn.Identity()
         if num_classes > 0:

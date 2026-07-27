@@ -38,6 +38,7 @@ import torch.nn as nn
 from vllm.model_executor.layers.fla.ops import (
     chunk_gated_delta_rule as _vllm_chunk_gated_delta_rule,
     fused_recurrent_gated_delta_rule as _vllm_fused_recurrent_gdn,
+    fused_sigmoid_gating_delta_rule_update as _vllm_fused_gating_gdn_update,
 )
 from vllm.model_executor.layers.fla.ops.chunk import l2norm_fwd
 from vllm.model_executor.layers.mamba.ops.causal_conv1d import (
@@ -223,11 +224,24 @@ class Qwen3NextGDNAttention(nn.Module):
         qkvz_dim = 2 * self.key_dim + 2 * self.value_dim
         self.in_proj_qkvz = ColumnParallelLinear(hidden_size, qkvz_dim)
 
-        # in_proj_ba: projects to [b, a] each of size num_v_heads.
-        # Match vLLM's MergedColumnParallelLinear(output_sizes=[num_v_heads]*2)
-        # which splits at midpoint then TP-shards each half independently.
+        # in_proj_ba: Qwen3-Next stores this as a *single* fused weight in an
+        # interleaved GQA layout, [b_g0, a_g0, b_g1, a_g1, ...], one pair per K-head
+        # group -- which is what ``_unpack_ba`` below reads. vLLM therefore builds it
+        # as MergedColumnParallelLinear(output_sizes=[num_v_heads * 2]), a single
+        # output shard, so plain contiguous ColumnParallel sharding hands each rank
+        # whole K-groups and preserves the interleaving.
+        #
+        # It must NOT get a midpoint-split loader. output_sizes=[num_v_heads] * 2 is
+        # the *Qwen3.5* form, for checkpoints that ship separate in_proj_b and
+        # in_proj_a; applying it here permutes rows across the b/a boundary that does
+        # not exist in this checkpoint, so the weight is scrambled. That was measured:
+        # with a midpoint-split loader, layer 0's in_proj_ba output came back at
+        # cos 0.636 / rel_l2 0.795 against vLLM while its input (input_layernorm) and
+        # its sibling in_proj_qkvz were both bit-identical -- see
+        # tests/debug/layer_probe.py. b and a feed the gating that produces g and
+        # beta, the delta rule's decay and learning rate, so scrambling them corrupts
+        # every GDN layer's state update.
         self.in_proj_ba = ColumnParallelLinear(hidden_size, 2 * num_v_heads)
-        self.in_proj_ba.weight.weight_loader = self._ba_weight_loader
 
         # Causal conv1d on concatenated [Q, K, V]
         conv_dim = 2 * self.key_dim + self.value_dim
@@ -254,9 +268,14 @@ class Qwen3NextGDNAttention(nn.Module):
         # Output projection
         self.out_proj = RowParallelLinear(self.value_dim, hidden_size)
         self._triton_allocator_ready = False
+        # FlashInfer's GDN prefill kernel is built for SM90 only -- on
+        # Blackwell it raises "delta rule kernel does not support this device
+        # major version: 10" from gdn_prefill_sm90. vLLM gates it the same way
+        # (``ChunkGatedDeltaRule``: ``is_device_capability(90)``) and falls back
+        # to the Triton/FLA kernel, which is the ``else`` branch below.
         self._use_flashinfer_prefill = (
             torch.cuda.is_available()
-            and torch.cuda.get_device_capability()[0] >= 9
+            and torch.cuda.get_device_capability() == (9, 0)
         )
 
     @staticmethod
@@ -264,24 +283,6 @@ class Qwen3NextGDNAttention(nn.Module):
         rank = _tp_rank()
         shard = param.data.size(0)
         param.data.copy_(loaded_weight.narrow(0, rank * shard, shard))
-
-    def _ba_weight_loader(self, param, loaded_weight):
-        """Load in_proj_ba weight matching vLLM's MergedColumnParallelLinear.
-
-        vLLM uses ``output_sizes=[num_v_heads, num_v_heads]`` which splits the
-        ``[2*num_v_heads, hidden_size]`` weight at the midpoint, then TP-shards
-        each half independently. This creates non-contiguous V-head assignments
-        per rank but matches vLLM's exact behavior for token-level alignment.
-        """
-        tp, rank = _tp_size(), _tp_rank()
-        if tp == 1:
-            param.data.copy_(loaded_weight)
-            return
-        half = loaded_weight.size(0) // 2  # num_v_heads
-        shard_size = half // tp
-        part0 = loaded_weight.narrow(0, rank * shard_size, shard_size)
-        part1 = loaded_weight.narrow(0, half + rank * shard_size, shard_size)
-        param.data.copy_(torch.cat([part0, part1], dim=0))
 
     def _unpack_qkvz(self, proj_out):
         """Unpack in_proj_qkvz output into q, k, v, z."""
@@ -384,7 +385,20 @@ class Qwen3NextGDNAttention(nn.Module):
 
         # 3. Gating: g = -exp(A_log) * softplus(a + dt_bias), beta=sigmoid(b).
         # Keep this fused to match vLLM's Qwen3-Next hot path.
-        g, beta = _fused_gdn_gating(self.A_log, a, b, self.dt_bias)
+        #
+        # Only needed for prefill. vLLM computes gating separately just when
+        # ``num_prefills > 0`` and otherwise feeds the raw A_log/a/b/dt_bias into
+        # ``fused_sigmoid_gating_delta_rule_update``, which derives g and beta
+        # inside the kernel. Materializing them here instead round-trips beta
+        # through ``b.dtype`` (bf16), and beta is the delta rule's learning rate,
+        # so that rounding perturbs the state update on *every* decode step and
+        # compounds -- which is what token agreement against the reference decays
+        # over, independently of any attention, page-size, prefill-budget or batch
+        # setting (all four were measured to change alignment not at all).
+        if md.num_prefills > 0:
+            g, beta = _fused_gdn_gating(self.A_log, a, b, self.dt_bias)
+        else:
+            g = beta = None
 
         recurrent_full = state_manager.recurrent[self.layer_idx]
         if md.num_prefills > 0:
@@ -423,12 +437,14 @@ class Qwen3NextGDNAttention(nn.Module):
                 final_state.to(recurrent_full.dtype),
             )
         else:
-            o, _ = _vllm_fused_recurrent_gdn(
+            o, _ = _vllm_fused_gating_gdn_update(
+                A_log=self.A_log,
+                a=a,
+                b=b,
+                dt_bias=self.dt_bias,
                 q=q_4d.contiguous(),
                 k=k_4d.contiguous(),
                 v=v_4d.contiguous(),
-                g=g.contiguous(),
-                beta=beta.contiguous(),
                 initial_state=recurrent_full,
                 inplace_final_state=True,
                 cu_seqlens=md.non_spec_query_start_loc[

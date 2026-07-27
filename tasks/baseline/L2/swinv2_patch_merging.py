@@ -42,7 +42,16 @@ class SwinV2PatchMerging(nn.Module):
         self.dim = dim
         self.out_dim = out_dim or 2 * dim
         self.reduction = Linear(4 * dim, self.out_dim, bias=False)
-        self.norm = LayerNorm(self.out_dim)
+        # promote_fp32=False: match timm, which runs LayerNorm natively in
+        # the model dtype. The fp32 promotion default exists for
+        # DeepSeek-V3.2's indexer k_norm, where a bf16 reduction shifts the
+        # FP8 indexer cache and changes top-2048 selection. SwinV2 needs
+        # none of that and paid
+        # 30% of its GPU time for it -- an ours-only nsys capture showed
+        # vectorized_layer_norm_kernel<float> at 1691ms/29,256 calls and
+        # 87,768 direct_copy conversions, both absent from timm's trace, while
+        # every GEMM and reduce matched within 1%.
+        self.norm = LayerNorm(self.out_dim, promote_fp32=False)
 
     def forward(self, x: torch.Tensor) -> torch.Tensor:
         B, H, W, C = x.shape

@@ -1,12 +1,17 @@
 """TRTLLM-gen paged attention decode kernel (via FlashInfer, Blackwell only).
 
 Accepts the same interface as FlashAttnDecode so that LlamaAttention can
-dispatch to either backend without branch logic.
+dispatch to either backend without branch logic.  ``Attention`` passes the
+sliding window and attention sinks as vLLM FlashAttention's
+``window_size``/``s_aux`` kwargs; both are translated to the TRTLLM kernel's
+``window_left``/``sinks``.
 """
 
 import torch
 import torch.nn as nn
 from flashinfer.decode import trtllm_batch_decode_with_kv_cache
+
+from .flashinfer_prefill import _window_left, as_sinks
 
 
 class TRTLLMDecode(nn.Module):
@@ -25,7 +30,7 @@ class TRTLLMDecode(nn.Module):
 
     def forward(self, q, k_cache, v_cache, cache_seqlens=None,
                 block_table=None, softmax_scale=None, causal=True,
-                max_seq_len=None, **kwargs):
+                max_seq_len=None, s_aux=None, window_size=None, **kwargs):
         if max_seq_len is None:
             max_seq_len = int(cache_seqlens.max().item())
         return trtllm_batch_decode_with_kv_cache(
@@ -37,5 +42,7 @@ class TRTLLMDecode(nn.Module):
             max_seq_len=max_seq_len,
             bmm1_scale=softmax_scale if softmax_scale is not None else self.sm_scale,
             bmm2_scale=1.0,
+            window_left=_window_left(window_size),
+            sinks=as_sinks(s_aux),
             kv_layout="HND",
         )

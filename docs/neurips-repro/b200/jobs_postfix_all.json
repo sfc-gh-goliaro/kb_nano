@@ -1,0 +1,270 @@
+[
+ {
+  "name": "pf_mixtral",
+  "gpus": 4,
+  "timeout": 14400,
+  "cmd": "python tests/bench_vllm.py --model mistralai/Mixtral-8x7B-Instruct-v0.1 --tp 4 --skip-latency"
+ },
+ {
+  "name": "pf_qwen3next",
+  "gpus": 2,
+  "timeout": 14400,
+  "cmd": "python tests/bench_vllm.py --model Qwen/Qwen3-Next-80B-A3B-Instruct --tp 2 --skip-latency"
+ },
+ {
+  "name": "pf_llama31",
+  "gpus": 1,
+  "timeout": 10800,
+  "cmd": "python tests/bench_vllm.py --model meta-llama/Llama-3.1-8B-Instruct --skip-latency"
+ },
+ {
+  "name": "pf_mamba",
+  "gpus": 1,
+  "timeout": 10800,
+  "cmd": "python tests/bench_vllm.py --model state-spaces/mamba-2.8b-hf --skip-latency"
+ },
+ {
+  "name": "pf_mamba2",
+  "gpus": 1,
+  "timeout": 10800,
+  "cmd": "python tests/bench_vllm.py --model mistralai/Mamba-Codestral-7B-v0.1 --skip-latency"
+ },
+ {
+  "name": "pf_whisper",
+  "gpus": 1,
+  "timeout": 10800,
+  "cmd": "python tests/bench_vllm.py --model openai/whisper-large-v3 --skip-latency"
+ },
+ {
+  "name": "pf_qwen2vl",
+  "gpus": 1,
+  "timeout": 10800,
+  "cmd": "python tests/bench_vllm.py --model Qwen/Qwen2-VL-7B-Instruct --skip-latency"
+ },
+ {
+  "name": "pf_qwen3vl",
+  "gpus": 1,
+  "timeout": 10800,
+  "cmd": "python tests/bench_vllm.py --model Qwen/Qwen3-VL-8B-Instruct --skip-latency"
+ },
+ {
+  "name": "pf_qwenomni",
+  "gpus": 1,
+  "timeout": 10800,
+  "cmd": "python tests/bench_vllm.py --model Qwen/Qwen2.5-Omni-7B --skip-latency"
+ },
+ {
+  "name": "pf_gemma4",
+  "gpus": 1,
+  "timeout": 10800,
+  "cmd": "python tests/bench_vllm.py --model google/gemma-4-26B-A4B-it --tp 1 --skip-latency --vllm-python /home/yak/repro_venvs/vllm020/bin/python"
+ },
+ {
+  "name": "pf_jamba",
+  "gpus": 1,
+  "timeout": 10800,
+  "cmd": "python tests/bench_jamba.py --model ai21labs/AI21-Jamba-Mini-1.7 --skip-latency"
+ },
+ {
+  "name": "pf_eagle3",
+  "gpus": 1,
+  "timeout": 10800,
+  "cmd": "python tests/bench_sglang.py --sglang-python /home/yak/repro_venvs/sglang/bin/python"
+ },
+ {
+  "name": "pf_gla",
+  "gpus": 1,
+  "timeout": 10800,
+  "cmd": "python tests/bench_fla.py --model fla-hub/gla-2.7B-100B --skip-latency"
+ },
+ {
+  "name": "pf_retnet",
+  "gpus": 1,
+  "timeout": 10800,
+  "cmd": "python tests/bench_fla.py --model fla-hub/retnet-2.7B-100B --skip-latency --max-num-seqs 256 --ref-max-num-seqs 256",
+  "env": {
+   "PYTORCH_ALLOC_CONF": "expandable_segments:True",
+   "PYTORCH_CUDA_ALLOC_CONF": "expandable_segments:True"
+  }
+ },
+ {
+  "name": "pf_rwkv7",
+  "gpus": 1,
+  "timeout": 10800,
+  "cmd": "python tests/bench_fla.py --model fla-hub/rwkv7-2.9B-g1 --skip-latency"
+ },
+ {
+  "name": "pf_ttte2e",
+  "gpus": 1,
+  "timeout": 10800,
+  "cmd": "TTT_E2E_REPO=/home/yak/reference_code/ttt-e2e python tests/bench_ttt_e2e.py --variant 125m_e2e --modes meta --cache-dir /home/yak/b200_repro/ttt_cache --results-out /home/yak/kb_nano/tests/results/B200/ttt-e2e-125m/results.json"
+ },
+ {
+  "name": "pf_flux",
+  "gpus": 1,
+  "timeout": 10800,
+  "cmd": "python tests/bench_vllm_omni.py --model black-forest-labs/FLUX.1-dev"
+ },
+ {
+  "name": "pf_hunyuan",
+  "gpus": 1,
+  "timeout": 18000,
+  "cmd": "python tests/bench_vllm_omni.py --model hunyuanvideo-community/HunyuanVideo-1.5-Diffusers-480p_t2v"
+ },
+ {
+  "name": "pf_cosyvoice3",
+  "gpus": 1,
+  "timeout": 14400,
+  "cmd": "python tests/bench_vllm_omni.py --model FunAudioLLM/Fun-CosyVoice3-0.5B-2512"
+ },
+ {
+  "name": "pf_sdxl_compiled",
+  "gpus": 1,
+  "timeout": 14400,
+  "cmd": "python tests/bench_diffusers.py"
+ },
+ {
+  "name": "pf_sdxl",
+  "gpus": 1,
+  "timeout": 10800,
+  "cmd": "python tests/bench_diffusers.py --enforce-eager"
+ },
+ {
+  "name": "pf_sam31",
+  "gpus": 1,
+  "timeout": 10800,
+  "cmd": "python tests/bench_sam.py"
+ },
+ {
+  "name": "pf_siglip2",
+  "gpus": 1,
+  "timeout": 10800,
+  "cmd": "python tests/bench_timm.py --model google/siglip2-so400m-patch16-naflex"
+ },
+ {
+  "name": "pf_dinov3",
+  "gpus": 1,
+  "timeout": 10800,
+  "cmd": "python tests/bench_timm.py --model facebook/dinov3-vit7b16-pretrain-lvd1689m"
+ },
+ {
+  "name": "pf_swinv2",
+  "gpus": 1,
+  "timeout": 10800,
+  "cmd": "python tests/bench_timm.py --model timm/swinv2_large_window12_192.ms_in22k"
+ },
+ {
+  "name": "pf_mobilenetv4",
+  "gpus": 1,
+  "timeout": 10800,
+  "cmd": "python tests/bench_timm.py --model timm/mobilenetv4_conv_medium.e500_r256_in1k"
+ },
+ {
+  "name": "pf_convnextv2",
+  "gpus": 1,
+  "timeout": 10800,
+  "cmd": "python tests/bench_image_cls.py --model facebook/convnextv2-base-22k-384 --num-images 3072 --batch-size 8"
+ },
+ {
+  "name": "pf_effnetv2",
+  "gpus": 1,
+  "timeout": 10800,
+  "cmd": "python tests/bench_image_cls.py --model timm/efficientnetv2_rw_m.agc_in1k --num-images 3072 --batch-size 8"
+ },
+ {
+  "name": "pf_yolov10",
+  "gpus": 1,
+  "timeout": 7200,
+  "cmd": "python tests/bench_detection.py --model jameslahm/yolov10n --use-fp16"
+ },
+ {
+  "name": "pf_rtdetrv2",
+  "gpus": 1,
+  "timeout": 7200,
+  "cmd": "python tests/bench_detection.py --model PekingU/rtdetr_v2_r101vd --use-fp16"
+ },
+ {
+  "name": "pf_3dgs",
+  "gpus": 1,
+  "timeout": 10800,
+  "cmd": "CUDA_HOME=/usr/local/cuda-12.9 /home/yak/repro_venvs/gs/bin/python tests/bench_3dgs.py --output-dir /home/yak/kb_nano/tests/results/B200/3dgs"
+ },
+ {
+  "name": "pf_instantngp",
+  "gpus": 1,
+  "timeout": 10800,
+  "cmd": "CUDA_HOME=/usr/local/cuda-12.9 LD_LIBRARY_PATH=/usr/local/cuda-12.9/lib64:$LD_LIBRARY_PATH python tests/bench_instantngp.py --output-dir /home/yak/kb_nano/tests/results/B200/instantngp"
+ },
+ {
+  "name": "pf_ptv3",
+  "gpus": 1,
+  "timeout": 10800,
+  "cmd": "/home/yak/repro_venvs/ptv3/bin/python tests/bench_pointcloud.py --output-dir /home/yak/kb_nano/tests/results/B200/ptv3"
+ },
+ {
+  "name": "pf_openfold3",
+  "gpus": 1,
+  "timeout": 18000,
+  "cmd": "python tests/bench_openfold3.py --data-dir /home/yak/b200_repro/openfold_data"
+ },
+ {
+  "name": "pf_pi0",
+  "gpus": 1,
+  "timeout": 10800,
+  "cmd": "python tests/bench_openpi.py --datasets aloha --num-requests 50 --model /home/yak/data-fast/pi0_ckpt/pi0_aloha_pen_uncap_pytorch --openpi-checkpoint /home/yak/data-fast/pi0_ckpt/pi0_aloha_pen_uncap_pytorch --reference-python /home/yak/repro_venvs/openpi/bin/python"
+ },
+ {
+  "name": "pf_dp3",
+  "gpus": 1,
+  "timeout": 10800,
+  "cmd": "python tests/bench_dp3.py --dp3-repo /home/yak/reference_code/3D-Diffusion-Policy/3D-Diffusion-Policy"
+ },
+ {
+  "name": "pf_dlrmv2",
+  "gpus": 1,
+  "timeout": 10800,
+  "cmd": "/home/yak/repro_venvs/dlrm/bin/python tests/bench_recsys.py --model dlrmv2"
+ },
+ {
+  "name": "pf_lightgcn",
+  "gpus": 1,
+  "timeout": 10800,
+  "cmd": "python tests/bench_recsys.py --model lightgcn"
+ },
+ {
+  "name": "pf_bgem3",
+  "gpus": 1,
+  "timeout": 10800,
+  "cmd": "python tests/bench_embedding.py --model bge-m3"
+ },
+ {
+  "name": "pf_colbertv2",
+  "gpus": 1,
+  "timeout": 10800,
+  "cmd": "python tests/bench_embedding.py --model colbertv2.0"
+ },
+ {
+  "name": "pf_llada",
+  "gpus": 1,
+  "timeout": 18000,
+  "cmd": "python tests/bench_dllm.py --model GSAI-ML/LLaDA-8B-Instruct --task gsm8k --batch-size 4 --max-samples 100 --fastdllm-root /home/yak/reference_code/Fast-dLLM/v1"
+ },
+ {
+  "name": "pf_oasis",
+  "gpus": 1,
+  "timeout": 14400,
+  "cmd": "python tests/bench_oasis.py --model Etched/oasis-500m"
+ },
+ {
+  "name": "pf_vjepa2",
+  "gpus": 1,
+  "timeout": 10800,
+  "cmd": "python tests/bench_vjepa2.py --output-dir /home/yak/kb_nano/tests/results/B200/vjepa2"
+ },
+ {
+  "name": "pf_gptoss20b_eager",
+  "gpus": 1,
+  "timeout": 14400,
+  "cmd": "python tests/bench_vllm.py --model openai/gpt-oss-20b --skip-latency --enforce-eager"
+ }
+]

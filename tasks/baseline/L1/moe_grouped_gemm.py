@@ -227,6 +227,23 @@ def _get_moe_configs(E: int, N: int, dtype: str | None,
     if os.path.isdir(local_configs_dir):
         config_file_paths.append(os.path.join(local_configs_dir, json_file_name))
 
+    # Installed vLLM package's tuned configs.  This is the intended source of
+    # truth (the ``vllm_repo`` source-checkout path above is used only when a
+    # checkout happens to be present); without it, block-FP8 MoE shapes such as
+    # DeepSeek-V3.2's fall back to the heuristic default, whose "large" config
+    # (BLOCK_SIZE_K=64) is ~4.6x slower than vLLM's tuned config at decode
+    # batch M>=128 because K=64 is incompatible with block_shape=[128,128].
+    try:
+        import vllm as _vllm  # already imported by the FP8 expert path
+        pkg_configs_dir = os.path.join(
+            os.path.dirname(os.path.abspath(_vllm.__file__)),
+            "model_executor", "layers", "fused_moe", "configs",
+        )
+        if os.path.isdir(pkg_configs_dir):
+            config_file_paths.append(os.path.join(pkg_configs_dir, json_file_name))
+    except Exception:
+        pass
+
     for config_file_path in config_file_paths:
         if os.path.exists(config_file_path):
             with open(config_file_path) as f:

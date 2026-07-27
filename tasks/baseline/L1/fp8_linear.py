@@ -522,10 +522,34 @@ def postprocess_fp8_weights(weight_fp8: torch.Tensor,
 
 
 def postprocess_fp8_weights_batched(weight_fp8: torch.Tensor,
-                                    scale_inv: torch.Tensor) -> None:
-    """Re-quantize 3D MoE weights [E, N, K] to UE8M0 scales in-place,
-    then transform scale layout for DeepGEMM. Matches vLLM's
-    requant_weight_ue8m0_inplace + deepgemm_post_process_fp8_weight_block."""
+                                    scale_inv: torch.Tensor) -> torch.Tensor:
+    """Re-quantize 3D MoE weights [E, N, K] to UE8M0 scales in-place.
+
+    Returns ``scale_inv`` for the caller to rebind. The requant is in-place; the
+    scales keep their plain per-block ``[E, ceil(N/128), ceil(K/128)]`` float32
+    layout because that is what this path's consumer wants -- DeepSeek's MoE runs
+    through ``FusedExperts`` -> ``MoeGroupedGemm``, a *Triton* block-wise FP8 GEMM
+    taking ``block_shape=[128, 128]``, not DeepGEMM.
+
+    No DeepGEMM SF layout transform is applied, deliberately. This used to end in
+
+        scale_transformed = deep_gemm.transform_sf_into_required_layout(...)
+        scale_inv[:, :scale_rows, :scale_cols].copy_(scale_transformed)
+
+    which is a no-op on Hopper and wrong on Blackwell. Measured directly on a
+    (4, 2, 4) float32 SF with recipe (1, 128, 128):
+
+        disable_ue8m0_cast=True   -> (4, 2, 4) float32, bit-identical to the input
+        UE8M0 enabled             -> (4, 256, 1) int32, four exponents packed per word
+
+    So on sm90 the call returned its own input and the copy was harmless, which is
+    why nobody noticed; on sm100 it produced a packed int32 tensor that no longer
+    even fits the fp32 destination ("The size of tensor a (56) must match the size
+    of tensor b (14)"). Rebinding the packed tensor instead makes the load succeed
+    but hands Triton a layout it cannot read: DeepSeek-V3.2 then ran at 0.724x with
+    alignment of 0.6 matched tokens and 0/192 exact -- diverging at the first token
+    of essentially every sequence.
+    """
     assert weight_fp8.ndim == 3
     E, N, K = weight_fp8.shape
     block_size = Fp8Linear.BLOCK_SIZE
@@ -550,14 +574,4 @@ def postprocess_fp8_weights_batched(weight_fp8: torch.Tensor,
         w_q.copy_(w_requant)
         s_old.copy_(s_requant)
 
-    recipe = (1, block_size, block_size)
-    scale_transformed = deep_gemm.transform_sf_into_required_layout(
-        sf=scale_inv[:, :scale_rows, :scale_cols],
-        mn=N,
-        k=K,
-        recipe=recipe,
-        num_groups=E,
-        is_sfa=False,
-        disable_ue8m0_cast=not use_ue8m0,
-    )
-    scale_inv[:, :scale_rows, :scale_cols].copy_(scale_transformed)
+    return scale_inv

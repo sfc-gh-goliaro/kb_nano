@@ -373,9 +373,19 @@ def main():
     torch.manual_seed(cfg["seed"])
     engine = _load_kb_engine(cfg, device, dtype)
 
+    # Warm up on a batch wide enough to compile what the timed run will use.
+    # Four requests do not: Triton autotune and FA4's CuTe-DSL JIT key on shapes
+    # including batch extent, so the first wide batch paid its compile cost inside
+    # the timed region. That made this bench's throughput swing ~3x run-to-run on
+    # our side (120k-373k input tok/s on BGE-M3 across identical code paths) while
+    # the reference, which ships pre-tuned configs, stayed within a few percent --
+    # enough noise to make single-run A/Bs meaningless. Applied identically to both
+    # engines below, so the comparison stays symmetric.
+    _n_warm = min(int(os.environ.get("FASTKERNELS_EMBED_WARMUP", "64")),
+                  len(cfg["records"]))
     warm_prompts = [
         {"prompt_token_ids": r["prompt_token_ids"]}
-        for r in cfg["records"][:min(4, len(cfg["records"]))]
+        for r in cfg["records"][:_n_warm]
     ]
     print(f"  fastkernels warmup: {len(warm_prompts)} requests", flush=True)
     _encode(engine, warm_prompts, cfg)
@@ -493,9 +503,19 @@ def main():
         max_num_seqs=cfg["max_num_seqs"],
     )
 
+    # Warm up on a batch wide enough to compile what the timed run will use.
+    # Four requests do not: Triton autotune and FA4's CuTe-DSL JIT key on shapes
+    # including batch extent, so the first wide batch paid its compile cost inside
+    # the timed region. That made this bench's throughput swing ~3x run-to-run on
+    # our side (120k-373k input tok/s on BGE-M3 across identical code paths) while
+    # the reference, which ships pre-tuned configs, stayed within a few percent --
+    # enough noise to make single-run A/Bs meaningless. Applied identically to both
+    # engines below, so the comparison stays symmetric.
+    _n_warm = min(int(os.environ.get("FASTKERNELS_EMBED_WARMUP", "64")),
+                  len(cfg["records"]))
     warm_prompts = [
         {"prompt_token_ids": r["prompt_token_ids"]}
-        for r in cfg["records"][:min(4, len(cfg["records"]))]
+        for r in cfg["records"][:_n_warm]
     ]
     print(f"  vLLM warmup: {len(warm_prompts)} requests", flush=True)
     _encode(llm, warm_prompts, cfg)

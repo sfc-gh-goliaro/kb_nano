@@ -1,0 +1,26 @@
+[
+ {
+  "name": "rb_rwkv7",
+  "gpus": 1,
+  "timeout": 14400,
+  "cmd": "python tests/bench_fla.py --model fla-hub/rwkv7-2.9B-g1 --skip-latency"
+ },
+ {
+  "name": "rb_gla",
+  "gpus": 1,
+  "timeout": 14400,
+  "cmd": "python tests/bench_fla.py --model fla-hub/gla-2.7B-100B --skip-latency"
+ },
+ {
+  "name": "rb_swinv2",
+  "gpus": 1,
+  "timeout": 10800,
+  "cmd": "python tests/bench_timm.py --model timm/swinv2_large_window12_192.ms_in22k"
+ },
+ {
+  "name": "rb_jamba",
+  "gpus": 1,
+  "timeout": 10800,
+  "cmd": "python tests/bench_jamba.py --model ai21labs/AI21-Jamba-Mini-1.7 --skip-latency"
+ }
+]

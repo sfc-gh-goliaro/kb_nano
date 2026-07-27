@@ -1,0 +1,333 @@
+[
+ {
+  "name": "full_mixtral",
+  "gpus": 4,
+  "timeout": 14400,
+  "cmd": "python tests/bench_vllm.py --model mistralai/Mixtral-8x7B-Instruct-v0.1 --tp 4 --skip-latency"
+ },
+ {
+  "name": "full_qwen3next",
+  "gpus": 2,
+  "timeout": 14400,
+  "cmd": "python tests/bench_vllm.py --model Qwen/Qwen3-Next-80B-A3B-Instruct --tp 2 --skip-latency"
+ },
+ {
+  "name": "full_kimi",
+  "gpus": 2,
+  "timeout": 14400,
+  "cmd": "python tests/bench_vllm.py --model moonshotai/Kimi-Linear-48B-A3B-Instruct --tp 2 --skip-latency",
+  "env": {
+   "FASTKERNELS_VLLM_ATTENTION_BACKEND": "CUTLASS_MLA"
+  }
+ },
+ {
+  "name": "full_gptoss120b",
+  "gpus": 2,
+  "timeout": 14400,
+  "cmd": "python tests/bench_vllm.py --model openai/gpt-oss-120b --tp 2 --skip-latency"
+ },
+ {
+  "name": "full_llama31",
+  "gpus": 1,
+  "timeout": 10800,
+  "cmd": "python tests/bench_vllm.py --model meta-llama/Llama-3.1-8B-Instruct --skip-latency"
+ },
+ {
+  "name": "full_gptoss20b",
+  "gpus": 1,
+  "timeout": 10800,
+  "cmd": "python tests/bench_vllm.py --model openai/gpt-oss-20b --skip-latency"
+ },
+ {
+  "name": "full_mamba",
+  "gpus": 1,
+  "timeout": 10800,
+  "cmd": "python tests/bench_vllm.py --model state-spaces/mamba-2.8b-hf --skip-latency"
+ },
+ {
+  "name": "full_mamba2",
+  "gpus": 1,
+  "timeout": 10800,
+  "cmd": "python tests/bench_vllm.py --model mistralai/Mamba-Codestral-7B-v0.1 --skip-latency"
+ },
+ {
+  "name": "full_whisper",
+  "gpus": 1,
+  "timeout": 10800,
+  "cmd": "python tests/bench_vllm.py --model openai/whisper-large-v3 --skip-latency"
+ },
+ {
+  "name": "full_qwen2vl",
+  "gpus": 1,
+  "timeout": 10800,
+  "cmd": "python tests/bench_vllm.py --model Qwen/Qwen2-VL-7B-Instruct --skip-latency"
+ },
+ {
+  "name": "full_qwen3vl",
+  "gpus": 1,
+  "timeout": 10800,
+  "cmd": "python tests/bench_vllm.py --model Qwen/Qwen3-VL-8B-Instruct --skip-latency"
+ },
+ {
+  "name": "full_qwenomni",
+  "gpus": 1,
+  "timeout": 10800,
+  "cmd": "python tests/bench_vllm.py --model Qwen/Qwen2.5-Omni-7B --skip-latency"
+ },
+ {
+  "name": "full_gemma4",
+  "gpus": 1,
+  "timeout": 10800,
+  "cmd": "python tests/bench_vllm.py --model google/gemma-4-26B-A4B-it --tp 1 --skip-latency --vllm-python /home/yak/repro_venvs/vllm020/bin/python"
+ },
+ {
+  "name": "full_jamba",
+  "gpus": 1,
+  "timeout": 10800,
+  "cmd": "python tests/bench_jamba.py --model ai21labs/AI21-Jamba-Mini-1.7 --skip-latency"
+ },
+ {
+  "name": "full_bitnet",
+  "gpus": 1,
+  "timeout": 14400,
+  "cmd": "python tests/bench_microsoft_bitnet.py",
+  "env": {
+   "BITNET_REPO": "/home/yak/reference_code/BitNet"
+  }
+ },
+ {
+  "name": "full_eagle3",
+  "gpus": 1,
+  "timeout": 10800,
+  "cmd": "python tests/bench_sglang.py --sglang-python /home/yak/repro_venvs/sglang/bin/python"
+ },
+ {
+  "name": "full_gla",
+  "gpus": 1,
+  "timeout": 10800,
+  "cmd": "python tests/bench_fla.py --model fla-hub/gla-2.7B-100B --skip-latency"
+ },
+ {
+  "name": "full_retnet",
+  "gpus": 1,
+  "timeout": 10800,
+  "cmd": "python tests/bench_fla.py --model fla-hub/retnet-2.7B-100B --skip-latency --max-num-seqs 256 --ref-max-num-seqs 256",
+  "env": {
+   "PYTORCH_ALLOC_CONF": "expandable_segments:True",
+   "PYTORCH_CUDA_ALLOC_CONF": "expandable_segments:True"
+  }
+ },
+ {
+  "name": "full_rwkv7",
+  "gpus": 1,
+  "timeout": 10800,
+  "cmd": "python tests/bench_fla.py --model fla-hub/rwkv7-2.9B-g1 --skip-latency"
+ },
+ {
+  "name": "full_ttte2e",
+  "gpus": 1,
+  "timeout": 10800,
+  "cmd": "TTT_E2E_REPO=/home/yak/reference_code/ttt-e2e python tests/bench_ttt_e2e.py --variant 125m_e2e --modes meta --cache-dir /home/yak/b200_repro/ttt_cache --results-out /home/yak/kb_nano/tests/results/B200/ttt-e2e-125m/results.json"
+ },
+ {
+  "name": "full_flux",
+  "gpus": 1,
+  "timeout": 10800,
+  "cmd": "python tests/bench_vllm_omni.py --model black-forest-labs/FLUX.1-dev"
+ },
+ {
+  "name": "full_hunyuan",
+  "gpus": 1,
+  "timeout": 18000,
+  "cmd": "python tests/bench_vllm_omni.py --model hunyuanvideo-community/HunyuanVideo-1.5-Diffusers-480p_t2v"
+ },
+ {
+  "name": "full_cosyvoice3",
+  "gpus": 1,
+  "timeout": 14400,
+  "cmd": "python tests/bench_vllm_omni.py --model FunAudioLLM/Fun-CosyVoice3-0.5B-2512"
+ },
+ {
+  "name": "full_sdxl_compiled",
+  "gpus": 1,
+  "timeout": 14400,
+  "cmd": "python tests/bench_diffusers.py"
+ },
+ {
+  "name": "full_sdxl",
+  "gpus": 1,
+  "timeout": 10800,
+  "cmd": "python tests/bench_diffusers.py --enforce-eager"
+ },
+ {
+  "name": "full_sam31",
+  "gpus": 1,
+  "timeout": 10800,
+  "cmd": "python tests/bench_sam.py"
+ },
+ {
+  "name": "full_siglip2",
+  "gpus": 1,
+  "timeout": 10800,
+  "cmd": "python tests/bench_timm.py --model google/siglip2-so400m-patch16-naflex"
+ },
+ {
+  "name": "full_dinov3",
+  "gpus": 1,
+  "timeout": 10800,
+  "cmd": "python tests/bench_timm.py --model facebook/dinov3-vit7b16-pretrain-lvd1689m"
+ },
+ {
+  "name": "full_swinv2",
+  "gpus": 1,
+  "timeout": 10800,
+  "cmd": "python tests/bench_timm.py --model timm/swinv2_large_window12_192.ms_in22k"
+ },
+ {
+  "name": "full_mobilenetv4",
+  "gpus": 1,
+  "timeout": 10800,
+  "cmd": "python tests/bench_timm.py --model timm/mobilenetv4_conv_medium.e500_r256_in1k"
+ },
+ {
+  "name": "full_convnextv2",
+  "gpus": 1,
+  "timeout": 10800,
+  "cmd": "python tests/bench_image_cls.py --model facebook/convnextv2-base-22k-384 --num-images 3072 --batch-size 8"
+ },
+ {
+  "name": "full_effnetv2",
+  "gpus": 1,
+  "timeout": 10800,
+  "cmd": "python tests/bench_image_cls.py --model timm/efficientnetv2_rw_m.agc_in1k --num-images 3072 --batch-size 8"
+ },
+ {
+  "name": "full_yolov10",
+  "gpus": 1,
+  "timeout": 7200,
+  "cmd": "python tests/bench_detection.py --model jameslahm/yolov10n --use-fp16"
+ },
+ {
+  "name": "full_rtdetrv2",
+  "gpus": 1,
+  "timeout": 7200,
+  "cmd": "python tests/bench_detection.py --model PekingU/rtdetr_v2_r101vd --use-fp16"
+ },
+ {
+  "name": "full_3dgs",
+  "gpus": 1,
+  "timeout": 10800,
+  "cmd": "CUDA_HOME=/usr/local/cuda-12.9 /home/yak/repro_venvs/gs/bin/python tests/bench_3dgs.py --output-dir /home/yak/kb_nano/tests/results/B200/3dgs"
+ },
+ {
+  "name": "full_instantngp",
+  "gpus": 1,
+  "timeout": 10800,
+  "cmd": "CUDA_HOME=/usr/local/cuda-12.9 LD_LIBRARY_PATH=/usr/local/cuda-12.9/lib64:$LD_LIBRARY_PATH python tests/bench_instantngp.py --output-dir /home/yak/kb_nano/tests/results/B200/instantngp"
+ },
+ {
+  "name": "full_ptv3",
+  "gpus": 1,
+  "timeout": 10800,
+  "cmd": "/home/yak/repro_venvs/ptv3/bin/python tests/bench_pointcloud.py --output-dir /home/yak/kb_nano/tests/results/B200/ptv3"
+ },
+ {
+  "name": "full_openfold3",
+  "gpus": 1,
+  "timeout": 18000,
+  "cmd": "python tests/bench_openfold3.py --data-dir /home/yak/b200_repro/openfold_data"
+ },
+ {
+  "name": "full_pi0",
+  "gpus": 1,
+  "timeout": 10800,
+  "cmd": "python tests/bench_openpi.py --datasets aloha --num-requests 50 --model /home/yak/data-fast/pi0_ckpt/pi0_aloha_pen_uncap_pytorch --openpi-checkpoint /home/yak/data-fast/pi0_ckpt/pi0_aloha_pen_uncap_pytorch --reference-python /home/yak/repro_venvs/openpi/bin/python"
+ },
+ {
+  "name": "full_dp3",
+  "gpus": 1,
+  "timeout": 10800,
+  "cmd": "python tests/bench_dp3.py --dp3-repo /home/yak/reference_code/3D-Diffusion-Policy/3D-Diffusion-Policy"
+ },
+ {
+  "name": "full_dlrmv2",
+  "gpus": 1,
+  "timeout": 10800,
+  "cmd": "/home/yak/repro_venvs/dlrm/bin/python tests/bench_recsys.py --model dlrmv2"
+ },
+ {
+  "name": "full_lightgcn",
+  "gpus": 1,
+  "timeout": 10800,
+  "cmd": "python tests/bench_recsys.py --model lightgcn"
+ },
+ {
+  "name": "full_bgem3",
+  "gpus": 1,
+  "timeout": 10800,
+  "cmd": "python tests/bench_embedding.py --model bge-m3"
+ },
+ {
+  "name": "full_colbertv2",
+  "gpus": 1,
+  "timeout": 10800,
+  "cmd": "python tests/bench_embedding.py --model colbertv2.0"
+ },
+ {
+  "name": "full_llada",
+  "gpus": 1,
+  "timeout": 18000,
+  "cmd": "python tests/bench_dllm.py --model GSAI-ML/LLaDA-8B-Instruct --task gsm8k --batch-size 4 --max-samples 100 --fastdllm-root /home/yak/reference_code/Fast-dLLM/v1"
+ },
+ {
+  "name": "full_oasis",
+  "gpus": 1,
+  "timeout": 14400,
+  "cmd": "python tests/bench_oasis.py --model Etched/oasis-500m"
+ },
+ {
+  "name": "full_vjepa2",
+  "gpus": 1,
+  "timeout": 10800,
+  "cmd": "python tests/bench_vjepa2.py --output-dir /home/yak/kb_nano/tests/results/B200/vjepa2"
+ },
+ {
+  "name": "full_gptoss20b_eager",
+  "gpus": 1,
+  "timeout": 14400,
+  "cmd": "python tests/bench_vllm.py --model openai/gpt-oss-20b --skip-latency --enforce-eager"
+ },
+ {
+  "name": "full_gptoss120b_eager",
+  "gpus": 2,
+  "timeout": 18000,
+  "cmd": "python tests/bench_vllm.py --model openai/gpt-oss-120b --tp 2 --skip-latency --enforce-eager"
+ },
+ {
+  "name": "exp_mamba2_seqs256",
+  "gpus": 1,
+  "timeout": 14400,
+  "cmd": "python tests/bench_vllm.py --model mistralai/Mamba-Codestral-7B-v0.1 --skip-latency",
+  "env": {
+   "FASTKERNELS_MAX_NUM_SEQS": "256"
+  }
+ },
+ {
+  "name": "exp_mamba_seqs256",
+  "gpus": 1,
+  "timeout": 14400,
+  "cmd": "python tests/bench_vllm.py --model state-spaces/mamba-2.8b-hf --skip-latency",
+  "env": {
+   "FASTKERNELS_MAX_NUM_SEQS": "256"
+  }
+ },
+ {
+  "name": "diag_kimi_vllm_blocking",
+  "gpus": 2,
+  "timeout": 5400,
+  "cmd": "python tests/bench_vllm.py --model moonshotai/Kimi-Linear-48B-A3B-Instruct --tp 2 --skip-latency --num-seqs 32 --scenario balanced",
+  "env": {
+   "CUDA_LAUNCH_BLOCKING": "1"
+  }
+ }
+]

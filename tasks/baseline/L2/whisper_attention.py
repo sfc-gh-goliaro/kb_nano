@@ -162,19 +162,35 @@ class WhisperCrossAttention(nn.Module):
         self.k_cache = self.v_cache = torch.tensor([])
 
         attn_cfg = get_attn_backend_config()
+        self._use_trtllm = attn_cfg.use_trtllm
         self._block_size = attn_cfg.block_size
 
-        self.store_kvcache = (
-            StoreKVCacheHND(page_size=attn_cfg.block_size)
-            if attn_cfg.use_trtllm
-            else StoreKVCache()
-        )
-        self.prefill_op = FlashAttnPrefill(
-            self.num_heads, self.num_heads, self.head_dim,
-        )
-        self.decode_op = FlashAttnDecode(
-            self.num_heads, self.num_heads, self.head_dim,
-        )
+        # The cross-attention K/V cache lives in the engine's paged KV pool, so
+        # it follows the global layout: HND/page-16 with the TRTLLM-gen kernels
+        # on Blackwell, NHD/page-256 with flash_attn elsewhere.
+        if self._use_trtllm:
+            from ..L1.flashinfer_prefill import TRTLLMPrefill
+            from ..L1.flashinfer_decode import TRTLLMDecode
+            self.store_kvcache = StoreKVCacheHND(page_size=attn_cfg.block_size)
+            self.prefill_op = TRTLLMPrefill(
+                self.num_heads, self.num_heads, self.head_dim,
+            )
+            self.decode_op = TRTLLMDecode(
+                self.num_heads, self.num_heads, self.head_dim,
+            )
+        else:
+            self.store_kvcache = StoreKVCache()
+            self.prefill_op = FlashAttnPrefill(
+                self.num_heads, self.num_heads, self.head_dim,
+            )
+            self.decode_op = FlashAttnDecode(
+                self.num_heads, self.num_heads, self.head_dim,
+            )
+
+    def set_trtllm_workspace(self, workspace: torch.Tensor):
+        if self._use_trtllm:
+            self.prefill_op._workspace = workspace
+            self.decode_op._workspace = workspace
 
     def forward(
         self,

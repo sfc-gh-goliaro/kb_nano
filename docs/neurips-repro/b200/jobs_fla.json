@@ -1,0 +1,38 @@
+[
+ {
+  "name": "fla_rwkv7_t65536",
+  "gpus": 1,
+  "timeout": 14400,
+  "cmd": "python tests/bench_fla.py --model fla-hub/rwkv7-2.9B-g1 --skip-latency",
+  "env": {
+   "FASTKERNELS_MAX_NUM_BATCHED_TOKENS": "65536"
+  }
+ },
+ {
+  "name": "fla_rwkv7_t131072",
+  "gpus": 1,
+  "timeout": 14400,
+  "cmd": "python tests/bench_fla.py --model fla-hub/rwkv7-2.9B-g1 --skip-latency",
+  "env": {
+   "FASTKERNELS_MAX_NUM_BATCHED_TOKENS": "131072"
+  }
+ },
+ {
+  "name": "fla_gla_t65536",
+  "gpus": 1,
+  "timeout": 14400,
+  "cmd": "python tests/bench_fla.py --model fla-hub/gla-2.7B-100B --skip-latency",
+  "env": {
+   "FASTKERNELS_MAX_NUM_BATCHED_TOKENS": "65536"
+  }
+ },
+ {
+  "name": "fla_gla_t131072",
+  "gpus": 1,
+  "timeout": 14400,
+  "cmd": "python tests/bench_fla.py --model fla-hub/gla-2.7B-100B --skip-latency",
+  "env": {
+   "FASTKERNELS_MAX_NUM_BATCHED_TOKENS": "131072"
+  }
+ }
+]

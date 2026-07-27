@@ -1,0 +1,22 @@
+[
+ {
+  "name": "m2_graph512",
+  "gpus": 1,
+  "timeout": 14400,
+  "cmd": "python tests/bench_vllm.py --model mistralai/Mamba-Codestral-7B-v0.1 --skip-latency",
+  "env": {
+   "FASTKERNELS_MAMBA_GRAPH_MAX_BS": "512",
+   "FASTKERNELS_MAMBA_GRAPH_RESERVE_BYTES": "6442450944"
+  }
+ },
+ {
+  "name": "m2_graph1024",
+  "gpus": 1,
+  "timeout": 14400,
+  "cmd": "python tests/bench_vllm.py --model mistralai/Mamba-Codestral-7B-v0.1 --skip-latency",
+  "env": {
+   "FASTKERNELS_MAMBA_GRAPH_MAX_BS": "1024",
+   "FASTKERNELS_MAMBA_GRAPH_RESERVE_BYTES": "12884901888"
+  }
+ }
+]

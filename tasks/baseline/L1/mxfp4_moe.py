@@ -122,9 +122,23 @@ def _swizzle_mxfp4(quant_tensor: torch.Tensor, scale: torch.Tensor, num_warps: i
     if cap[0] == 9:
         opt_flags.update_opt_flags_constraints({"split_k": 1})
     elif cap[0] == 10:
-        opt_flags.update_opt_flags_constraints(
-            {"is_persistent": True, "epilogue_subtile": 1}
-        )
+        constraints = {"is_persistent": True, "epilogue_subtile": 1}
+        # These match vLLM's mxfp4_utils._swizzle_mxfp4 exactly -- but vLLM only ever
+        # reaches this kernel on Blackwell when FlashInfer is *absent*
+        # (``_get_mxfp4_backend`` returns SM100_FI_MXFP4_BF16 otherwise), so the
+        # sm100 constraints it publishes are effectively untested. Both GPT-OSS rows
+        # fault inside matmul_ogs here: 20b in the persistent kernel under CUDA
+        # graphs, 120b in the split-k ``reduce`` even eagerly. Hopper avoids the
+        # reduce path entirely by pinning split_k=1, so allow overriding the sm100
+        # constraints to test the same, e.g.
+        # ``FASTKERNELS_MXFP4_SM100_CONSTRAINTS=split_k=1,is_persistent=0``.
+        raw = os.environ.get("FASTKERNELS_MXFP4_SM100_CONSTRAINTS", "")
+        for item in (p for p in raw.split(",") if p.strip()):
+            key, _, val = item.partition("=")
+            constraints[key.strip()] = bool(int(val)) if key.strip() in (
+                "is_persistent",
+            ) else int(val)
+        opt_flags.update_opt_flags_constraints(constraints)
 
     # transpose so the quantization axis is on dim 1
     quant_tensor = quant_tensor.transpose(-2, -1)
@@ -203,7 +217,37 @@ def _routing_from_bitmatrix(bitmatrix, expt_scal, expt_indx, n_expts_tot, n_expt
     )
     gather_idx = GatherIndx(combine_indx, dispatch_indx)
     scatter_idx = ScatterIndx(dispatch_indx, combine_indx)
+    if os.environ.get("FASTKERNELS_CHECK_MOE_ROUTING") == "1":
+        _check_routing_indices(dispatch_indx, combine_indx,
+                              sparse_logits.mask_metadata.col_sum, n_expts_tot)
     return routing_data, gather_idx, scatter_idx
+
+
+def _check_routing_indices(dispatch_indx, combine_indx, col_sum, n_expts_tot):
+    """Validate the indices ``matmul_ogs`` will dereference.
+
+    ``matmul_ogs`` gathers rows through these, so a single out-of-range entry reads
+    outside the expert weights and reports as ``illegal memory access`` from
+    whichever CUDA call happens to come next -- which is how the GPT-OSS crash
+    presents (inside Triton's ``load_binary``, several frames from the cause).
+    Off by default: this syncs and allocates, so it is a debugging aid, not a
+    hot-path guard, and it cannot run inside a CUDA graph capture.
+    """
+    n = dispatch_indx.numel()
+    for name, t in (("dispatch_indx", dispatch_indx), ("combine_indx", combine_indx)):
+        lo, hi = int(t.min()), int(t.max())
+        # -1 is the documented "no token" sentinel; anything else must index a row.
+        if lo < -1 or hi >= n:
+            raise RuntimeError(
+                f"MoE routing {name} out of range: min {lo} max {hi} for {n} rows "
+                f"(n_expts_tot={n_expts_tot}). matmul_ogs would read out of bounds."
+            )
+    total = int(col_sum.sum())
+    if col_sum.numel() != n_expts_tot or total > n:
+        raise RuntimeError(
+            f"MoE routing histogram inconsistent: {col_sum.numel()} experts "
+            f"(expected {n_expts_tot}), tokens {total} > {n} rows."
+        )
 
 
 def _routing_from_logits(logits: torch.Tensor, n_expts_act: int, sm_first: bool):
@@ -324,6 +368,141 @@ class Mxfp4MoE(nn.Module):
     exposed as static helpers so the L2 caller does not need to import
     ``triton_kernels`` directly.
     """
+
+    @staticmethod
+    def sm100_flashinfer_available() -> bool:
+        """Should this run take the Blackwell FlashInfer path?
+
+        vLLM's ``_get_mxfp4_backend`` returns ``SM100_FI_MXFP4_BF16`` for any
+        capability-family-100 host that has FlashInfer, and only falls through to
+        ``Mxfp4Backend.TRITON`` (the ``matmul_ogs`` path below) when FlashInfer is
+        absent. We were taking the Triton path unconditionally, which is why gpt-oss
+        faulted inside ``_p_matmul_ogs`` on B200 and nowhere else: those sm100
+        ``opt_flags`` constraints are code the reference never executes on Blackwell.
+        Mirroring the selection also makes the row 1.4-4.7x faster.
+
+        ``cc[0] == 10`` matches vLLM's ``is_device_capability_family(100)``. H200
+        reports (9, 0), so the Triton path is untouched there.
+        """
+        if os.environ.get("FASTKERNELS_MXFP4_FLASHINFER", "1") != "1":
+            return False
+        if not torch.cuda.is_available() or torch.cuda.get_device_capability()[0] != 10:
+            return False
+        try:
+            from flashinfer import trtllm_fp4_block_scale_moe  # noqa: F401
+            from flashinfer.fp4_quantization import (  # noqa: F401
+                nvfp4_block_scale_interleave,
+            )
+            from flashinfer.fused_moe.core import (  # noqa: F401
+                get_w2_permute_indices_with_cache,
+            )
+        except ImportError:
+            return False
+        return True
+
+    @staticmethod
+    def _swap_every_two_rows(t: torch.Tensor, axis: int = -1) -> torch.Tensor:
+        """Swap adjacent pairs along ``axis``.
+
+        gpt-oss stores gate/up interleaved as (gate_0, up_0, gate_1, up_1, ...); the
+        TRTLLM-gen kernel's fused SwiGLU expects the opposite order within each pair.
+        This is load-bearing, not cosmetic -- omitting it moves the output by abs-max
+        2.01 against a 0.015 reference scale.
+        """
+        shape = t.shape
+        if axis < 0:
+            axis = len(shape) + axis
+        new = list(shape)
+        new[axis] = shape[axis] // 2
+        new.insert(axis + 1, 2)
+        return t.reshape(*new).flip(axis + 1).reshape(*shape)
+
+    @staticmethod
+    def prepare_weight_flashinfer(w13_q, w13_s, w13_b, w2_q, w2_s, w2_b):
+        """Lay MXFP4 expert weights out for ``trtllm_fp4_block_scale_moe``.
+
+        Mirrors vLLM's SM100_FI_MXFP4_BF16 preparation, which is a completely
+        different layout from ``_swizzle_mxfp4``: swap adjacent gate/up rows, apply
+        the kernel's epilogue row shuffle per expert, interleave the block scales, and
+        hand the scales over as float8_e4m3fn. Inputs must already be padded to the
+        shapes the kernel wants (see ``GptOssMoE``); zero pad rows survive the
+        permutation as zeros, and an E8M0 byte of 0 times FP4 0 contributes nothing.
+
+        Returns ``(FW13, FS13, FB13, FW2, FS2, FB2)``.
+        """
+        from flashinfer.fp4_quantization import nvfp4_block_scale_interleave
+        from flashinfer.fused_moe.core import get_w2_permute_indices_with_cache
+
+        E = w13_q.shape[0]
+        dev = w13_q.device
+        swap = Mxfp4MoE._swap_every_two_rows
+        s13 = swap(w13_s, -2)
+        q13 = swap(w13_q, -2)
+        b13 = swap(w13_b.float(), -1)
+        b2 = w2_b.float()
+
+        cache: dict = {}
+        epilogue_tile_m = 128
+        g1w, g1s, g1b, g2w, g2s, g2b = [], [], [], [], [], []
+        for i in range(E):
+            p = get_w2_permute_indices_with_cache(
+                cache, q13[i].view(torch.uint8), epilogue_tile_m)
+            g1w.append(q13[i].view(torch.uint8)[p.to(dev)].contiguous())
+            ps = get_w2_permute_indices_with_cache(
+                cache, s13[i].view(torch.uint8), epilogue_tile_m, num_elts_per_sf=16)
+            g1s.append(nvfp4_block_scale_interleave(
+                s13[i].view(torch.uint8)[ps.to(dev)].contiguous()))
+            pb = get_w2_permute_indices_with_cache(
+                cache, b13[i].clone().reshape(-1, 1), epilogue_tile_m)
+            g1b.append(b13[i].clone().reshape(-1, 1)[pb.to(dev)].contiguous())
+
+            p = get_w2_permute_indices_with_cache(
+                cache, w2_q[i].view(torch.uint8), epilogue_tile_m)
+            g2w.append(w2_q[i].view(torch.uint8)[p.to(dev)].contiguous())
+            ps = get_w2_permute_indices_with_cache(
+                cache, w2_s[i].view(torch.uint8), epilogue_tile_m, num_elts_per_sf=16)
+            g2s.append(nvfp4_block_scale_interleave(
+                w2_s[i].view(torch.uint8)[ps.to(dev)].contiguous()))
+            p = get_w2_permute_indices_with_cache(
+                cache, b2[i].clone().reshape(-1, 1), epilogue_tile_m)
+            g2b.append(b2[i].clone().reshape(-1, 1)[p.to(dev)].contiguous())
+
+        FW13 = torch.stack(g1w)
+        FS13 = torch.stack(g1s).reshape(*w13_s.shape).view(torch.float8_e4m3fn)
+        FW2 = torch.stack(g2w)
+        FS2 = torch.stack(g2s).reshape(*w2_s.shape).view(torch.float8_e4m3fn)
+        FB13 = torch.stack(g1b).reshape(E, -1)
+        FB2 = torch.stack(g2b).reshape(E, -1)
+        return FW13, FS13, FB13, FW2, FS2, FB2
+
+    @staticmethod
+    def forward_flashinfer(hidden_states, router_logits, *, w13, w13_scale, w13_bias,
+                           w2, w2_scale, w2_bias, alpha, beta, clamp_limit,
+                           num_experts, top_k, intermediate_size,
+                           tune_max_num_tokens):
+        """One ``trtllm_fp4_block_scale_moe`` call, replacing routing + two matmuls.
+
+        ``routing_method_type=1`` is Renormalize (top-k then softmax), matching the
+        ``renormalize=True`` / ``sm_first=False`` semantics of the Triton path.
+        FlashInfer autotuning is left off, as vLLM also forces it off, so no probe
+        kernels are launched -- which matters because this runs inside CUDA graphs.
+        """
+        from flashinfer import trtllm_fp4_block_scale_moe
+
+        return trtllm_fp4_block_scale_moe(
+            routing_logits=router_logits.to(torch.bfloat16), routing_bias=None,
+            hidden_states=hidden_states, hidden_states_scale=None,
+            gemm1_weights=w13, gemm1_weights_scale=w13_scale, gemm1_bias=w13_bias,
+            gemm1_alpha=alpha, gemm1_beta=beta, gemm1_clamp_limit=clamp_limit,
+            gemm2_weights=w2, gemm2_weights_scale=w2_scale, gemm2_bias=w2_bias,
+            output1_scale_scalar=None, output1_scale_gate_scalar=None,
+            output2_scale_scalar=None,
+            num_experts=num_experts, top_k=top_k, n_group=None, topk_group=None,
+            intermediate_size=intermediate_size,
+            local_expert_offset=0, local_num_experts=num_experts,
+            routed_scaling_factor=None, routing_method_type=1, do_finalize=True,
+            tune_max_num_tokens=tune_max_num_tokens,
+        )[0]
 
     @staticmethod
     def prepare_weight(
