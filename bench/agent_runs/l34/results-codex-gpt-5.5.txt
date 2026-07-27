@@ -1,0 +1,19 @@
+llama                   5/5 PASS    avg speedup: 1.27x
+gpt_oss                 0/5 PASS    avg speedup: 11841.07x
+gpt_oss_decoder         10/10 PASS    avg speedup: 1.01x
+qwen3_vl                0/8 PASS    avg speedup: 0.00x [OOM]
+llama_decoder           4/10 PASS    avg speedup: 0.90x
+gla                     10/10 PASS    avg speedup: 1.01x
+oasis_block             10/10 PASS    avg speedup: 1.10x
+vision_block            5/5 PASS    avg speedup: 1.81x
+oasis_vae_attention_block 5/5 PASS    avg speedup: 1.26x
+gla_decoder             318/320 PASS    avg speedup: 0.96x
+flux_transformer_block  4/4 PASS    avg speedup: 1.00x
+yolov10_backbone        1/1 PASS    avg speedup: 1.26x
+oasis_dit               15/15 PASS    avg speedup: 1.00x
+yolov10_neck            1/1 PASS    avg speedup: 1.35x
+yolov10_head            1/1 PASS    avg speedup: 1.05x
+bge_m3                  4/4 PASS    avg speedup: 1.00x
+yolov10                 0/1 PASS    avg speedup: 0.00x
+qwen3_moe_decoder       5/10 PASS    avg speedup: 0.95x
+oasis_rollout           4/4 PASS    avg speedup: 1.00x
