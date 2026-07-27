@@ -21,6 +21,8 @@ active.  If/when we add CUDA graph support, we need to handle this case.
 
 from __future__ import annotations
 
+import os
+
 import numpy as np
 import torch
 import torch.nn as nn
@@ -191,6 +193,21 @@ def _chunked_decode_remap(
     return local_seqlens, block_tables, max_context_len
 
 
+# Head size above which attention goes to vLLM's Triton unified kernel instead of
+# FlashAttention. FA2 is the fallback for large head dims because FA4's Blackwell
+# kernels are TMEM-limited to 128, but FA2's splitkv kernel is itself poor at large
+# head dims: on Gemma-4 (dual config, 512 for global layers and 256 for sliding) it
+# was 32% of our GPU time, while vLLM selects TRITON_ATTN for *every* layer. With
+# the default 256 our sliding layers take FA2 and only the global ones take Triton,
+# so the two engines disagree on exactly the layers FA2 is worst at.
+#
+# ``FASTKERNELS_TRITON_ATTN_MIN_HEAD_DIM`` lowers the bar so a model can be put on
+# the reference's kernel for all its layers; 257 keeps the previous behaviour.
+_TRITON_UNIFIED_MIN_HEAD_DIM = int(
+    os.environ.get("FASTKERNELS_TRITON_ATTN_MIN_HEAD_DIM", "257")
+)
+
+
 class Attention(nn.Module):
 
     def __init__(self, num_heads: int, head_size: int, scale: float,
@@ -299,7 +316,7 @@ class Attention(nn.Module):
                 softmax_scale=self.scale,
             )
         elif ctx.is_mixed:
-            if self.head_size > 256:
+            if self.head_size >= _TRITON_UNIFIED_MIN_HEAD_DIM:
                 can_use_triton = (
                     self._can_use_triton_unified(k_cache, ctx.prefill_block_tables)
                     and (ctx.num_decode_tokens == 0 or ctx.decode_block_tables is not None)
@@ -311,7 +328,7 @@ class Attention(nn.Module):
                 return o.reshape(N, self.num_heads * self.head_size)
             o = self._forward_mixed(q, k_cache, v_cache, ctx)
         else:
-            if self.head_size > 256:
+            if self.head_size >= _TRITON_UNIFIED_MIN_HEAD_DIM:
                 if self._can_use_triton_unified(k_cache, ctx.block_tables):
                     o = self._forward_pure_triton(q, k_cache, v_cache, ctx)
                 else:

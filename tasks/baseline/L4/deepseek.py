@@ -111,7 +111,9 @@ class DeepSeekV3Config:
             hidden_size=hf.hidden_size,
             intermediate_size=hf.intermediate_size,
             moe_intermediate_size=getattr(hf, 'moe_intermediate_size', 2048),
-            num_hidden_layers=hf.num_hidden_layers,
+            # DEEPSEEK_NUM_LAYERS: debug-only override to load fewer layers for
+            # fast profiling/iteration (the checkpoint's extra layers are skipped).
+            num_hidden_layers=int(__import__("os").environ.get("DEEPSEEK_NUM_LAYERS") or hf.num_hidden_layers),
             num_attention_heads=hf.num_attention_heads,
             vocab_size=hf.vocab_size,
             max_position_embeddings=hf.max_position_embeddings,
