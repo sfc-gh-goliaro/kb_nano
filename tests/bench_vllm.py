@@ -342,6 +342,119 @@ def _is_qwen_omni_model(model_name: str) -> bool:
     return "qwen" in lower and "omni" in lower
 
 
+# Per-model fastkernels engine tuning, applied via env so the engine keeps its
+# own defaults for every other model/path.  Only set when the user has not
+# already exported the variable.
+#
+# Qwen3-VL-235B (verified on 8x H200, Qwen3-VL-235B-A22B-Instruct-FP8 @ TP4,
+# 1000 seqs/scenario, vs vLLM 0.18):
+#   FASTKERNELS_MAX_CUDAGRAPH_BS=1024
+#     The serving benchmarks run max_num_seqs=1024, and batches above the
+#     capture cap fall back to *full* eager (vLLM keeps its piecewise-compiled
+#     regions above its own cap, so a 512 cap penalises us far more).
+#     text-only: 5,292 -> 8,549 out tok/s (+62%), for +5s of capture time.
+#   FASTKERNELS_MAX_ENCODER_TOKENS=4096
+#     Bounds post-merge vision tokens admitted per prefill step.  Without it the
+#     vision tower is handed a full max_num_batched_tokens (= 4x that many
+#     patches) in one call and OOMs mid-run, regardless of
+#     gpu_memory_utilization.  4096 completes image+video; 8192 OOMs.
+# Qwen2-VL (verified on 1x H200, Qwen2-VL-7B-Instruct @ TP1):
+#   FASTKERNELS_MAX_ENCODER_TOKENS=4096 + gpu_memory_utilization=0.85
+#     The image scenario OOMs without BOTH.  The unbounded encoder batch is the
+#     primary cause, but the cap alone is not enough here: the OOM lands in
+#     apply_rotary asking for only 80 MiB with 73 MiB free, i.e. the KV cache
+#     had consumed essentially all of the budget (PyTorch held 137.9 of
+#     139.8 GiB despite util=0.9), so the tower needs headroom too.  Lowering
+#     util alone is also not enough -- admission has to be bounded as well.
+#     0.85 clears the image scenario but video still OOMs the same way (94 MiB
+#     wanted, 55 MiB free), so 0.80 is used.
+#     Note one 2048x2048 image is 5349 post-merge tokens here (patch 14 vs
+#     Qwen3-VL's 16), i.e. above the cap, so it is admitted alone via the
+#     forward-progress rule in the scheduler.
+_PER_MODEL_DEFAULTS: dict[str, dict] = {
+    "qwen3-vl-235b": {
+        "env": {
+            "FASTKERNELS_MAX_CUDAGRAPH_BS": "1024",
+            "FASTKERNELS_MAX_ENCODER_TOKENS": "4096",
+        },
+    },
+    # Every Qwen3-VL size needs the encoder cap, not just the 235B. Budgeting the
+    # tower in *vision* tokens (rather than the prompt tokens it used to charge)
+    # is a strictly looser bound, because a multimodal prompt is its vision
+    # placeholders plus text -- so more sequences are admitted per step than
+    # before, and the tower's transient grows accordingly. Measured on 1x B200:
+    # Qwen3-VL-8B ran fine with the old prompt-token accounting but OOMs under
+    # the new one with the budget left at max_num_batched_tokens (136 MiB wanted,
+    # 83 MiB free of 178 GiB). Listed after the 235B entry so that model keeps
+    # its own graph-cap setting; already-set env vars are never overridden.
+    "qwen3-vl": {
+        "env": {"FASTKERNELS_MAX_ENCODER_TOKENS": "4096"},
+    },
+    "qwen2-vl": {
+        "env": {"FASTKERNELS_MAX_ENCODER_TOKENS": "4096"},
+        "gpu_memory_utilization": 0.80,
+    },
+    # Kimi-Linear is a hybrid whose full-attention layers use MLA. On Blackwell
+    # vLLM picks FLASHINFER_MLA, whose TRTLLM-gen decode kernel requires the
+    # block-table width to satisfy block_num % (128 / block_size) == 0. vLLM does
+    # not pad it (we do -- see flashinfer_mla_decode._pad_block_table), so the
+    # reference dies with an illegal memory access mid-run and the row had no
+    # oracle at all. CUTLASS_MLA asserts the same thing and FLASHMLA is
+    # Hopper-only, so TRITON_MLA is the only backend that runs; verified to
+    # complete 32 prompts at TP=2 where the default crashes.
+    #
+    # Caveat for anyone reading a speedup off this row: TRITON_MLA is not the
+    # backend vLLM would choose, and it is slower than the TRTLLM-gen path, so
+    # the comparison flatters us on throughput. Treat this row's speedup as a
+    # lower bound on the reference and its alignment as the meaningful number.
+    # Gemma-4 has dual head dims -- 512 for global layers, 256 for sliding -- and
+    # vLLM selects TRITON_ATTN for *every* layer. Our dispatch only sends
+    # head_size > 256 to the Triton unified kernel, so the sliding layers fall to
+    # FA2, which is the fallback because FA4's Blackwell kernels are TMEM-limited
+    # to 128 but is itself weak at large head dims: flash_fwd_splitkv was 32% of
+    # our GPU time. Matching the reference's choice on all layers, 3 runs per arm
+    # at 300 seqs with the reference stable within 0.5%:
+    #   FA2 on sliding   0.820 / 0.804 / 0.812   median 0.812
+    #   Triton all       0.946 / 0.943 / 0.900   median 0.943
+    # Non-overlapping, so +16% and 94% of the 1.00x paper figure.
+    #
+    # It is not free: avg matched tokens go 99.3 -> 89.7 (ranges 97.0-100.5 vs
+    # 87.5-95.8), about -10%. The paper reports this row on rank-score Top-20
+    # rather than avg tokens, so that axis is unaffected, but drop this entry if
+    # avg-token agreement matters more than the throughput.
+    "gemma-4": {
+        "env": {"FASTKERNELS_TRITON_ATTN_MIN_HEAD_DIM": "256"},
+    },
+    "kimi-linear": {
+        "env": {"FASTKERNELS_VLLM_ATTENTION_BACKEND": "TRITON_MLA"},
+    },
+}
+
+
+def _apply_per_model_defaults(model_name: str, args) -> dict[str, str]:
+    """Apply verified per-model settings; returns what was applied, for logging.
+
+    Never overrides an explicit user setting (exported env var or CLI flag).
+    ``gpu_memory_utilization`` is applied to *both* engines so the comparison
+    stays symmetric.
+    """
+    lower = model_name.lower()
+    applied: dict[str, str] = {}
+    for key, spec in _PER_MODEL_DEFAULTS.items():
+        if key not in lower:
+            continue
+        for name, value in spec.get("env", {}).items():
+            if os.environ.get(name):
+                continue
+            os.environ[name] = value
+            applied[name] = value
+        util = spec.get("gpu_memory_utilization")
+        if util is not None and args.gpu_memory_utilization is None:
+            args.gpu_memory_utilization = util
+            applied["gpu_memory_utilization"] = str(util)
+    return applied
+
+
 # ---------------------------------------------------------------------------
 # Multi-scenario vLLM subprocess worker (LLM, text-only)
 # ---------------------------------------------------------------------------
@@ -403,6 +516,26 @@ def main():
         }
     if cfg.get("load_format"):
         llm_kwargs["load_format"] = cfg["load_format"]
+    # vLLM 0.18 replaced VLLM_ATTENTION_BACKEND with AttentionConfig.backend, so
+    # an env var alone no longer pins the reference's backend. Needed when vLLM's
+    # own default is broken on the host arch -- e.g. it selects FLASHINFER_MLA for
+    # Kimi-Linear on B200 and then dies with an illegal memory access inside
+    # gpu_model_runner, leaving the row with no reference at all.
+    _vb = os.environ.get("FASTKERNELS_VLLM_ATTENTION_BACKEND")
+    if _vb:
+        llm_kwargs["attention_config"] = {"backend": _vb}
+        print(f"  vLLM attention backend pinned to {_vb}", flush=True)
+    # vLLM's decode auto-detection is `use_trtllm = num_tokens <= 256`
+    # (vllm/utils/flashinfer.py:use_trtllm_attention), so above a 256-token decode
+    # batch the reference silently leaves TRTLLM-gen for
+    # BatchDecodeWithPagedKVCacheWrapper while fastkernels stays on TRTLLM-gen.
+    # The two kernels differ by ~3e-3 relative, which is enough to flip a greedy
+    # argmax, and that is what collapses token agreement at 1000 prompts but not at
+    # 64. Forcing the reference to keep TRTLLM-gen at every batch size makes the
+    # comparison kernel-for-kernel and isolates that effect.
+    if os.environ.get("FASTKERNELS_VLLM_FORCE_TRTLLM") == "1":
+        llm_kwargs.setdefault("attention_config", {})["use_trtllm_attention"] = True
+        print("  vLLM forced to TRTLLM attention at all batch sizes", flush=True)
     llm = LLM(**llm_kwargs)
 
     # Warmup
@@ -799,14 +932,24 @@ def _preload_mm_data(dataset_name, dataset_split, num_seqs, seed,
             f"https://huggingface.co/datasets/{dataset_name}/resolve/main"
         )
         pbar = tqdm(data, total=num_seqs, desc="Loading videos")
+        skipped = 0
         for item in pbar:
             if len(results) >= num_seqs:
                 break
-            prompt = item["question"] + " " + " ".join(
-                f"{k}.{v}" for k, v in item["choices"].items())
-            video_path = item["video"].replace(remote_root, local_root)
-            frames, metadata = _load_video_opencv(
-                video_path, num_frames=num_video_frames)
+            # A single unreadable/corrupt clip must not abort the whole run:
+            # MMVU ships some files OpenCV cannot open (e.g.
+            # videos/Pharmacy/32.mp4), and raising here discarded every
+            # already-completed scenario for both engines.  Skip and count
+            # instead, matching the image/audio branches.
+            try:
+                prompt = item["question"] + " " + " ".join(
+                    f"{k}.{v}" for k, v in item["choices"].items())
+                video_path = item["video"].replace(remote_root, local_root)
+                frames, metadata = _load_video_opencv(
+                    video_path, num_frames=num_video_frames)
+            except Exception:
+                skipped += 1
+                continue
             results.append({
                 "prompt": prompt,
                 "images": None,
@@ -817,6 +960,10 @@ def _preload_mm_data(dataset_name, dataset_split, num_seqs, seed,
             })
             pbar.update(0)
         pbar.close()
+        if skipped:
+            print(f"  NOTE: skipped {skipped} unreadable video(s) from "
+                  f"{dataset_name}; loaded {len(results)}/{num_seqs}",
+                  flush=True)
     elif "librispeech_asr" in dataset_name:
         pbar = tqdm(data, total=num_seqs, desc="Loading audio")
         for item in pbar:
@@ -951,6 +1098,26 @@ def main():
         llm_kwargs["trust_remote_code"] = True
     if cfg.get("load_format"):
         llm_kwargs["load_format"] = cfg["load_format"]
+    # vLLM 0.18 replaced VLLM_ATTENTION_BACKEND with AttentionConfig.backend, so
+    # an env var alone no longer pins the reference's backend. Needed when vLLM's
+    # own default is broken on the host arch -- e.g. it selects FLASHINFER_MLA for
+    # Kimi-Linear on B200 and then dies with an illegal memory access inside
+    # gpu_model_runner, leaving the row with no reference at all.
+    _vb = os.environ.get("FASTKERNELS_VLLM_ATTENTION_BACKEND")
+    if _vb:
+        llm_kwargs["attention_config"] = {"backend": _vb}
+        print(f"  vLLM attention backend pinned to {_vb}", flush=True)
+    # vLLM's decode auto-detection is `use_trtllm = num_tokens <= 256`
+    # (vllm/utils/flashinfer.py:use_trtllm_attention), so above a 256-token decode
+    # batch the reference silently leaves TRTLLM-gen for
+    # BatchDecodeWithPagedKVCacheWrapper while fastkernels stays on TRTLLM-gen.
+    # The two kernels differ by ~3e-3 relative, which is enough to flip a greedy
+    # argmax, and that is what collapses token agreement at 1000 prompts but not at
+    # 64. Forcing the reference to keep TRTLLM-gen at every batch size makes the
+    # comparison kernel-for-kernel and isolates that effect.
+    if os.environ.get("FASTKERNELS_VLLM_FORCE_TRTLLM") == "1":
+        llm_kwargs.setdefault("attention_config", {})["use_trtllm_attention"] = True
+        print("  vLLM forced to TRTLLM attention at all batch sizes", flush=True)
     if cfg.get("limit_mm_per_prompt"):
         llm_kwargs["limit_mm_per_prompt"] = cfg["limit_mm_per_prompt"]
     llm = LLM(**llm_kwargs)
@@ -1451,6 +1618,26 @@ def main():
         llm_kwargs["trust_remote_code"] = True
     if cfg.get("load_format"):
         llm_kwargs["load_format"] = cfg["load_format"]
+    # vLLM 0.18 replaced VLLM_ATTENTION_BACKEND with AttentionConfig.backend, so
+    # an env var alone no longer pins the reference's backend. Needed when vLLM's
+    # own default is broken on the host arch -- e.g. it selects FLASHINFER_MLA for
+    # Kimi-Linear on B200 and then dies with an illegal memory access inside
+    # gpu_model_runner, leaving the row with no reference at all.
+    _vb = os.environ.get("FASTKERNELS_VLLM_ATTENTION_BACKEND")
+    if _vb:
+        llm_kwargs["attention_config"] = {"backend": _vb}
+        print(f"  vLLM attention backend pinned to {_vb}", flush=True)
+    # vLLM's decode auto-detection is `use_trtllm = num_tokens <= 256`
+    # (vllm/utils/flashinfer.py:use_trtllm_attention), so above a 256-token decode
+    # batch the reference silently leaves TRTLLM-gen for
+    # BatchDecodeWithPagedKVCacheWrapper while fastkernels stays on TRTLLM-gen.
+    # The two kernels differ by ~3e-3 relative, which is enough to flip a greedy
+    # argmax, and that is what collapses token agreement at 1000 prompts but not at
+    # 64. Forcing the reference to keep TRTLLM-gen at every batch size makes the
+    # comparison kernel-for-kernel and isolates that effect.
+    if os.environ.get("FASTKERNELS_VLLM_FORCE_TRTLLM") == "1":
+        llm_kwargs.setdefault("attention_config", {})["use_trtllm_attention"] = True
+        print("  vLLM forced to TRTLLM attention at all batch sizes", flush=True)
     llm = LLM(**llm_kwargs)
 
     from vllm.inputs import ExplicitEncoderDecoderPrompt, TextPrompt
@@ -1850,6 +2037,14 @@ def main():
         "--model", type=str, default="meta-llama/Llama-3.1-8B-Instruct",
     )
     parser.add_argument("--tp", type=int, default=1)
+    parser.add_argument(
+        "--gpu-memory-utilization", type=float, default=None,
+        help="Fraction of GPU memory the engine may use, applied identically "
+             "to both the fastkernels and vLLM workers (default: each "
+             "worker's own 0.9). Lower it when a multimodal run OOMs in the "
+             "vision tower -- its activations are not fully covered by the "
+             "memory profile.",
+    )
     parser.add_argument("--num-seqs", type=int, default=None)
     parser.add_argument("--seed", type=int, default=42)
     parser.add_argument(
@@ -1911,6 +2106,7 @@ def main():
     is_vlm = _is_vlm_model(args.model)
     is_qwen_omni = _is_qwen_omni_model(args.model)
     is_whisper = _is_whisper_model(args.model)
+    engine_env = _apply_per_model_defaults(args.model, args)
 
     if args.output_dir is None:
         short = args.model.split("/")[-1]
@@ -2139,6 +2335,10 @@ def main():
     print(f"  Seed           : {args.seed}")
     print(f"  Trust RC       : {args.trust_remote_code}")
     print(f"  Max seq len    : {global_max_seq_len}")
+    if engine_env:
+        print("  Engine env     : "
+              + ", ".join(f"{k}={v}" for k, v in sorted(engine_env.items()))
+              + "  (per-model default)")
     print(f"  fastkernels port   : {kb_nccl_port}")
     if vllm_port is not None:
         print(f"  vLLM port      : {vllm_port}")
@@ -2178,6 +2378,8 @@ def main():
             "temperature": args.temperature,
             "enforce_eager": args.enforce_eager,
             "max_model_len": global_max_seq_len,
+            **({"gpu_memory_utilization": args.gpu_memory_utilization}
+               if args.gpu_memory_utilization is not None else {}),
             "scenarios": scenario_data,
             "latency_scenarios": latency_data,
             "trust_remote_code": args.trust_remote_code,
@@ -2204,6 +2406,19 @@ def main():
             os.environ["FASTKERNELS_FLASHINFER_SOCKET_NAMESPACE"] = (
                 previous_flashinfer_namespace_env
             )
+        if vllm_raw is None:
+            # Fail loudly. The reference crashing used to be indistinguishable
+            # from success: the run continued, exited 0, and wrote a results.json
+            # carrying only fastkernels numbers with no speedup or alignment
+            # fields at all. Kimi-Linear looked like a passing row for hours that
+            # way (vLLM 0.18 dies on Blackwell in its MLA decode kernel), and a
+            # collector keyed on missing fields silently drops the row rather
+            # than reporting it. --skip-vllm remains the way to ask for a
+            # reference-free run on purpose.
+            print("  ERROR: the vLLM reference failed and --skip-vllm was not "
+                  "passed, so there is no baseline to compare against. "
+                  "Re-run with --skip-vllm if a reference-free run is intended.")
+            sys.exit(1)
 
     # -- Run fastkernels (one subprocess, all scenarios) --
     kb_root = str(_PROJECT_ROOT)
@@ -2215,6 +2430,8 @@ def main():
         "temperature": args.temperature,
         "enforce_eager": args.enforce_eager,
         "max_model_len": global_max_seq_len,
+        **({"gpu_memory_utilization": args.gpu_memory_utilization}
+           if args.gpu_memory_utilization is not None else {}),
         "project_root": kb_root,
         "package_name": package_name,
         "scenarios": scenario_data,

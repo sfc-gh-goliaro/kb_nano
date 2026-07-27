@@ -152,6 +152,24 @@ def _build_wildchat_scenarios(
 # ---------------------------------------------------------------------------
 # sglang subprocess worker
 # ---------------------------------------------------------------------------
+def _default_sglang_attention_backend() -> str:
+    """SGLang's EAGLE-3 default backend is FA3, which is Hopper-only.
+
+    Its own assertion says so: "FlashAttention v3 Backend requires SM>=80 and
+    SM<=90. Please use `--attention-backend flashinfer`." Pick flashinfer on
+    Blackwell so the reference actually runs, instead of the row silently
+    reporting fastkernels-only numbers with SGLANG N/A.
+    """
+    try:
+        import torch
+
+        if torch.cuda.is_available() and torch.cuda.get_device_capability()[0] >= 10:
+            return "flashinfer"
+    except Exception:
+        pass
+    return "fa3"
+
+
 SGLANG_WORKER = r'''
 import json, os, sys, time
 
@@ -538,6 +556,11 @@ def main():
              "comparisons isolating raw kernel/dispatch perf.",
     )
     parser.add_argument(
+        "--attention-backend", type=str,
+        default=_default_sglang_attention_backend(),
+        help="SGLang attention backend. Defaults to fa3 on Hopper and "
+             "flashinfer on Blackwell (SGLang's FA3 backend is SM<=90 only).")
+    parser.add_argument(
         "--sglang-python", type=str,
         default="/home/yak/miniconda3/envs/sglang-bench/bin/python",
         help="Python interpreter to use for the sglang subprocess. We launch "
@@ -639,6 +662,7 @@ def main():
             "scenarios": scenarios,
             "latency_scenarios": latency_scenarios,
             "disable_cuda_graph": args.enforce_eager,
+            "attention_backend": args.attention_backend,
         }
         sgl_raw = run_worker(
             SGLANG_WORKER, sgl_cfg,

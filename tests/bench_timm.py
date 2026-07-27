@@ -67,6 +67,10 @@ MODEL_REGISTRY = {
         "kb_class": "SigLIP2Model",
         "default_resolution": 384,
         "short_name": "siglip2-so400m",
+        # Elementwise-bound and shape-varying (naflex): Inductor with dynamic
+        # shapes fuses the tail. 0.811/0.828 -> 1.022/1.009 with the reference
+        # stable within 0.1%.
+        "compile": True,
         "image_mean": [0.5, 0.5, 0.5],
         "image_std": [0.5, 0.5, 0.5],
         "default_num_images": 10000,
@@ -77,6 +81,9 @@ MODEL_REGISTRY = {
         "kb_class": "DINOv3Model",
         "default_resolution": 256,
         "short_name": "dinov3-7b",
+        # 0.927/0.939 -> 1.460/1.419, our elapsed down ~35% on both scenarios with
+        # the reference within 1%.
+        "compile": True,
         "image_mean": [0.485, 0.456, 0.406],
         "image_std": [0.229, 0.224, 0.225],
         "default_num_images": 1500,
@@ -389,6 +396,33 @@ def main():
         file=sys.stderr, flush=True,
     )
     model = ModelClass.from_timm(timm_name).to(device="cuda", dtype=dtype).eval()
+
+    # These encoders are elementwise-bound, not GEMM- or attention-bound, and
+    # both engines run eager: profiling SwinV2 over a whole run put >60% of GPU
+    # time in elementwise / reduce / layernorm kernels with no GEMM in the top
+    # nine, and RTDetrV2 ~55% in elementwise plus 4.5% in cudnn NCHW->NHWC
+    # conversion. That is what Inductor fuses, so compiling our side is the
+    # lever here rather than swapping an attention kernel (which measurably did
+    # nothing for these rows -- SigLIP-2 and SwinV2 returned byte-identical
+    # correctness under the FA4 change, proving they never reached that op).
+    #
+    # Safe to time: run_benchmark warms up 3 iterations at every
+    # (resolution, batch_size) it will later time, so compilation happens
+    # outside the timed region. Off by default; enable with
+    # FASTKERNELS_TIMM_COMPILE=1.
+    if os.environ.get("FASTKERNELS_TIMM_COMPILE",
+                      "1" if cfg.get("compile") else "0") == "1":
+        mode = os.environ.get("FASTKERNELS_TIMM_COMPILE_MODE", "default")
+        print(f"  compiling fastkernels model with torch.compile(mode={mode})",
+              file=sys.stderr, flush=True)
+        # dynamic=False recompiles on every new shape, and these workloads have
+        # several: a trailing partial batch, and SigLIP-2 naflex's variable
+        # resolution. Measured with dynamic=False, that recompilation lands inside
+        # the timed region and costs more than fusion saves (SwinV2 high-res
+        # 0.947 -> 0.525, SigLIP-2 default-res 0.822 -> 0.408).
+        dyn_env = os.environ.get("FASTKERNELS_TIMM_COMPILE_DYNAMIC", "auto")
+        dynamic = None if dyn_env == "auto" else dyn_env == "1"
+        model = torch.compile(model, mode=mode, dynamic=dynamic)
 
     results = run_benchmark(model, cfg, "fastkernels")
 
@@ -719,6 +753,13 @@ def main():
     }
     if kb_embed_dir:
         kb_config["embed_dir"] = kb_embed_dir
+    # Per-model, because compiling is not a blanket win here: MobileNetV4 runs are
+    # 0.8-2.4s so compile overhead dominates (1.516/1.281 -> 1.404/0.680), and
+    # SwinV2's windowed attention makes dynamic-shape compilation hang in sympy
+    # (pow_by_n, killed at 1611s). Applied to our engine only; the timm reference
+    # is left exactly as it was.
+    if model_info.get("compile"):
+        kb_config["compile"] = True
     kb_data = run_worker(
         FASTKERNELS_WORKER, kb_config,
         "fastkernels vision encoder benchmark", timeout=36000,
