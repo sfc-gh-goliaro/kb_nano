@@ -16,6 +16,7 @@ dependencies = [
     "huggingface_hub",
     "safetensors",
     "tqdm",
+    "ray[default]",
     # Pin to the prebuilt local-version wheel (see [tool.uv] find-links) so uv
     # installs it instead of building from source. Unpinned resolves to PyPI's
     # 2.8.3.post1 sdist, which outranks the "+cu128torch2.10" wheel and triggers
@@ -69,3 +70,6 @@ no-build-isolation-package = ["flash-attn", "deep-gemm"]
 
 [tool.setuptools.package-dir]
 "fastkernels" = "."
+
+[tool.setuptools.package-data]
+"fastkernels" = ["scenarios/*.yaml"]

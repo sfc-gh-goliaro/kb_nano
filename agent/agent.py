@@ -3,7 +3,7 @@
 
 Uses Claude Opus 4.6 (via the internal Corvo endpoint) to generate
 replacement kernels for fastkernels operators, then benchmarks them using
-the fastkernels.bench suite.
+the fastkernels bench CLI.
 
 Usage:
     python -m fastkernels.agent.agent \
@@ -38,7 +38,27 @@ from dataclasses import dataclass
 from pathlib import Path
 
 from fastkernels import CANDIDATE_DIR, CUDA_BUILD_CACHE, KB_ROOT, PREV_ATTEMPTS_DIR, PROJECT_ROOT
-from fastkernels.bench.tracking import tracker
+try:
+    from fastkernels.bench.tracking import tracker
+except ModuleNotFoundError:
+    class _NoopRun:
+        def __enter__(self):
+            return self
+
+        def __exit__(self, *_exc):
+            return False
+
+    class _NoopTracker:
+        def start_run(self, *_args, **_kwargs):
+            return _NoopRun()
+
+        def log_kernel(self, *_args, **_kwargs):
+            return None
+
+        def log_metrics(self, *_args, **_kwargs):
+            return None
+
+    tracker = _NoopTracker()
 
 _PROJECT_ROOT = str(PROJECT_ROOT)
 if _PROJECT_ROOT not in sys.path:

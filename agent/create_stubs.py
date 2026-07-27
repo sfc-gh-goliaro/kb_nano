@@ -298,7 +298,7 @@ def main():
 
     print(f"\nDone. Stubs written to {_CANDIDATE_DIR}")
     print("Edit the forward() methods to add your custom implementations,")
-    print("then benchmark with: fastkernels kernels --target <name>")
+    print("then benchmark with: fastkernels bench --target <name>")
 
 
 if __name__ == "__main__":
