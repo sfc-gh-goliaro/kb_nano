@@ -1,173 +1,120 @@
-"""Encoder-only attention for Qwen vision transformer blocks.
+"""T5 self-attention with TP-aware QKV projection and relative position bias (L2).
 
-Non-causal, no KV cache. Uses FlashAttnPrefill L1 op with cu_seqlens
-for variable-length sequence support within the vision encoder.
+Mirrors vllm-omni's T5SelfAttention: QKVParallelLinear -> manual SDPA ->
+RowParallelLinear, with T5-style relative position bias computed per-partition.
 """
 
 
 from __future__ import annotations
 
 
-# Inlined helper (no baseline task): pure-torch dense/varlen attention
-# and paged-cache gather.  The baselines call flash_attn / vllm_flash_attn
-# here, so there is no baseline file to inline this from.
-import torch
-import torch.nn.functional as F
+# Inlined helper (no baseline task): HuggingFace config dataclasses.
+# The baselines get these from transformers, so there is no baseline file
+# to inline this from.
+# The baselines get these from transformers, so there is no baseline file
+# to inline this from.
+import json
+import os
+from dataclasses import dataclass, field
 
 
-def repeat_kv(k: torch.Tensor, target_heads: int) -> torch.Tensor:
-    if k.shape[-2] == target_heads:
-        return k
-    if target_heads % k.shape[-2] != 0:
-        raise ValueError(
-            f"Cannot repeat {k.shape[-2]} KV heads to {target_heads} query heads"
-        )
-    return k.repeat_interleave(target_heads // k.shape[-2], dim=-2)
+def _read_config_json(model_name: str, subfolder: str | None = None,
+                      local_files_only: bool = False) -> dict:
+    """Load ``config.json`` from a local directory or the Hub."""
+    path = os.path.join(model_name, subfolder) if subfolder else model_name
+    if not os.path.isdir(path):
+        from huggingface_hub import snapshot_download
+        repo = snapshot_download(model_name, local_files_only=local_files_only)
+        path = os.path.join(repo, subfolder) if subfolder else repo
+    with open(os.path.join(path, "config.json")) as fh:
+        return json.load(fh)
 
 
-def dense_attention(
-    q: torch.Tensor,
-    k: torch.Tensor,
-    v: torch.Tensor,
-    *,
-    softmax_scale: float | None,
-    causal: bool,
-    window_size: tuple[int, int] | list[int] | None = (-1, -1),
-    s_aux: torch.Tensor | None = None,
-    softcap: float = 0.0,
-) -> torch.Tensor:
-    window_size = (-1, -1) if window_size is None else tuple(window_size)
-    q_in = q.transpose(-3, -2)
-    k_in = repeat_kv(k, q.shape[-2]).transpose(-3, -2)
-    v_in = repeat_kv(v, q.shape[-2]).transpose(-3, -2)
-    scale = softmax_scale if softmax_scale is not None else q.shape[-1] ** -0.5
-    has_backend_specific_mask = (
-        window_size != (-1, -1)
-        or s_aux is not None
-        or softcap > 0.0
-    )
-    if q.is_cuda and not has_backend_specific_mask and q_in.shape[-2] == k_in.shape[-2]:
-        out = torch.ops.aten._scaled_dot_product_flash_attention(
-            q_in, k_in, v_in, 0.0, causal, scale=scale,
-        )[0]
-        return out.transpose(-3, -2)
-    if (
-        q.is_cuda
-        and causal
-        and not has_backend_specific_mask
-        and q_in.shape[-2] == 1
-    ):
-        out = torch.ops.aten._scaled_dot_product_flash_attention(
-            q_in, k_in, v_in, 0.0, False, scale=scale,
-        )[0]
-        return out.transpose(-3, -2)
-    if causal or has_backend_specific_mask:
-        q_len = q_in.shape[-2]
-        k_len = k_in.shape[-2]
-        left, right = window_size
-        if causal:
-            right = 0
-        q_pos = torch.arange(q_len, device=q.device).unsqueeze(1) + (k_len - q_len)
-        k_pos = torch.arange(k_len, device=q.device).unsqueeze(0)
-        if left < 0:
-            mask = k_pos <= q_pos + right
-        else:
-            mask = (k_pos <= torch.minimum(q_pos + right, torch.full_like(q_pos, k_len))) & (
-                k_pos >= q_pos - left
-            )
-        scores = torch.matmul(q_in.float(), k_in.float().transpose(-2, -1)) * scale
-        if softcap > 0.0:
-            scores = torch.tanh(scores / softcap) * softcap
-        scores = scores.masked_fill(~mask, torch.finfo(scores.dtype).min)
-        if s_aux is not None:
-            sink = s_aux.to(device=scores.device, dtype=scores.dtype).view(1, -1, 1, 1)
-            sink = sink.expand(scores.shape[0], -1, scores.shape[-2], -1)
-            probs = torch.softmax(torch.cat((scores, sink), dim=-1), dim=-1)[..., :-1]
-        else:
-            probs = torch.softmax(scores, dim=-1)
-        probs = probs.masked_fill(torch.all(~mask, dim=-1, keepdim=True), 0.0)
-        if s_aux is not None:
-            out = torch.matmul(probs, v_in.float()).to(v_in.dtype)
-        else:
-            out = torch.matmul(probs.to(v_in.dtype), v_in)
-        return out.transpose(-3, -2)
-    out = F.scaled_dot_product_attention(
-        q_in, k_in, v_in, is_causal=False, scale=scale,
-    )
-    return out.transpose(-3, -2)
+@dataclass
+class CLIPTextConfig:
+    """Fields of ``transformers.CLIPTextConfig`` read by the CLIP references."""
+
+    vocab_size: int = 49408
+    hidden_size: int = 512
+    intermediate_size: int = 2048
+    num_hidden_layers: int = 12
+    num_attention_heads: int = 8
+    max_position_embeddings: int = 77
+    layer_norm_eps: float = 1e-5
+    hidden_act: str = "quick_gelu"
+    eos_token_id: int = 49407
+    extra: dict = field(default_factory=dict)
+
+    def get(self, key: str, default=None):
+        if key in self.__dataclass_fields__ and key != "extra":
+            return getattr(self, key)
+        return self.extra.get(key, default)
+
+    @classmethod
+    def from_dict(cls, data: dict) -> "CLIPTextConfig":
+        # A full CLIP model config nests the text tower under "text_config".
+        if "text_config" in data and isinstance(data["text_config"], dict):
+            data = data["text_config"]
+        known = {f for f in cls.__dataclass_fields__ if f != "extra"}
+        return cls(extra={k: v for k, v in data.items() if k not in known},
+                   **{k: v for k, v in data.items() if k in known})
+
+    @classmethod
+    def from_pretrained(cls, model_name: str, subfolder: str | None = None,
+                        local_files_only: bool = False, **kwargs) -> "CLIPTextConfig":
+        return cls.from_dict(_read_config_json(model_name, subfolder, local_files_only))
 
 
-def varlen_attention(
-    q: torch.Tensor,
-    k: torch.Tensor,
-    v: torch.Tensor,
-    cu_seqlens_q: torch.Tensor,
-    cu_seqlens_k: torch.Tensor,
-    *,
-    softmax_scale: float | None,
-    causal: bool,
-    window_size: tuple[int, int] | list[int] | None = (-1, -1),
-    s_aux: torch.Tensor | None = None,
-    softcap: float = 0.0,
-) -> torch.Tensor:
-    window_size = (-1, -1) if window_size is None else tuple(window_size)
-    outputs = []
-    batch = cu_seqlens_q.numel() - 1
-    for i in range(batch):
-        q_start = int(cu_seqlens_q[i].item())
-        q_end = int(cu_seqlens_q[i + 1].item())
-        k_start = int(cu_seqlens_k[i].item())
-        k_end = int(cu_seqlens_k[i + 1].item())
-        out = dense_attention(
-            q[q_start:q_end].unsqueeze(0),
-            k[k_start:k_end].unsqueeze(0),
-            v[k_start:k_end].unsqueeze(0),
-            softmax_scale=softmax_scale,
-            causal=causal,
-            window_size=window_size,
-            s_aux=s_aux,
-            softcap=softcap,
-        ).squeeze(0)
-        outputs.append(out)
-    if not outputs:
-        return q.new_empty(q.shape)
-    return torch.cat(outputs, dim=0)
+@dataclass
+class T5Config:
+    """Fields of ``transformers.T5Config`` read by the T5 references.
 
+    ``dense_act_fn`` / ``is_gated_act`` are derived from ``feed_forward_proj``
+    exactly as transformers does, including the ``gated-gelu -> gelu_new``
+    backwards-compatibility remap.
+    """
 
-def gather_paged_cache(
-    cache: torch.Tensor,
-    block_table: torch.Tensor | None,
-    seq_idx: int,
-    seq_len: int,
-    *,
-    hnd: bool = False,
-) -> torch.Tensor:
-    if block_table is None:
-        if cache.ndim == 4 and hnd:
-            return cache.reshape(-1, cache.shape[1], cache.shape[-1])[:seq_len]
-        if cache.ndim == 4:
-            return cache.reshape(-1, cache.shape[-2], cache.shape[-1])[:seq_len]
-        return cache[:seq_len]
+    vocab_size: int = 32128
+    d_model: int = 512
+    d_kv: int = 64
+    d_ff: int = 2048
+    num_layers: int = 6
+    num_heads: int = 8
+    relative_attention_num_buckets: int = 32
+    relative_attention_max_distance: int = 128
+    layer_norm_epsilon: float = 1e-6
+    feed_forward_proj: str = "relu"
+    dense_act_fn: str = "relu"
+    is_gated_act: bool = False
+    extra: dict = field(default_factory=dict)
 
-    blocks = block_table[seq_idx]
-    pieces = []
-    remaining = seq_len
-    for block in blocks:
-        if remaining <= 0:
-            break
-        block_idx = int(block.item())
-        if block_idx < 0:
-            continue
-        block_cache = cache[block_idx]
-        if hnd:
-            block_cache = block_cache.transpose(0, 1)
-        take = min(remaining, block_cache.shape[0])
-        pieces.append(block_cache[:take])
-        remaining -= take
-    if not pieces:
-        shape = (0, cache.shape[1], cache.shape[-1]) if hnd else (0, cache.shape[-2], cache.shape[-1])
-        return cache.new_empty(shape)
-    return torch.cat(pieces, dim=0)
+    def __post_init__(self):
+        act_info = self.feed_forward_proj.split("-")
+        self.dense_act_fn = act_info[-1]
+        self.is_gated_act = act_info[0] == "gated"
+        if len(act_info) > 1 and act_info[0] != "gated" or len(act_info) > 2:
+            raise ValueError(
+                f"`feed_forward_proj`: {self.feed_forward_proj} is not a valid activation "
+                "function of the dense layer. Expected `gated-{ACT_FN}` or `{ACT_FN}`.")
+        if self.feed_forward_proj == "gated-gelu":
+            self.dense_act_fn = "gelu_new"
+
+    def get(self, key: str, default=None):
+        if key in self.__dataclass_fields__ and key != "extra":
+            return getattr(self, key)
+        return self.extra.get(key, default)
+
+    @classmethod
+    def from_dict(cls, data: dict) -> "T5Config":
+        known = {f for f in cls.__dataclass_fields__
+                 if f not in ("extra", "dense_act_fn", "is_gated_act")}
+        return cls(extra={k: v for k, v in data.items() if k not in known},
+                   **{k: v for k, v in data.items() if k in known})
+
+    @classmethod
+    def from_pretrained(cls, model_name: str, subfolder: str | None = None,
+                        local_files_only: bool = False, **kwargs) -> "T5Config":
+        return cls.from_dict(_read_config_json(model_name, subfolder, local_files_only))
 
 
 # Inlined from infra/tp.py
@@ -181,45 +128,61 @@ def _tp_rank():
     return dist.get_rank() if dist.is_initialized() else 0
 
 
-# Inlined from tasks/reference/L1/flash_attn_prefill.py
+# Inlined from tasks/reference/L1/embedding.py
 import torch.nn as nn
 
 
-class FlashAttnPrefill(nn.Module):
-    def __init__(self, num_heads: int, num_kv_heads: int, head_dim: int):
+class Embedding(nn.Module):
+    def __init__(self, num_embeddings: int, embedding_dim: int,
+                 padding_idx: int | None = None):
         super().__init__()
-        self.num_heads = num_heads
-        self.num_kv_heads = num_kv_heads
-        self.head_dim = head_dim
-        self.sm_scale = head_dim ** -0.5
+        self.emb = nn.Embedding(num_embeddings, embedding_dim,
+                                padding_idx=padding_idx)
 
-    def forward(self, q, k, v, cu_seqlens_q, cu_seqlens_k, max_seqlen_q, max_seqlen_k, **kwargs):
-        del max_seqlen_q, max_seqlen_k
-        block_table = kwargs.get("block_table")
-        window_size = kwargs.get("window_size", (-1, -1))
-        window_size = (-1, -1) if window_size is None else tuple(window_size)
-        if block_table is not None and k.ndim == 4:
-            k_parts = []
-            v_parts = []
-            cu_k = [0]
-            for i in range(cu_seqlens_k.numel() - 1):
-                seq_len = int((cu_seqlens_k[i + 1] - cu_seqlens_k[i]).item())
-                k_seq = gather_paged_cache(k, block_table, i, seq_len)
-                v_seq = gather_paged_cache(v, block_table, i, seq_len)
-                k_parts.append(k_seq)
-                v_parts.append(v_seq)
-                cu_k.append(cu_k[-1] + k_seq.shape[0])
-            k = torch.cat(k_parts, dim=0) if k_parts else k.new_empty((0, self.num_kv_heads, self.head_dim))
-            v = torch.cat(v_parts, dim=0) if v_parts else v.new_empty((0, self.num_kv_heads, self.head_dim))
-            cu_seqlens_k = torch.tensor(cu_k, device=cu_seqlens_k.device, dtype=cu_seqlens_k.dtype)
-        return varlen_attention(
-            q, k, v, cu_seqlens_q, cu_seqlens_k,
-            softmax_scale=kwargs.get("softmax_scale", self.sm_scale),
-            causal=kwargs.get("causal", True),
-            window_size=window_size,
-            s_aux=kwargs.get("s_aux", None),
-            softcap=kwargs.get("softcap", 0.0),
-        )
+    def forward(self, input_ids):
+        return self.emb(input_ids)
+
+
+# Inlined from tasks/reference/L1/linear.py
+import torch
+import torch.nn.functional as F
+
+
+class Matmul(nn.Module):
+    """Pure functional linear: takes input, weight, and optional bias as forward args."""
+
+    def forward(self, input, weight, bias=None):
+        return F.linear(input, weight, bias)
+
+
+class BMM(nn.Module):
+    """Batch matrix multiply: torch.matmul(a, b)."""
+
+    def forward(self, a: torch.Tensor, b: torch.Tensor) -> torch.Tensor:
+        return torch.matmul(a, b)
+
+
+class Linear(nn.Module):
+    """Parametric linear: stores weight and bias internally."""
+
+    def __init__(self, in_features: int, out_features: int, bias: bool = True):
+        super().__init__()
+        self.weight = nn.Parameter(torch.empty(out_features, in_features))
+        self.bias = nn.Parameter(torch.empty(out_features)) if bias else None
+        self.matmul = Matmul()
+
+    def forward(self, input):
+        return self.matmul(input, self.weight, self.bias)
+
+
+# Inlined from tasks/reference/L1/softmax.py
+class Softmax(nn.Module):
+    def __init__(self, dim: int = -1):
+        super().__init__()
+        self.dim = dim
+
+    def forward(self, x: torch.Tensor) -> torch.Tensor:
+        return F.softmax(x, dim=self.dim)
 
 
 # Inlined from tasks/reference/L1/fp8_linear.py
@@ -373,8 +336,6 @@ __all__ = ["AllReduce", "CustomAllreduce", "get_custom_ar", "set_custom_ar"]
 
 
 # Inlined from tasks/reference/L2/parallel_linear.py
-
-
 def _get_fp8_linear_cls():
     return Fp8Linear
 
@@ -690,87 +651,134 @@ class RowParallelLinear(nn.Module):
         return y
 
 
-def _rotate_half(x: torch.Tensor) -> torch.Tensor:
-    half = x.shape[-1] // 2
-    return torch.cat((-x[..., half:], x[..., :half]), dim=-1)
-
-
-def apply_rotary(x: torch.Tensor, cos: torch.Tensor, sin: torch.Tensor) -> torch.Tensor:
-    cos = cos.to(device=x.device, dtype=x.dtype)
-    sin = sin.to(device=x.device, dtype=x.dtype)
-    if cos.shape[-1] * 2 == x.shape[-1]:
-        cos = torch.cat([cos, cos], dim=-1)
-        sin = torch.cat([sin, sin], dim=-1)
-    while cos.ndim < x.ndim:
-        cos = cos.unsqueeze(0)
-        sin = sin.unsqueeze(0)
-    return x * cos + _rotate_half(x) * sin
-
-
-class VisionAttention(nn.Module):
-    """Multi-head attention for vision encoder (Qwen2-VL / Qwen2.5-VL / Qwen3-VL).
-
-    All heads are attention heads (no GQA). Uses full (non-causal) attention.
-    Supports TP: QKV is sharded, then gathered for RoPE, then re-sharded.
-    """
-
-    def __init__(self, embed_dim: int, num_heads: int, projection_size: int | None = None):
+class T5SelfAttention(nn.Module):
+    def __init__(self, config: T5Config, has_relative_attention_bias: bool = False):
         super().__init__()
-        if projection_size is None:
-            projection_size = embed_dim
-        tp = _tp_size()
-        self.tp_size = tp
-        self.tp_rank = _tp_rank()
-        self.head_dim = projection_size // num_heads
-        self.num_heads = num_heads // tp
+        self.d_model = config.d_model
+        self.d_kv = config.d_kv
+        self.n_heads = config.num_heads
+        self.inner_dim = self.n_heads * self.d_kv
+        self.has_relative_attention_bias = has_relative_attention_bias
+        self.relative_attention_num_buckets = config.relative_attention_num_buckets
+        self.relative_attention_max_distance = config.relative_attention_max_distance
 
-        self.qkv = QKVParallelLinear(
-            embed_dim, self.head_dim, num_heads, num_heads, bias=True,
+        tp_size = _tp_size()
+        assert self.n_heads % tp_size == 0
+        self.n_heads_per_partition = self.n_heads // tp_size
+
+        self.qkv_proj = QKVParallelLinear(
+            hidden_size=self.d_model,
+            head_size=self.d_kv,
+            total_num_heads=self.n_heads,
+            total_num_kv_heads=self.n_heads,
+            bias=False,
         )
-        self.proj = RowParallelLinear(projection_size, embed_dim, bias=True)
-        self.attn = FlashAttnPrefill(self.num_heads, self.num_heads, self.head_dim)
+
+        self.o = RowParallelLinear(self.inner_dim, self.d_model, bias=False)
+
+        self.bmm = BMM()
+        self.softmax = Softmax(dim=-1)
+
+        if has_relative_attention_bias:
+            self.relative_attention_bias = Embedding(
+                self.relative_attention_num_buckets, self.n_heads,
+            )
+
+    @staticmethod
+    def _relative_position_bucket(
+        relative_position: torch.Tensor,
+        bidirectional: bool = True,
+        num_buckets: int = 32,
+        max_distance: int = 128,
+    ) -> torch.Tensor:
+        relative_buckets = 0
+        if bidirectional:
+            num_buckets //= 2
+            relative_buckets += (relative_position > 0).to(torch.long) * num_buckets
+            relative_position = torch.abs(relative_position)
+        else:
+            relative_position = -torch.min(
+                relative_position, torch.zeros_like(relative_position),
+            )
+        max_exact = num_buckets // 2
+        is_small = relative_position < max_exact
+        relative_position_if_large = max_exact + (
+            torch.log(relative_position.float() / max_exact)
+            / math.log(max_distance / max_exact)
+            * (num_buckets - max_exact)
+        ).to(torch.long)
+        relative_position_if_large = torch.min(
+            relative_position_if_large,
+            torch.full_like(relative_position_if_large, num_buckets - 1),
+        )
+        relative_buckets += torch.where(
+            is_small, relative_position, relative_position_if_large,
+        )
+        return relative_buckets
+
+    def compute_bias(self, query_length: int, key_length: int, device: torch.device) -> torch.Tensor:
+        context_position = torch.arange(query_length, dtype=torch.long, device=device)[:, None]
+        memory_position = torch.arange(key_length, dtype=torch.long, device=device)[None, :]
+        relative_position = memory_position - context_position
+        relative_position_bucket = self._relative_position_bucket(
+            relative_position, bidirectional=True,
+            num_buckets=self.relative_attention_num_buckets,
+            max_distance=self.relative_attention_max_distance,
+        )
+        values = self.relative_attention_bias(relative_position_bucket)
+        tp_rank = _tp_rank()
+        head_start = tp_rank * self.n_heads_per_partition
+        head_end = head_start + self.n_heads_per_partition
+        values = values[:, :, head_start:head_end]
+        values = values.permute(2, 0, 1).unsqueeze(0)
+        return values
 
     def forward(
-        self, x: torch.Tensor,
-        cu_seqlens: torch.Tensor,
-        rotary_pos_emb_cos: torch.Tensor,
-        rotary_pos_emb_sin: torch.Tensor,
-        max_seqlen: int | None = None,
-    ) -> torch.Tensor:
-        seq_len, batch_size, _ = x.shape
-        qkv = self.qkv(x)
+        self,
+        hidden_states: torch.Tensor,
+        mask: torch.Tensor | None = None,
+        position_bias: torch.Tensor | None = None,
+    ) -> tuple[torch.Tensor, torch.Tensor]:
+        batch_size, seq_length = hidden_states.shape[:2]
 
-        q_size = self.num_heads * self.head_dim
-        q, k, v = qkv.split([q_size, q_size, q_size], dim=-1)
-        q = q.view(seq_len, batch_size, self.num_heads, self.head_dim)
-        k = k.view(seq_len, batch_size, self.num_heads, self.head_dim)
-        v = v.view(seq_len, batch_size, self.num_heads, self.head_dim)
-
-        # Transpose to (batch, seq, heads, dim)
-        q = q.transpose(0, 1).contiguous()
-        k = k.transpose(0, 1).contiguous()
-        v = v.transpose(0, 1).contiguous()
-
-        if rotary_pos_emb_cos is not None and rotary_pos_emb_sin is not None:
-            qk = torch.cat([q, k], dim=0)
-            qk = apply_rotary(qk, rotary_pos_emb_cos, rotary_pos_emb_sin)
-            q, k = qk.chunk(2, dim=0)
-
-        # Flatten batch dim for varlen
-        q = q.reshape(-1, self.num_heads, self.head_dim)
-        k = k.reshape(-1, self.num_heads, self.head_dim)
-        v = v.reshape(-1, self.num_heads, self.head_dim)
-
-        if max_seqlen is None:
-            max_seqlen = (cu_seqlens[1:] - cu_seqlens[:-1]).max().item()
-
-        out = self.attn(
-            q, k, v,
-            cu_seqlens, cu_seqlens,
-            max_seqlen, max_seqlen,
-            softmax_scale=self.head_dim ** -0.5,
-            causal=False,
+        qkv = self.qkv_proj(hidden_states)
+        q_size = self.n_heads_per_partition * self.d_kv
+        kv_size = self.n_heads_per_partition * self.d_kv
+        query_states, key_states, value_states = qkv.split(
+            [q_size, kv_size, kv_size], dim=-1,
         )
 
-        out = out.view(seq_len, batch_size, -1)
-        return self.proj(out)
+        query_states = query_states.view(
+            batch_size, seq_length, self.n_heads_per_partition, self.d_kv,
+        ).transpose(1, 2)
+        key_states = key_states.view(
+            batch_size, seq_length, self.n_heads_per_partition, self.d_kv,
+        ).transpose(1, 2)
+        value_states = value_states.view(
+            batch_size, seq_length, self.n_heads_per_partition, self.d_kv,
+        ).transpose(1, 2)
+
+        scores = self.bmm(query_states, key_states.transpose(3, 2))
+
+        if position_bias is None:
+            if self.has_relative_attention_bias:
+                position_bias = self.compute_bias(
+                    seq_length, seq_length, device=scores.device,
+                )
+            else:
+                position_bias = torch.zeros(
+                    (1, self.n_heads_per_partition, seq_length, seq_length),
+                    device=scores.device, dtype=scores.dtype,
+                )
+            if mask is not None:
+                position_bias = position_bias + mask
+
+        scores += position_bias
+        attn_weights = self.softmax(scores.float()).type_as(scores)
+        attn_output = self.bmm(attn_weights, value_states)
+
+        attn_output = attn_output.transpose(1, 2).contiguous()
+        attn_output = attn_output.view(batch_size, seq_length, -1)
+        attn_output = self.o(attn_output)
+
+        return attn_output, position_bias

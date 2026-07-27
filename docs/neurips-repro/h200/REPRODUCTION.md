@@ -158,11 +158,15 @@ today and are listed for completeness.
     dependency on vLLM being importable).
   * `_preload_mm_data` raised on the first unreadable MMVU clip, discarding
     every already-completed scenario for both engines. It now skips and counts.
-    This exposed the real problem: the MMVU snapshot ships only
-    `README.md` + `validation.json`, so with `HF_HUB_OFFLINE=1` there were **zero**
-    `.mp4` files and every video "failed to open". Fetch the videos first
-    (`snapshot_download('yale-nlp/MMVU', repo_type='dataset')`, 583 clips /
-    822 MB) — the video row cannot run without them.
+    This exposed the real problem: `_preload_mm_data` *does* call
+    `snapshot_download` for MMVU, but `HF_HUB_OFFLINE=1` silently degrades that
+    to "return whatever is already cached", and MMVU's metadata caches
+    separately from its clips — so the snapshot held only `validation.json`,
+    there were **zero** `.mp4` files, and all 1000 clips reported "could not
+    open". The loader now checks for clips up front and fails with the actual
+    reason (naming `HF_HUB_OFFLINE` when it is set) plus the one-line fetch
+    command, instead of 1000 opaque decode errors. No manual step is needed for
+    an online run; the clips (583 / 822 MB) download on first use.
   * `FASTKERNELS_MAX_CUDAGRAPH_BS=1024` — the serving benchmarks use
     `max_num_seqs=1024`, and batches above the capture cap fall back to *full*
     eager (vLLM keeps its piecewise-compiled regions above its own 512 cap, so

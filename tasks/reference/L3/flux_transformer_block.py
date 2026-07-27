@@ -1,14 +1,166 @@
-"""FLUX attention module (L2 composite).
+"""FLUX transformer blocks (L3 composites).
 
-Joint attention for dual-stream blocks (with added_kv_proj for text stream)
-and self-attention for single-stream blocks (pre_only=True).
+FluxTransformerBlock: Dual-stream block with AdaLayerNormZero conditioning.
+  Separate attention/FFN for image and text (encoder) streams.
 
-Mirrors vllm-omni's ``FluxAttention`` in
-``vllm_omni/diffusion/models/flux/flux_transformer.py``.
+FluxSingleTransformerBlock: Single-stream block with AdaLayerNormZeroSingle.
+  Concatenates text and image, applies self-attention and MLP in parallel.
 """
 
 
 from __future__ import annotations
+
+
+# Inlined from tasks/reference/L1/gelu.py
+import torch
+import torch.nn as nn
+import torch.nn.functional as F
+
+
+class GELU(nn.Module):
+    def __init__(self, approximate: str = "none"):
+        super().__init__()
+        self.approximate = approximate
+
+    def forward(self, x: torch.Tensor) -> torch.Tensor:
+        return F.gelu(x, approximate=self.approximate)
+
+
+# Inlined from tasks/reference/L1/layer_norm.py
+class LayerNorm(nn.Module):
+    def __init__(
+        self,
+        normalized_shape: int,
+        eps: float = 1e-5,
+        elementwise_affine: bool = True,
+        create_scale: bool = True,
+        create_offset: bool = True,
+    ):
+        super().__init__()
+        self.normalized_shape = (normalized_shape,)
+        self.eps = eps
+        self.elementwise_affine = elementwise_affine
+        if elementwise_affine and create_scale:
+            self.weight = nn.Parameter(torch.ones(normalized_shape))
+        else:
+            self.register_parameter("weight", None)
+        if elementwise_affine and create_offset:
+            self.bias = nn.Parameter(torch.zeros(normalized_shape))
+        else:
+            self.register_parameter("bias", None)
+
+    def forward(self, x: torch.Tensor) -> torch.Tensor:
+        orig_dtype = x.dtype
+        weight = self.weight.float() if self.weight is not None else None
+        bias = self.bias.float() if self.bias is not None else None
+        return F.layer_norm(
+            x.float(), self.normalized_shape, weight, bias, self.eps,
+        ).to(orig_dtype)
+
+
+# Inlined from tasks/reference/L1/linear.py
+class Matmul(nn.Module):
+    """Pure functional linear: takes input, weight, and optional bias as forward args."""
+
+    def forward(self, input, weight, bias=None):
+        return F.linear(input, weight, bias)
+
+
+class BMM(nn.Module):
+    """Batch matrix multiply: torch.matmul(a, b)."""
+
+    def forward(self, a: torch.Tensor, b: torch.Tensor) -> torch.Tensor:
+        return torch.matmul(a, b)
+
+
+class Linear(nn.Module):
+    """Parametric linear: stores weight and bias internally."""
+
+    def __init__(self, in_features: int, out_features: int, bias: bool = True):
+        super().__init__()
+        self.weight = nn.Parameter(torch.empty(out_features, in_features))
+        self.bias = nn.Parameter(torch.empty(out_features)) if bias else None
+        self.matmul = Matmul()
+
+    def forward(self, input):
+        return self.matmul(input, self.weight, self.bias)
+
+
+# Inlined from tasks/reference/L1/silu.py
+class SiLU(nn.Module):
+    def forward(self, x: torch.Tensor) -> torch.Tensor:
+        return F.silu(x)
+
+
+# Inlined from tasks/reference/L2/ada_layer_norm.py
+class AdaLayerNormZero(nn.Module):
+    r"""
+    Norm layer adaptive layer norm zero (adaLN-Zero).
+
+    Parameters:
+        embedding_dim (`int`): The size of each embedding vector.
+        num_embeddings (`int`): The size of the embeddings dictionary.
+    """
+
+    def __init__(self, embedding_dim: int, num_embeddings: int | None = None,
+                 norm_type="layer_norm", bias=True):
+        super().__init__()
+        self.emb = None
+
+        self.silu = SiLU()
+        self.linear = Linear(embedding_dim, 6 * embedding_dim, bias=bias)
+        if norm_type == "layer_norm":
+            self.norm = LayerNorm(embedding_dim, elementwise_affine=False, eps=1e-6)
+        else:
+            raise ValueError(
+                f"Unsupported `norm_type` ({norm_type}) provided. Supported ones are: 'layer_norm'."
+            )
+
+    def forward(
+        self,
+        x: torch.Tensor,
+        timestep: torch.Tensor | None = None,
+        class_labels: torch.LongTensor | None = None,
+        hidden_dtype: torch.dtype | None = None,
+        emb: torch.Tensor | None = None,
+    ) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor]:
+        if self.emb is not None:
+            emb = self.emb(timestep, class_labels, hidden_dtype=hidden_dtype)
+        emb = self.linear(self.silu(emb))
+        shift_msa, scale_msa, gate_msa, shift_mlp, scale_mlp, gate_mlp = emb.chunk(6, dim=1)
+        x = self.norm(x) * (1 + scale_msa[:, None]) + shift_msa[:, None]
+        return x, gate_msa, shift_mlp, scale_mlp, gate_mlp
+
+
+class AdaLayerNormZeroSingle(nn.Module):
+    r"""
+    Norm layer adaptive layer norm zero (adaLN-Zero) for single-stream blocks.
+
+    Parameters:
+        embedding_dim (`int`): The size of each embedding vector.
+    """
+
+    def __init__(self, embedding_dim: int, norm_type="layer_norm", bias=True):
+        super().__init__()
+
+        self.silu = SiLU()
+        self.linear = Linear(embedding_dim, 3 * embedding_dim, bias=bias)
+        if norm_type == "layer_norm":
+            self.norm = LayerNorm(embedding_dim, elementwise_affine=False, eps=1e-6)
+        else:
+            raise ValueError(
+                f"Unsupported `norm_type` ({norm_type}) provided. Supported ones are: 'layer_norm'."
+            )
+
+    def forward(
+        self,
+        x: torch.Tensor,
+        emb: torch.Tensor | None = None,
+    ) -> tuple[torch.Tensor, torch.Tensor]:
+        emb = self.linear(self.silu(emb))
+        shift_msa, scale_msa, gate_msa = emb.chunk(3, dim=1)
+        x = self.norm(x) * (1 + scale_msa[:, None]) + shift_msa[:, None]
+        return x, gate_msa
 
 
 # Inlined from infra/tp.py
@@ -23,10 +175,6 @@ def _tp_rank():
 
 
 # Inlined from tasks/reference/L1/t5_layer_norm.py
-import torch
-import torch.nn as nn
-
-
 class T5LayerNorm(nn.Module):
     def __init__(self, hidden_size: int, eps: float = 1e-6):
         super().__init__()
@@ -250,8 +398,6 @@ class DiffusionRoPE(nn.Module):
 # Inlined from tasks/reference/L1/dense_attention.py
 from typing import Literal
 
-import torch.nn.functional as F
-
 
 class DenseAttention(nn.Module):
     """Dense multi-head attention with ``(batch, seq, heads, dim)`` layout."""
@@ -435,8 +581,6 @@ __all__ = ["AllReduce", "CustomAllreduce", "get_custom_ar", "set_custom_ar"]
 
 
 # Inlined from tasks/reference/L2/parallel_linear.py
-
-
 def _get_fp8_linear_cls():
     return Fp8Linear
 
@@ -752,6 +896,7 @@ class RowParallelLinear(nn.Module):
         return y
 
 
+# Inlined from tasks/reference/L2/flux_attention.py
 def _tensor_model_parallel_all_gather(tensor: torch.Tensor, dim: int = -1) -> torch.Tensor:
     """Gather tensor across TP ranks along the given dimension."""
     import torch.distributed as dist
@@ -928,3 +1073,210 @@ class FluxAttention(nn.Module):
             if _tp_size() > 1:
                 hidden_states = _tensor_model_parallel_all_gather(hidden_states, dim=-1)
             return hidden_states
+
+
+# Inlined from tasks/reference/L2/flux_feedforward.py
+class ColumnParallelApproxGELU(nn.Module):
+    def __init__(self, dim_in: int, dim_out: int, *, approximate: str, bias: bool = True,
+                 quant_config: dict | None = None):
+        super().__init__()
+        self.proj = ColumnParallelLinear(dim_in, dim_out, bias=bias, quant_config=quant_config)
+        self.gelu = GELU(approximate=approximate)
+
+    def forward(self, x: torch.Tensor) -> torch.Tensor:
+        x = self.proj(x)
+        return self.gelu(x)
+
+
+class FeedForward(nn.Module):
+    """FLUX FFN: GELU(tanh) linear -> linear with TP sharding."""
+
+    def __init__(
+        self,
+        dim: int,
+        dim_out: int | None = None,
+        mult: int = 4,
+        inner_dim: int | None = None,
+        bias: bool = True,
+        quant_config: dict | None = None,
+    ) -> None:
+        super().__init__()
+        inner_dim = inner_dim or int(dim * mult)
+        dim_out = dim_out or dim
+
+        layers: list[nn.Module] = [
+            ColumnParallelApproxGELU(dim, inner_dim, approximate="tanh", bias=bias,
+                                      quant_config=quant_config),
+            nn.Identity(),
+            RowParallelLinear(inner_dim, dim_out, bias=bias, quant_config=quant_config),
+        ]
+        self.net = nn.ModuleList(layers)
+
+    def forward(self, hidden_states: torch.Tensor) -> torch.Tensor:
+        for module in self.net:
+            hidden_states = module(hidden_states)
+        return hidden_states
+
+
+from typing import Any
+
+
+class FluxTransformerBlock(nn.Module):
+    """Dual-stream DiT block: joint attention over text+image, then separate FFNs."""
+
+    def __init__(
+        self,
+        dim: int,
+        num_attention_heads: int,
+        attention_head_dim: int,
+        qk_norm: str = "rms_norm",
+        eps: float = 1e-6,
+        quant_config: dict | None = None,
+    ):
+        super().__init__()
+        self.norm1 = AdaLayerNormZero(dim)
+        self.norm1_context = AdaLayerNormZero(dim)
+
+        self.attn = FluxAttention(
+            query_dim=dim,
+            added_kv_proj_dim=dim,
+            dim_head=attention_head_dim,
+            heads=num_attention_heads,
+            out_dim=dim,
+            context_pre_only=False,
+            bias=True,
+            eps=eps,
+            quant_config=quant_config,
+        )
+
+        self.norm2 = LayerNorm(dim, elementwise_affine=False, eps=1e-6)
+        self.ff = FeedForward(dim=dim, dim_out=dim, quant_config=quant_config)
+
+        self.norm2_context = LayerNorm(dim, elementwise_affine=False, eps=1e-6)
+        self.ff_context = FeedForward(dim=dim, dim_out=dim, quant_config=quant_config)
+
+    def forward(
+        self,
+        hidden_states: torch.Tensor,
+        encoder_hidden_states: torch.Tensor,
+        temb: torch.Tensor,
+        image_rotary_emb: tuple[torch.Tensor, torch.Tensor] | None = None,
+        joint_attention_kwargs: dict[str, Any] | None = None,
+    ) -> tuple[torch.Tensor, torch.Tensor]:
+        norm_hidden_states, gate_msa, shift_mlp, scale_mlp, gate_mlp = self.norm1(
+            hidden_states, emb=temb
+        )
+        norm_encoder_hidden_states, c_gate_msa, c_shift_mlp, c_scale_mlp, c_gate_mlp = self.norm1_context(
+            encoder_hidden_states, emb=temb
+        )
+        joint_attention_kwargs = joint_attention_kwargs or {}
+
+        attention_outputs = self.attn(
+            hidden_states=norm_hidden_states,
+            encoder_hidden_states=norm_encoder_hidden_states,
+            image_rotary_emb=image_rotary_emb,
+            **joint_attention_kwargs,
+        )
+
+        if len(attention_outputs) == 2:
+            attn_output, context_attn_output = attention_outputs
+        elif len(attention_outputs) == 3:
+            attn_output, context_attn_output, ip_attn_output = attention_outputs
+
+        attn_output = gate_msa.unsqueeze(1) * attn_output
+        hidden_states = hidden_states + attn_output
+
+        norm_hidden_states = self.norm2(hidden_states)
+        norm_hidden_states = norm_hidden_states * (1 + scale_mlp[:, None]) + shift_mlp[:, None]
+
+        ff_output = self.ff(norm_hidden_states)
+        ff_output = gate_mlp.unsqueeze(1) * ff_output
+        hidden_states = hidden_states + ff_output
+
+        if len(attention_outputs) == 3:
+            hidden_states = hidden_states + ip_attn_output
+
+        context_attn_output = c_gate_msa.unsqueeze(1) * context_attn_output
+        encoder_hidden_states = encoder_hidden_states + context_attn_output
+
+        norm_encoder_hidden_states = self.norm2_context(encoder_hidden_states)
+        norm_encoder_hidden_states = (
+            norm_encoder_hidden_states * (1 + c_scale_mlp[:, None]) + c_shift_mlp[:, None]
+        )
+
+        context_ff_output = self.ff_context(norm_encoder_hidden_states)
+        encoder_hidden_states = encoder_hidden_states + c_gate_mlp.unsqueeze(1) * context_ff_output
+
+        if encoder_hidden_states.dtype == torch.float16:
+            encoder_hidden_states = encoder_hidden_states.clip(-65504, 65504)
+
+        return encoder_hidden_states, hidden_states
+
+
+class FluxSingleTransformerBlock(nn.Module):
+    """Single-stream DiT block: text+image concatenated, self-attention + MLP in parallel."""
+
+    def __init__(
+        self,
+        dim: int,
+        num_attention_heads: int,
+        attention_head_dim: int,
+        mlp_ratio: float = 4.0,
+        quant_config: dict | None = None,
+    ):
+        super().__init__()
+        self.mlp_hidden_dim = int(dim * mlp_ratio)
+
+        self.norm = AdaLayerNormZeroSingle(dim)
+        self.proj_mlp = ReplicatedLinear(dim, self.mlp_hidden_dim, bias=True,
+                                         quant_config=quant_config)
+        self.act_mlp = GELU(approximate="tanh")
+        self.proj_out = ReplicatedLinear(dim + self.mlp_hidden_dim, dim, bias=True,
+                                         quant_config=quant_config)
+
+        self.attn = FluxAttention(
+            query_dim=dim,
+            dim_head=attention_head_dim,
+            heads=num_attention_heads,
+            out_dim=dim,
+            bias=True,
+            eps=1e-6,
+            pre_only=True,
+            quant_config=quant_config,
+        )
+
+    def forward(
+        self,
+        hidden_states: torch.Tensor,
+        encoder_hidden_states: torch.Tensor,
+        temb: torch.Tensor,
+        image_rotary_emb: tuple[torch.Tensor, torch.Tensor] | None = None,
+        joint_attention_kwargs: dict[str, Any] | None = None,
+    ) -> tuple[torch.Tensor, torch.Tensor]:
+        text_seq_len = encoder_hidden_states.shape[1]
+        hidden_states = torch.cat([encoder_hidden_states, hidden_states], dim=1)
+
+        residual = hidden_states
+        norm_hidden_states, gate = self.norm(hidden_states, emb=temb)
+        mlp_hidden_states = self.act_mlp(self.proj_mlp(norm_hidden_states))
+
+        joint_attention_kwargs = joint_attention_kwargs or {}
+        attn_output = self.attn(
+            hidden_states=norm_hidden_states,
+            image_rotary_emb=image_rotary_emb,
+            **joint_attention_kwargs,
+        )
+
+        hidden_states = torch.cat([attn_output, mlp_hidden_states], dim=2)
+        gate = gate.unsqueeze(1)
+        hidden_states = gate * self.proj_out(hidden_states)
+        hidden_states = residual + hidden_states
+
+        if hidden_states.dtype == torch.float16:
+            hidden_states = hidden_states.clip(-65504, 65504)
+
+        encoder_hidden_states, hidden_states = (
+            hidden_states[:, :text_seq_len],
+            hidden_states[:, text_seq_len:],
+        )
+        return encoder_hidden_states, hidden_states

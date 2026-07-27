@@ -1,18 +1,63 @@
-"""Encoder-only attention for Qwen vision transformer blocks.
+"""Vision transformer block for Qwen VL models.
 
-Non-causal, no KV cache. Uses FlashAttnPrefill L1 op with cu_seqlens
-for variable-length sequence support within the vision encoder.
+Unified across Qwen2-VL and Qwen3-VL:
+  - act_fn: Qwen2 uses QuickGELU (default), Qwen3 uses SiLU.
+  - norm_eps: configurable LayerNorm epsilon.
+
+Uses LayerNorm (not RMSNorm) with pre-norm residual connections,
+encoder-only attention, and vision MLP.
 """
 
 
 from __future__ import annotations
 
 
+# Inlined from tasks/reference/L1/layer_norm.py
+import torch
+import torch.nn as nn
+import torch.nn.functional as F
+
+
+class LayerNorm(nn.Module):
+    def __init__(
+        self,
+        normalized_shape: int,
+        eps: float = 1e-5,
+        elementwise_affine: bool = True,
+        create_scale: bool = True,
+        create_offset: bool = True,
+    ):
+        super().__init__()
+        self.normalized_shape = (normalized_shape,)
+        self.eps = eps
+        self.elementwise_affine = elementwise_affine
+        if elementwise_affine and create_scale:
+            self.weight = nn.Parameter(torch.ones(normalized_shape))
+        else:
+            self.register_parameter("weight", None)
+        if elementwise_affine and create_offset:
+            self.bias = nn.Parameter(torch.zeros(normalized_shape))
+        else:
+            self.register_parameter("bias", None)
+
+    def forward(self, x: torch.Tensor) -> torch.Tensor:
+        orig_dtype = x.dtype
+        weight = self.weight.float() if self.weight is not None else None
+        bias = self.bias.float() if self.bias is not None else None
+        return F.layer_norm(
+            x.float(), self.normalized_shape, weight, bias, self.eps,
+        ).to(orig_dtype)
+
+
+# Inlined from tasks/reference/L1/quickgelu.py
+class QuickGELU(nn.Module):
+    def forward(self, x: torch.Tensor) -> torch.Tensor:
+        return x * torch.sigmoid(1.702 * x)
+
+
 # Inlined helper (no baseline task): pure-torch dense/varlen attention
 # and paged-cache gather.  The baselines call flash_attn / vllm_flash_attn
 # here, so there is no baseline file to inline this from.
-import torch
-import torch.nn.functional as F
 
 
 def repeat_kv(k: torch.Tensor, target_heads: int) -> torch.Tensor:
@@ -182,9 +227,6 @@ def _tp_rank():
 
 
 # Inlined from tasks/reference/L1/flash_attn_prefill.py
-import torch.nn as nn
-
-
 class FlashAttnPrefill(nn.Module):
     def __init__(self, num_heads: int, num_kv_heads: int, head_dim: int):
         super().__init__()
@@ -373,8 +415,6 @@ __all__ = ["AllReduce", "CustomAllreduce", "get_custom_ar", "set_custom_ar"]
 
 
 # Inlined from tasks/reference/L2/parallel_linear.py
-
-
 def _get_fp8_linear_cls():
     return Fp8Linear
 
@@ -690,6 +730,7 @@ class RowParallelLinear(nn.Module):
         return y
 
 
+# Inlined from tasks/reference/L2/vision_attention.py
 def _rotate_half(x: torch.Tensor) -> torch.Tensor:
     half = x.shape[-1] // 2
     return torch.cat((-x[..., half:], x[..., :half]), dim=-1)
@@ -774,3 +815,55 @@ class VisionAttention(nn.Module):
 
         out = out.view(seq_len, batch_size, -1)
         return self.proj(out)
+
+
+# Inlined from tasks/reference/L2/vision_mlp.py
+from collections.abc import Callable
+
+
+class VisionMLP(nn.Module):
+    """Vision encoder MLP with configurable activation.
+
+    Qwen2-VL uses QuickGELU (default); Qwen3-VL uses F.silu.
+    """
+
+    def __init__(self, in_features: int, hidden_features: int,
+                 act_fn: Callable[[torch.Tensor], torch.Tensor] = QuickGELU(),
+                 bias: bool = True):
+        super().__init__()
+        self.fc1 = ColumnParallelLinear(in_features, hidden_features, bias=bias)
+        self.fc2 = RowParallelLinear(hidden_features, in_features, bias=bias)
+        self.act_fn = act_fn
+
+    def forward(self, x: torch.Tensor) -> torch.Tensor:
+        return self.fc2(self.act_fn(self.fc1(x)))
+
+
+from typing import Callable
+
+
+class VisionBlock(nn.Module):
+    def __init__(self, embed_dim: int, num_heads: int,
+                 mlp_hidden_dim: int,
+                 act_fn: Callable[[torch.Tensor], torch.Tensor] = QuickGELU(),
+                 norm_eps: float = 1e-6):
+        super().__init__()
+        self.norm1 = LayerNorm(embed_dim, eps=norm_eps)
+        self.norm2 = LayerNorm(embed_dim, eps=norm_eps)
+        self.attn = VisionAttention(embed_dim, num_heads)
+        self.mlp = VisionMLP(embed_dim, mlp_hidden_dim, act_fn=act_fn)
+
+    def forward(
+        self, x: torch.Tensor,
+        cu_seqlens: torch.Tensor,
+        rotary_pos_emb_cos: torch.Tensor,
+        rotary_pos_emb_sin: torch.Tensor,
+        max_seqlen: int | None = None,
+    ) -> torch.Tensor:
+        x = x + self.attn(
+            self.norm1(x), cu_seqlens,
+            rotary_pos_emb_cos, rotary_pos_emb_sin,
+            max_seqlen,
+        )
+        x = x + self.mlp(self.norm2(x))
+        return x
