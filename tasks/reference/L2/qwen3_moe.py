@@ -10,22 +10,37 @@ from __future__ import annotations
 
 
 # Inlined from infra/tp.py
+
+
 import torch.distributed as dist
 
 
 def _tp_size():
     return dist.get_world_size() if dist.is_initialized() else 1
 
+
 def _tp_rank():
     return dist.get_rank() if dist.is_initialized() else 0
 
 
 # Inlined from tasks/reference/L1/allreduce.py
+
+
 from contextlib import nullcontext
+
+
 from typing import Optional
 
+
 import torch
+
+
+import torch.distributed as dist
+
+
 import torch.nn as nn
+
+
 from torch.distributed import ProcessGroup
 
 
@@ -70,10 +85,15 @@ class CustomAllreduce:
     def close(self) -> None:
         pass
 
-__all__ = ["AllReduce", "CustomAllreduce", "get_custom_ar", "set_custom_ar"]
-
 
 # Inlined from tasks/reference/L1/topk_softmax.py
+
+
+import torch
+
+
+import torch.nn as nn
+
 
 class TopKSoftmax(nn.Module):
     """Top-k expert selection with softmax normalization."""
@@ -123,9 +143,19 @@ class TopKSoftmax(nn.Module):
 
 
 # Inlined from tasks/reference/L1/fp8_linear.py
+
+
 import math
 
+
+import torch
+
+
+import torch.nn as nn
+
+
 import torch.nn.functional as F
+
 
 _GROUP_SIZE = 128
 
@@ -224,6 +254,13 @@ def postprocess_fp8_weights(
 
 # Inlined from tasks/reference/L1/moe_align.py
 
+
+import torch
+
+
+import torch.nn as nn
+
+
 class MoeAlign(nn.Module):
     """Token-to-expert alignment with per-expert block padding."""
 
@@ -314,6 +351,12 @@ class MoeAlign(nn.Module):
 
 
 # Inlined from tasks/reference/L1/moe_grouped_gemm.py
+
+
+import torch
+
+
+import torch.nn as nn
 
 
 def _get_default_config(M: int, E: int = 0, N: int = 0,
@@ -476,6 +519,13 @@ class MoeGroupedGemm(nn.Module):
 
 # Inlined from tasks/reference/L1/moe_sum.py
 
+
+import torch
+
+
+import torch.nn as nn
+
+
 class MoeSum(nn.Module):
     """Top-k reduction for MoE outputs."""
 
@@ -510,7 +560,48 @@ class MoeSum(nn.Module):
         return output
 
 
+# Inlined from tasks/reference/L1/gelu_and_mul.py
+
+
+import torch
+
+
+import torch.nn as nn
+
+
+import torch.nn.functional as F
+
+
+class GeluAndMul(nn.Module):
+    """Apply GELU to the gate half and multiply by the up half."""
+
+    def __init__(self, approximate: str = "none"):
+        super().__init__()
+        self.approximate = approximate
+        if approximate not in ("none", "tanh"):
+            raise ValueError(f"Unsupported GELU approximation: {approximate}")
+
+    def forward_native(self, x: torch.Tensor) -> torch.Tensor:
+        d = x.shape[-1] // 2
+        return F.gelu(x[..., :d], approximate=self.approximate) * x[..., d:]
+
+    def forward_cuda(self, x: torch.Tensor) -> torch.Tensor:
+        return self.forward_native(x)
+
+    def forward(self, x: torch.Tensor) -> torch.Tensor:
+        return self.forward_native(x)
+
+
 # Inlined from tasks/reference/L1/silu_and_mul.py
+
+
+import torch
+
+
+import torch.nn as nn
+
+
+import torch.nn.functional as F
 
 
 class SiluAndMul(nn.Module):
@@ -531,75 +622,19 @@ class SiluAndMul(nn.Module):
 
 
 # Inlined from tasks/reference/L1/silu_mul_quant_fp8.py
-import triton
-import triton.language as tl
+
+
+import torch
+
+
+import torch.nn as nn
+
 
 _FP8_INFO = torch.finfo(torch.float8_e4m3fn)
 
 
-@triton.jit
-def _silu_mul_per_token_group_quant_fp8_colmajor(
-    y_ptr,
-    y_q_ptr,
-    y_s_ptr,
-    M,
-    N,
-    y_s_col_stride: tl.int64,
-    eps,
-    fp8_min,
-    fp8_max,
-    use_ue8m0: tl.constexpr,
-    GROUP_SIZE: tl.constexpr,
-    BLOCK_M: tl.constexpr,
-    BLOCK_N: tl.constexpr,
-):
-    pid_m = tl.program_id(0)
-    pid_n = tl.program_id(1)
-    N_2 = N // 2
-
-    m_offset = pid_m * BLOCK_M
-    n_offset = pid_n * BLOCK_N
-    if m_offset >= M:
-        return
-
-    offs_n = tl.arange(0, BLOCK_N).to(tl.int64)
-    offs_m = tl.arange(0, BLOCK_M).to(tl.int64)
-
-    base_y_ptr = y_ptr + m_offset * N + n_offset
-    act_in_ptrs = base_y_ptr + offs_m[:, None] * N + offs_n[None, :]
-
-    act_in = tl.load(act_in_ptrs)
-    mul_in = tl.load(act_in_ptrs + N_2)
-
-    act_in = act_in.to(tl.float32)
-    one_f32 = tl.cast(1, tl.float32)
-    silu_out = (act_in / (one_f32 + tl.exp(-act_in))).to(y_ptr.dtype.element_ty)
-    y = (silu_out * mul_in).to(tl.float32)
-
-    _absmax = tl.maximum(tl.max(tl.abs(y), axis=1), eps)
-    scale_raw = _absmax / fp8_max
-    y_s = tl.math.exp2(tl.ceil(tl.log2(scale_raw))) if use_ue8m0 else scale_raw
-    y_s = tl.reshape(y_s, (BLOCK_M, 1))
-    y_q = tl.clamp(y / y_s, fp8_min, fp8_max).to(y_q_ptr.dtype.element_ty)
-
-    base_y_q_ptr = y_q_ptr + m_offset * N_2 + n_offset
-    y_q_ptrs = base_y_q_ptr + offs_m[:, None] * N_2 + offs_n[None, :]
-    tl.store(y_q_ptrs, y_q)
-
-    group_id = n_offset // GROUP_SIZE
-    base_y_s_ptr = y_s_ptr + group_id * y_s_col_stride + m_offset
-    y_s_ptrs = base_y_s_ptr + offs_m
-    y_s = tl.reshape(y_s, (BLOCK_M,))
-    tl.store(y_s_ptrs, y_s)
-
-
 class SiluMulQuantFp8(nn.Module):
-    """Fused SiLU-mul + per-token-group FP8 quantization (colmajor scales).
-
-    Stateless wrapper around the Triton kernel
-    :func:`_silu_mul_per_token_group_quant_fp8_colmajor`.  Mirrors vLLM's
-    ``silu_mul_per_token_group_quant_fp8_colmajor`` exactly.
-    """
+    """Fused SiLU-mul + per-token-group FP8 quantization (colmajor scales)."""
 
     def forward(
         self,
@@ -637,33 +672,111 @@ class SiluMulQuantFp8(nn.Module):
             (N_2 // _GROUP_SIZE, M), dtype=torch.float32, device=input.device,
         ).transpose(0, 1)
 
-        BLOCK_M = 8
-        BLOCK_N = _GROUP_SIZE
-        assert M % BLOCK_M == 0
-        assert N_2 % BLOCK_N == 0
-
         fp8_min = _FP8_INFO.min
         fp8_max = _FP8_INFO.max
 
-        grid = (M // BLOCK_M, N_2 // BLOCK_N)
+        gate = input[:, :N_2]
+        up = input[:, N_2:]
 
-        _silu_mul_per_token_group_quant_fp8_colmajor[grid](
-            input, output, output_scales,
-            M, N,
-            output_scales.stride(-1),
-            eps,
-            fp8_min, fp8_max,
-            use_ue8m0,
-            _GROUP_SIZE, BLOCK_M, BLOCK_N,
-        )
+        # SiLU in fp32, then back to the input dtype before the multiply --
+        # mirrors the kernel's cast.
+        gate_f32 = gate.to(torch.float32)
+        silu = (gate_f32 / (1.0 + torch.exp(-gate_f32))).to(input.dtype)
+        y = (silu * up).to(torch.float32)                        # [M, N_2]
 
+        groups = y.view(M, N_2 // _GROUP_SIZE, _GROUP_SIZE)
+        absmax = groups.abs().amax(dim=-1).clamp_min(eps)         # [M, G]
+        scale = absmax / fp8_max
+        if use_ue8m0:
+            scale = torch.exp2(torch.ceil(torch.log2(scale)))
+
+        y_q = torch.clamp(
+            groups / scale.unsqueeze(-1), fp8_min, fp8_max,
+        ).to(output.dtype)
+
+        output.copy_(y_q.view(M, N_2))
+        output_scales.copy_(scale)
         return output, output_scales
 
 
 # Inlined from tasks/reference/L2/fused_experts.py
 
 
+import math
+
+
+import torch
+
+
+import torch.nn as nn
+
+
+import torch.nn.functional as F
+
+
+import torch
+
+
+import torch.nn as nn
+
+
+import torch
+
+
+import torch.nn as nn
+
+
+import torch
+
+
+import torch.nn as nn
+
+
+import torch
+
+
+import torch.nn as nn
+
+
+import torch.nn.functional as F
+
+
+import torch
+
+
+import torch.nn as nn
+
+
+import torch.nn.functional as F
+
+
+import torch
+
+
+import torch.nn as nn
+
+
+import math
+
+
+import torch
+
+
+import torch.nn as nn
+
+
+import torch.nn.functional as F
+
+
+
+
+
+
+
+
 SPARSITY_FACTOR = 4
+
+
 _FP8_GROUP_SIZE = 128
 
 
@@ -787,6 +900,7 @@ class _SharedBuf:
         self.a_scale_2 = None
         self.dg_ws1 = None
         self.dg_ws2 = None
+
 
 _SHARED_BUF = _SharedBuf()
 
@@ -988,8 +1102,33 @@ class FusedExperts(nn.Module):
 # Inlined from tasks/reference/L2/parallel_linear.py
 
 
+import torch.distributed as dist
+
+
+import math
+
+
+import torch
+
+
+import torch.nn as nn
+
+
+import torch.nn.functional as F
+
+
+from contextlib import nullcontext
+
+
+from typing import Optional
+
+
+from torch.distributed import ProcessGroup
+
+
 def _get_fp8_linear_cls():
     return Fp8Linear
+
 
 _FP8_BLOCK = 128
 
@@ -1301,6 +1440,37 @@ class RowParallelLinear(nn.Module):
         if self.reduce_results and self.tp_size > 1:
             y = self.allreduce(y)
         return y
+
+
+# Inlined from tasks/reference/L2/qwen3_moe.py
+
+
+import torch.distributed as dist
+
+
+from contextlib import nullcontext
+
+
+from typing import Optional
+
+
+import torch
+
+
+import torch.nn as nn
+
+
+from torch.distributed import ProcessGroup
+
+
+import math
+
+
+import torch.nn.functional as F
+
+
+
+
 
 
 class Qwen3MoE(nn.Module):

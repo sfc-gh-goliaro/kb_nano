@@ -1,8 +1,17 @@
 """Rotary position embedding for diffusion models (interleaved / GPT-J style).
 
-Triton kernel copied from ``flash_attn.ops.triton.rotary`` (Tri Dao, 2023),
-via ``vllm.vllm_flash_attn.ops.triton.rotary``.  The ``apply_rotary`` launcher
-and ``rotary_kernel`` are self-contained — no vllm dependency at runtime.
+Pure-PyTorch semantic reference for the baseline's Triton ``_rotary_kernel``
+(from ``flash_attn.ops.triton.rotary``, Tri Dao 2023, via
+``vllm.vllm_flash_attn.ops.triton.rotary``).
+
+The ``_apply_rotary`` contract is preserved: both head-dim layouts, a
+``rotary_dim`` smaller than ``headdim`` (the tail is copied through
+untouched), scalar or per-batch ``seqlen_offsets``, the varlen packed layout,
+``conjugate`` (negated sine, for the backward direction), and in-place
+operation.
+
+Rotation is computed in fp32 and cast back once, which is what the kernel
+does via its fp32 accumulators.
 """
 
 from __future__ import annotations
@@ -12,110 +21,44 @@ from typing import Optional, Union
 import torch
 import torch.nn as nn
 
-import triton
-import triton.language as tl
 
+def _rotate(
+    x_rot: torch.Tensor,
+    cos: torch.Tensor,
+    sin: torch.Tensor,
+    interleaved: bool,
+    conjugate: bool,
+) -> torch.Tensor:
+    """Apply the rotation to the leading ``rotary_dim`` channels.
 
-# ---------------------------------------------------------------------------
-# Triton kernel  (from flash_attn / vllm_flash_attn, Copyright (c) 2023 Tri Dao)
-# ---------------------------------------------------------------------------
+    Args:
+        x_rot: ``[..., rotary_dim]``
+        cos, sin: broadcastable to ``[..., rotary_dim // 2]``
+    """
+    orig_dtype = x_rot.dtype
+    xf = x_rot.to(torch.float32)
+    cosf = cos.to(torch.float32)
+    sinf = sin.to(torch.float32)
+    if conjugate:
+        sinf = -sinf
 
-@triton.jit
-def _rotary_kernel(
-    OUT, X, COS, SIN, CU_SEQLENS, SEQLEN_OFFSETS,
-    seqlen, rotary_dim, seqlen_ro,
-    stride_out_batch, stride_out_seqlen, stride_out_nheads, stride_out_headdim,
-    stride_x_batch, stride_x_seqlen, stride_x_nheads, stride_x_headdim,
-    BLOCK_K: tl.constexpr,
-    IS_SEQLEN_OFFSETS_TENSOR: tl.constexpr,
-    IS_VARLEN: tl.constexpr,
-    INTERLEAVED: tl.constexpr,
-    CONJUGATE: tl.constexpr,
-    BLOCK_M: tl.constexpr,
-):
-    pid_m = tl.program_id(axis=0)
-    pid_head = tl.program_id(axis=1)
-    pid_batch = tl.program_id(axis=2)
-    rotary_dim_half = rotary_dim // 2
-
-    if not IS_VARLEN:
-        X = X + pid_batch * stride_x_batch + pid_head * stride_x_nheads
-        OUT = OUT + pid_batch * stride_out_batch + pid_head * stride_out_nheads
+    if interleaved:
+        # GPT-J: consecutive channel pairs (0,1), (2,3), ...
+        x1 = xf[..., 0::2]
+        x2 = xf[..., 1::2]
+        o1 = x1 * cosf - x2 * sinf
+        o2 = x1 * sinf + x2 * cosf
+        out = torch.stack((o1, o2), dim=-1).flatten(-2)
     else:
-        start_idx = tl.load(CU_SEQLENS + pid_batch)
-        seqlen = tl.load(CU_SEQLENS + pid_batch + 1) - start_idx
-        X = X + start_idx * stride_x_seqlen + pid_head * stride_x_nheads
-        OUT = OUT + start_idx * stride_out_seqlen + pid_head * stride_out_nheads
+        # GPT-NeoX: split the rotary block in half
+        half = xf.shape[-1] // 2
+        x1 = xf[..., :half]
+        x2 = xf[..., half:]
+        o1 = x1 * cosf - x2 * sinf
+        o2 = x1 * sinf + x2 * cosf
+        out = torch.cat((o1, o2), dim=-1)
 
-    if pid_m * BLOCK_M >= seqlen:
-        return
-    rm = pid_m * BLOCK_M + tl.arange(0, BLOCK_M)
-    if not IS_SEQLEN_OFFSETS_TENSOR:
-        rm_cs = rm + SEQLEN_OFFSETS
-    else:
-        rm_cs = rm + tl.load(SEQLEN_OFFSETS + pid_batch)
-    rk = tl.arange(0, BLOCK_K)
-    rk_half = tl.arange(0, BLOCK_K // 2)
-
-    if not INTERLEAVED:
-        X = X + (rm[:, None] * stride_x_seqlen + rk_half[None, :] * stride_x_headdim)
-        COS = COS + (rm_cs[:, None] * rotary_dim_half + rk_half[None, :])
-        SIN = SIN + (rm_cs[:, None] * rotary_dim_half + rk_half[None, :])
-        cos = tl.load(
-            COS, mask=(rm_cs[:, None] < seqlen_ro) & (rk_half[None, :] < rotary_dim_half), other=1.0
-        ).to(tl.float32)
-        sin = tl.load(
-            SIN, mask=(rm_cs[:, None] < seqlen_ro) & (rk_half[None, :] < rotary_dim_half), other=0.0
-        ).to(tl.float32)
-        x0 = tl.load(
-            X, mask=(rm[:, None] < seqlen) & (rk_half[None, :] < rotary_dim_half), other=0.0
-        ).to(tl.float32)
-        x1 = tl.load(
-            X + rotary_dim_half * stride_x_headdim,
-            mask=(rm[:, None] < seqlen) & (rk_half[None, :] < rotary_dim_half),
-            other=0.0,
-        ).to(tl.float32)
-        if CONJUGATE:
-            sin = -sin
-        o0 = x0 * cos - x1 * sin
-        o1 = x0 * sin + x1 * cos
-        OUT = OUT + (rm[:, None] * stride_out_seqlen + rk_half[None, :] * stride_out_headdim)
-        tl.store(OUT, o0, mask=(rm[:, None] < seqlen) & (rk_half[None, :] < rotary_dim_half))
-        tl.store(
-            OUT + rotary_dim_half * stride_out_headdim,
-            o1,
-            mask=(rm[:, None] < seqlen) & (rk_half[None, :] < rotary_dim_half),
-        )
-    else:
-        rk_swap = rk + ((rk + 1) % 2) * 2 - 1  # 1, 0, 3, 2, 5, 4, ...
-        rk_repeat = tl.arange(0, BLOCK_K) // 2
-        X0 = X + (rm[:, None] * stride_x_seqlen + rk[None, :] * stride_x_headdim)
-        X1 = X + (rm[:, None] * stride_x_seqlen + rk_swap[None, :] * stride_x_headdim)
-        COS = COS + (rm_cs[:, None] * rotary_dim_half + rk_repeat[None, :])
-        SIN = SIN + (rm_cs[:, None] * rotary_dim_half + rk_repeat[None, :])
-        cos = tl.load(
-            COS,
-            mask=(rm_cs[:, None] < seqlen_ro) & (rk_repeat[None, :] < rotary_dim_half),
-            other=1.0,
-        ).to(tl.float32)
-        sin = tl.load(
-            SIN,
-            mask=(rm_cs[:, None] < seqlen_ro) & (rk_repeat[None, :] < rotary_dim_half),
-            other=0.0,
-        ).to(tl.float32)
-        x0 = tl.load(X0, mask=(rm[:, None] < seqlen) & (rk[None, :] < rotary_dim), other=0.0).to(
-            tl.float32
-        )
-        x1 = tl.load(
-            X1, mask=(rm[:, None] < seqlen) & (rk_swap[None, :] < rotary_dim), other=0.0
-        ).to(tl.float32)
-        if CONJUGATE:
-            sin = -sin
-        x0_cos = x0 * cos
-        x1_sin = x1 * sin
-        out = tl.where(rk[None, :] % 2 == 0, x0_cos - x1_sin, x0_cos + x1_sin)
-        OUT = OUT + (rm[:, None] * stride_out_seqlen + rk[None, :] * stride_out_headdim)
-        tl.store(OUT, out, mask=(rm[:, None] < seqlen) & (rk[None, :] < rotary_dim))
+    return out.to(orig_dtype)
 
 
 def _apply_rotary(
@@ -129,7 +72,7 @@ def _apply_rotary(
     inplace: bool = False,
     conjugate: bool = False,
 ) -> torch.Tensor:
-    """Launch the Triton rotary-embedding kernel.
+    """Apply rotary embeddings, mirroring the Triton launcher's contract.
 
     Args:
         x: (batch, seqlen, nheads, headdim) or (total_seqlen, nheads, headdim)
@@ -151,40 +94,44 @@ def _apply_rotary(
     assert seqlen_ro >= seqlen
 
     cos, sin = cos.contiguous(), sin.contiguous()
-    if isinstance(seqlen_offsets, torch.Tensor):
-        seqlen_offsets = seqlen_offsets.contiguous()
 
-    output = torch.empty_like(x) if not inplace else x
-    if rotary_dim < headdim and not inplace:
+    output = x if inplace else torch.empty_like(x)
+    if not inplace and rotary_dim < headdim:
         output[..., rotary_dim:].copy_(x[..., rotary_dim:])
 
-    BLOCK_K = (
-        32 if rotary_dim <= 32
-        else (64 if rotary_dim <= 64
-              else (128 if rotary_dim <= 128 else 256))
-    )
-    BLOCK_M = 4 if interleaved else (8 if rotary_dim <= 128 else 4)
-    grid = lambda META: (triton.cdiv(seqlen, META["BLOCK_M"]), nheads, batch)  # noqa
+    def _offset_for(batch_idx: int) -> int:
+        if isinstance(seqlen_offsets, torch.Tensor):
+            return int(seqlen_offsets[batch_idx].item())
+        return int(seqlen_offsets)
 
-    with torch.cuda.device(x.device.index):
-        _rotary_kernel[grid](
-            output, x, cos, sin, cu_seqlens, seqlen_offsets,
-            seqlen, rotary_dim, seqlen_ro,
-            output.stride(0) if not is_varlen else 0,
-            output.stride(-3), output.stride(-2), output.stride(-1),
-            x.stride(0) if not is_varlen else 0,
-            x.stride(-3), x.stride(-2), x.stride(-1),
-            BLOCK_K,
-            isinstance(seqlen_offsets, torch.Tensor),
-            is_varlen, interleaved, conjugate, BLOCK_M,
-            num_warps=2 if rotary_dim <= 64 else 4,
-        )
+    if not is_varlen:
+        for b in range(batch):
+            off = _offset_for(b)
+            pos = torch.arange(seqlen, device=x.device) + off
+            # [seqlen, 1, rotary_dim // 2] -> broadcasts over heads
+            c = cos[pos].unsqueeze(1)
+            s = sin[pos].unsqueeze(1)
+            rotated = _rotate(
+                x[b, :, :, :rotary_dim], c, s, interleaved, conjugate,
+            )
+            output[b, :, :, :rotary_dim] = rotated
+    else:
+        for b in range(batch):
+            start = int(cu_seqlens[b].item())
+            end = int(cu_seqlens[b + 1].item())
+            if end <= start:
+                continue
+            off = _offset_for(b)
+            pos = torch.arange(end - start, device=x.device) + off
+            c = cos[pos].unsqueeze(1)
+            s = sin[pos].unsqueeze(1)
+            rotated = _rotate(
+                x[start:end, :, :rotary_dim], c, s, interleaved, conjugate,
+            )
+            output[start:end, :, :rotary_dim] = rotated
+
     return output
 
-
-# ---------------------------------------------------------------------------
-# Module
-# ---------------------------------------------------------------------------
 
 class DiffusionRoPE(nn.Module):
     """Apply rotary embeddings given pre-computed (cos, sin) tensors.

@@ -371,21 +371,38 @@ def dense_attention(
             mask = (k_pos <= torch.minimum(q_pos + right, torch.full_like(q_pos, k_len))) & (
                 k_pos >= q_pos - left
             )
-        scores = torch.matmul(q_in.float(), k_in.float().transpose(-2, -1)) * scale
-        if softcap > 0.0:
-            scores = torch.tanh(scores / softcap) * softcap
-        scores = scores.masked_fill(~mask, torch.finfo(scores.dtype).min)
-        if s_aux is not None:
-            sink = s_aux.to(device=scores.device, dtype=scores.dtype).view(1, -1, 1, 1)
-            sink = sink.expand(scores.shape[0], -1, scores.shape[-2], -1)
-            probs = torch.softmax(torch.cat((scores, sink), dim=-1), dim=-1)[..., :-1]
-        else:
-            probs = torch.softmax(scores, dim=-1)
-        probs = probs.masked_fill(torch.all(~mask, dim=-1, keepdim=True), 0.0)
-        if s_aux is not None:
-            out = torch.matmul(probs, v_in.float()).to(v_in.dtype)
-        else:
-            out = torch.matmul(probs.to(v_in.dtype), v_in)
+        # Materializing the full [.., q_len, k_len] score matrix in float32 costs
+        # q_len*k_len*heads*4 bytes -- 64 GiB at 16384x16384 with 64 heads, which
+        # is why gpt_oss_decoder's tokens-16384 scenarios died with an OOM while
+        # the FlashAttention baseline peaked near 13 GB.  Walk the query axis in
+        # blocks so peak memory is O(block * k_len).  Softmax runs along the key
+        # axis, so every block is a complete softmax over all keys and the result
+        # is identical, not an approximation.
+        q_block = 1024 if q_len * k_len > (8192 * 8192) else q_len
+        out_parts = []
+        for start in range(0, q_len, q_block):
+            stop = min(start + q_block, q_len)
+            q_chunk = q_in[..., start:stop, :]
+            mask_chunk = mask[start:stop]
+            sc = torch.matmul(
+                q_chunk.float(), k_in.float().transpose(-2, -1)
+            ) * scale
+            if softcap > 0.0:
+                sc = torch.tanh(sc / softcap) * softcap
+            sc = sc.masked_fill(~mask_chunk, torch.finfo(sc.dtype).min)
+            if s_aux is not None:
+                sink = s_aux.to(device=sc.device, dtype=sc.dtype).view(1, -1, 1, 1)
+                sink = sink.expand(sc.shape[0], -1, sc.shape[-2], -1)
+                p = torch.softmax(torch.cat((sc, sink), dim=-1), dim=-1)[..., :-1]
+            else:
+                p = torch.softmax(sc, dim=-1)
+            p = p.masked_fill(torch.all(~mask_chunk, dim=-1, keepdim=True), 0.0)
+            if s_aux is not None:
+                out_parts.append(torch.matmul(p, v_in.float()).to(v_in.dtype))
+            else:
+                out_parts.append(torch.matmul(p.to(v_in.dtype), v_in))
+            del sc, p
+        out = torch.cat(out_parts, dim=-2) if len(out_parts) > 1 else out_parts[0]
         return out.transpose(-3, -2)
     out = F.scaled_dot_product_attention(
         q_in, k_in, v_in, is_causal=False, scale=scale,

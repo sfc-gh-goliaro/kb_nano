@@ -823,8 +823,13 @@ class GatedLinearAttention(nn.Module):
             k = k.view(b, t, self.num_heads, self.head_k_dim)
         v = v.view(b, t, self.num_heads, self.head_v_dim)
         initial_state = None
-        if past_key_values is not None and getattr(past_key_values, "states", None):
-            initial_state = past_key_values.states.get(id(self))
+        # ``states`` may be the dataclass Field descriptor rather than a real
+        # dict when the cache class is reached as a *type* instead of an
+        # instance; a Field is truthy, so a bare getattr check passes and the
+        # subsequent .get() raises "'Field' object has no attribute 'get'".
+        _states = getattr(past_key_values, "states", None)
+        if past_key_values is not None and isinstance(_states, dict) and _states:
+            initial_state = _states.get(id(self))
         out, final_state = self.naive_recurrence(
             q.transpose(1, 2),
             k.transpose(1, 2),
@@ -836,6 +841,8 @@ class GatedLinearAttention(nn.Module):
         out = out.transpose(1, 2)
         if use_cache and past_key_values is not None:
             if not hasattr(past_key_values, "states"):
+                past_key_values.states = {}
+            if not isinstance(getattr(past_key_values, 'states', None), dict):
                 past_key_values.states = {}
             past_key_values.states[id(self)] = final_state
         out = self.g_norm_swish_gate(out.reshape(-1, self.head_v_dim))

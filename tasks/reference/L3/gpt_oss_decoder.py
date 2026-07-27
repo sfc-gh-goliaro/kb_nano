@@ -935,21 +935,38 @@ def dense_attention(
             mask = (k_pos <= torch.minimum(q_pos + right, torch.full_like(q_pos, k_len))) & (
                 k_pos >= q_pos - left
             )
-        scores = torch.matmul(q_in.float(), k_in.float().transpose(-2, -1)) * scale
-        if softcap > 0.0:
-            scores = torch.tanh(scores / softcap) * softcap
-        scores = scores.masked_fill(~mask, torch.finfo(scores.dtype).min)
-        if s_aux is not None:
-            sink = s_aux.to(device=scores.device, dtype=scores.dtype).view(1, -1, 1, 1)
-            sink = sink.expand(scores.shape[0], -1, scores.shape[-2], -1)
-            probs = torch.softmax(torch.cat((scores, sink), dim=-1), dim=-1)[..., :-1]
-        else:
-            probs = torch.softmax(scores, dim=-1)
-        probs = probs.masked_fill(torch.all(~mask, dim=-1, keepdim=True), 0.0)
-        if s_aux is not None:
-            out = torch.matmul(probs, v_in.float()).to(v_in.dtype)
-        else:
-            out = torch.matmul(probs.to(v_in.dtype), v_in)
+        # Materializing the full [.., q_len, k_len] score matrix in float32 costs
+        # q_len*k_len*heads*4 bytes -- 64 GiB at 16384x16384 with 64 heads, which
+        # is why gpt_oss_decoder's tokens-16384 scenarios died with an OOM while
+        # the FlashAttention baseline peaked near 13 GB.  Walk the query axis in
+        # blocks so peak memory is O(block * k_len).  Softmax runs along the key
+        # axis, so every block is a complete softmax over all keys and the result
+        # is identical, not an approximation.
+        q_block = 1024 if q_len * k_len > (8192 * 8192) else q_len
+        out_parts = []
+        for start in range(0, q_len, q_block):
+            stop = min(start + q_block, q_len)
+            q_chunk = q_in[..., start:stop, :]
+            mask_chunk = mask[start:stop]
+            sc = torch.matmul(
+                q_chunk.float(), k_in.float().transpose(-2, -1)
+            ) * scale
+            if softcap > 0.0:
+                sc = torch.tanh(sc / softcap) * softcap
+            sc = sc.masked_fill(~mask_chunk, torch.finfo(sc.dtype).min)
+            if s_aux is not None:
+                sink = s_aux.to(device=sc.device, dtype=sc.dtype).view(1, -1, 1, 1)
+                sink = sink.expand(sc.shape[0], -1, sc.shape[-2], -1)
+                p = torch.softmax(torch.cat((sc, sink), dim=-1), dim=-1)[..., :-1]
+            else:
+                p = torch.softmax(sc, dim=-1)
+            p = p.masked_fill(torch.all(~mask_chunk, dim=-1, keepdim=True), 0.0)
+            if s_aux is not None:
+                out_parts.append(torch.matmul(p, v_in.float()).to(v_in.dtype))
+            else:
+                out_parts.append(torch.matmul(p.to(v_in.dtype), v_in))
+            del sc, p
+        out = torch.cat(out_parts, dim=-2) if len(out_parts) > 1 else out_parts[0]
         return out.transpose(-3, -2)
     out = F.scaled_dot_product_attention(
         q_in, k_in, v_in, is_causal=False, scale=scale,
@@ -2073,11 +2090,90 @@ def _dequant_mxfp4(
     lut = _FP4_E2M1_LUT.to(blocks.device)
     low = (blocks & 0x0F).long()
     high = ((blocks >> 4) & 0x0F).long()
-    unpacked = torch.stack([low, high], dim=-1).reshape(*blocks.shape[:-1], 32)
+    # Byte b holds value 2b in its low nibble and 2b+1 in its high nibble, so
+    # the unpacked width is always 2 * (packed width) -- not the constant 32,
+    # which assumes an explicit [..., n_blocks, 16] block axis that Mxfp4MoE's
+    # flat [e, rows, h//2] parameters do not have.
+    unpacked = torch.stack([low, high], dim=-1).reshape(
+        *blocks.shape[:-1], blocks.shape[-1] * 2
+    )
     values = lut[unpacked]
     scale_float = torch.pow(2.0, scales.float() - 127.0)
+    if blocks.ndim == scales.ndim + 1:
+        # [..., n_blocks, bytes]: one scale per block, already aligned.
+        values = values * scale_float.unsqueeze(-1)
+        return values.reshape(*values.shape[:-2], -1).to(dtype)
+    # Flat [..., bytes]: split the value axis into one group per scale.  The
+    # group size comes out to the MXFP4 block width (32) without hardcoding it.
+    n_values = values.shape[-1]
+    n_groups = scale_float.shape[-1]
+    values = values.reshape(*values.shape[:-1], n_groups, n_values // n_groups)
     values = values * scale_float.unsqueeze(-1)
-    return values.reshape(*values.shape[:-2], -1).to(dtype)
+    return values.reshape(*values.shape[:-2], n_values).to(dtype)
+
+
+class _LazyMxfp4Weight:
+    """Packed MXFP4 expert weights, dequantized per expert on demand.
+
+    Materializing all experts costs ~230 GB for gpt-oss-120b in bf16; the MoE
+    token loop reads one expert at a time, so they are produced on access and
+    kept behind a small cache instead.
+    """
+
+    # Each gpt-oss expert is ~33 MB in bf16 and one forward touches only a
+    # handful.  An unbounded cache grows back to the full expert set across
+    # scenarios, which is the situation this class exists to avoid.
+    _CACHE_LIMIT = 8
+
+    def __init__(self, blocks, scales):
+        self.blocks = blocks
+        self.scales = scales
+        self._cache = {}
+
+    @property
+    def shape(self):
+        e, rows = self.blocks.shape[0], self.blocks.shape[1]
+        cols = self.blocks.shape[-1] * 2
+        if self.blocks.ndim == 4:
+            cols = self.blocks.shape[2] * self.blocks.shape[3] * 2
+        return (e, rows, cols)
+
+    @property
+    def dtype(self):
+        return torch.bfloat16
+
+    @property
+    def device(self):
+        return self.blocks.device
+
+    def expert(self, idx: int):
+        cached = self._cache.get(idx)
+        if cached is None:
+            cached = _dequant_mxfp4(
+                self.blocks[idx:idx + 1], self.scales[idx:idx + 1],
+                dtype=torch.bfloat16,
+            )[0]
+            if len(self._cache) >= self._CACHE_LIMIT:
+                self._cache.pop(next(iter(self._cache)))
+            self._cache[idx] = cached
+        return cached
+
+    def __getitem__(self, idx):
+        if isinstance(idx, int):
+            return self.expert(idx)
+        return _dequant_mxfp4(self.blocks[idx], self.scales[idx],
+                              dtype=torch.bfloat16)
+
+    def float(self):
+        # Promoting the whole expert set is exactly what this class avoids;
+        # callers index first (``w1[expert].float()``).
+        raise RuntimeError(
+            "_LazyMxfp4Weight.float() would materialize every expert; "
+            "index a single expert first"
+        )
+
+    def to(self, *args, **kwargs):
+        return self
 
 
 class Mxfp4MoE(nn.Module):
@@ -2090,7 +2186,8 @@ class Mxfp4MoE(nn.Module):
         num_warps: int = 8,
     ):
         del num_warps
-        return _dequant_mxfp4(quant_tensor, scale, dtype=torch.bfloat16), None
+        # Packed: the token loop dequantizes the experts it actually routes to.
+        return _LazyMxfp4Weight(quant_tensor, scale), None
 
     @staticmethod
     def make_quant_config(
@@ -2122,8 +2219,11 @@ class Mxfp4MoE(nn.Module):
         if renormalize:
             topk_weights = topk_weights / topk_weights.sum(dim=-1, keepdim=True).clamp_min(1e-20)
 
-        w1_dense = w1.float()
-        w2_dense = w2.float()
+        # Index before promoting: ``w1.float()`` on the full expert set is a
+        # second full-size copy (~460 GB for gpt-oss-120b) of weights the loop
+        # below reads one expert at a time.
+        w1_dense = w1
+        w2_dense = w2
         output = torch.zeros_like(hidden_states, dtype=torch.float32)
         x_all = hidden_states.float()
 
@@ -2138,7 +2238,7 @@ class Mxfp4MoE(nn.Module):
                 bias1 = None
                 if quant_config.w1_bias is not None:
                     bias1 = quant_config.w1_bias[expert].float()
-                gate_up = F.linear(x, w1_dense[expert], bias1)
+                gate_up = F.linear(x, w1_dense[expert].float(), bias1)
                 gate = gate_up[0::2]
                 up = gate_up[1::2]
                 gate = gate.clamp(max=7.0)
@@ -2148,7 +2248,7 @@ class Mxfp4MoE(nn.Module):
                 bias2 = None
                 if quant_config.w2_bias is not None:
                     bias2 = quant_config.w2_bias[expert].float()
-                y = F.linear(hidden, w2_dense[expert], bias2)
+                y = F.linear(hidden, w2_dense[expert].float(), bias2)
                 if not apply_router_weight_on_input:
                     y = y * weight
                 output[token] += y
