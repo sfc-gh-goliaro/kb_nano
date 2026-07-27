@@ -41,7 +41,13 @@ import numpy as np
 import torch
 from transformers import AutoTokenizer
 
-from .context import get_attn_backend_config, set_context, set_forward_context
+from .context import (
+    AttnBackendConfig,
+    get_attn_backend_config,
+    set_attn_backend_config,
+    set_context,
+    set_forward_context,
+)
 from .weight_loader import load_eagle3_draft_model, load_model
 from ..tasks.baseline.L1.eagle_tree_ops import (
     build_tree_kernel_efficient_with_metadata,
@@ -211,6 +217,17 @@ class LlamaEagle3Engine:
         torch.set_default_device("cuda")
 
         attn_cfg = get_attn_backend_config()
+        if attn_cfg.use_trtllm:
+            # Tree verification scores draft tokens by re-viewing the paged KV
+            # cache at single-token page granularity (see TreeAttnPrefill), which
+            # is only meaningful when a token's heads are contiguous -- i.e. NHD.
+            # Blackwell defaults to the TRTLLM backend's HND layout, so pin this
+            # engine (target + draft) to flash_attn before the models are built.
+            attn_cfg = AttnBackendConfig()
+            set_attn_backend_config(attn_cfg)
+            print("[EAGLE-3] Pinning attention backend to flash_attn "
+                  f"(NHD, block_size={attn_cfg.block_size}): tree attention "
+                  "requires an NHD paged KV cache.")
         self.block_size = attn_cfg.block_size
         self.kv_layout = attn_cfg.kv_layout
 

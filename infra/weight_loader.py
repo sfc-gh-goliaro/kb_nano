@@ -1183,7 +1183,10 @@ def _postprocess_fp8_weights(model: torch.nn.Module) -> None:
                                  ("w2", "w2_weight_scale_inv")):
                 w = getattr(module, wname)
                 s = getattr(module, sname)
-                postprocess_fp8_weights_batched(w.data, s.data)
+                # Rebind rather than copy: the DeepGEMM scale-layout transform
+                # changes shape and dtype on Blackwell (4 UE8M0 exponents packed
+                # per int32), so it cannot be written back in place.
+                s.data = postprocess_fp8_weights_batched(w.data, s.data)
                 moe_count += w.shape[0]
             if j % max(1, total // 5) == 0 or j == total - 1:
                 print(f"    DeepSeek MoE postprocess {j+1}/{total} "
