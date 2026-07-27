@@ -149,12 +149,18 @@ class RWKV7Attention(nn.Module):
     ) -> tuple[torch.Tensor, None, object | None, torch.Tensor]:
         B, T, _ = hidden_states.shape
         cu_seqlens = kwargs.get("cu_seqlens")
-        max_seqlen = None
+        max_seqlen = kwargs.get("max_seqlen")
         if cu_seqlens is not None:
             if B != 1:
                 raise ValueError("cu_seqlens prefill expects packed hidden_states with batch size 1")
-            lengths = cu_seqlens[1:] - cu_seqlens[:-1]
-            max_seqlen = int(lengths.max().item()) if lengths.numel() else 0
+            if max_seqlen is None:
+                # Only reached when the caller did not supply it. ``.item()`` is a
+                # device->host sync, and this runs once per layer, so a 32-layer
+                # prefill step paid 32 of them purely to pick a dispatch branch.
+                # FLAEngine builds its chunk list on the host and so knows this
+                # value for free; it passes it through as ``max_seqlen``.
+                lengths = cu_seqlens[1:] - cu_seqlens[:-1]
+                max_seqlen = int(lengths.max().item()) if lengths.numel() else 0
 
         # Token shift: shifted[t] = previous token's hidden state.
         # For cached decode the previous token lives in past_key_values.conv_states[id(self)]

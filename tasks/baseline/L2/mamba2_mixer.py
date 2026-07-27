@@ -48,6 +48,51 @@ from vllm.model_executor.layers.mamba.ops.ssd_combined import (
     mamba_chunk_scan_combined_varlen,
 )
 
+
+_SSU_BLACKWELL_KWARGS: dict | None = None
+
+
+def _ssu_platform_kwargs() -> dict:
+    """Extra kwargs that give ``selective_state_update`` its Blackwell tiling.
+
+    That kernel does not autotune -- "We don't want autotune since it will overwrite
+    the state" -- so it picks ``BLOCK_SIZE_M``/``num_warps`` from a hand-written
+    table keyed on ``dstate``. For ``dstate > 64`` there are two branches, and the
+    good one on Blackwell is only reachable by asking:
+
+        dstate > 64 and is_blackwell -> BLOCK_SIZE_M=32, num_warps=8
+        dstate > 64 and dstate <= 128 -> BLOCK_SIZE_M=4,  num_warps=4
+
+    Mamba-Codestral has ``dstate=128``, so omitting the flag on B200 runs the kernel
+    at an 8x smaller tile. vLLM's own mixer passes
+    ``is_blackwell=current_platform.is_device_capability_family(100)``, so the
+    reference gets the wide tile and we did not -- which is why this row regressed on
+    B200 while matching the paper on H200, where the flag is False for both engines
+    and the two take the identical ``BLOCK_SIZE_M=4`` path.
+
+    Resolved lazily and cached: reading device capability at import time would
+    initialize CUDA before the worker has selected its device. Also gated on the
+    parameter actually existing, so an older vLLM without it is unaffected.
+    """
+    global _SSU_BLACKWELL_KWARGS
+    if _SSU_BLACKWELL_KWARGS is None:
+        import inspect
+
+        try:
+            supported = "is_blackwell" in inspect.signature(
+                selective_state_update,
+            ).parameters
+        except (TypeError, ValueError):
+            supported = False
+        is_blackwell = (
+            torch.cuda.is_available()
+            and torch.cuda.get_device_capability()[0] == 10
+        )
+        _SSU_BLACKWELL_KWARGS = (
+            {"is_blackwell": True} if (supported and is_blackwell) else {}
+        )
+    return _SSU_BLACKWELL_KWARGS
+
 from ....infra.context import get_context
 from ....infra.tp import _tp_rank, _tp_size
 from .parallel_linear import (
@@ -525,6 +570,7 @@ class Mamba2Mixer(nn.Module):
                 dt_softplus=True,
                 state_batch_indices=mamba_meta.state_indices_d,
                 out=ssm_out_d.view(num_decode_tokens, -1, self.head_dim),
+                **_ssu_platform_kwargs(),
             )
 
     def forward(self, hidden_states: torch.Tensor) -> torch.Tensor:

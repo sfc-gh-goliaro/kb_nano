@@ -29,12 +29,19 @@ class RWKV7Block(nn.Module):
                 config.hidden_size,
                 eps=config.norm_eps,
                 create_offset=config.norm_bias,
+            # bf16 reduction, matching FLA's RWKV-7 norms. The repo default
+            # promote_fp32=True exists for DeepSeek-V3.2's indexer k_norm; here it
+            # upcasts every hidden state, which at the engine's varlen prefill shape
+            # showed up as 2.2 ms of casting copies plus a wider LayerNorm kernel
+            # (1.21 ms vs the reference's 0.98) out of a 6.9 ms total gap.
+            promote_fp32=False,
             )
 
         self.attn_norm = LayerNorm(
             config.hidden_size,
             eps=config.norm_eps,
             create_offset=config.norm_bias,
+            promote_fp32=False,   # see pre_norm above
         )
         self.attn = RWKV7Attention(
             hidden_size=config.hidden_size,
@@ -52,6 +59,7 @@ class RWKV7Block(nn.Module):
             config.hidden_size,
             eps=config.norm_eps,
             create_offset=config.norm_bias,
+            promote_fp32=False,   # see pre_norm above
         )
         self.ffn = RWKV7FeedForward(
             hidden_size=config.hidden_size,
