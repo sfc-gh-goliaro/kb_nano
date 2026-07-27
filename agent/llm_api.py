@@ -6,7 +6,13 @@ Provides both async and synchronous interfaces for calling Claude models.
 from __future__ import annotations
 
 import asyncio
+import functools
+import os
+import shutil
 import ssl
+import subprocess
+import tempfile
+from pathlib import Path
 from typing import Optional
 
 import aiohttp
@@ -67,6 +73,113 @@ async def _do_request(
         raise RuntimeError(f"Unexpected response format: {response_text[:500]}")
 
 
+@functools.cache
+def _claude_bin() -> str | None:
+    """Absolute path to the Claude Code CLI.
+
+    ``shutil.which`` alone is not enough: the CLI is installed under nvm, whose
+    bin directory is added by an interactive shell profile.  A background job,
+    cron run, or subprocess with a minimal environment therefore fails with
+    "claude: No such file or directory" and the backend silently falls back to
+    the unreachable Corvo endpoint.
+    """
+    found = shutil.which("claude")
+    if found:
+        return found
+    for cand in sorted(Path.home().glob(".nvm/versions/node/*/bin/claude")):
+        if os.access(cand, os.X_OK):
+            return str(cand)
+    return None
+
+
+def _claude_cli_available() -> bool:
+    return _claude_bin() is not None
+
+
+def call_llm_claude_cli(
+    prompt: str,
+    model_name: str = "claude-opus-4-6",
+    system: str | None = None,
+    timeout: int = 1500,
+) -> str:
+    """Generate via the locally installed Claude Code CLI.
+
+    Backend for environments without access to the Corvo proxy (which is
+    reachable only from inside Snowflake).  ``claude -p`` runs headless and
+    prints the completion on stdout.
+
+    The prompt goes in on **stdin**, not argv: a kernel-generation prompt embeds
+    the whole baseline module and easily reaches several kilobytes, which is
+    fragile as a command-line argument.  No tool flags are passed -- the task is
+    pure text generation, and an empty ``--allowedTools ""`` was observed to
+    make the CLI hang until the timeout.
+    """
+    # A prompt whose *text* embeds source code to rewrite reliably aborts the
+    # CLI's stream in this environment ("terminal_reason": "aborted_streaming",
+    # main model 0 tokens).  Handing the same content over as a *file* the model
+    # reads with its Read tool completes normally, so the task is staged on disk:
+    # instructions in task.md, answer written to out.py.
+    workdir = tempfile.mkdtemp(prefix="fk_llm_")
+    task_path = os.path.join(workdir, "task.md")
+    out_path = os.path.join(workdir, "out.py")
+    with open(task_path, "w") as fh:
+        fh.write(prompt)
+
+    instruction = (
+        "Read the file task.md in this directory and carry out the instructions "
+        "in it. Write your complete answer to out.py -- the contents of the "
+        "single Python code block it asks for, with no ``` fences and no "
+        "commentary. out.py must be valid, self-contained Python. "
+        "Reply with just DONE when finished."
+    )
+    cmd = [
+        _claude_bin() or "claude", "-p", instruction,
+        "--model", model_name,
+        "--allowedTools", "Read,Write",
+        "--permission-mode", "acceptEdits",
+    ]
+    if system:
+        cmd += ["--append-system-prompt", system]
+    # The CLI is intermittently slow on these tasks (observed 661s success and
+    # 900s hangs for the same prompt), so a single timeout is retried once
+    # before giving up.
+    proc = None
+    for attempt in range(2):
+        try:
+            proc = subprocess.run(
+                cmd, capture_output=True, text=True, timeout=timeout,
+                cwd=workdir,
+            )
+            break
+        except subprocess.TimeoutExpired:
+            if attempt == 1:
+                raise
+            if os.path.exists(out_path) and open(out_path).read().strip():
+                break  # it wrote the answer before stalling on teardown
+    if os.path.exists(out_path):
+        code = open(out_path).read().strip()
+        if code:
+            # The agent's extractor expects a fenced block.
+            return f"```python\n{code}\n```"
+    if proc is not None and proc.returncode != 0:
+        raise RuntimeError(
+            f"claude CLI failed ({proc.returncode}): "
+            f"{(proc.stderr or proc.stdout)[:500]}"
+        )
+    out = (proc.stdout if proc is not None else '').strip()
+    if not out:
+        raise RuntimeError("claude CLI returned empty output")
+    return out
+
+
+def _backend() -> str:
+    """Which LLM backend to use: 'claude-cli' or 'corvo'."""
+    choice = os.environ.get("FASTKERNELS_LLM_BACKEND", "").strip().lower()
+    if choice:
+        return choice
+    return "claude-cli" if _claude_cli_available() else "corvo"
+
+
 async def call_llm_async(
     prompt: str,
     model_name: str = "claude-opus-4-6",
@@ -79,6 +192,11 @@ async def call_llm_async(
 
     Raises RuntimeError on failure.
     """
+    if _backend() == "claude-cli":
+        return await asyncio.to_thread(
+            call_llm_claude_cli, prompt, model_name, system,
+        )
+
     messages = []
     if system:
         messages.append({"role": "system", "content": system})
