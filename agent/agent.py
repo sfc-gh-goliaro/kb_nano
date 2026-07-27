@@ -24,6 +24,7 @@ from __future__ import annotations
 import argparse
 import asyncio
 import importlib.util
+import inspect
 import json
 import os
 import re
@@ -158,6 +159,12 @@ def build_generation_prompt(op: OperatorSpec, cuda_only: bool) -> str:
         f"keep the same signature.\n"
         f"2. {constraint_block}\n"
         f"3. Do NOT import `vllm`, `sglang`, or `sgl_kernel`.\n"
+        f"3b. Your file is imported STANDALONE, outside the package, so "
+        f"RELATIVE imports (`from ..L1.x import Y`) will fail with "
+        f"ImportError. To reuse a baseline component, import it absolutely as "
+        f"`from fastkernels.tasks.baseline.L<n>.<module> import <Class>` "
+        f"(e.g. `from fastkernels.tasks.baseline.L1.rms_norm import RMSNorm`), "
+        f"or inline the code you need. Never emit a relative import.\n"
         f"4. You may import `torch`, `triton`, `triton.language`, standard library modules, "
         f"`flash_attn`, or JIT-compile CUDA. For inline CUDA strings use "
         f"`torch.utils.cpp_extension.load_inline(name=..., cpp_sources=..., "
@@ -237,8 +244,19 @@ def extract_python_code(response: str) -> str | None:
     return None
 
 
-def validate_kernel(code: str, expected_class_name: str) -> tuple[type | None, str | None]:
+def validate_kernel(
+    code: str,
+    expected_class_name: str,
+    models: tuple[str, ...] = (),
+) -> tuple[type | None, str | None]:
     """Write code to a temp file, import it, instantiate the class, and check it works.
+
+    ``models`` names the architectures the operator belongs to, so a module whose
+    constructor takes a HuggingFace ``config`` (every L2 block, L3 layer and L4
+    pipeline) can be instantiated.  Validating with a bare ``cls()`` would reject
+    every structurally-correct L3/L4 kernel before it was ever benchmarked --
+    the constructor signature, not the generated code, would be the thing that
+    failed.
 
     Returns (cls, None) on success, (None, error_msg) on failure.
     """
@@ -266,12 +284,38 @@ def validate_kernel(code: str, expected_class_name: str) -> tuple[type | None, s
                 f"Available nn.Module classes: {available}"
             )
 
-        try:
-            cls()
-        except Exception:
+        from fastkernels.bench.kernels.init_resolver import (
+            candidate_kwargs,
+            describe_unresolved,
+        )
+
+        built = False
+        last_tb = ""
+        for raw in candidate_kwargs(cls, {}, models):
+            sig_params = inspect.signature(cls.__init__).parameters
+            accepts_kwargs = any(
+                p.kind == inspect.Parameter.VAR_KEYWORD
+                for p in sig_params.values()
+            )
+            kwargs = raw if accepts_kwargs else {
+                k: v for k, v in raw.items() if k in sig_params and k != "self"
+            }
+            try:
+                cls(**kwargs)
+                built = True
+                break
+            except Exception:
+                last_tb = traceback.format_exc()
+        if not built:
+            unresolved = describe_unresolved(cls, {}, models)
+            hint = (
+                f" Unresolved constructor arguments {unresolved} could not be "
+                f"reconstructed for models {list(models)}."
+                if unresolved else ""
+            )
             return None, (
-                f"Class {expected_class_name} found but __init__() failed:\n"
-                + traceback.format_exc()
+                f"Class {expected_class_name} found but __init__() failed:{hint}\n"
+                + last_tb
             )
 
         return cls, None
@@ -490,7 +534,7 @@ async def generate_kernel_async(
         # Validation is CPU/GPU bound -- run in thread pool to avoid blocking the event loop
         loop = asyncio.get_event_loop()
         cls, error_msg = await loop.run_in_executor(
-            None, validate_kernel, code, op.class_name,
+            None, validate_kernel, code, op.class_name, tuple(op.models),
         )
 
         if cls is not None:
@@ -571,7 +615,7 @@ async def regenerate_kernel_async(
 
         loop = asyncio.get_event_loop()
         cls, error_msg = await loop.run_in_executor(
-            None, validate_kernel, code, op.class_name,
+            None, validate_kernel, code, op.class_name, tuple(op.models),
         )
 
         if cls is not None:
