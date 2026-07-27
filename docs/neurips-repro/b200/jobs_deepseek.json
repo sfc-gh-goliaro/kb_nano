@@ -1,0 +1,14 @@
+[
+ {
+  "name": "full_deepseek",
+  "gpus": 8,
+  "timeout": 10800,
+  "cmd": "python tests/bench_vllm.py --model deepseek-ai/DeepSeek-V3.2 --tp 8 --skip-latency"
+ },
+ {
+  "name": "full_qwen3vl235",
+  "gpus": 8,
+  "timeout": 14400,
+  "cmd": "python tests/bench_vllm.py --model Qwen/Qwen3-VL-235B-A22B-Instruct-FP8 --tp 8 --skip-latency"
+ }
+]

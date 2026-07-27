@@ -1,0 +1,20 @@
+[
+ {
+  "name": "m2_prefill65536",
+  "gpus": 1,
+  "timeout": 14400,
+  "cmd": "python tests/bench_vllm.py --model mistralai/Mamba-Codestral-7B-v0.1 --skip-latency",
+  "env": {
+   "FASTKERNELS_MAX_NUM_BATCHED_TOKENS": "65536"
+  }
+ },
+ {
+  "name": "m2_prefill131072",
+  "gpus": 1,
+  "timeout": 14400,
+  "cmd": "python tests/bench_vllm.py --model mistralai/Mamba-Codestral-7B-v0.1 --skip-latency",
+  "env": {
+   "FASTKERNELS_MAX_NUM_BATCHED_TOKENS": "131072"
+  }
+ }
+]

@@ -1,0 +1,65 @@
+[
+ {
+  "name": "p64_llama31",
+  "gpus": 1,
+  "timeout": 10800,
+  "cmd": "python tests/bench_vllm.py --model meta-llama/Llama-3.1-8B-Instruct --skip-latency",
+  "env": {
+   "FASTKERNELS_HND_PAGE_SIZE": "64"
+  }
+ },
+ {
+  "name": "p64_mixtral",
+  "gpus": 4,
+  "timeout": 14400,
+  "cmd": "python tests/bench_vllm.py --model mistralai/Mixtral-8x7B-Instruct-v0.1 --tp 4 --skip-latency",
+  "env": {
+   "FASTKERNELS_HND_PAGE_SIZE": "64"
+  }
+ },
+ {
+  "name": "p64_qwen3next",
+  "gpus": 2,
+  "timeout": 14400,
+  "cmd": "python tests/bench_vllm.py --model Qwen/Qwen3-Next-80B-A3B-Instruct --tp 2 --skip-latency",
+  "env": {
+   "FASTKERNELS_HND_PAGE_SIZE": "64"
+  }
+ },
+ {
+  "name": "p64_whisper",
+  "gpus": 1,
+  "timeout": 10800,
+  "cmd": "python tests/bench_vllm.py --model openai/whisper-large-v3 --skip-latency",
+  "env": {
+   "FASTKERNELS_HND_PAGE_SIZE": "64"
+  }
+ },
+ {
+  "name": "p64_gemma4",
+  "gpus": 1,
+  "timeout": 10800,
+  "cmd": "python tests/bench_vllm.py --model google/gemma-4-26B-A4B-it --tp 1 --skip-latency --vllm-python /home/yak/repro_venvs/vllm020/bin/python",
+  "env": {
+   "FASTKERNELS_HND_PAGE_SIZE": "64"
+  }
+ },
+ {
+  "name": "p64_qwen2vl",
+  "gpus": 1,
+  "timeout": 10800,
+  "cmd": "python tests/bench_vllm.py --model Qwen/Qwen2-VL-7B-Instruct --skip-latency",
+  "env": {
+   "FASTKERNELS_HND_PAGE_SIZE": "64"
+  }
+ },
+ {
+  "name": "p64_jamba",
+  "gpus": 1,
+  "timeout": 10800,
+  "cmd": "python tests/bench_jamba.py --model ai21labs/AI21-Jamba-Mini-1.7 --skip-latency",
+  "env": {
+   "FASTKERNELS_HND_PAGE_SIZE": "64"
+  }
+ }
+]

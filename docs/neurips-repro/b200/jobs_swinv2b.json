@@ -1,0 +1,20 @@
+[
+ {
+  "name": "sw_nocache",
+  "gpus": 1,
+  "timeout": 10800,
+  "cmd": "python tests/bench_timm.py --model timm/swinv2_large_window12_192.ms_in22k",
+  "env": {
+   "FASTKERNELS_SWINV2_BIAS_CACHE": "0"
+  }
+ },
+ {
+  "name": "sw_cache",
+  "gpus": 1,
+  "timeout": 10800,
+  "cmd": "python tests/bench_timm.py --model timm/swinv2_large_window12_192.ms_in22k",
+  "env": {
+   "FASTKERNELS_SWINV2_BIAS_CACHE": "1"
+  }
+ }
+]

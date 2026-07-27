@@ -1,0 +1,104 @@
+[
+ {
+  "name": "rm_mamba2",
+  "gpus": 1,
+  "timeout": 14400,
+  "cmd": "python tests/bench_vllm.py --model mistralai/Mamba-Codestral-7B-v0.1 --skip-latency"
+ },
+ {
+  "name": "rm_mamba",
+  "gpus": 1,
+  "timeout": 14400,
+  "cmd": "python tests/bench_vllm.py --model state-spaces/mamba-2.8b-hf --skip-latency"
+ },
+ {
+  "name": "rm_gla",
+  "gpus": 1,
+  "timeout": 14400,
+  "cmd": "python tests/bench_fla.py --model fla-hub/gla-2.7B-100B --skip-latency"
+ },
+ {
+  "name": "rm_rwkv7",
+  "gpus": 1,
+  "timeout": 14400,
+  "cmd": "python tests/bench_fla.py --model fla-hub/rwkv7-2.9B-g1 --skip-latency"
+ },
+ {
+  "name": "rm_siglip2",
+  "gpus": 1,
+  "timeout": 10800,
+  "cmd": "python tests/bench_timm.py --model google/siglip2-so400m-patch16-naflex"
+ },
+ {
+  "name": "rm_swinv2",
+  "gpus": 1,
+  "timeout": 10800,
+  "cmd": "python tests/bench_timm.py --model timm/swinv2_large_window12_192.ms_in22k"
+ },
+ {
+  "name": "rm_yolov10",
+  "gpus": 1,
+  "timeout": 7200,
+  "cmd": "python tests/bench_detection.py --model jameslahm/yolov10n --use-fp16"
+ },
+ {
+  "name": "rm_rtdetrv2",
+  "gpus": 1,
+  "timeout": 7200,
+  "cmd": "python tests/bench_detection.py --model PekingU/rtdetr_v2_r101vd --use-fp16"
+ },
+ {
+  "name": "rm_llama31",
+  "gpus": 1,
+  "timeout": 10800,
+  "cmd": "python tests/bench_vllm.py --model meta-llama/Llama-3.1-8B-Instruct --skip-latency"
+ },
+ {
+  "name": "rm_sdxl",
+  "gpus": 1,
+  "timeout": 14400,
+  "cmd": "python tests/bench_diffusers.py"
+ },
+ {
+  "name": "rm_cosyvoice3",
+  "gpus": 1,
+  "timeout": 14400,
+  "cmd": "python tests/bench_vllm_omni.py --model FunAudioLLM/Fun-CosyVoice3-0.5B-2512"
+ },
+ {
+  "name": "rm_flux",
+  "gpus": 1,
+  "timeout": 14400,
+  "cmd": "python tests/bench_vllm_omni.py --model black-forest-labs/FLUX.1-dev"
+ },
+ {
+  "name": "rm_dinov3",
+  "gpus": 1,
+  "timeout": 10800,
+  "cmd": "python tests/bench_timm.py --model facebook/dinov3-vit7b16-pretrain-lvd1689m"
+ },
+ {
+  "name": "rm_mobilenetv4",
+  "gpus": 1,
+  "timeout": 10800,
+  "cmd": "python tests/bench_timm.py --model timm/mobilenetv4_conv_medium.e500_r256_in1k"
+ },
+ {
+  "name": "rm_convnextv2",
+  "gpus": 1,
+  "timeout": 10800,
+  "cmd": "python tests/bench_image_cls.py --model facebook/convnextv2-base-22k-384 --num-images 3072 --batch-size 8"
+ },
+ {
+  "name": "rm_effnetv2",
+  "gpus": 1,
+  "timeout": 10800,
+  "cmd": "python tests/bench_image_cls.py --model timm/efficientnetv2_rw_m.agc_in1k --num-images 3072 --batch-size 8"
+ },
+ {
+  "name": "rm_hunyuan",
+  "gpus": 1,
+  "timeout": 21600,
+  "cmd": "python tests/bench_vllm_omni.py --model hunyuanvideo-community/HunyuanVideo-1.5-Diffusers-480p_t2v"
+ }
+]
