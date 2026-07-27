@@ -14,6 +14,25 @@ import triton
 from .csrc import _C
 
 
+def _persistent(factory, *args, **kwargs) -> torch.Tensor:
+    """Allocate a reusable buffer that is safe to mutate from anywhere.
+
+    These buffers are created lazily on first forward, which usually runs under
+    ``torch.inference_mode()``. A tensor created there is an *inference tensor*,
+    and PyTorch rejects in-place updates to it from outside inference mode --
+    which is exactly what happens once the surrounding module is compiled and
+    Inductor calls the op from its generated wrapper:
+
+        RuntimeError: Inplace update to inference tensor outside InferenceMode
+        is not allowed.
+
+    Allocating with inference mode explicitly disabled keeps the buffer a normal
+    tensor, so both call paths may write it.
+    """
+    with torch.inference_mode(False):
+        return factory(*args, **kwargs)
+
+
 class MoeAlign(nn.Module):
     """MoE token-to-expert alignment using sgl_kernel.
 
@@ -26,28 +45,27 @@ class MoeAlign(nn.Module):
         self._expert_ids = None
         self._num_tokens_post_padded = None
         self._cumsum_buffer = None
-        self._naive_num_tokens_post_padded = None
 
     def _ensure_buffers(self, max_padded, max_blocks, num_experts, device):
         if (self._sorted_token_ids is None
                 or self._sorted_token_ids.size(0) < max_padded):
-            self._sorted_token_ids = torch.empty(
-                max_padded, dtype=torch.int32, device=device,
+            self._sorted_token_ids = _persistent(
+                torch.empty, max_padded, dtype=torch.int32, device=device,
             )
         if (self._expert_ids is None
                 or self._expert_ids.size(0) < max_blocks):
-            self._expert_ids = torch.empty(
-                max_blocks, dtype=torch.int32, device=device,
+            self._expert_ids = _persistent(
+                torch.empty, max_blocks, dtype=torch.int32, device=device,
             )
         if (self._num_tokens_post_padded is None
                 or self._num_tokens_post_padded.device != device):
-            self._num_tokens_post_padded = torch.zeros(
-                1, dtype=torch.int32, device=device,
+            self._num_tokens_post_padded = _persistent(
+                torch.zeros, 1, dtype=torch.int32, device=device,
             )
         if (self._cumsum_buffer is None
                 or self._cumsum_buffer.size(0) < num_experts + 1):
-            self._cumsum_buffer = torch.zeros(
-                num_experts + 1, dtype=torch.int32, device=device,
+            self._cumsum_buffer = _persistent(
+                torch.zeros, num_experts + 1, dtype=torch.int32, device=device,
             )
 
     def _naive_forward(
@@ -59,13 +77,25 @@ class MoeAlign(nn.Module):
         numel = topk_ids.numel()
         max_num_tokens_padded = numel * block_size
         expert_ids = topk_ids.view(-1).to(torch.int32)
-        if (self._naive_num_tokens_post_padded is None
-                or self._naive_num_tokens_post_padded.device != topk_ids.device):
-            self._naive_num_tokens_post_padded = torch.empty(
-                1, dtype=torch.int32, device=topk_ids.device,
-            )
-        self._naive_num_tokens_post_padded.fill_(max_num_tokens_padded)
-        return None, expert_ids, self._naive_num_tokens_post_padded
+        # Allocate fresh rather than caching + fill_():  a buffer first created
+        # inside torch.inference_mode() becomes an inference tensor, and the
+        # in-place fill_ then dies with "Inplace update to inference tensor
+        # outside InferenceMode" as soon as the op is invoked outside that mode
+        # (which torch.compile/Inductor does when it benchmarks the graph).
+        # vLLM's moe_align_block_size allocates these per call for the same
+        # reason; a 1-element alloc is free and stays CUDA-graph capturable.
+        #
+        # This supersedes the earlier B200 fix, which kept the cached buffer and
+        # allocated it via ``_persistent`` (outside inference mode) so fill_()
+        # stayed legal. Both cure the inference-tensor error, but a fresh
+        # allocation also removes the shared-mutable-buffer hazard: the returned
+        # tensor aliased engine state, so a later call overwrote a value a
+        # caller might still hold.
+        num_tokens_post_padded = torch.full(
+            (1,), max_num_tokens_padded,
+            dtype=torch.int32, device=topk_ids.device,
+        )
+        return None, expert_ids, num_tokens_post_padded
 
     def forward(
         self,

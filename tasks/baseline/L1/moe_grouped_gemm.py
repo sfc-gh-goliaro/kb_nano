@@ -227,6 +227,23 @@ def _get_moe_configs(E: int, N: int, dtype: str | None,
     if os.path.isdir(local_configs_dir):
         config_file_paths.append(os.path.join(local_configs_dir, json_file_name))
 
+    # Installed vLLM package's tuned configs.  This is the intended source of
+    # truth (the ``vllm_repo`` source-checkout path above is used only when a
+    # checkout happens to be present); without it, block-FP8 MoE shapes such as
+    # DeepSeek-V3.2's fall back to the heuristic default, whose "large" config
+    # (BLOCK_SIZE_K=64) is ~4.6x slower than vLLM's tuned config at decode
+    # batch M>=128 because K=64 is incompatible with block_shape=[128,128].
+    try:
+        import vllm as _vllm  # already imported by the FP8 expert path
+        pkg_configs_dir = os.path.join(
+            os.path.dirname(os.path.abspath(_vllm.__file__)),
+            "model_executor", "layers", "fused_moe", "configs",
+        )
+        if os.path.isdir(pkg_configs_dir):
+            config_file_paths.append(os.path.join(pkg_configs_dir, json_file_name))
+    except Exception:
+        pass
+
     for config_file_path in config_file_paths:
         if os.path.exists(config_file_path):
             with open(config_file_path) as f:
@@ -288,6 +305,20 @@ def _get_vllm_default_config(M: int, E: int = 0, dtype: str | None = None) -> di
 
 def _get_default_config(M: int, E: int = 0, N: int = 0,
                         block_shape: list[int] | None = None) -> dict:
+    # Block-wise FP8: the N/K tiles must line up with the scale blocks, so the
+    # generic size heuristic below does not apply.  Mirrors vLLM's
+    # get_default_config() fp8_w8a8 + block_shape branch -- in particular
+    # BLOCK_SIZE_K must be the scale block (128), not 64, otherwise each
+    # 128-wide scale group is re-loaded twice per K step.
+    if block_shape is not None and all(block_shape):
+        return {
+            "BLOCK_SIZE_M": 16 if M <= 64 else 64,
+            "BLOCK_SIZE_N": block_shape[0],
+            "BLOCK_SIZE_K": block_shape[1],
+            "GROUP_SIZE_M": 1 if M <= 16 else 32,
+            "num_warps": 4,
+            "num_stages": 3,
+        }
     if M <= 4:
         return dict(_DEFAULT_CONFIG_HEURISTIC["small"])
     if M <= 64:
