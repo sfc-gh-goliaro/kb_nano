@@ -1,0 +1,223 @@
+{
+    "21": [
+        {
+            "sample_id": 0,
+            "compiled": false,
+            "correctness": false,
+            "metadata": {
+                "other_error": "error: ModelNew.__init__() takes 1 positional argument but 6 were given",
+                "other_error_name": "builtins.TypeError",
+                "hardware": "NVIDIA B200",
+                "device": "cuda:0"
+            },
+            "runtime": -1.0,
+            "runtime_stats": {},
+            "ref_runtime": -1.0,
+            "ref_runtime_stats": {}
+        },
+        {
+            "sample_id": 1,
+            "compiled": true,
+            "correctness": false,
+            "metadata": {
+                "hardware": "NVIDIA B200",
+                "device": "cuda:0",
+                "max_difference": [
+                    "5.543727",
+                    "6.109050",
+                    "5.694299",
+                    "5.620503",
+                    "5.642250"
+                ],
+                "avg_difference": [
+                    "0.797549",
+                    "0.797467",
+                    "0.797532",
+                    "0.797454",
+                    "0.797484"
+                ],
+                "correctness_issue": "Output mismatch",
+                "correctness_trials": "(0 / 5)"
+            },
+            "runtime": -1.0,
+            "runtime_stats": {},
+            "ref_runtime": 4.33,
+            "ref_runtime_stats": {
+                "mean": 4.33,
+                "std": 1.61,
+                "min": 3.96,
+                "max": 19.0,
+                "num_trials": 100,
+                "hardware": "NVIDIA B200",
+                "device": "cuda:0"
+            }
+        },
+        {
+            "sample_id": 2,
+            "compiled": true,
+            "correctness": true,
+            "metadata": {
+                "hardware": "NVIDIA B200",
+                "device": "cuda:0",
+                "correctness_trials": "(5 / 5)"
+            },
+            "runtime": 5.44,
+            "runtime_stats": {
+                "mean": 5.44,
+                "std": 1.04,
+                "min": 3.45,
+                "max": 8.29,
+                "num_trials": 100,
+                "hardware": "NVIDIA B200",
+                "device": "cuda:0"
+            },
+            "ref_runtime": 4.0,
+            "ref_runtime_stats": {
+                "mean": 4.0,
+                "std": 0.0634,
+                "min": 3.96,
+                "max": 4.59,
+                "num_trials": 100,
+                "hardware": "NVIDIA B200",
+                "device": "cuda:0"
+            }
+        },
+        {
+            "sample_id": 3,
+            "compiled": true,
+            "correctness": true,
+            "metadata": {
+                "hardware": "NVIDIA B200",
+                "device": "cuda:0",
+                "correctness_trials": "(5 / 5)"
+            },
+            "runtime": 4.48,
+            "runtime_stats": {
+                "mean": 4.48,
+                "std": 4.89,
+                "min": 3.97,
+                "max": 53.2,
+                "num_trials": 100,
+                "hardware": "NVIDIA B200",
+                "device": "cuda:0"
+            },
+            "ref_runtime": 4.0,
+            "ref_runtime_stats": {
+                "mean": 4.0,
+                "std": 0.0595,
+                "min": 3.97,
+                "max": 4.52,
+                "num_trials": 100,
+                "hardware": "NVIDIA B200",
+                "device": "cuda:0"
+            }
+        },
+        {
+            "sample_id": 4,
+            "compiled": true,
+            "correctness": false,
+            "metadata": {
+                "hardware": "NVIDIA B200",
+                "device": "cuda:0",
+                "runtime_error": "at 70:12:\n\n    # Broadcast to (PX, OC)\n    acc = acc * (bn_w[None, :] * inv_std[None, :]) + bn_b[None, :]\n\n    # Apply ReLU6\n    zero = 0.0\n    six = 6.0\n    acc = tl.maximum(acc, zero)\n    acc = t...",
+                "runtime_error_name": "triton.compiler.errors.CompilationError",
+                "runtime_error_traceback": "Traceback (most recent call last):\n  File \"/raid/user_data/olu/scratch/drkernel_paper/kernelbench_ref/src/kernelbench/eval.py\", line 782, in run_and_check_correctness\n    output_new = model_new(*inputs)\n  File \"/raid/user_data/olu/scratch/drkernel_paper/kernelbench_ref/.venv/lib/python3.10/site-packages/torch/nn/modules/module.py\", line 1778, in _wrapped_call_impl\n    return self._call_impl(*args, **kwargs)\n  File \"/raid/user_data/olu/scratch/drkernel_paper/kernelbench_ref/.venv/lib/python3.10/site-packages/torch/nn/modules/module.py\", line 1789, in _call_impl\n    return forward_call(*args, **kwargs)\n  File \"/tmp/tmptiyyd35u.py\", line 311, in forward\n    conv1x1_bn_relu6_kernel[grid](\n  File \"/raid/user_data/olu/scratch/drkernel_paper/kernelbench_ref/.venv/lib/python3.10/site-packages/triton/runtime/jit.py\", line 370, in <lambda>\n    return lambda *args, **kwargs: self.run(grid=grid, warmup=False, *args, **kwargs)\n  File \"/raid/user_data/olu/scratch/drkernel_paper/kernelbench_ref/.venv/lib/python3.10/site-packages/triton/runtime/jit.py\", line 739, in run\n    kernel = self._do_compile(key, signature, device, constexprs, options, attrs, warmup)\n  File \"/raid/user_data/olu/scratch/drkernel_paper/kernelbench_ref/.venv/lib/python3.10/site-packages/triton/runtime/jit.py\", line 884, in _do_compile\n    kernel = self.compile(src, target=target, options=options.__dict__)\n  File \"/raid/user_data/olu/scratch/drkernel_paper/kernelbench_ref/.venv/lib/python3.10/site-packages/triton/compiler/compiler.py\", line 307, in compile\n    module = src.make_ir(target, options, codegen_fns, module_map, context)\n  File \"/raid/user_data/olu/scratch/drkernel_paper/kernelbench_ref/.venv/lib/python3.10/site-packages/triton/compiler/compiler.py\", line 80, in make_ir\n    return ast_to_ttir(self.fn, self, context=context, options=options, codegen_fns=codegen_fns,\ntriton.compiler.errors.CompilationError: at 70:12:\n\n    # Broadcast to (PX, OC)\n    acc = acc * (bn_w[None, :] * inv_std[None, :]) + bn_b[None, :]\n\n    # Apply ReLU6\n    zero = 0.0\n    six = 6.0\n    acc = tl.maximum(acc, zero)\n    acc = tl.minimum(acc, six)\n\n    # Store\n    y_off = n * out_stride_n + oc[None, :] * out_stride_c + h * out_stride_h + w * out_stride_w\n            ^\nValueError('Cannot make_shape_compatible: incompatible dimensions at index 1: 256 and 64')\n"
+            },
+            "runtime": -1.0,
+            "runtime_stats": {},
+            "ref_runtime": 4.0,
+            "ref_runtime_stats": {
+                "mean": 4.0,
+                "std": 0.0559,
+                "min": 3.97,
+                "max": 4.52,
+                "num_trials": 100,
+                "hardware": "NVIDIA B200",
+                "device": "cuda:0"
+            }
+        },
+        {
+            "sample_id": 5,
+            "compiled": true,
+            "correctness": false,
+            "metadata": {
+                "hardware": "NVIDIA B200",
+                "device": "cuda:0",
+                "max_difference": [
+                    "7.689161",
+                    "8.263473",
+                    "8.324448",
+                    "7.510227",
+                    "7.523405"
+                ],
+                "avg_difference": [
+                    "1.127569",
+                    "1.127716",
+                    "1.127684",
+                    "1.127280",
+                    "1.127550"
+                ],
+                "correctness_issue": "Output mismatch",
+                "correctness_trials": "(0 / 5)"
+            },
+            "runtime": -1.0,
+            "runtime_stats": {},
+            "ref_runtime": 5.33,
+            "ref_runtime_stats": {
+                "mean": 5.33,
+                "std": 1.21,
+                "min": 3.96,
+                "max": 6.5,
+                "num_trials": 100,
+                "hardware": "NVIDIA B200",
+                "device": "cuda:0"
+            }
+        },
+        {
+            "sample_id": 6,
+            "compiled": true,
+            "correctness": false,
+            "metadata": {
+                "hardware": "NVIDIA B200",
+                "device": "cuda:0",
+                "correctness_issue": "Output shape mismatch: Expected torch.Size([10, 192, 112, 112]), got torch.Size([10, 192, 224, 224])",
+                "correctness_issue_name": "correctness_issue"
+            },
+            "runtime": -1.0,
+            "runtime_stats": {},
+            "ref_runtime": 4.03,
+            "ref_runtime_stats": {
+                "mean": 4.03,
+                "std": 0.0652,
+                "min": 3.98,
+                "max": 4.64,
+                "num_trials": 100,
+                "hardware": "NVIDIA B200",
+                "device": "cuda:0"
+            }
+        },
+        {
+            "sample_id": 7,
+            "compiled": true,
+            "correctness": false,
+            "metadata": {
+                "hardware": "NVIDIA B200",
+                "device": "cuda:0",
+                "correctness_issue": "Output shape mismatch: Expected torch.Size([10, 192, 112, 112]), got torch.Size([10, 112, 224, 224])",
+                "correctness_issue_name": "correctness_issue"
+            },
+            "runtime": -1.0,
+            "runtime_stats": {},
+            "ref_runtime": 4.0,
+            "ref_runtime_stats": {
+                "mean": 4.0,
+                "std": 0.0695,
+                "min": 3.97,
+                "max": 4.64,
+                "num_trials": 100,
+                "hardware": "NVIDIA B200",
+                "device": "cuda:0"
+            }
+        }
+    ]
+}

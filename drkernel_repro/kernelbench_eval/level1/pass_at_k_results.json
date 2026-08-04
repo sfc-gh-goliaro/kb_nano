@@ -1,0 +1,24 @@
+{
+  "averages": {
+    "avg_pass@1": 0.125
+  },
+  "metadata": {
+    "total_problems": 2,
+    "problems_with_samples": 2,
+    "total_evaluated_samples": 16,
+    "total_correct_samples": 2,
+    "pass@1_count": 2
+  },
+  "problems": {
+    "16": {
+      "total_samples": 8,
+      "correct_samples": 0,
+      "pass@1": 0.0
+    },
+    "89": {
+      "total_samples": 8,
+      "correct_samples": 2,
+      "pass@1": 0.25
+    }
+  }
+}

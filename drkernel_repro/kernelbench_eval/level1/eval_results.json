@@ -1,0 +1,484 @@
+{
+    "16": [
+        {
+            "sample_id": 0,
+            "compiled": true,
+            "correctness": false,
+            "metadata": {
+                "hardware": "NVIDIA B200",
+                "device": "cuda:0",
+                "runtime_error": "at 42:15:\n        a_mask = (kk[:, None] < K) & (offs_m[None, :] < M)\n        b_mask = (kk[:, None] < K) & (offs_n[None, :] < N)\n\n        # Load\n        a = tl.load(a_ptrs, mask=a_mask, other=0.0)\n ...",
+                "runtime_error_name": "triton.compiler.errors.CompilationError",
+                "runtime_error_traceback": "Traceback (most recent call last):\n  File \"/raid/user_data/olu/scratch/drkernel_paper/kernelbench_ref/.venv/lib/python3.10/site-packages/triton/language/core.py\", line 43, in wrapper\n    return fn(*args, **kwargs)\n  File \"/raid/user_data/olu/scratch/drkernel_paper/kernelbench_ref/.venv/lib/python3.10/site-packages/triton/language/core.py\", line 2073, in dot\n    assert a_shape[-1] == b_shape[-2], \"input and other must have equal reduction dimensions\"\nAssertionError: input and other must have equal reduction dimensions\n\nThe above exception was the direct cause of the following exception:\n\nTraceback (most recent call last):\n  File \"/raid/user_data/olu/scratch/drkernel_paper/kernelbench_ref/src/kernelbench/eval.py\", line 782, in run_and_check_correctness\n    output_new = model_new(*inputs)\n  File \"/raid/user_data/olu/scratch/drkernel_paper/kernelbench_ref/.venv/lib/python3.10/site-packages/torch/nn/modules/module.py\", line 1778, in _wrapped_call_impl\n    return self._call_impl(*args, **kwargs)\n  File \"/raid/user_data/olu/scratch/drkernel_paper/kernelbench_ref/.venv/lib/python3.10/site-packages/torch/nn/modules/module.py\", line 1789, in _call_impl\n    return forward_call(*args, **kwargs)\n  File \"/tmp/tmp13e2zm1v.py\", line 111, in forward\n    _matmul_kernel[grid](\n  File \"/raid/user_data/olu/scratch/drkernel_paper/kernelbench_ref/.venv/lib/python3.10/site-packages/triton/runtime/jit.py\", line 370, in <lambda>\n    return lambda *args, **kwargs: self.run(grid=grid, warmup=False, *args, **kwargs)\n  File \"/raid/user_data/olu/scratch/drkernel_paper/kernelbench_ref/.venv/lib/python3.10/site-packages/triton/runtime/jit.py\", line 739, in run\n    kernel = self._do_compile(key, signature, device, constexprs, options, attrs, warmup)\n  File \"/raid/user_data/olu/scratch/drkernel_paper/kernelbench_ref/.venv/lib/python3.10/site-packages/triton/runtime/jit.py\", line 884, in _do_compile\n    kernel = self.compile(src, target=target, options=options.__dict__)\n  File \"/raid/user_data/olu/scratch/drkernel_paper/kernelbench_ref/.venv/lib/python3.10/site-packages/triton/compiler/compiler.py\", line 307, in compile\n    module = src.make_ir(target, options, codegen_fns, module_map, context)\n  File \"/raid/user_data/olu/scratch/drkernel_paper/kernelbench_ref/.venv/lib/python3.10/site-packages/triton/compiler/compiler.py\", line 80, in make_ir\n    return ast_to_ttir(self.fn, self, context=context, options=options, codegen_fns=codegen_fns,\ntriton.compiler.errors.CompilationError: at 42:15:\n        a_mask = (kk[:, None] < K) & (offs_m[None, :] < M)\n        b_mask = (kk[:, None] < K) & (offs_n[None, :] < N)\n\n        # Load\n        a = tl.load(a_ptrs, mask=a_mask, other=0.0)\n        b = tl.load(b_ptrs, mask=b_mask, other=0.0)\n\n        # Accumulate: (BK x BM) @ (BK x BN) => (BM x BN)\n        # Cast to fp32 for numeric stability\n        af = a.to(tl.float32)\n        bf = b.to(tl.float32)\n        acc += tl.dot(af, bf)  # returns fp32\n               ^\ninput and other must have equal reduction dimensions\n"
+            },
+            "runtime": -1.0,
+            "runtime_stats": {},
+            "ref_runtime": 2.46,
+            "ref_runtime_stats": {
+                "mean": 2.46,
+                "std": 0.00998,
+                "min": 2.46,
+                "max": 2.52,
+                "num_trials": 100,
+                "hardware": "NVIDIA B200",
+                "device": "cuda:0"
+            }
+        },
+        {
+            "sample_id": 1,
+            "compiled": true,
+            "correctness": false,
+            "metadata": {
+                "hardware": "NVIDIA B200",
+                "device": "cuda:0",
+                "max_difference": [
+                    "1.532715",
+                    "1.525146",
+                    "1.530273",
+                    "1.534424",
+                    "1.530273"
+                ],
+                "avg_difference": [
+                    "1.446149",
+                    "1.446616",
+                    "1.445539",
+                    "1.446116",
+                    "1.445865"
+                ],
+                "correctness_issue": "Output mismatch",
+                "correctness_trials": "(0 / 5)"
+            },
+            "runtime": -1.0,
+            "runtime_stats": {},
+            "ref_runtime": 2.46,
+            "ref_runtime_stats": {
+                "mean": 2.46,
+                "std": 0.00188,
+                "min": 2.46,
+                "max": 2.48,
+                "num_trials": 100,
+                "hardware": "NVIDIA B200",
+                "device": "cuda:0"
+            }
+        },
+        {
+            "sample_id": 2,
+            "compiled": true,
+            "correctness": false,
+            "metadata": {
+                "hardware": "NVIDIA B200",
+                "device": "cuda:0",
+                "runtime_error": "at 40:15:\n        b_ptrs = B + (offs_k[:, None] * sB0) + (offs_n[None, :] * sB1)\n\n        # Masks\n        a_mask = (offs_k[:, None] < K) & (offs_m[None, :] < M)\n        b_mask = (offs_k[:, None] < ...",
+                "runtime_error_name": "triton.compiler.errors.CompilationError",
+                "runtime_error_traceback": "Traceback (most recent call last):\n  File \"/raid/user_data/olu/scratch/drkernel_paper/kernelbench_ref/.venv/lib/python3.10/site-packages/triton/language/core.py\", line 43, in wrapper\n    return fn(*args, **kwargs)\n  File \"/raid/user_data/olu/scratch/drkernel_paper/kernelbench_ref/.venv/lib/python3.10/site-packages/triton/language/core.py\", line 2073, in dot\n    assert a_shape[-1] == b_shape[-2], \"input and other must have equal reduction dimensions\"\nAssertionError: input and other must have equal reduction dimensions\n\nThe above exception was the direct cause of the following exception:\n\nTraceback (most recent call last):\n  File \"/raid/user_data/olu/scratch/drkernel_paper/kernelbench_ref/src/kernelbench/eval.py\", line 782, in run_and_check_correctness\n    output_new = model_new(*inputs)\n  File \"/raid/user_data/olu/scratch/drkernel_paper/kernelbench_ref/.venv/lib/python3.10/site-packages/torch/nn/modules/module.py\", line 1778, in _wrapped_call_impl\n    return self._call_impl(*args, **kwargs)\n  File \"/raid/user_data/olu/scratch/drkernel_paper/kernelbench_ref/.venv/lib/python3.10/site-packages/torch/nn/modules/module.py\", line 1789, in _call_impl\n    return forward_call(*args, **kwargs)\n  File \"/tmp/tmpbpr74lx4.py\", line 108, in forward\n    _matmul_at_b_kernel[grid](\n  File \"/raid/user_data/olu/scratch/drkernel_paper/kernelbench_ref/.venv/lib/python3.10/site-packages/triton/runtime/jit.py\", line 370, in <lambda>\n    return lambda *args, **kwargs: self.run(grid=grid, warmup=False, *args, **kwargs)\n  File \"/raid/user_data/olu/scratch/drkernel_paper/kernelbench_ref/.venv/lib/python3.10/site-packages/triton/runtime/jit.py\", line 739, in run\n    kernel = self._do_compile(key, signature, device, constexprs, options, attrs, warmup)\n  File \"/raid/user_data/olu/scratch/drkernel_paper/kernelbench_ref/.venv/lib/python3.10/site-packages/triton/runtime/jit.py\", line 884, in _do_compile\n    kernel = self.compile(src, target=target, options=options.__dict__)\n  File \"/raid/user_data/olu/scratch/drkernel_paper/kernelbench_ref/.venv/lib/python3.10/site-packages/triton/compiler/compiler.py\", line 307, in compile\n    module = src.make_ir(target, options, codegen_fns, module_map, context)\n  File \"/raid/user_data/olu/scratch/drkernel_paper/kernelbench_ref/.venv/lib/python3.10/site-packages/triton/compiler/compiler.py\", line 80, in make_ir\n    return ast_to_ttir(self.fn, self, context=context, options=options, codegen_fns=codegen_fns,\ntriton.compiler.errors.CompilationError: at 40:15:\n        b_ptrs = B + (offs_k[:, None] * sB0) + (offs_n[None, :] * sB1)\n\n        # Masks\n        a_mask = (offs_k[:, None] < K) & (offs_m[None, :] < M)\n        b_mask = (offs_k[:, None] < K) & (offs_n[None, :] < N)\n\n        # Load, cast to fp32\n        a = tl.load(a_ptrs, mask=a_mask, other=0.0).to(tl.float32)\n        b = tl.load(b_ptrs, mask=b_mask, other=0.0).to(tl.float32)\n\n        # Accumulate\n        acc += tl.dot(a, b)\n               ^\ninput and other must have equal reduction dimensions\n"
+            },
+            "runtime": -1.0,
+            "runtime_stats": {},
+            "ref_runtime": 2.46,
+            "ref_runtime_stats": {
+                "mean": 2.46,
+                "std": 0.00282,
+                "min": 2.46,
+                "max": 2.49,
+                "num_trials": 100,
+                "hardware": "NVIDIA B200",
+                "device": "cuda:0"
+            }
+        },
+        {
+            "sample_id": 3,
+            "compiled": true,
+            "correctness": false,
+            "metadata": {
+                "hardware": "NVIDIA B200",
+                "device": "cuda:0",
+                "max_difference": [
+                    "1.532715",
+                    "1.525146",
+                    "1.530273",
+                    "1.534424",
+                    "1.530273"
+                ],
+                "avg_difference": [
+                    "1.446149",
+                    "1.446616",
+                    "1.445539",
+                    "1.446116",
+                    "1.445865"
+                ],
+                "correctness_issue": "Output mismatch",
+                "correctness_trials": "(0 / 5)"
+            },
+            "runtime": -1.0,
+            "runtime_stats": {},
+            "ref_runtime": 2.46,
+            "ref_runtime_stats": {
+                "mean": 2.46,
+                "std": 0.00559,
+                "min": 2.46,
+                "max": 2.51,
+                "num_trials": 100,
+                "hardware": "NVIDIA B200",
+                "device": "cuda:0"
+            }
+        },
+        {
+            "sample_id": 4,
+            "compiled": true,
+            "correctness": false,
+            "metadata": {
+                "hardware": "NVIDIA B200",
+                "device": "cuda:0",
+                "max_difference": [
+                    "1.532715",
+                    "1.525146",
+                    "1.530273",
+                    "1.534424",
+                    "1.530273"
+                ],
+                "avg_difference": [
+                    "1.446149",
+                    "1.446616",
+                    "1.445539",
+                    "1.446116",
+                    "1.445865"
+                ],
+                "correctness_issue": "Output mismatch",
+                "correctness_trials": "(0 / 5)"
+            },
+            "runtime": -1.0,
+            "runtime_stats": {},
+            "ref_runtime": 2.47,
+            "ref_runtime_stats": {
+                "mean": 2.47,
+                "std": 0.019,
+                "min": 2.46,
+                "max": 2.57,
+                "num_trials": 100,
+                "hardware": "NVIDIA B200",
+                "device": "cuda:0"
+            }
+        },
+        {
+            "sample_id": 5,
+            "compiled": true,
+            "correctness": false,
+            "metadata": {
+                "hardware": "NVIDIA B200",
+                "device": "cuda:0",
+                "max_difference": [
+                    "113.973389",
+                    "103.764282",
+                    "103.591675",
+                    "108.755371",
+                    "102.912964"
+                ],
+                "avg_difference": [
+                    "16.649725",
+                    "16.659115",
+                    "16.598198",
+                    "16.962599",
+                    "17.002193"
+                ],
+                "correctness_issue": "Output mismatch",
+                "correctness_trials": "(0 / 5)"
+            },
+            "runtime": -1.0,
+            "runtime_stats": {},
+            "ref_runtime": 2.46,
+            "ref_runtime_stats": {
+                "mean": 2.46,
+                "std": 0.00785,
+                "min": 2.46,
+                "max": 2.52,
+                "num_trials": 100,
+                "hardware": "NVIDIA B200",
+                "device": "cuda:0"
+            }
+        },
+        {
+            "sample_id": 6,
+            "compiled": true,
+            "correctness": false,
+            "metadata": {
+                "hardware": "NVIDIA B200",
+                "device": "cuda:0",
+                "max_difference": [
+                    "1.532715",
+                    "1.525146",
+                    "1.530273",
+                    "1.534424",
+                    "1.530273"
+                ],
+                "avg_difference": [
+                    "1.446149",
+                    "1.446616",
+                    "1.445539",
+                    "1.446116",
+                    "1.445865"
+                ],
+                "correctness_issue": "Output mismatch",
+                "correctness_trials": "(0 / 5)"
+            },
+            "runtime": -1.0,
+            "runtime_stats": {},
+            "ref_runtime": 2.46,
+            "ref_runtime_stats": {
+                "mean": 2.46,
+                "std": 0.0104,
+                "min": 2.46,
+                "max": 2.53,
+                "num_trials": 100,
+                "hardware": "NVIDIA B200",
+                "device": "cuda:0"
+            }
+        },
+        {
+            "sample_id": 7,
+            "compiled": true,
+            "correctness": false,
+            "metadata": {
+                "hardware": "NVIDIA B200",
+                "device": "cuda:0",
+                "runtime_error": "at 41:15:\n        b_ptrs = B + (k_ids[:, None] * stride_bk + offs_n[None, :] * stride_bn)\n\n        # Masks for in-bounds\n        a_mask = (k_ids[:, None] < K) & (offs_m[None, :] < M)\n        b_mask...",
+                "runtime_error_name": "triton.compiler.errors.CompilationError",
+                "runtime_error_traceback": "Traceback (most recent call last):\n  File \"/raid/user_data/olu/scratch/drkernel_paper/kernelbench_ref/.venv/lib/python3.10/site-packages/triton/language/core.py\", line 43, in wrapper\n    return fn(*args, **kwargs)\n  File \"/raid/user_data/olu/scratch/drkernel_paper/kernelbench_ref/.venv/lib/python3.10/site-packages/triton/language/core.py\", line 2073, in dot\n    assert a_shape[-1] == b_shape[-2], \"input and other must have equal reduction dimensions\"\nAssertionError: input and other must have equal reduction dimensions\n\nThe above exception was the direct cause of the following exception:\n\nTraceback (most recent call last):\n  File \"/raid/user_data/olu/scratch/drkernel_paper/kernelbench_ref/src/kernelbench/eval.py\", line 782, in run_and_check_correctness\n    output_new = model_new(*inputs)\n  File \"/raid/user_data/olu/scratch/drkernel_paper/kernelbench_ref/.venv/lib/python3.10/site-packages/torch/nn/modules/module.py\", line 1778, in _wrapped_call_impl\n    return self._call_impl(*args, **kwargs)\n  File \"/raid/user_data/olu/scratch/drkernel_paper/kernelbench_ref/.venv/lib/python3.10/site-packages/torch/nn/modules/module.py\", line 1789, in _call_impl\n    return forward_call(*args, **kwargs)\n  File \"/tmp/tmp_ee__roi.py\", line 120, in forward\n    _matmul_at_b_kernel[grid](\n  File \"/raid/user_data/olu/scratch/drkernel_paper/kernelbench_ref/.venv/lib/python3.10/site-packages/triton/runtime/jit.py\", line 370, in <lambda>\n    return lambda *args, **kwargs: self.run(grid=grid, warmup=False, *args, **kwargs)\n  File \"/raid/user_data/olu/scratch/drkernel_paper/kernelbench_ref/.venv/lib/python3.10/site-packages/triton/runtime/jit.py\", line 739, in run\n    kernel = self._do_compile(key, signature, device, constexprs, options, attrs, warmup)\n  File \"/raid/user_data/olu/scratch/drkernel_paper/kernelbench_ref/.venv/lib/python3.10/site-packages/triton/runtime/jit.py\", line 884, in _do_compile\n    kernel = self.compile(src, target=target, options=options.__dict__)\n  File \"/raid/user_data/olu/scratch/drkernel_paper/kernelbench_ref/.venv/lib/python3.10/site-packages/triton/compiler/compiler.py\", line 307, in compile\n    module = src.make_ir(target, options, codegen_fns, module_map, context)\n  File \"/raid/user_data/olu/scratch/drkernel_paper/kernelbench_ref/.venv/lib/python3.10/site-packages/triton/compiler/compiler.py\", line 80, in make_ir\n    return ast_to_ttir(self.fn, self, context=context, options=options, codegen_fns=codegen_fns,\ntriton.compiler.errors.CompilationError: at 41:15:\n        b_ptrs = B + (k_ids[:, None] * stride_bk + offs_n[None, :] * stride_bn)\n\n        # Masks for in-bounds\n        a_mask = (k_ids[:, None] < K) & (offs_m[None, :] < M)\n        b_mask = (k_ids[:, None] < K) & (offs_n[None, :] < N)\n\n        # Load tiles\n        a = tl.load(a_ptrs, mask=a_mask, other=0.0)      # (BM, BK)\n        b = tl.load(b_ptrs, mask=b_mask, other=0.0)      # (BK, BN)\n\n        # Accumulate\n        acc += tl.dot(a, b)  # (BM, BN)\n               ^\ninput and other must have equal reduction dimensions\n"
+            },
+            "runtime": -1.0,
+            "runtime_stats": {},
+            "ref_runtime": 2.46,
+            "ref_runtime_stats": {
+                "mean": 2.46,
+                "std": 0.00294,
+                "min": 2.46,
+                "max": 2.49,
+                "num_trials": 100,
+                "hardware": "NVIDIA B200",
+                "device": "cuda:0"
+            }
+        }
+    ],
+    "89": [
+        {
+            "sample_id": 0,
+            "compiled": true,
+            "correctness": false,
+            "metadata": {
+                "hardware": "NVIDIA B200",
+                "device": "cuda:0",
+                "max_difference": [
+                    "16644.318359",
+                    "16618.154297",
+                    "16586.550781",
+                    "16619.089844",
+                    "16595.023438"
+                ],
+                "avg_difference": [
+                    "16383.763672",
+                    "16383.755859",
+                    "16383.672852",
+                    "16384.136719",
+                    "16383.551758"
+                ],
+                "correctness_issue": "Output mismatch",
+                "correctness_trials": "(0 / 5)"
+            },
+            "runtime": -1.0,
+            "runtime_stats": {},
+            "ref_runtime": 4.01,
+            "ref_runtime_stats": {
+                "mean": 4.01,
+                "std": 0.0498,
+                "min": 4.0,
+                "max": 4.51,
+                "num_trials": 100,
+                "hardware": "NVIDIA B200",
+                "device": "cuda:0"
+            }
+        },
+        {
+            "sample_id": 1,
+            "compiled": true,
+            "correctness": false,
+            "metadata": {
+                "hardware": "NVIDIA B200",
+                "device": "cuda:0",
+                "max_difference": [
+                    "536843904.000000",
+                    "536849952.000000",
+                    "536841536.000000",
+                    "536856736.000000",
+                    "536838688.000000"
+                ],
+                "avg_difference": [
+                    "268425072.000000",
+                    "268424928.000000",
+                    "268418336.000000",
+                    "268428544.000000",
+                    "268420064.000000"
+                ],
+                "correctness_issue": "Output mismatch",
+                "correctness_trials": "(0 / 5)"
+            },
+            "runtime": -1.0,
+            "runtime_stats": {},
+            "ref_runtime": 4.01,
+            "ref_runtime_stats": {
+                "mean": 4.01,
+                "std": 0.0649,
+                "min": 4.0,
+                "max": 4.66,
+                "num_trials": 100,
+                "hardware": "NVIDIA B200",
+                "device": "cuda:0"
+            }
+        },
+        {
+            "sample_id": 2,
+            "compiled": true,
+            "correctness": false,
+            "metadata": {
+                "hardware": "NVIDIA B200",
+                "device": "cuda:0",
+                "runtime_error": "at 62:34:\n            d += 1\n\n        # Store results for this tile\n        out_ptrs = y_ptr + row * stride_m + offs * stride_n\n        tl.store(out_ptrs, vals, mask=mask)\n\n        # Update carry: ...",
+                "runtime_error_name": "triton.compiler.errors.CompilationError",
+                "runtime_error_traceback": "Traceback (most recent call last):\n  File \"/raid/user_data/olu/scratch/drkernel_paper/kernelbench_ref/.venv/lib/python3.10/site-packages/triton/language/core.py\", line 43, in wrapper\n    return fn(*args, **kwargs)\n  File \"/raid/user_data/olu/scratch/drkernel_paper/kernelbench_ref/.venv/lib/python3.10/site-packages/triton/language/core.py\", line 1104, in __getitem__\n    for dim, sl in enumerate(slices):\n  File \"/raid/user_data/olu/scratch/drkernel_paper/kernelbench_ref/.venv/lib/python3.10/site-packages/triton/language/core.py\", line 41, in wrapper\n    raise ValueError(\"Did you forget to add @triton.jit ? \"\nValueError: Did you forget to add @triton.jit ? (`_semantic` argument must be provided outside of JIT functions.)\n\nThe above exception was the direct cause of the following exception:\n\nTraceback (most recent call last):\n  File \"/raid/user_data/olu/scratch/drkernel_paper/kernelbench_ref/src/kernelbench/eval.py\", line 782, in run_and_check_correctness\n    output_new = model_new(*inputs)\n  File \"/raid/user_data/olu/scratch/drkernel_paper/kernelbench_ref/.venv/lib/python3.10/site-packages/torch/nn/modules/module.py\", line 1778, in _wrapped_call_impl\n    return self._call_impl(*args, **kwargs)\n  File \"/raid/user_data/olu/scratch/drkernel_paper/kernelbench_ref/.venv/lib/python3.10/site-packages/torch/nn/modules/module.py\", line 1789, in _call_impl\n    return forward_call(*args, **kwargs)\n  File \"/tmp/tmp7gjyjbj5.py\", line 114, in forward\n    _cumsum_rows_kernel[grid](\n  File \"/raid/user_data/olu/scratch/drkernel_paper/kernelbench_ref/.venv/lib/python3.10/site-packages/triton/runtime/jit.py\", line 370, in <lambda>\n    return lambda *args, **kwargs: self.run(grid=grid, warmup=False, *args, **kwargs)\n  File \"/raid/user_data/olu/scratch/drkernel_paper/kernelbench_ref/.venv/lib/python3.10/site-packages/triton/runtime/jit.py\", line 739, in run\n    kernel = self._do_compile(key, signature, device, constexprs, options, attrs, warmup)\n  File \"/raid/user_data/olu/scratch/drkernel_paper/kernelbench_ref/.venv/lib/python3.10/site-packages/triton/runtime/jit.py\", line 884, in _do_compile\n    kernel = self.compile(src, target=target, options=options.__dict__)\n  File \"/raid/user_data/olu/scratch/drkernel_paper/kernelbench_ref/.venv/lib/python3.10/site-packages/triton/compiler/compiler.py\", line 307, in compile\n    module = src.make_ir(target, options, codegen_fns, module_map, context)\n  File \"/raid/user_data/olu/scratch/drkernel_paper/kernelbench_ref/.venv/lib/python3.10/site-packages/triton/compiler/compiler.py\", line 80, in make_ir\n    return ast_to_ttir(self.fn, self, context=context, options=options, codegen_fns=codegen_fns,\ntriton.compiler.errors.CompilationError: at 62:34:\n            d += 1\n\n        # Store results for this tile\n        out_ptrs = y_ptr + row * stride_m + offs * stride_n\n        tl.store(out_ptrs, vals, mask=mask)\n\n        # Update carry: last valid element of this tile\n        # Find the last in-range index: BLOCK-1 or max index where mask True.\n        # Simple: use BLOCK-1 and, if it's OOB, set carry = 0.\n        last_col = BLOCK - 1\n        in_last = (start + last_col) < N\n        carry = tl.where(in_last, vals[last_col], 0.0)\n                                  ^\nDid you forget to add @triton.jit ? (`_semantic` argument must be provided outside of JIT functions.)\n"
+            },
+            "runtime": -1.0,
+            "runtime_stats": {},
+            "ref_runtime": 4.01,
+            "ref_runtime_stats": {
+                "mean": 4.01,
+                "std": 0.0486,
+                "min": 4.0,
+                "max": 4.49,
+                "num_trials": 100,
+                "hardware": "NVIDIA B200",
+                "device": "cuda:0"
+            }
+        },
+        {
+            "sample_id": 3,
+            "compiled": true,
+            "correctness": false,
+            "metadata": {
+                "hardware": "NVIDIA B200",
+                "device": "cuda:0",
+                "runtime_error": "at 36:46:\n        x = tl.load(x_ptr + row_start + cols, mask=mask, other=0.0)\n\n        # Vector of lane indices\n        idx = tl.arange(0, BLOCK)\n\n        # Compute inclusive scan within the tile u...",
+                "runtime_error_name": "triton.compiler.errors.CompilationError",
+                "runtime_error_traceback": "Traceback (most recent call last):\n  File \"/raid/user_data/olu/scratch/drkernel_paper/kernelbench_ref/.venv/lib/python3.10/site-packages/triton/language/core.py\", line 43, in wrapper\n    return fn(*args, **kwargs)\n  File \"/raid/user_data/olu/scratch/drkernel_paper/kernelbench_ref/.venv/lib/python3.10/site-packages/triton/language/core.py\", line 1104, in __getitem__\n    for dim, sl in enumerate(slices):\n  File \"/raid/user_data/olu/scratch/drkernel_paper/kernelbench_ref/.venv/lib/python3.10/site-packages/triton/language/core.py\", line 41, in wrapper\n    raise ValueError(\"Did you forget to add @triton.jit ? \"\nValueError: Did you forget to add @triton.jit ? (`_semantic` argument must be provided outside of JIT functions.)\n\nThe above exception was the direct cause of the following exception:\n\nTraceback (most recent call last):\n  File \"/raid/user_data/olu/scratch/drkernel_paper/kernelbench_ref/src/kernelbench/eval.py\", line 782, in run_and_check_correctness\n    output_new = model_new(*inputs)\n  File \"/raid/user_data/olu/scratch/drkernel_paper/kernelbench_ref/.venv/lib/python3.10/site-packages/torch/nn/modules/module.py\", line 1778, in _wrapped_call_impl\n    return self._call_impl(*args, **kwargs)\n  File \"/raid/user_data/olu/scratch/drkernel_paper/kernelbench_ref/.venv/lib/python3.10/site-packages/torch/nn/modules/module.py\", line 1789, in _call_impl\n    return forward_call(*args, **kwargs)\n  File \"/tmp/tmp45czdbiu.py\", line 90, in forward\n    cumsum_rows_kernel[grid](\n  File \"/raid/user_data/olu/scratch/drkernel_paper/kernelbench_ref/.venv/lib/python3.10/site-packages/triton/runtime/jit.py\", line 370, in <lambda>\n    return lambda *args, **kwargs: self.run(grid=grid, warmup=False, *args, **kwargs)\n  File \"/raid/user_data/olu/scratch/drkernel_paper/kernelbench_ref/.venv/lib/python3.10/site-packages/triton/runtime/jit.py\", line 739, in run\n    kernel = self._do_compile(key, signature, device, constexprs, options, attrs, warmup)\n  File \"/raid/user_data/olu/scratch/drkernel_paper/kernelbench_ref/.venv/lib/python3.10/site-packages/triton/runtime/jit.py\", line 884, in _do_compile\n    kernel = self.compile(src, target=target, options=options.__dict__)\n  File \"/raid/user_data/olu/scratch/drkernel_paper/kernelbench_ref/.venv/lib/python3.10/site-packages/triton/compiler/compiler.py\", line 307, in compile\n    module = src.make_ir(target, options, codegen_fns, module_map, context)\n  File \"/raid/user_data/olu/scratch/drkernel_paper/kernelbench_ref/.venv/lib/python3.10/site-packages/triton/compiler/compiler.py\", line 80, in make_ir\n    return ast_to_ttir(self.fn, self, context=context, options=options, codegen_fns=codegen_fns,\ntriton.compiler.errors.CompilationError: at 36:46:\n        x = tl.load(x_ptr + row_start + cols, mask=mask, other=0.0)\n\n        # Vector of lane indices\n        idx = tl.arange(0, BLOCK)\n\n        # Compute inclusive scan within the tile using Hillis\u2013Steele\n        # working vector 'tmp' starts as x\n        tmp = x\n        offset = 1\n        while offset < BLOCK:\n            # shifted = tmp[idx - offset] if idx >= offset else 0\n            shifted = tl.where(idx >= offset, tmp[idx - offset], 0.0)\n                                              ^\nDid you forget to add @triton.jit ? (`_semantic` argument must be provided outside of JIT functions.)\n"
+            },
+            "runtime": -1.0,
+            "runtime_stats": {},
+            "ref_runtime": 4.01,
+            "ref_runtime_stats": {
+                "mean": 4.01,
+                "std": 0.055,
+                "min": 4.0,
+                "max": 4.56,
+                "num_trials": 100,
+                "hardware": "NVIDIA B200",
+                "device": "cuda:0"
+            }
+        },
+        {
+            "sample_id": 4,
+            "compiled": true,
+            "correctness": true,
+            "metadata": {
+                "hardware": "NVIDIA B200",
+                "device": "cuda:0",
+                "correctness_trials": "(5 / 5)"
+            },
+            "runtime": 76.9,
+            "runtime_stats": {
+                "mean": 76.9,
+                "std": 0.102,
+                "min": 76.8,
+                "max": 77.6,
+                "num_trials": 100,
+                "hardware": "NVIDIA B200",
+                "device": "cuda:0"
+            },
+            "ref_runtime": 4.02,
+            "ref_runtime_stats": {
+                "mean": 4.02,
+                "std": 0.0817,
+                "min": 4.0,
+                "max": 4.83,
+                "num_trials": 100,
+                "hardware": "NVIDIA B200",
+                "device": "cuda:0"
+            }
+        },
+        {
+            "sample_id": 5,
+            "compiled": true,
+            "correctness": true,
+            "metadata": {
+                "hardware": "NVIDIA B200",
+                "device": "cuda:0",
+                "correctness_trials": "(5 / 5)"
+            },
+            "runtime": 103.0,
+            "runtime_stats": {
+                "mean": 103.0,
+                "std": 0.132,
+                "min": 103.0,
+                "max": 105.0,
+                "num_trials": 100,
+                "hardware": "NVIDIA B200",
+                "device": "cuda:0"
+            },
+            "ref_runtime": 4.02,
+            "ref_runtime_stats": {
+                "mean": 4.02,
+                "std": 0.0656,
+                "min": 4.0,
+                "max": 4.67,
+                "num_trials": 100,
+                "hardware": "NVIDIA B200",
+                "device": "cuda:0"
+            }
+        },
+        {
+            "sample_id": 6,
+            "compiled": false,
+            "correctness": false,
+            "metadata": {
+                "hardware": "NVIDIA B200",
+                "device": "cuda:0",
+                "compilation_error_name": "builtins.SyntaxError",
+                "compilation_error": "invalid character '\u2019' (U+2019) (tmp8rk5rz3z.py, line 5)"
+            },
+            "runtime": -1.0,
+            "runtime_stats": {},
+            "ref_runtime": -1.0,
+            "ref_runtime_stats": {}
+        },
+        {
+            "sample_id": 7,
+            "compiled": true,
+            "correctness": false,
+            "metadata": {
+                "hardware": "NVIDIA B200",
+                "device": "cuda:0",
+                "runtime_error": "at 31:17:\n        # Compute pointers for this block\n        x_idx = row * stride_x_row + col + offs * stride_x_col\n        out_idx = row * stride_out_row + col + offs * stride_out_col\n        mask ...",
+                "runtime_error_name": "triton.compiler.errors.CompilationError",
+                "runtime_error_traceback": "Traceback (most recent call last):\n  File \"/raid/user_data/olu/scratch/drkernel_paper/kernelbench_ref/.venv/lib/python3.10/site-packages/triton/language/core.py\", line 43, in wrapper\n    return fn(*args, **kwargs)\n  File \"/raid/user_data/olu/scratch/drkernel_paper/kernelbench_ref/.venv/lib/python3.10/site-packages/triton/language/core.py\", line 1104, in __getitem__\n    for dim, sl in enumerate(slices):\n  File \"/raid/user_data/olu/scratch/drkernel_paper/kernelbench_ref/.venv/lib/python3.10/site-packages/triton/language/core.py\", line 41, in wrapper\n    raise ValueError(\"Did you forget to add @triton.jit ? \"\nValueError: Did you forget to add @triton.jit ? (`_semantic` argument must be provided outside of JIT functions.)\n\nThe above exception was the direct cause of the following exception:\n\nTraceback (most recent call last):\n  File \"/raid/user_data/olu/scratch/drkernel_paper/kernelbench_ref/src/kernelbench/eval.py\", line 782, in run_and_check_correctness\n    output_new = model_new(*inputs)\n  File \"/raid/user_data/olu/scratch/drkernel_paper/kernelbench_ref/.venv/lib/python3.10/site-packages/torch/nn/modules/module.py\", line 1778, in _wrapped_call_impl\n    return self._call_impl(*args, **kwargs)\n  File \"/raid/user_data/olu/scratch/drkernel_paper/kernelbench_ref/.venv/lib/python3.10/site-packages/torch/nn/modules/module.py\", line 1789, in _call_impl\n    return forward_call(*args, **kwargs)\n  File \"/tmp/tmpmyl9fzyv.py\", line 108, in forward\n    _cumsum_rows_blocks_kernel[grid](\n  File \"/raid/user_data/olu/scratch/drkernel_paper/kernelbench_ref/.venv/lib/python3.10/site-packages/triton/runtime/jit.py\", line 370, in <lambda>\n    return lambda *args, **kwargs: self.run(grid=grid, warmup=False, *args, **kwargs)\n  File \"/raid/user_data/olu/scratch/drkernel_paper/kernelbench_ref/.venv/lib/python3.10/site-packages/triton/runtime/jit.py\", line 739, in run\n    kernel = self._do_compile(key, signature, device, constexprs, options, attrs, warmup)\n  File \"/raid/user_data/olu/scratch/drkernel_paper/kernelbench_ref/.venv/lib/python3.10/site-packages/triton/runtime/jit.py\", line 884, in _do_compile\n    kernel = self.compile(src, target=target, options=options.__dict__)\n  File \"/raid/user_data/olu/scratch/drkernel_paper/kernelbench_ref/.venv/lib/python3.10/site-packages/triton/compiler/compiler.py\", line 307, in compile\n    module = src.make_ir(target, options, codegen_fns, module_map, context)\n  File \"/raid/user_data/olu/scratch/drkernel_paper/kernelbench_ref/.venv/lib/python3.10/site-packages/triton/compiler/compiler.py\", line 80, in make_ir\n    return ast_to_ttir(self.fn, self, context=context, options=options, codegen_fns=codegen_fns,\ntriton.compiler.errors.CompilationError: at 31:17:\n        # Compute pointers for this block\n        x_idx = row * stride_x_row + col + offs * stride_x_col\n        out_idx = row * stride_out_row + col + offs * stride_out_col\n        mask = (col + offs) < N\n\n        # Load block; use 0 for out-of-bounds\n        x = tl.load(x_ptr + x_idx, mask=mask, other=0.0)\n\n        # Inclusive scan in registers, store to out, accumulate block sum\n        s = 0.0\n        for i in range(0, BLOCK):\n            vi = x[i]\n                 ^\nDid you forget to add @triton.jit ? (`_semantic` argument must be provided outside of JIT functions.)\n"
+            },
+            "runtime": -1.0,
+            "runtime_stats": {},
+            "ref_runtime": 4.01,
+            "ref_runtime_stats": {
+                "mean": 4.01,
+                "std": 0.0557,
+                "min": 4.0,
+                "max": 4.56,
+                "num_trials": 100,
+                "hardware": "NVIDIA B200",
+                "device": "cuda:0"
+            }
+        }
+    ]
+}

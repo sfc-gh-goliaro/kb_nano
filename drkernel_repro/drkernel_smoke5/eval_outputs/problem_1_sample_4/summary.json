@@ -1,0 +1,16 @@
+{
+  "uid": "test_example_5c2644e3ae414934887f2680a6c062b7",
+  "num_turns": 3,
+  "total_score": 0.5268387198448181,
+  "per_turn_scores": [
+    0.0,
+    0.0,
+    0.5268387198448181
+  ],
+  "problem_id": 1,
+  "improvement": {
+    "first_turn_score": 0.0,
+    "last_turn_score": 0.5268387198448181,
+    "improved": true
+  }
+}

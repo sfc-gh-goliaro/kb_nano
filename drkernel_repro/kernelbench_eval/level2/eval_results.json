@@ -1,0 +1,455 @@
+{
+    "13": [
+        {
+            "sample_id": 0,
+            "compiled": true,
+            "correctness": false,
+            "metadata": {
+                "hardware": "NVIDIA B200",
+                "device": "cuda:0",
+                "max_difference": [
+                    "0.001793",
+                    "0.001790",
+                    "0.001792",
+                    "0.001773",
+                    "0.001793"
+                ],
+                "avg_difference": [
+                    "0.000045",
+                    "0.000045",
+                    "0.000045",
+                    "0.000045",
+                    "0.000045"
+                ],
+                "correctness_issue": "Output mismatch",
+                "correctness_trials": "(0 / 5)"
+            },
+            "runtime": -1.0,
+            "runtime_stats": {},
+            "ref_runtime": 5.43,
+            "ref_runtime_stats": {
+                "mean": 5.43,
+                "std": 0.0566,
+                "min": 5.41,
+                "max": 5.93,
+                "num_trials": 100,
+                "hardware": "NVIDIA B200",
+                "device": "cuda:0"
+            }
+        },
+        {
+            "sample_id": 1,
+            "compiled": true,
+            "correctness": true,
+            "metadata": {
+                "hardware": "NVIDIA B200",
+                "device": "cuda:0",
+                "correctness_trials": "(5 / 5)"
+            },
+            "runtime": 5.81,
+            "runtime_stats": {
+                "mean": 5.81,
+                "std": 0.0201,
+                "min": 5.78,
+                "max": 5.89,
+                "num_trials": 100,
+                "hardware": "NVIDIA B200",
+                "device": "cuda:0"
+            },
+            "ref_runtime": 5.57,
+            "ref_runtime_stats": {
+                "mean": 5.57,
+                "std": 1.23,
+                "min": 5.41,
+                "max": 17.8,
+                "num_trials": 100,
+                "hardware": "NVIDIA B200",
+                "device": "cuda:0"
+            }
+        },
+        {
+            "sample_id": 2,
+            "compiled": true,
+            "correctness": true,
+            "metadata": {
+                "hardware": "NVIDIA B200",
+                "device": "cuda:0",
+                "correctness_trials": "(5 / 5)"
+            },
+            "runtime": 5.52,
+            "runtime_stats": {
+                "mean": 5.52,
+                "std": 0.365,
+                "min": 5.47,
+                "max": 9.15,
+                "num_trials": 100,
+                "hardware": "NVIDIA B200",
+                "device": "cuda:0"
+            },
+            "ref_runtime": 5.44,
+            "ref_runtime_stats": {
+                "mean": 5.44,
+                "std": 0.0568,
+                "min": 5.41,
+                "max": 5.98,
+                "num_trials": 100,
+                "hardware": "NVIDIA B200",
+                "device": "cuda:0"
+            }
+        },
+        {
+            "sample_id": 3,
+            "compiled": false,
+            "correctness": false,
+            "metadata": {
+                "other_error": "error: ModelNew.__init__() takes from 2 to 4 positional arguments but 7 were given",
+                "other_error_name": "builtins.TypeError",
+                "hardware": "NVIDIA B200",
+                "device": "cuda:0"
+            },
+            "runtime": -1.0,
+            "runtime_stats": {},
+            "ref_runtime": -1.0,
+            "ref_runtime_stats": {}
+        },
+        {
+            "sample_id": 4,
+            "compiled": true,
+            "correctness": true,
+            "metadata": {
+                "hardware": "NVIDIA B200",
+                "device": "cuda:0",
+                "correctness_trials": "(5 / 5)"
+            },
+            "runtime": 5.52,
+            "runtime_stats": {
+                "mean": 5.52,
+                "std": 0.0185,
+                "min": 5.49,
+                "max": 5.59,
+                "num_trials": 100,
+                "hardware": "NVIDIA B200",
+                "device": "cuda:0"
+            },
+            "ref_runtime": 5.44,
+            "ref_runtime_stats": {
+                "mean": 5.44,
+                "std": 0.074,
+                "min": 5.41,
+                "max": 6.16,
+                "num_trials": 100,
+                "hardware": "NVIDIA B200",
+                "device": "cuda:0"
+            }
+        },
+        {
+            "sample_id": 5,
+            "compiled": true,
+            "correctness": false,
+            "metadata": {
+                "hardware": "NVIDIA B200",
+                "device": "cuda:0",
+                "runtime_error": "not enough values to unpack (expected 5, got 4)",
+                "runtime_error_name": "builtins.ValueError",
+                "runtime_error_traceback": "Traceback (most recent call last):\n  File \"/raid/user_data/olu/scratch/drkernel_paper/kernelbench_ref/src/kernelbench/eval.py\", line 782, in run_and_check_correctness\n    output_new = model_new(*inputs)\n  File \"/raid/user_data/olu/scratch/drkernel_paper/kernelbench_ref/.venv/lib/python3.10/site-packages/torch/nn/modules/module.py\", line 1778, in _wrapped_call_impl\n    return self._call_impl(*args, **kwargs)\n  File \"/raid/user_data/olu/scratch/drkernel_paper/kernelbench_ref/.venv/lib/python3.10/site-packages/torch/nn/modules/module.py\", line 1789, in _call_impl\n    return forward_call(*args, **kwargs)\n  File \"/tmp/tmp97eeswyl.py\", line 190, in forward\n    ob, oc, _, oh, ow = out1.stride()\nValueError: not enough values to unpack (expected 5, got 4)\n"
+            },
+            "runtime": -1.0,
+            "runtime_stats": {},
+            "ref_runtime": 5.44,
+            "ref_runtime_stats": {
+                "mean": 5.44,
+                "std": 0.0608,
+                "min": 5.41,
+                "max": 6.01,
+                "num_trials": 100,
+                "hardware": "NVIDIA B200",
+                "device": "cuda:0"
+            }
+        },
+        {
+            "sample_id": 6,
+            "compiled": true,
+            "correctness": false,
+            "metadata": {
+                "hardware": "NVIDIA B200",
+                "device": "cuda:0",
+                "max_difference": [
+                    "0.001793",
+                    "0.001790",
+                    "0.001792",
+                    "0.001773",
+                    "0.001793"
+                ],
+                "avg_difference": [
+                    "0.000045",
+                    "0.000045",
+                    "0.000045",
+                    "0.000045",
+                    "0.000045"
+                ],
+                "correctness_issue": "Output mismatch",
+                "correctness_trials": "(0 / 5)"
+            },
+            "runtime": -1.0,
+            "runtime_stats": {},
+            "ref_runtime": 5.49,
+            "ref_runtime_stats": {
+                "mean": 5.49,
+                "std": 0.0682,
+                "min": 5.42,
+                "max": 6.04,
+                "num_trials": 100,
+                "hardware": "NVIDIA B200",
+                "device": "cuda:0"
+            }
+        },
+        {
+            "sample_id": 7,
+            "compiled": true,
+            "correctness": true,
+            "metadata": {
+                "hardware": "NVIDIA B200",
+                "device": "cuda:0",
+                "correctness_trials": "(5 / 5)"
+            },
+            "runtime": 5.84,
+            "runtime_stats": {
+                "mean": 5.84,
+                "std": 0.0357,
+                "min": 5.79,
+                "max": 5.95,
+                "num_trials": 100,
+                "hardware": "NVIDIA B200",
+                "device": "cuda:0"
+            },
+            "ref_runtime": 5.44,
+            "ref_runtime_stats": {
+                "mean": 5.44,
+                "std": 0.0642,
+                "min": 5.41,
+                "max": 6.04,
+                "num_trials": 100,
+                "hardware": "NVIDIA B200",
+                "device": "cuda:0"
+            }
+        }
+    ],
+    "40": [
+        {
+            "sample_id": 0,
+            "compiled": true,
+            "correctness": false,
+            "metadata": {
+                "hardware": "NVIDIA B200",
+                "device": "cuda:0",
+                "max_difference": [
+                    "0.002007",
+                    "0.002018",
+                    "0.001941",
+                    "0.001899",
+                    "0.001895"
+                ],
+                "avg_difference": [
+                    "0.000280",
+                    "0.000280",
+                    "0.000280",
+                    "0.000280",
+                    "0.000280"
+                ],
+                "correctness_issue": "Output mismatch",
+                "correctness_trials": "(0 / 5)"
+            },
+            "runtime": -1.0,
+            "runtime_stats": {},
+            "ref_runtime": 9.14,
+            "ref_runtime_stats": {
+                "mean": 9.14,
+                "std": 0.0188,
+                "min": 9.11,
+                "max": 9.2,
+                "num_trials": 100,
+                "hardware": "NVIDIA B200",
+                "device": "cuda:0"
+            }
+        },
+        {
+            "sample_id": 1,
+            "compiled": true,
+            "correctness": false,
+            "metadata": {
+                "hardware": "NVIDIA B200",
+                "device": "cuda:0",
+                "max_difference": [
+                    "0.002007",
+                    "0.002018",
+                    "0.001941",
+                    "0.001899",
+                    "0.001895"
+                ],
+                "avg_difference": [
+                    "0.000280",
+                    "0.000280",
+                    "0.000280",
+                    "0.000280",
+                    "0.000280"
+                ],
+                "correctness_issue": "Output mismatch",
+                "correctness_trials": "(0 / 5)"
+            },
+            "runtime": -1.0,
+            "runtime_stats": {},
+            "ref_runtime": 9.16,
+            "ref_runtime_stats": {
+                "mean": 9.16,
+                "std": 0.0348,
+                "min": 9.1,
+                "max": 9.23,
+                "num_trials": 100,
+                "hardware": "NVIDIA B200",
+                "device": "cuda:0"
+            }
+        },
+        {
+            "sample_id": 2,
+            "compiled": true,
+            "correctness": false,
+            "metadata": {
+                "hardware": "NVIDIA B200",
+                "device": "cuda:0",
+                "max_difference": [
+                    "0.002007",
+                    "0.002018",
+                    "0.001941",
+                    "0.001899",
+                    "0.001895"
+                ],
+                "avg_difference": [
+                    "0.000280",
+                    "0.000280",
+                    "0.000280",
+                    "0.000280",
+                    "0.000280"
+                ],
+                "correctness_issue": "Output mismatch",
+                "correctness_trials": "(0 / 5)"
+            },
+            "runtime": -1.0,
+            "runtime_stats": {},
+            "ref_runtime": 9.15,
+            "ref_runtime_stats": {
+                "mean": 9.15,
+                "std": 0.0345,
+                "min": 9.1,
+                "max": 9.21,
+                "num_trials": 100,
+                "hardware": "NVIDIA B200",
+                "device": "cuda:0"
+            }
+        },
+        {
+            "sample_id": 3,
+            "compiled": false,
+            "correctness": false,
+            "metadata": {
+                "other_error": "error: ModelNew.__init__() takes 1 positional argument but 4 were given",
+                "other_error_name": "builtins.TypeError",
+                "hardware": "NVIDIA B200",
+                "device": "cuda:0"
+            },
+            "runtime": -1.0,
+            "runtime_stats": {},
+            "ref_runtime": -1.0,
+            "ref_runtime_stats": {}
+        },
+        {
+            "sample_id": 4,
+            "compiled": true,
+            "correctness": true,
+            "metadata": {
+                "hardware": "NVIDIA B200",
+                "device": "cuda:0",
+                "correctness_trials": "(5 / 5)"
+            },
+            "runtime": 8.91,
+            "runtime_stats": {
+                "mean": 8.91,
+                "std": 0.0211,
+                "min": 8.89,
+                "max": 9.05,
+                "num_trials": 100,
+                "hardware": "NVIDIA B200",
+                "device": "cuda:0"
+            },
+            "ref_runtime": 9.16,
+            "ref_runtime_stats": {
+                "mean": 9.16,
+                "std": 0.0395,
+                "min": 9.1,
+                "max": 9.26,
+                "num_trials": 100,
+                "hardware": "NVIDIA B200",
+                "device": "cuda:0"
+            }
+        },
+        {
+            "sample_id": 5,
+            "compiled": false,
+            "correctness": false,
+            "metadata": {
+                "other_error": "error: ModelNew.__init__() takes 1 positional argument but 4 were given",
+                "other_error_name": "builtins.TypeError",
+                "hardware": "NVIDIA B200",
+                "device": "cuda:0"
+            },
+            "runtime": -1.0,
+            "runtime_stats": {},
+            "ref_runtime": -1.0,
+            "ref_runtime_stats": {}
+        },
+        {
+            "sample_id": 6,
+            "compiled": true,
+            "correctness": true,
+            "metadata": {
+                "hardware": "NVIDIA B200",
+                "device": "cuda:0",
+                "correctness_trials": "(5 / 5)"
+            },
+            "runtime": 8.96,
+            "runtime_stats": {
+                "mean": 8.96,
+                "std": 0.0201,
+                "min": 8.91,
+                "max": 9.01,
+                "num_trials": 100,
+                "hardware": "NVIDIA B200",
+                "device": "cuda:0"
+            },
+            "ref_runtime": 9.14,
+            "ref_runtime_stats": {
+                "mean": 9.14,
+                "std": 0.0286,
+                "min": 9.1,
+                "max": 9.27,
+                "num_trials": 100,
+                "hardware": "NVIDIA B200",
+                "device": "cuda:0"
+            }
+        },
+        {
+            "sample_id": 7,
+            "compiled": false,
+            "correctness": false,
+            "metadata": {
+                "hardware": "NVIDIA B200",
+                "device": "cuda:0",
+                "compilation_error_name": "builtins.SyntaxError",
+                "compilation_error": "invalid character '\u00b7' (U+00B7) (tmpedkihknh.py, line 4)"
+            },
+            "runtime": -1.0,
+            "runtime_stats": {},
+            "ref_runtime": -1.0,
+            "ref_runtime_stats": {}
+        }
+    ]
+}
